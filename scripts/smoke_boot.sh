@@ -309,6 +309,22 @@ check_floattest() {
     fi
 }
 
+check_tensor() {
+    # init spawns sbin/tensortest; the SSE tensor-kernel library (matmul/add/
+    # scale/relu/dot) is run against an independent scalar reference within an
+    # epsilon. "TENSORTEST: PASS" gates the first tensor-runtime brick.
+    if grep -qF 'TENSORTEST: PASS' "$LOG"; then
+        pass "SSE tensor kernels verified (matmul/add/scale/relu/dot vs scalar ref)"
+        return 0
+    elif grep -qF 'TENSORTEST: FAIL' "$LOG"; then
+        fail "tensor kernel mismatch: $(grep -F 'TENSORTEST: FAIL' "$LOG" | head -1)"
+        return 1
+    else
+        fail "tensortest did not report (tensor lib crashed or never ran)"
+        return 1
+    fi
+}
+
 check_slab() {
     # kernel.c calls slab_selftest() — the object-cache slab allocator.
     if grep -qF '[SLAB] SELFTEST: PASS' "$LOG"; then
@@ -696,6 +712,7 @@ run_checks() {
         check_slab
         check_argv
         check_floattest
+        check_tensor
         check_compiler
         check_compress
         check_sysutils

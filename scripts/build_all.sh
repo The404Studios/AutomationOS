@@ -67,6 +67,11 @@ cc userspace/apps/cpuburn/cpuburn.c /tmp/cpuburn.o; $LD /tmp/crt0.o /tmp/cpuburn
 # matbench: SIMD float matmul benchmark -- scalar baseline vs hand-vectorized SSE
 # (gcc v4sf), with a correctness check + a measured speedup. First tensor-runtime brick.
 cc userspace/apps/matbench/matbench.c /tmp/matbench.o; $LD /tmp/crt0.o /tmp/matbench.o -o /tmp/matbench.elf
+# tensor: freestanding SSE float tensor-kernel lib (matmul/add/scale/relu/dot, each
+# 4-wide v4sf + scalar remainder). tensortest runs each SSE op vs an independent
+# scalar reference within epsilon and prints TENSORTEST: PASS. crt0-linked.
+cc userspace/lib/tensor/tensor.c /tmp/tensor.o
+cc userspace/apps/tensortest/tensortest.c /tmp/tensortest.o; $LD /tmp/crt0.o /tmp/tensortest.o /tmp/tensor.o -o /tmp/tensortest.elf
 
 # Wave: process/disk sysutils + file/text tools (all argv-aware, crt0-linked).
 # ps/kill/free/uptime = process+system info; find/diff/cmp/tee/wcx/xargs = file
@@ -360,7 +365,7 @@ $LD /tmp/crt0.o /tmp/cc.o \
     -o /tmp/cc.elf
 
 echo "[all] canary check (all must be 0):"
-for e in comp init filemanager calculator clock sysinfo settings sysmon uidemo dateapp applauncher taskman terminal editor snake paint synth tetris game2048 sheet notes calendar stopwatch mines piano dashboard welcome bench breakout pong invaders procmon soundtest solitaire aiconsole screenshot stress musicplayer ide bubbletd pacman clockapp forktest aibroker sed awk tar pkg make meminfo argvtest floattest cpuburn blk ps kill free uptime find diff cmp tee wcx xargs gzip cc nettest sockettest wget netman browser cryptotest libtest ping nc grep head tail sort uniq cut tr nl du touch basename dirname uname hostname whoami date less hexdump tlsprobe certtool dhcpc apidemo js futextest epolltest sendfiletest perftest batchtest domtest htmltest csstest layouttest webtest browser2 webapitest; do
+for e in comp init filemanager calculator clock sysinfo settings sysmon uidemo dateapp applauncher taskman terminal editor snake paint synth tetris game2048 sheet notes calendar stopwatch mines piano dashboard welcome bench breakout pong invaders procmon soundtest solitaire aiconsole screenshot stress musicplayer ide bubbletd pacman clockapp forktest aibroker sed awk tar pkg make meminfo argvtest floattest matbench tensortest cpuburn blk ps kill free uptime find diff cmp tee wcx xargs gzip cc nettest sockettest wget netman browser cryptotest libtest ping nc grep head tail sort uniq cut tr nl du touch basename dirname uname hostname whoami date less hexdump tlsprobe certtool dhcpc apidemo js futextest epolltest sendfiletest perftest batchtest domtest htmltest csstest layouttest webtest browser2 webapitest; do
     n=$(objdump -d /tmp/$e.elf 2>/dev/null | grep -c "fs:0x28" || true)
     echo "  $e=$n"
 done
@@ -390,6 +395,8 @@ cp /tmp/floattest.elf /tmp/ird/sbin/floattest
 # every initrd but only spawned by a STRESS=1 init, so it is inert otherwise.
 cp /tmp/cpuburn.elf /tmp/ird/sbin/cpuburn
 cp /tmp/matbench.elf /tmp/ird/sbin/matbench
+# tensortest: SSE tensor-kernel correctness self-test (init spawns it at boot).
+cp /tmp/tensortest.elf /tmp/ird/sbin/tensortest
 # Wave tools: process/disk + file/text utils, gzip, and the on-device C compiler.
 for t in blk ps kill free uptime find diff cmp tee wcx xargs gzip cc; do
     cp /tmp/$t.elf /tmp/ird/bin/$t

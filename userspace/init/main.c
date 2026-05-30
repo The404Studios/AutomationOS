@@ -136,6 +136,11 @@ void _start(void) {
     print("[INIT] Spawning matbench...\n");
     spawn("sbin/matbench");
 
+    // tensortest: SSE tensor-kernel library self-test (matmul/add/scale/relu/dot
+    // each compared against an independent scalar reference). Prints TENSORTEST: PASS.
+    print("[INIT] Spawning tensortest...\n");
+    spawn("sbin/tensortest");
+
     // AI-native layer: the capability-gated command broker (crown jewel) runs a
     // self-test of its tool-bus + policy + ledger + rollback pipeline.
     print("[INIT] Spawning aibroker...\n");

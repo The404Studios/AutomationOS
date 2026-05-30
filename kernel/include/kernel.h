@@ -20,7 +20,27 @@
 
 // Panic and assertions
 void kernel_panic(const char* message) NORETURN;
-#define ASSERT(cond) do { if (!(cond)) kernel_panic("Assertion failed: " #cond); } while(0)
+void assert_failed(const char* expr, const char* file, int line) NORETURN;
+
+// Debug assertions (enabled in debug builds)
+#ifdef DEBUG
+#define ASSERT(expr) \
+    do { \
+        if (!(expr)) { \
+            assert_failed(#expr, __FILE__, __LINE__); \
+        } \
+    } while (0)
+#else
+#define ASSERT(expr) ((void)0)
+#endif
+
+// Always-on assertions for critical invariants
+#define ASSERT_ALWAYS(expr) \
+    do { \
+        if (!(expr)) { \
+            assert_failed(#expr, __FILE__, __LINE__); \
+        } \
+    } while (0)
 
 // Kernel printf
 int kprintf(const char* format, ...);

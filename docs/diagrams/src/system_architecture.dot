@@ -1,0 +1,123 @@
+// AutomationOS System Architecture
+// Graphviz DOT format
+// Generate with: dot -Tsvg system_architecture.dot -o ../system_architecture.svg
+
+digraph AutomationOS {
+    rankdir=TB;
+    node [shape=box, style="rounded,filled", fontname="Arial"];
+    graph [fontname="Arial", fontsize=12, compound=true];
+    edge [fontname="Arial"];
+
+    // Color scheme
+    node [fillcolor="#E8F4F8"];
+
+    // Userspace layer
+    subgraph cluster_userspace {
+        label="Userspace (Ring 3)";
+        style=filled;
+        fillcolor="#E3F2FD";
+
+        init [label="Init Process\n(PID 1)", fillcolor="#64B5F6"];
+        shell [label="Shell\n(/bin/shell)", fillcolor="#64B5F6"];
+        utils [label="Utilities\necho, ls, cat, etc.", fillcolor="#90CAF9"];
+
+        init -> shell [label="spawns", style=dashed];
+    }
+
+    // System call interface
+    syscall_interface [label="System Call Interface\n(syscall instruction)", shape=ellipse, fillcolor="#FFF9C4", style=filled];
+
+    userspace -> syscall_interface [ltail=cluster_userspace];
+
+    // Kernel space
+    subgraph cluster_kernel {
+        label="Kernel Space (Ring 0)\n0xFFFFFFFF80000000";
+        style=filled;
+        fillcolor="#F3E5F5";
+
+        // Core subsystems
+        subgraph cluster_core {
+            label="Core Subsystems";
+            style=filled;
+            fillcolor="#E1BEE7";
+
+            sched [label="Process Scheduler\n(Round-Robin)", fillcolor="#CE93D8"];
+            mem [label="Memory Manager\nPMM + VMM + Heap", fillcolor="#CE93D8"];
+            syscall [label="System Call Dispatcher", fillcolor="#CE93D8"];
+            namespace [label="Namespace Manager\nPID/Mount/Net/IPC", fillcolor="#CE93D8"];
+
+            sched -> mem [style=dashed, label="allocates"];
+            syscall -> sched [style=dashed];
+            syscall -> mem [style=dashed];
+        }
+
+        // Driver layer
+        subgraph cluster_drivers {
+            label="Device Drivers";
+            style=filled;
+            fillcolor="#C8E6C9";
+
+            serial [label="Serial Console\n(COM1)", fillcolor="#81C784"];
+            pit [label="Timer (PIT)\n1000 Hz", fillcolor="#81C784"];
+            ps2 [label="PS/2 Keyboard", fillcolor="#81C784"];
+            fb [label="Framebuffer\nVBE/UEFI GOP", fillcolor="#81C784"];
+        }
+
+        // Architecture layer
+        subgraph cluster_arch {
+            label="x86_64 Architecture";
+            style=filled;
+            fillcolor="#FFCCBC";
+
+            gdt [label="GDT\nSegmentation", fillcolor="#FF8A65"];
+            idt [label="IDT\nInterrupts", fillcolor="#FF8A65"];
+            paging [label="Paging\n4-level PT", fillcolor="#FF8A65"];
+            context [label="Context Switch\nRegister Save/Restore", fillcolor="#FF8A65"];
+
+            idt -> sched [label="timer IRQ", constraint=false];
+        }
+
+        // Security layer
+        subgraph cluster_security {
+            label="Security Subsystems";
+            style=filled;
+            fillcolor="#FFE0B2";
+
+            mac [label="MAC Policy\nType Enforcement", fillcolor="#FFB74D"];
+            seccomp [label="Seccomp\nSyscall Filter", fillcolor="#FFB74D"];
+            audit [label="Audit Log\nRing Buffer", fillcolor="#FFB74D"];
+            crypto [label="Crypto\nSHA256 + RSA", fillcolor="#FFB74D"];
+        }
+    }
+
+    syscall_interface -> syscall [lhead=cluster_kernel];
+
+    // Bootloader
+    bootloader [label="AutoBoot\nUEFI Bootloader", shape=box, style="rounded,filled", fillcolor="#B2DFDB"];
+
+    cluster_kernel -> bootloader [dir=back, label="loads kernel\nsets up memory"];
+
+    // Hardware
+    hardware [label="Hardware\nx86_64 CPU, RAM, Devices", shape=box3d, fillcolor="#CFD8DC"];
+
+    bootloader -> hardware [dir=back, label="UEFI firmware"];
+    cluster_drivers -> hardware [dir=back, ltail=cluster_drivers, label="I/O ports\nMMIO"];
+
+    // Legend
+    subgraph cluster_legend {
+        label="Legend";
+        style=filled;
+        fillcolor="#FFFFFF";
+
+        legend_user [label="Userspace", fillcolor="#64B5F6"];
+        legend_kernel [label="Kernel Core", fillcolor="#CE93D8"];
+        legend_driver [label="Drivers", fillcolor="#81C784"];
+        legend_arch [label="Architecture", fillcolor="#FF8A65"];
+        legend_security [label="Security", fillcolor="#FFB74D"];
+
+        legend_user -> legend_kernel [style=invis];
+        legend_kernel -> legend_driver [style=invis];
+        legend_driver -> legend_arch [style=invis];
+        legend_arch -> legend_security [style=invis];
+    }
+}

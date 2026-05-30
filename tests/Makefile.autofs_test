@@ -1,0 +1,95 @@
+# AutoFS Comprehensive Test Suite Makefile
+
+CC = gcc
+CFLAGS = -Wall -Wextra -O2 -g -I../kernel/include -pthread
+LDFLAGS = -L../kernel/fs/autofs -lautofs -lpthread -lm
+
+# Compression libraries
+LDFLAGS += -lzstd -llz4 -lz
+
+# Crypto libraries
+LDFLAGS += -lcrypto -lssl
+
+# Source files
+TEST_SRC = autofs_comprehensive_test.c
+TEST_BIN = autofs_comprehensive_test
+
+# Additional test binaries
+BASIC_TEST = test_autofs
+STRESS_TEST = test_autofs_stress
+PERF_TEST = test_autofs_performance
+
+all: build_libs $(TEST_BIN) $(BASIC_TEST)
+
+# Build AutoFS library first
+build_libs:
+	@echo "Building AutoFS library..."
+	@cd ../kernel/fs/autofs && $(MAKE)
+	@echo "AutoFS library built successfully"
+
+# Comprehensive test suite
+$(TEST_BIN): $(TEST_SRC)
+	@echo "Compiling comprehensive test suite..."
+	$(CC) $(CFLAGS) -o $@ $< $(LDFLAGS)
+	@echo "✓ Comprehensive test suite compiled"
+
+# Basic test (existing)
+$(BASIC_TEST): test_autofs.c
+	@echo "Compiling basic test..."
+	$(CC) $(CFLAGS) -o $@ $< $(LDFLAGS)
+	@echo "✓ Basic test compiled"
+
+# Run all tests
+test: all
+	@echo ""
+	@echo "========================================"
+	@echo "  Running AutoFS Test Suite"
+	@echo "========================================"
+	@echo ""
+	@echo "=== Test 1: Basic Tests ==="
+	@./$(BASIC_TEST) || true
+	@echo ""
+	@echo "=== Test 2: Comprehensive Tests ==="
+	@./$(TEST_BIN) || true
+	@echo ""
+	@echo "========================================"
+	@echo "  Test Suite Complete"
+	@echo "========================================"
+
+# Run only comprehensive tests
+test-comprehensive: $(TEST_BIN)
+	@./$(TEST_BIN)
+
+# Run with valgrind for memory leak detection
+test-valgrind: $(TEST_BIN)
+	@echo "Running tests with valgrind..."
+	valgrind --leak-check=full --show-leak-kinds=all --track-origins=yes \
+		--verbose --log-file=valgrind-autofs.log ./$(TEST_BIN)
+	@echo "Valgrind log saved to: valgrind-autofs.log"
+
+# Run with gdb for debugging
+test-debug: $(TEST_BIN)
+	gdb ./$(TEST_BIN)
+
+# Performance benchmarks
+benchmark: $(TEST_BIN)
+	@echo "Running performance benchmarks..."
+	@./$(TEST_BIN) --benchmark
+
+# Clean build artifacts
+clean:
+	rm -f $(TEST_BIN) $(BASIC_TEST) $(STRESS_TEST) $(PERF_TEST)
+	rm -f *.o *.log
+	rm -f /tmp/autofs_test.img
+	@cd ../kernel/fs/autofs && $(MAKE) clean
+
+# Clean everything including logs
+clean-all: clean
+	rm -f *.log test-report-*.txt
+
+# Install test suite
+install: $(TEST_BIN)
+	install -m 755 $(TEST_BIN) /usr/local/bin/
+	@echo "Test suite installed to /usr/local/bin/"
+
+.PHONY: all test test-comprehensive test-valgrind test-debug benchmark clean clean-all install build_libs

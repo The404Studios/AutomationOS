@@ -1,0 +1,63 @@
+# Minimal Compositor Makefile
+# Builds the simple framebuffer-based compositor (without GPU acceleration)
+
+CC = gcc
+CFLAGS = -Wall -Wextra -O2 -std=gnu11 -D_POSIX_C_SOURCE=200809L -I. -I..
+LDFLAGS = -lm
+
+# Minimal compositor sources
+MINIMAL_SRCS = main.c fb.c render.c
+MINIMAL_OBJS = $(MINIMAL_SRCS:.c=.o)
+
+# Test program
+TEST_SRCS = test_minimal_compositor.c fb.c render.c
+TEST_OBJS = $(TEST_SRCS:.c=.o)
+
+# Binaries
+COMPOSITOR_MIN = compositor-minimal
+TEST_MIN = test_minimal_compositor
+
+.PHONY: all clean minimal test install
+
+# Build minimal compositor
+all: $(COMPOSITOR_MIN)
+
+minimal: $(COMPOSITOR_MIN)
+
+$(COMPOSITOR_MIN): $(MINIMAL_OBJS)
+	$(CC) -o $@ $^ $(LDFLAGS)
+	@echo "Built minimal compositor: $@"
+
+test: $(TEST_MIN)
+
+$(TEST_MIN): $(TEST_OBJS)
+	$(CC) -o $@ $^ $(LDFLAGS)
+	@echo "Built test program: $@"
+
+# Object file compilation
+%.o: %.c
+	$(CC) $(CFLAGS) -c -o $@ $<
+
+# Dependencies
+main.o: main.c fb.h render.h
+fb.o: fb.c fb.h
+render.o: render.c render.h fb.h
+test_minimal_compositor.o: test_minimal_compositor.c fb.h render.h
+
+clean:
+	rm -f $(MINIMAL_OBJS) $(TEST_OBJS) $(COMPOSITOR_MIN) $(TEST_MIN)
+	@echo "Cleaned minimal compositor build artifacts"
+
+install: $(COMPOSITOR_MIN)
+	mkdir -p /usr/bin
+	cp $(COMPOSITOR_MIN) /usr/bin/
+	chmod +x /usr/bin/$(COMPOSITOR_MIN)
+	@echo "Installed minimal compositor to /usr/bin/"
+
+# Run test
+run-test: $(TEST_MIN)
+	./$(TEST_MIN)
+
+# Run compositor
+run: $(COMPOSITOR_MIN)
+	./$(COMPOSITOR_MIN)

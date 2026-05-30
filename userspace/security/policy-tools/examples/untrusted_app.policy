@@ -1,0 +1,37 @@
+# Untrusted Application MAC Policy
+# Maximum restriction for untrusted/sandboxed applications
+
+# Untrusted app can only access temporary directory
+allow untrusted_t tmp_t:file { read write create delete };
+
+# Untrusted app can read its own executable
+allow untrusted_t untrusted_t:file { read execute };
+
+# Untrusted app CANNOT access any system files
+deny untrusted_t etc_t:file { read write };
+deny untrusted_t bin_t:file { read write execute };
+deny untrusted_t lib_t:file { read write };
+deny untrusted_t shadow_t:file { read write };
+
+# Untrusted app CANNOT access home directories
+deny untrusted_t home_t:file { read write };
+
+# Untrusted app CANNOT access network
+deny untrusted_t *:socket { bind connect listen };
+
+# Untrusted app CANNOT access devices
+deny untrusted_t dev_t:device { read write };
+
+# Untrusted app CANNOT signal other processes
+deny untrusted_t *:process { signal ptrace kill };
+
+# Untrusted app CANNOT create IPC objects
+deny untrusted_t *:shm { create };
+deny untrusted_t *:msg { create };
+deny untrusted_t *:sem { create };
+
+# Untrusted app can only fork itself
+allow untrusted_t untrusted_t:process { fork };
+
+# Untrusted app CANNOT execute other binaries (no exec)
+deny untrusted_t *:file { execute };

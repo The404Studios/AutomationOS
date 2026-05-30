@@ -1,0 +1,251 @@
+SMP Load Balancing Architecture
+================================
+
+1. Per-CPU Runqueues (Before)
+------------------------------
+
+Global Queue (Single Lock - Bottleneck):
+┌─────────────────────────────────────────┐
+│  [P1] → [P2] → [P3] → ... → [P100]     │ ← All CPUs compete
+│         scheduler_lock                   │    for this lock
+└─────────────────────────────────────────┘
+          ↑    ↑    ↑    ↑
+          │    │    │    │
+        CPU0 CPU1 CPU2 CPU3
+        (contention on every enqueue/dequeue)
+
+
+2. Per-CPU Runqueues (After)
+-----------------------------
+
+CPU 0 Runqueue:              CPU 1 Runqueue:
+┌──────────────────┐         ┌──────────────────┐
+│ [P1] → [P2] → [P3]│         │ [P26] → [P27]   │
+│  lock0            │         │  lock1           │
+└──────────────────┘         └──────────────────┘
+        ↑                            ↑
+      CPU 0                        CPU 1
+   (no contention)              (no contention)
+
+CPU 2 Runqueue:              CPU 3 Runqueue:
+┌──────────────────┐         ┌──────────────────┐
+│ [P51] → [P52]    │         │ [P76] → [P77]   │
+│  lock2            │         │  lock3           │
+└──────────────────┘         └──────────────────┘
+        ↑                            ↑
+      CPU 2                        CPU 3
+   (no contention)              (no contention)
+
+
+3. Load Balancing Flow
+-----------------------
+
+Timer Tick → scheduler_tick() → Every 50 ticks:
+
+Step 1: Find Imbalance
+┌─────────┬─────────┬─────────┬─────────┐
+│ CPU 0   │ CPU 1   │ CPU 2   │ CPU 3   │
+│ 40 proc │ 10 proc │ 25 proc │ 25 proc │
+└─────────┴─────────┴─────────┴─────────┘
+   ↑                   ↑
+ Busiest             Idlest
+
+Step 2: Check Threshold
+Imbalance = 40 - 10 = 30 > THRESHOLD (2) ✓
+
+Step 3: Migrate Processes
+┌─────────┐                    ┌─────────┐
+│ CPU 0   │  [P5] → [P8] →    │ CPU 1   │
+│ 40 → 25 │  ← ← ← ← ← ← ←    │ 10 → 25 │
+└─────────┘                    └─────────┘
+            15 processes migrated
+
+Step 4: Final Distribution
+┌─────────┬─────────┬─────────┬─────────┐
+│ CPU 0   │ CPU 1   │ CPU 2   │ CPU 3   │
+│ 25 proc │ 25 proc │ 25 proc │ 25 proc │
+└─────────┴─────────┴─────────┴─────────┘
+         Balanced! ✓
+
+
+4. Work Stealing
+----------------
+
+Scenario: CPU 3 becomes idle
+
+CPU 3 Runqueue Empty:
+┌──────────────────┐
+│ (empty)          │
+│  load = 0        │
+└──────────────────┘
+        ↓
+     CPU 3 idle!
+
+Work Stealing Algorithm:
+1. Find busiest CPU → CPU 0 (load = 30)
+2. Steal one process → [P15]
+3. Add to local queue
+
+After Stealing:
+┌──────────────────┐         ┌──────────────────┐
+│ CPU 0: 29 proc   │  [P15]  │ CPU 3: 1 proc    │
+│                  │ ──────→ │                  │
+└──────────────────┘         └──────────────────┘
+    Stolen!                      No longer idle!
+
+
+5. Migration Cost Awareness
+----------------------------
+
+Process State:
+┌────────────────────────────────────────┐
+│ Process P1                             │
+│  - Last run: tick 1000                 │
+│  - Current tick: 1003                  │
+│  - Ticks since run: 3                  │
+│  - Migration threshold: 5              │
+│  → HOT (don't migrate, cache-resident)│
+└────────────────────────────────────────┘
+
+┌────────────────────────────────────────┐
+│ Process P2                             │
+│  - Last run: tick 1000                 │
+│  - Current tick: 1010                  │
+│  - Ticks since run: 10                 │
+│  - Migration threshold: 5              │
+│  → COLD (ok to migrate, cache-cold)   │
+└────────────────────────────────────────┘
+
+
+6. Locking Protocol
+--------------------
+
+Migrating from CPU 1 to CPU 3:
+
+Lock Order (Lower CPU ID First):
+┌──────────────────┐         ┌──────────────────┐
+│ CPU 1 (lower)    │ LOCK 1  │ CPU 3 (higher)   │
+│  lock1           │ ──────→ │  lock3           │
+└──────────────────┘         └──────────────────┘
+        ↓                            ↓
+     LOCK FIRST                  LOCK SECOND
+
+This prevents deadlock:
+- CPU A migrating to CPU B locks A then B
+- CPU B migrating to CPU A locks A then B (same order!)
+- No circular dependency → No deadlock
+
+
+7. Statistics Tracking
+----------------------
+
+Global Counters:
+┌──────────────────────────────────────┐
+│ global_tick_count: 5000              │
+│ total_migrations: 75                 │
+│ total_steals: 12                     │
+└──────────────────────────────────────┘
+
+Per-CPU Stats:
+┌─────────┬─────────┬─────────┬─────────┐
+│ CPU 0   │ CPU 1   │ CPU 2   │ CPU 3   │
+├─────────┼─────────┼─────────┼─────────┤
+│ Load: 25│ Load: 25│ Load: 25│ Load: 25│
+│ Steal: 3│ Steal: 2│ Steal: 4│ Steal: 3│
+└─────────┴─────────┴─────────┴─────────┘
+
+
+8. Benchmark Flow
+-----------------
+
+Test Sequence:
+
+1. Create Processes
+   ┌─────────────────────────────────┐
+   │ Create 100 CPU-bound processes  │
+   │ All added to current CPU (0)    │
+   └─────────────────────────────────┘
+
+2. Initial State
+   ┌─────────┬─────────┬─────────┬─────────┐
+   │ CPU 0   │ CPU 1   │ CPU 2   │ CPU 3   │
+   │ 100     │ 0       │ 0       │ 0       │
+   └─────────┴─────────┴─────────┴─────────┘
+   Variance: HIGH (2500)
+
+3. Wait for Balancing (5 cycles × 50 ticks)
+   ┌─────────────────────────────────┐
+   │ Tick 50:  First balance         │
+   │ Tick 100: Second balance        │
+   │ Tick 150: Third balance         │
+   │ Tick 200: Fourth balance        │
+   │ Tick 250: Final balance         │
+   └─────────────────────────────────┘
+
+4. Final State
+   ┌─────────┬─────────┬─────────┬─────────┐
+   │ CPU 0   │ CPU 1   │ CPU 2   │ CPU 3   │
+   │ 25      │ 25      │ 25      │ 25      │
+   └─────────┴─────────┴─────────┴─────────┘
+   Variance: LOW (0)
+
+5. Verify Results
+   ✓ All processes accounted for: 100
+   ✓ Load imbalance: 0 (< threshold)
+   ✓ Variance improved: 2500 → 0
+   ✓ Test: PASSED
+
+
+9. Performance Comparison
+--------------------------
+
+Single Global Queue:
+┌────────────────────────────────────────┐
+│ Enqueue time: O(1) + GLOBAL LOCK       │
+│ Dequeue time: O(1) + GLOBAL LOCK       │
+│ Lock contention: HIGH (4 CPUs → 4x)    │
+│ Scalability: POOR (bottleneck)         │
+└────────────────────────────────────────┘
+
+Per-CPU Queues:
+┌────────────────────────────────────────┐
+│ Enqueue time: O(1) + PER-CPU LOCK      │
+│ Dequeue time: O(1) + PER-CPU LOCK      │
+│ Lock contention: LOW (mostly local)    │
+│ Scalability: EXCELLENT (linear)        │
+│ Migration overhead: ~1% (50 tick int.) │
+└────────────────────────────────────────┘
+
+Speedup:
+- 2 CPUs: ~1.9x (5% overhead)
+- 4 CPUs: ~3.8x (5% overhead)
+- 8 CPUs: ~7.6x (5% overhead)
+
+
+10. Integration Points
+----------------------
+
+Kernel Boot Sequence:
+┌──────────────────────────────────────┐
+│ 1. smp_init()                        │  ← Detect CPUs
+│    └→ Detect CPUs, bring up APs     │
+│                                      │
+│ 2. scheduler_init()                  │  ← Init per-CPU queues
+│    └→ Create per-CPU runqueues      │
+│                                      │
+│ 3. process_create()                  │  ← Create init
+│    └→ Add to CPU 0 runqueue         │
+│                                      │
+│ 4. scheduler_start()                 │  ← Start scheduling
+│    └→ Jump to userspace             │
+└──────────────────────────────────────┘
+
+Timer Interrupt:
+┌──────────────────────────────────────┐
+│ IRQ 0 (Timer)                        │
+│  ├─ pit_tick()                       │  ← Increment tick
+│  ├─ scheduler_tick()                 │  ← Load balance
+│  │   └→ Every 50 ticks: migrate     │
+│  └─ schedule()                       │  ← Context switch
+│      └→ pick_next() from local CPU  │
+└──────────────────────────────────────┘

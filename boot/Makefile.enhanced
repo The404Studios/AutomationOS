@@ -1,0 +1,132 @@
+# AutomationOS Boot System Makefile
+# Builds UEFI bootloader with boot menu, initrd support, and enhanced features
+
+# Toolchain
+CC = x86_64-elf-gcc
+LD = x86_64-elf-ld
+AS = nasm
+AR = x86_64-elf-ar
+
+# Directories
+BUILD_DIR = ../build
+OBJ_DIR = $(BUILD_DIR)/boot_obj
+
+# Compiler flags
+CFLAGS = -ffreestanding -fno-stack-protector -fno-pic -mno-red-zone \
+         -mno-mmx -mno-sse -mno-sse2 \
+         -Wall -Wextra -Werror \
+         -I. -I../kernel/include \
+         -O2 -g
+
+# Linker flags for UEFI PE executable
+LDFLAGS = -T boot.ld \
+          -nostdlib \
+          -znocombreloc \
+          -shared \
+          -Bsymbolic
+
+# Source files
+ASM_SRC = boot.asm
+C_SRC = loader.c \
+        boot_config.c \
+        menu.c \
+        elf.c \
+        paging.c \
+        bootloader_enhanced.c
+
+# Object files
+ASM_OBJ = $(OBJ_DIR)/boot.o
+C_OBJ = $(C_SRC:%.c=$(OBJ_DIR)/%.o)
+ALL_OBJ = $(ASM_OBJ) $(C_OBJ)
+
+# Output
+OUTPUT = $(BUILD_DIR)/BOOTX64.EFI
+
+# Phony targets
+.PHONY: all clean directories test
+
+# Default target
+all: directories $(OUTPUT)
+
+# Create directories
+directories:
+	@mkdir -p $(BUILD_DIR)
+	@mkdir -p $(OBJ_DIR)
+
+# Link bootloader
+$(OUTPUT): $(ALL_OBJ)
+	@echo "Linking UEFI bootloader..."
+	$(LD) $(LDFLAGS) -o $@ $^
+	@echo "Built: $@"
+
+# Compile assembly
+$(OBJ_DIR)/%.o: %.asm
+	@echo "Assembling $<..."
+	$(AS) -f elf64 -o $@ $<
+
+# Compile C sources
+$(OBJ_DIR)/%.o: %.c
+	@echo "Compiling $<..."
+	$(CC) $(CFLAGS) -c -o $@ $<
+
+# Clean build artifacts
+clean:
+	@echo "Cleaning boot system..."
+	rm -rf $(OBJ_DIR)
+	rm -f $(OUTPUT)
+
+# Test in QEMU
+test: $(OUTPUT)
+	@echo "Testing bootloader in QEMU..."
+	@echo "Note: Requires OVMF firmware and test disk image"
+	qemu-system-x86_64 \
+		-bios /usr/share/ovmf/OVMF.fd \
+		-drive file=../build/test.img,format=raw \
+		-m 2048 \
+		-serial stdio \
+		-vga std
+
+# Build with verbose output
+verbose: CFLAGS += -v
+verbose: all
+
+# Build debug version
+debug: CFLAGS += -DDEBUG -g3 -O0
+debug: all
+
+# Build optimized release
+release: CFLAGS += -O3 -DNDEBUG
+release: all
+
+# Show configuration
+info:
+	@echo "Boot System Build Configuration"
+	@echo "==============================="
+	@echo "CC:        $(CC)"
+	@echo "LD:        $(LD)"
+	@echo "AS:        $(AS)"
+	@echo "CFLAGS:    $(CFLAGS)"
+	@echo "LDFLAGS:   $(LDFLAGS)"
+	@echo "BUILD_DIR: $(BUILD_DIR)"
+	@echo "OUTPUT:    $(OUTPUT)"
+	@echo ""
+	@echo "Source Files:"
+	@echo "  Assembly: $(ASM_SRC)"
+	@echo "  C:        $(C_SRC)"
+	@echo ""
+	@echo "Targets:"
+	@echo "  make         - Build bootloader"
+	@echo "  make clean   - Clean build artifacts"
+	@echo "  make test    - Test in QEMU"
+	@echo "  make debug   - Build debug version"
+	@echo "  make release - Build optimized release"
+	@echo "  make info    - Show this information"
+
+# Dependencies (simplified - full version would use gcc -MM)
+$(OBJ_DIR)/boot.o: boot.asm
+$(OBJ_DIR)/loader.o: loader.c boot.h
+$(OBJ_DIR)/boot_config.o: boot_config.c boot_config.h boot_enhanced.h
+$(OBJ_DIR)/menu.o: menu.c boot_config.h boot_enhanced.h
+$(OBJ_DIR)/elf.o: elf.c boot_enhanced.h
+$(OBJ_DIR)/paging.o: paging.c boot_enhanced.h
+$(OBJ_DIR)/bootloader_enhanced.o: bootloader_enhanced.c boot_enhanced.h boot_config.h

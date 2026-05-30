@@ -1,0 +1,214 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version tag (e.g., v0.1.0)'
+        required: true
+
+env:
+  RELEASE_NAME: AutomationOS
+
+jobs:
+  create-release:
+    name: Create Release
+    runs-on: ubuntu-22.04
+    outputs:
+      upload_url: ${{ steps.create_release.outputs.upload_url }}
+      version: ${{ steps.get_version.outputs.version }}
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+
+    - name: Get version
+      id: get_version
+      run: |
+        if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+          echo "version=${{ github.event.inputs.version }}" >> $GITHUB_OUTPUT
+        else
+          echo "version=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+        fi
+
+    - name: Generate changelog
+      run: |
+        python3 scripts/generate-changelog.py \
+          --version ${{ steps.get_version.outputs.version }} \
+          --output RELEASE_NOTES.md
+
+    - name: Create Release
+      id: create_release
+      uses: actions/create-release@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        tag_name: ${{ steps.get_version.outputs.version }}
+        release_name: ${{ env.RELEASE_NAME }} ${{ steps.get_version.outputs.version }}
+        body_path: RELEASE_NOTES.md
+        draft: false
+        prerelease: ${{ contains(steps.get_version.outputs.version, 'alpha') || contains(steps.get_version.outputs.version, 'beta') || contains(steps.get_version.outputs.version, 'rc') }}
+
+  build-release:
+    name: Build Release (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    needs: create-release
+    strategy:
+      matrix:
+        os: [ubuntu-22.04, ubuntu-24.04, macos-latest]
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Setup build environment (Ubuntu)
+      if: startsWith(matrix.os, 'ubuntu')
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y build-essential nasm python3 qemu-system-x86 \
+          xorriso gcc-x86-64-elf binutils-x86-64-elf
+
+    - name: Setup build environment (macOS)
+      if: startsWith(matrix.os, 'macos')
+      run: |
+        brew update
+        brew install nasm python qemu xorriso
+        brew tap messense/macos-cross-toolchains
+        brew install x86_64-elf-gcc x86_64-elf-binutils
+
+    - name: Build release
+      run: |
+        make clean
+        RELEASE_BUILD=1 make all
+
+    - name: Run tests
+      run: make test
+
+    - name: Create release archive
+      run: |
+        VERSION="${{ needs.create-release.outputs.version }}"
+        PLATFORM="${{ matrix.os }}"
+
+        mkdir -p release
+        cp build/AutomationOS.iso release/
+        cp build/kernel.elf release/
+        cp README.md QUICKSTART.md CHANGELOG.md release/
+
+        cd release
+        tar -czf ../AutomationOS-${VERSION}-${PLATFORM}.tar.gz *
+        cd ..
+
+        # Also create a ZIP for Windows users
+        zip -r AutomationOS-${VERSION}-${PLATFORM}.zip release/*
+
+    - name: Calculate checksums
+      run: |
+        VERSION="${{ needs.create-release.outputs.version }}"
+        PLATFORM="${{ matrix.os }}"
+
+        sha256sum AutomationOS-${VERSION}-${PLATFORM}.tar.gz > AutomationOS-${VERSION}-${PLATFORM}.tar.gz.sha256
+        sha256sum AutomationOS-${VERSION}-${PLATFORM}.zip > AutomationOS-${VERSION}-${PLATFORM}.zip.sha256
+
+    - name: Sign release (if GPG key available)
+      if: env.GPG_PRIVATE_KEY != ''
+      env:
+        GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
+        GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
+      run: |
+        echo "$GPG_PRIVATE_KEY" | gpg --batch --import
+        VERSION="${{ needs.create-release.outputs.version }}"
+        PLATFORM="${{ matrix.os }}"
+
+        echo "$GPG_PASSPHRASE" | gpg --batch --yes --passphrase-fd 0 \
+          --detach-sign --armor AutomationOS-${VERSION}-${PLATFORM}.tar.gz
+
+    - name: Upload release assets
+      uses: actions/upload-release-asset@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        upload_url: ${{ needs.create-release.outputs.upload_url }}
+        asset_path: ./AutomationOS-${{ needs.create-release.outputs.version }}-${{ matrix.os }}.tar.gz
+        asset_name: AutomationOS-${{ needs.create-release.outputs.version }}-${{ matrix.os }}.tar.gz
+        asset_content_type: application/gzip
+
+    - name: Upload release assets (ZIP)
+      uses: actions/upload-release-asset@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        upload_url: ${{ needs.create-release.outputs.upload_url }}
+        asset_path: ./AutomationOS-${{ needs.create-release.outputs.version }}-${{ matrix.os }}.zip
+        asset_name: AutomationOS-${{ needs.create-release.outputs.version }}-${{ matrix.os }}.zip
+        asset_content_type: application/zip
+
+    - name: Upload checksums
+      uses: actions/upload-release-asset@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        upload_url: ${{ needs.create-release.outputs.upload_url }}
+        asset_path: ./AutomationOS-${{ needs.create-release.outputs.version }}-${{ matrix.os }}.tar.gz.sha256
+        asset_name: AutomationOS-${{ needs.create-release.outputs.version }}-${{ matrix.os }}.tar.gz.sha256
+        asset_content_type: text/plain
+
+    - name: Upload ISO (primary platform only)
+      if: matrix.os == 'ubuntu-22.04'
+      uses: actions/upload-release-asset@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        upload_url: ${{ needs.create-release.outputs.upload_url }}
+        asset_path: ./build/AutomationOS.iso
+        asset_name: AutomationOS-${{ needs.create-release.outputs.version }}.iso
+        asset_content_type: application/x-iso9660-image
+
+  publish-docker:
+    name: Publish Docker Image
+    runs-on: ubuntu-22.04
+    needs: [create-release, build-release]
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+
+    - name: Login to GitHub Container Registry
+      uses: docker/login-action@v3
+      with:
+        registry: ghcr.io
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Build and push Docker image
+      uses: docker/build-push-action@v5
+      with:
+        context: .
+        file: ./Dockerfile.build
+        push: true
+        tags: |
+          ghcr.io/${{ github.repository }}/build:latest
+          ghcr.io/${{ github.repository }}/build:${{ needs.create-release.outputs.version }}
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
+
+  notify:
+    name: Notify Release
+    runs-on: ubuntu-latest
+    needs: [create-release, build-release, publish-docker]
+    if: always()
+
+    steps:
+    - name: Send notification
+      run: |
+        echo "Release ${{ needs.create-release.outputs.version }} created"
+        echo "Status:"
+        echo "  - Build: ${{ needs.build-release.result }}"
+        echo "  - Docker: ${{ needs.publish-docker.result }}"

@@ -1,0 +1,82 @@
+%% AutomationOS Process State Machine
+%% Mermaid State Diagram
+
+stateDiagram-v2
+    [*] --> CREATED: process_create()
+
+    CREATED --> READY: scheduler_add_process()
+    note right of CREATED
+        Process just created
+        • PCB allocated
+        • Stack allocated
+        • Page tables setup
+        • Not yet scheduled
+    end note
+
+    READY --> RUNNING: schedule() selects process
+    note right of READY
+        Ready to run
+        • In scheduler queue
+        • Waiting for CPU time
+        • Context saved
+    end note
+
+    RUNNING --> READY: Time slice expired (timer IRQ)
+    RUNNING --> BLOCKED: I/O request or sleep()
+    RUNNING --> TERMINATED: exit() syscall
+    note right of RUNNING
+        Currently executing
+        • Has CPU time
+        • Running on core
+        • time_slice > 0
+    end note
+
+    BLOCKED --> READY: I/O complete or wakeup
+    note right of BLOCKED
+        Waiting for event
+        • I/O operation
+        • Sleep timeout
+        • Signal from another process
+        • Not in scheduler queue
+    end note
+
+    TERMINATED --> [*]: process_destroy()
+    note right of TERMINATED
+        Zombie state
+        • Exit status saved
+        • Waiting for parent wait()
+        • Resources not yet freed
+        • PCB kept for parent
+    end note
+
+    %% State transitions with detailed labels
+    state RUNNING {
+        [*] --> ExecutingUser: From READY
+        ExecutingUser --> ExecutingKernel: syscall/interrupt
+        ExecutingKernel --> ExecutingUser: return to userspace
+    }
+
+    state BLOCKED {
+        [*] --> WaitingIO: I/O request
+        [*] --> Sleeping: sleep() syscall
+        [*] --> WaitingChild: waitpid() syscall
+        WaitingIO --> [*]: I/O complete
+        Sleeping --> [*]: Timer wakeup
+        WaitingChild --> [*]: Child exits
+    }
+
+    %% Annotations
+    note left of RUNNING
+        Preemption points:
+        • Timer interrupt (every 1ms)
+        • Voluntary yield()
+        • Higher priority process
+    end note
+
+    note left of BLOCKED
+        Blocking operations:
+        • read() on empty buffer
+        • write() on full buffer
+        • sleep() syscall
+        • waitpid() on running child
+    end note

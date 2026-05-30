@@ -1,0 +1,72 @@
+# Makefile for SMP Test Suite
+# ===========================
+
+CC = gcc
+CFLAGS = -std=c11 -Wall -Wextra -O2 -g
+CFLAGS += -m64 -mcmodel=kernel -mno-red-zone -mno-mmx -mno-sse -mno-sse2
+CFLAGS += -ffreestanding -fno-pic -fno-pie -fno-stack-protector
+CFLAGS += -I../kernel/include
+
+LDFLAGS = -nostdlib -static
+LDFLAGS += -Wl,--build-id=none -Wl,-z,max-page-size=0x1000
+
+# Source files
+SMP_TEST_SRC = test_smp.c
+KERNEL_SRCS = \
+	../kernel/arch/x86_64/smp.c \
+	../kernel/arch/x86_64/lapic.c \
+	../kernel/arch/x86_64/ipi.c \
+	../kernel/acpi/acpi.c \
+	../kernel/lib/string.c
+
+OBJS = $(SMP_TEST_SRC:.c=.o) $(KERNEL_SRCS:.c=.o)
+
+# Targets
+.PHONY: all clean test
+
+all: test_smp
+
+test_smp: $(OBJS)
+	$(CC) $(LDFLAGS) -o $@ $^
+
+%.o: %.c
+	$(CC) $(CFLAGS) -c -o $@ $<
+
+test: test_smp
+	qemu-system-x86_64 \
+		-kernel test_smp \
+		-smp cpus=4 \
+		-m 512M \
+		-serial stdio \
+		-display none
+
+test-8cpu: test_smp
+	qemu-system-x86_64 \
+		-kernel test_smp \
+		-smp cpus=8 \
+		-m 1G \
+		-serial stdio \
+		-display none
+
+test-16cpu: test_smp
+	qemu-system-x86_64 \
+		-kernel test_smp \
+		-smp cpus=16 \
+		-m 2G \
+		-serial stdio \
+		-display none
+
+clean:
+	rm -f $(OBJS) test_smp
+
+# Help
+help:
+	@echo "SMP Test Suite Makefile"
+	@echo ""
+	@echo "Targets:"
+	@echo "  all        - Build test suite"
+	@echo "  test       - Run tests with 4 CPUs in QEMU"
+	@echo "  test-8cpu  - Run tests with 8 CPUs in QEMU"
+	@echo "  test-16cpu - Run tests with 16 CPUs in QEMU"
+	@echo "  clean      - Clean build artifacts"
+	@echo "  help       - Show this help"

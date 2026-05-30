@@ -1,0 +1,283 @@
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                     NAMESPACE ISOLATION ARCHITECTURE                         │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                              KERNEL SPACE                                    │
+│                                                                              │
+│  ┌────────────────────────────────────────────────────────────────┐         │
+│  │                    Root Namespace Container                     │         │
+│  │  ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌──────┐│         │
+│  │  │ PID NS 0 │ │Mount NS 0│ │ Net NS 0 │ │ IPC NS 0 │ │UTS 0 ││         │
+│  │  │ level: 0 │ │root: "/" │ │(global)  │ │(global)  │ │host  ││         │
+│  │  └──────────┘ └──────────┘ └──────────┘ └──────────┘ └──────┘│         │
+│  └────────────────────────────────────────────────────────────────┘         │
+│         ▲                    ▲                    ▲                          │
+│         │                    │                    │                          │
+│         │ shares             │ shares             │ shares                   │
+│         │                    │                    │                          │
+│  ┌──────┴──────┐     ┌───────┴────────┐   ┌──────┴───────┐                │
+│  │  Process 1  │     │   Container 1   │   │ Container 2  │                │
+│  │  (init)     │     │  (web-server)   │   │  (database)  │                │
+│  │             │     │                 │   │              │                │
+│  │ PID: 1      │     │ ┌─────────────┐│   │┌────────────┐│                │
+│  │ Namespaces: │     │ │  PID NS 1   ││   ││ PID NS 2   ││                │
+│  │ - PID: 0    │     │ │  level: 1   ││   ││ level: 1   ││                │
+│  │ - Mount: 0  │     │ │  parent: 0  ││   ││ parent: 0  ││                │
+│  │ - Net: 0    │     │ └─────────────┘│   │└────────────┘│                │
+│  │ - IPC: 0    │     │ ┌─────────────┐│   │┌────────────┐│                │
+│  │ - UTS: 0    │     │ │ Mount NS 0  ││   ││ Mount NS 0 ││                │
+│  └─────────────┘     │ │ (shared)    ││   ││ (shared)   ││                │
+│                      │ └─────────────┘│   │└────────────┘│                │
+│                      │ ┌─────────────┐│   │┌────────────┐│                │
+│                      │ │  Net NS 0   ││   ││ Net NS 3   ││                │
+│                      │ │  (shared)   ││   ││ (isolated) ││                │
+│                      │ └─────────────┘│   │└────────────┘│                │
+│                      │ ┌─────────────┐│   │┌────────────┐│                │
+│                      │ │  IPC NS 0   ││   ││ IPC NS 0   ││                │
+│                      │ │  (shared)   ││   ││ (shared)   ││                │
+│                      │ └─────────────┘│   │└────────────┘│                │
+│                      │ ┌─────────────┐│   │┌────────────┐│                │
+│                      │ │  UTS NS 4   ││   ││ UTS NS 5   ││                │
+│                      │ │"web-server" ││   ││ "database" ││                │
+│                      │ └─────────────┘│   │└────────────┘│                │
+│                      └─────────────────┘   └──────────────┘                │
+│                               │                     │                       │
+│                               │                     │                       │
+│                      ┌────────▼─────────┐           │                      │
+│                      │ Nested Container │           │                      │
+│                      │  (inside C1)     │           │                      │
+│                      │ ┌──────────────┐ │           │                      │
+│                      │ │  PID NS 6    │ │           │                      │
+│                      │ │  level: 2    │ │           │                      │
+│                      │ │  parent: 1   │ │           │                      │
+│                      │ └──────────────┘ │           │                      │
+│                      │ (inherits other  │           │                      │
+│                      │  NS from C1)     │           │                      │
+│                      └──────────────────┘           │                      │
+│                                                      │                      │
+└──────────────────────────────────────────────────────┼──────────────────────┘
+                                                       │
+┌──────────────────────────────────────────────────────┼──────────────────────┐
+│                              USER SPACE               │                      │
+│                                                       │                      │
+│  ┌─────────────┐         ┌─────────────┐      ┌─────▼─────┐               │
+│  │ Process 1   │         │ Container 1  │      │Container 2│               │
+│  │ (init)      │         │ Process      │      │ Process   │               │
+│  │             │         │              │      │           │               │
+│  │ Sees:       │         │ Sees:        │      │ Sees:     │               │
+│  │ - All PIDs  │         │ - PID 1      │      │ - PID 1   │               │
+│  │ - Host      │         │ - Hostname:  │      │ - Hostname│               │
+│  │   hostname  │         │  "web-server"│      │ "database"│               │
+│  │ - Global    │         │ - Shared net │      │ - Own net │               │
+│  │   network   │         │              │      │   stack   │               │
+│  └─────────────┘         └──────────────┘      └───────────┘               │
+│                                                                              │
+└──────────────────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                           PID TRANSLATION EXAMPLE                            │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  Host (PID NS 0):                                                           │
+│  ┌─────┬──────────────┬─────────────┐                                      │
+│  │ PID │ Process Name │ Namespace   │                                      │
+│  ├─────┼──────────────┼─────────────┤                                      │
+│  │  1  │ init         │ Root (0)    │                                      │
+│  │ 157 │ container1   │ Container 1 │ ◄─── Same process, different PID!   │
+│  │ 158 │ web_app      │ Container 1 │                                      │
+│  │ 201 │ container2   │ Container 2 │                                      │
+│  └─────┴──────────────┴─────────────┘                                      │
+│                                                                              │
+│  Container 1 View (PID NS 1):                                               │
+│  ┌─────┬──────────────┬─────────────┐                                      │
+│  │ PID │ Process Name │ Note        │                                      │
+│  ├─────┼──────────────┼─────────────┤                                      │
+│  │  1  │ container1   │ Init in C1  │ ◄─── Host PID 157                   │
+│  │  2  │ web_app      │ Child       │ ◄─── Host PID 158                   │
+│  └─────┴──────────────┴─────────────┘                                      │
+│                                                                              │
+│  Container 2 View (PID NS 2):                                               │
+│  ┌─────┬──────────────┬─────────────┐                                      │
+│  │ PID │ Process Name │ Note        │                                      │
+│  ├─────┼──────────────┼─────────────┤                                      │
+│  │  1  │ container2   │ Init in C2  │ ◄─── Host PID 201                   │
+│  └─────┴──────────────┴─────────────┘                                      │
+│                                                                              │
+│  Translation:                                                                │
+│  - Container 1 PID 1 → Host PID 157                                         │
+│  - Host PID 158 → Container 1 PID 2                                         │
+│  - Container 2 PID 1 → Host PID 201                                         │
+│  - Host PID 157 → Container 2: NOT VISIBLE (different namespace)            │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                        REFERENCE COUNTING EXAMPLE                            │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  Initial State (after namespace_init):                                      │
+│  ┌──────────────┬──────────────┐                                           │
+│  │ Namespace    │  ref_count   │                                           │
+│  ├──────────────┼──────────────┤                                           │
+│  │ PID NS 0     │      1       │  (root container)                         │
+│  │ Mount NS 0   │      1       │                                           │
+│  │ Net NS 0     │      1       │                                           │
+│  │ IPC NS 0     │      1       │                                           │
+│  │ UTS NS 0     │      1       │                                           │
+│  └──────────────┴──────────────┘                                           │
+│                                                                              │
+│  After creating Process 1 (shares all namespaces):                          │
+│  ┌──────────────┬──────────────┐                                           │
+│  │ Namespace    │  ref_count   │                                           │
+│  ├──────────────┼──────────────┤                                           │
+│  │ PID NS 0     │      2       │  (root + process 1)                       │
+│  │ Mount NS 0   │      2       │                                           │
+│  │ Net NS 0     │      2       │                                           │
+│  │ IPC NS 0     │      2       │                                           │
+│  │ UTS NS 0     │      2       │                                           │
+│  └──────────────┴──────────────┘                                           │
+│                                                                              │
+│  After creating Container 1 (CLONE_NEWPID | CLONE_NEWUTS):                 │
+│  ┌──────────────┬──────────────┐                                           │
+│  │ Namespace    │  ref_count   │                                           │
+│  ├──────────────┼──────────────┤                                           │
+│  │ PID NS 0     │      2       │  (root + process 1)                       │
+│  │ PID NS 1     │      1       │  (container 1) ◄── NEW!                   │
+│  │ Mount NS 0   │      3       │  (root + p1 + c1) SHARED                  │
+│  │ Net NS 0     │      3       │  SHARED                                   │
+│  │ IPC NS 0     │      3       │  SHARED                                   │
+│  │ UTS NS 0     │      2       │  (root + p1)                              │
+│  │ UTS NS 4     │      1       │  (container 1) ◄── NEW!                   │
+│  └──────────────┴──────────────┘                                           │
+│                                                                              │
+│  After destroying Container 1:                                              │
+│  ┌──────────────┬──────────────┐                                           │
+│  │ Namespace    │  ref_count   │                                           │
+│  ├──────────────┼──────────────┤                                           │
+│  │ PID NS 0     │      2       │  (root + process 1)                       │
+│  │ PID NS 1     │      0       │  ◄── DESTROYED                            │
+│  │ Mount NS 0   │      2       │  (root + p1)                              │
+│  │ Net NS 0     │      2       │                                           │
+│  │ IPC NS 0     │      2       │                                           │
+│  │ UTS NS 0     │      2       │  (root + p1)                              │
+│  │ UTS NS 4     │      0       │  ◄── DESTROYED                            │
+│  └──────────────┴──────────────┘                                           │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                           NAMESPACE CLONING FLAGS                            │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  namespace_clone_container(parent, flags):                                  │
+│                                                                              │
+│  flags = 0 (share all):                                                     │
+│  ┌─────────────────────────────────────────────────────────┐               │
+│  │ Parent NS  →  Child NS     Action                       │               │
+│  ├─────────────────────────────────────────────────────────┤               │
+│  │ PID NS 0   →  PID NS 0     Share (ref_count++)          │               │
+│  │ Mount NS 0 →  Mount NS 0   Share                        │               │
+│  │ Net NS 0   →  Net NS 0     Share                        │               │
+│  │ IPC NS 0   →  IPC NS 0     Share                        │               │
+│  │ UTS NS 0   →  UTS NS 0     Share                        │               │
+│  └─────────────────────────────────────────────────────────┘               │
+│                                                                              │
+│  flags = CLONE_NEWPID | CLONE_NEWUTS:                                       │
+│  ┌─────────────────────────────────────────────────────────┐               │
+│  │ Parent NS  →  Child NS     Action                       │               │
+│  ├─────────────────────────────────────────────────────────┤               │
+│  │ PID NS 0   →  PID NS 1     Create NEW (parent=0)        │               │
+│  │ Mount NS 0 →  Mount NS 0   Share                        │               │
+│  │ Net NS 0   →  Net NS 0     Share                        │               │
+│  │ IPC NS 0   →  IPC NS 0     Share                        │               │
+│  │ UTS NS 0   →  UTS NS 4     Create NEW (copy hostname)   │               │
+│  └─────────────────────────────────────────────────────────┘               │
+│                                                                              │
+│  flags = CLONE_NEWPID | CLONE_NEWMOUNT | CLONE_NEWNET |                    │
+│          CLONE_NEWIPC | CLONE_NEWUTS (full isolation):                      │
+│  ┌─────────────────────────────────────────────────────────┐               │
+│  │ Parent NS  →  Child NS     Action                       │               │
+│  ├─────────────────────────────────────────────────────────┤               │
+│  │ PID NS 0   →  PID NS 1     Create NEW                   │               │
+│  │ Mount NS 0 →  Mount NS 2   Create NEW (clone mounts)    │               │
+│  │ Net NS 0   →  Net NS 3     Create NEW (empty stack)     │               │
+│  │ IPC NS 0   →  IPC NS 4     Create NEW (empty IPC)       │               │
+│  │ UTS NS 0   →  UTS NS 5     Create NEW (copy hostname)   │               │
+│  └─────────────────────────────────────────────────────────┘               │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                      DATA STRUCTURE RELATIONSHIPS                            │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  process_t                                                                   │
+│  ┌────────────────────────────────────────┐                                │
+│  │ pid: 157                               │                                │
+│  │ parent_pid: 1                          │                                │
+│  │ state: PROCESS_RUNNING                 │                                │
+│  │ context: (CPU registers)               │                                │
+│  │ kernel_stack: 0xFFFF...                │                                │
+│  │ user_stack: NULL                       │                                │
+│  │ name: "container1"                     │                                │
+│  │ ref_count: 1                           │                                │
+│  │                                        │                                │
+│  │ namespaces ────────────────────────┐  │                                │
+│  │ sandbox_flags: 0                    │  │                                │
+│  └─────────────────────────────────────┼──┘                                │
+│                                        │                                    │
+│                                        ▼                                    │
+│  namespace_container_t                                                      │
+│  ┌─────────────────────────────────────────┐                               │
+│  │ pid_ns ──────►│ pid_namespace_t        │                               │
+│  │               │ ┌───────────────────────┤                               │
+│  │               │ │ id: 1                 │                               │
+│  │               │ │ next_pid: 3           │                               │
+│  │               │ │ process_table[1024]   │                               │
+│  │               │ │ process_count: 2      │                               │
+│  │               │ │ parent: (PID NS 0)    │                               │
+│  │               │ │ ref_count: 1          │                               │
+│  │               │ │ level: 1              │                               │
+│  │               │ └───────────────────────┘                               │
+│  │                                                                          │
+│  │ mount_ns ─────►│ mount_namespace_t      │                              │
+│  │ (shared)       │ ┌───────────────────────┤                             │
+│  │                │ │ id: 0                 │                              │
+│  │                │ │ mounts: (mount table) │                              │
+│  │                │ │ root_path: "/"        │                              │
+│  │                │ │ flags: PRIVATE        │                              │
+│  │                │ │ ref_count: 3          │                              │
+│  │                │ └───────────────────────┘                              │
+│  │                                                                          │
+│  │ net_ns ───────►│ net_namespace_t        │                              │
+│  │ (shared)       │ ┌───────────────────────┤                             │
+│  │                │ │ id: 0                 │                              │
+│  │                │ │ stack: (net stack)    │                              │
+│  │                │ │ ref_count: 3          │                              │
+│  │                │ └───────────────────────┘                              │
+│  │                                                                          │
+│  │ ipc_ns ───────►│ ipc_namespace_t        │                              │
+│  │ (shared)       │ ┌───────────────────────┤                             │
+│  │                │ │ id: 0                 │                              │
+│  │                │ │ table: (IPC table)    │                              │
+│  │                │ │ ref_count: 3          │                              │
+│  │                │ └───────────────────────┘                              │
+│  │                                                                          │
+│  │ uts_ns ───────►│ uts_namespace_t        │                              │
+│  │                │ ┌───────────────────────┤                             │
+│  │                │ │ id: 4                 │                              │
+│  │                │ │ hostname: "web-server"│                              │
+│  │                │ │ domainname: "local"   │                              │
+│  │                │ │ ref_count: 1          │                              │
+│  │                │ └───────────────────────┘                              │
+│  └──────────────────────────────────────────┘                              │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+Legend:
+  ──► Points to (pointer)
+  ◄── Indicates direction or relationship
+  (shared) - Multiple processes share this namespace
+  NEW! - Newly created namespace
+  DESTROYED - Namespace cleaned up when ref_count reaches 0

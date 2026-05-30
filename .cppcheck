@@ -1,0 +1,40 @@
+# Cppcheck Configuration for AutomationOS
+#
+# Suppression rules for false positives and kernel-specific patterns
+
+# Suppress missing includes (we use cross-compiler includes)
+missingInclude
+
+# Suppress unused function warnings (may be used by assembly or external)
+unusedFunction
+
+# Kernel-specific suppressions
+unmatchedSuppression
+
+# Allow inline assembly (common in kernel code)
+inlineAssembly
+
+# Suppress style checks (too opinionated for kernel code)
+variableScope
+unreadVariable
+
+# Platform-specific: we know we're targeting x86_64
+ConfigurationNotChecked
+
+# Allow intentional null pointer arithmetic (physical memory mapping)
+nullPointerArithmetic:kernel/arch/x86_64/paging.c
+
+# Intentional infinite loops (kernel main loop, scheduler)
+infiniteLoop:kernel/kernel.c
+infiniteLoop:kernel/core/sched/scheduler.c
+
+# Known false positive: this variable is initialized by inline assembly
+uninitvar:kernel/arch/x86_64/gdt.c:*
+uninitvar:kernel/arch/x86_64/idt.c:*
+
+# Physical memory management intentionally uses pointer arithmetic
+pointerArithmeticBool:kernel/core/mem/pmm.c
+pointerArithmeticBool:kernel/core/mem/vmm.c
+
+# Memory-mapped I/O requires volatile
+redundantAssignment:kernel/drivers/*.c

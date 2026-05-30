@@ -1,0 +1,123 @@
+# Makefile for AutomationOS Framebuffer Compositor
+# Builds software rendering compositor
+
+CC = gcc
+CFLAGS = -Wall -Wextra -O2 -std=gnu11 -g
+LDFLAGS = -lpthread
+
+BUILD_DIR = ../../build/userspace/compositor
+OBJ_DIR = $(BUILD_DIR)/obj
+
+# Source files
+SOURCES = fb_compositor.c \
+          composition.c \
+          blit.c \
+          damage.c \
+          window.c \
+          ipc.c \
+          compositor_main.c \
+          fb.c
+
+OBJECTS = $(patsubst %.c,$(OBJ_DIR)/%.o,$(SOURCES))
+
+# Target binaries
+TARGET = $(BUILD_DIR)/fb_compositor
+TEST_VSYNC = $(BUILD_DIR)/test_vsync_benchmark
+DEMO_DOUBLE_BUFFER = $(BUILD_DIR)/demo_double_buffer
+
+# Test source files
+TEST_VSYNC_SOURCES = test_vsync_benchmark.c \
+                     fb_compositor.c \
+                     composition.c \
+                     blit.c \
+                     damage.c \
+                     window.c \
+                     fb.c
+
+DEMO_SOURCES = demo_double_buffer.c \
+               fb_compositor.c \
+               composition.c \
+               blit.c \
+               damage.c \
+               window.c \
+               fb.c
+
+TEST_VSYNC_OBJECTS = $(patsubst %.c,$(OBJ_DIR)/test_%.o,$(TEST_VSYNC_SOURCES))
+DEMO_OBJECTS = $(patsubst %.c,$(OBJ_DIR)/demo_%.o,$(DEMO_SOURCES))
+
+.PHONY: all clean test tests demos
+
+all: $(TARGET)
+
+tests: $(TEST_VSYNC)
+
+demos: $(DEMO_DOUBLE_BUFFER)
+
+$(TARGET): $(OBJECTS) | $(BUILD_DIR)
+	@echo "Linking $@"
+	$(CC) $(OBJECTS) -o $@ $(LDFLAGS)
+	@echo "Built: $@"
+
+$(OBJ_DIR)/%.o: %.c | $(OBJ_DIR)
+	@echo "Compiling $<"
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(BUILD_DIR):
+	mkdir -p $(BUILD_DIR)
+
+$(OBJ_DIR):
+	mkdir -p $(OBJ_DIR)
+
+$(TEST_VSYNC): test_vsync_benchmark.c fb_compositor.c composition.c blit.c damage.c window.c fb.c | $(BUILD_DIR)
+	@echo "Building VSync benchmark..."
+	$(CC) $(CFLAGS) $^ -o $@ $(LDFLAGS) -lm
+	@echo "Built: $@"
+
+$(DEMO_DOUBLE_BUFFER): demo_double_buffer.c fb_compositor.c composition.c blit.c damage.c window.c fb.c | $(BUILD_DIR)
+	@echo "Building double-buffer demo..."
+	$(CC) $(CFLAGS) $^ -o $@ $(LDFLAGS) -lm
+	@echo "Built: $@"
+
+clean:
+	rm -rf $(OBJ_DIR) $(TARGET) $(TEST_VSYNC) $(DEMO_DOUBLE_BUFFER)
+	@echo "Clean complete"
+
+# Test target: build and run
+test: $(TARGET)
+	@echo "Running compositor..."
+	$(TARGET)
+
+# Run VSync benchmark
+test-vsync: $(TEST_VSYNC)
+	@echo "Running VSync benchmark..."
+	$(TEST_VSYNC)
+
+# Run double-buffer demo (with VSync)
+demo-vsync: $(DEMO_DOUBLE_BUFFER)
+	@echo "Running double-buffer demo (VSync ON)..."
+	$(DEMO_DOUBLE_BUFFER) vsync
+
+# Run double-buffer demo (without VSync - for comparison)
+demo-no-vsync: $(DEMO_DOUBLE_BUFFER)
+	@echo "Running double-buffer demo (VSync OFF)..."
+	$(DEMO_DOUBLE_BUFFER) no-vsync
+
+# Debug build
+debug: CFLAGS += -DDEBUG -g3 -O0
+debug: clean $(TARGET)
+
+.PHONY: help
+help:
+	@echo "AutomationOS Framebuffer Compositor Build System"
+	@echo ""
+	@echo "Targets:"
+	@echo "  all              - Build compositor (default)"
+	@echo "  tests            - Build VSync benchmark"
+	@echo "  demos            - Build double-buffer demo"
+	@echo "  clean            - Remove build artifacts"
+	@echo "  test             - Build and run compositor"
+	@echo "  test-vsync       - Run VSync benchmark"
+	@echo "  demo-vsync       - Run double-buffer demo (VSync ON)"
+	@echo "  demo-no-vsync    - Run double-buffer demo (VSync OFF)"
+	@echo "  debug            - Build with debug symbols"
+	@echo "  help             - Show this help"

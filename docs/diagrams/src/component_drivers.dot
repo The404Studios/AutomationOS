@@ -1,0 +1,196 @@
+// AutomationOS Driver Architecture
+// Graphviz DOT format
+
+digraph DriverArchitecture {
+    rankdir=TB;
+    node [shape=component, fontname="Arial", style="filled"];
+    graph [fontname="Arial", fontsize=12];
+    edge [fontname="Arial"];
+
+    // Driver layer
+    subgraph cluster_drivers {
+        label="Device Drivers";
+        style=filled;
+        fillcolor="#E8F5E9";
+
+        // Serial driver
+        subgraph cluster_serial {
+            label="Serial Console Driver (serial.c)";
+            style=filled;
+            fillcolor="#C8E6C9";
+
+            serial_init [label="serial_init()\nInitialize COM1", fillcolor="#81C784"];
+            serial_write [label="serial_write()\nWrite to port", fillcolor="#81C784"];
+            serial_read [label="serial_read()\nRead from port", fillcolor="#81C784"];
+
+            serial_port [label="COM1 Ports\n0x3F8 (data)\n0x3F9 (interrupt)\n0x3FA (FIFO)\n0x3FB (line control)\n0x3FC (modem control)\n0x3FD (line status)\n0x3FE (modem status)", shape=cylinder, fillcolor="#A5D6A7"];
+        }
+
+        // Timer driver
+        subgraph cluster_pit {
+            label="Timer Driver (pit.c)";
+            style=filled;
+            fillcolor="#FFF9C4";
+
+            pit_init [label="pit_init()\nConfigure PIT", fillcolor="#FFF59D"];
+            pit_set_freq [label="pit_set_frequency()\nSet tick rate", fillcolor="#FFF59D"];
+            pit_handler [label="pit_interrupt_handler()\nTimer IRQ", fillcolor="#FFF59D"];
+
+            pit_ports [label="PIT Ports\n0x40 (channel 0)\n0x41 (channel 1)\n0x42 (channel 2)\n0x43 (command)", shape=cylinder, fillcolor="#FFF9C4"];
+            pit_config [label="Configuration\nChannel 0: 1000 Hz\nMode 3: Square wave\nDivisor: 1193182/1000", shape=note, fillcolor="#FFF9C4"];
+        }
+
+        // PS/2 driver
+        subgraph cluster_ps2 {
+            label="PS/2 Keyboard Driver (ps2.c)";
+            style=filled;
+            fillcolor="#E1BEE7";
+
+            ps2_init [label="ps2_init()\nInitialize controller", fillcolor="#CE93D8"];
+            ps2_handler [label="ps2_interrupt_handler()\nKeyboard IRQ", fillcolor="#CE93D8"];
+            ps2_read [label="ps2_read_scancode()\nRead scan code", fillcolor="#CE93D8"];
+            ps2_translate [label="scancode_to_ascii()\nTranslate to ASCII", fillcolor="#CE93D8"];
+
+            ps2_ports [label="PS/2 Ports\n0x60 (data)\n0x64 (status/command)", shape=cylinder, fillcolor="#E1BEE7"];
+        }
+
+        // Framebuffer driver
+        subgraph cluster_fb {
+            label="Framebuffer Driver (framebuffer.c)";
+            style=filled;
+            fillcolor="#BBDEFB";
+
+            fb_init [label="fb_init()\nInitialize display", fillcolor="#90CAF9"];
+            fb_putchar [label="fb_putchar()\nDraw character", fillcolor="#90CAF9"];
+            fb_clear [label="fb_clear()\nClear screen", fillcolor="#90CAF9"];
+            fb_scroll [label="fb_scroll()\nScroll up", fillcolor="#90CAF9"];
+
+            fb_info [label="Framebuffer Info\nAddress: from UEFI GOP\nWidth: pixels\nHeight: pixels\nPitch: bytes per row\nFormat: RGB/BGR", shape=note, fillcolor="#BBDEFB"];
+        }
+    }
+
+    // Common driver interface
+    subgraph cluster_driver_common {
+        label="Driver Interface (drivers.h)";
+        style=filled;
+        fillcolor="#FFE0B2";
+
+        driver_interface [label="Driver Interface\ndriver_init_t\ndriver_read_t\ndriver_write_t\ndriver_ioctl_t", shape=folder, fillcolor="#FFB74D"];
+    }
+
+    // Interrupt controller
+    subgraph cluster_pic {
+        label="PIC (8259A)";
+        style=filled;
+        fillcolor="#FFCCBC";
+
+        pic_init [label="pic_init()\nRemap IRQs", fillcolor="#FF8A65"];
+        pic_eoi [label="pic_send_eoi()\nEnd of interrupt", fillcolor="#FF8A65"];
+        pic_mask [label="pic_set_mask()\nEnable/disable IRQ", fillcolor="#FF8A65"];
+
+        pic_ports [label="PIC Ports\nMaster: 0x20, 0x21\nSlave: 0xA0, 0xA1", shape=cylinder, fillcolor="#FF8A65"];
+        pic_irq_map [label="IRQ Mapping\nIRQ 0 → PIT (timer)\nIRQ 1 → PS/2 keyboard\nIRQ 3 → COM2 (serial)\nIRQ 4 → COM1 (serial)\nIRQ 12 → PS/2 mouse", shape=note, fillcolor="#FFCCBC"];
+    }
+
+    // IDT
+    idt [label="IDT\n(Interrupt Descriptor Table)", shape=cylinder, fillcolor="#CFD8DC"];
+
+    // Hardware
+    hardware [label="Hardware Devices\nUART, PIT, PS/2, VGA", shape=box3d, fillcolor="#B0BEC5"];
+
+    // Kernel subsystems
+    kernel [label="Kernel Subsystems\n(syscall handlers, scheduler)", shape=ellipse, fillcolor="#64B5F6"];
+
+    // Dependencies
+
+    // Driver initialization
+    driver_interface -> serial_init [style=dashed, label="implements"];
+    driver_interface -> pit_init [style=dashed];
+    driver_interface -> ps2_init [style=dashed];
+    driver_interface -> fb_init [style=dashed];
+
+    // Serial driver
+    serial_init -> serial_port [label="configure"];
+    serial_write -> serial_port [label="outb"];
+    serial_read -> serial_port [label="inb"];
+    kernel -> serial_write [label="console output"];
+
+    // Timer driver
+    pit_init -> pit_config [label="apply"];
+    pit_init -> pit_ports [label="configure"];
+    pit_set_freq -> pit_ports [label="write divisor"];
+    pit_handler -> pic_eoi [label="send EOI"];
+    hardware -> pit_handler [label="IRQ 0", style=dashed];
+    pit_handler -> kernel [label="schedule()"];
+
+    // PS/2 driver
+    ps2_init -> ps2_ports [label="configure"];
+    ps2_handler -> ps2_ports [label="read scancode"];
+    ps2_handler -> ps2_read;
+    ps2_read -> ps2_translate [label="raw scancode"];
+    ps2_translate -> kernel [label="ASCII char"];
+    ps2_handler -> pic_eoi [label="send EOI"];
+    hardware -> ps2_handler [label="IRQ 1", style=dashed];
+
+    // Framebuffer driver
+    fb_init -> fb_info [label="get from UEFI"];
+    fb_putchar -> fb_info [label="read address"];
+    fb_clear -> fb_info [label="fill buffer"];
+    kernel -> fb_putchar [label="console output"];
+
+    // PIC
+    pic_init -> pic_irq_map [label="remap"];
+    pic_init -> pic_ports [label="configure"];
+    pic_mask -> pic_ports [label="set IMR"];
+    pic_eoi -> pic_ports [label="write EOI"];
+
+    // IDT registration
+    pit_handler -> idt [label="register", dir=back];
+    ps2_handler -> idt [label="register", dir=back];
+    idt -> pic_init [label="vectors 32-47", style=dashed];
+
+    // Hardware connections
+    serial_port -> hardware [dir=back];
+    pit_ports -> hardware [dir=back];
+    ps2_ports -> hardware [dir=back];
+    fb_info -> hardware [dir=back, label="MMIO"];
+    pic_ports -> hardware [dir=back];
+
+    // Port I/O
+    port_io [shape=note, label="Port I/O Instructions:\n\
+• outb(port, value): Write byte\n\
+• inb(port): Read byte\n\
+• outw(port, value): Write word\n\
+• inw(port): Read word\n\
+\n\
+Memory-Mapped I/O:\n\
+• Framebuffer: Direct memory access\n\
+• Write to framebuffer address\n\
+• No port I/O required", fillcolor="#E3F2FD"];
+
+    irq_flow [shape=note, label="IRQ Handling Flow:\n\
+1. Device raises IRQ signal\n\
+2. PIC sends INTR to CPU\n\
+3. CPU looks up IDT entry\n\
+4. Jump to ISR handler\n\
+5. Handler reads device port\n\
+6. Process data\n\
+7. Send EOI to PIC\n\
+8. Return from interrupt", fillcolor="#FFE0B2"];
+
+    {rank=same; port_io; irq_flow;}
+
+    // Legend
+    subgraph cluster_legend {
+        label="Driver Types";
+        style=filled;
+        fillcolor="#FFFFFF";
+
+        leg_char [label="Character Device\n(serial, console)", fillcolor="#81C784"];
+        leg_timer [label="Timer Device\n(periodic interrupt)", fillcolor="#FFF59D"];
+        leg_input [label="Input Device\n(keyboard, mouse)", fillcolor="#CE93D8"];
+        leg_display [label="Display Device\n(framebuffer)", fillcolor="#90CAF9"];
+
+        leg_char -> leg_timer -> leg_input -> leg_display [style=invis];
+    }
+}

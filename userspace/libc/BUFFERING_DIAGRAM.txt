@@ -1,0 +1,261 @@
+╔════════════════════════════════════════════════════════════════════════════╗
+║                     STDIO BUFFERING ARCHITECTURE                           ║
+╚════════════════════════════════════════════════════════════════════════════╝
+
+┌──────────────────────────────────────────────────────────────────────────┐
+│                          WRITE PATH (fwrite)                              │
+└──────────────────────────────────────────────────────────────────────────┘
+
+  User Space                     Libc                        Kernel
+  ──────────                     ────                        ──────
+
+  fwrite("Hello", 1, 5, f)
+       │
+       ├──→ Check buffering mode
+       │
+       ├──→ Unbuffered (_IONBF)?
+       │    ├─ YES → write() syscall ────────────────────→ VFS → Disk
+       │    └─ NO  → Continue to buffer
+       │
+       └──→ Copy to buffer
+            │
+            │   ┌─────────────────────────┐
+            │   │  FILE->buffer (8KB)     │
+            │   ├─────────────────────────┤
+            └──→│ H e l l o _ _ _ _ _ ... │
+                │ (buf_count = 5)         │
+                └─────────────────────────┘
+                         │
+                         ├─ Buffer full?
+                         │  └─ YES → fflush() → write() ──→ VFS → Disk
+                         │
+                         └─ Newline + Line buffered (_IOLBF)?
+                            └─ YES → fflush() → write() ──→ VFS → Disk
+
+┌──────────────────────────────────────────────────────────────────────────┐
+│                          READ PATH (fread)                                │
+└──────────────────────────────────────────────────────────────────────────┘
+
+  User Space                     Libc                        Kernel
+  ──────────                     ────                        ──────
+
+  fread(buf, 1, 100, f)
+       │
+       ├──→ Check buffering mode
+       │
+       ├──→ Unbuffered (_IONBF)?
+       │    ├─ YES → read() syscall ────────────────────→ VFS → Disk
+       │    └─ NO  → Continue to buffer
+       │
+       ├──→ Buffer empty (buf_pos >= buf_count)?
+       │    │
+       │    └─ YES → read(fd, buffer, 8192) ──────────→ VFS → Disk
+       │               │
+       │               │   ┌─────────────────────────┐
+       │               └──→│  FILE->buffer (8KB)     │
+       │                   ├─────────────────────────┤
+       │                   │ [8192 bytes from disk]  │
+       │                   │ buf_count = 8192        │
+       │                   │ buf_pos = 0             │
+       │                   └─────────────────────────┘
+       │
+       └──→ Copy from buffer to user
+            │
+            └──→ memcpy(user_buf, buffer[buf_pos:buf_pos+100])
+                 buf_pos += 100
+
+┌──────────────────────────────────────────────────────────────────────────┐
+│                        BUFFERING MODES                                    │
+└──────────────────────────────────────────────────────────────────────────┘
+
+╔══════════════════╦════════════════╦═══════════════════════════════════════╗
+║ Mode             ║ Constant       ║ Flush Behavior                        ║
+╠══════════════════╬════════════════╬═══════════════════════════════════════╣
+║ Fully Buffered   ║ _IOFBF         ║ When buffer full (8192 bytes)         ║
+║                  ║                ║ Or on fflush() / fclose()             ║
+╠══════════════════╬════════════════╬═══════════════════════════════════════╣
+║ Line Buffered    ║ _IOLBF         ║ On newline character ('\n')           ║
+║                  ║                ║ Or buffer full, fflush(), fclose()    ║
+╠══════════════════╬════════════════╬═══════════════════════════════════════╣
+║ Unbuffered       ║ _IONBF         ║ Immediate (every write)               ║
+╚══════════════════╩════════════════╩═══════════════════════════════════════╝
+
+┌──────────────────────────────────────────────────────────────────────────┐
+│                        STANDARD STREAMS                                   │
+└──────────────────────────────────────────────────────────────────────────┘
+
+  stdin (fd 0)
+  ┌────────────────────────────────────┐
+  │ static char stdin_buffer[8192];    │ ◄─┐
+  └────────────────────────────────────┘   │
+  ┌────────────────────────────────────┐   │
+  │ FILE stdin_file = {                │   │
+  │   .fd = 0,                         │   │
+  │   .flags = _FILE_READ,             │   │
+  │   .buffer = stdin_buffer, ─────────┼───┘
+  │   .buf_size = 8192,                │
+  │   .buf_mode = _IOFBF               │ (Fully buffered)
+  │ }                                  │
+  └────────────────────────────────────┘
+
+  stdout (fd 1)
+  ┌────────────────────────────────────┐
+  │ static char stdout_buffer[8192];   │ ◄─┐
+  └────────────────────────────────────┘   │
+  ┌────────────────────────────────────┐   │
+  │ FILE stdout_file = {               │   │
+  │   .fd = 1,                         │   │
+  │   .flags = _FILE_WRITE,            │   │
+  │   .buffer = stdout_buffer, ────────┼───┘
+  │   .buf_size = 8192,                │
+  │   .buf_mode = _IOLBF               │ (Line buffered)
+  │ }                                  │
+  └────────────────────────────────────┘
+
+  stderr (fd 2)
+  ┌────────────────────────────────────┐
+  │ FILE stderr_file = {               │
+  │   .fd = 2,                         │
+  │   .flags = _FILE_WRITE,            │
+  │   .buffer = NULL, ◄────────────────┼─── (No buffer)
+  │   .buf_size = 0,                   │
+  │   .buf_mode = _IONBF               │ (Unbuffered)
+  │ }                                  │
+  └────────────────────────────────────┘
+
+┌──────────────────────────────────────────────────────────────────────────┐
+│                     SYSCALL REDUCTION EXAMPLE                             │
+└──────────────────────────────────────────────────────────────────────────┘
+
+  BEFORE BUFFERING (10,000 × 1-byte writes):
+  ═════════════════════════════════════════
+
+    for (i = 0; i < 10000; i++) {
+        fputc('X', f);
+            │
+            └──→ write(fd, "X", 1) ──────────→ Syscall #1
+            └──→ write(fd, "X", 1) ──────────→ Syscall #2
+            └──→ write(fd, "X", 1) ──────────→ Syscall #3
+            ...
+            └──→ write(fd, "X", 1) ──────────→ Syscall #10,000
+    }
+
+    Total syscalls: 10,000 ❌
+
+
+  AFTER BUFFERING (10,000 × 1-byte writes):
+  ════════════════════════════════════════
+
+    for (i = 0; i < 10000; i++) {
+        fputc('X', f);
+            │
+            ├──→ buffer[0] = 'X'    (buf_count = 1)
+            ├──→ buffer[1] = 'X'    (buf_count = 2)
+            ├──→ buffer[2] = 'X'    (buf_count = 3)
+            ...
+            ├──→ buffer[8191] = 'X' (buf_count = 8192) ──┐
+            │                                             │
+            └──→ BUFFER FULL! ◄──────────────────────────┘
+                 │
+                 └──→ write(fd, buffer, 8192) ───→ Syscall #1
+                      Reset: buf_count = 0
+            │
+            ├──→ buffer[0] = 'X'    (buf_count = 1)
+            ├──→ buffer[1] = 'X'    (buf_count = 2)
+            ...
+            └──→ buffer[1807] = 'X' (buf_count = 1808)
+    }
+
+    fclose(f);
+        └──→ fflush() → write(fd, buffer, 1808) ───→ Syscall #2
+
+    Total syscalls: 2 ✓
+    Improvement: 5000×
+
+
+┌──────────────────────────────────────────────────────────────────────────┐
+│                        MEMORY LAYOUT                                      │
+└──────────────────────────────────────────────────────────────────────────┘
+
+  FILE Structure (dynamically allocated):
+  ┌─────────────────────────────────┐
+  │ int fd           = 3            │
+  │ int flags        = _FILE_WRITE  │
+  │ int error        = 0            │
+  │ int eof          = 0            │
+  │ char* buffer     = 0xABCD1000 ──┼──┐
+  │ size_t buf_size  = 8192         │  │
+  │ size_t buf_pos   = 0            │  │
+  │ size_t buf_count = 5            │  │
+  │ int buf_mode     = _IOFBF       │  │
+  └─────────────────────────────────┘  │
+                                       │
+  Buffer (malloc'd 8KB):               │
+  ┌─────────────────────────────────┐  │
+  │ 0xABCD1000: [H][e][l][l][o]    │ ◄┘
+  │              ... (8187 bytes)   │
+  │ 0xABCD2FFF: [ ][ ][ ][ ][ ]    │
+  └─────────────────────────────────┘
+            ▲           ▲
+            │           └─ buf_size (8192)
+            └─ buf_count (5 bytes used)
+
+┌──────────────────────────────────────────────────────────────────────────┐
+│                       FLUSH DECISION TREE                                 │
+└──────────────────────────────────────────────────────────────────────────┘
+
+  fwrite() called
+       │
+       ├─ Unbuffered? ──YES→ write() syscall immediately
+       │                     └─→ Return
+       NO
+       │
+       └─ Copy data to buffer
+           │
+           ├─ buf_count >= buf_size? ──YES→ fflush()
+           │                               └─→ write() syscall
+           │                               └─→ buf_count = 0
+           NO
+           │
+           ├─ Line buffered? ──NO──→ Done (return)
+           │
+           YES
+           │
+           └─ Buffer contains '\n'? ──YES→ fflush()
+                                          └─→ write() syscall
+                                          └─→ buf_count = 0
+                                     NO
+                                      │
+                                      └─ Done (return)
+
+┌──────────────────────────────────────────────────────────────────────────┐
+│                        KEY INVARIANTS                                     │
+└──────────────────────────────────────────────────────────────────────────┘
+
+  Write Mode:
+    • 0 ≤ buf_count ≤ buf_size
+    • buf_pos is unused (always 0)
+    • buf_count tracks bytes pending flush
+
+  Read Mode:
+    • 0 ≤ buf_pos ≤ buf_count ≤ buf_size
+    • buf_pos is current read position
+    • buf_count is total bytes in buffer
+    • buf_pos >= buf_count → buffer is empty, refill needed
+
+  Position Tracking:
+    • ftell() = lseek(fd, 0, SEEK_CUR) + adjustment
+    • Write adjustment: + buf_count (unflushed bytes)
+    • Read adjustment:  - (buf_count - buf_pos) (unread bytes)
+
+  Seek Operations:
+    • fseek() MUST flush write buffers first
+    • fseek() MUST invalidate read buffers
+    • Sets buf_pos = buf_count = 0
+
+═══════════════════════════════════════════════════════════════════════════
+
+                         IMPLEMENTATION COMPLETE
+                    Syscall Reduction: 1000-5000× achieved!
+
+═══════════════════════════════════════════════════════════════════════════

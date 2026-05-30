@@ -1,0 +1,506 @@
+# AutomationOS Fuzzing Infrastructure - Architecture
+
+## System Overview
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                      AutomationOS Kernel (Target)                        │
+│  ┌───────────────┐  ┌─────────────┐  ┌──────────────────────────────┐  │
+│  │   Syscalls    │  │    Heap     │  │        Drivers               │  │
+│  │  - sys_read   │  │  - kmalloc  │  │  - PS/2 Keyboard             │  │
+│  │  - sys_write  │  │  - kfree    │  │  - Serial Port (COM1)        │  │
+│  │  - sys_getpid │  │  - krealloc │  │  - Framebuffer (VESA/GOP)    │  │
+│  └───────────────┘  └─────────────┘  └──────────────────────────────┘  │
+└──────────────────────────────┬──────────────────────────────────────────┘
+                               │
+                               │ (Fuzzing Interface)
+                               │
+┌──────────────────────────────▼──────────────────────────────────────────┐
+│                     Fuzzing Infrastructure                               │
+│                                                                          │
+│  ┌───────────────────────────────────────────────────────────────────┐  │
+│  │                     Fuzzer Harness (fuzzer_common.h)              │  │
+│  │  - Random number generation (xorshift32)                          │  │
+│  │  - Memory sanitization (canary-based)                             │  │
+│  │  - Crash detection (signal handlers)                              │  │
+│  │  - Timeout detection (SIGALRM)                                    │  │
+│  │  - Statistics tracking                                            │  │
+│  │  - AFL++ integration                                              │  │
+│  └───────────────────────────┬───────────────────────────────────────┘  │
+│                              │                                           │
+│        ┌─────────────────────┼─────────────────────┐                    │
+│        │                     │                     │                    │
+│  ┌─────▼──────┐    ┌─────────▼────────┐    ┌──────▼────────┐          │
+│  │  Syscall   │    │      Heap        │    │    Driver     │          │
+│  │  Fuzzer    │    │     Fuzzer       │    │    Fuzzer     │          │
+│  │            │    │                  │    │               │          │
+│  │ - Random   │    │ - Malloc/Free    │    │ - PS/2 fuzz   │          │
+│  │   args     │    │ - Realloc        │    │ - Serial fuzz │          │
+│  │ - Edge     │    │ - Calloc         │    │ - FB fuzz     │          │
+│  │   cases    │    │ - Stress test    │    │ - Race cond   │          │
+│  │ - NULL ptr │    │ - Concurrency    │    │ - Buffer OOB  │          │
+│  └────────────┘    └──────────────────┘    └───────────────┘          │
+│                                                                          │
+└──────────────────────────────────────────────────────────────────────────┘
+                               │
+                ┌──────────────┼──────────────┐
+                │              │              │
+         ┌──────▼─────┐  ┌─────▼────┐  ┌─────▼──────┐
+         │  AFL++     │  │  Corpus  │  │  Crashes   │
+         │  Engine    │  │  (Seeds) │  │  Storage   │
+         │            │  │          │  │            │
+         │ - Coverage │  │ 41 seeds │  │ - SIGSEGV  │
+         │   feedback │  │ - Syscall│  │ - SIGABRT  │
+         │ - Mutation │  │ - Heap   │  │ - SIGILL   │
+         │ - Trim     │  │ - Driver │  │ - Hangs    │
+         └────────────┘  └──────────┘  └────────────┘
+```
+
+## Component Breakdown
+
+### 1. Fuzzer Harness (Core Infrastructure)
+
+**File**: `fuzzer_common.h` (400 LOC)
+
+**Responsibilities**:
+- Provide random number generation
+- Detect crashes via signal handlers
+- Track statistics (iterations, crashes, hangs)
+- Interface with AFL++
+- Manage timeouts
+
+**Key Functions**:
+```c
+void fuzz_setup_handlers(void);         // Install signal handlers
+uint32_t fuzz_rand(void);               // Generate random numbers
+void fuzz_set_timeout(unsigned int);    // Set execution timeout
+void* fuzz_malloc(size_t);              // Allocate with canaries
+void fuzz_free(void*);                  // Free with checks
+uint8_t* fuzz_read_input(const char*);  // Read AFL++ input
+```
+
+### 2. Syscall Fuzzer
+
+**File**: `syscall_fuzzer.c` (350 LOC)
+
+**Architecture**:
+```
+┌─────────────────────────────────────┐
+│      Syscall Testcase Generator     │
+│  ┌────────────────────────────────┐ │
+│  │ syscall_testcase_t             │ │
+│  │  - syscall_num (4 bytes)       │ │
+│  │  - args[6] (6 * 8 bytes)       │ │
+│  │  Total: 52 bytes               │ │
+│  └────────────────────────────────┘ │
+└─────────────────┬───────────────────┘
+                  │
+      ┌───────────┴───────────┐
+      │                       │
+┌─────▼──────┐       ┌────────▼────────┐
+│  Random    │       │  Structured     │
+│  Generation│       │  Input (AFL++)  │
+│            │       │                 │
+│ - Small    │       │ - Parse binary  │
+│   integers │       │ - Validate      │
+│ - NULL ptr │       │ - Map to safe   │
+│ - Edge vals│       │   syscalls      │
+└─────┬──────┘       └────────┬────────┘
+      │                       │
+      └───────────┬───────────┘
+                  │
+         ┌────────▼────────┐
+         │ execute_syscall │
+         │    _safe()      │
+         │                 │
+         │ - SYS_READ      │
+         │ - SYS_WRITE     │
+         │ - SYS_GETPID    │
+         └─────────────────┘
+```
+
+**Safety Mechanisms**:
+- Only safe syscalls (no SYS_EXIT, SYS_FORK)
+- Bounded buffers for READ/WRITE
+- Timeout protection
+- Signal handlers for crashes
+
+### 3. Heap Fuzzer
+
+**File**: `heap_fuzzer.c` (550 LOC)
+
+**Architecture**:
+```
+┌────────────────────────────────────────────────┐
+│         Allocation Tracker                     │
+│  alloc_info_t[MAX_ALLOCATIONS]                 │
+│  - ptr (allocation address)                    │
+│  - size (allocation size)                      │
+│  - is_free (free status)                       │
+│  - alloc_id (unique ID)                        │
+└────────────────┬───────────────────────────────┘
+                 │
+         ┌───────┴────────┐
+         │ Heap Operations│
+         └───────┬────────┘
+                 │
+    ┌────────────┼────────────┐
+    │            │            │
+┌───▼───┐  ┌────▼────┐  ┌────▼────┐
+│ Alloc │  │  Free   │  │ Realloc │
+└───┬───┘  └────┬────┘  └────┬────┘
+    │           │            │
+    └───────────┼────────────┘
+                │
+    ┌───────────┴────────────┐
+    │  Memory Operations     │
+    │  - Read (UAF detect)   │
+    │  - Write (overflow)    │
+    │  - Memset              │
+    │  - Memcpy              │
+    └────────────────────────┘
+```
+
+**Testing Strategy**:
+- **Single-threaded**: Sequential alloc/free patterns
+- **Multi-threaded**: Concurrent stress test (--stress mode)
+- **Fragmentation**: Alternating alloc/free to fragment heap
+- **Edge cases**: Size 0, 1, MAX_SIZE
+
+**Bug Detection**:
+- **Double-free**: Tracked via `is_free` flag
+- **Use-after-free**: Read/write to freed memory
+- **Overflow**: Canary-based detection
+- **Leaks**: Compare total_allocs vs total_frees
+
+### 4. Driver Fuzzer
+
+**File**: `driver_fuzzer.c` (450 LOC)
+
+**Architecture**:
+```
+┌────────────────────────────────────────────┐
+│          Driver Fuzzer                     │
+└──────────────┬─────────────────────────────┘
+               │
+       ┌───────┴────────┐
+       │ Driver Select  │
+       └───────┬────────┘
+               │
+    ┌──────────┼──────────┐
+    │          │          │
+┌───▼────┐ ┌───▼────┐ ┌──▼──────┐
+│  PS/2  │ │ Serial │ │  FB     │
+│        │ │        │ │         │
+│ Fuzz   │ │ Fuzz   │ │ Fuzz    │
+│ Types: │ │ Types: │ │ Types:  │
+│        │ │        │ │         │
+│ - Scan │ │ - Ctrl │ │ - Pixel │
+│   codes│ │   chars│ │   write │
+│ - Buf  │ │ - FIFO │ │ - OOB   │
+│   OVF  │ │   OVF  │ │ - Race  │
+│ - Race │ │ - Baud │ │ - Mode  │
+│ - Mods │ │   rate │ │   switch│
+└────────┘ └────────┘ └─────────┘
+```
+
+**PS/2 Keyboard Fuzzing**:
+- Random scancodes (0x00 - 0xFF)
+- Buffer overflow (300+ rapid keys)
+- Modifier combinations (Shift, Ctrl, Alt, Caps)
+- Race conditions (TOCTOU in circular buffer)
+
+**Serial Port Fuzzing**:
+- Control characters (0x00, 0x03, 0x1B, etc.)
+- Binary data patterns
+- FIFO overflow (100+ byte bursts)
+- Baud rate edge cases (0, 1, 4000000, MAX_UINT)
+
+**Framebuffer Fuzzing**:
+- Out-of-bounds writes (x/y > max)
+- Concurrent writes (race conditions)
+- Mode switching (resolution/BPP changes)
+- Invalid resolutions (0x0, MAX_UINT)
+
+## Data Flow
+
+### AFL++ Fuzzing Workflow
+
+```
+┌─────────┐
+│  Start  │
+└────┬────┘
+     │
+     ▼
+┌──────────────┐
+│ Read Initial │
+│ Corpus Seeds │  ← corpus/syscall_seeds/
+└────┬─────────┘
+     │
+     ▼
+┌──────────────────┐
+│ AFL++ Mutator    │
+│ - Bit flips      │
+│ - Arithmetic     │
+│ - Dictionary     │
+│ - Havoc          │
+└────┬─────────────┘
+     │
+     ▼
+┌──────────────────┐
+│ Execute Fuzzer   │  ← ./syscall_fuzzer input
+│ with Input       │
+└────┬─────────────┘
+     │
+     ├──► Crash? ────────┐
+     │                   │
+     ├──► Hang? ─────────┼──► Save to crashes/
+     │                   │
+     └──► New Path? ─────┼──► Add to corpus/
+                         │
+                         ▼
+                   ┌──────────┐
+                   │ Continue │
+                   │ Fuzzing  │
+                   └──────────┘
+```
+
+### Standalone Fuzzing Workflow
+
+```
+┌─────────┐
+│  Start  │
+└────┬────┘
+     │
+     ▼
+┌──────────────────┐
+│ Generate Random  │
+│ Test Case        │
+└────┬─────────────┘
+     │
+     ▼
+┌──────────────────┐
+│ Execute Test     │
+│ - Set timeout    │
+│ - Run operation  │
+│ - Clear timeout  │
+└────┬─────────────┘
+     │
+     ├──► Crash? ────────┐
+     │                   │
+     ├──► Hang? ─────────┼──► Report & Exit
+     │                   │
+     └──► Success ───────┼──► Update Stats
+                         │
+                         ▼
+                   ┌──────────┐
+                   │ Next     │
+                   │ Iteration│
+                   └──────────┘
+```
+
+## Build System Architecture
+
+```
+┌─────────────────────────────────────────────┐
+│           Makefile                          │
+└──────────────┬──────────────────────────────┘
+               │
+       ┌───────┴────────┐
+       │ Check AFL++?   │
+       └───────┬────────┘
+               │
+        ┌──────┴──────┐
+        │             │
+   Yes  │             │  No
+        │             │
+┌───────▼──────┐  ┌───▼────────┐
+│ afl-gcc      │  │ gcc        │
+│ + ASAN       │  │ + ASAN     │
+│ + UBSAN      │  │ + UBSAN    │
+└───────┬──────┘  └───┬────────┘
+        │             │
+        └──────┬──────┘
+               │
+         ┌─────▼─────┐
+         │  Fuzzers  │
+         │  - syscall│
+         │  - heap   │
+         │  - driver │
+         └───────────┘
+```
+
+## CI/CD Pipeline
+
+```
+┌─────────────────────────────────────────────────────────┐
+│              GitHub Actions Workflow                     │
+└───────────────────────┬─────────────────────────────────┘
+                        │
+                ┌───────▼────────┐
+                │ Trigger Event  │
+                │ - Pull Request │
+                │ - Schedule     │
+                │ - Manual       │
+                └───────┬────────┘
+                        │
+              ┌─────────▼─────────┐
+              │ Install AFL++     │
+              │ Configure System  │
+              └─────────┬─────────┘
+                        │
+              ┌─────────▼─────────┐
+              │ Build Fuzzers     │
+              │ Generate Corpus   │
+              └─────────┬─────────┘
+                        │
+        ┌───────────────┼───────────────┐
+        │               │               │
+  ┌─────▼────┐    ┌─────▼────┐    ┌────▼─────┐
+  │ Syscall  │    │   Heap   │    │  Driver  │
+  │ Fuzzer   │    │  Fuzzer  │    │  Fuzzer  │
+  │ (1 hour) │    │ (1 hour) │    │ (1 hour) │
+  └─────┬────┘    └─────┬────┘    └────┬─────┘
+        │               │               │
+        └───────────────┼───────────────┘
+                        │
+              ┌─────────▼─────────┐
+              │ Check Crashes     │
+              │ Upload Artifacts  │
+              │ Generate Report   │
+              └─────────┬─────────┘
+                        │
+                  ┌─────▼──────┐
+                  │ Crashes?   │
+                  └─────┬──────┘
+                        │
+                  ┌─────┴──────┐
+             Yes  │            │  No
+                  │            │
+          ┌───────▼──────┐  ┌──▼────────┐
+          │ File GitHub  │  │  Success  │
+          │ Issue        │  │  Badge    │
+          │ (Priority:   │  │           │
+          │  HIGH)       │  │           │
+          └──────────────┘  └───────────┘
+```
+
+## Memory Layout
+
+### Test Case Format
+
+**Syscall Fuzzer**:
+```
+Offset  Size  Field
+------  ----  -----
+0       4     syscall_num (uint32_t)
+4       8     arg1 (uint64_t)
+12      8     arg2 (uint64_t)
+20      8     arg3 (uint64_t)
+28      8     arg4 (uint64_t)
+36      8     arg5 (uint64_t)
+44      8     arg6 (uint64_t)
+------  ----
+Total:  52 bytes
+```
+
+**Heap Fuzzer**:
+```
+Offset  Size  Field
+------  ----  -----
+0       4     operation (uint32_t)
+4       4     target_idx (uint32_t)
+8       8     size (uint64_t)
+16      4     value (uint32_t)
+------  ----
+Total:  20 bytes
+```
+
+## Statistics Tracking
+
+```c
+typedef struct {
+    uint64_t iterations;      // Total test cases executed
+    uint64_t crashes;         // Crashes detected
+    uint64_t hangs;           // Hangs detected
+    uint64_t unique_crashes;  // Deduplicated crashes
+    uint64_t total_execs;     // Total executions
+    double coverage;          // Code coverage %
+    time_t start_time;        // Campaign start
+    time_t end_time;          // Campaign end
+} fuzz_stats_t;
+```
+
+## Integration Points
+
+### 1. Kernel Interface
+- Syscall handler table (`syscall_table[]`)
+- Heap allocator (`kmalloc/kfree`)
+- Driver entry points (`ps2_init`, `serial_init`, etc.)
+
+### 2. AFL++ Interface
+- Input reading (`fuzz_read_input`)
+- Coverage instrumentation (automatic via afl-gcc)
+- Crash detection (exit codes: 0=ok, 1=crash, 2=hang)
+
+### 3. Sanitizers
+- ASAN (heap errors, UAF, double-free)
+- UBSAN (undefined behavior, integer overflow)
+- Valgrind (memory leaks, uninitialized reads)
+
+## Deployment Architecture
+
+```
+┌─────────────────────────────────────────────────────────┐
+│                  Fuzzing Server                          │
+│  ┌────────────────────────────────────────────────────┐ │
+│  │  Orchestration (run-fuzzer.sh)                     │ │
+│  └─────────────────┬──────────────────────────────────┘ │
+│                    │                                     │
+│     ┌──────────────┼──────────────┐                     │
+│     │              │              │                     │
+│  ┌──▼───┐      ┌───▼──┐      ┌───▼──┐                 │
+│  │ AFL  │      │ AFL  │      │ AFL  │                 │
+│  │ Core │      │ Core │      │ Core │                 │
+│  │  1-8 │      │ 9-16 │      │17-24 │                 │
+│  └──────┘      └──────┘      └──────┘                 │
+│                                                         │
+│  ┌────────────────────────────────────────────────┐   │
+│  │  Storage                                       │   │
+│  │  - Corpus: 41 seeds → thousands after fuzzing │   │
+│  │  - Output: Coverage maps, stats               │   │
+│  │  - Crashes: Deduplicated crash files          │   │
+│  └────────────────────────────────────────────────┘   │
+└─────────────────────────────────────────────────────────┘
+```
+
+## Performance Optimization
+
+### 1. Fuzzer Performance
+- Fast RNG (xorshift32): ~100M ops/sec
+- Minimal overhead: Signal handlers only
+- Efficient allocation tracking: O(1) lookup
+
+### 2. AFL++ Optimization
+- Persistent mode (future): 10x speed boost
+- CmpLog mode: Better mutation guidance
+- Deterministic mode: Exhaustive coverage
+
+### 3. Parallel Execution
+- Multi-core: Linear speedup (8 cores = 8x throughput)
+- Distributed: Sync via `afl-whatsup`
+
+---
+
+## Conclusion
+
+The AutomationOS fuzzing infrastructure provides a robust, scalable, and well-architected solution for continuous vulnerability discovery. The modular design allows easy extension to new fuzzers while maintaining consistency through the shared harness.
+
+**Key Architectural Strengths**:
+- **Modularity**: Clean separation between fuzzers and harness
+- **Extensibility**: Easy to add new fuzzers or test cases
+- **Reliability**: Signal handlers and timeout protection
+- **Performance**: Multi-core parallel execution
+- **Integration**: AFL++, ASAN, CI/CD ready
+
+**Ready for production deployment.**

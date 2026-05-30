@@ -1,0 +1,150 @@
+%% AutomationOS Memory Page State Machine
+%% Mermaid State Diagram
+
+stateDiagram-v2
+    [*] --> Free: System boot (pmm_init)
+
+    state Free {
+        [*] --> InBuddyAllocator
+        note right of InBuddyAllocator
+            Physical page free
+            • In buddy allocator free list
+            • Linked with buddy page
+            • Available for allocation
+            • Bitmap bit = 0
+        end note
+    }
+
+    Free --> Allocated: pmm_alloc_page()
+
+    state Allocated {
+        [*] --> Zeroed: Security zeroing
+
+        Zeroed --> Unmapped: Page allocated but not mapped
+        Unmapped --> MappingRequested: vmm_map_page()
+
+        MappingRequested --> PageTableUpdate
+        PageTableUpdate --> TLBInvalidate
+        TLBInvalidate --> Mapped
+
+        Mapped --> InUse
+
+        state InUse {
+            [*] --> KernelHeap: kmalloc()
+            [*] --> KernelCode: Kernel static data
+            [*] --> UserHeap: User brk()/mmap()
+            [*] --> UserStack: User stack allocation
+            [*] --> PageTableEntry: Page table itself
+            [*] --> DMA: DMA buffer
+        }
+
+        note right of InUse
+            Page actively used
+            • Virtual mapping exists
+            • PTE has PRESENT bit
+            • TLB may cache translation
+            • Reference count > 0
+        end note
+    }
+
+    state Mapped {
+        [*] --> CleanPage
+        CleanPage --> DirtyPage: Write access
+        DirtyPage --> CleanPage: Writeback (future: disk I/O)
+
+        note right of CleanPage
+            Page contents match backing store
+            • Can be discarded safely
+            • Accessed bit may be set
+            • Dirty bit = 0
+        end note
+
+        note right of DirtyPage
+            Modified since loaded
+            • Must be written back
+            • Dirty bit = 1 in PTE
+            • Cannot be discarded
+        end note
+    }
+
+    Allocated --> CopyOnWrite: fork() syscall
+
+    state CopyOnWrite {
+        [*] --> SharedReadOnly
+        SharedReadOnly --> CopyTriggered: Write attempt
+        CopyTriggered --> PageFault: #PF (Protection violation)
+        PageFault --> AllocateNewPage
+        AllocateNewPage --> CopyData
+        CopyData --> UpdatePTE
+        UpdatePTE --> [*]: Private writable copy
+
+        note right of SharedReadOnly
+            Optimization for fork()
+            • Parent and child share page
+            • Both mappings read-only
+            • Write triggers page fault
+            • On-demand copying
+        end note
+    }
+
+    CopyOnWrite --> Allocated: Copy complete
+
+    Allocated --> Swapped: Page out (future: memory pressure)
+
+    state Swapped {
+        [*] --> OnDisk
+        note right of OnDisk
+            Page on swap device
+            • Not in physical RAM
+            • PTE has PRESENT=0
+            • Swap address in PTE
+            • Access triggers page fault
+        end note
+        OnDisk --> [*]: Page in (on access)
+    }
+
+    Swapped --> Allocated: Page fault brings back
+
+    Allocated --> Free: pmm_free_page() / kfree()
+
+    note left of Allocated
+        Page Fault Scenarios:
+        • Not present → Allocate
+        • Protection violation → COW
+        • Swapped out → Page in
+        • Invalid address → SIGSEGV
+    end note
+
+    state PageFlags {
+        state "PRESENT" as p
+        state "WRITE" as w
+        state "USER" as u
+        state "ACCESSED" as a
+        state "DIRTY" as d
+        state "GLOBAL" as g
+    }
+
+    note right of PageFlags
+        x86_64 Page Table Entry Flags:
+        • PRESENT (bit 0): Page in RAM
+        • WRITE (bit 1): Writable
+        • USER (bit 2): User accessible
+        • ACCESSED (bit 5): Read/written
+        • DIRTY (bit 6): Modified
+        • GLOBAL (bit 8): TLB global
+    end note
+
+    state BuddyAllocatorStates {
+        state "Order 0 (4 KB)" as o0
+        state "Order 1 (8 KB)" as o1
+        state "Order 2 (16 KB)" as o2
+        state "Order 10 (4 MB)" as o10
+    }
+
+    note right of BuddyAllocatorStates
+        Buddy System Free Lists:
+        • Split larger blocks on demand
+        • Coalesce on free (merge buddies)
+        • Orders 0-10 (4KB to 4MB)
+        • Fast allocation O(1)
+    end note

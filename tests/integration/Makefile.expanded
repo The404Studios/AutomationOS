@@ -1,0 +1,128 @@
+# AutomationOS Expanded Integration Test Suite Makefile
+#
+# Builds all 110+ integration tests into a single test binary.
+
+CC = gcc
+CFLAGS = -Wall -Wextra -std=c11 -I../../kernel/include -I../../include
+LDFLAGS =
+
+# Test categories
+BOOT_TESTS = test_boot_expanded.o
+APP_TESTS = test_application_lifecycle.o
+FS_TESTS = test_filesystem_integration.o
+NET_TESTS = test_network_stack.o
+GFX_TESTS = test_graphics_stack.o
+SEC_TESTS = test_security_expanded.o
+PWR_TESTS = test_power_management.o
+CORE_TESTS = integration_suite.o
+
+# Expanded suite runner
+SUITE_RUNNER = integration_suite_expanded.o
+
+# All test objects
+TEST_OBJS = $(BOOT_TESTS) $(APP_TESTS) $(FS_TESTS) $(NET_TESTS) \
+            $(GFX_TESTS) $(SEC_TESTS) $(PWR_TESTS) $(CORE_TESTS) \
+            $(SUITE_RUNNER)
+
+# Target binary
+TARGET = integration_tests_expanded
+
+# Phony targets
+.PHONY: all clean test categories smoke
+
+all: $(TARGET)
+
+$(TARGET): $(TEST_OBJS)
+	@echo "Linking expanded integration test suite..."
+	$(CC) $(LDFLAGS) -o $@ $^
+	@echo "Built: $(TARGET)"
+	@echo "Test count: 110+ integration tests"
+
+%.o: %.c
+	@echo "Compiling $<..."
+	$(CC) $(CFLAGS) -c -o $@ $<
+
+# Run full expanded suite
+test: $(TARGET)
+	@echo "Running expanded integration test suite (110+ tests)..."
+	./$(TARGET)
+
+# Run specific category
+category-%: $(TARGET)
+	@echo "Running test category $*..."
+	./$(TARGET) --category=$*
+
+# Run smoke test
+smoke: $(TARGET)
+	@echo "Running smoke test (fast validation)..."
+	./$(TARGET) --smoke
+
+# Show test statistics
+stats:
+	@echo "==================================="
+	@echo "Expanded Integration Test Suite"
+	@echo "==================================="
+	@echo "Test Files: 8"
+	@echo "Total Tests: 110"
+	@echo ""
+	@echo "Breakdown:"
+	@echo "  Boot Sequence:        10 tests"
+	@echo "  Application Lifecycle: 15 tests"
+	@echo "  File System:          15 tests"
+	@echo "  Network Stack:        15 tests"
+	@echo "  Graphics Stack:       10 tests"
+	@echo "  Security (Expanded):  20 tests"
+	@echo "  Power Management:     10 tests"
+	@echo "  Core Subsystems:      15 tests"
+	@echo "==================================="
+	@echo "Phase 2 Ready:         60 tests"
+	@echo "Phase 3 Pending:       30 tests"
+	@echo "Phase 4 Pending:       20 tests"
+	@echo "==================================="
+
+# Clean build artifacts
+clean:
+	@echo "Cleaning expanded integration tests..."
+	rm -f $(TEST_OBJS) $(TARGET)
+	@echo "Clean complete."
+
+# Help target
+help:
+	@echo "AutomationOS Expanded Integration Test Suite"
+	@echo ""
+	@echo "Targets:"
+	@echo "  all          - Build all integration tests (default)"
+	@echo "  test         - Run full expanded suite (110+ tests)"
+	@echo "  smoke        - Run smoke test (fast validation)"
+	@echo "  category-N   - Run specific category (N = 1-8)"
+	@echo "  stats        - Show test statistics"
+	@echo "  clean        - Remove build artifacts"
+	@echo "  help         - Show this help message"
+	@echo ""
+	@echo "Test Categories:"
+	@echo "  1 - Boot Sequence (10 tests)"
+	@echo "  2 - Application Lifecycle (15 tests)"
+	@echo "  3 - File System (15 tests)"
+	@echo "  4 - Network Stack (15 tests)"
+	@echo "  5 - Graphics Stack (10 tests)"
+	@echo "  6 - Security Expanded (20 tests)"
+	@echo "  7 - Power Management (10 tests)"
+	@echo "  8 - Core Subsystems (15 tests)"
+	@echo ""
+	@echo "Examples:"
+	@echo "  make              # Build tests"
+	@echo "  make test         # Run all 110+ tests"
+	@echo "  make category-1   # Run boot tests only"
+	@echo "  make smoke        # Quick validation"
+	@echo "  make stats        # Show statistics"
+
+# Dependencies
+integration_suite_expanded.o: integration_suite_expanded.c
+test_boot_expanded.o: test_boot_expanded.c
+test_application_lifecycle.o: test_application_lifecycle.c
+test_filesystem_integration.o: test_filesystem_integration.c
+test_network_stack.o: test_network_stack.c
+test_graphics_stack.o: test_graphics_stack.c
+test_security_expanded.o: test_security_expanded.c
+test_power_management.o: test_power_management.c
+integration_suite.o: integration_suite.c

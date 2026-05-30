@@ -1,0 +1,65 @@
+// AutomationOS Memory Layout
+// Graphviz DOT format
+// Generate with: dot -Tsvg memory_layout.dot -o ../memory_layout.svg
+
+digraph MemoryLayout {
+    rankdir=TB;
+    node [shape=record, fontname="Arial"];
+    graph [fontname="Arial", fontsize=12];
+
+    // Virtual memory layout
+    memory [label="{Virtual Address Space\n(48-bit addressing)\l|
+        {<high>0xFFFFFFFF_FFFFFFFF|Higher Half\n(Kernel Space)\l}|
+        {<kernel_heap>0xFFFFFFFF_C0000000|Kernel Heap\n(Slab Allocator)\l}|
+        {<kernel_code>0xFFFFFFFF_80000000|Kernel Code + Data\n(2 MB pages)\l}|
+        {<hole>0x00008000_00000000|Canonical Address Hole\n(Non-addressable)\l}|
+        {<user_stack>0x00007FFF_FFFFF000|User Stack\n(grows down)\l}|
+        {<user_heap>0x00000000_40000000|User Heap\n(grows up)\l}|
+        {<user_code>0x00000000_00400000|User Code + Data\l}|
+        {<low>0x00000000_00000000|Null Page\n(unmapped)\l}
+    }", fillcolor="#E8F4F8", style=filled];
+
+    // Physical memory layout
+    phys_memory [label="{Physical Memory\l|
+        {<high_phys>Top of RAM|Free Pages\n(Buddy Allocator)\l}|
+        {<kernel_phys>1 MB - ~5 MB|Kernel Code + Data\l}|
+        {<boot_phys>0x7C00 - 1 MB|Boot Structures\n(UEFI, Memory Map)\l}|
+        {<reserved>0x00000 - 0x1000|Reserved\n(IVT, BDA)\l}
+    }", fillcolor="#FFF9C4", style=filled];
+
+    // Page table hierarchy
+    paging [label="{4-Level Page Tables\l|
+        {<pml4>PML4\n(Page Map Level 4)\l|512 entries × 512 GB}|
+        {<pdpt>PDPT\n(Page Directory Pointer)\l|512 entries × 1 GB}|
+        {<pd>PD\n(Page Directory)\l|512 entries × 2 MB}|
+        {<pt>PT\n(Page Table)\l|512 entries × 4 KB}|
+        {<page>Physical Page\l|4 KB frame}
+    }", fillcolor="#C8E6C9", style=filled];
+
+    // Connections
+    memory:kernel_code -> phys_memory:kernel_phys [label="mapped 1:1\n+ offset"];
+    memory:kernel_heap -> phys_memory:high_phys [label="dynamic mapping"];
+    memory:user_code -> paging:pml4 [label="page fault\ntriggers mapping"];
+    paging:page -> phys_memory:high_phys;
+
+    // Labels
+    label_virtual [shape=plaintext, label="Virtual Address Space\n(What processes see)"];
+    label_physical [shape=plaintext, label="Physical Memory\n(Actual RAM)"];
+    label_paging [shape=plaintext, label="Page Table Structure\n(CR3 → PML4)"];
+
+    label_virtual -> memory [style=invis];
+    label_physical -> phys_memory [style=invis];
+    label_paging -> paging [style=invis];
+
+    // Memory stats box
+    stats [shape=note, label="Memory Configuration:\n\
+• Page Size: 4 KB\n\
+• Virtual Address: 48-bit\n\
+• Physical Address: depends on RAM\n\
+• Kernel Offset: 0xFFFFFFFF80000000\n\
+• User/Kernel Split: 0x0000800000000000\n\
+• Buddy Allocator: Order 0-10 (4 KB - 4 MB)\n\
+• Slab Allocator: 32B - 8KB caches", fillcolor="#FFE0B2", style=filled];
+
+    {rank=same; memory; phys_memory; paging;}
+}

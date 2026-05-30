@@ -17,22 +17,36 @@ A freestanding cross-compiler is required to build the kernel and bootloader.
 
 #### Linux (Ubuntu/Debian)
 ```bash
-sudo apt-get install build-essential gcc-x86-64-linux-gnu nasm
-# Or build from source (recommended for OS development)
+# Cross-compiler toolchain
+sudo apt install gcc-x86-64-elf binutils-x86-64-elf
+
+# Additional build tools
+sudo apt install build-essential nasm python3 qemu-system-x86 xorriso
+```
+
+#### Linux (Arch)
+```bash
+# Cross-compiler toolchain
+sudo pacman -S x86_64-elf-gcc x86_64-elf-binutils
+
+# Additional build tools
+sudo pacman -S base-devel nasm python qemu xorriso
 ```
 
 #### macOS
 ```bash
-brew install x86_64-elf-gcc nasm
+# Cross-compiler toolchain
+brew install x86_64-elf-gcc x86_64-elf-binutils
+
+# Additional build tools
+brew install nasm python qemu xorriso
 ```
 
-#### Windows (WSL2 or MSYS2)
+#### Windows (WSL2)
 ```bash
-# WSL2 (Ubuntu)
-sudo apt-get install build-essential nasm
-
-# MSYS2
-pacman -S mingw-w64-x86_64-gcc nasm
+# Use Ubuntu instructions in WSL2
+sudo apt install gcc-x86-64-elf binutils-x86-64-elf
+sudo apt install build-essential nasm python3 qemu-system-x86 xorriso
 ```
 
 #### Building from Source (All platforms)
@@ -129,16 +143,30 @@ xorriso --version
 python3 --version
 ```
 
-## Current Status (2026-05-26)
+## Troubleshooting
 
-On this Windows 11 system with WSL2:
-- ❌ x86_64-elf-gcc - **NOT INSTALLED**
-- ❌ nasm - **NOT INSTALLED**
-- ❓ QEMU - Not verified
-- ❓ xorriso - Not verified
-- ✅ Python 3 - Installed
+### "x86_64-elf-gcc: command not found"
 
-**Action Required:** Install cross-compiler toolchain before building.
+This means the cross-compiler toolchain is not installed or not in your PATH.
+
+**Solution:**
+1. Install the cross-compiler using the instructions above
+2. Verify installation: `x86_64-elf-gcc --version`
+3. If installed but not found, add to PATH:
+   ```bash
+   export PATH="/usr/local/cross/bin:$PATH"
+   ```
+
+### Package not found in Ubuntu/Debian
+
+If `gcc-x86-64-elf` is not available in your package repository:
+1. Try `apt search x86.*elf.*gcc` to find the correct package name
+2. Build from source using the instructions below
+3. Use a PPA or third-party repository (not recommended)
+
+### Building from Source - Best for OS Development
+
+The most reliable method for OS development is building the toolchain from source. This ensures you have a proper freestanding compiler configured for bare-metal development.
 
 ## Quick Setup Script
 

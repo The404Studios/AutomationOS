@@ -1,0 +1,217 @@
+// AutomationOS Kernel Component Architecture
+// Graphviz DOT format
+
+digraph KernelComponents {
+    rankdir=TB;
+    node [shape=component, fontname="Arial", style="filled"];
+    graph [fontname="Arial", fontsize=12, compound=true];
+    edge [fontname="Arial"];
+
+    // Color scheme
+    subgraph cluster_kernel {
+        label="Kernel Core (kernel/)";
+        style=filled;
+        fillcolor="#F5F5F5";
+
+        // Architecture layer
+        subgraph cluster_arch {
+            label="arch/x86_64/";
+            style=filled;
+            fillcolor="#FFCCBC";
+
+            boot_asm [label="boot.asm\nKernel entry", fillcolor="#FF8A65"];
+            gdt [label="gdt.c/asm\nSegmentation", fillcolor="#FF8A65"];
+            idt [label="idt.c\nInterrupt setup", fillcolor="#FF8A65"];
+            interrupt_asm [label="interrupt.asm\nISR stubs", fillcolor="#FF8A65"];
+            paging [label="paging.c\nPage tables", fillcolor="#FF8A65"];
+            syscall_asm [label="syscall.asm\nSyscall entry", fillcolor="#FF8A65"];
+            syscall_init [label="syscall_init.c\nMSR setup", fillcolor="#FF8A65"];
+            context_asm [label="context_switch.asm\nRegister save/restore", fillcolor="#FF8A65"];
+        }
+
+        // Core subsystems
+        subgraph cluster_core {
+            label="core/";
+            style=filled;
+            fillcolor="#E1BEE7";
+
+            // Memory management
+            subgraph cluster_mem {
+                label="mem/";
+                style=filled;
+                fillcolor="#CE93D8";
+
+                pmm [label="pmm.c\nBuddy allocator", fillcolor="#BA68C8"];
+                vmm [label="vmm.c\nVirtual memory", fillcolor="#BA68C8"];
+                heap [label="heap.c\nSlab allocator", fillcolor="#BA68C8"];
+            }
+
+            // Scheduler
+            subgraph cluster_sched {
+                label="sched/";
+                style=filled;
+                fillcolor="#CE93D8";
+
+                process [label="process.c\nProcess table", fillcolor="#BA68C8"];
+                scheduler [label="scheduler.c\nRound-robin", fillcolor="#BA68C8"];
+                context [label="context.c\nContext mgmt", fillcolor="#BA68C8"];
+            }
+
+            // System calls
+            subgraph cluster_syscall {
+                label="syscall/";
+                style=filled;
+                fillcolor="#CE93D8";
+
+                syscall [label="syscall.c\nDispatcher", fillcolor="#BA68C8"];
+                handlers [label="handlers.c\nSyscall handlers", fillcolor="#BA68C8"];
+            }
+
+            // Namespaces
+            subgraph cluster_namespace {
+                label="namespace/";
+                style=filled;
+                fillcolor="#CE93D8";
+
+                ns_pid [label="ns_pid.c\nPID namespace", fillcolor="#BA68C8"];
+                ns_mount [label="ns_mount.c\nMount namespace", fillcolor="#BA68C8"];
+                ns_net [label="ns_net.c\nNetwork namespace", fillcolor="#BA68C8"];
+                ns_ipc [label="ns_ipc.c\nIPC namespace", fillcolor="#BA68C8"];
+                ns_uts [label="ns_uts.c\nUTS namespace", fillcolor="#BA68C8"];
+            }
+
+            // Resource limits
+            subgraph cluster_rlimit {
+                label="rlimit/";
+                style=filled;
+                fillcolor="#CE93D8";
+
+                rlimit_cpu [label="cpu.c\nCPU limits", fillcolor="#BA68C8"];
+                rlimit_mem [label="memory.c\nMemory limits", fillcolor="#BA68C8"];
+            }
+
+            perf [label="perf.c\nPerformance monitoring", fillcolor="#BA68C8"];
+        }
+
+        // Drivers
+        subgraph cluster_drivers {
+            label="drivers/";
+            style=filled;
+            fillcolor="#C8E6C9";
+
+            serial [label="serial.c\nCOM1 console", fillcolor="#81C784"];
+            pit [label="pit.c\nTimer (1000 Hz)", fillcolor="#81C784"];
+            ps2 [label="ps2.c\nKeyboard", fillcolor="#81C784"];
+            framebuffer [label="framebuffer.c\nVGA/UEFI GOP", fillcolor="#81C784"];
+        }
+
+        // Security
+        subgraph cluster_security {
+            label="security/";
+            style=filled;
+            fillcolor="#FFE0B2";
+
+            subgraph cluster_mac {
+                label="mac/";
+                fillcolor="#FFCC80";
+                mac_label [label="label.c\nSecurity labels", fillcolor="#FFB74D"];
+                mac_policy [label="policy.c\nType enforcement", fillcolor="#FFB74D"];
+            }
+
+            subgraph cluster_seccomp {
+                label="seccomp/";
+                fillcolor="#FFCC80";
+                seccomp_filter [label="filter.c\nSyscall filtering", fillcolor="#FFB74D"];
+            }
+
+            sec_namespace [label="namespace.c\nNamespace security", fillcolor="#FFB74D"];
+        }
+
+        // Audit
+        subgraph cluster_audit {
+            label="audit/";
+            style=filled;
+            fillcolor="#FFF9C4";
+
+            audit_log [label="log.c\nAudit logging", fillcolor="#FFF59D"];
+            audit_buffer [label="buffer.c\nRing buffer", fillcolor="#FFF59D"];
+        }
+
+        // Cryptography
+        subgraph cluster_crypto {
+            label="crypto/";
+            style=filled;
+            fillcolor="#B2DFDB";
+
+            sha256 [label="sha256.c\nHashing", fillcolor="#80CBC4"];
+            rsa [label="rsa.c\nPublic key", fillcolor="#80CBC4"];
+            verify [label="verify.c\nSignature verification", fillcolor="#80CBC4"];
+        }
+
+        // Library
+        subgraph cluster_lib {
+            label="lib/";
+            style=filled;
+            fillcolor="#CFD8DC";
+
+            string [label="string.c\nString ops", fillcolor="#B0BEC5"];
+            printf [label="printf.c\nFormatted output", fillcolor="#B0BEC5"];
+            panic [label="panic.c\nKernel panic", fillcolor="#B0BEC5"];
+        }
+
+        // Main kernel entry
+        kernel_main [label="kernel.c\nkmain()", fillcolor="#42A5F5", shape=box3d];
+    }
+
+    // Dependencies (selected key relationships)
+    kernel_main -> boot_asm [label="called from", style=dashed];
+    kernel_main -> pmm [label="init"];
+    kernel_main -> vmm [label="init"];
+    kernel_main -> heap [label="init"];
+    kernel_main -> gdt [label="init"];
+    kernel_main -> idt [label="init"];
+    kernel_main -> serial [label="init"];
+    kernel_main -> pit [label="init"];
+    kernel_main -> scheduler [label="init"];
+    kernel_main -> syscall [label="init"];
+
+    vmm -> pmm [label="allocate pages"];
+    vmm -> paging [label="manipulate PTEs"];
+    heap -> pmm [label="allocate pages"];
+
+    scheduler -> process [label="manage"];
+    scheduler -> context_asm [label="switch"];
+    scheduler -> pit [label="timer IRQ", style=dashed];
+
+    syscall -> handlers [label="dispatch"];
+    handlers -> process [label="fork/exit"];
+    handlers -> vmm [label="mmap"];
+    handlers -> serial [label="write"];
+
+    interrupt_asm -> idt [label="registered in"];
+    interrupt_asm -> pit [label="IRQ 0"];
+    interrupt_asm -> ps2 [label="IRQ 1"];
+
+    process -> ns_pid [label="isolate PIDs"];
+    process -> mac_label [label="security labels"];
+    process -> seccomp_filter [label="syscall filter"];
+
+    handlers -> audit_log [label="log syscalls"];
+    audit_log -> audit_buffer [label="write to"];
+
+    // Legend
+    subgraph cluster_legend {
+        label="Component Types";
+        style=filled;
+        fillcolor="#FFFFFF";
+        rank=same;
+
+        leg_arch [label="Architecture", fillcolor="#FF8A65"];
+        leg_core [label="Core", fillcolor="#BA68C8"];
+        leg_driver [label="Driver", fillcolor="#81C784"];
+        leg_security [label="Security", fillcolor="#FFB74D"];
+        leg_lib [label="Library", fillcolor="#B0BEC5"];
+
+        leg_arch -> leg_core -> leg_driver -> leg_security -> leg_lib [style=invis];
+    }
+}

@@ -6,6 +6,21 @@ iso/
 *.bin
 *.iso
 
+# Framebuffer captures / one-off screenshots (curated shots live in screenshots/)
+*.ppm
+/boot_shot.png
+/boot_fade.png
+/boot_settled.png
+/desktop_final.png
+
+# Stray in-tree compiled binaries (build outputs that landed in source dirs)
+userspace/compositor/compositor
+userspace/shell/shell
+userspace/wm/wm
+userspace/test_ring3/init_bare
+userspace/test_ring3/terminal
+userspace/test_ring3/test_ring3
+
 # Editor files
 *.swp
 *.swo
@@ -16,3 +31,27 @@ iso/
 # OS files
 .DS_Store
 Thumbs.db
+
+# Cryptographic keys (NEVER COMMIT!)
+keys/
+*.pem
+*.key
+*.crt
+*.p12
+*.pfx
+
+# Session / agent status artifacts (not part of the project source)
+AGENT*.md
+*_REPORT.md
+*_SUMMARY.md
+*_DELIVER*.md
+*_DELIVERY.md
+*_CHECKLIST.md
+*_COMPLETE.md
+*_VALIDATION*.md
+ACCESSIBILITY_*.md
+AUTOFS_*.md
+ANIMATION_*.md
+.task*tracker*
+.task*.md
+.phase*tracker*

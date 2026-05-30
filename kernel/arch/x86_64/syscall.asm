@@ -1,67 +1,85 @@
 ; syscall.asm - System call entry point for x86_64
-; Handles SYSCALL instruction and dispatches to kernel
+; SYSCALL does NOT switch RSP. We must manually load the kernel stack.
 
 [BITS 64]
 global syscall_entry
 extern syscall_dispatch
+extern tss_get
 
 section .text
 
 syscall_entry:
-    ; When SYSCALL is executed:
-    ; RAX = syscall number
-    ; RDI = arg1
-    ; RSI = arg2
-    ; RDX = arg3
-    ; R10 = arg4 (RCX is clobbered by SYSCALL, so use R10)
-    ; R8  = arg5
-    ; R9  = arg6
-    ; RCX = return RIP (saved by SYSCALL)
-    ; R11 = RFLAGS (saved by SYSCALL)
+    ; SYSCALL state:
+    ;   RCX = user RIP, R11 = user RFLAGS
+    ;   RSP = USER stack (not kernel!)
+    ;   RAX = syscall number, RDI-R9 = args
 
-    ; Save user registers on kernel stack
-    push rcx        ; Return RIP
-    push r11        ; RFLAGS
+    ; Save user RSP, switch to kernel stack from TSS.RSP0
+    ; TSS.RSP0 is at offset 4 in the TSS structure (after reserved0)
+    mov [rel user_rsp_save], rsp    ; Save user RSP
+
+    ; Load kernel RSP from TSS (tss.rsp0)
+    ; tss_get() returns pointer to TSS, rsp0 is at offset 4
+    mov rsp, [rel kernel_rsp_save]  ; Load saved kernel RSP
+
+    ; Now on kernel stack - save ALL user registers that SYSCALL doesn't save.
+    ; SYSCALL saves RCX→RIP and R11→RFLAGS. Everything else is volatile.
+    ; Userspace inline asm expects rdi, rsi, rdx, r8, r9, r10 to be preserved.
+    push qword [rel user_rsp_save]  ; Save user RSP on kernel stack
+    push rcx                        ; User RIP
+    push r11                        ; User RFLAGS
     push rbx
     push rbp
     push r12
     push r13
     push r14
     push r15
+    push r10
+    push r9
+    push r8
+    push rdx
+    push rsi
+    push rdi
 
-    ; Arguments for syscall_dispatch:
-    ; RDI = syscall_num (from RAX)
-    ; RSI = arg1 (already in RDI)
-    ; RDX = arg2 (already in RSI)
-    ; RCX = arg3 (already in RDX)
-    ; R8  = arg4 (from R10)
-    ; R9  = arg5 (already in R8)
-    ; stack = arg6 (from R9)
+    ; Marshal syscall args to System V ABI.
+    ; syscall_dispatch(n, a1, a2, a3, a4, a5, a6) takes its 7th argument
+    ; on the stack. Original user r9 was saved 32 bytes above rsp.
+    push qword [rsp + 32]  ; arg6
+    mov r9, r8      ; arg5 (was user's arg4)
+    mov r8, r10     ; arg4 (was user's arg3)
+    mov rcx, rdx    ; arg3
+    mov rdx, rsi    ; arg2
+    mov rsi, rdi    ; arg1
+    mov rdi, rax    ; syscall_num
 
-    ; Setup arguments in System V ABI order
-    mov r9, r8      ; arg5 = R8
-    mov r8, r10     ; arg4 = R10
-    mov rcx, rdx    ; arg3 = RDX
-    mov rdx, rsi    ; arg2 = RSI
-    mov rsi, rdi    ; arg1 = RDI
-    mov rdi, rax    ; syscall_num = RAX
-
-    ; Call C dispatcher
     call syscall_dispatch
+    add rsp, 8
 
-    ; RAX now contains return value
+    ; RAX = return value
 
-    ; Restore user registers
+    ; Restore user registers (reverse push order)
+    pop rdi
+    pop rsi
+    pop rdx
+    pop r8
+    pop r9
+    pop r10
     pop r15
     pop r14
     pop r13
     pop r12
     pop rbp
     pop rbx
-    pop r11         ; RFLAGS
-    pop rcx         ; Return RIP
+    pop r11         ; User RFLAGS
+    or r11, 0x200   ; Ensure IF=1 so interrupts work in userspace
+    pop rcx         ; User RIP
+    pop rsp         ; Restore user RSP directly
 
-    ; Return to userspace with SYSRET
-    ; (For now, use a simple return - SYSRET requires MSR setup)
-    ; TODO: Implement SYSRET when userspace is ready
-    jmp rcx         ; Jump back to user code
+    o64 sysret
+
+section .data
+align 8
+user_rsp_save:  dq 0
+; kernel_rsp_save is set by the kernel before entering usermode
+global kernel_rsp_save
+kernel_rsp_save: dq 0

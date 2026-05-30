@@ -1,0 +1,38 @@
+# Database Server MAC Policy
+# Defines security policy for a database server (PostgreSQL style)
+
+# Database can read/write its data directory
+allow db_t db_data_t:file { read write create delete append };
+
+# Database can bind to its port (5432 for PostgreSQL)
+allow db_t db_port_t:socket { bind listen accept };
+
+# Database can read configuration files
+allow db_t etc_t:file { read };
+
+# Database can write logs
+allow db_t log_t:file { write append create };
+
+# Database can create shared memory for IPC
+allow db_t db_t:shm { create read write destroy };
+
+# Database can use semaphores
+allow db_t db_t:sem { create read write destroy };
+
+# Database CANNOT access user files
+deny db_t home_t:file { read write };
+
+# Database CANNOT bind to HTTP ports
+deny db_t http_port_t:socket { bind };
+
+# Database CANNOT access shadow files
+deny db_t shadow_t:file { read write };
+
+# Database CANNOT execute arbitrary binaries
+deny db_t bin_t:file { execute };
+
+# Database processes can signal each other
+allow db_t db_t:process { signal };
+
+# Database CANNOT ptrace other processes
+deny db_t *:process { ptrace };

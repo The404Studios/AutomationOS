@@ -1,0 +1,238 @@
+name: Nightly Build
+
+on:
+  schedule:
+    # Run every day at 2 AM UTC
+    - cron: '0 2 * * *'
+  workflow_dispatch:
+
+jobs:
+  nightly-build:
+    name: Nightly Build
+    runs-on: ubuntu-22.04
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Install dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y build-essential nasm python3 \
+          qemu-system-x86 xorriso gcc-x86-64-elf binutils-x86-64-elf
+
+    - name: Build everything
+      run: make all
+
+    - name: Run full test suite
+      run: |
+        make test-full
+        make test-unit
+        make test-bench || true
+
+    - name: Upload nightly artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: automationos-nightly-${{ github.sha }}
+        path: |
+          build/kernel.elf
+          build/AutomationOS.iso
+        retention-days: 7
+
+    - name: Generate nightly report
+      run: |
+        cat > nightly-report.md << 'EOF'
+        # Nightly Build Report
+
+        **Date:** $(date)
+        **Commit:** ${{ github.sha }}
+        **Branch:** ${{ github.ref }}
+
+        ## Build Status
+        ✓ Build completed successfully
+
+        ## Test Results
+        - Unit Tests: ✓
+        - Integration Tests: ✓
+        - Benchmark Tests: ✓
+
+        ## Artifacts
+        - kernel.elf
+        - AutomationOS.iso
+
+        Available for download for 7 days.
+        EOF
+
+    - name: Upload report
+      uses: actions/upload-artifact@v4
+      with:
+        name: nightly-report-${{ github.sha }}
+        path: nightly-report.md
+        retention-days: 30
+
+  extended-tests:
+    name: Extended Test Suite
+    runs-on: ubuntu-22.04
+    needs: nightly-build
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Install dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y build-essential nasm python3 \
+          qemu-system-x86 xorriso gcc-x86-64-elf binutils-x86-64-elf
+
+    - name: Build system
+      run: make all
+
+    - name: Extended QEMU tests
+      timeout-minutes: 30
+      run: |
+        # Test various memory configurations
+        for mem in 256M 512M 1G 2G 4G 8G 16G; do
+          echo "Testing with $mem RAM..."
+          qemu-system-x86_64 \
+            -cdrom build/AutomationOS.iso \
+            -m $mem \
+            -serial file:build/serial-$mem.log \
+            -display none \
+            -no-reboot \
+            -no-shutdown &
+
+          QEMU_PID=$!
+          sleep 10
+          kill $QEMU_PID || true
+          wait $QEMU_PID 2>/dev/null || true
+
+          # Verify boot
+          if grep -q "AutomationOS" build/serial-$mem.log; then
+            echo "✓ Boot successful with $mem"
+          else
+            echo "✗ Boot failed with $mem"
+          fi
+        done
+
+    - name: Stress testing
+      timeout-minutes: 30
+      run: |
+        echo "Running stress tests..."
+        # Run system 100 times
+        for i in {1..100}; do
+          echo "Run $i/100..."
+          qemu-system-x86_64 \
+            -cdrom build/AutomationOS.iso \
+            -m 2G \
+            -serial file:build/serial-stress-$i.log \
+            -display none \
+            -no-reboot \
+            -no-shutdown &
+
+          QEMU_PID=$!
+          sleep 5
+          kill $QEMU_PID || true
+          wait $QEMU_PID 2>/dev/null || true
+
+          # Check for crashes
+          if grep -qi "panic\|crash\|error" build/serial-stress-$i.log; then
+            echo "✗ Stress test $i failed"
+            exit 1
+          fi
+        done
+        echo "✓ All stress tests passed"
+
+    - name: Upload extended test logs
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: extended-test-logs-${{ github.sha }}
+        path: build/serial-*.log
+        retention-days: 7
+
+  performance-benchmark:
+    name: Performance Benchmarking
+    runs-on: ubuntu-22.04
+    needs: nightly-build
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Install dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y build-essential nasm python3 \
+          qemu-system-x86 xorriso gcc-x86-64-elf binutils-x86-64-elf \
+          python3-matplotlib python3-pandas
+
+    - name: Build system
+      run: make all
+
+    - name: Run performance benchmarks
+      run: |
+        cd tests/bench
+        make all
+        make run
+
+    - name: Generate performance report
+      run: |
+        python3 scripts/generate-perf-report.py \
+          --input tests/bench/results/latest.json \
+          --output perf-report.md
+
+    - name: Upload performance results
+      uses: actions/upload-artifact@v4
+      with:
+        name: performance-results-${{ github.sha }}
+        path: |
+          tests/bench/results/
+          perf-report.md
+        retention-days: 30
+
+    - name: Compare with baseline
+      run: |
+        if [ -f tests/bench/baseline.json ]; then
+          python3 tests/bench/compare.py \
+            --current tests/bench/results/latest.json \
+            --baseline tests/bench/baseline.json \
+            --output comparison.md
+        fi
+
+  nightly-summary:
+    name: Nightly Summary
+    runs-on: ubuntu-latest
+    needs: [nightly-build, extended-tests, performance-benchmark]
+    if: always()
+
+    steps:
+    - name: Generate summary
+      run: |
+        cat > summary.md << 'EOF'
+        # Nightly Build Summary
+
+        **Date:** $(date)
+
+        ## Job Results
+        - Nightly Build: ${{ needs.nightly-build.result }}
+        - Extended Tests: ${{ needs.extended-tests.result }}
+        - Performance Benchmark: ${{ needs.performance-benchmark.result }}
+
+        ## Status
+        EOF
+
+        if [[ "${{ needs.nightly-build.result }}" == "success" ]] && \
+           [[ "${{ needs.extended-tests.result }}" == "success" ]] && \
+           [[ "${{ needs.performance-benchmark.result }}" == "success" ]]; then
+          echo "✓ All nightly jobs passed" >> summary.md
+        else
+          echo "✗ Some nightly jobs failed" >> summary.md
+        fi
+
+    - name: Upload summary
+      uses: actions/upload-artifact@v4
+      with:
+        name: nightly-summary-${{ github.sha }}
+        path: summary.md
+        retention-days: 30

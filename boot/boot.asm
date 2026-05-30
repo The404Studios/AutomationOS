@@ -1,5 +1,4 @@
 [BITS 64]
-[ORG 0x100000]
 
 global _start
 extern efi_main

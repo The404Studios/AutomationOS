@@ -1,0 +1,93 @@
+// AutomationOS Boot Sequence
+// Graphviz DOT format
+// Generate with: dot -Tsvg boot_sequence.dot -o ../boot_sequence.svg
+
+digraph BootSequence {
+    rankdir=TB;
+    node [shape=box, style="rounded,filled", fontname="Arial"];
+    graph [fontname="Arial", fontsize=12];
+    edge [fontname="Arial"];
+
+    // Power on
+    power [label="Power On", fillcolor="#FF8A65", shape=ellipse];
+
+    // UEFI firmware
+    uefi [label="UEFI Firmware\n• POST (Power-On Self-Test)\n• Initialize hardware\n• Load boot services", fillcolor="#FFB74D"];
+
+    // Boot manager
+    boot_mgr [label="UEFI Boot Manager\n• Read boot order\n• Locate EFI partition\n• Load AutoBoot.efi", fillcolor="#FFD54F"];
+
+    // AutoBoot stages
+    autoboot_entry [label="AutoBoot Entry\n(boot.asm)\n• Verify UEFI tables\n• Switch to long mode\n• Setup minimal GDT", fillcolor="#81C784"];
+
+    autoboot_loader [label="AutoBoot Loader\n(loader.c)\n• Parse memory map\n• Load kernel ELF\n• Setup page tables\n• Allocate kernel stack", fillcolor="#66BB6A"];
+
+    // Kernel initialization
+    kernel_entry [label="Kernel Entry\n(_start in boot.asm)\n• Setup kernel GDT/IDT\n• Initialize paging\n• Jump to kmain()", fillcolor="#42A5F5"];
+
+    kmain [label="kmain()\n(kernel.c)", fillcolor="#1E88E5"];
+
+    // Initialization phases
+    phase1 [label="Phase 1: Memory\n• PMM init (buddy allocator)\n• VMM init (paging)\n• Heap init (slab allocator)", fillcolor="#AB47BC"];
+
+    phase2 [label="Phase 2: Drivers\n• Serial console\n• Timer (PIT @ 1000 Hz)\n• PS/2 keyboard\n• Framebuffer", fillcolor="#8E24AA"];
+
+    phase3 [label="Phase 3: Scheduler\n• Initialize process table\n• Setup idle process\n• Enable timer interrupts", fillcolor="#5E35B1"];
+
+    phase4 [label="Phase 4: Syscalls\n• Register syscall handlers\n• Configure SYSCALL/SYSRET MSRs\n• Setup syscall stack", fillcolor="#3949AB"];
+
+    phase5 [label="Phase 5: Security\n• Initialize MAC policy\n• Setup seccomp filters\n• Enable audit logging", fillcolor="#1E88E5"];
+
+    phase6 [label="Phase 6: Userspace\n• Load init (/sbin/init)\n• Switch to ring 3\n• Schedule init process", fillcolor="#0277BD"];
+
+    // User init
+    init_proc [label="Init Process\n• Mount filesystems\n• Spawn shell\n• Reap zombies", fillcolor="#0097A7"];
+
+    shell [label="Shell Ready\n✓ System Booted", fillcolor="#00897B", shape=doubleoctagon];
+
+    // Flow
+    power -> uefi -> boot_mgr -> autoboot_entry -> autoboot_loader;
+    autoboot_loader -> kernel_entry [label="Jump to kernel"];
+    kernel_entry -> kmain;
+    kmain -> phase1 -> phase2 -> phase3 -> phase4 -> phase5 -> phase6;
+    phase6 -> init_proc [label="execve()"];
+    init_proc -> shell;
+
+    // Error paths
+    error1 [label="Boot Failure\n• Serial debug output\n• Halt with error code", fillcolor="#E57373", shape=octagon];
+
+    uefi -> error1 [label="No boot device", style=dashed, color=red];
+    autoboot_entry -> error1 [label="Invalid kernel", style=dashed, color=red];
+    kmain -> error1 [label="Panic", style=dashed, color=red];
+
+    // Timeline annotations
+    time1 [shape=plaintext, label="~100ms"];
+    time2 [shape=plaintext, label="~50ms"];
+    time3 [shape=plaintext, label="~10ms"];
+    time4 [shape=plaintext, label="~5ms"];
+
+    uefi -> time1 [style=invis];
+    autoboot_loader -> time2 [style=invis];
+    phase6 -> time3 [style=invis];
+    shell -> time4 [style=invis];
+
+    {rank=same; uefi; time1;}
+    {rank=same; autoboot_loader; time2;}
+    {rank=same; phase6; time3;}
+    {rank=same; shell; time4;}
+
+    // Legend
+    subgraph cluster_legend {
+        label="Boot Stages";
+        style=filled;
+        fillcolor="#FFFFFF";
+
+        leg_firmware [label="UEFI Firmware", fillcolor="#FFD54F"];
+        leg_bootloader [label="AutoBoot", fillcolor="#81C784"];
+        leg_kernel [label="Kernel Init", fillcolor="#42A5F5"];
+        leg_subsystems [label="Subsystems", fillcolor="#AB47BC"];
+        leg_userspace [label="Userspace", fillcolor="#0097A7"];
+
+        leg_firmware -> leg_bootloader -> leg_kernel -> leg_subsystems -> leg_userspace [style=invis];
+    }
+}

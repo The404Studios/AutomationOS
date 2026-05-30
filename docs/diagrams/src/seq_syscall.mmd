@@ -1,0 +1,76 @@
+%% AutomationOS System Call Sequence
+%% Mermaid Sequence Diagram
+%% Render with: mmdc -i seq_syscall.mmd -o ../seq_syscall.svg
+
+sequenceDiagram
+    participant User as Userspace<br/>(Ring 3)
+    participant Lib as libc
+    participant CPU as CPU<br/>(syscall instruction)
+    participant Entry as Syscall Entry<br/>(syscall.asm)
+    participant Dispatch as Syscall Dispatcher<br/>(syscall.c)
+    participant Handler as Syscall Handler<br/>(handlers.c)
+    participant Kernel as Kernel Subsystem<br/>(sched/mem/drivers)
+
+    Note over User,Kernel: Example: write(1, "Hello", 5)
+
+    User->>Lib: write(1, "Hello", 5)
+    activate Lib
+    Note over Lib: Prepare syscall:<br/>rax=SYS_WRITE<br/>rdi=fd, rsi=buf, rdx=count
+
+    Lib->>CPU: syscall instruction
+    deactivate Lib
+    activate CPU
+    Note over CPU: Hardware transition:<br/>• CPL 3 → 0 (ring 3 → 0)<br/>• RIP → IA32_LSTAR MSR<br/>• Save user RIP to RCX<br/>• Save RFLAGS to R11<br/>• Load kernel RSP
+
+    CPU->>Entry: Jump to syscall_entry
+    deactivate CPU
+    activate Entry
+    Note over Entry: Save user context:<br/>• Push all registers<br/>• Save user stack<br/>• Switch to kernel stack<br/>• Clear direction flag
+
+    Entry->>Dispatch: syscall_dispatch(rax, rdi, rsi, rdx, ...)
+    deactivate Entry
+    activate Dispatch
+
+    Note over Dispatch: Validate syscall number:<br/>if (rax >= MAX_SYSCALLS)<br/>  return -ENOSYS
+
+    Dispatch->>Dispatch: Lookup handler in table
+    Note over Dispatch: syscall_table[rax]
+
+    Dispatch->>Handler: sys_write(fd, buf, count)
+    activate Handler
+
+    Handler->>Handler: Validate arguments:<br/>• Check fd bounds<br/>• Validate user buffer<br/>• Check size limits
+
+    alt Invalid arguments
+        Handler-->>Dispatch: return -EINVAL
+    else Valid arguments
+        Handler->>Kernel: serial_write(buf, count)
+        activate Kernel
+        Note over Kernel: Write to serial port<br/>(or TTY buffer)
+        Kernel-->>Handler: return bytes_written
+        deactivate Kernel
+        Handler-->>Dispatch: return bytes_written
+    end
+    deactivate Handler
+
+    Dispatch->>Dispatch: Update audit log
+    Note over Dispatch: Log syscall:<br/>• PID, syscall number<br/>• Arguments, return value<br/>• Timestamp
+
+    Dispatch-->>Entry: return result in rax
+    deactivate Dispatch
+    activate Entry
+
+    Note over Entry: Restore user context:<br/>• Pop registers<br/>• Restore user stack
+
+    Entry->>CPU: sysretq instruction
+    deactivate Entry
+    activate CPU
+    Note over CPU: Hardware transition:<br/>• CPL 0 → 3 (ring 0 → 3)<br/>• RIP ← RCX (user RIP)<br/>• RFLAGS ← R11<br/>• Load user RSP
+
+    CPU-->>Lib: Return to userspace
+    deactivate CPU
+    activate Lib
+    Lib-->>User: return bytes_written
+    deactivate Lib
+
+    Note over User,Kernel: Total latency: ~500-1000 cycles<br/>(~0.2-0.5 μs on 2 GHz CPU)

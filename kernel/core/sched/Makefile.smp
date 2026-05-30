@@ -1,0 +1,26 @@
+# SMP Load Balancing Scheduler Makefile
+# ======================================
+#
+# Add this to your kernel/core/sched/Makefile or include it
+
+# Compiler and flags
+CC ?= gcc
+CFLAGS ?= -Wall -Wextra -O2 -ffreestanding -nostdlib -m64
+INCLUDES = -I../../include
+
+# SMP scheduler object
+SCHEDULER_SMP_OBJ = scheduler_smp.o
+
+# Build rule
+$(SCHEDULER_SMP_OBJ): scheduler_smp.c
+	$(CC) $(CFLAGS) $(INCLUDES) -c scheduler_smp.c -o $(SCHEDULER_SMP_OBJ)
+
+# Clean rule
+clean:
+	rm -f $(SCHEDULER_SMP_OBJ)
+
+# Install (copy to build directory)
+install: $(SCHEDULER_SMP_OBJ)
+	@echo "SMP scheduler built: $(SCHEDULER_SMP_OBJ)"
+
+.PHONY: clean install

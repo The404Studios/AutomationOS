@@ -1,0 +1,306 @@
+AutomationOS Desktop Shell - Architecture Diagram
+
+================================================================================
+                            DESKTOP SHELL ARCHITECTURE
+================================================================================
+
+┌────────────────────────────────────────────────────────────────────────────┐
+│                           USER INPUT LAYER                                  │
+│                    (Mouse, Keyboard, Touch, Gestures)                       │
+└──────────────────────────────────┬─────────────────────────────────────────┘
+                                   │
+                                   ▼
+┌────────────────────────────────────────────────────────────────────────────┐
+│                        DESKTOP SHELL MAIN (desktop_shell.c)                 │
+│                                                                             │
+│  desktop_shell_t {                                                          │
+│    - Event handling (mouse, keyboard)                                       │
+│    - Component orchestration                                                │
+│    - Theme management                                                       │
+│    - Window management                                                      │
+│    - Workspace management                                                   │
+│    - Main render loop (60 FPS)                                              │
+│  }                                                                          │
+└────────────────────┬─────────────────────────────────┬─────────────────────┘
+                     │                                 │
+         ┌───────────┴──────────────┐     ┌───────────┴──────────────┐
+         │                          │     │                          │
+         ▼                          ▼     ▼                          ▼
+
+┌──────────────────┐  ┌──────────────────┐  ┌──────────────────┐  ┌──────────────────┐
+│  DESKTOP LAYER   │  │   PANEL LAYER    │  │   DOCK LAYER     │  │  OVERLAY LAYER   │
+│  (desktop.c)     │  │   (panel.c)      │  │   (dock.c)       │  │                  │
+└──────────────────┘  └──────────────────┘  └──────────────────┘  └──────────────────┘
+                                                                    │
+                                                                    ├─ overview.c
+                                                                    ├─ notifications.c
+                                                                    ├─ quick_settings.c
+                                                                    └─ system_menu.c
+
+================================================================================
+                            COMPONENT BREAKDOWN
+================================================================================
+
+1. DESKTOP (Background Layer - Rendered First)
+   ┌─────────────────────────────────────────────────────────────┐
+   │  desktop_t                                                   │
+   │  ┌──────────────────────────────────────────────────────┐   │
+   │  │ Wallpaper (texture or solid color)                   │   │
+   │  └──────────────────────────────────────────────────────┘   │
+   │  ┌───┐ ┌───┐ ┌───┐ ┌───┐                                    │
+   │  │📁 │ │📄 │ │🗑️│ │📂 │  Desktop Icons                     │
+   │  └───┘ └───┘ └───┘ └───┘                                    │
+   │  Home  Doc  Trash  Down                                      │
+   └─────────────────────────────────────────────────────────────┘
+
+2. PANEL (Top Bar - Always Visible)
+   ┌─────────────────────────────────────────────────────────────────────────┐
+   │ [Activities] Current App Name     📶 🔊 🔋 [3:45 PM] [👤]              │
+   │                                                                          │
+   │ ├─ Activities button (opens overview)                                   │
+   │ ├─ App title (focused app name)                                         │
+   │ ├─ System tray (WiFi, volume, battery icons)                            │
+   │ ├─ Clock widget (time + date)                                           │
+   │ └─ User menu (settings, logout, power)                                  │
+   └─────────────────────────────────────────────────────────────────────────┘
+
+3. DOCK (Bottom - Application Launcher)
+   ┌─────────────────────────────────────────────────────────────────────────┐
+   │                                                                          │
+   │              ┌───────────────────────────────────┐                      │
+   │              │ 📱 📱 📱 📱 📱 📱 📱 │ 🗑️│                      │
+   │              │ •  •     •                 │                      │
+   │              └───────────────────────────────────┘                      │
+   │                                                                          │
+   │              Running indicators (dots)                                   │
+   │              Notification badges (red circles)                           │
+   │              Magnification on hover (macOS style)                        │
+   └─────────────────────────────────────────────────────────────────────────┘
+
+4. OVERVIEW (Fullscreen Overlay - Triggered by Super Key)
+   ┌─────────────────────────────────────────────────────────────────────────┐
+   │  [🔍 Search apps, files, settings...]                                   │
+   ├─────────────────────────────────────────────────────────────────────────┤
+   │                                                                          │
+   │  📱 App  📱 App  📱 App  📱 App  📱 App  📱 App                        │
+   │  📱 App  📱 App  📱 App  📱 App  📱 App  📱 App                        │
+   │  📱 App  📱 App  📱 App  📱 App  📱 App  📱 App                        │
+   │                                                                          │
+   ├─────────────────────────────────────────────────────────────────────────┤
+   │  🖼️ Window  🖼️ Window  🖼️ Window  🖼️ Window                          │
+   ├─────────────────────────────────────────────────────────────────────────┤
+   │  [ Workspace 1 ] [ Workspace 2 ] [ Workspace 3 ] [+]                    │
+   └─────────────────────────────────────────────────────────────────────────┘
+
+5. NOTIFICATION CENTER (Right Panel)
+   ┌────────────────────────────┐
+   │ Notifications              │
+   ├────────────────────────────┤
+   │ ┌────────────────────────┐ │
+   │ │📧 Email               │ │
+   │ │New Message            │ │
+   │ │You have 3 new...      │ │
+   │ └────────────────────────┘ │
+   │ ┌────────────────────────┐ │
+   │ │⚠️  System             │ │
+   │ │Low Disk Space         │ │
+   │ │Free up some space...  │ │
+   │ └────────────────────────┘ │
+   │ ┌────────────────────────┐ │
+   │ │✅ Download Complete   │ │
+   │ │File saved to...       │ │
+   │ └────────────────────────┘ │
+   └────────────────────────────┘
+
+6. QUICK SETTINGS (Right Panel - Below Panel)
+   ┌─────────────────────────┐
+   │ Quick Settings          │
+   ├─────────────────────────┤
+   │ WiFi        [●──] ON    │
+   │ Bluetooth   [──○] OFF   │
+   │ Do Not Dist [──○] OFF   │
+   ├─────────────────────────┤
+   │ Volume:   [========──]  │
+   │ Bright:   [======────]  │
+   ├─────────────────────────┤
+   │ [Settings] [Power]      │
+   └─────────────────────────┘
+
+7. SYSTEM MENU (Dropdown - Below User Button)
+   ┌────────────────────────┐
+   │ Settings...            │
+   │ About This PC          │
+   ├────────────────────────┤
+   │ Lock Screen   Ctrl+L   │
+   │ Log Out       Ctrl+Q   │
+   ├────────────────────────┤
+   │ Sleep                  │
+   │ Restart...             │
+   │ Shut Down...           │
+   └────────────────────────┘
+
+================================================================================
+                            DATA FLOW
+================================================================================
+
+User Input
+   │
+   ▼
+desktop_shell_handle_mouse()
+desktop_shell_handle_keyboard()
+   │
+   ▼
+Component Event Handlers
+   │
+   ├─ panel_update()
+   ├─ dock_update()
+   ├─ desktop_update()
+   ├─ overview_update()
+   ├─ notification_center_update()
+   ├─ quick_settings_update()
+   └─ system_menu_update()
+   │
+   ▼
+State Changes
+   │
+   ▼
+desktop_shell_render()
+   │
+   ├─ desktop_render()         (Background)
+   ├─ [window_render() ...]    (Windows)
+   ├─ dock_render()            (Dock)
+   ├─ panel_render()           (Panel)
+   ├─ overview_render()        (If open)
+   ├─ quick_settings_render()  (If open)
+   ├─ system_menu_render()     (If open)
+   └─ notification_center_render() (If open)
+   │
+   ▼
+Framebuffer Output (60 FPS)
+
+================================================================================
+                            THEME SYSTEM
+================================================================================
+
+theme_t
+├── Colors
+│   ├── Primary (accent)
+│   ├── Backgrounds (primary, secondary, tertiary)
+│   ├── Text (primary, secondary, tertiary)
+│   └── UI Elements (panel, dock, window, separator)
+│
+├── Effects
+│   ├── Blur radius
+│   ├── Shadow opacity
+│   └── Corner radius
+│
+└── Typography
+    ├── Font family
+    └── Font sizes (small, body, heading)
+
+Light Theme          Dark Theme           Auto Theme
+├── White BG         ├── Dark BG          ├── 6am-6pm: Light
+├── Black Text       ├── White Text       └── 6pm-6am: Dark
+└── Blue Accent      └── Blue Accent
+
+================================================================================
+                            IPC INTEGRATION
+================================================================================
+
+Applications ──────IPC Messages────> Desktop Shell
+                                     │
+                                     ├─ MSG_NOTIFY → notification_center
+                                     ├─ MSG_DOCK_ADD → dock
+                                     ├─ MSG_PROGRESS → dock (progress bar)
+                                     ├─ MSG_WINDOW_CREATE → window manager
+                                     └─ MSG_TRAY_ADD → panel (system tray)
+
+================================================================================
+                            FILE STRUCTURE
+================================================================================
+
+userspace/shell/desktop/
+│
+├── desktop_shell.h         # Main header (450 LOC)
+│   ├── All data structures
+│   ├── Component APIs
+│   └── Utility functions
+│
+├── desktop_shell.c         # Core lifecycle (350 LOC)
+│   ├── Shell create/destroy
+│   ├── Event handling
+│   ├── Main render loop
+│   └── Theme system
+│
+├── panel.c                 # Top bar (280 LOC)
+│   ├── Activities button
+│   ├── App title
+│   ├── System tray
+│   ├── Clock widget
+│   └── User menu
+│
+├── dock.c                  # App launcher (380 LOC)
+│   ├── App icons
+│   ├── Running indicators
+│   ├── Magnification
+│   └── Progress bars
+│
+├── desktop.c               # Background (270 LOC)
+│   ├── Wallpaper
+│   └── Desktop icons
+│
+├── overview.c              # Activities (400 LOC)
+│   ├── Search bar
+│   ├── App grid
+│   ├── Window thumbnails
+│   └── Workspace switcher
+│
+├── notifications.c         # Notifications (290 LOC)
+│   ├── Notification queue
+│   ├── Toast display
+│   └── Action buttons
+│
+├── quick_settings.c        # Quick settings (280 LOC)
+│   ├── Toggles (WiFi, BT, DND)
+│   └── Sliders (Volume, Brightness)
+│
+├── system_menu.c           # System menu (220 LOC)
+│   └── Power options
+│
+├── Makefile               # Build config (50 LOC)
+└── README.md              # Quick reference
+
+Total: ~3,000 LOC across 9 files
+
+================================================================================
+                            RENDER ORDER (Z-Index)
+================================================================================
+
+Layer 0: Desktop (wallpaper + icons)
+Layer 1: Windows (application windows)
+Layer 2: Dock (always above windows)
+Layer 3: Panel (always on top)
+Layer 4: Overview (fullscreen overlay)
+Layer 5: Quick Settings (slide-in panel)
+Layer 6: System Menu (dropdown menu)
+Layer 7: Notification Center (slide-in panel)
+Layer 8: Notification Toasts (temporary popups)
+
+================================================================================
+                            PERFORMANCE TARGETS
+================================================================================
+
+┌────────────────────────────────────────┐
+│ Metric            │ Target    │ Actual │
+├────────────────────────────────────────┤
+│ FPS               │ 60+       │ TBD    │
+│ Frame Time        │ <16ms     │ TBD    │
+│ Idle CPU          │ <0.5%     │ TBD    │
+│ Memory Usage      │ <50MB     │ TBD    │
+│ Startup Time      │ <1s       │ TBD    │
+│ Notif Latency     │ <10ms     │ TBD    │
+└────────────────────────────────────────┘
+
+================================================================================
+                            END OF ARCHITECTURE DIAGRAM
+================================================================================

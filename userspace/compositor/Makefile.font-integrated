@@ -1,0 +1,35 @@
+# userspace/compositor/Makefile - Compositor with font integration
+# Updated to link with libfont
+
+CC = gcc
+LD = ld
+
+CFLAGS = -ffreestanding -nostdlib -fno-builtin -fno-stack-protector \
+         -fno-pic -fno-pie -mno-red-zone -Wall -Wextra -O2 -std=gnu11 \
+         -I../../include
+
+LDFLAGS = -nostdlib -static -n -no-pie -L../../lib -lfont -lm
+
+BUILD_DIR = ../../build/userspace/compositor
+
+# Source files (add font integration)
+SOURCES = minimal.c font_integration.c
+
+OBJECTS = $(SOURCES:%.c=$(BUILD_DIR)/%.o)
+
+all: $(BUILD_DIR)/compositor
+
+$(BUILD_DIR):
+	mkdir -p $(BUILD_DIR)
+
+$(BUILD_DIR)/%.o: %.c | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/compositor: $(OBJECTS) | $(BUILD_DIR)
+	$(LD) $(LDFLAGS) -e _start -T../userspace.ld $(OBJECTS) -o $@
+	@echo "Built: $@ (with font integration)"
+
+clean:
+	rm -f $(BUILD_DIR)/*.o $(BUILD_DIR)/compositor
+
+.PHONY: all clean

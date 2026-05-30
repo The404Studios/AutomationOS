@@ -1,0 +1,62 @@
+# Makefile snippet for namespace subsystem
+# Include this in the main kernel Makefile
+
+# Namespace source files
+NAMESPACE_SRC = \
+	kernel/security/namespace.c \
+	kernel/core/namespace/ns_pid.c \
+	kernel/core/namespace/ns_mount.c \
+	kernel/core/namespace/ns_net.c \
+	kernel/core/namespace/ns_ipc.c \
+	kernel/core/namespace/ns_uts.c
+
+# Namespace object files
+NAMESPACE_OBJ = $(NAMESPACE_SRC:.c=.o)
+
+# Add to kernel objects
+KERNEL_OBJ += $(NAMESPACE_OBJ)
+
+# Test files
+NAMESPACE_TEST_SRC = tests/unit/test_namespace.c
+NAMESPACE_TEST_OBJ = $(NAMESPACE_TEST_SRC:.c=.o)
+
+# Integration tests
+NAMESPACE_INTEGRATION_TEST = tests/integration/test_container_isolation.py
+
+# Example
+NAMESPACE_EXAMPLE_SRC = examples/namespace_demo.c
+NAMESPACE_EXAMPLE_OBJ = $(NAMESPACE_EXAMPLE_SRC:.c=.o)
+
+# Build rules
+$(NAMESPACE_OBJ): %.o: %.c
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(NAMESPACE_TEST_OBJ): %.o: %.c
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(NAMESPACE_EXAMPLE_OBJ): %.o: %.c
+	$(CC) $(CFLAGS) -c $< -o $@
+
+# Test targets
+.PHONY: test-namespace
+test-namespace: $(NAMESPACE_TEST_OBJ)
+	@echo "Running namespace unit tests..."
+	$(CC) $(LDFLAGS) $(NAMESPACE_TEST_OBJ) $(KERNEL_OBJ) -o test_namespace
+	./test_namespace
+
+.PHONY: test-namespace-integration
+test-namespace-integration:
+	@echo "Running namespace integration tests..."
+	python3 $(NAMESPACE_INTEGRATION_TEST)
+
+.PHONY: namespace-demo
+namespace-demo: $(NAMESPACE_EXAMPLE_OBJ) $(KERNEL_OBJ)
+	@echo "Building namespace demo..."
+	$(CC) $(LDFLAGS) $(NAMESPACE_EXAMPLE_OBJ) $(KERNEL_OBJ) -o namespace_demo
+	./namespace_demo
+
+# Clean
+.PHONY: clean-namespace
+clean-namespace:
+	rm -f $(NAMESPACE_OBJ) $(NAMESPACE_TEST_OBJ) $(NAMESPACE_EXAMPLE_OBJ)
+	rm -f test_namespace namespace_demo

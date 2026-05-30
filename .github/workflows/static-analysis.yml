@@ -1,0 +1,203 @@
+name: Static Analysis
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main, develop ]
+  schedule:
+    # Weekly comprehensive scan every Monday at 00:00 UTC
+    - cron: '0 0 * * 1'
+
+jobs:
+  static-analysis:
+    name: Static Analysis Suite
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v3
+      with:
+        fetch-depth: 0  # Full history for trend analysis
+
+    - name: Install dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y \
+          clang \
+          clang-tools \
+          clang-tidy \
+          cppcheck \
+          sparse \
+          python3 \
+          python3-pip
+
+    - name: Install cross-compiler toolchain
+      run: |
+        sudo apt-get install -y \
+          gcc-x86-64-elf \
+          binutils-x86-64-elf || \
+        echo "Warning: x86_64-elf toolchain not available, using native gcc"
+
+    - name: Create analysis directory
+      run: mkdir -p build/static-analysis
+
+    - name: Run Clang Static Analyzer
+      continue-on-error: true
+      run: make analyze || true
+
+    - name: Run Cppcheck
+      continue-on-error: true
+      run: make cppcheck || true
+
+    - name: Run Sparse
+      continue-on-error: true
+      run: make sparse || true
+
+    - name: Run Clang-Tidy
+      continue-on-error: true
+      run: make clang-tidy || true
+
+    - name: Generate analysis report
+      run: |
+        python3 scripts/static-analysis/generate-report.py
+        cat build/static-analysis/summary.txt
+
+    - name: Upload analysis results
+      uses: actions/upload-artifact@v3
+      with:
+        name: static-analysis-results
+        path: |
+          build/static-analysis/
+          !build/static-analysis/cache/
+        retention-days: 30
+
+    - name: Check for critical issues
+      run: |
+        # Fail build if critical issues found
+        if grep -q "Critical: [1-9]" build/static-analysis/summary.txt; then
+          echo "❌ FAILED: Critical issues found"
+          cat build/static-analysis/summary.txt
+          exit 1
+        else
+          echo "✅ PASSED: No critical issues"
+        fi
+
+    - name: Comment PR with results
+      if: github.event_name == 'pull_request'
+      uses: actions/github-script@v6
+      with:
+        script: |
+          const fs = require('fs');
+          const summary = fs.readFileSync('build/static-analysis/summary.txt', 'utf8');
+
+          const body = `## 🔍 Static Analysis Results
+
+          ${summary}
+
+          <details>
+          <summary>View detailed results</summary>
+
+          Download the \`static-analysis-results\` artifact from this workflow run for detailed logs.
+
+          </details>
+          `;
+
+          github.rest.issues.createComment({
+            issue_number: context.issue.number,
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            body: body
+          });
+
+  incremental-analysis:
+    name: Incremental Analysis (Changed Files Only)
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v3
+      with:
+        fetch-depth: 0
+
+    - name: Install analysis tools
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y clang cppcheck sparse
+
+    - name: Get changed C files
+      id: changed-files
+      run: |
+        git diff --name-only origin/${{ github.base_ref }}...HEAD | \
+          grep '\.c$' > changed_files.txt || echo "No C files changed"
+        cat changed_files.txt
+
+    - name: Analyze changed files
+      run: |
+        if [ -s changed_files.txt ]; then
+          echo "Analyzing changed files..."
+          cat changed_files.txt | while read file; do
+            if [ -f "$file" ]; then
+              echo "=== Analyzing $file ==="
+              cppcheck --enable=all --quiet "$file" || true
+              sparse -D__KERNEL__ -I kernel/include "$file" 2>&1 || true
+            fi
+          done | tee incremental-analysis.log
+        else
+          echo "No C files changed"
+        fi
+
+    - name: Upload incremental results
+      uses: actions/upload-artifact@v3
+      with:
+        name: incremental-analysis
+        path: incremental-analysis.log
+
+  weekly-scan:
+    name: Weekly Comprehensive Scan
+    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule'
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v3
+      with:
+        fetch-depth: 0
+
+    - name: Install all analysis tools
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y \
+          clang clang-tools clang-tidy \
+          cppcheck sparse \
+          python3 python3-pip \
+          lcov
+
+    - name: Run weekly comprehensive scan
+      run: make analyze-weekly
+
+    - name: Upload weekly report
+      uses: actions/upload-artifact@v3
+      with:
+        name: weekly-scan-report
+        path: build/static-analysis/weekly/
+        retention-days: 90
+
+    - name: Create issue for critical findings
+      if: failure()
+      uses: actions/github-script@v6
+      with:
+        script: |
+          const fs = require('fs');
+          const reportPath = 'build/static-analysis/weekly/report-' +
+            new Date().toISOString().split('T')[0] + '.txt';
+          const report = fs.readFileSync(reportPath, 'utf8');
+
+          github.rest.issues.create({
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            title: `🚨 Weekly Static Analysis: Critical Issues Found`,
+            body: `Weekly static analysis scan found critical issues:\n\n\`\`\`\n${report}\n\`\`\`\n\nPlease review and address these issues.`,
+            labels: ['static-analysis', 'bug', 'critical']
+          });

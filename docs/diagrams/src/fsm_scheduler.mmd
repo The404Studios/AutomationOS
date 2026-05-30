@@ -1,0 +1,97 @@
+%% AutomationOS Scheduler State Machine
+%% Mermaid State Diagram
+
+stateDiagram-v2
+    [*] --> Idle: scheduler_init()
+
+    state Idle {
+        [*] --> WaitingTimerIRQ
+        note right of WaitingTimerIRQ
+            No processes ready
+            • CPU in HLT state
+            • Waiting for interrupt
+            • Lowest power mode
+        end note
+    }
+
+    Idle --> Scheduling: Timer IRQ (schedule())
+
+    state Scheduling {
+        [*] --> CheckCurrentProcess
+
+        CheckCurrentProcess --> DecrementTimeSlice: Current process running
+        CheckCurrentProcess --> SelectNext: No current process
+
+        DecrementTimeSlice --> CheckTimeSliceExpired
+
+        CheckTimeSliceExpired --> ResetTimeSlice: Time slice = 0
+        CheckTimeSliceExpired --> ContinueCurrent: Time slice > 0
+
+        ResetTimeSlice --> MarkCurrentReady
+        MarkCurrentReady --> SelectNext
+
+        SelectNext --> CheckReadyQueue
+
+        CheckReadyQueue --> PickNextProcess: Queue not empty
+        CheckReadyQueue --> [*]: Queue empty (return to Idle)
+
+        PickNextProcess --> ValidateProcess
+
+        ValidateProcess --> SkipProcess: Process BLOCKED/TERMINATED
+        ValidateProcess --> ContextSwitch: Process READY
+
+        SkipProcess --> SelectNext: Try next in queue
+
+        ContextSwitch --> SaveCurrentContext
+        SaveCurrentContext --> LoadNextContext
+        LoadNextContext --> UpdateSchedulerState
+        UpdateSchedulerState --> [*]: Return to execution
+
+        ContinueCurrent --> [*]: Keep running current
+    }
+
+    Scheduling --> Executing: Context switch complete
+
+    state Executing {
+        [*] --> RunningProcess
+        note right of RunningProcess
+            Process executing
+            • User or kernel mode
+            • Time slice counting down
+            • Waiting for next timer IRQ
+        end note
+    }
+
+    Executing --> Scheduling: Timer IRQ (next schedule())
+    Executing --> Idle: Last process exits
+
+    note left of Scheduling
+        Scheduler Algorithm: Round-Robin
+        • Time slice: 10ms (10 ticks)
+        • No priority levels (Phase 1)
+        • Fair share of CPU time
+        • Simple FIFO queue
+    end note
+
+    note right of Scheduling
+        Scheduling decision factors:
+        • Process state (READY only)
+        • Time slice remaining
+        • Queue position
+        • No starvation (all processes scheduled)
+    end note
+
+    state SchedulerMetrics {
+        state "Context Switches/sec" as cs
+        state "Average Wait Time" as awt
+        state "CPU Utilization" as cpu
+        state "Idle Time %" as idle
+    }
+
+    note right of SchedulerMetrics
+        Performance Metrics:
+        • Context switch rate: ~100-1000/sec
+        • Switch overhead: ~1-2 μs
+        • Scheduler overhead: ~0.1-0.5%
+        • Throughput: ~1000 processes/sec
+    end note

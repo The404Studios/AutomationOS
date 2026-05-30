@@ -27,42 +27,44 @@ The bootloader passes this structure to the kernel:
 typedef struct {
     memory_map_entry_t* memory_map;  // Physical memory regions
     uint32_t memory_map_count;       // Number of entries
-    void* framebuffer_addr;          // Linear framebuffer address
+    uint64_t framebuffer_addr;       // Linear framebuffer address
+    uint64_t framebuffer_size;       // Framebuffer size in bytes
     uint32_t framebuffer_width;      // Width in pixels
     uint32_t framebuffer_height;     // Height in pixels
     uint32_t framebuffer_pitch;      // Bytes per scanline
+    uint32_t pixels_per_scanline;    // Pixels per scanline
     void* kernel_entry;              // Kernel entry point
 } boot_info_t;
 ```
 
-## Current Implementation Status
+## Implementation Status
 
-### ✅ Completed
+### ✅ Phase 1: COMPLETE (2026-05-26)
 
-- Boot info header structures
-- UEFI entry point assembly
-- Basic C loader skeleton
-- memset utility function
-- Kernel entry jump mechanism
-- Build system (Makefile + linker script)
+**All bootloader functionality implemented and ready for production:**
 
-### 🚧 TODO (Marked in code)
+- ✅ Boot info header structures
+- ✅ UEFI entry point assembly
+- ✅ Full UEFI protocol implementations
+- ✅ UEFI memory map query and conversion
+- ✅ Graphics Output Protocol (GOP) setup
+- ✅ ELF kernel loading from ESP
+- ✅ ELF64 parsing and segment loading
+- ✅ Boot services exit and kernel handoff
+- ✅ Error handling and retry logic
+- ✅ memset/memcpy utility functions
+- ✅ Build system (Makefile + linker script)
+- ✅ Testing scripts and documentation
 
-1. **Get memory map from UEFI** (`loader.c:34`)
-   - Call `EFI_BOOT_SERVICES->GetMemoryMap()`
-   - Convert UEFI memory descriptors to our format
-   - Mark usable vs reserved regions
+**Key Features:**
+- Queries UEFI for complete system memory map
+- Configures framebuffer via Graphics Output Protocol
+- Loads 64-bit ELF kernels from disk
+- Properly exits UEFI boot services
+- Passes comprehensive boot_info to kernel
 
-2. **Setup graphics mode** (`loader.c:42`)
-   - Query EFI Graphics Output Protocol (GOP)
-   - Set desired resolution (or detect best available)
-   - Get framebuffer address and format
-
-3. **Load kernel from disk** (`loader.c:48`)
-   - Use EFI Simple File System Protocol
-   - Read kernel ELF binary from `\boot\kernel.elf`
-   - Parse ELF headers and load segments to memory
-   - Resolve kernel entry point address
+See `IMPLEMENTATION.md` for detailed technical documentation.
+See `VERIFICATION.md` for testing and verification procedures.
 
 ## Building
 
@@ -79,26 +81,86 @@ Output: `../build/BOOTX64.EFI`
 
 ## Testing
 
-Place `BOOTX64.EFI` in the ESP (EFI System Partition) at:
-```
-/EFI/BOOT/BOOTX64.EFI
+### Quick Test (QEMU with OVMF)
+
+```bash
+./test-qemu.sh
 ```
 
-Or in ISO structure:
+### Manual Testing
+
+Place `BOOTX64.EFI` and `KERNEL.ELF` in the ESP (EFI System Partition):
 ```
-iso/
+ESP/
 └── EFI/
     └── BOOT/
-        └── BOOTX64.EFI
+        ├── BOOTX64.EFI  (bootloader)
+        └── KERNEL.ELF   (kernel)
 ```
 
-## Next Steps
+Boot in UEFI mode (not Legacy/CSM).
 
-1. Implement UEFI service calls (memory map, GOP, file system)
-2. Add ELF loader to properly load kernel segments
-3. Setup identity mapping for kernel entry
-4. Add error handling and diagnostic output
-5. Test with OVMF (UEFI firmware for QEMU)
+### Expected Output
+
+```
+AutomationOS UEFI Bootloader
+=============================
+[1/4] Querying memory map...
+  Memory map acquired: N usable regions
+[2/4] Setting up graphics...
+  Graphics mode: WxH
+[3/4] Loading kernel...
+  Kernel size: NNNN bytes
+  Kernel loaded
+[4/4] Parsing ELF...
+  Entry point: 0xXXXXXXXXXXXXXXXX
+
+Exiting boot services...
+[Kernel takes over]
+```
+
+## Implementation Details
+
+### UEFI Protocols Used
+- **EFI_BOOT_SERVICES:** Memory allocation, protocol location
+- **EFI_GRAPHICS_OUTPUT_PROTOCOL:** Display mode configuration
+- **EFI_SIMPLE_FILE_SYSTEM_PROTOCOL:** Disk access
+- **EFI_FILE_PROTOCOL:** File I/O operations
+- **EFI_LOADED_IMAGE_PROTOCOL:** Boot device information
+
+### Memory Map
+- Queries UEFI memory map via GetMemoryMap()
+- Filters for EfiConventionalMemory (usable RAM)
+- Converts to simplified boot_info format
+- Handles two-phase allocation pattern
+
+### Graphics Setup
+- Locates Graphics Output Protocol
+- Extracts current mode information
+- Captures framebuffer base address
+- Falls back to safe defaults if GOP unavailable
+
+### ELF Loading
+- Accesses boot device filesystem
+- Reads kernel from \EFI\BOOT\KERNEL.ELF
+- Validates ELF64 magic and headers
+- Loads PT_LOAD segments to memory
+- Zero-initializes BSS sections
+- Extracts entry point address
+
+### Boot Handoff
+- Exits UEFI boot services (with retry)
+- Disables UEFI interrupts
+- Jumps to kernel entry point
+- Passes boot_info via RDI (System V ABI)
+
+## Next Steps (Phase 2)
+
+1. ✅ Bootloader complete - proceed to kernel initialization
+2. Kernel should validate boot_info
+3. Initialize memory management with provided map
+4. Initialize framebuffer driver with GOP info
+5. Set up proper page tables (UEFI's are temporary)
 
 ## References
 

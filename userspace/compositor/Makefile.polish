@@ -1,0 +1,70 @@
+# AutomationOS Graphics & Animation Polish - Build System
+
+CC = gcc
+CFLAGS = -Wall -Wextra -O2 -std=c11
+LDFLAGS = -lm -lGL -lGLESv2 -lEGL -ldrm
+
+# Source files
+PERF_SOURCES = performance.c
+SHADOW_SOURCES = shadow_system.c
+BLUR_SOURCES = blur_effects.c
+SCROLL_SOURCES = ../lib/ui/smooth_scroll.c
+COMPOSITOR_SOURCES = compositor.c animations.c effects.c gpu.c
+
+# Object files
+PERF_OBJS = $(PERF_SOURCES:.c=.o)
+SHADOW_OBJS = $(SHADOW_SOURCES:.c=.o)
+BLUR_OBJS = $(BLUR_SOURCES:.c=.o)
+SCROLL_OBJS = $(SCROLL_SOURCES:.c=.o)
+COMPOSITOR_OBJS = $(COMPOSITOR_SOURCES:.c=.o)
+
+# Demo executable
+DEMO = polish_demo
+
+all: $(DEMO)
+
+$(DEMO): polish_demo.o $(PERF_OBJS) $(SHADOW_OBJS) $(BLUR_OBJS) $(SCROLL_OBJS) $(COMPOSITOR_OBJS)
+	@echo "🔗 Linking $@..."
+	$(CC) -o $@ $^ $(LDFLAGS)
+	@echo "✓ Build complete: $@"
+
+%.o: %.c
+	@echo "🔨 Compiling $<..."
+	$(CC) $(CFLAGS) -c $< -o $@
+
+clean:
+	@echo "🧹 Cleaning build artifacts..."
+	rm -f $(DEMO) *.o ../lib/ui/*.o
+	@echo "✓ Clean complete"
+
+test: $(DEMO)
+	@echo "🚀 Running graphics polish demo..."
+	./$(DEMO)
+
+benchmark: $(DEMO)
+	@echo "📊 Running 60-second benchmark..."
+	./$(DEMO) --benchmark --duration=60
+
+check-fps: $(DEMO)
+	@echo "📈 FPS validation test (10 seconds)..."
+	./$(DEMO) --duration=10 | grep "FPS:"
+
+.PHONY: all clean test benchmark check-fps
+
+# Build info
+info:
+	@echo "AutomationOS Graphics & Animation Polish"
+	@echo "========================================"
+	@echo "Components:"
+	@echo "  - Performance Monitoring (FPS tracking)"
+	@echo "  - Shadow System (5 levels, Material Design 3)"
+	@echo "  - Blur Effects (Gaussian, Box, Kawase)"
+	@echo "  - Smooth Scrolling (Kinetic physics)"
+	@echo "  - Animation System (30+ easing functions)"
+	@echo ""
+	@echo "Build targets:"
+	@echo "  make all        - Build demo"
+	@echo "  make test       - Run demo (30 seconds)"
+	@echo "  make benchmark  - Run 60-second benchmark"
+	@echo "  make check-fps  - Quick FPS validation"
+	@echo "  make clean      - Clean build artifacts"

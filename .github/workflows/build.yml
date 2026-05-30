@@ -1,0 +1,252 @@
+name: Build
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main, develop ]
+  workflow_dispatch:
+
+env:
+  QEMU_VERSION: 8.2.0
+
+jobs:
+  build-linux:
+    name: Build on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, ubuntu-24.04]
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Cache cross-compiler
+      id: cache-toolchain
+      uses: actions/cache@v4
+      with:
+        path: |
+          /opt/cross
+          ~/.cache/cross-compiler
+        key: ${{ runner.os }}-cross-compiler-x86_64-elf-gcc-13.2.0
+
+    - name: Install dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y build-essential nasm python3 python3-pip \
+          qemu-system-x86 xorriso mtools genisoimage libgmp-dev libmpfr-dev \
+          libmpc-dev texinfo bison flex
+
+    - name: Install or build cross-compiler
+      if: steps.cache-toolchain.outputs.cache-hit != 'true'
+      run: |
+        # Try to install from package manager first
+        if sudo apt-get install -y gcc-x86-64-elf binutils-x86-64-elf 2>/dev/null; then
+          echo "Cross-compiler installed from package manager"
+        else
+          echo "Building cross-compiler from source..."
+          bash scripts/setup-toolchain.sh --prefix=/opt/cross --ci
+        fi
+
+    - name: Add cross-compiler to PATH
+      run: |
+        echo "/opt/cross/bin" >> $GITHUB_PATH
+        echo "$HOME/.local/bin" >> $GITHUB_PATH
+
+    - name: Verify toolchain
+      run: |
+        x86_64-elf-gcc --version
+        x86_64-elf-ld --version
+        nasm --version
+        qemu-system-x86_64 --version
+
+    - name: Clean build
+      run: make clean || true
+
+    - name: Build bootloader
+      run: make bootloader
+
+    - name: Build kernel
+      run: make kernel
+
+    - name: Build userspace
+      run: make userspace || true
+
+    - name: Build ISO
+      run: make iso
+
+    - name: Verify build artifacts
+      run: |
+        ls -lh build/
+        test -f build/kernel.elf
+        test -f build/AutomationOS.iso
+        echo "Build artifacts verified successfully"
+
+    - name: Upload build artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: automationos-${{ matrix.os }}-${{ github.sha }}
+        path: |
+          build/kernel.elf
+          build/AutomationOS.iso
+          build/boot.bin
+        retention-days: 30
+
+    - name: Upload ISO for release
+      if: startsWith(github.ref, 'refs/tags/')
+      uses: actions/upload-artifact@v4
+      with:
+        name: automationos-iso-${{ matrix.os }}
+        path: build/AutomationOS.iso
+        retention-days: 90
+
+  build-macos:
+    name: Build on macOS
+    runs-on: macos-latest
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Cache Homebrew packages
+      uses: actions/cache@v4
+      with:
+        path: |
+          ~/Library/Caches/Homebrew
+          /usr/local/Cellar/x86_64-elf-gcc
+          /usr/local/Cellar/x86_64-elf-binutils
+        key: ${{ runner.os }}-homebrew-${{ hashFiles('scripts/setup-toolchain.sh') }}
+
+    - name: Install dependencies
+      run: |
+        brew update
+        brew install nasm python qemu xorriso
+
+        # Install cross-compiler
+        brew tap messense/macos-cross-toolchains
+        brew install x86_64-elf-gcc x86_64-elf-binutils || \
+          bash scripts/setup-toolchain.sh --prefix=/usr/local --ci
+
+    - name: Verify toolchain
+      run: |
+        x86_64-elf-gcc --version
+        x86_64-elf-ld --version
+        nasm --version
+        qemu-system-x86_64 --version
+
+    - name: Build all
+      run: make all
+
+    - name: Verify build artifacts
+      run: |
+        ls -lh build/
+        test -f build/kernel.elf
+        test -f build/AutomationOS.iso
+
+    - name: Upload build artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: automationos-macos-${{ github.sha }}
+        path: |
+          build/kernel.elf
+          build/AutomationOS.iso
+        retention-days: 30
+
+  build-wsl2:
+    name: Build on WSL2 (Ubuntu)
+    runs-on: windows-latest
+
+    steps:
+    - name: Enable WSL2
+      run: |
+        wsl --install -d Ubuntu-22.04
+        wsl --set-default-version 2
+
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Setup WSL2 environment
+      run: |
+        wsl sudo apt-get update
+        wsl sudo apt-get install -y build-essential nasm python3 qemu-system-x86 xorriso
+
+    - name: Install cross-compiler in WSL2
+      run: |
+        wsl sudo apt-get install -y gcc-x86-64-elf binutils-x86-64-elf || \
+          wsl bash scripts/setup-toolchain.sh --ci
+
+    - name: Build in WSL2
+      run: wsl make all
+
+    - name: Verify build artifacts
+      run: wsl test -f build/kernel.elf && wsl test -f build/AutomationOS.iso
+
+    - name: Upload build artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: automationos-wsl2-${{ github.sha }}
+        path: |
+          build/kernel.elf
+          build/AutomationOS.iso
+        retention-days: 30
+
+  docker-build:
+    name: Docker Build Environment
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+
+    - name: Cache Docker layers
+      uses: actions/cache@v4
+      with:
+        path: /tmp/.buildx-cache
+        key: ${{ runner.os }}-docker-${{ hashFiles('Dockerfile.build') }}
+
+    - name: Build Docker image
+      run: docker build -f Dockerfile.build -t automationos-build:latest .
+
+    - name: Build in Docker
+      run: |
+        docker run --rm -v $PWD:/workspace automationos-build:latest make all
+
+    - name: Verify Docker build
+      run: |
+        test -f build/kernel.elf
+        test -f build/AutomationOS.iso
+
+    - name: Upload Docker build artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: automationos-docker-${{ github.sha }}
+        path: |
+          build/kernel.elf
+          build/AutomationOS.iso
+        retention-days: 30
+
+  build-summary:
+    name: Build Summary
+    runs-on: ubuntu-latest
+    needs: [build-linux, build-macos, build-wsl2, docker-build]
+    if: always()
+
+    steps:
+    - name: Check build results
+      run: |
+        echo "Build Summary:"
+        echo "Linux: ${{ needs.build-linux.result }}"
+        echo "macOS: ${{ needs.build-macos.result }}"
+        echo "WSL2: ${{ needs.build-wsl2.result }}"
+        echo "Docker: ${{ needs.docker-build.result }}"
+
+        if [[ "${{ needs.build-linux.result }}" != "success" ]] || \
+           [[ "${{ needs.build-macos.result }}" != "success" ]]; then
+          echo "ERROR: Core builds failed"
+          exit 1
+        fi

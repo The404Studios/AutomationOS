@@ -1,0 +1,75 @@
+%% AutomationOS Context Switch Sequence
+%% Mermaid Sequence Diagram
+
+sequenceDiagram
+    participant Timer as Timer IRQ<br/>(PIT @ 1000 Hz)
+    participant IDT as IDT Handler<br/>(interrupt.asm)
+    participant Sched as Scheduler<br/>(scheduler.c)
+    participant ProcA as Process A<br/>(current)
+    participant Switch as context_switch()<br/>(context_switch.asm)
+    participant ProcB as Process B<br/>(next)
+
+    Note over Timer,ProcB: Timer tick occurs (every 1ms)
+
+    Timer->>IDT: IRQ 0 (Timer interrupt)
+    activate IDT
+    Note over IDT: Hardware:<br/>• Push RIP, CS, RFLAGS<br/>• Push error code<br/>• Jump to ISR
+
+    IDT->>IDT: Save registers<br/>(push all GPRs)
+
+    IDT->>Sched: schedule()
+    activate Sched
+
+    Sched->>Sched: Decrement time_slice<br/>of current process
+
+    alt Time slice expired
+        Note over Sched: Process A's time slice = 0
+
+        Sched->>Sched: scheduler_pick_next()
+        Note over Sched: Round-robin selection:<br/>1. Find next READY process<br/>2. Skip BLOCKED processes<br/>3. Wrap around to queue start
+
+        Sched->>ProcA: Get current process
+        activate ProcA
+        ProcA-->>Sched: Process A (state=RUNNING)
+        deactivate ProcA
+
+        Sched->>ProcB: Get next process
+        activate ProcB
+        ProcB-->>Sched: Process B (state=READY)
+
+        Sched->>Sched: Update states:<br/>• A: RUNNING → READY<br/>• B: READY → RUNNING
+
+        Sched->>Switch: context_switch(A, B)
+        activate Switch
+
+        Note over Switch: Save Process A context:
+        Switch->>ProcA: Save to A->context:<br/>• RAX, RBX, RCX, RDX<br/>• RSI, RDI, RBP, RSP<br/>• R8-R15<br/>• RIP, RFLAGS<br/>• CR3 (page table)
+
+        Note over Switch: Load Process B context:
+        Switch->>ProcB: Load from B->context:<br/>• Restore all registers<br/>• Load CR3 (switch address space)<br/>• Update TSS RSP0<br/>(kernel stack)
+
+        Switch->>Switch: Switch stacks:<br/>RSP ← B->kernel_stack
+
+        Switch-->>Sched: Context switch complete
+        deactivate Switch
+        deactivate ProcB
+
+        Sched->>Sched: Update current_process = B
+
+    else Time slice remaining
+        Note over Sched: Process A continues running
+    end
+
+    Sched-->>IDT: Return from schedule()
+    deactivate Sched
+
+    IDT->>IDT: Restore registers<br/>(pop all GPRs)
+
+    IDT->>IDT: Send EOI to PIC<br/>(End of Interrupt)
+
+    IDT-->>ProcB: iretq (return from interrupt)
+    deactivate IDT
+
+    Note over ProcB: Process B now running<br/>on its own stack and address space
+
+    Note over Timer,ProcB: Context switch overhead:<br/>~1000-2000 cycles (~0.5-1 μs)<br/>• Register save/restore: ~200 cycles<br/>• CR3 flush (TLB): ~500-1000 cycles<br/>• Scheduler logic: ~300-500 cycles

@@ -1,0 +1,175 @@
+// AutomationOS System Call Data Flow
+// Graphviz DOT format
+
+digraph SyscallDataFlow {
+    rankdir=LR;
+    node [fontname="Arial"];
+    graph [fontname="Arial", fontsize=12];
+    edge [fontname="Arial"];
+
+    // Define node styles
+    node [shape=box, style="rounded,filled"];
+
+    // User space
+    subgraph cluster_user {
+        label="User Space (Ring 3)";
+        style=filled;
+        fillcolor="#E3F2FD";
+
+        user_process [label="User Process\nPID=42", fillcolor="#64B5F6"];
+        user_regs [label="User Registers\nRAX=syscall_num\nRDI=arg1\nRSI=arg2\nRDX=arg3\nR10=arg4\nR8=arg5\nR9=arg6", shape=note, fillcolor="#90CAF9"];
+        user_stack [label="User Stack\nRSP=0x7FFF...", shape=cylinder, fillcolor="#90CAF9"];
+        user_mem [label="User Memory\nBuffers, strings", shape=cylinder, fillcolor="#90CAF9"];
+    }
+
+    // CPU transition
+    syscall_insn [label="SYSCALL\nInstruction", shape=diamond, fillcolor="#FFF9C4"];
+
+    // Kernel entry
+    subgraph cluster_entry {
+        label="Syscall Entry (syscall.asm)";
+        style=filled;
+        fillcolor="#FFE0B2";
+
+        entry_regs [label="Save Registers\nAll GPRs to stack", shape=note, fillcolor="#FFB74D"];
+        entry_stack [label="Kernel Stack\nRSP=0xFFFF...", shape=cylinder, fillcolor="#FFB74D"];
+        entry_context [label="Context Switch\nUser → Kernel", fillcolor="#FFB74D"];
+    }
+
+    // Dispatcher
+    subgraph cluster_dispatch {
+        label="Syscall Dispatcher (syscall.c)";
+        style=filled;
+        fillcolor="#C8E6C9";
+
+        dispatch_validate [label="Validate\nSyscall Number", fillcolor="#81C784"];
+        dispatch_table [label="Syscall Table\nsyscall_table[256]", shape=folder, fillcolor="#81C784"];
+        dispatch_audit [label="Audit Log\nRecord syscall", shape=cylinder, fillcolor="#81C784"];
+    }
+
+    // Handler
+    subgraph cluster_handler {
+        label="Syscall Handler (handlers.c)";
+        style=filled;
+        fillcolor="#E1BEE7";
+
+        handler_validate [label="Validate Arguments\n• Check bounds\n• Validate pointers\n• Check permissions", fillcolor="#BA68C8"];
+        handler_copy [label="Copy from User\ncopy_from_user()", fillcolor="#BA68C8"];
+        handler_kernel_buf [label="Kernel Buffer\nSafe kernel copy", shape=cylinder, fillcolor="#BA68C8"];
+        handler_process [label="Process Request\nKernel subsystem", fillcolor="#BA68C8"];
+        handler_result [label="Result Data", shape=note, fillcolor="#BA68C8"];
+        handler_copy_out [label="Copy to User\ncopy_to_user()", fillcolor="#BA68C8"];
+    }
+
+    // Kernel subsystems
+    subgraph cluster_kernel {
+        label="Kernel Subsystems";
+        style=filled;
+        fillcolor="#F3E5F5";
+
+        kernel_sched [label="Scheduler\nProcess mgmt", fillcolor="#CE93D8"];
+        kernel_mem [label="Memory\nVMM/PMM", fillcolor="#CE93D8"];
+        kernel_drivers [label="Drivers\nSerial, disk, net", fillcolor="#CE93D8"];
+        kernel_fs [label="Filesystem\nVFS layer", fillcolor="#CE93D8"];
+    }
+
+    // Return path
+    subgraph cluster_return {
+        label="Return to User";
+        style=filled;
+        fillcolor="#FFE0B2";
+
+        return_regs [label="Restore Registers\nRAX=return_value", shape=note, fillcolor="#FFB74D"];
+        return_stack [label="User Stack\nRestored", shape=cylinder, fillcolor="#FFB74D"];
+        return_context [label="Context Switch\nKernel → User", fillcolor="#FFB74D"];
+    }
+
+    sysret_insn [label="SYSRET\nInstruction", shape=diamond, fillcolor="#FFF9C4"];
+
+    // Data flow edges
+
+    // User to syscall
+    user_process -> user_regs [label="prepare args"];
+    user_process -> user_stack [label="current stack"];
+    user_process -> syscall_insn [label="execute"];
+
+    // Syscall entry
+    syscall_insn -> entry_context [label="CPL 3→0\nRIP→kernel"];
+    entry_context -> entry_regs [label="save state"];
+    entry_regs -> entry_stack [label="push to"];
+
+    // Dispatch
+    entry_stack -> dispatch_validate [label="read RAX"];
+    dispatch_validate -> dispatch_table [label="lookup handler"];
+    dispatch_table -> dispatch_audit [label="log call"];
+
+    // Handler execution
+    dispatch_table -> handler_validate [label="call handler"];
+    handler_validate -> user_mem [label="check user ptr", style=dashed];
+    handler_validate -> handler_copy [label="if valid"];
+    user_mem -> handler_copy [label="read data"];
+    handler_copy -> handler_kernel_buf [label="safe copy"];
+    handler_kernel_buf -> handler_process [label="process"];
+
+    // Kernel subsystem interaction
+    handler_process -> kernel_sched [label="fork/exit/wait"];
+    handler_process -> kernel_mem [label="mmap/brk"];
+    handler_process -> kernel_drivers [label="read/write"];
+    handler_process -> kernel_fs [label="open/close"];
+
+    // Generate result
+    kernel_sched -> handler_result [label="return data"];
+    kernel_mem -> handler_result [label="return data"];
+    kernel_drivers -> handler_result [label="return data"];
+    kernel_fs -> handler_result [label="return data"];
+
+    handler_result -> handler_copy_out [label="copy out"];
+    handler_copy_out -> user_mem [label="write result"];
+
+    // Return path
+    handler_copy_out -> dispatch_audit [label="log result"];
+    dispatch_audit -> return_regs [label="set RAX"];
+    return_regs -> return_stack [label="restore RSP"];
+    return_context -> sysret_insn [label="CPL 0→3"];
+    sysret_insn -> user_process [label="resume"];
+
+    // Data annotations
+    data_flow [shape=note, label="Data Transformations:\n\
+1. User args → Registers (userspace)\n\
+2. Registers → Stack (kernel entry)\n\
+3. Stack → Kernel buffer (copy_from_user)\n\
+4. Kernel buffer → Subsystem (processing)\n\
+5. Result → Kernel buffer (generate result)\n\
+6. Kernel buffer → User memory (copy_to_user)\n\
+7. Result → RAX register (return)\n\
+8. RAX → User code (completion)", fillcolor="#FFFDE7"];
+
+    security [shape=note, label="Security Checks:\n\
+• Syscall number validation\n\
+• Pointer bounds checking\n\
+• User/kernel address separation\n\
+• Buffer size limits\n\
+• Permission checks (UID, capabilities)\n\
+• Seccomp filtering\n\
+• Audit logging", fillcolor="#FFEBEE"];
+
+    {rank=same; data_flow; security;}
+
+    // Example data
+    example [shape=note, label="Example: write(1, \"Hello\", 5)\n\
+Input:\n\
+• RAX = 3 (SYS_WRITE)\n\
+• RDI = 1 (stdout fd)\n\
+• RSI = 0x400100 (user buffer)\n\
+• RDX = 5 (count)\n\
+\n\
+Kernel Processing:\n\
+1. Validate fd=1 (stdout)\n\
+2. Validate buffer at 0x400100, size 5\n\
+3. Copy \"Hello\" to kernel buffer\n\
+4. serial_write(kernel_buf, 5)\n\
+5. Return bytes_written=5\n\
+\n\
+Output:\n\
+• RAX = 5 (success)", fillcolor="#E8F5E9"];
+}

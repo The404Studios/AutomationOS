@@ -1,0 +1,119 @@
+name: Code Coverage
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main, develop ]
+  workflow_dispatch:  # Allow manual triggering
+
+jobs:
+  coverage:
+    name: Build and Test with Coverage
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout Repository
+      uses: actions/checkout@v4
+
+    - name: Install Dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y \
+          build-essential \
+          nasm \
+          lcov \
+          python3 \
+          python3-pip
+
+    - name: Build Unit Tests with Coverage
+      run: |
+        make -C tests/unit COVERAGE=1 clean all
+      continue-on-error: false
+
+    - name: Run Unit Tests
+      run: |
+        make -C tests/unit run
+      continue-on-error: false
+
+    - name: Generate Coverage Report
+      run: |
+        make coverage-report
+      continue-on-error: false
+
+    - name: Display Coverage Summary
+      run: |
+        lcov --list coverage_filtered.info || echo "Coverage summary not available"
+
+    - name: Check Coverage Thresholds
+      run: |
+        python3 scripts/check-coverage.py \
+          --info-file coverage_filtered.info \
+          --threshold 60 \
+          --branch-threshold 50
+      continue-on-error: true  # Don't fail CI yet, just warn
+
+    - name: Upload Coverage to Codecov
+      uses: codecov/codecov-action@v4
+      with:
+        files: ./coverage_filtered.info
+        flags: unittests
+        name: codecov-automationos
+        fail_ci_if_error: false  # Don't fail for now
+        verbose: true
+      env:
+        CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+
+    - name: Upload Coverage HTML Report
+      uses: actions/upload-artifact@v4
+      with:
+        name: coverage-report
+        path: docs/coverage/
+        retention-days: 30
+
+    - name: Comment PR with Coverage
+      if: github.event_name == 'pull_request'
+      uses: actions/github-script@v7
+      with:
+        script: |
+          const fs = require('fs');
+
+          // Read coverage summary
+          let coverageSummary = 'Coverage report generated';
+          try {
+            const { execSync } = require('child_process');
+            coverageSummary = execSync('lcov --list coverage_filtered.info | tail -20').toString();
+          } catch (e) {
+            coverageSummary = 'Could not generate coverage summary';
+          }
+
+          // Post comment
+          github.rest.issues.createComment({
+            issue_number: context.issue.number,
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            body: `## 📊 Coverage Report\n\n\`\`\`\n${coverageSummary}\n\`\`\`\n\n[View Full Report](https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId})`
+          });
+
+  coverage-trend:
+    name: Track Coverage Trends
+    runs-on: ubuntu-latest
+    needs: coverage
+    if: github.ref == 'refs/heads/main'
+
+    steps:
+    - name: Checkout Repository
+      uses: actions/checkout@v4
+
+    - name: Download Coverage Artifact
+      uses: actions/download-artifact@v4
+      with:
+        name: coverage-report
+        path: docs/coverage/
+
+    - name: Store Coverage History
+      run: |
+        mkdir -p .coverage-history
+        DATE=$(date +%Y-%m-%d)
+        cp coverage_filtered.info .coverage-history/coverage-${DATE}.info
+        echo "Coverage data stored for ${DATE}"

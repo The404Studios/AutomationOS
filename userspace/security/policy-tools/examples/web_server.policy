@@ -1,0 +1,35 @@
+# Web Server MAC Policy
+# Defines security policy for a web server process
+
+# Web server domain can read web content
+allow web_t www_content_t:file { read };
+
+# Web server can bind to HTTP/HTTPS ports
+allow web_t http_port_t:socket { bind listen accept };
+
+# Web server can read its configuration
+allow web_t etc_t:file { read };
+
+# Web server can write logs
+allow web_t log_t:file { write append create };
+
+# Web server can create temporary files
+allow web_t tmp_t:file { read write create delete };
+
+# Web server CANNOT read shadow files (explicit deny)
+deny web_t shadow_t:file { read write };
+
+# Web server CANNOT access user home directories
+deny web_t home_t:file { read write };
+
+# Web server CANNOT bind to SSH port
+deny web_t ssh_port_t:socket { bind };
+
+# Web server CANNOT execute shells
+deny web_t shell_exec_t:file { execute };
+
+# Web server can signal other web processes
+allow web_t web_t:process { signal };
+
+# Web server CANNOT ptrace other processes
+deny web_t *:process { ptrace };

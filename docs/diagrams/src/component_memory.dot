@@ -1,0 +1,157 @@
+// AutomationOS Memory Subsystem Component Diagram
+// Graphviz DOT format
+
+digraph MemorySubsystem {
+    rankdir=TB;
+    node [shape=component, fontname="Arial", style="filled"];
+    graph [fontname="Arial", fontsize=12];
+    edge [fontname="Arial"];
+
+    // Memory subsystem components
+    subgraph cluster_memory {
+        label="Memory Management Subsystem";
+        style=filled;
+        fillcolor="#F5F5F5";
+
+        // Physical Memory Manager
+        subgraph cluster_pmm {
+            label="Physical Memory Manager (pmm.c)";
+            style=filled;
+            fillcolor="#FFE0B2";
+
+            pmm_init [label="pmm_init()\nInitialize buddy allocator", fillcolor="#FFB74D"];
+            pmm_alloc [label="pmm_alloc_page()\nAllocate 4KB page", fillcolor="#FFB74D"];
+            pmm_free [label="pmm_free_page()\nFree and coalesce", fillcolor="#FFB74D"];
+            pmm_stats [label="pmm_get_*_memory()\nMemory statistics", fillcolor="#FFB74D"];
+
+            buddy_struct [label="Buddy Allocator\nData Structures", shape=folder, fillcolor="#FFCC80"];
+            buddy_struct [label="• free_lists[11]\n• bitmap\n• total_pages\n• free_pages", shape=note, fillcolor="#FFCC80"];
+        }
+
+        // Virtual Memory Manager
+        subgraph cluster_vmm {
+            label="Virtual Memory Manager (vmm.c)";
+            style=filled;
+            fillcolor="#C8E6C9";
+
+            vmm_init [label="vmm_init()\nSetup kernel page tables", fillcolor="#81C784"];
+            vmm_map [label="vmm_map_page()\nCreate virtual mapping", fillcolor="#81C784"];
+            vmm_unmap [label="vmm_unmap_page()\nRemove mapping", fillcolor="#81C784"];
+            vmm_getphys [label="vmm_get_physical()\nTranslate V→P", fillcolor="#81C784"];
+
+            page_tables [label="Page Table\nData Structures", shape=folder, fillcolor="#A5D6A7"];
+            page_tables [label="• PML4 (512 entries)\n• PDPT (512 entries)\n• PD (512 entries)\n• PT (512 entries)", shape=note, fillcolor="#A5D6A7"];
+        }
+
+        // Kernel Heap
+        subgraph cluster_heap {
+            label="Kernel Heap (heap.c)";
+            style=filled;
+            fillcolor="#E1BEE7";
+
+            heap_init [label="heap_init()\nInitialize slab allocator", fillcolor="#BA68C8"];
+            kmalloc [label="kmalloc(size)\nAllocate kernel memory", fillcolor="#BA68C8"];
+            kfree [label="kfree(ptr)\nFree kernel memory", fillcolor="#BA68C8"];
+
+            slab_struct [label="Slab Allocator\nData Structures", shape=folder, fillcolor="#CE93D8"];
+            slab_struct [label="• Caches: 32B, 64B, 128B,\n  256B, 512B, 1KB, 2KB,\n  4KB, 8KB\n• Free lists per cache\n• Slab objects", shape=note, fillcolor="#CE93D8"];
+        }
+
+        // User space memory operations
+        subgraph cluster_user_mem {
+            label="User Memory Validation";
+            style=filled;
+            fillcolor="#FFF9C4";
+
+            validate_buffer [label="validate_user_buffer()\nCheck buffer bounds", fillcolor="#FFF59D"];
+            validate_string [label="validate_user_string()\nCheck string validity", fillcolor="#FFF59D"];
+            copy_from_user [label="copy_from_user()\nSafe copy from user", fillcolor="#FFF59D"];
+            copy_to_user [label="copy_to_user()\nSafe copy to user", fillcolor="#FFF59D"];
+        }
+    }
+
+    // Architecture-specific components
+    subgraph cluster_arch {
+        label="Architecture Layer (arch/x86_64/)";
+        style=filled;
+        fillcolor="#FFCCBC";
+
+        paging_c [label="paging.c\nPage table manipulation", fillcolor="#FF8A65"];
+        cr3_reg [label="CR3 Register\nPage table base", shape=hexagon, fillcolor="#FF8A65"];
+        tlb [label="TLB\n(Translation Lookaside Buffer)", shape=cylinder, fillcolor="#FF8A65"];
+    }
+
+    // Hardware
+    ram [label="Physical RAM", shape=cylinder, fillcolor="#CFD8DC"];
+
+    // Dependencies and data flow
+
+    // PMM dependencies
+    pmm_init -> buddy_struct [label="creates"];
+    pmm_alloc -> buddy_struct [label="reads/updates"];
+    pmm_free -> buddy_struct [label="updates"];
+    pmm_stats -> buddy_struct [label="reads"];
+    buddy_struct -> ram [label="tracks"];
+
+    // VMM dependencies
+    vmm_init -> pmm_alloc [label="allocate PT pages"];
+    vmm_init -> page_tables [label="creates"];
+    vmm_map -> pmm_alloc [label="allocate page"];
+    vmm_map -> page_tables [label="update PTE"];
+    vmm_map -> paging_c [label="manipulate"];
+    vmm_unmap -> pmm_free [label="free page"];
+    vmm_unmap -> page_tables [label="clear PTE"];
+    vmm_getphys -> page_tables [label="walk PT"];
+
+    // Heap dependencies
+    heap_init -> pmm_alloc [label="allocate slab pages"];
+    heap_init -> slab_struct [label="creates"];
+    kmalloc -> slab_struct [label="allocate from cache"];
+    kmalloc -> pmm_alloc [label="large allocs"];
+    kfree -> slab_struct [label="return to cache"];
+    kfree -> pmm_free [label="large frees"];
+
+    // User memory validation
+    validate_buffer -> vmm_getphys [label="check mapped"];
+    copy_from_user -> validate_buffer [label="validate first"];
+    copy_to_user -> validate_buffer [label="validate first"];
+
+    // Architecture interaction
+    page_tables -> cr3_reg [label="base address"];
+    cr3_reg -> tlb [label="flushes on write"];
+    paging_c -> page_tables [label="manipulate"];
+    paging_c -> tlb [label="invlpg instruction"];
+
+    // External consumers
+    scheduler [label="Scheduler\n(process.c)", shape=ellipse, fillcolor="#64B5F6"];
+    syscall_handlers [label="Syscall Handlers\n(handlers.c)", shape=ellipse, fillcolor="#64B5F6"];
+    drivers [label="Device Drivers", shape=ellipse, fillcolor="#64B5F6"];
+
+    scheduler -> kmalloc [label="allocate PCB"];
+    scheduler -> vmm_map [label="setup process AS"];
+    syscall_handlers -> copy_from_user [label="read args"];
+    syscall_handlers -> copy_to_user [label="write results"];
+    drivers -> kmalloc [label="allocate buffers"];
+
+    // Performance annotations
+    perf_note [shape=note, label="Performance Characteristics:\n\
+• pmm_alloc_page(): O(1) - bitmap lookup\n\
+• pmm_free_page(): O(log n) - buddy coalesce\n\
+• vmm_map_page(): ~100-200 cycles\n\
+• kmalloc(): O(1) for cached sizes\n\
+• Page fault handler: ~5-10 μs\n\
+• TLB miss penalty: ~100 cycles\n\
+• TLB hit rate: >99% (typical)", fillcolor="#E3F2FD"];
+
+    memory_layout [shape=note, label="Memory Layout:\n\
+Kernel Space (0xFFFF800000000000+):\n\
+• Kernel heap: 0xFFFFFFFF_C0000000\n\
+• Kernel code: 0xFFFFFFFF_80000000\n\
+\n\
+User Space (0x0000000000000000+):\n\
+• Stack: 0x00007FFF_FFFFF000 (down)\n\
+• Heap: 0x00000000_40000000 (up)\n\
+• Code: 0x00000000_00400000", fillcolor="#E3F2FD"];
+
+    {rank=same; perf_note; memory_layout;}
+}

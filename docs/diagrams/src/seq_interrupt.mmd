@@ -1,0 +1,93 @@
+%% AutomationOS Interrupt Handling Sequence
+%% Mermaid Sequence Diagram
+
+sequenceDiagram
+    participant Dev as Device<br/>(e.g., Keyboard)
+    participant PIC as PIC<br/>(8259A)
+    participant CPU as CPU
+    participant IDT as IDT<br/>(Interrupt Descriptor Table)
+    participant ISR as ISR Handler<br/>(interrupt.asm)
+    participant Driver as Device Driver<br/>(ps2.c)
+    participant Kernel as Kernel<br/>(Process/Buffer)
+
+    Note over Dev,Kernel: Example: Keyboard key press
+
+    Dev->>PIC: Assert IRQ 1 signal
+    activate PIC
+    Note over PIC: Keyboard controller<br/>raises hardware interrupt
+
+    PIC->>PIC: Check IRQ mask<br/>(IMR - Interrupt Mask Register)
+
+    alt IRQ masked
+        Note over PIC: Interrupt ignored<br/>(IRQ bit set in IMR)
+        PIC-->>Dev: No interrupt delivered
+    else IRQ enabled
+        PIC->>CPU: INTR signal raised
+        activate CPU
+
+        CPU->>CPU: Check RFLAGS.IF<br/>(Interrupt Enable Flag)
+
+        alt Interrupts disabled
+            Note over CPU: IF=0<br/>Interrupt deferred
+        else Interrupts enabled
+            CPU->>CPU: Finish current instruction<br/>(instruction boundary)
+
+            Note over CPU: Hardware interrupt sequence:<br/>1. Push SS, RSP (if privilege change)<br/>2. Push RFLAGS<br/>3. Clear IF (disable interrupts)<br/>4. Push CS, RIP<br/>5. Read interrupt vector from PIC
+
+            PIC-->>CPU: IRQ 1 → Vector 33<br/>(IRQ 0-15 mapped to 32-47)
+            deactivate PIC
+
+            CPU->>IDT: Lookup IDT[33]
+            activate IDT
+            Note over IDT: IDT entry:<br/>• Offset: ISR address<br/>• Segment: kernel CS<br/>• DPL: 0 (kernel only)<br/>• Type: Interrupt Gate
+
+            IDT-->>CPU: ISR address
+            deactivate IDT
+
+            CPU->>ISR: Jump to ISR
+            deactivate CPU
+            activate ISR
+
+            Note over ISR: Common ISR stub:<br/>• Push error code (0)<br/>• Push interrupt number (33)<br/>• Save all GPRs
+
+            ISR->>Driver: Call device handler:<br/>keyboard_handler()
+            activate Driver
+
+            Driver->>Dev: Read scancode from keyboard<br/>inb(0x60)
+            activate Dev
+            Dev-->>Driver: Scancode (e.g., 0x1E = 'a')
+            deactivate Dev
+
+            Driver->>Driver: Translate scancode<br/>to ASCII character
+
+            Driver->>Kernel: Add to input buffer<br/>or send to process
+            activate Kernel
+            Note over Kernel: Store in TTY buffer<br/>or wake waiting process
+            Kernel-->>Driver: Buffer updated
+            deactivate Kernel
+
+            Driver-->>ISR: Handler complete
+            deactivate Driver
+
+            ISR->>PIC: Send EOI<br/>(End of Interrupt)<br/>outb(0x20, 0x20)
+            activate PIC
+            Note over PIC: Clear IRQ in service bit<br/>Allow new interrupts
+            PIC-->>ISR: EOI acknowledged
+            deactivate PIC
+
+            ISR->>ISR: Restore all GPRs<br/>Pop error code and vector
+
+            ISR->>CPU: iretq instruction
+            deactivate ISR
+            activate CPU
+
+            Note over CPU: Hardware return:<br/>1. Pop CS, RIP<br/>2. Pop RFLAGS (restore IF)<br/>3. Pop SS, RSP (if privilege change)
+
+            CPU-->>Kernel: Resume interrupted code
+            deactivate CPU
+        end
+    end
+
+    Note over Dev,Kernel: Interrupt latency breakdown:<br/>• PIC to CPU: ~0.1 μs<br/>• CPU state save: ~0.2 μs<br/>• ISR handler: ~1-5 μs<br/>• State restore: ~0.2 μs<br/>Total: ~1.5-5.5 μs
+
+    Note over Dev,Kernel: Nested Interrupts:<br/>• IF cleared on entry (no nesting by default)<br/>• Can be enabled explicitly for high-priority IRQs<br/>• Requires separate interrupt stacks (IST)

@@ -1,0 +1,68 @@
+# userspace/libc/Makefile.shared - Build userspace C library as shared object
+
+CC = x86_64-elf-gcc
+LD = x86_64-elf-ld
+AR = x86_64-elf-ar
+
+# Position-independent code flags
+CFLAGS = -std=gnu11 -ffreestanding -nostdlib -fno-builtin \
+         -mno-red-zone -fno-stack-protector -Wall -Wextra -O2 \
+         -fPIC -I.
+
+# Shared library linker flags
+LDFLAGS = -shared -Bsymbolic --hash-style=gnu \
+          -z max-page-size=4096 -z common-page-size=4096 \
+          -soname libc.so.1
+
+BUILD_DIR = ../../build/userspace/libc/shared
+OUTPUT_SO = $(BUILD_DIR)/libc.so.1
+OUTPUT_A = ../../build/userspace/libc/libc.a
+
+OBJS_PIC = syscall.o string.o stdio.o stdlib.o
+OBJS = $(addprefix $(BUILD_DIR)/, $(OBJS_PIC))
+
+.PHONY: all shared static clean install
+
+# Build both static and shared by default
+all: static shared
+
+# Build shared library
+shared: $(OUTPUT_SO)
+
+# Build static library (for backwards compatibility)
+static: $(OUTPUT_A)
+
+$(OUTPUT_SO): $(OBJS)
+	@mkdir -p $(dir $@)
+	$(LD) $(LDFLAGS) -o $@ $(OBJS)
+	@echo "Built shared libc: $@"
+
+$(OUTPUT_A): $(OBJS)
+	@mkdir -p $(dir $@)
+	$(AR) rcs $@ $(OBJS)
+	@echo "Built static libc: $@"
+
+$(BUILD_DIR)/%.o: %.c
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+clean:
+	rm -rf $(BUILD_DIR)
+	rm -f $(OUTPUT_A)
+
+install: shared
+	@mkdir -p ../../initrd/lib
+	cp $(OUTPUT_SO) ../../initrd/lib/
+	ln -sf libc.so.1 ../../initrd/lib/libc.so
+	@echo "Installed libc.so to initrd/lib/"
+
+# For testing: show what symbols are exported
+symbols: $(OUTPUT_SO)
+	x86_64-elf-nm -D $(OUTPUT_SO)
+
+# Show information about the shared library
+info: $(OUTPUT_SO)
+	x86_64-elf-readelf -d $(OUTPUT_SO)
+	x86_64-elf-readelf -l $(OUTPUT_SO)
+
+.PHONY: symbols info

@@ -1,0 +1,222 @@
+name: Test
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main, develop ]
+  workflow_dispatch:
+
+jobs:
+  unit-tests:
+    name: Unit Tests
+    runs-on: ubuntu-22.04
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Cache cross-compiler
+      uses: actions/cache@v4
+      with:
+        path: |
+          /opt/cross
+          ~/.cache/cross-compiler
+        key: ${{ runner.os }}-cross-compiler-x86_64-elf-gcc
+
+    - name: Install dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y build-essential nasm python3 \
+          qemu-system-x86 xorriso gcc-x86-64-elf binutils-x86-64-elf
+
+    - name: Build unit tests
+      run: |
+        cd tests/unit
+        make all
+
+    - name: Run unit tests
+      run: |
+        cd tests/unit
+        make test
+
+    - name: Upload test results
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: unit-test-results-${{ github.sha }}
+        path: tests/unit/results/
+        retention-days: 30
+
+  integration-tests:
+    name: Integration Tests
+    runs-on: ubuntu-22.04
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Cache cross-compiler
+      uses: actions/cache@v4
+      with:
+        path: /opt/cross
+        key: ${{ runner.os }}-cross-compiler-x86_64-elf-gcc
+
+    - name: Install dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y build-essential nasm python3 python3-pip \
+          qemu-system-x86 xorriso gcc-x86-64-elf binutils-x86-64-elf
+
+    - name: Build system
+      run: make all
+
+    - name: Run integration tests
+      timeout-minutes: 10
+      run: |
+        python3 tests/integration/test_boot.py --verbose --timeout 20
+
+    - name: Upload serial logs
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: integration-test-logs-${{ github.sha }}
+        path: build/serial.log
+        retention-days: 30
+
+    - name: Run extended integration tests
+      if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+      run: |
+        python3 tests/integration/phase2/test_framework.py --all
+
+  benchmark-tests:
+    name: Benchmark Tests
+    runs-on: ubuntu-22.04
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Install dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y build-essential nasm python3 \
+          qemu-system-x86 xorriso gcc-x86-64-elf binutils-x86-64-elf
+
+    - name: Build system
+      run: make all
+
+    - name: Run benchmarks
+      run: |
+        cd tests/bench
+        make all
+        make run
+
+    - name: Upload benchmark results
+      uses: actions/upload-artifact@v4
+      with:
+        name: benchmark-results-${{ github.sha }}
+        path: tests/bench/results/
+        retention-days: 90
+
+    - name: Compare with baseline
+      run: |
+        python3 tests/bench/compare.py \
+          --current tests/bench/results/latest.json \
+          --baseline tests/bench/baseline.json
+
+  qemu-tests:
+    name: QEMU Tests (Multiple Configurations)
+    runs-on: ubuntu-22.04
+    strategy:
+      matrix:
+        qemu-config:
+          - { name: 'minimal', mem: '512M', smp: 1 }
+          - { name: 'standard', mem: '2G', smp: 2 }
+          - { name: 'high-mem', mem: '8G', smp: 4 }
+          - { name: 'many-cpu', mem: '4G', smp: 8 }
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Install dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y build-essential nasm python3 \
+          qemu-system-x86 xorriso gcc-x86-64-elf binutils-x86-64-elf
+
+    - name: Build system
+      run: make all
+
+    - name: Run QEMU test (${{ matrix.qemu-config.name }})
+      timeout-minutes: 5
+      run: |
+        qemu-system-x86_64 \
+          -cdrom build/AutomationOS.iso \
+          -m ${{ matrix.qemu-config.mem }} \
+          -smp ${{ matrix.qemu-config.smp }} \
+          -serial file:build/serial-${{ matrix.qemu-config.name }}.log \
+          -display none \
+          -no-reboot \
+          -no-shutdown &
+
+        QEMU_PID=$!
+        sleep 15
+        kill $QEMU_PID || true
+
+    - name: Verify boot (${{ matrix.qemu-config.name }})
+      run: |
+        grep "AutomationOS" build/serial-${{ matrix.qemu-config.name }}.log
+        grep "\[KERNEL\]" build/serial-${{ matrix.qemu-config.name }}.log
+
+    - name: Upload QEMU logs
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: qemu-logs-${{ matrix.qemu-config.name }}-${{ github.sha }}
+        path: build/serial-${{ matrix.qemu-config.name }}.log
+        retention-days: 7
+
+  test-summary:
+    name: Test Summary
+    runs-on: ubuntu-latest
+    needs: [unit-tests, integration-tests, qemu-tests]
+    if: always()
+
+    steps:
+    - name: Download all test results
+      uses: actions/download-artifact@v4
+      with:
+        pattern: '*-test-*-${{ github.sha }}'
+        path: test-results/
+
+    - name: Generate test report
+      run: |
+        echo "# Test Summary" > test-summary.md
+        echo "" >> test-summary.md
+        echo "## Results" >> test-summary.md
+        echo "- Unit Tests: ${{ needs.unit-tests.result }}" >> test-summary.md
+        echo "- Integration Tests: ${{ needs.integration-tests.result }}" >> test-summary.md
+        echo "- QEMU Tests: ${{ needs.qemu-tests.result }}" >> test-summary.md
+        echo "" >> test-summary.md
+        echo "## Artifacts" >> test-summary.md
+        find test-results/ -type f | sort >> test-summary.md
+
+    - name: Upload test summary
+      uses: actions/upload-artifact@v4
+      with:
+        name: test-summary-${{ github.sha }}
+        path: test-summary.md
+        retention-days: 90
+
+    - name: Check test results
+      run: |
+        if [[ "${{ needs.unit-tests.result }}" != "success" ]] || \
+           [[ "${{ needs.integration-tests.result }}" != "success" ]] || \
+           [[ "${{ needs.qemu-tests.result }}" != "success" ]]; then
+          echo "ERROR: Tests failed"
+          exit 1
+        fi
+        echo "All tests passed successfully"

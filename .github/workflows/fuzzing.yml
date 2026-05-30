@@ -1,0 +1,176 @@
+name: Fuzzing
+
+on:
+  pull_request:
+    branches: [ main, develop ]
+  schedule:
+    # Run nightly at 2 AM UTC
+    - cron: '0 2 * * *'
+  workflow_dispatch:
+    inputs:
+      duration:
+        description: 'Fuzzing duration (e.g., 1h, 30m)'
+        required: false
+        default: '1h'
+
+jobs:
+  fuzz:
+    name: Fuzz Testing
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    strategy:
+      matrix:
+        fuzzer: [syscall, heap, driver]
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y afl++ gcc-multilib python3 lcov
+
+      - name: Configure system for fuzzing
+        run: |
+          echo core | sudo tee /proc/sys/kernel/core_pattern
+          echo 0 | sudo tee /proc/sys/kernel/randomize_va_space || true
+
+      - name: Build fuzzers
+        run: |
+          make -C tests/fuzz
+
+      - name: Generate corpus
+        run: |
+          cd tests/fuzz
+          python3 generate_corpus.py
+
+      - name: Run smoke test
+        run: |
+          make -C tests/fuzz test
+
+      - name: Run fuzzer - ${{ matrix.fuzzer }}
+        run: |
+          DURATION="${{ github.event.inputs.duration || '1h' }}"
+
+          if [ "${{ matrix.fuzzer }}" = "syscall" ]; then
+            ./scripts/run-fuzzer.sh --syscall --time "$DURATION"
+          elif [ "${{ matrix.fuzzer }}" = "heap" ]; then
+            ./scripts/run-fuzzer.sh --heap --time "$DURATION"
+          elif [ "${{ matrix.fuzzer }}" = "driver" ]; then
+            ./scripts/run-fuzzer.sh --driver --time "$DURATION"
+          fi
+        continue-on-error: true
+
+      - name: Check for crashes
+        id: check_crashes
+        run: |
+          CRASH_COUNT=$(find tests/fuzz/crashes -type f 2>/dev/null | wc -l)
+          echo "crash_count=$CRASH_COUNT" >> $GITHUB_OUTPUT
+
+          if [ "$CRASH_COUNT" -gt 0 ]; then
+            echo "::error::Found $CRASH_COUNT crashes during fuzzing!"
+            exit 1
+          fi
+
+      - name: Upload crashes
+        if: failure() && steps.check_crashes.outputs.crash_count > 0
+        uses: actions/upload-artifact@v3
+        with:
+          name: crashes-${{ matrix.fuzzer }}
+          path: tests/fuzz/crashes/
+          retention-days: 90
+
+      - name: Upload fuzzer statistics
+        if: always()
+        uses: actions/upload-artifact@v3
+        with:
+          name: fuzzer-stats-${{ matrix.fuzzer }}
+          path: tests/fuzz/output/
+          retention-days: 7
+
+      - name: Generate coverage report
+        if: always()
+        run: |
+          make -C tests/fuzz coverage || true
+
+      - name: Upload coverage report
+        if: always()
+        uses: actions/upload-artifact@v3
+        with:
+          name: coverage-${{ matrix.fuzzer }}
+          path: tests/fuzz/output/coverage/
+          retention-days: 7
+
+  report:
+    name: Fuzzing Summary
+    runs-on: ubuntu-latest
+    needs: fuzz
+    if: always()
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v3
+
+      - name: Generate summary report
+        run: |
+          echo "# Fuzzing Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "## Results" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          for FUZZER in syscall heap driver; do
+            echo "### $FUZZER Fuzzer" >> $GITHUB_STEP_SUMMARY
+
+            if [ -f "fuzzer-stats-$FUZZER/fuzzer_stats" ]; then
+              EXECS=$(grep "^execs_done" "fuzzer-stats-$FUZZER/fuzzer_stats" | cut -d: -f2)
+              PATHS=$(grep "^paths_total" "fuzzer-stats-$FUZZER/fuzzer_stats" | cut -d: -f2)
+              CRASHES=$(grep "^unique_crashes" "fuzzer-stats-$FUZZER/fuzzer_stats" | cut -d: -f2)
+
+              echo "- Executions: $EXECS" >> $GITHUB_STEP_SUMMARY
+              echo "- Paths: $PATHS" >> $GITHUB_STEP_SUMMARY
+              echo "- Crashes: $CRASHES" >> $GITHUB_STEP_SUMMARY
+            else
+              echo "No statistics available" >> $GITHUB_STEP_SUMMARY
+            fi
+            echo "" >> $GITHUB_STEP_SUMMARY
+          done
+
+      - name: Create issue for crashes
+        if: failure()
+        uses: actions/github-script@v6
+        with:
+          script: |
+            const fs = require('fs');
+            const crashes = [];
+
+            for (const fuzzer of ['syscall', 'heap', 'driver']) {
+              const dir = `crashes-${fuzzer}`;
+              if (fs.existsSync(dir)) {
+                const files = fs.readdirSync(dir);
+                crashes.push(...files.map(f => `${fuzzer}: ${f}`));
+              }
+            }
+
+            if (crashes.length > 0) {
+              const body = `## Fuzzing Crashes Detected\n\n` +
+                `**PR**: #${{ github.event.pull_request.number }}\n` +
+                `**Commit**: ${{ github.sha }}\n\n` +
+                `### Crashes Found:\n\n` +
+                crashes.map(c => `- ${c}`).join('\n') + '\n\n' +
+                `See artifacts for crash details.\n\n` +
+                `**Priority**: HIGH\n` +
+                `**Action Required**: Triage within 24 hours`;
+
+              github.rest.issues.create({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                title: `[FUZZING] Crashes detected in PR #${{ github.event.pull_request.number }}`,
+                body: body,
+                labels: ['bug', 'fuzzing', 'security']
+              });
+            }

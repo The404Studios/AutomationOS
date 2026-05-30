@@ -1,0 +1,106 @@
+# Default MAC Policy for AutomationOS
+# This is the base policy loaded at boot
+
+# ============================================================================
+# Kernel Domain (Full Access)
+# ============================================================================
+
+# Kernel has full access to everything
+allow kernel_t *:file { read write execute create delete chmod chown };
+allow kernel_t *:socket { bind connect listen accept send recv raw };
+allow kernel_t *:process { signal ptrace kill fork exec transition };
+allow kernel_t *:device { read write };
+allow kernel_t *:shm { create read write destroy };
+allow kernel_t *:msg { create read write destroy };
+allow kernel_t *:sem { create read write destroy };
+
+# ============================================================================
+# Init Domain (System Initialization)
+# ============================================================================
+
+# Init can start services and manage processes
+allow init_t bin_t:file { read execute };
+allow init_t etc_t:file { read };
+allow init_t *:process { signal fork exec transition };
+allow init_t log_t:file { write append create };
+
+# ============================================================================
+# User Domain (Regular Users)
+# ============================================================================
+
+# Users can read most files
+allow user_t file_t:file { read };
+allow user_t bin_t:file { read execute };
+allow user_t lib_t:file { read };
+allow user_t etc_t:file { read };
+
+# Users can fully access their home directories
+allow user_t home_t:file { read write execute create delete };
+
+# Users can access temporary directory
+allow user_t tmp_t:file { read write create delete };
+
+# Users CANNOT read shadow files
+deny user_t shadow_t:file { read write };
+
+# Users CANNOT modify system files
+deny user_t etc_t:file { write create delete };
+deny user_t bin_t:file { write delete };
+
+# Users can fork and execute
+allow user_t user_t:process { fork exec };
+
+# Users can connect to network (but not bind privileged ports)
+allow user_t unrestricted_port_t:socket { connect };
+
+# Users CANNOT bind to privileged ports (<1024)
+deny user_t reserved_port_t:socket { bind };
+
+# ============================================================================
+# Web Server Domain
+# ============================================================================
+
+allow web_t www_content_t:file { read };
+allow web_t http_port_t:socket { bind listen accept };
+allow web_t etc_t:file { read };
+allow web_t log_t:file { write append create };
+deny web_t shadow_t:file { read write };
+deny web_t home_t:file { read write };
+
+# ============================================================================
+# Database Domain
+# ============================================================================
+
+allow db_t db_data_t:file { read write create delete append };
+allow db_t db_port_t:socket { bind listen accept };
+allow db_t log_t:file { write append create };
+allow db_t db_t:shm { create read write destroy };
+deny db_t shadow_t:file { read write };
+deny db_t home_t:file { read write };
+
+# ============================================================================
+# Untrusted/Isolated Domain
+# ============================================================================
+
+allow isolated_t tmp_t:file { read write create delete };
+deny isolated_t *:socket { bind connect };
+deny isolated_t *:process { signal ptrace };
+deny isolated_t etc_t:file { read write };
+deny isolated_t home_t:file { read write };
+
+# ============================================================================
+# Domain Transitions
+# ============================================================================
+
+# User executing su transitions to admin domain
+transition user_t bin_t:/bin/su -> admin_t;
+
+# User executing trusted apps transition to app domain
+transition user_t bin_t:/opt/trusted/* -> trusted_app_t;
+
+# Init starting services transitions to service domains
+transition init_t bin_t:/usr/sbin/httpd -> web_t;
+transition init_t bin_t:/usr/sbin/postgres -> db_t;
+
+# Any domain executing untrusted binary stays isolated
+transition *:untrusted_t:/* -> isolated_t;

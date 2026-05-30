@@ -1,0 +1,77 @@
+%% AutomationOS Page Fault Handling Sequence
+%% Mermaid Sequence Diagram
+
+sequenceDiagram
+    participant User as Userspace Process
+    participant CPU as CPU (MMU)
+    participant IDT as Page Fault Handler<br/>(exception 14)
+    participant VMM as Virtual Memory Manager<br/>(vmm.c)
+    participant PMM as Physical Memory Manager<br/>(pmm.c)
+    participant PT as Page Tables
+
+    Note over User,PT: Example: Access unmapped page at 0x400000
+
+    User->>CPU: Access memory at 0x400000<br/>(read/write/execute)
+    activate CPU
+
+    CPU->>CPU: Walk page tables:<br/>PML4 → PDPT → PD → PT
+
+    Note over CPU: Page table entry<br/>has PRESENT bit = 0
+
+    CPU->>IDT: Exception 14 (Page Fault)
+    deactivate CPU
+    activate IDT
+
+    Note over IDT: Error code pushed:<br/>bit 0: PRESENT (0=not present)<br/>bit 1: WRITE (1=write access)<br/>bit 2: USER (1=user mode)<br/>bit 3: RSVD (1=reserved bit set)<br/>bit 4: FETCH (1=instruction fetch)
+
+    IDT->>IDT: Read CR2 register<br/>(faulting address)
+    Note over IDT: CR2 = 0x400000
+
+    IDT->>IDT: Analyze error code
+
+    alt Invalid access (e.g., null pointer, kernel address)
+        Note over IDT: Fault address < 0x1000<br/>or in kernel space
+        IDT->>User: SIGSEGV<br/>(Segmentation Fault)
+        Note over User: Process terminated
+    else Valid page fault (demand paging)
+        IDT->>VMM: handle_page_fault(addr=0x400000, flags)
+        activate VMM
+
+        VMM->>VMM: Validate address:<br/>• Check in user space<br/>• Aligned to page boundary<br/>• Within process limits
+
+        VMM->>PMM: pmm_alloc_page()
+        activate PMM
+        Note over PMM: Buddy allocator:<br/>• Find free 4KB frame<br/>• Mark as allocated<br/>• Update bitmap
+        PMM-->>VMM: Physical page = 0x12345000
+        deactivate PMM
+
+        VMM->>VMM: Zero the page<br/>(security: prevent data leak)
+
+        VMM->>PT: Map virtual to physical:<br/>virt=0x400000<br/>phys=0x12345000<br/>flags=PRESENT|WRITE|USER
+        activate PT
+        Note over PT: Update page table entry:<br/>PTE = 0x12345007<br/>(address + flags)
+        PT-->>VMM: Mapping complete
+        deactivate PT
+
+        VMM->>CPU: Flush TLB entry<br/>invlpg [0x400000]
+        Note over CPU: Clear cached translation
+
+        VMM-->>IDT: Page fault resolved
+        deactivate VMM
+
+        IDT->>IDT: Restore registers
+
+        IDT-->>User: iretq (Resume execution)
+        deactivate IDT
+
+        User->>CPU: Retry faulting instruction
+        activate CPU
+        CPU->>CPU: Walk page tables again
+        Note over CPU: Page now PRESENT<br/>Access succeeds
+        CPU-->>User: Memory access complete
+        deactivate CPU
+    end
+
+    Note over User,PT: Page fault latency:<br/>• Minor fault (allocation): ~5-10 μs<br/>• Major fault (disk I/O): ~1-10 ms<br/>(no disk I/O in Phase 1)
+
+    Note over User,PT: TLB miss vs Page Fault:<br/>• TLB miss: hardware walk (~100 cycles)<br/>• Page fault: full software handler (~10,000 cycles)

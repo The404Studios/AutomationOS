@@ -1,0 +1,310 @@
+name: Fuzzing
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main, develop ]
+  schedule:
+    # Run nightly at 1 AM UTC
+    - cron: '0 1 * * *'
+  workflow_dispatch:
+    inputs:
+      duration:
+        description: 'Fuzzing duration in minutes'
+        required: false
+        default: '60'
+
+jobs:
+  afl-fuzzing:
+    name: AFL++ Fuzzing
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Install AFL++
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y afl++ build-essential
+
+    - name: Build fuzz targets with AFL
+      run: |
+        cd tests/fuzz
+        AFL_USE_ASAN=1 make afl-build
+
+    - name: Run AFL fuzzing
+      timeout-minutes: ${{ github.event.inputs.duration || 60 }}
+      run: |
+        cd tests/fuzz
+        mkdir -p corpus crashes output
+
+        # Start AFL fuzzing
+        afl-fuzz -i corpus -o output -m none -t 1000 \
+          ./fuzz_pmm @@ > afl.log 2>&1 &
+        AFL_PID=$!
+
+        # Let it run for specified duration
+        sleep $(( ${{ github.event.inputs.duration || 60 }} * 60 ))
+
+        # Stop AFL
+        kill $AFL_PID || true
+        sleep 5
+
+    - name: Analyze crashes
+      if: always()
+      run: |
+        cd tests/fuzz
+        if [ -d output/default/crashes ]; then
+          echo "Crashes found:"
+          ls -la output/default/crashes/
+          cp -r output/default/crashes/ crashes/
+        else
+          echo "No crashes found"
+        fi
+
+    - name: Generate fuzzing report
+      if: always()
+      run: |
+        cd tests/fuzz
+        cat > fuzzing-report.md << 'EOF'
+        # AFL++ Fuzzing Report
+
+        ## Configuration
+        - Duration: ${{ github.event.inputs.duration || 60 }} minutes
+        - Target: Physical Memory Manager (PMM)
+        - Fuzzer: AFL++
+
+        ## Results
+        EOF
+
+        if [ -d output/default/crashes ]; then
+          echo "- Crashes: $(ls output/default/crashes | wc -l)" >> fuzzing-report.md
+          echo "- Unique crashes: $(ls output/default/crashes/id:* 2>/dev/null | wc -l)" >> fuzzing-report.md
+        else
+          echo "- Crashes: 0" >> fuzzing-report.md
+        fi
+
+        if [ -f output/default/plot_data ]; then
+          echo "" >> fuzzing-report.md
+          echo "## Statistics" >> fuzzing-report.md
+          tail -1 output/default/plot_data >> fuzzing-report.md
+        fi
+
+    - name: Upload fuzzing results
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: afl-fuzzing-${{ github.sha }}
+        path: |
+          tests/fuzz/crashes/
+          tests/fuzz/output/
+          tests/fuzz/afl.log
+          tests/fuzz/fuzzing-report.md
+        retention-days: 90
+
+  libfuzzer:
+    name: LibFuzzer
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
+
+    strategy:
+      matrix:
+        target:
+          - fuzz_heap
+          - fuzz_vmm
+          - fuzz_scheduler
+          - fuzz_syscall
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Install Clang and LibFuzzer
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y clang-15 llvm-15
+
+    - name: Build fuzz target
+      run: |
+        cd tests/fuzz
+        CC=clang-15 make libfuzzer-${{ matrix.target }}
+
+    - name: Run LibFuzzer
+      timeout-minutes: 60
+      run: |
+        cd tests/fuzz
+        mkdir -p corpus/${{ matrix.target }}
+        ./${{ matrix.target }} corpus/${{ matrix.target }} \
+          -max_total_time=$(( 60 * 60 )) \
+          -timeout=10 \
+          -rss_limit_mb=2048 \
+          -print_final_stats=1 \
+          > libfuzzer-${{ matrix.target }}.log 2>&1 || true
+
+    - name: Check for crashes
+      if: always()
+      run: |
+        cd tests/fuzz
+        if ls crash-* 2>/dev/null; then
+          echo "Crashes found for ${{ matrix.target }}:"
+          ls -la crash-*
+          mkdir -p crashes/${{ matrix.target }}
+          mv crash-* crashes/${{ matrix.target }}/
+        fi
+
+    - name: Upload LibFuzzer results
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: libfuzzer-${{ matrix.target }}-${{ github.sha }}
+        path: |
+          tests/fuzz/crashes/${{ matrix.target }}/
+          tests/fuzz/libfuzzer-${{ matrix.target }}.log
+          tests/fuzz/corpus/${{ matrix.target }}/
+        retention-days: 90
+
+  honggfuzz:
+    name: Honggfuzz
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Install Honggfuzz
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y honggfuzz build-essential
+
+    - name: Build with Honggfuzz
+      run: |
+        cd tests/fuzz
+        CC=hfuzz-cc make honggfuzz-build
+
+    - name: Run Honggfuzz
+      timeout-minutes: 60
+      run: |
+        cd tests/fuzz
+        mkdir -p corpus crashes
+        honggfuzz -i corpus -o crashes \
+          --timeout 10 --run_time 3600 \
+          --asan --threads 4 \
+          -- ./fuzz_target ___FILE___ > honggfuzz.log 2>&1 || true
+
+    - name: Upload Honggfuzz results
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: honggfuzz-${{ github.sha }}
+        path: |
+          tests/fuzz/crashes/
+          tests/fuzz/honggfuzz.log
+        retention-days: 90
+
+  kernel-fuzzing:
+    name: Kernel System Call Fuzzing
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Install dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y build-essential nasm python3 \
+          qemu-system-x86 gcc-x86-64-elf binutils-x86-64-elf
+
+    - name: Build kernel with fuzzing support
+      run: |
+        CFLAGS="-DFUZZING_BUILD_MODE" make kernel
+
+    - name: Build system
+      run: make all
+
+    - name: Run kernel fuzzer
+      timeout-minutes: 60
+      run: |
+        cd tests/fuzz
+        python3 kernel_fuzzer.py --duration 60 --output fuzz-results.json
+
+    - name: Analyze kernel fuzzing results
+      if: always()
+      run: |
+        cd tests/fuzz
+        python3 analyze_results.py fuzz-results.json > kernel-fuzz-report.md
+
+    - name: Upload kernel fuzzing results
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: kernel-fuzzing-${{ github.sha }}
+        path: |
+          tests/fuzz/fuzz-results.json
+          tests/fuzz/kernel-fuzz-report.md
+        retention-days: 90
+
+  fuzzing-summary:
+    name: Fuzzing Summary
+    runs-on: ubuntu-latest
+    needs: [afl-fuzzing, libfuzzer, honggfuzz, kernel-fuzzing]
+    if: always()
+
+    steps:
+    - name: Download all fuzzing results
+      uses: actions/download-artifact@v4
+      with:
+        pattern: '*-${{ github.sha }}'
+        path: fuzzing-results/
+
+    - name: Generate fuzzing summary
+      run: |
+        cat > fuzzing-summary.md << 'EOF'
+        # Fuzzing Summary Report
+
+        ## Overview
+        - Run Date: $(date)
+        - Duration: ${{ github.event.inputs.duration || 60 }} minutes
+        - Commit: ${{ github.sha }}
+
+        ## Results by Fuzzer
+        - AFL++: ${{ needs.afl-fuzzing.result }}
+        - LibFuzzer: ${{ needs.libfuzzer.result }}
+        - Honggfuzz: ${{ needs.honggfuzz.result }}
+        - Kernel Fuzzing: ${{ needs.kernel-fuzzing.result }}
+
+        ## Crashes Found
+        EOF
+
+        # Count total crashes
+        TOTAL_CRASHES=$(find fuzzing-results/ -name "crash-*" -o -name "id:*" | wc -l)
+        echo "Total crashes: $TOTAL_CRASHES" >> fuzzing-summary.md
+
+        if [ $TOTAL_CRASHES -gt 0 ]; then
+          echo "" >> fuzzing-summary.md
+          echo "## Action Required" >> fuzzing-summary.md
+          echo "⚠️ Crashes detected! Review artifacts and fix vulnerabilities." >> fuzzing-summary.md
+        else
+          echo "" >> fuzzing-summary.md
+          echo "✓ No crashes detected" >> fuzzing-summary.md
+        fi
+
+    - name: Upload fuzzing summary
+      uses: actions/upload-artifact@v4
+      with:
+        name: fuzzing-summary-${{ github.sha }}
+        path: fuzzing-summary.md
+        retention-days: 90
+
+    - name: Fail if crashes found
+      run: |
+        TOTAL_CRASHES=$(find fuzzing-results/ -name "crash-*" -o -name "id:*" 2>/dev/null | wc -l)
+        if [ $TOTAL_CRASHES -gt 0 ]; then
+          echo "ERROR: $TOTAL_CRASHES crashes found during fuzzing"
+          exit 1
+        fi

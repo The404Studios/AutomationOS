@@ -304,12 +304,16 @@ static void scan_project(Ide* a) {
  * ==========================================================================*/
 
 static void init(Ide* a) {
-    ide_strlcpy(a->root, "/usr/src/towerdefense", IDE_PATH);
+    /* Root the explorer at /usr/src so EVERY packaged project (towerdefense,
+     * bubbledefense, native, ...) is browsable + editable from the file tree,
+     * not just the single towerdefense demo. scan_dir() recurses into the
+     * subdirs, so clicking any file under any project opens it in the editor. */
+    ide_strlcpy(a->root, "/usr/src", IDE_PATH);
 
     scan_project(a);
 
-    /* Pick the first file named "tower.c"; else the first .c file; else the
-     * first regular file found. */
+    /* Pick a friendly starting file: prefer "tower.c"; else the first .c file;
+     * else the first regular file found anywhere in the tree. */
     int pick = -1;
     int first_c = -1;
     int first_file = -1;
@@ -830,7 +834,12 @@ static void scroll_under_mouse(Ide* a, int delta, int horizontal) {
 static int handle_ctrl_chord(Ide* a, int keycode) {
     switch (keycode) {
     case KEY_B:               /* Ctrl+B: build the open file */
+        /* Build what's on screen: flush unsaved editor edits to disk first so
+         * tc_build (which re-reads the file) compiles the live buffer, not a
+         * stale on-disk copy. Harmless when nothing is dirty / no file open. */
+        if (a->cur_file[0] && ide_editor_dirty(a)) ide_editor_save(a);
         ide_do_build(a);
+        /* Always surface build output: switch to/show the BUILD view. */
         if (a->ws == WS_EDITOR) a->btab = BTAB_BUILD;
         else                    g_build_view = 1;
         return 1;
@@ -875,11 +884,17 @@ static void handle_key(Ide* a, int keycode, int pressed) {
 
     if (!pressed) return;
 
-    /* Ctrl chords first (work in both workspaces). */
+    /* Ctrl chords first (work in both workspaces). handle_ctrl_chord only
+     * returns 1 for keys we actually bind (B/R/S/E/J/`). If g_ctrl_down is set
+     * but the key is NOT a bound chord, we deliberately FALL THROUGH to normal
+     * typing instead of dead-swallowing the key: on real hardware a Ctrl
+     * *release* can be missed (focus change while Ctrl is held, or a dropped
+     * event), which would otherwise latch g_ctrl_down=1 and silently kill ALL
+     * subsequent typing. Falling through means a desynced modifier can never
+     * permanently disable the keyboard -- at worst one keystroke types a literal
+     * char, and the next real Ctrl press/release resyncs the state. */
     if (g_ctrl_down) {
         if (handle_ctrl_chord(a, keycode)) return;
-        /* Ctrl + something we don't bind: swallow so it never types. */
-        return;
     }
 
     /* ESC always exits (matches the LEGO workspace's original behaviour). */
@@ -962,6 +977,16 @@ void _start(void) {
     if (!win) {
         ide_exit(1);
     }
+
+    /* Defensive: guarantee the landing view is the editable EDITOR workspace
+     * with the editor (not the bottom terminal) owning the keyboard, so the
+     * very first keystroke after launch lands in the editor. init() already
+     * sets these, but reassert here so nothing can leave keys mis-routed. */
+    a->ws          = WS_EDITOR;
+    a->term_focus  = 0;
+    a->editor.focused = 1;
+    g_ctrl_down    = 0;
+    g_shift_down   = 0;
 
     a->mouse_x = 0;
     a->mouse_y = 0;

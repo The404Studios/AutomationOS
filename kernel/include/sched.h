@@ -165,6 +165,15 @@ typedef struct process {
     // reaping waitpid. Appended at the END to keep the asm context offset valid.
     struct wait_queue* child_wait;
     int exit_status;
+
+    // Real blocking sleep (SYS_SLEEP). A process that calls sleep(ms) goes
+    // PROCESS_BLOCKED (zero CPU) and is linked onto the global sleep list via
+    // sleep_next; the timer wakeup scan re-readies it once timer_get_ticks()
+    // reaches wake_deadline. A sleeper is on the sleep list XOR a ready queue,
+    // never both. Both fields are memset-zeroed by process_create(). Appended at
+    // the END to keep the assembler's hardcoded context offset valid.
+    uint64_t wake_deadline;          // absolute tick (timer_get_ticks units) to wake at
+    struct process* sleep_next;      // intrusive singly-linked sleep list link
 } process_t;
 
 // Global pointer to current process (for PE loader and other subsystems)
@@ -231,6 +240,20 @@ void cooperative_switch_to(process_t* from, process_t* next);
 // resumed by context_switch). Does not return to the caller.
 void context_switch_to_iretq(process_t* from, process_t* to);
 #endif
+
+// ===========================================================================
+// Real blocking sleep support (scheduler.c owns the global sleep list)
+// ===========================================================================
+// sys_sleep() marks the caller PROCESS_BLOCKED, sets wake_deadline, and pushes
+// it onto the global sleep list with sleep_list_push() BEFORE switching away.
+// Once per timer tick the wakeup scan (sleep_list_wake_due) is called from BOTH
+// the cooperative PIT handler (pit.c timer_handler) and the preemptive
+// schedule_from_irq(); it unlinks every sleeper whose wake_deadline <= now,
+// marks it PROCESS_READY, and re-adds it via scheduler_add_process(). Present in
+// BOTH builds (not gated). Single-core; the implementation brackets the list
+// mutation with cli/restore so a timer IRQ cannot observe a half-linked node.
+void sleep_list_push(process_t* proc);
+void sleep_list_wake_due(uint64_t now);
 
 // SMP Load Balancing (scheduler_smp.c)
 void scheduler_tick(void);                                    // Called on timer tick for load balancing

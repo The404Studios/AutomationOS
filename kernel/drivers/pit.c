@@ -51,6 +51,12 @@ static inline uint64_t pit_rflags_if(void)
 // EOI is sent by the IRQ dispatch layer (idt.c:irq_handler) after we return.
 static void timer_handler(void) {
     timer_ticks++;
+    // Real-sleep wakeups: re-ready any process whose blocking-sleep deadline has
+    // arrived (1 tick == 1 ms at 1000 Hz). Runs once per tick here (the
+    // cooperative IRQ0 path); the PREEMPTIVE build does the equivalent at the top
+    // of schedule_from_irq(). Interrupts are disabled in the IRQ handler, so the
+    // sleep-list walk is race-free against sys_sleep's push.
+    sleep_list_wake_due(timer_ticks);
     // Per-process CPU accounting: charge this 1000 Hz tick to whatever process is
     // currently RUNNING. Counter only -- does not touch total_time or switch logic.
     // (The PREEMPTIVE build does the equivalent once at the top of

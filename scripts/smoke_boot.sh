@@ -309,6 +309,22 @@ check_floattest() {
     fi
 }
 
+check_sleep() {
+    # init spawns sbin/sleeptest; proves SYS_SLEEP is a real, ms-granularity,
+    # BLOCKING sleep (process goes BLOCKED, timer wakes it at its deadline). The
+    # app sleeps 50 ms and checks the measured elapsed time is in [40, 300] ms.
+    if grep -qF 'SLEEPTEST: PASS' "$LOG"; then
+        pass "blocking ms-sleep verified ($(grep -F 'SLEEPTEST: slept=' "$LOG" | head -1 | sed 's/^.*SLEEPTEST: //'))"
+        return 0
+    elif grep -qF 'SLEEPTEST: FAIL' "$LOG"; then
+        fail "sleep broken: $(grep -F 'SLEEPTEST:' "$LOG" | head -2 | tr '\n' ' ')"
+        return 1
+    else
+        fail "sleeptest did not report (SYS_SLEEP hung or never ran)"
+        return 1
+    fi
+}
+
 check_tensor() {
     # init spawns sbin/tensortest; the SSE tensor-kernel library (matmul/add/
     # scale/relu/dot) is run against an independent scalar reference within an
@@ -712,6 +728,7 @@ run_checks() {
         check_slab
         check_argv
         check_floattest
+        check_sleep
         check_tensor
         check_compiler
         check_compress

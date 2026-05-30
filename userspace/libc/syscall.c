@@ -51,8 +51,14 @@ int getpid(void) {
     return (int)syscall6(SYS_GETPID, 0, 0, 0, 0, 0, 0);
 }
 
+// POSIX sleep(): the argument is SECONDS. SYS_SLEEP now takes MILLISECONDS
+// (the PIT runs at 1000 Hz, 1 tick == 1 ms), so convert seconds -> ms here. This
+// keeps every existing caller (which passes seconds) correct while the kernel
+// performs a real blocking sleep. Saturate the ms product to avoid overflow on
+// absurd inputs.
 int sleep(unsigned int seconds) {
-    return (int)syscall6(SYS_SLEEP, seconds, 0, 0, 0, 0, 0);
+    unsigned long ms = (unsigned long)seconds * 1000UL;
+    return (int)syscall6(SYS_SLEEP, (long)ms, 0, 0, 0, 0, 0);
 }
 
 int open(const char* path, int flags, ...) {

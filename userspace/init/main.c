@@ -241,6 +241,15 @@ void _start(void) {
     // prints "WEBAPITEST: PASS" and exits.
     spawn("sbin/webapitest");
 
+    // sleeptest: proves SYS_SLEEP is a real, ms-granularity, BLOCKING sleep (the
+    // process goes BLOCKED, accrues ~no CPU, and the timer wakes it at its
+    // deadline). It sleeps 50 ms and checks the measured elapsed ms is in a tight
+    // window. Spawned LAST (after the boot-time spawn storm has drained) so the
+    // measured elapsed reflects the sleep itself, not ready-queue dispatch latency
+    // behind dozens of still-spawning boot apps. Works in BOTH builds.
+    print("[INIT] Spawning sleeptest...\n");
+    spawn("sbin/sleeptest");
+
 #ifdef PREEMPT_STRESS
     // ========================================================================
     // PREEMPTIVE-SCHEDULER STRESS WORKLOAD  (compiled ONLY with -DPREEMPT_STRESS,

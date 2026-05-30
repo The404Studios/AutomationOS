@@ -14,7 +14,7 @@
 #define SYS_WAITPID 6
 #define SYS_EXECVE  7
 #define SYS_GETPID  8
-#define SYS_SLEEP   9
+#define SYS_SLEEP   9     // Blocking sleep, argument is MILLISECONDS (1 tick = 1 ms)
 #define SYS_SETRLIMIT 10  // Set resource limit
 #define SYS_GETRLIMIT 11  // Get resource limit
 #define SYS_GETRUSAGE 12  // Get resource usage
@@ -133,7 +133,7 @@ int64_t sys_close(uint64_t fd, uint64_t arg2, uint64_t arg3,
                   uint64_t arg4, uint64_t arg5, uint64_t arg6);
 int64_t sys_getpid(uint64_t arg1, uint64_t arg2, uint64_t arg3,
                     uint64_t arg4, uint64_t arg5, uint64_t arg6);
-int64_t sys_sleep(uint64_t seconds, uint64_t arg2, uint64_t arg3,
+int64_t sys_sleep(uint64_t ms, uint64_t arg2, uint64_t arg3,
                   uint64_t arg4, uint64_t arg5, uint64_t arg6);
 
 // Resource limit syscalls

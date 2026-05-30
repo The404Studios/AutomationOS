@@ -20,7 +20,7 @@ Minimal C library for userspace programs.
 - `read(int fd, void* buf, size_t count)` - Read from file descriptor
 - `write(int fd, const void* buf, size_t count)` - Write to file descriptor
 - `getpid(void)` - Get process ID
-- `sleep(unsigned int seconds)` - Sleep for seconds (stub)
+- `sleep(unsigned int seconds)` - Real blocking sleep (converts seconds to ms; SYS_SLEEP takes ms)
 - `open/close/waitpid/execve` - File/process operations (stubs)
 
 **Syscall Interface:**

@@ -60,6 +60,9 @@ cc userspace/apps/make/make.c   /tmp/make.o;    $LD /tmp/crt0.o /tmp/make.o    -
 cc userspace/apps/argvtest/argvtest.c /tmp/argvtest.o; $LD /tmp/crt0.o /tmp/argvtest.o -o /tmp/argvtest.elf
 # floattest: proves ring-3 float/SSE at runtime (scalar + 2x2 matmul + reduction).
 cc userspace/apps/floattest/floattest.c /tmp/floattest.o; $LD /tmp/crt0.o /tmp/floattest.o -o /tmp/floattest.elf
+# sleeptest: proves SYS_SLEEP is a real, ms-granularity, BLOCKING sleep (measures
+# elapsed ms across a 50 ms sleep via SYS_GET_TICKS_MS). crt0-linked.
+cc userspace/apps/sleeptest/sleeptest.c /tmp/sleeptest.o; $LD /tmp/crt0.o /tmp/sleeptest.o -o /tmp/sleeptest.elf
 # cpuburn: never-yielding CPU burner (int + float/SSE) for the preemptive-scheduler
 # stress test. Harmless to build/ship unconditionally -- it is only ever SPAWNED
 # when init is built with -DPREEMPT_STRESS (STRESS=1). crt0-linked (id from argv[1]).
@@ -365,7 +368,7 @@ $LD /tmp/crt0.o /tmp/cc.o \
     -o /tmp/cc.elf
 
 echo "[all] canary check (all must be 0):"
-for e in comp init filemanager calculator clock sysinfo settings sysmon uidemo dateapp applauncher taskman terminal editor snake paint synth tetris game2048 sheet notes calendar stopwatch mines piano dashboard welcome bench breakout pong invaders procmon soundtest solitaire aiconsole screenshot stress musicplayer ide bubbletd pacman clockapp forktest aibroker sed awk tar pkg make meminfo argvtest floattest matbench tensortest cpuburn blk ps kill free uptime find diff cmp tee wcx xargs gzip cc nettest sockettest wget netman browser cryptotest libtest ping nc grep head tail sort uniq cut tr nl du touch basename dirname uname hostname whoami date less hexdump tlsprobe certtool dhcpc apidemo js futextest epolltest sendfiletest perftest batchtest domtest htmltest csstest layouttest webtest browser2 webapitest; do
+for e in comp init filemanager calculator clock sysinfo settings sysmon uidemo dateapp applauncher taskman terminal editor snake paint synth tetris game2048 sheet notes calendar stopwatch mines piano dashboard welcome bench breakout pong invaders procmon soundtest solitaire aiconsole screenshot stress musicplayer ide bubbletd pacman clockapp forktest aibroker sed awk tar pkg make meminfo argvtest floattest sleeptest matbench tensortest cpuburn blk ps kill free uptime find diff cmp tee wcx xargs gzip cc nettest sockettest wget netman browser cryptotest libtest ping nc grep head tail sort uniq cut tr nl du touch basename dirname uname hostname whoami date less hexdump tlsprobe certtool dhcpc apidemo js futextest epolltest sendfiletest perftest batchtest domtest htmltest csstest layouttest webtest browser2 webapitest; do
     n=$(objdump -d /tmp/$e.elf 2>/dev/null | grep -c "fs:0x28" || true)
     echo "  $e=$n"
 done
@@ -391,6 +394,7 @@ cp /tmp/make.elf     /tmp/ird/bin/make
 cp /tmp/meminfo.elf  /tmp/ird/bin/meminfo
 cp /tmp/argvtest.elf /tmp/ird/sbin/argvtest
 cp /tmp/floattest.elf /tmp/ird/sbin/floattest
+cp /tmp/sleeptest.elf /tmp/ird/sbin/sleeptest
 # cpuburn -> /sbin (init spawns sbin/cpuburn under PREEMPT_STRESS). Shipped in
 # every initrd but only spawned by a STRESS=1 init, so it is inert otherwise.
 cp /tmp/cpuburn.elf /tmp/ird/sbin/cpuburn

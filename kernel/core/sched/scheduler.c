@@ -265,6 +265,58 @@ static inline int process_get_priority(process_t* proc) {
     return priority;
 }
 
+// ===========================================================================
+// Global sleep list — real blocking SYS_SLEEP (ms granularity, zero CPU)
+// ===========================================================================
+// Intrusive singly-linked list of processes parked in PROCESS_BLOCKED by
+// sys_sleep(). Each node links via proc->sleep_next and carries an absolute
+// wake_deadline in timer_get_ticks() units (the PIT runs at 1000 Hz, so 1 tick
+// == 1 ms). A sleeper is on THIS list XOR a ready queue, never both:
+//   sys_sleep:   state=BLOCKED, sleep_list_push(), switch away (not re-queued).
+//   timer scan:  unlink when wake_deadline<=now, state=READY, scheduler_add_process.
+//
+// Single-core: the only concurrent mutator of this list is the timer IRQ's
+// wakeup scan. sys_sleep() may run with IF=1, so we bracket the push/unlink with
+// save_flags_cli()/restore_flags() — that makes the IRQ unable to observe a
+// half-linked node (and the IRQ scan itself already runs with IF=0). No spinlock
+// is needed beyond this on a uniprocessor.
+static process_t* g_sleep_list = NULL;
+
+void sleep_list_push(process_t* proc) {
+    if (!proc) return;
+    uint64_t flags = save_flags_cli();
+    proc->sleep_next = g_sleep_list;
+    g_sleep_list = proc;
+    restore_flags(flags);
+}
+
+// Walk the sleep list and wake every process whose deadline has arrived. Called
+// once per timer tick from BOTH the cooperative pit.c handler and the preemptive
+// schedule_from_irq() (after the tick counter advances). Unlinks due sleepers,
+// marks them READY, and hands them to scheduler_add_process() (which takes its
+// own reference). Runs with interrupts disabled in the IRQ context; we also save
+// flags so it is safe if ever invoked from an IF=1 path.
+void sleep_list_wake_due(uint64_t now) {
+    uint64_t flags = save_flags_cli();
+    process_t** link = &g_sleep_list;
+    while (*link) {
+        process_t* it = *link;
+        if (it->wake_deadline <= now) {
+            // Unlink first so the list is consistent before we touch the
+            // scheduler (scheduler_add_process clobbers it->next, a different
+            // field than sleep_next, but we keep the invariant tight anyway).
+            *link = it->sleep_next;
+            it->sleep_next = NULL;
+            it->state = PROCESS_READY;
+            scheduler_add_process(it);
+            // *link now points at the successor; do NOT advance link.
+        } else {
+            link = &it->sleep_next;
+        }
+    }
+    restore_flags(flags);
+}
+
 void scheduler_init(void) {
     kprintf("[SCHEDULER] Initializing O(1) multi-level feedback queue scheduler...\n");
 
@@ -738,6 +790,13 @@ void schedule_from_irq(interrupt_frame_t* frame) {
     //    (We bypass idt.c's irq_handler, so we own the EOI here.)
     pit_tick();
     outb(PIC1_COMMAND, PIC_EOI);
+
+    // Real-sleep wakeups: once per tick, re-ready any process whose sleep
+    // deadline has arrived. Mirrors the cooperative pit.c timer_handler so
+    // blocking sleep works identically in BOTH builds. Done before the quantum
+    // logic so a just-woken sleeper can be picked as the successor below.
+    extern uint64_t timer_get_ticks(void);
+    sleep_list_wake_due(timer_get_ticks());
 
     process_t* current = process_get_current();
     if (current == NULL) {

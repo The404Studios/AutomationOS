@@ -82,6 +82,13 @@ extern void irq13(void);
 extern void irq14(void);
 extern void irq15(void);
 
+// Preemptive timer (IRQ0) entry stub. Defined in interrupt.asm ONLY under
+// -DPREEMPTIVE (gated %ifdef block). When the flag is off this symbol does not
+// exist and IDT[32] keeps pointing at the cooperative irq0 stub below.
+#ifdef PREEMPTIVE
+extern void irq0_preempt(void);
+#endif
+
 // External assembly function to load IDT
 extern void idt_flush(uint64_t idt_ptr);
 
@@ -204,7 +211,15 @@ void idt_init(void) {
     idt_set_gate(31, (uint64_t)isr31, 0x08, IDT_GATE_INTERRUPT);
 
     // Install IRQ handlers (INT 32-47)
+    // IRQ0 (timer, vector 32): under -DPREEMPTIVE the timer drives the
+    // preemptive scheduler via irq0_preempt (which builds an interrupt_frame_t
+    // and calls schedule_from_irq). With the flag OFF this is the cooperative
+    // irq0 stub -- byte-for-byte unchanged default behavior.
+#ifdef PREEMPTIVE
+    idt_set_gate(32, (uint64_t)irq0_preempt, 0x08, IDT_GATE_INTERRUPT);
+#else
     idt_set_gate(32, (uint64_t)irq0, 0x08, IDT_GATE_INTERRUPT);
+#endif
     idt_set_gate(33, (uint64_t)irq1, 0x08, IDT_GATE_INTERRUPT);
     idt_set_gate(34, (uint64_t)irq2, 0x08, IDT_GATE_INTERRUPT);
     idt_set_gate(35, (uint64_t)irq3, 0x08, IDT_GATE_INTERRUPT);

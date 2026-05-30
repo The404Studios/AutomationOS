@@ -690,6 +690,21 @@ void schedule_from_irq(interrupt_frame_t* frame) {
         return;  // Nothing running yet; leave frame untouched.
     }
 
+    // HARD RING-3 GUARD — non-preemptible kernel (CRITICAL safety).
+    // Only ever switch tasks that the timer interrupted while running in
+    // userspace (CPL==3). If the interrupted code segment's RPL is not 3, the
+    // KERNEL itself was running (a syscall, IRQ handler, or any kernel critical
+    // section), so we must NOT preempt: doing so could switch away mid-update of
+    // a kernel data structure that holds a lock or a half-built frame, deadlock
+    // the system, or resume into a kernel continuation via the iretq path (which
+    // only knows how to resume ring-3 RESUME_IRETQ contexts). Leaving the frame
+    // untouched makes iretq simply resume the interrupted kernel code. This is
+    // the single most important invariant of this scheduler: the timer preempts
+    // user code only, never the kernel.
+    if ((frame->cs & 3) != 3) {
+        return;  // kernel was running: leave frame untouched, resume it.
+    }
+
     // Guard: only preempt a genuinely RUNNING process. If current is BLOCKED
     // (e.g. the timer fired while wq_block_current() was idling in sti/hlt
     // before it switched away) or otherwise not running, do nothing — switching

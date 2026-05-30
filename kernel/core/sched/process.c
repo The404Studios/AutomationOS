@@ -102,11 +102,17 @@ process_t* process_create(const char* name, void* entry_point) {
     proc->uid = current_process ? current_process->uid : 0;
     proc->gid = current_process ? current_process->gid : 0;
 
-    // IMPORTANT: Initialize time_slice to 0!
-    // When process is first scheduled, scheduler_pick_next() will give it
-    // a fresh time slice. This ensures fairness - new processes don't start
-    // with a "free" time slice advantage.
-    proc->time_slice = 0;
+    // Initialize time_slice to a full quantum (SCHED_QUANTUM_TICKS, == the
+    // cooperative DEFAULT_TIME_SLICE of 10). Two reasons:
+    //   (1) Cooperative path: unchanged behavior. scheduler_pick_next() only
+    //       refills when time_slice==0, so a fresh process keeps its 10 here and
+    //       still runs exactly one 10-tick quantum on first pick -- identical to
+    //       starting at 0 and being refilled to 10.
+    //   (2) Preemptive path (-DPREEMPTIVE): schedule_from_irq decrements the
+    //       quantum each tick. Starting at a sane non-zero value avoids any
+    //       first-quantum underflow if a process ever became current without
+    //       passing through pick_next's refill. Defensive, costs nothing.
+    proc->time_slice = SCHED_QUANTUM_TICKS;
 
     proc->total_time = 0;
     proc->priority = 0;  // Default priority (nice value 0)

@@ -5,6 +5,31 @@ mkdir -p build
 CC=gcc
 CFLAGS="-std=gnu11 -ffreestanding -nostdlib -nostdinc -fno-pic -fno-pie -fno-stack-protector -mno-red-zone -mcmodel=kernel -DSYSCALL_QUIET -DSCHEDULER_QUIET -DCONTEXT_SWITCH_QUIET -DEXEC_QUIET -DPROCESS_QUIET -Wno-unused-variable -Wno-unused-function -Wno-builtin-declaration-mismatch -Wno-implicit-function-declaration -Wno-int-conversion -Wno-incompatible-pointer-types -Ikernel/include -Ikernel/include/compat"
 
+# Assembler flags. Empty by default so the cooperative build is byte-for-byte
+# unchanged.
+NASMFLAGS=""
+
+# Kernel output. Default cooperative build writes build/kernel.elf (unchanged).
+KERNEL_OUT="build/kernel.elf"
+
+# =============================================================================
+# OPT-IN PREEMPTIVE SCHEDULER (experimental). GATED behind the PREEMPT env var.
+#   PREEMPT=1 bash scripts/quick_build.sh   ->  build/kernel-preempt.elf
+# When PREEMPT is UNSET this whole block is skipped and the build behaves
+# EXACTLY as before: cooperative scheduler, build/kernel.elf, no -DPREEMPTIVE.
+# We add -DPREEMPTIVE to BOTH the nasm flags (so interrupt.asm + context_switch.asm
+# assemble their %ifdef PREEMPTIVE blocks: irq0_preempt / context_save_irq /
+# context_load_irq) AND the gcc CFLAGS (so scheduler.c compiles schedule_from_irq
+# and idt.c points IDT[32] at irq0_preempt), and write to a SEPARATE output so
+# the normal build/kernel.elf is never touched by a preemptive build.
+# =============================================================================
+if [ "${PREEMPT:-0}" = "1" ]; then
+    CFLAGS="$CFLAGS -DPREEMPTIVE"
+    NASMFLAGS="$NASMFLAGS -DPREEMPTIVE"
+    KERNEL_OUT="build/kernel-preempt.elf"
+    echo "*** PREEMPTIVE build: -DPREEMPTIVE enabled, output -> $KERNEL_OUT ***"
+fi
+
 GOOD=0
 BAD=0
 OBJS=""
@@ -28,7 +53,7 @@ assemble() {
     local src="$1"
     local tag="$2"
     local obj="build/${tag}.o"
-    if nasm -f elf64 "$src" -o "$obj" 2>/tmp/nasm_err.txt; then
+    if nasm -f elf64 $NASMFLAGS "$src" -o "$obj" 2>/tmp/nasm_err.txt; then
         echo "  OK: $src"
         GOOD=$((GOOD+1))
         OBJS="$OBJS $obj"
@@ -165,7 +190,7 @@ compile kernel/core/syscall/vma_test.c        c_vma_test
 
 echo ""
 echo "[3/3] Linking (strict: undefined symbols are fatal)..."
-if ld -T kernel/linker.ld -nostdlib $OBJS -o build/kernel.elf 2>/tmp/ld_err.txt; then
+if ld -T kernel/linker.ld -nostdlib $OBJS -o "$KERNEL_OUT" 2>/tmp/ld_err.txt; then
     echo "  Link OK -- no unresolved symbols"
 else
     echo "  LINK FAILED:"
@@ -174,11 +199,11 @@ fi
 
 echo ""
 echo "=== Results: $GOOD compiled, $BAD failed ==="
-if [ -f build/kernel.elf ]; then
+if [ -f "$KERNEL_OUT" ]; then
     echo ""
     echo "========================================="
-    echo "  SUCCESS: build/kernel.elf ($(stat -c%s build/kernel.elf) bytes)"
+    echo "  SUCCESS: $KERNEL_OUT ($(stat -c%s "$KERNEL_OUT") bytes)"
     echo "========================================="
 else
-    echo "FAILED: No kernel.elf produced"
+    echo "FAILED: No $KERNEL_OUT produced"
 fi

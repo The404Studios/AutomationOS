@@ -59,6 +59,34 @@ typedef struct {
     char path[IDE_PATH];
 } EntryRow;
 
+/* ---------------------------------------------------------------------------
+ * "New Project" modal. Ctrl+N (or the topbar [+ NEW] button) opens a small
+ * centered overlay that (1) lists the project templates found under
+ * /usr/src/templates/ so the user picks one, then (2) prompts for a project
+ * name. Confirming clones the chosen template dir into /usr/src/<name>/ and
+ * opens its main .c in the editor.
+ * ------------------------------------------------------------------------- */
+#define IDE_TEMPLATES_DIR "/usr/src/templates"
+#define IDE_PROJECTS_DIR  "/usr/src"
+#define NP_MAXTPL  16          /* templates listed in the picker            */
+#define NP_NAMELEN 64          /* max typed project-name length             */
+
+typedef enum {
+    NP_CLOSED = 0,   /* modal hidden (normal IDE)                  */
+    NP_PICK,         /* choosing a template from the list          */
+    NP_NAME          /* typing the new project's name              */
+} NewProjPhase;
+
+typedef struct {
+    NewProjPhase phase;
+    char tpl[NP_MAXTPL][64];   /* template directory names               */
+    int  ntpl;                 /* count discovered                       */
+    int  sel;                  /* highlighted template row               */
+    char name[NP_NAMELEN];     /* project name being typed               */
+    int  name_len;
+    char status[96];           /* one-line result / error message        */
+} NewProj;
+
 typedef struct Ide {
     /* project / file */
     char     root[IDE_PATH];        /* project root dir              */
@@ -96,6 +124,9 @@ typedef struct Ide {
     /* editor-workspace rects */
     Rect     r_e_tree, r_e_editor, r_e_bottom, r_e_btabs;
 
+    /* "New Project" modal (Ctrl+N / topbar [+ NEW]); see NewProj above. */
+    NewProj  np;
+
     int      mouse_x, mouse_y, buttons, prev_buttons;
 } Ide;
 
@@ -126,5 +157,8 @@ int  gen_apply_action(Ide* a, int idx);
 void ide_open_file(Ide* a, const char* path);
 /* Set the focused function (re-runs analyze for that focus). */
 void ide_set_focus(Ide* a, int func_idx);
+/* Open the "New Project" templates modal (Ctrl+N / topbar [+ NEW] button).
+ * Public so chrome in ide_chrome.c can trigger it too. Implemented in ide.c. */
+void ide_new_project(Ide* a);
 
 #endif /* IDE_H */

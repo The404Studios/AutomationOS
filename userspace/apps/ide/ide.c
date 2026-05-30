@@ -46,7 +46,10 @@ static int g_build_view = 0;
 #define KEY_Q        16
 #define KEY_B        48          /* Build the open file with the native toolchain */
 #define KEY_R        19          /* Run the last build (SYS_SPAWN the ELF)        */
+#define KEY_N        49          /* Ctrl+N new project (templates picker)         */
 #define KEY_S        31          /* Ctrl+S save (editor)                          */
+#define KEY_ENTER    28          /* confirm in the New Project modal              */
+#define KEY_BACKSPC  14          /* edit the typed project name                   */
 #define KEY_J        36          /* Ctrl+J toggle bottom panel focus              */
 #define KEY_E        18          /* Ctrl+E toggle workspace (editor <-> LEGO)     */
 #define KEY_GRAVE    41          /* Ctrl+` focus terminal                         */
@@ -300,6 +303,204 @@ static void scan_project(Ide* a) {
 }
 
 /* ===========================================================================
+ * "New Project" flow: pick a template under /usr/src/templates/, name it, then
+ * clone the template directory into /usr/src/<name>/ and open its main .c.
+ *
+ * Cloning is done entirely through the AOS syscalls already wrapped in
+ * ide_sys.c: SYS_MKDIR creates the destination dir, SYS_READDIR enumerates the
+ * template's files, and each file is copied verbatim with ide_read_file +
+ * ide_write_file. No libc, no recursion (templates are a single flat dir of a
+ * clean .c + README).
+ * ==========================================================================*/
+
+#define SYS_MKDIR_NUM 67          /* matches kernel/include/syscall.h          */
+
+/* Reuse the big source buffer as a scratch copy area so we don't add another
+ * 128 KB to .bss. ide_open_file() overwrites a->src afterwards anyway. */
+
+/* Open the modal: discover template dirs under /usr/src/templates/. */
+static void np_open(Ide* a) {
+    NewProj* np = &a->np;
+    np->ntpl = 0;
+    np->sel  = 0;
+    np->name_len = 0;
+    np->name[0]  = 0;
+    np->status[0] = 0;
+
+    IdeDirent ents[NP_MAXTPL * 2];
+    int got = ide_list_dir(IDE_TEMPLATES_DIR, ents,
+                           (int)(sizeof(ents) / sizeof(ents[0])));
+    for (int i = 0; i < got && np->ntpl < NP_MAXTPL; i++) {
+        if (ents[i].type != IDE_DT_DIR) continue;     /* only directories  */
+        if (is_dot_entry(ents[i].name)) continue;
+        ide_strlcpy(np->tpl[np->ntpl], ents[i].name, 64);
+        np->ntpl++;
+    }
+
+    if (np->ntpl <= 0) {
+        /* No templates on disk: still show the modal with a clear message so
+         * the user isn't left wondering why nothing happened. */
+        ide_strlcpy(np->status, "no templates in /usr/src/templates", 96);
+    }
+    np->phase = NP_PICK;
+}
+
+static void np_close(Ide* a) { a->np.phase = NP_CLOSED; }
+
+/* Public entry point (declared in ide.h) so ide_chrome.c can open the modal. */
+void ide_new_project(Ide* a) { if (a) np_open(a); }
+
+/* Choose the file to open after a clone: prefer the template's canonical main
+ * source (game.c / app.c / service.c / main.c), else the first .c file. The
+ * dst path (/usr/src/<name>) is prepended. Writes into out (cap bytes); leaves
+ * out empty if nothing suitable was copied. */
+static int np_is_preferred_main(const char* name) {
+    return ide_streq(name, "game.c")   || ide_streq(name, "app.c") ||
+           ide_streq(name, "service.c")|| ide_streq(name, "main.c");
+}
+
+/* Clone template dir `src_dir` into `dst_dir`, copying every regular file.
+ * Records the best "main .c" path into open_path (cap bytes). Returns the
+ * number of files copied, or <0 on a fatal error (dst mkdir failed). */
+static int np_clone(Ide* a, const char* src_dir, const char* dst_dir,
+                    char* open_path, int open_cap) {
+    if (open_cap > 0) open_path[0] = 0;
+
+    /* Create the destination project directory (recursive mkdir; ignore an
+     * "already exists" style error -- the write below would still succeed). */
+    ide_sc(SYS_MKDIR_NUM, (long)dst_dir, 0755, 0, 0, 0, 0);
+
+    IdeDirent ents[64];
+    int got = ide_list_dir(src_dir, ents, 64);
+    if (got < 0) return -1;
+
+    int copied = 0;
+    int have_main = 0;          /* 1 once a preferred main .c is chosen      */
+    for (int i = 0; i < got; i++) {
+        if (ents[i].type != IDE_DT_REG) continue;     /* flat dir of files  */
+        if (is_dot_entry(ents[i].name)) continue;
+
+        char src_path[IDE_PATH];
+        char dst_path[IDE_PATH];
+        path_join(src_path, IDE_PATH, src_dir, ents[i].name);
+        path_join(dst_path, IDE_PATH, dst_dir, ents[i].name);
+
+        /* Copy bytes verbatim through the shared source buffer. */
+        int n = ide_read_file(src_path, a->src, IDE_SRC_CAP);
+        if (n < 0) continue;                          /* skip unreadable    */
+        if (n > IDE_SRC_CAP) n = IDE_SRC_CAP;
+        if (ide_write_file(dst_path, a->src, n) < 0) continue;
+        copied++;
+
+        /* Track which copied file to open: a preferred main wins outright;
+         * otherwise remember the first .c as a fallback. */
+        if (open_cap > 0 && ends_with_dot_c(ents[i].name)) {
+            if (!have_main && np_is_preferred_main(ents[i].name)) {
+                ide_strlcpy(open_path, dst_path, open_cap);
+                have_main = 1;
+            } else if (open_path[0] == 0) {
+                ide_strlcpy(open_path, dst_path, open_cap);
+            }
+        }
+    }
+    return copied;
+}
+
+/* Confirm the typed name: validate, build the src/dst dirs, clone, rescan the
+ * tree and open the new project's main .c. Updates np->status either way. */
+static void np_confirm(Ide* a) {
+    NewProj* np = &a->np;
+
+    if (np->ntpl <= 0) { np_close(a); return; }
+    if (np->name_len <= 0) {
+        ide_strlcpy(np->status, "type a project name, then Enter", 96);
+        return;
+    }
+    if (np->sel < 0 || np->sel >= np->ntpl) np->sel = 0;
+
+    char src_dir[IDE_PATH];
+    char dst_dir[IDE_PATH];
+    path_join(src_dir, IDE_PATH, IDE_TEMPLATES_DIR, np->tpl[np->sel]);
+    path_join(dst_dir, IDE_PATH, IDE_PROJECTS_DIR,  np->name);
+
+    char open_path[IDE_PATH];
+    int copied = np_clone(a, src_dir, dst_dir, open_path, IDE_PATH);
+    if (copied < 0) {
+        ide_strlcpy(np->status, "create failed (mkdir/readdir)", 96);
+        return;
+    }
+    if (copied == 0) {
+        ide_strlcpy(np->status, "template was empty", 96);
+        return;
+    }
+
+    /* Refresh the explorer so the new /usr/src/<name>/ appears, then open the
+     * project's main source (if we found one) and land in the editor. */
+    scan_project(a);
+    np_close(a);
+    if (open_path[0]) {
+        ide_open_file(a, open_path);
+        a->ws = WS_EDITOR;
+        a->term_focus = 0;
+        a->editor.focused = 1;
+        /* Select the opened file's row in the tree if we can find it. */
+        for (int i = 0; i < a->nentries; i++) {
+            if (!a->entries[i].is_dir &&
+                ide_streq(a->entries[i].path, open_path)) {
+                a->sel_entry = i;
+                break;
+            }
+        }
+    }
+}
+
+/* Modal key handling. Returns 1 if the modal consumed the key (so the editor /
+ * terminal never see it while the overlay is up). `ch` is the ASCII translation
+ * (0 for non-printables); keycode distinguishes Enter/Backspace/Esc/arrows. */
+static int np_key(Ide* a, int keycode, char ch) {
+    NewProj* np = &a->np;
+    if (np->phase == NP_CLOSED) return 0;
+
+    if (keycode == KEY_ESC) { np_close(a); return 1; }
+
+    if (np->phase == NP_PICK) {
+        switch (keycode) {
+        case KEY_UP:
+            if (np->ntpl > 0) np->sel = (np->sel + np->ntpl - 1) % np->ntpl;
+            return 1;
+        case KEY_DOWN:
+            if (np->ntpl > 0) np->sel = (np->sel + 1) % np->ntpl;
+            return 1;
+        case KEY_ENTER:
+            if (np->ntpl > 0) { np->phase = NP_NAME; np->status[0] = 0; }
+            return 1;
+        default:
+            return 1;             /* swallow everything else while picking */
+        }
+    }
+
+    /* NP_NAME: edit the project name. */
+    switch (keycode) {
+    case KEY_ENTER:
+        np_confirm(a);
+        return 1;
+    case KEY_BACKSPC:
+        if (np->name_len > 0) np->name[--np->name_len] = 0;
+        return 1;
+    default:
+        break;
+    }
+
+    /* Accept a conservative filename charset: letters, digits, '_', '-'. */
+    if (ch && np->name_len < NP_NAMELEN - 1) {
+        int ok = (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') ||
+                 (ch >= '0' && ch <= '9') || ch == '_' || ch == '-';
+        if (ok) { np->name[np->name_len++] = ch; np->name[np->name_len] = 0; }
+    }
+    return 1;
+}
+
+/* ===========================================================================
  * init: set the root, scan, choose an initial file, set initial view tabs.
  * ==========================================================================*/
 
@@ -500,6 +701,174 @@ static void layout_editor(Ide* a, wl_window* win) {
 }
 
 /* ===========================================================================
+ * "New Project" modal rendering + click hit-testing.
+ *
+ * Drawn LAST (over whatever workspace is active) as a centered card. Phase
+ * NP_PICK lists the templates; NP_NAME shows the typed name with a caret. The
+ * card geometry is recomputed from the live window size so it always centers.
+ * ==========================================================================*/
+
+#define NP_CARD_W   360
+#define NP_ROW_H    ROW_H
+
+/* Compute the centered card rect for the current window size. */
+static Rect np_card_rect(Ide* a) {
+    int rows = a->np.ntpl > 0 ? a->np.ntpl : 1;
+    int body = rows * NP_ROW_H;
+    int h = TOPBAR_H            /* title bar              */
+          + GFX_FH + PAD        /* hint line              */
+          + body + PAD          /* template list          */
+          + GFX_FH + 2 * PAD    /* name field             */
+          + GFX_FH + 2 * PAD;   /* footer hint / status   */
+    int w = NP_CARD_W;
+    if (w > a->win_w - 2 * PAD)  w = a->win_w - 2 * PAD;
+    if (h > a->win_h - 2 * PAD)  h = a->win_h - 2 * PAD;
+    Rect r;
+    r.w = w; r.h = h;
+    r.x = (a->win_w - w) / 2;
+    r.y = (a->win_h - h) / 2;
+    if (r.x < 0) r.x = 0;
+    if (r.y < 0) r.y = 0;
+    return r;
+}
+
+/* The list area inside the card (where each template row is hit-tested). */
+static Rect np_list_rect(Ide* a, Rect card) {
+    int rows = a->np.ntpl > 0 ? a->np.ntpl : 1;
+    Rect r;
+    r.x = card.x + PAD;
+    r.y = card.y + TOPBAR_H + GFX_FH + PAD;
+    r.w = card.w - 2 * PAD;
+    r.h = rows * NP_ROW_H;
+    return r;
+}
+
+static void render_newproj(Ide* a, Canvas* cv) {
+    NewProj* np = &a->np;
+    if (np->phase == NP_CLOSED) return;
+
+    /* Dim the whole screen behind the card so it reads as modal. */
+    gfx_blend(cv, 0, 0, cv->w, cv->h, 0xB0000000u);
+
+    Rect c = np_card_rect(a);
+    gfx_fill  (cv, c.x, c.y, c.w, c.h, TH_PANEL);
+    gfx_stroke(cv, c.x, c.y, c.w, c.h, TH_BORDER_LT);
+
+    /* Title bar. */
+    gfx_fill (cv, c.x, c.y, c.w, TOPBAR_H, TH_HEADER);
+    gfx_hline(cv, c.x, c.y + TOPBAR_H - 1, c.w, TH_BORDER);
+    {
+        int ty = c.y + (TOPBAR_H - GFX_FH) / 2;
+        gfx_text_clip(cv, c.x + PAD, ty, "NEW PROJECT", TH_TEXT,
+                      c.x + PAD, c.w - 2 * PAD);
+        const char* esc = "Esc";
+        int ew = gfx_textw(esc);
+        gfx_text_clip(cv, c.x + c.w - PAD - ew, ty, esc, TH_TEXT_FAINT,
+                      c.x + PAD, c.w - 2 * PAD);
+    }
+
+    int clip_x = c.x + PAD;
+    int clip_w = c.w - 2 * PAD;
+
+    /* Hint line. */
+    {
+        int hy = c.y + TOPBAR_H + (PAD / 2);
+        const char* hint = (np->phase == NP_PICK)
+            ? "Pick a template (Up/Down, Enter):"
+            : "Project name (type, Enter to create):";
+        gfx_text_clip(cv, clip_x, hy, hint, TH_TEXT_DIM, clip_x, clip_w);
+    }
+
+    /* Template list. */
+    Rect lst = np_list_rect(a, c);
+    if (np->ntpl <= 0) {
+        gfx_text_clip(cv, lst.x, lst.y, "(no templates found)",
+                      TH_ORANGE, clip_x, clip_w);
+    } else {
+        int hover = -1;
+        if (np->phase == NP_PICK && rect_hit(lst, a->mouse_x, a->mouse_y))
+            hover = (a->mouse_y - lst.y) / NP_ROW_H;
+        for (int i = 0; i < np->ntpl; i++) {
+            int ry = lst.y + i * NP_ROW_H;
+            int sel = (i == np->sel);
+            if (sel)
+                gfx_fill(cv, lst.x, ry, lst.w, NP_ROW_H, TH_SELECT);
+            else if (i == hover)
+                gfx_fill(cv, lst.x, ry, lst.w, NP_ROW_H, TH_HOVER);
+            int ty = ry + (NP_ROW_H - GFX_FH) / 2;
+            /* small folder glyph + name */
+            gfx_fill(cv, lst.x + 2, ty + 4, 3, 2, TH_YELLOW);
+            gfx_fill(cv, lst.x + 2, ty + 6, GFX_FW, 7, TH_YELLOW);
+            gfx_text_clip(cv, lst.x + GFX_FW + 8, ty, np->tpl[i],
+                          sel ? TH_TEXT : TH_TEXT_DIM,
+                          lst.x + GFX_FW + 8, lst.w - GFX_FW - 8);
+        }
+    }
+
+    /* Name field. */
+    {
+        int fy = lst.y + lst.h + PAD;
+        int fh = GFX_FH + 2;
+        uint32_t border = (np->phase == NP_NAME) ? TH_BLUE : TH_BORDER;
+        gfx_fill  (cv, clip_x, fy, clip_w, fh, TH_PANEL2);
+        gfx_stroke(cv, clip_x, fy, clip_w, fh, border);
+        int ty = fy + (fh - GFX_FH) / 2;
+        if (np->name_len > 0) {
+            gfx_text_clip(cv, clip_x + 4, ty, np->name, TH_TEXT,
+                          clip_x + 4, clip_w - 8);
+            if (np->phase == NP_NAME) {
+                int cx = clip_x + 4 + np->name_len * GFX_FW;
+                if (cx < clip_x + clip_w - 2)
+                    gfx_fill(cv, cx, ty, 2, GFX_FH, TH_TEXT);
+            }
+        } else {
+            const char* ph = (np->phase == NP_NAME)
+                ? "my-game" : "(select a template above)";
+            gfx_text_clip(cv, clip_x + 4, ty, ph, TH_TEXT_FAINT,
+                          clip_x + 4, clip_w - 8);
+        }
+
+        /* Footer: full destination path preview OR the status message. */
+        int sy = fy + fh + (PAD / 2);
+        if (np->status[0]) {
+            gfx_text_clip(cv, clip_x, sy, np->status, TH_ORANGE,
+                          clip_x, clip_w);
+        } else if (np->name_len > 0) {
+            char prev[IDE_PATH];
+            ide_strlcpy(prev, "-> " IDE_PROJECTS_DIR "/", (int)sizeof(prev));
+            ide_strlcat(prev, np->name, (int)sizeof(prev));
+            gfx_text_clip(cv, clip_x, sy, prev, TH_GREEN, clip_x, clip_w);
+        }
+    }
+}
+
+/* Hit-test a click while the modal is open. Always returns 1 (the modal is
+ * fully captured -- clicks outside the card are ignored, not passed through). */
+static int np_click(Ide* a, int mx, int my) {
+    NewProj* np = &a->np;
+    if (np->phase == NP_CLOSED) return 0;
+
+    Rect c = np_card_rect(a);
+
+    /* Clicking the list selects a template (and, in PICK phase, advances to the
+     * name step on the same click for a fast one-two flow). */
+    if (np->ntpl > 0) {
+        Rect lst = np_list_rect(a, c);
+        if (rect_hit(lst, mx, my)) {
+            int row = (my - lst.y) / NP_ROW_H;
+            if (row >= 0 && row < np->ntpl) {
+                np->sel = row;
+                if (np->phase == NP_PICK) { np->phase = NP_NAME; np->status[0] = 0; }
+            }
+            return 1;
+        }
+    }
+    /* Click anywhere else inside the card: no-op (keeps it open). Outside the
+     * card: also a no-op so a stray click can't dismiss a half-typed name. */
+    return 1;
+}
+
+/* ===========================================================================
  * Rendering: clear + draw every panel into its rect.
  * ==========================================================================*/
 
@@ -552,6 +921,8 @@ static void render(Ide* a, Canvas* cv) {
     panel_inspector(a, cv, a->r_inspector);   /* RIGHT inspector: own tab   */
     panel_runtime  (a, cv, a->r_runtime);
     panel_status   (a, cv, a->r_status);
+
+    render_newproj (a, cv);                   /* modal overlay (if open)    */
 }
 
 /* ===========================================================================
@@ -560,6 +931,20 @@ static void render(Ide* a, Canvas* cv) {
  * ==========================================================================*/
 
 static const char* const WS_TAB_LABEL[2] = { "EDITOR", "LEGO MAP" };
+
+/* The "[+ NEW]" toolbar button label (clickable -> opens the New Project
+ * modal). Kept here so the renderer and the hit-test share one string. */
+static const char NP_BTN_LABEL[] = "+ NEW";
+
+/* X of the left edge of the [+ NEW] button: just past the two workspace tabs.
+ * Mirrors the tab-advance math in editor_topbar so render + click agree. */
+static int np_btn_x(Rect r) {
+    int x = r.x + PAD;
+    for (int i = 0; i < 2; i++)
+        x += gfx_textw(WS_TAB_LABEL[i]) + 2 * GFX_FW + GFX_FW;
+    return x;
+}
+static inline int np_btn_w(void) { return gfx_textw(NP_BTN_LABEL) + 2 * GFX_FW; }
 
 static void editor_topbar(Ide* a, Canvas* cv, Rect r) {
     gfx_fill(cv, r.x, r.y, r.w, r.h, TH_HEADER);
@@ -580,6 +965,20 @@ static void editor_topbar(Ide* a, Canvas* cv, Rect r) {
         gfx_text_clip(cv, x, ty, WS_TAB_LABEL[i],
                       active ? TH_TEXT : TH_TEXT_DIM, r.x, r.w);
         x += tw + GFX_FW;
+    }
+
+    /* [+ NEW] button: a small framed, green-accented pill that opens the New
+     * Project modal. Hovering tints it. */
+    {
+        int bx = np_btn_x(r);
+        int bw = np_btn_w();
+        if (bx + bw < r.x + r.w) {
+            int hov = (a->mouse_y >= r.y && a->mouse_y < r.y + r.h &&
+                       a->mouse_x >= bx && a->mouse_x < bx + bw);
+            gfx_fill  (cv, bx, r.y + 3, bw, r.h - 6, hov ? TH_SELECT : TH_PANEL);
+            gfx_stroke(cv, bx, r.y + 3, bw, r.h - 6, TH_GREEN);
+            gfx_text_clip(cv, bx + GFX_FW, ty, NP_BTN_LABEL, TH_GREEN, bx, bw);
+        }
     }
 
     /* right-aligned filename + dirty marker */
@@ -668,7 +1067,7 @@ static void editor_status(Ide* a, Canvas* cv, Rect r) {
     }
 
     /* right-aligned shortcut legend */
-    const char* leg = "Ctrl+B build  Ctrl+S save  Ctrl+`/J term  Ctrl+E map";
+    const char* leg = "Ctrl+N new  Ctrl+B build  Ctrl+R run  Ctrl+S save  Ctrl+E map";
     int lw = gfx_textw(leg);
     int lx = r.x + r.w - PAD - lw;
     if (lx > x) gfx_text_clip(cv, lx, ty, leg, TH_TEXT_FAINT, x, clip_w);
@@ -683,6 +1082,8 @@ static void render_editor(Ide* a, Canvas* cv) {
     editor_btabs  (a, cv, a->r_e_btabs);
     editor_bottom (a, cv, a->r_e_bottom);
     editor_status (a, cv, a->r_status);
+
+    render_newproj(a, cv);                     /* modal overlay (if open)    */
 }
 
 /* ===========================================================================
@@ -756,6 +1157,11 @@ static int editor_topbar_click(Ide* a, Rect r, int mx, int my) {
             return 1;
         }
         x += tw + GFX_FW;
+    }
+    /* [+ NEW] button -> open the New Project modal. */
+    {
+        int bx = np_btn_x(r);
+        if (mx >= bx && mx < bx + np_btn_w()) { np_open(a); return 1; }
     }
     return 1;   /* consumed (top bar) even on empty space */
 }
@@ -833,6 +1239,9 @@ static void scroll_under_mouse(Ide* a, int delta, int horizontal) {
  * chord was handled. Modifier state is already tracked in g_ctrl_down. */
 static int handle_ctrl_chord(Ide* a, int keycode) {
     switch (keycode) {
+    case KEY_N:               /* Ctrl+N: open the New Project templates picker */
+        np_open(a);
+        return 1;
     case KEY_B:               /* Ctrl+B: build the open file */
         /* Build what's on screen: flush unsaved editor edits to disk first so
          * tc_build (which re-reads the file) compiles the live buffer, not a
@@ -883,6 +1292,16 @@ static void handle_key(Ide* a, int keycode, int pressed) {
     }
 
     if (!pressed) return;
+
+    /* New Project modal captures ALL keys while open (Esc closes it, Enter
+     * advances/confirms, Backspace edits, arrows move the selection, printable
+     * keys type the name). It runs BEFORE the global ESC-exit so Esc dismisses
+     * the modal instead of quitting the whole IDE. */
+    if (a->np.phase != NP_CLOSED) {
+        char ch = ide_keycode_ascii(keycode, g_shift_down);
+        np_key(a, keycode, ch);
+        return;
+    }
 
     /* Ctrl chords first (work in both workspaces). handle_ctrl_chord only
      * returns 1 for keys we actually bind (B/R/S/E/J/`). If g_ctrl_down is set
@@ -1045,6 +1464,15 @@ void _start(void) {
 
                 int left_now  = (ec & 1);
                 int left_prev = (a->prev_buttons & 1);
+
+                if (a->np.phase != NP_CLOSED) {
+                    /* Modal up: it captures the pointer. Only the press edge
+                     * matters (select a template / advance); drags are ignored. */
+                    if (left_now && !left_prev)
+                        np_click(a, ea, eb);
+                    a->prev_buttons = ec;
+                    continue;
+                }
 
                 if (a->ws == WS_EDITOR) {
                     /* EDITOR: route clicks immediately on the press edge; no

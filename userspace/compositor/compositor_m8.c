@@ -1351,6 +1351,19 @@ static void render_window_static(uint32_t *buf, uint32_t w, uint32_t h, uint32_t
                          min_x + (MIN_SZ - FONT_W) / 2,
                          min_y + (MIN_SZ - FONT_H) / 2, "-", 0xFF000000u);
 
+        /* maximize/restore box (left of minimize): a square-outline glyph,
+         * font-independent. Clicking it toggles SNAP_MAX (see handle_mouse). */
+        int32_t max_x = min_x - MIN_SZ - 6;
+        int32_t max_y = fy + (TITLEBAR_H - MIN_SZ) / 2;
+        fill_round_rect(buf, w, h, stride, max_x, max_y, MIN_SZ, MIN_SZ, 3, BTN_MIN);
+        {
+            int32_t gs = (MIN_SZ > 10) ? 8 : ((int32_t)MIN_SZ - 4);
+            int32_t gx = max_x + ((int32_t)MIN_SZ - gs) / 2;
+            int32_t gy = max_y + ((int32_t)MIN_SZ - gs) / 2;
+            fill_round_rect(buf, w, h, stride, gx, gy, gs, gs, 1, 0xFF202020u);
+            fill_round_rect(buf, w, h, stride, gx + 1, gy + 2, gs - 2, gs - 3, 1, BTN_MIN);
+        }
+
         /* window title text */
         font_draw_string(buf, (int)stride, (int)w, (int)h,
                          fx + 8, fy + (TITLEBAR_H - FONT_H) / 2, win->title,
@@ -3363,6 +3376,22 @@ static void handle_mouse(uint32_t W, uint32_t H) {
         int32_t min_y = fy + (TITLEBAR_H - MIN_SZ) / 2;
         if (point_in(cx, cy, min_x, min_y, MIN_SZ, MIN_SZ)) {
             begin_minimize(slot);
+            g_prev_buttons = g_buttons;
+            return;
+        }
+
+        /* 3a3) titlebar maximize/restore box (left of minimize) -> toggle SNAP_MAX */
+        int32_t max_x = min_x - MIN_SZ - 6;
+        int32_t max_y = fy + (TITLEBAR_H - MIN_SZ) / 2;
+        if (point_in(cx, cy, max_x, max_y, MIN_SZ, MIN_SZ)) {
+            if (win->snap_state == SNAP_MAX) {
+                /* restore: tween back to the saved pre-maximize geometry */
+                start_geom_tween(win, win->saved_x, win->saved_y,
+                                 win->saved_w, win->saved_h);
+                win->snap_state = SNAP_NONE;
+            } else {
+                begin_snap_to(slot, SNAP_MAX);   /* maximize to the work area */
+            }
             g_prev_buttons = g_buttons;
             return;
         }

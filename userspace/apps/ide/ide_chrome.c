@@ -42,6 +42,13 @@ static inline uint32_t chr_coh_color(int coh) {
     return TH_RED;
 }
 
+/* "[+ NEW]" button on the LEGO top bar (mirrors the EDITOR workspace button):
+ * opens the New Project modal. Render + hit-test share this geometry. */
+static const char CHR_NEW_LABEL[] = "+ NEW";
+static inline int chr_new_w(void) { return gfx_textw(CHR_NEW_LABEL) + 2 * GFX_FW; }
+/* Left edge of the button: anchored to the right, leaving PAD margin. */
+static inline int chr_new_x(Rect r) { return r.x + r.w - PAD - chr_new_w(); }
+
 /* ------------------------------------------------------------------ top bar */
 void panel_topbar(Ide* a, Canvas* cv, Rect r) {
     if (r.w <= 0 || r.h <= 0) return;
@@ -86,8 +93,19 @@ void panel_topbar(Ide* a, Canvas* cv, Rect r) {
         gfx_text_clip(cv, tx, ty, CHR_TAB_WORD[i], wcol, clip_x, clip_w);
     }
 
-    /* Right-aligned coherence chip: "COH <n>%" coloured by band so the score
-     * is always visible regardless of the active VIZ. */
+    /* Right-aligned "[+ NEW]" button -> opens the New Project modal. */
+    {
+        int bx = chr_new_x(r);
+        int bw = chr_new_w();
+        int hov = (a->mouse_y >= r.y && a->mouse_y < r.y + r.h &&
+                   a->mouse_x >= bx && a->mouse_x < bx + bw);
+        gfx_fill  (cv, bx, r.y + 3, bw, r.h - 6, hov ? TH_SELECT : TH_PANEL);
+        gfx_stroke(cv, bx, r.y + 3, bw, r.h - 6, TH_GREEN);
+        gfx_text_clip(cv, bx + GFX_FW, ty, CHR_NEW_LABEL, TH_GREEN, bx, bw);
+    }
+
+    /* Coherence chip "COH <n>%", placed to the LEFT of the [+ NEW] button so
+     * the two never overlap; coloured by band so the score is always visible. */
     {
         char num[16];
         int coh = m->coherence;
@@ -99,7 +117,8 @@ void panel_topbar(Ide* a, Canvas* cv, Rect r) {
         /* width of "COH " + number + "%" */
         int label_w = gfx_textw("COH") + GFX_FW;       /* "COH" + space */
         int chip_w  = label_w + n * GFX_FW + GFX_FW;   /* digits + '%' */
-        int chip_x  = r.x + r.w - PAD - chip_w;
+        /* sit just left of the [+ NEW] button (with a gap). */
+        int chip_x  = chr_new_x(r) - GFX_FW - chip_w;
         if (chip_x < r.x + PAD) chip_x = r.x + PAD;
 
         int clip_x = r.x + PAD;
@@ -119,6 +138,12 @@ void panel_topbar(Ide* a, Canvas* cv, Rect r) {
 int panel_topbar_click(Ide* a, Rect r, int mx, int my) {
     if (!rect_hit(r, mx, my)) return 0;
     if (r.w <= 0) return 1;
+
+    /* [+ NEW] button (right edge) takes priority over the tab cells below it. */
+    {
+        int bx = chr_new_x(r);
+        if (mx >= bx && mx < bx + chr_new_w()) { ide_new_project(a); return 1; }
+    }
 
     int rel = mx - r.x;
     int i = (rel * CHR_NTABS) / r.w;

@@ -55,6 +55,7 @@
 
 #include "../../lib/wl/wl_client.h"
 #include "../../lib/font/bitfont.h"
+#include "../../lib/keymap/keymap.h"   /* shared US-QWERTY: caps-lock + shift + symbols */
 #include "sh_git.h"
 
 /* ---- syscall numbers (must match kernel/include/syscall.h) ---- */
@@ -275,63 +276,11 @@ static void print_num(long n) {
 static void print_char(char ch) { sc(SYS_WRITE, 1, (long)&ch, 1, 0, 0, 0); }
 
 /*
- * US-layout raw-keycode -> ASCII. `shift` selects the shifted glyph (uppercase
- * letters and the row of symbols). Keys with no printable mapping (and
- * Enter/Backspace, handled by the caller) return 0.
+ * Raw-keycode -> ASCII now comes from the shared US-QWERTY keymap library
+ * (userspace/lib/keymap), which adds caps-lock and the full Shift+symbol set
+ * that the old per-app table lacked. The translation state (shift/caps) lives
+ * in a single keymap_state_t driven from the event loop; see below.
  */
-static char keycode_to_ascii(int kc, int shift) {
-    switch (kc) {
-        case KEY_1: return shift ? '!' : '1';
-        case KEY_2: return shift ? '@' : '2';
-        case KEY_3: return shift ? '#' : '3';
-        case KEY_4: return shift ? '$' : '4';
-        case KEY_5: return shift ? '%' : '5';
-        case KEY_6: return shift ? '^' : '6';
-        case KEY_7: return shift ? '&' : '7';
-        case KEY_8: return shift ? '*' : '8';
-        case KEY_9: return shift ? '(' : '9';
-        case KEY_0: return shift ? ')' : '0';
-        case KEY_MINUS:      return shift ? '_' : '-';
-        case KEY_EQUAL:      return shift ? '+' : '=';
-        case KEY_Q: return shift ? 'Q' : 'q';
-        case KEY_W: return shift ? 'W' : 'w';
-        case KEY_E: return shift ? 'E' : 'e';
-        case KEY_R: return shift ? 'R' : 'r';
-        case KEY_T: return shift ? 'T' : 't';
-        case KEY_Y: return shift ? 'Y' : 'y';
-        case KEY_U: return shift ? 'U' : 'u';
-        case KEY_I: return shift ? 'I' : 'i';
-        case KEY_O: return shift ? 'O' : 'o';
-        case KEY_P: return shift ? 'P' : 'p';
-        case KEY_LEFTBRACE:  return shift ? '{' : '[';
-        case KEY_RIGHTBRACE: return shift ? '}' : ']';
-        case KEY_A: return shift ? 'A' : 'a';
-        case KEY_S: return shift ? 'S' : 's';
-        case KEY_D: return shift ? 'D' : 'd';
-        case KEY_F: return shift ? 'F' : 'f';
-        case KEY_G: return shift ? 'G' : 'g';
-        case KEY_H: return shift ? 'H' : 'h';
-        case KEY_J: return shift ? 'J' : 'j';
-        case KEY_K: return shift ? 'K' : 'k';
-        case KEY_L: return shift ? 'L' : 'l';
-        case KEY_SEMICOLON:  return shift ? ':' : ';';
-        case KEY_APOSTROPHE: return shift ? '"' : '\'';
-        case KEY_GRAVE:      return shift ? '~' : '`';
-        case KEY_BACKSLASH:  return shift ? '|' : '\\';
-        case KEY_Z: return shift ? 'Z' : 'z';
-        case KEY_X: return shift ? 'X' : 'x';
-        case KEY_C: return shift ? 'C' : 'c';
-        case KEY_V: return shift ? 'V' : 'v';
-        case KEY_B: return shift ? 'B' : 'b';
-        case KEY_N: return shift ? 'N' : 'n';
-        case KEY_M: return shift ? 'M' : 'm';
-        case KEY_COMMA: return shift ? '<' : ',';
-        case KEY_DOT:   return shift ? '>' : '.';
-        case KEY_SLASH: return shift ? '?' : '/';
-        case KEY_SPACE: return ' ';
-        default:        return 0;
-    }
-}
 
 /* ---- window / grid geometry ---- */
 #define WIN_W      640
@@ -3078,6 +3027,11 @@ void _start(void) {
 
     long last = sc(SYS_GET_TICKS_MS, 0, 0, 0, 0, 0, 0);
     int shift_down = 0;
+    /* US-QWERTY layout + modifier state for printable input. We track the shift
+     * edges ourselves (mirrored into km.shift_l each resolve); km also owns the
+     * caps-lock toggle, folded in when a CapsLock key-DOWN reaches keymap_resolve. */
+    keymap_state_t km;
+    keymap_reset(&km);
 
     for (;;) {
         int dirty = 0;
@@ -3153,7 +3107,12 @@ void _start(void) {
                     dirty = 1;
                 }
             } else {
-                char ascii = keycode_to_ascii(keycode, shift_down);
+                /* Mirror the locally-tracked shift into km, then let the shared
+                 * keymap resolve the glyph: this folds caps-lock (a CapsLock
+                 * key-DOWN, kc 58, toggles km) and the full Shift+symbol set. */
+                km.shift_l = (uint8_t)(shift_down ? 1 : 0);
+                km.shift_r = 0;
+                char ascii = keymap_resolve((uint8_t)keycode, 1, &km);
                 if (ascii && line_len < LINE_MAX - 1) {
                     print("[TERM] key ");
                     print_char(ascii);

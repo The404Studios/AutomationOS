@@ -17,6 +17,7 @@ echo "[all] shared libs..."
 cc userspace/lib/font/bitfont.c /tmp/bf.o
 cc userspace/lib/wl/wl_client.c /tmp/wlc.o
 cc userspace/lib/ui/ui.c        /tmp/ui.o
+cc userspace/lib/keymap/keymap.c /tmp/keymap.o
 cc userspace/lib/game/game.c    /tmp/game.o
 cc userspace/lib/aictl/aictl.c  /tmp/aictl.o
 cc userspace/lib/audio/audio.c  /tmp/audio.o
@@ -260,7 +261,7 @@ echo "[all] wl-direct apps..."
 # terminal: terminal_m3 + sh_git (native git-like VCS) + wl + bitfont
 cc userspace/apps/terminal/terminal_m3.c /tmp/terminal.o
 cc userspace/apps/terminal/sh_git.c      /tmp/sh_git.o
-$LD /tmp/terminal.o /tmp/sh_git.o /tmp/wlc.o /tmp/bf.o -o /tmp/terminal.elf
+$LD /tmp/terminal.o /tmp/sh_git.o /tmp/wlc.o /tmp/bf.o /tmp/keymap.o -o /tmp/terminal.elf
 build_wl_app userspace/apps/editor/editor.c           editor
 build_wl_app userspace/apps/snake/snake.c             snake
 build_wl_app userspace/apps/asteroids/asteroids.c     asteroids
@@ -315,7 +316,7 @@ echo "[all] IDE (Semantic LEGO Map)..."
 IDE_SRCS="ide ide_sys ide_gfx ide_lex ide_ast ide_pcore ide_pdecl ide_pstmt ide_pexpr ide_astprint ide_parse ide_semantic ide_explorer ide_funcs ide_map ide_codeview ide_inspector ide_runtime ide_chrome ide_gen elf_write as_x64 cc_type cc_codegen cc_expr tc_driver ide_build ide_editor ide_term"
 IDE_OBJS=""
 for s in $IDE_SRCS; do cc userspace/apps/ide/$s.c /tmp/ide_$s.o; IDE_OBJS="$IDE_OBJS /tmp/ide_$s.o"; done
-$LD $IDE_OBJS /tmp/wlc.o /tmp/bf.o -o /tmp/ide.elf
+$LD $IDE_OBJS /tmp/wlc.o /tmp/bf.o /tmp/keymap.o -o /tmp/ide.elf
 
 # cc: the on-device C compiler (the self-hosting flagship). It is a thin driver
 # that REUSES the IDE's verified toolchain objects (lexer/parser/codegen/

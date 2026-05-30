@@ -20,6 +20,7 @@
 #include "ide_theme.h"
 #include "ide_lex.h"
 #include "ide_editor.h"
+#include "../../lib/keymap/keymap.h"   /* shared US-QWERTY: caps-lock + shift + symbols */
 
 /* ---- tunables (mirror ide_codeview.c where it matters) ---- */
 #define ED_HEADER_H   (ROW_H + 2)
@@ -197,9 +198,29 @@ static void ed_scroll_to_caret(struct Ide* a, Rect body) {
 #define EDK_PAGEUP    104
 #define EDK_PAGEDOWN  109
 
+/* Per-editor keyboard layout state. The compositor/IDE forward shift & ctrl as
+ * separate parameters (ide.c swallows the shift KEY events itself), but NOT the
+ * caps-lock toggle -- a CapsLock key-DOWN (evdev 58) falls through to us. We
+ * therefore mirror the caller's shift/ctrl into this state every call and let
+ * keymap_resolve() own the caps-lock toggle + the full US symbol map, so the
+ * editor now gets uppercase via caps-lock as well as Shift+symbol glyphs. */
+static keymap_state_t ed_km;
+
 int ide_editor_key(struct Ide* a, int keycode, char ch, int shift, int ctrl) {
     Editor* e = &a->editor;
-    (void)shift;
+    (void)ch;   /* the upstream char was shift-only (no caps); we re-resolve below */
+
+    /* Mirror the caller-tracked modifiers (authoritative; ide.c eats the shift
+     * KEY events, so we can't see their up/down edges ourselves). */
+    ed_km.shift_l = (uint8_t)(shift ? 1 : 0);
+    ed_km.shift_r = 0;
+    ed_km.ctrl    = (uint8_t)(ctrl ? 1 : 0);
+
+    /* Resolve the printable glyph for THIS key-DOWN through the shared keymap.
+     * This also folds the CapsLock toggle into ed_km (keycode 58) and returns 0
+     * for arrows/Enter/Backspace/Tab/etc., so the special-key switch below is
+     * unaffected. We only use kch on the printable path. */
+    char kch = keymap_resolve((uint8_t)keycode, 1, &ed_km);
 
     /* Ctrl+S: save (handled even if a printable 's' resolved). */
     if (ctrl && keycode == EDK_S) {
@@ -304,10 +325,10 @@ int ide_editor_key(struct Ide* a, int keycode, char ch, int shift, int ctrl) {
     default: break;
     }
 
-    /* printable character */
-    if (ch >= 32 && ch < 127) {
+    /* printable character (keymap-resolved: honours caps-lock + Shift+symbol) */
+    if (kch >= 32 && kch < 127) {
         int off = ed_caret_off(a);
-        if (ed_insert_byte(a, off, ch)) {
+        if (ed_insert_byte(a, off, kch)) {
             e->caret_col++;
             e->want_col = e->caret_col;
         }

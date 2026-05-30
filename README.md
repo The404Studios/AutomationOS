@@ -52,7 +52,7 @@ itself, wired into an IDE with a Ctrl+B build button.
 
 ### Browser & networking
 - A **from-scratch web browser** (`userspace/apps/browser2`) with its own **DOM**, **HTML parser**, **CSS engine**, **layout engine**, and a **JavaScript engine** (ES5-subset interpreter), plus web APIs (timers, fetch, localStorage, console, URL)
-- A from-scratch **TLS 1.2 / 1.3 + HTTPS** stack: SHA-1/256/512, MD5, HMAC, AES, ChaCha20-Poly1305, RSA, X25519, P-256, HKDF, ASN.1/X.509 parsing + certificate verification — all hand-rolled
+- A from-scratch **TLS 1.2 + HTTPS** stack: SHA-1/256/512, MD5, HMAC, AES, ChaCha20-Poly1305, RSA, X25519, P-256, HKDF (incl. a TLS 1.3 HKDF-Expand-Label primitive), ASN.1/X.509 parsing + certificate verification — all hand-rolled
 - Networking from scratch: an **e1000 NIC driver** (QEMU), an in-progress **Intel 82577LM** driver for the T410, and an **ARP / IPv4 / ICMP / UDP / TCP** stack with **DNS**, BSD-style sockets, and tools (`ping`, `nc`, `wget`, `dhcpc`)
 
 ### Filesystems

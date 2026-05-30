@@ -43,7 +43,7 @@ that feels like Windows (start menu, taskbar, window snapping, animations) but i
 - ✅ **IDE forge**: file tree, editor (syntax highlight, caps/shift typing), integrated terminal,
   **New Project from templates** (game / app / service), **Ctrl+B build → Ctrl+R run**
 - ✅ Windows-11-style **File Explorer** (live VFS, New Folder, open)
-- ✅ **Browser** (own DOM/HTML/CSS/layout + JS engine + TLS 1.2/1.3 + HTTPS), `about:home` + Google search bar
+- ✅ **Browser** (own DOM/HTML/CSS/layout + JS engine + TLS 1.2 + HTTPS), `about:home` + Google search bar
 - ✅ Terminal, Settings, **Control Center** (quick-settings), **Photos** (PNG/BMP/GIF), Task Manager, Notes, Calculator, Clock & **Clock+** (alarms/timer/stopwatch)…
 - ✅ **Games**: Snake, Tetris, 2048, Minesweeper, Breakout, Pong, Invaders, Solitaire, Chess, Asteroids, Sudoku, **Pac-Man**, Bubble Defense
 

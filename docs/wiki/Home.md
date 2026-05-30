@@ -14,6 +14,8 @@ compositor, the web browser engine, and the C compiler.
 | [Architecture](Architecture.md) | The big picture: boot → kernel → desktop, what's compiled, the directory map |
 | [Kernel Internals](Kernel-Internals.md) | Memory, the **cooperative** scheduler, processes, system calls, interrupts |
 | [Drivers & I/O](Drivers-and-IO.md) | Framebuffer, PS/2, PCI, storage/AHCI, filesystems, networking |
+| [Networking & Security](Networking-and-Security.md) | The e1000 NIC, the ARP/IP/ICMP/UDP/TCP stack, sockets, DNS/HTTP/DHCP, and the hand-rolled crypto + TLS 1.2/HTTPS |
+| [Browser & Web Engine](Browser-and-Web-Engine.md) | The from-scratch browser: DOM, HTML parser, CSS, layout, the ES5 JS engine, and the web APIs |
 | [Desktop & Apps](Desktop-and-Apps.md) | The compositor, the window protocol, the app suite, the self-hosting toolchain |
 | [Building & Running](Building-and-Running.md) | Toolchain, building the kernel + ISO, QEMU, flashing the T410 |
 | [Roadmap](../ROADMAP.md) | What's done, in progress, and planned |

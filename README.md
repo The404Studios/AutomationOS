@@ -25,6 +25,11 @@ itself, wired into an IDE with a Ctrl+B build button.
 
 ![desktop](screenshots/desktop.png)
 
+## 📖 Documentation
+
+- **[Wiki](docs/wiki/Home.md)** — [Architecture](docs/wiki/Architecture.md) · [Kernel Internals](docs/wiki/Kernel-Internals.md) · [Drivers & I/O](docs/wiki/Drivers-and-IO.md) · [Desktop & Apps](docs/wiki/Desktop-and-Apps.md) · [Building & Running](docs/wiki/Building-and-Running.md)
+- **[Roadmap](docs/ROADMAP.md)** — what's done, in progress, and planned
+
 ## Highlights
 
 ### Kernel
@@ -35,10 +40,10 @@ itself, wired into an IDE with a Ctrl+B build button.
 - Drivers: serial, PIT, RTC, PS/2 keyboard + mouse, PCI, framebuffer, AHCI/SATA block I/O, and an NVIDIA GPU detection foundation
 
 ### Desktop & apps
-- A **from-scratch compositor**: window management, dirty-rectangle redraw, a right-side **dock with hover-magnify**, folders, and a bounce animation
-- A fluid **boot splash → desktop cross-fade** on startup
-- A **Windows-11-style file manager**, a tabbed terminal (VT/ANSI), settings, a task manager, system monitors, a paint app, a music player, and more
-- **Games**: snake, tetris, 2048, minesweeper, breakout, pong, invaders, solitaire, connect-4, chess, a raycaster, and others under `userspace/apps/`
+- A **from-scratch compositor**: window management with **maximize + edge-snap**, dirty-rectangle redraw, a right-side **dock with hover-magnify**, folders, and **eased** open/close animations
+- A fluid **circular iris boot transition** — the welcome splash reveals the desktop through a growing, eased circle
+- A **Windows-11 Start menu**, a Win-11-style **file manager**, a **Control Center** (quick settings), a **Photos** viewer, a tabbed terminal (VT/ANSI), settings, a task manager, and more
+- **Games**: snake, tetris, 2048, minesweeper, breakout, pong, invaders, solitaire, connect-4, **chess**, **asteroids**, **sudoku**, and others under `userspace/apps/`
 
 ### Self-hosting toolchain
 - **`cc`** — an on-device C compiler (`userspace/apps/cc`) that lexes, parses, type-checks, generates x86-64, assembles, and writes ELF, entirely on the running OS

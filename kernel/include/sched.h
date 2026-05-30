@@ -174,6 +174,22 @@ typedef struct process {
     // the END to keep the assembler's hardcoded context offset valid.
     uint64_t wake_deadline;          // absolute tick (timer_get_ticks units) to wake at
     struct process* sleep_next;      // intrusive singly-linked sleep list link
+
+    // Cooperative priority weighting (scheduler.c: scheduler_yield_requeue).
+    // The O(1) active/expired runqueue is a strict round-robin, so on the
+    // cooperative path (where time slices are never decremented) two equally
+    // greedy yielders get EQUAL CPU regardless of nice -- nice only changes pick
+    // ORDER, not share. To make a higher-priority (more-negative nice) process
+    // actually accrue MORE CPU when it yields, we let it re-enter the ACTIVE
+    // queue a bounded number of extra times before finally rotating to expired;
+    // yield_boost counts those remaining bonus re-queues. It is derived from nice
+    // (PRIORITY_YIELD_BOOST), so nice 0/positive get ZERO bonus -- i.e. NORMAL
+    // and below behave byte-for-byte as before (desktop fairness unchanged); only
+    // above-normal classes get extra turns. Bounded => no starvation (the booster
+    // still rotates to expired once its boost is spent, letting lower prio run).
+    // memset-zeroed by process_create(). Appended at the END to keep the
+    // assembler's hardcoded context offset valid.
+    int yield_boost;                 // remaining bonus ACTIVE re-queues on yield
 } process_t;
 
 // Global pointer to current process (for PE loader and other subsystems)
@@ -218,6 +234,14 @@ extern volatile int scheduler_in_switch;
 // Scheduler
 void scheduler_init(void);
 void scheduler_add_process(process_t* proc);
+// Cooperative-yield re-queue with priority weighting. Use INSTEAD of
+// scheduler_add_process() from sys_yield(): a process with above-normal priority
+// re-enters the ACTIVE queue (so pick_next runs it again ahead of lower-priority
+// peers) up to a nice-derived number of bonus turns, then rotates to EXPIRED like
+// normal. For nice >= 0 this is exactly equivalent to scheduler_add_process()
+// (straight to expired), so NORMAL/background tasks are unaffected. Takes the
+// scheduler's reference exactly like scheduler_add_process().
+void scheduler_yield_requeue(process_t* proc);
 void scheduler_remove_process(process_t* proc);
 void schedule(void);  // Scheduler tick - called from timer interrupt
 process_t* scheduler_pick_next(void);

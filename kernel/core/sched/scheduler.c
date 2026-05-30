@@ -87,9 +87,49 @@ static spinlock_t scheduler_lock;
 volatile int scheduler_in_switch = 0;
 
 // Scheduler constants
-#define DEFAULT_TIME_SLICE 10  // 10 timer ticks (quantum)
+#define DEFAULT_TIME_SLICE 10  // 10 timer ticks (quantum) for nice 0 (NORMAL)
 #define DEFAULT_NICE 0         // Default nice value (maps to priority 100)
 #define NICE_TO_PRIORITY(nice) (100 + (nice))  // Convert nice (-20 to +19) to priority (0-139)
+
+// ---------------------------------------------------------------------------
+// PRIORITY-PROPORTIONAL TIME SLICE (the piece that makes nice actually shift
+// CPU *share*, not just pick order).
+//
+// The O(1) active/expired runqueue is a strict-priority round-robin: within one
+// active->expired cycle every ready process runs exactly once, so picking the
+// lowest-nice process FIRST changes ORDER but not the NUMBER of turns. To make a
+// lower nice translate into MORE CPU, we scale the per-turn quantum by nice:
+// higher-priority (more-negative nice) processes get a LONGER time slice, so
+// across equal numbers of turns they accrue proportionally more CPU ticks.
+//
+// This is the classic Linux-O(1) idea (task_timeslice scaled by static_prio).
+// It takes effect wherever a process runs to quantum exhaustion -- i.e. the
+// PREEMPTIVE build, where the timer slices non-yielding ring-3 burners by
+// quantum. (In the cooperative build a process that voluntarily yields before
+// its quantum expires is unaffected; cooperative share is governed by yield
+// behavior, not the quantum.) Default nice 0 still yields exactly
+// DEFAULT_TIME_SLICE / SCHED_QUANTUM_TICKS, so existing behavior is unchanged
+// for normal-priority tasks.
+//
+// Mapping (monotonic in nice; clamped to a sane [min,max] tick band):
+//   nice -20  -> ~3.0x default   (REALTIME, big slices)
+//   nice -10  -> ~2.0x default   (HIGH)
+//   nice   0  -> 1.0x default    (NORMAL, == DEFAULT_TIME_SLICE)
+//   nice +10  -> ~0.5x default   (BACKGROUND, small slices)
+//   nice +19  -> floor (1 tick)  (IDLE)
+// Computed as DEFAULT_TIME_SLICE * (40 - (nice+20)) / 20, clamped to [1, 32].
+#define SCHED_MIN_SLICE 1
+#define SCHED_MAX_SLICE 32
+static inline uint64_t priority_time_slice(int32_t nice) {
+    if (nice < -20) nice = -20;
+    if (nice >  19) nice =  19;
+    // weight in [1..40], higher for more-negative nice (40 at -20, 1 at +19).
+    int weight = 40 - (nice + 20);              // nice -20 -> 40 ; nice +19 -> 1
+    long slice = (long)DEFAULT_TIME_SLICE * weight / 20;  // nice 0 (w=20) -> DEFAULT
+    if (slice < SCHED_MIN_SLICE) slice = SCHED_MIN_SLICE;
+    if (slice > SCHED_MAX_SLICE) slice = SCHED_MAX_SLICE;
+    return (uint64_t)slice;
+}
 
 // ===========================================================================
 // O(1) Bitmap Operations
@@ -400,6 +440,63 @@ void scheduler_add_process(process_t* proc) {
     PERF_END(PERF_OP_SCHEDULER_ADD);
 }
 
+// Bonus ACTIVE re-queues granted to an above-normal-priority process when it
+// yields, derived from nice. nice 0 and positive => 0 (NORMAL/background behave
+// exactly as before: straight to expired). More-negative nice => more bonus
+// turns, so a HIGH/REALTIME yielder runs several times per swap cycle while a
+// NORMAL/BACKGROUND peer runs once -> higher-priority gets proportionally more
+// CPU. Clamped so even REALTIME (nice -20) gets a bounded boost (no starvation).
+//   nice 0   -> 0     (unchanged)
+//   nice -10 -> 5     (HIGH:  ~6 turns per cycle vs 1)
+//   nice -20 -> 10    (REALTIME)
+//   nice +k  -> 0     (BACKGROUND/IDLE: unchanged)
+#define PRIORITY_YIELD_BOOST_MAX 10
+static inline int priority_yield_boost(int32_t nice) {
+    if (nice >= 0) return 0;
+    int b = (-nice) / 2;                 // nice -10 -> 5, nice -20 -> 10
+    if (b > PRIORITY_YIELD_BOOST_MAX) b = PRIORITY_YIELD_BOOST_MAX;
+    return b;
+}
+
+void scheduler_yield_requeue(process_t* proc) {
+    // Priority-weighted twin of scheduler_add_process() for the cooperative
+    // yield path. Identical reference/idempotency/locking discipline; the ONLY
+    // difference is the target runqueue: while a high-priority process has
+    // yield_boost remaining we re-queue it to ACTIVE (so pick_next picks it again
+    // ahead of lower-priority peers this same cycle), decrementing the boost;
+    // otherwise we refill its boost from nice and rotate it to EXPIRED exactly
+    // like the normal path. For nice >= 0 the boost is always 0, so this routes
+    // straight to EXPIRED -- byte-for-byte the old behavior.
+    if (!proc) return;
+    if (proc->state == PROCESS_TERMINATED) return;
+
+    spin_lock(&scheduler_lock);
+    if (proc->on_queue) { spin_unlock(&scheduler_lock); return; }
+    spin_unlock(&scheduler_lock);
+
+    process_ref(proc);
+
+    spin_lock(&scheduler_lock);
+    proc->state = PROCESS_READY;
+    proc->on_queue = 1;
+    int priority = process_get_priority(proc);
+
+    if (proc->yield_boost > 0) {
+        // Spend one bonus turn: re-enter ACTIVE so this higher-priority process
+        // is eligible to be picked again immediately (ahead of lower priorities).
+        proc->yield_boost--;
+        runqueue_enqueue(&active_rq, proc, priority);
+    } else {
+        // Out of bonus turns (or never had any): refill from nice and rotate to
+        // EXPIRED, guaranteeing lower-priority ready processes get their turn
+        // after the next active/expired swap (anti-starvation preserved).
+        proc->yield_boost = priority_yield_boost(proc->priority);
+        runqueue_enqueue(&expired_rq, proc, priority);
+    }
+    ready_count++;
+    spin_unlock(&scheduler_lock);
+}
+
 void scheduler_remove_process(process_t* proc) {
     if (!proc) return;
 
@@ -541,11 +638,12 @@ pick_again:
     //   Process B: uses 3 ticks, yields → resumes with 7 ticks left (FAIR)
     // ============================================================================
     if (next->time_slice == 0) {
-        // Process exhausted its quantum - give fresh allocation
-        next->time_slice = DEFAULT_TIME_SLICE;
+        // Process exhausted its quantum - give a fresh, PRIORITY-SCALED allocation
+        // (lower nice => longer slice => more CPU share where slices matter).
+        next->time_slice = priority_time_slice(next->priority);
 #ifndef SCHEDULER_QUIET
-        kprintf("[SCHEDULER] Fresh quantum for '%s' (PID %d): %d ticks (priority: %d)\n",
-                next->name, next->pid, DEFAULT_TIME_SLICE, process_get_priority(next));
+        kprintf("[SCHEDULER] Fresh quantum for '%s' (PID %d): %llu ticks (priority: %d)\n",
+                next->name, next->pid, (unsigned long long)next->time_slice, process_get_priority(next));
 #endif
     } else {
         // Process yielded early - keep remaining allocation
@@ -712,8 +810,8 @@ void schedule(void) {
         process_t* next = scheduler_pick_next();
 
         if (next == NULL) {
-            // No other processes - continue current with fresh time slice
-            current->time_slice = DEFAULT_TIME_SLICE;
+            // No other processes - continue current with a fresh priority-scaled slice
+            current->time_slice = priority_time_slice(current->priority);
             current->state = PROCESS_RUNNING;
 #ifndef SCHEDULER_QUIET
             kprintf("[SCHEDULER] No other processes, continuing '%s' (PID %d) with fresh time slice\n",
@@ -857,7 +955,7 @@ void schedule_from_irq(interrupt_frame_t* frame) {
             // in some races); just refill and continue.
         }
         if (current->state != PROCESS_TERMINATED) {
-            current->time_slice = SCHED_QUANTUM_TICKS;
+            current->time_slice = priority_time_slice(current->priority);
             current->need_resched = 0;
             current->state = PROCESS_RUNNING;
         }
@@ -967,7 +1065,7 @@ void schedule_from_irq(interrupt_frame_t* frame) {
         scheduler_add_process(next);   // re-queue (takes a fresh ref)
         process_unref(next);           // release pick_next's transferred ref
         if (current->state != PROCESS_TERMINATED) {
-            current->time_slice = SCHED_QUANTUM_TICKS;
+            current->time_slice = priority_time_slice(current->priority);
             current->need_resched = 0;
             current->state = PROCESS_RUNNING;
         }

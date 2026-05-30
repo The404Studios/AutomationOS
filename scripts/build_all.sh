@@ -67,6 +67,13 @@ cc userspace/apps/sleeptest/sleeptest.c /tmp/sleeptest.o; $LD /tmp/crt0.o /tmp/s
 # stress test. Harmless to build/ship unconditionally -- it is only ever SPAWNED
 # when init is built with -DPREEMPT_STRESS (STRESS=1). crt0-linked (id from argv[1]).
 cc userspace/apps/cpuburn/cpuburn.c /tmp/cpuburn.o; $LD /tmp/crt0.o /tmp/cpuburn.o -o /tmp/cpuburn.elf
+# prioritytest: PROVES scheduler priority classes shift CPU share. Forks two
+# CPU-bound children (one SCHED_CLASS_HIGH nice -10, one SCHED_CLASS_BACKGROUND
+# nice +10), runs them a ~1.5s window with periodic yields, then compares their
+# per-process cpu_ticks via SYS_PROCLIST. Prints PRIORITYTEST: PASS iff high >
+# low*1.3. Works in BOTH the cooperative and preemptive builds. crt0-linked;
+# includes userspace/lib/sched_class.h (named classes + sched_setclass()).
+cc userspace/apps/prioritytest/prioritytest.c /tmp/prioritytest.o; $LD /tmp/crt0.o /tmp/prioritytest.o -o /tmp/prioritytest.elf
 # matbench: SIMD float matmul benchmark -- scalar baseline vs hand-vectorized SSE
 # (gcc v4sf), with a correctness check + a measured speedup. First tensor-runtime brick.
 cc userspace/apps/matbench/matbench.c /tmp/matbench.o; $LD /tmp/crt0.o /tmp/matbench.o -o /tmp/matbench.elf
@@ -368,7 +375,7 @@ $LD /tmp/crt0.o /tmp/cc.o \
     -o /tmp/cc.elf
 
 echo "[all] canary check (all must be 0):"
-for e in comp init filemanager calculator clock sysinfo settings sysmon uidemo dateapp applauncher taskman terminal editor snake paint synth tetris game2048 sheet notes calendar stopwatch mines piano dashboard welcome bench breakout pong invaders procmon soundtest solitaire aiconsole screenshot stress musicplayer ide bubbletd pacman clockapp forktest aibroker sed awk tar pkg make meminfo argvtest floattest sleeptest matbench tensortest cpuburn blk ps kill free uptime find diff cmp tee wcx xargs gzip cc nettest sockettest wget netman browser cryptotest libtest ping nc grep head tail sort uniq cut tr nl du touch basename dirname uname hostname whoami date less hexdump tlsprobe certtool dhcpc apidemo js futextest epolltest sendfiletest perftest batchtest domtest htmltest csstest layouttest webtest browser2 webapitest; do
+for e in comp init filemanager calculator clock sysinfo settings sysmon uidemo dateapp applauncher taskman terminal editor snake paint synth tetris game2048 sheet notes calendar stopwatch mines piano dashboard welcome bench breakout pong invaders procmon soundtest solitaire aiconsole screenshot stress musicplayer ide bubbletd pacman clockapp forktest aibroker sed awk tar pkg make meminfo argvtest floattest sleeptest prioritytest matbench tensortest cpuburn blk ps kill free uptime find diff cmp tee wcx xargs gzip cc nettest sockettest wget netman browser cryptotest libtest ping nc grep head tail sort uniq cut tr nl du touch basename dirname uname hostname whoami date less hexdump tlsprobe certtool dhcpc apidemo js futextest epolltest sendfiletest perftest batchtest domtest htmltest csstest layouttest webtest browser2 webapitest; do
     n=$(objdump -d /tmp/$e.elf 2>/dev/null | grep -c "fs:0x28" || true)
     echo "  $e=$n"
 done
@@ -395,6 +402,9 @@ cp /tmp/meminfo.elf  /tmp/ird/bin/meminfo
 cp /tmp/argvtest.elf /tmp/ird/sbin/argvtest
 cp /tmp/floattest.elf /tmp/ird/sbin/floattest
 cp /tmp/sleeptest.elf /tmp/ird/sbin/sleeptest
+# prioritytest -> /sbin (init spawns it after the boot storm drains). Proves
+# priority classes shift CPU share by comparing two children's cpu_ticks.
+cp /tmp/prioritytest.elf /tmp/ird/sbin/prioritytest
 # cpuburn -> /sbin (init spawns sbin/cpuburn under PREEMPT_STRESS). Shipped in
 # every initrd but only spawned by a STRESS=1 init, so it is inert otherwise.
 cp /tmp/cpuburn.elf /tmp/ird/sbin/cpuburn

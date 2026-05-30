@@ -727,8 +727,11 @@ int64_t sys_yield(uint64_t arg1, uint64_t arg2, uint64_t arg3,
         return ESRCH;
     }
 
-    // Add current to back of ready queue, pick next.
-    scheduler_add_process(current);
+    // Add current back to the ready queue (priority-weighted: a higher-priority
+    // yielder re-enters ACTIVE for a bounded number of bonus turns so it accrues
+    // proportionally more CPU than lower-priority peers; nice >= 0 routes
+    // straight to expired, unchanged), then pick next.
+    scheduler_yield_requeue(current);
     process_t* next = scheduler_pick_next();
     // Never switch to a process with no kernel stack (it has nowhere to take a
     // trap/syscall) -- current simply keeps running.
@@ -1281,8 +1284,15 @@ int64_t sys_proclist(uint64_t ubuf, uint64_t max, uint64_t arg3,
     if (!ubuf) return EFAULT;
     if (max == 0) return 0;
     // Cooperative, non-preemptive kernel -> a file-static snapshot buffer is safe.
-    static proc_info_t list[64];
-    int cap = (int)(max > 64 ? 64 : max);
+    // Sized to the full process table (MAX_PROCESSES, process.c) so a caller can
+    // see EVERY live process, not just the first 64. The old 64-entry cap
+    // silently truncated late/high-PID processes (e.g. a test's freshly-forked
+    // children at high table slots vanished from the snapshot), which made
+    // per-process CPU accounting via SYS_PROCLIST miss exactly the processes a
+    // scheduler test needs. 256 * 64 B = 16 KiB of .bss -- acceptable.
+    #define PROCLIST_SNAP_MAX 256
+    static proc_info_t list[PROCLIST_SNAP_MAX];
+    int cap = (int)(max > PROCLIST_SNAP_MAX ? PROCLIST_SNAP_MAX : max);
     int n = process_list(list, cap);
     if (n > 0) {
         if (copy_to_user((void*)ubuf, list, (uint64_t)n * sizeof(proc_info_t)) != COPY_SUCCESS) {

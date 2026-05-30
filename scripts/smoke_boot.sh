@@ -325,6 +325,27 @@ check_sleep() {
     fi
 }
 
+check_priority() {
+    # init spawns sbin/prioritytest, which PROVES scheduler priority CLASSES
+    # actually shift CPU share: it forks two CPU-bound children -- one
+    # SCHED_CLASS_HIGH (nice -10), one SCHED_CLASS_BACKGROUND (nice +10) -- runs
+    # them a ~1.5s window with periodic yields (so scheduler_pick_next re-picks by
+    # priority each turn, in BOTH the cooperative and preemptive builds), then
+    # compares their per-process cpu_ticks via SYS_PROCLIST. "PRIORITYTEST: PASS"
+    # means the HIGH child accrued meaningfully more CPU (high > low*1.3); the
+    # "high=<t> low=<t>" line is printed either way for diagnosis.
+    if grep -qF 'PRIORITYTEST: PASS' "$LOG"; then
+        pass "priority classes shift CPU share ($(grep -F 'PRIORITYTEST: high=' "$LOG" | head -1 | sed 's/^.*PRIORITYTEST: //'))"
+        return 0
+    elif grep -qF 'PRIORITYTEST: FAIL' "$LOG"; then
+        fail "priority did NOT shift CPU share: $(grep -F 'PRIORITYTEST:' "$LOG" | grep -E 'high=|FAIL' | head -2 | tr '\n' ' ')"
+        return 1
+    else
+        fail "prioritytest did not report (priority probe hung or never ran)"
+        return 1
+    fi
+}
+
 check_tensor() {
     # init spawns sbin/tensortest; the SSE tensor-kernel library (matmul/add/
     # scale/relu/dot) is run against an independent scalar reference within an
@@ -729,6 +750,7 @@ run_checks() {
         check_argv
         check_floattest
         check_sleep
+        check_priority
         check_tensor
         check_compiler
         check_compress

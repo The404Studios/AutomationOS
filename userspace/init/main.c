@@ -250,6 +250,17 @@ void _start(void) {
     print("[INIT] Spawning sleeptest...\n");
     spawn("sbin/sleeptest");
 
+    // prioritytest: PROVES scheduler priority classes actually shift CPU share.
+    // Forks two CPU-bound children (one SCHED_CLASS_HIGH / nice -10, one
+    // SCHED_CLASS_BACKGROUND / nice +10), runs them a fixed ~1.5s window with
+    // periodic yields, then compares their per-process cpu_ticks (SYS_PROCLIST)
+    // and prints "PRIORITYTEST: PASS" iff HIGH got meaningfully more CPU. Works
+    // in BOTH the cooperative and preemptive builds. Spawned LAST (after the
+    // boot-time spawn storm has drained) so the two burners get a clean window
+    // rather than fighting dozens of still-spawning boot apps for the CPU.
+    print("[INIT] Spawning prioritytest...\n");
+    spawn("sbin/prioritytest");
+
 #ifdef PREEMPT_STRESS
     // ========================================================================
     // PREEMPTIVE-SCHEDULER STRESS WORKLOAD  (compiled ONLY with -DPREEMPT_STRESS,

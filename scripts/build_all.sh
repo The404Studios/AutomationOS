@@ -64,6 +64,9 @@ cc userspace/apps/floattest/floattest.c /tmp/floattest.o; $LD /tmp/crt0.o /tmp/f
 # stress test. Harmless to build/ship unconditionally -- it is only ever SPAWNED
 # when init is built with -DPREEMPT_STRESS (STRESS=1). crt0-linked (id from argv[1]).
 cc userspace/apps/cpuburn/cpuburn.c /tmp/cpuburn.o; $LD /tmp/crt0.o /tmp/cpuburn.o -o /tmp/cpuburn.elf
+# matbench: SIMD float matmul benchmark -- scalar baseline vs hand-vectorized SSE
+# (gcc v4sf), with a correctness check + a measured speedup. First tensor-runtime brick.
+cc userspace/apps/matbench/matbench.c /tmp/matbench.o; $LD /tmp/crt0.o /tmp/matbench.o -o /tmp/matbench.elf
 
 # Wave: process/disk sysutils + file/text tools (all argv-aware, crt0-linked).
 # ps/kill/free/uptime = process+system info; find/diff/cmp/tee/wcx/xargs = file
@@ -386,6 +389,7 @@ cp /tmp/floattest.elf /tmp/ird/sbin/floattest
 # cpuburn -> /sbin (init spawns sbin/cpuburn under PREEMPT_STRESS). Shipped in
 # every initrd but only spawned by a STRESS=1 init, so it is inert otherwise.
 cp /tmp/cpuburn.elf /tmp/ird/sbin/cpuburn
+cp /tmp/matbench.elf /tmp/ird/sbin/matbench
 # Wave tools: process/disk + file/text utils, gzip, and the on-device C compiler.
 for t in blk ps kill free uptime find diff cmp tee wcx xargs gzip cc; do
     cp /tmp/$t.elf /tmp/ird/bin/$t

@@ -131,6 +131,11 @@ void _start(void) {
     print("[INIT] Spawning floattest...\n");
     spawn("sbin/floattest");
 
+    // matbench: SIMD float matmul benchmark (scalar baseline vs hand-vectorized
+    // SSE) -- prints MATBENCH with the measured speedup + a correctness PASS.
+    print("[INIT] Spawning matbench...\n");
+    spawn("sbin/matbench");
+
     // AI-native layer: the capability-gated command broker (crown jewel) runs a
     // self-test of its tool-bus + policy + ledger + rollback pipeline.
     print("[INIT] Spawning aibroker...\n");

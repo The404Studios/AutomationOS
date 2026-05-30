@@ -570,7 +570,7 @@ static void blit_surface_scaled_alpha(uint32_t *buf, uint32_t bw, uint32_t bh, u
 #define RDOCK_FAN_SPARKLES    8   /* sparkle dots drawn around a hovered icon */
 
 /* Number of app entries and folders */
-#define RDOCK_NICONS  18
+#define RDOCK_NICONS  20
 #define RDOCK_NFOLDERS 2
 
 /* App descriptor */
@@ -608,6 +608,8 @@ static const rdock_app_t rdock_apps[RDOCK_NICONS] = {
     { "Nm", "sbin/netman",      0xFF00897Bu },  /* 15 NetManager */
     { "Ch", "sbin/chess",       0xFF5C3A2Au },  /* 16 Chess      */
     { "As", "sbin/asteroids",   0xFF202840u },  /* 17 Asteroids  */
+    { "Su", "sbin/sudoku",      0xFF6D4C9Fu },  /* 18 Sudoku     */
+    { "Cc", "sbin/controlcenter", 0xFF0A84FFu },/* 19 ControlCtr */
 };
 
 /* ---- Folder table (Games + Tools) ---- */

@@ -2443,10 +2443,11 @@ static void present_diff(uint32_t *fb, uint32_t *back, uint32_t *prev,
 
 /* Boot transition: how long the kernel splash fluidly cross-fades into the
  * desktop, in ms. */
-#define BOOT_FADE_MS  700
+#define BOOT_FADE_MS  900
 
 /* Present a per-channel cross-fade of `splash` -> `back` into `fb`.
- * `t` is the blend amount in [0,256] (0 = all splash, 256 = all desktop). */
+ * `t` is the blend amount in [0,256] (0 = all splash, 256 = all desktop).
+ * Kept as a fallback; the boot transition uses present_circle_iris() below. */
 static void present_crossfade(uint32_t *fb, uint32_t *back, uint32_t *splash,
                               uint32_t total, uint32_t t) {
     if (t > 256u) t = 256u;
@@ -2457,6 +2458,59 @@ static void present_crossfade(uint32_t *fb, uint32_t *back, uint32_t *splash,
         uint32_t g = ((((a >>  8) & 0xFFu) * it) + (((b >>  8) & 0xFFu) * t)) >> 8;
         uint32_t bl= (((( a       & 0xFFu) * it) + ((  b       & 0xFFu) * t))) >> 8;
         fb[i] = (r << 16) | (g << 8) | bl;
+    }
+}
+
+/* Integer sqrt (Newton) -- used once per frame for the iris radius. */
+static uint32_t isqrt32(uint32_t n) {
+    if (n == 0) return 0;
+    uint32_t x = n, y = (x + 1u) / 2u;
+    while (y < x) { x = y; y = (x + n / x) / 2u; }
+    return x;
+}
+
+/* Circular IRIS reveal: the desktop (`back`) opens through a growing, eased,
+ * soft-edged circle centered on screen, over the captured boot splash. `t` in
+ * [0,256] is transition progress; `max_radius` = center-to-corner distance so
+ * the circle fully covers the screen at t=256. This is the fluid "Welcome to
+ * AutomationOS" -> desktop boot transition. Writes the full frame, but only
+ * during the brief BOOT_FADE_MS window (present_diff takes over after). */
+static void present_circle_iris(uint32_t *fb, uint32_t *back, uint32_t *splash,
+                                uint32_t W, uint32_t H, uint32_t stride,
+                                uint32_t max_radius, uint32_t t) {
+    if (t > 256u) t = 256u;
+    /* smoothstep easing 3t^2 - 2t^3, kept in [0,256] fixed-point. */
+    uint32_t eased  = (uint32_t)(((uint64_t)t * t * (768u - 2u * t)) >> 16);
+    uint32_t radius = (max_radius * eased) >> 8;          /* px */
+    int32_t  cx = (int32_t)W / 2, cy = (int32_t)H / 2;
+    const int32_t FEATHER = 28;                           /* soft-edge band */
+    int64_t inner  = (int64_t)radius - FEATHER; if (inner < 0) inner = 0;
+    int64_t outer  = (int64_t)radius + FEATHER;
+    int64_t inner2 = inner * inner, outer2 = outer * outer;
+    int64_t band   = outer2 - inner2; if (band < 1) band = 1;
+    for (uint32_t y = 0; y < H; y++) {
+        int32_t  dy  = (int32_t)y - cy;
+        int64_t  dy2 = (int64_t)dy * dy;
+        uint32_t off = y * stride;
+        for (uint32_t x = 0; x < W; x++) {
+            int32_t dx = (int32_t)x - cx;
+            int64_t dist2 = (int64_t)dx * dx + dy2;
+            uint32_t px;
+            if (dist2 <= inner2) {
+                px = back[off + x];                        /* fully revealed */
+            } else if (dist2 >= outer2) {
+                px = splash[off + x];                      /* still splash    */
+            } else {
+                uint32_t bl = (uint32_t)(((dist2 - inner2) * 256) / band); /* back->splash */
+                uint32_t a = back[off + x], b = splash[off + x];
+                uint32_t it = 256u - bl;
+                uint32_t r = ((((a >> 16) & 0xFFu) * it) + (((b >> 16) & 0xFFu) * bl)) >> 8;
+                uint32_t g = ((((a >>  8) & 0xFFu) * it) + (((b >>  8) & 0xFFu) * bl)) >> 8;
+                uint32_t c = (((  a        & 0xFFu) * it) + ((  b        & 0xFFu) * bl)) >> 8;
+                px = (r << 16) | (g << 8) | c;
+            }
+            fb[off + x] = px;
+        }
     }
 }
 
@@ -3421,6 +3475,12 @@ void _start(void) {
             print("[SHELL] dirty-rect present enabled\n");
         }
     }
+
+    /* Center-to-corner distance: the radius the circular boot iris grows to so
+     * it fully covers the screen by the end of the transition. */
+    uint32_t _half_w = W / 2, _half_h = H / 2;
+    uint32_t max_radius = isqrt32(_half_w * _half_w + _half_h * _half_h);
+
     long boot_ms = syscall(SYS_GET_TICKS_MS, 0, 0, 0);
 
     /* 3. Create the server command inbox (SysV message queue). */
@@ -3494,7 +3554,7 @@ void _start(void) {
             long fade_el = now - boot_ms;
             if (splash && fade_el >= 0 && fade_el < BOOT_FADE_MS) {
                 uint32_t t = (uint32_t)((fade_el * 256) / BOOT_FADE_MS);
-                present_crossfade(hw, back, splash, H * stride, t);
+                present_circle_iris(hw, back, splash, W, H, stride, max_radius, t);
             } else {
                 if (prev) present_diff(hw, back, prev, W, H, stride);
                 else      present(hw, back, H, stride);

@@ -617,8 +617,8 @@ static const rdock_app_t rdock_apps[RDOCK_NICONS] = {
 
 /* ---- Folder table (Games + Tools) ---- */
 static const rdock_folder_t rdock_folders[RDOCK_NFOLDERS] = {
-    { "Gm", 0xFF3A3A5Cu, { 7, 8, 9, -1 }, 3 },   /* Games  */
-    { "Tl", 0xFF3A5C3Au, { 4, 5, 2, -1 }, 3 },   /* Tools  */
+    { "Gm", 0xFF3A3A5Cu, { 7, 8, 9, 21 }, 4 },   /* Games  (+Pac-Man) */
+    { "Tl", 0xFF3A5C3Au, { 4, 5, 2, 22 }, 4 },   /* Tools  (+Clock+)  */
 };
 
 /* ---- Per-icon animation state ---- */

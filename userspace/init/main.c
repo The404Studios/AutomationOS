@@ -126,6 +126,11 @@ void _start(void) {
     print("[INIT] Spawning argvtest...\n");
     spawn_args("sbin/argvtest", "hello world");
 
+    // ring-3 float/SSE probe: proves SSE is enabled + context-switched for user
+    // tasks (scalar float, a 2x2 float matmul, a reduction). Prints FLOATTEST: PASS.
+    print("[INIT] Spawning floattest...\n");
+    spawn("sbin/floattest");
+
     // AI-native layer: the capability-gated command broker (crown jewel) runs a
     // self-test of its tool-bus + policy + ledger + rollback pipeline.
     print("[INIT] Spawning aibroker...\n");

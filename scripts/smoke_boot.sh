@@ -294,6 +294,21 @@ check_argv() {
     fi
 }
 
+check_floattest() {
+    # init spawns sbin/floattest; proves ring-3 SSE/FPU works end-to-end
+    # (scalar float, a 2x2 float matmul, an auto-vectorized reduction).
+    if grep -qF 'FLOATTEST: PASS' "$LOG"; then
+        pass "ring-3 float/SSE verified ($(grep -F 'FLOATTEST: matmul' "$LOG" | head -1 | sed 's/^.*FLOATTEST: //'))"
+        return 0
+    elif grep -qF 'FLOATTEST: FAIL' "$LOG"; then
+        fail "ring-3 float/SSE broken: $(grep -F 'FLOATTEST:' "$LOG" | head -2 | tr '\n' ' ')"
+        return 1
+    else
+        fail "floattest did not report (SSE not enabled for ring 3, or it crashed)"
+        return 1
+    fi
+}
+
 check_slab() {
     # kernel.c calls slab_selftest() — the object-cache slab allocator.
     if grep -qF '[SLAB] SELFTEST: PASS' "$LOG"; then
@@ -680,6 +695,7 @@ run_checks() {
         check_tools
         check_slab
         check_argv
+        check_floattest
         check_compiler
         check_compress
         check_sysutils

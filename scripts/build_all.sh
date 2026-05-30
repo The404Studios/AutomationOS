@@ -48,6 +48,8 @@ cc userspace/apps/tar/tar.c     /tmp/tar.o;     $LD /tmp/crt0.o /tmp/tar.o     -
 cc userspace/apps/pkg/pkg.c     /tmp/pkg.o;     $LD /tmp/crt0.o /tmp/pkg.o     -o /tmp/pkg.elf
 cc userspace/apps/make/make.c   /tmp/make.o;    $LD /tmp/crt0.o /tmp/make.o    -o /tmp/make.elf
 cc userspace/apps/argvtest/argvtest.c /tmp/argvtest.o; $LD /tmp/crt0.o /tmp/argvtest.o -o /tmp/argvtest.elf
+# floattest: proves ring-3 float/SSE at runtime (scalar + 2x2 matmul + reduction).
+cc userspace/apps/floattest/floattest.c /tmp/floattest.o; $LD /tmp/crt0.o /tmp/floattest.o -o /tmp/floattest.elf
 
 # Wave: process/disk sysutils + file/text tools (all argv-aware, crt0-linked).
 # ps/kill/free/uptime = process+system info; find/diff/cmp/tee/wcx/xargs = file
@@ -366,6 +368,7 @@ cp /tmp/pkg.elf      /tmp/ird/bin/pkg
 cp /tmp/make.elf     /tmp/ird/bin/make
 cp /tmp/meminfo.elf  /tmp/ird/bin/meminfo
 cp /tmp/argvtest.elf /tmp/ird/sbin/argvtest
+cp /tmp/floattest.elf /tmp/ird/sbin/floattest
 # Wave tools: process/disk + file/text utils, gzip, and the on-device C compiler.
 for t in blk ps kill free uptime find diff cmp tee wcx xargs gzip cc; do
     cp /tmp/$t.elf /tmp/ird/bin/$t

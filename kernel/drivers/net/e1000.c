@@ -634,6 +634,25 @@ int e1000_init(void) {
                              : " -- standalone, using classic bring-up");
     }
 
+    /*
+     * RUNTIME GATE -- decline PCH NICs (82577LM &c.) BEFORE touching any MMIO.
+     * Confirmed on the ThinkPad T410: re-enabling networking made the boot HANG
+     * right after the "storage SKIPPED" marker, i.e. inside this function's
+     * 82577LM bring-up. Its MMIO/MDIO/SW-FW-semaphore path stalls the bus in a
+     * way the iteration caps cannot unwedge (a bus stall, not a software spin).
+     * We only reached the device match via PCI config space (safe); returning
+     * here, before `pci_get_bar`/`e1000.mmio`/any register access, guarantees we
+     * issue ZERO NIC MMIO on the T410 -- so it boots to the desktop exactly like
+     * the fully-network-skipped build did, while QEMU's e1000 (NOT a PCH part)
+     * still runs the full, working bring-up below. The PCH driver code is kept
+     * intact; re-enable by removing this gate once it is validated on real HW.
+     */
+    if (e1000.is_pch) {
+        kprintf("[E1000] PCH NIC 0x%04x detected -- bring-up DISABLED (hangs real "
+                "hardware); declining to keep the boot alive\n", dev->device_id);
+        return -1;
+    }
+
     /* BAR0 is the memory-mapped register file (identity-mapped 1:1). */
     uint64_t bar0 = pci_get_bar(dev, 0);
     if (bar0 == 0) {

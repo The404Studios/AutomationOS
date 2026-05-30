@@ -21,6 +21,23 @@ userspace/test_ring3/init_bare
 userspace/test_ring3/terminal
 userspace/test_ring3/test_ring3
 
+# Claude Code workspace (never publish)
+.claude/
+
+# Build logs & loose scratch files (root-level dev cruft)
+*.log
+/kerr*.txt
+/kout*.txt
+/uerr*.txt
+/uout*.txt
+/t.c
+/tmp*.c
+/p256_*.c
+*_SUMMARY.txt
+*_DELIVERABLES.txt
+*_VERIFICATION.txt
+*_IMPLEMENTATION.txt
+
 # Editor files
 *.swp
 *.swo

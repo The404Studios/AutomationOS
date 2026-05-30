@@ -570,7 +570,7 @@ static void blit_surface_scaled_alpha(uint32_t *buf, uint32_t bw, uint32_t bh, u
 #define RDOCK_FAN_SPARKLES    8   /* sparkle dots drawn around a hovered icon */
 
 /* Number of app entries and folders */
-#define RDOCK_NICONS  21
+#define RDOCK_NICONS  23
 #define RDOCK_NFOLDERS 2
 
 /* App descriptor */
@@ -611,6 +611,8 @@ static const rdock_app_t rdock_apps[RDOCK_NICONS] = {
     { "Su", "sbin/sudoku",      0xFF6D4C9Fu },  /* 18 Sudoku     */
     { "Cc", "sbin/controlcenter", 0xFF0A84FFu },/* 19 ControlCtr */
     { "Ph", "sbin/photos",      0xFF2D8B8Bu },  /* 20 Photos     */
+    { "Pm", "sbin/pacman",      0xFFFFD60Au },  /* 21 Pac-Man    */
+    { "C+", "sbin/clockapp",    0xFF0067C0u },  /* 22 Clock+     */
 };
 
 /* ---- Folder table (Games + Tools) ---- */

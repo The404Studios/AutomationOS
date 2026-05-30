@@ -306,20 +306,33 @@ static inline int process_get_priority(process_t* proc) {
 }
 
 // ===========================================================================
-// Global sleep list — real blocking SYS_SLEEP (ms granularity, zero CPU)
+// Global sleep list — the TIMER half of the unified wait object
 // ===========================================================================
-// Intrusive singly-linked list of processes parked in PROCESS_BLOCKED by
-// sys_sleep(). Each node links via proc->sleep_next and carries an absolute
+// Intrusive singly-linked list of processes that armed a wakeup DEADLINE when
+// they blocked. Each node links via proc->sleep_next and carries an absolute
 // wake_deadline in timer_get_ticks() units (the PIT runs at 1000 Hz, so 1 tick
-// == 1 ms). A sleeper is on THIS list XOR a ready queue, never both:
-//   sys_sleep:   state=BLOCKED, sleep_list_push(), switch away (not re-queued).
-//   timer scan:  unlink when wake_deadline<=now, state=READY, scheduler_add_process.
+// == 1 ms). It is populated by wait_object_block(wo, deadline) — the single
+// block primitive — for any timer-armed wait (sys_sleep is the canonical one):
+//   block:      state=BLOCKED, sleep_list_push(), switch away (not re-queued).
+//   timer scan: unlink when wake_deadline<=now, state=READY, scheduler_add_process.
+//
+// A timer-armed waiter is on BOTH this list AND its wait_object's waiter list.
+// Whichever fires first (timeout here, or a wait_object_signal) re-readies it;
+// the OTHER linkage is cleaned up afterward:
+//   • signal first: wait_object_signal calls sleep_list_remove() before
+//     re-readying, taking the waiter off this list.
+//   • timer first (here): we just re-ready via the sleep list; the waiter is
+//     still linked on its wait_object, and the resuming wait_object_block()
+//     unlinks itself from the wait_object (dropping the object-ref) on return.
+// So this scan does NOT need to touch the wait_object — keeping the IRQ path
+// free of cross-lock ordering. A pure-timer wait (no signal possible) is just
+// the degenerate case where only this list ever fires.
 //
 // Single-core: the only concurrent mutator of this list is the timer IRQ's
-// wakeup scan. sys_sleep() may run with IF=1, so we bracket the push/unlink with
-// save_flags_cli()/restore_flags() — that makes the IRQ unable to observe a
-// half-linked node (and the IRQ scan itself already runs with IF=0). No spinlock
-// is needed beyond this on a uniprocessor.
+// wakeup scan. The block path may run with IF=1, so we bracket every mutation
+// with save_flags_cli()/restore_flags() — that makes the IRQ unable to observe
+// a half-linked node (and the IRQ scan itself already runs with IF=0). No
+// spinlock is needed beyond this on a uniprocessor.
 static process_t* g_sleep_list = NULL;
 
 void sleep_list_push(process_t* proc) {
@@ -330,12 +343,38 @@ void sleep_list_push(process_t* proc) {
     restore_flags(flags);
 }
 
+// Remove `proc` from the sleep list if present (idempotent; no-op if absent).
+// Called when a timer-armed waiter is woken by a SIGNAL instead of its timeout
+// (wait_object_signal), and again as belt-and-braces on the wait_object_block
+// resume path. Bracketed with cli/restore so it is race-free vs the IRQ scan.
+void sleep_list_remove(process_t* proc) {
+    if (!proc) return;
+    uint64_t flags = save_flags_cli();
+    process_t** link = &g_sleep_list;
+    while (*link) {
+        if (*link == proc) {
+            *link = proc->sleep_next;
+            proc->sleep_next = NULL;
+            break;
+        }
+        link = &(*link)->sleep_next;
+    }
+    restore_flags(flags);
+}
+
 // Walk the sleep list and wake every process whose deadline has arrived. Called
 // once per timer tick from BOTH the cooperative pit.c handler and the preemptive
 // schedule_from_irq() (after the tick counter advances). Unlinks due sleepers,
 // marks them READY, and hands them to scheduler_add_process() (which takes its
 // own reference). Runs with interrupts disabled in the IRQ context; we also save
 // flags so it is safe if ever invoked from an IF=1 path.
+//
+// A woken sleeper that was a timer-armed wait_object waiter is left linked on
+// its wait_object here (with its object-ref intact); the resuming
+// wait_object_block() unlinks it and drops that ref. We only re-ready genuinely
+// BLOCKED sleepers: a process a signal already re-readied (and removed via
+// sleep_list_remove) is gone from this list, but the BLOCKED guard is kept as
+// defense in depth so a stray non-blocked node can never be doubly re-added.
 void sleep_list_wake_due(uint64_t now) {
     uint64_t flags = save_flags_cli();
     process_t** link = &g_sleep_list;
@@ -347,8 +386,10 @@ void sleep_list_wake_due(uint64_t now) {
             // field than sleep_next, but we keep the invariant tight anyway).
             *link = it->sleep_next;
             it->sleep_next = NULL;
-            it->state = PROCESS_READY;
-            scheduler_add_process(it);
+            if (it->state == PROCESS_BLOCKED) {
+                it->state = PROCESS_READY;
+                scheduler_add_process(it);
+            }
             // *link now points at the successor; do NOT advance link.
         } else {
             link = &it->sleep_next;

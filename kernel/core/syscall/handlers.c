@@ -546,14 +546,22 @@ int64_t sys_getpid(uint64_t arg1, uint64_t arg2, uint64_t arg3,
 // SYS_SLEEP - Real blocking sleep in MILLISECONDS.
 //
 // The PIT runs at 1000 Hz (1 tick == 1 ms), so arg1 (milliseconds) maps 1:1 onto
-// timer ticks. Unlike the old busy-yield sleep (which kept the process READY and
-// burned scheduler time), this BLOCKS the caller: it goes PROCESS_BLOCKED (zero
-// CPU), is parked on the global sleep list with an absolute wake_deadline, and is
-// re-readied by the timer wakeup scan (sleep_list_wake_due, run once per tick in
-// BOTH the cooperative pit.c handler and the preemptive schedule_from_irq). The
-// block/resume discipline mirrors wq_block_current() exactly: set state, push,
-// pick a successor, cooperative_switch_to(), and resume "here" with no reliance
-// on stale locals after the switch. Works identically in both builds.
+// timer ticks. This BLOCKS the caller (zero CPU) until its deadline. It is now
+// expressed in terms of the UNIFIED wait primitive: sleep == wait(timer). We
+// block on a process-global timer-only wait_object, passing an absolute deadline;
+// wait_object_block() arms the timer sleep list and runs the shared block/resume
+// discipline (set BLOCKED, link, pick a successor, sti/hlt idle if needed,
+// cooperative_switch_to, and on resume unlink from both lists with no stale
+// locals). The timer wakeup scan (sleep_list_wake_due, once per tick in BOTH the
+// cooperative pit.c handler and the preemptive schedule_from_irq) re-readies us
+// at the deadline. Works identically in both builds.
+//
+// g_sleep_wobj is a dedicated timer-wait object: nothing ever calls
+// wait_object_signal() on it, so a sleeper is only ever woken by its timeout
+// (then it self-unlinks from the object on resume). This preserves the exact old
+// sleep semantics while sharing one code path with event waits.
+static wait_object_t g_sleep_wobj = WAIT_OBJECT_INITIALIZER;
+
 int64_t sys_sleep(uint64_t ms, uint64_t arg2, uint64_t arg3,
                   uint64_t arg4, uint64_t arg5, uint64_t arg6) {
     (void)arg2; (void)arg3; (void)arg4; (void)arg5; (void)arg6;
@@ -575,51 +583,14 @@ int64_t sys_sleep(uint64_t ms, uint64_t arg2, uint64_t arg3,
     if (deadline < now) {
         return EINVAL;
     }
-    current->wake_deadline = deadline;
 
-    // Mark blocked and park on the sleep list BEFORE switching away, so a timer
-    // wakeup racing in right after we set state cannot lose us (the scan re-readies
-    // a not-yet-switched-out process safely: it just goes back on the ready queue
-    // and we never actually sleep).
-    current->state = PROCESS_BLOCKED;
-    sleep_list_push(current);
+    // Single block primitive: a timer-armed wait. Returns 0 (timeout) for a real
+    // sleep; the return value is irrelevant here since this object is never
+    // signalled. All of the block/park/switch/resume/cleanup lives in
+    // wait_object_block(), shared with the event-wait (wait queue) path.
+    (void)wait_object_block(&g_sleep_wobj, deadline);
 
-    // Hand the CPU to another runnable process. Mirror sys_yield()/wq_block_current
-    // exactly: pick a successor; the current (blocked) process is NOT re-added to
-    // the ready queue, so it will not run again until the timer wakeup re-readies it.
-    process_t* next = scheduler_pick_next();
-
-    // If nothing else is runnable, idle until the timer makes a process ready (our
-    // own wakeup, or another). Re-enable interrupts so IRQ0 can fire and advance.
-    while (next == NULL) {
-        __asm__ volatile("sti; hlt; cli" ::: "memory");
-        if (current->state != PROCESS_BLOCKED) {
-            // The timer woke us (deadline reached) while we idled. Resume.
-            return ESUCCESS;
-        }
-        next = scheduler_pick_next();
-    }
-
-    if (next == current) {
-        // Degenerate: we got picked despite being blocked (woken between push and
-        // pick). Just resume.
-        next->state = PROCESS_RUNNING;
-        process_set_current(next);
-        return ESUCCESS;
-    }
-
-    next->state = PROCESS_RUNNING;
-    process_set_current(next);
-
-    // Cooperative (C-return) save: when this process is later re-readied by the
-    // timer scan and picked, context_switch() "returns" right here and we fall
-    // through to the return below. cooperative_switch_to() sets next's TSS/kernel
-    // stack and routes RESUME_IRETQ successors (e.g. preempted ring-3 burners)
-    // through iretq so a sleeping task can hand off to them.
-    current->resume_mode = RESUME_CRETURN;
-    cooperative_switch_to(current, next);
-
-    // Resumed here after the timer woke us. (Do not touch stale locals.)
+    // Resumed here after the timer woke us at the deadline.
     return ESUCCESS;
 }
 

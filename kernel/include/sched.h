@@ -190,6 +190,19 @@ typedef struct process {
     // memset-zeroed by process_create(). Appended at the END to keep the
     // assembler's hardcoded context offset valid.
     int yield_boost;                 // remaining bonus ACTIVE re-queues on yield
+
+    // Unified wait-object support (wait.h / waitqueue.c). A process blocked via
+    // wait_object_block() is linked onto ITS wait_object's intrusive waiter list
+    // through wait_next, with wait_on pointing back at that object. This is the
+    // single block primitive underlying BOTH event waits (wait queues: waitpid,
+    // futex, epoll) and timer waits (sys_sleep, which passes a deadline). The
+    // object holds one process_ref per linked waiter (mirroring the old wait-
+    // entry ref), so a process killed while BLOCKED stays alive until unlinked.
+    // wait_on lets the timer wakeup scan (sleep_list_wake_due) unlink a sleeper
+    // from its wait_object when its deadline fires first. memset-zeroed by
+    // process_create(). Appended at the END to keep the asm context offset valid.
+    struct wait_object* wait_on;     // wait_object this process is parked on (or NULL)
+    struct process* wait_next;       // intrusive waiter-list link within wait_on
 } process_t;
 
 // Global pointer to current process (for PE loader and other subsystems)
@@ -277,6 +290,7 @@ void context_switch_to_iretq(process_t* from, process_t* to);
 // BOTH builds (not gated). Single-core; the implementation brackets the list
 // mutation with cli/restore so a timer IRQ cannot observe a half-linked node.
 void sleep_list_push(process_t* proc);
+void sleep_list_remove(process_t* proc);
 void sleep_list_wake_due(uint64_t now);
 
 // SMP Load Balancing (scheduler_smp.c)
@@ -322,22 +336,68 @@ void context_load_irq(cpu_context_t* ctx, interrupt_frame_t* frame);
 void irq0_preempt(void);
 
 // ===========================================================================
-// Wait queues (waitqueue.c) — blocking primitive for I/O and synchronization
+// Unified WAIT OBJECT (wait.h / waitqueue.c) — the SINGLE blocking primitive
 // ===========================================================================
-typedef struct wait_entry {
-    process_t* proc;
-    struct wait_entry* next;
-} wait_entry_t;
+// A wait_object_t is the one place the block/resume discipline lives. Both
+// blocking flavors are now `wait_object_block(wo, deadline)`:
+//   • event wait  == wait_object_block(wo, 0)         — woken by a signal only
+//   • timer wait  == wait_object_block(wo, deadline)  — woken by signal OR timer
+// so "sleep == wait(timer)" and "wait_event == wait(event)" are the same code.
+//
+// Waiters are kept on an INTRUSIVE singly-linked FIFO list via the parked
+// process's wait_next link (process_t), with the process's wait_on pointing
+// back at the object. The object holds ONE process_ref per linked waiter
+// (replacing the old kmalloc'd wait_entry's ref), which keeps a process killed
+// while BLOCKED alive until it is unlinked — the load-bearing safety property
+// the old wait queue relied on. No per-wait heap allocation is needed.
+//
+// A waiter with a non-zero deadline is ALSO linked onto the global timer sleep
+// list (sleep_list_push) with wake_deadline set, so whichever of {signal,
+// timeout} happens first wins; the other linkage is cleaned up on resume (or by
+// the timer scan, which unlinks the sleeper from its wait_object too).
+typedef struct wait_object {
+    struct process* waiters;  // intrusive FIFO head (via process_t.wait_next)
+    struct process* tail;     // FIFO tail for O(1) append (preserves wake order)
+    spinlock_t lock;          // protects the waiter list
+    int initialized;          // 0 => zero-initialized; lazily inited on first use
+} wait_object_t;
 
+#define WAIT_OBJECT_INITIALIZER  { NULL, NULL, { 0, 0xFFFFFFFF, NULL }, 1 }
+
+void wait_object_init(wait_object_t* wo);
+
+// THE single block primitive. Marks the current process PROCESS_BLOCKED, links
+// it on wo's waiter list (and, if deadline != 0, on the timer sleep list with
+// wake_deadline == deadline), then switches to another runnable process exactly
+// like the old wq_block_current/sys_sleep (pick next / sti-hlt idle /
+// cooperative_switch_to). Returns when the process is later woken AND
+// rescheduled, after unlinking from both lists.
+// Returns 1 if woken by wait_object_signal, 0 if woken by timeout (or if it
+// fell through without truly sleeping). Must be called from a sleepable context
+// (not a hard IRQ; interrupts enabled).
+int wait_object_block(wait_object_t* wo, uint64_t deadline_or_0);
+
+// Wake the wait_object's waiters: wake_all==0 wakes exactly one (FIFO), nonzero
+// wakes all. Each woken waiter is unlinked, marked PROCESS_READY and handed to
+// scheduler_add_process(). Returns the number of processes woken.
+int wait_object_signal(wait_object_t* wo, int wake_all);
+
+// Number of processes currently parked on wo.
+int wait_object_count(wait_object_t* wo);
+
+// ===========================================================================
+// Wait queues — thin compatibility wrapper over wait_object_t
+// ===========================================================================
+// wait_queue_t keeps its exact historical public API (wq_init/wq_block_current/
+// wq_wake_one/wq_wake_all/wq_count) so its many callers (waitpid, futex, epoll)
+// are untouched; internally it is now just a wait_object (event-only: deadline
+// 0). This is the wait-queue half of the unification.
 typedef struct wait_queue {
-    wait_entry_t* head;
-    wait_entry_t* tail;
-    spinlock_t lock;
-    int initialized;
+    wait_object_t wobj;
 } wait_queue_t;
 
 // Statically initialize a wait_queue_t at file scope.
-#define WAIT_QUEUE_INITIALIZER  { NULL, NULL, { 0, 0xFFFFFFFF, NULL }, 1 }
+#define WAIT_QUEUE_INITIALIZER  { WAIT_OBJECT_INITIALIZER }
 
 void wq_init(wait_queue_t* wq);
 

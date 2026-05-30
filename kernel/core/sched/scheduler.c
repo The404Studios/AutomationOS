@@ -508,6 +508,56 @@ pick_again:
     return next;
 }
 
+// ===========================================================================
+// cooperative_switch_to() — hand the CPU to `next` from a cooperative site
+// ===========================================================================
+// A cooperative resume site (sys_yield / schedule / wq_block_current) runs in
+// ring 0 inside a syscall and switches to `next`. The mechanism DEPENDS on how
+// `next` was suspended:
+//
+//  • RESUME_CRETURN — `next` was suspended cooperatively (SYS_YIELD / a blocking
+//    syscall), or is brand-new (context.rip == usermode trampoline). Its
+//    context.rip is a KERNEL continuation, so the normal context_switch()
+//    (which ends in `ret`) resumes it correctly.
+//
+//  • RESUME_IRETQ — `next` was preempted by the timer IRQ while in ring 3, so
+//    context_save_irq stored its *ring-3* RIP/RSP/regs into its context. A `ret`
+//    into that would execute user code at CPL=0 (runaway → #DF). It must be
+//    resumed by restoring its ring-3 state and IRETQ-ing — context_switch_to_iretq.
+//
+// This is the piece the preemptive first-dispatch fix made necessary: once
+// never-run processes start under the timer IRQ, many become RESUME_IRETQ and a
+// cooperative caller can legitimately need to run one (e.g. a UI app that yields
+// while only timer-preempted burners are ready). Routing both kinds here keeps
+// every cooperative site correct without each having to special-case resume_mode.
+//
+// In a non-preemptive build no process is ever RESUME_IRETQ, so this is always
+// the plain context_switch() path — identical behaviour to before.
+void cooperative_switch_to(process_t* from, process_t* next) {
+    // TSS.RSP0 + SYSCALL kernel stack must point at `next`'s kernel stack before
+    // it runs in ring 3 (so its next syscall/interrupt lands on the right stack).
+    // 16-byte align: the CPU pushes the iretq frame here and aligned SSE stores
+    // in the entry path fault on a misaligned stack.
+    if (next->kernel_stack) {
+        uint64_t kstack_top =
+            ((uint64_t)next->kernel_stack + KERNEL_STACK_SIZE) & ~0xFULL;
+        tss_set_kernel_stack(kstack_top);
+        extern uint64_t kernel_rsp_save;
+        kernel_rsp_save = kstack_top;
+    }
+
+#ifdef PREEMPTIVE
+    if (next->resume_mode == RESUME_IRETQ) {
+        // Resume a timer-preempted (ring-3) process via iretq. Does not return;
+        // `from` is saved inside so the scheduler can resume it later.
+        context_switch_to_iretq(from, next);
+        return;  // unreachable (iretq transferred control to ring 3)
+    }
+#endif
+    // RESUME_CRETURN (or any non-preemptive build): kernel-continuation resume.
+    context_switch(from, next);
+}
+
 void schedule(void) {
     // Called from timer interrupt (scheduler tick)
 #ifdef PERF_CONTEXT_SWITCH
@@ -566,8 +616,10 @@ void schedule(void) {
             // process is saved here so the assembly stub can return — but
             // because dead->state == PROCESS_TERMINATED and scheduler_add_process
             // rejects TERMINATED processes, this saved context is never used.
+            // cooperative_switch_to routes RESUME_IRETQ successors through iretq
+            // (a dead process can hand off to a timer-preempted one safely).
             dead->resume_mode = RESUME_CRETURN;
-            context_switch(dead, next);
+            cooperative_switch_to(dead, next);
 
             // -------------------------------------------------------------------
             // KILL-FIX-002 (continued): Release the dead process's "current"
@@ -624,9 +676,11 @@ void schedule(void) {
 #endif
 
             process_set_current(next);
-            // Cooperative (C-return) save path.
+            // Cooperative (C-return) save path. cooperative_switch_to routes to
+            // context_switch (RESUME_CRETURN) or iretq resume (RESUME_IRETQ) and
+            // sets next's TSS/kernel stack.
             current->resume_mode = RESUME_CRETURN;
-            context_switch(current, next);
+            cooperative_switch_to(current, next);
 
             // BUG-006 fix: Do NOT put ANY code here that references 'current' or local variables!
             //
@@ -755,6 +809,94 @@ void schedule_from_irq(interrupt_frame_t* frame) {
     //    leak on this reject-and-requeue path (the cooperative path never
     //    rejects, so it has no equivalent release — this branch is unique to
     //    the IRQ path).
+    //
+    //    FIRST-DISPATCH EXCEPTION (fairness fix): a brand-new userspace process
+    //    that has never run is NOT yet RESUME_IRETQ — exec.c set its
+    //    context.rip to process_enter_usermode_trampoline and its real ring-3
+    //    entry/stack into user_entry/user_rsp, expecting the cooperative path to
+    //    `ret` into the trampoline. But a non-yielding CPU hog never enters the
+    //    cooperative path, so without this case new processes STARVE (only the
+    //    first-launched burner ever runs). Detect the never-run state by its
+    //    one reliable signature — context.rip == trampoline — and give it its
+    //    first ring-3 entry directly from the IRQ by SYNTHESIZING a fresh iretq
+    //    frame (we cannot context_load_irq it: next->context holds the trampoline
+    //    rip + a kernel rsp, not the userspace entry). After this the process is
+    //    RESUME_IRETQ like any preempted ring-3 task. Only never-run userspace
+    //    procs match; a yielded/blocked process has rip != trampoline and stays
+    //    on the reject/defer path below, untouched.
+    extern void process_enter_usermode_trampoline(void);
+    if (next->resume_mode != RESUME_IRETQ &&
+        next->context.rip == (uint64_t)process_enter_usermode_trampoline) {
+        // Causal-proof trace (gated: runs only in the PREEMPTIVE build, since
+        // schedule_from_irq is the IRQ path). One line per never-run process the
+        // first time the timer bootstraps it into ring 3 -- so the stress log
+        // shows a first-dispatch for each previously-starved burner, then its
+        // heartbeats. Naturally once-per-process; rate-limit/remove once stable.
+        kprintf("[SCHED] first-dispatch pid=%d via irq iretq\n", next->pid);
+
+        // Save the OUTGOING current exactly as the RESUME_IRETQ path does:
+        // it was interrupted in ring 3, so an iretq frame save is correct.
+        // (Skip if it terminated — nothing to preserve.)
+        if (current->state != PROCESS_TERMINATED) {
+            context_save_irq(&current->context, frame);
+            current->resume_mode = RESUME_IRETQ;
+            current->need_resched = 0;
+            current->total_time++;
+            scheduler_add_process(current);
+        }
+
+        // SYNTHESIZE a fresh ring-3 entry frame directly into `frame`. Zero all
+        // GP registers (clean process start — no inherited register state), then
+        // set the hardware iretq fields for the real userspace entry. CS=0x23 /
+        // SS=0x1B are the ring-3 (RPL=3) user code/data selectors; RFLAGS=0x202
+        // sets IF=1 so the new process runs with interrupts enabled (and the
+        // reserved bit 1). This mirrors what the trampoline -> enter_usermode ->
+        // iretq path would have built, but does it from the IRQ frame.
+        frame->rax = 0; frame->rbx = 0; frame->rcx = 0; frame->rdx = 0;
+        frame->rsi = 0; frame->rdi = 0; frame->rbp = 0;
+        frame->r8  = 0; frame->r9  = 0; frame->r10 = 0; frame->r11 = 0;
+        frame->r12 = 0; frame->r13 = 0; frame->r14 = 0; frame->r15 = 0;
+        frame->rip    = next->user_entry;  // real ELF entry, not the trampoline
+        frame->cs     = 0x23;              // ring-3 user code selector (RPL=3)
+        frame->rflags = 0x202;             // IF=1, reserved bit 1
+        frame->rsp    = next->user_rsp;    // user stack
+        frame->ss     = 0x1B;              // ring-3 user data selector (RPL=3)
+
+        // Make the incoming process current; it is now ring-3 RESUME_IRETQ.
+        next->resume_mode = RESUME_IRETQ;
+        next->state = PROCESS_RUNNING;
+        process_set_current(next);
+        next->total_time++;
+
+        // TSS.RSP0 + SYSCALL kernel stack (mirror the RESUME_IRETQ path).
+        if (next->kernel_stack) {
+            uint64_t kstack_top =
+                ((uint64_t)next->kernel_stack + KERNEL_STACK_SIZE) & ~0xFULL;
+            tss_set_kernel_stack(kstack_top);
+            extern uint64_t kernel_rsp_save;
+            kernel_rsp_save = kstack_top;
+        }
+
+        // Switch address space last. PCID bit-63 preserve mirrors the
+        // RESUME_IRETQ path / context_switch_asm. The synthesized frame and
+        // next->context live in identity-mapped kernel memory shared across all
+        // address spaces, so they stay valid after CR3.
+        uint64_t cr3 = next->context.cr3;
+        uint64_t cr4;
+        __asm__ volatile("mov %%cr4, %0" : "=r"(cr4));
+        if (cr4 & (1ULL << 17)) {
+            cr3 |= (1ULL << 63);  // CR4.PCIDE set: don't flush TLB
+        }
+        __asm__ volatile("mov %0, %%cr3" :: "r"(cr3) : "memory");
+
+        // Ref accounting: pick_next() transferred the queue's ref for `next` to
+        // us; it is now held by `next` being current_process (identical to the
+        // RESUME_IRETQ path). Do NOT unref here.
+
+        // Return to irq0_preempt, whose iretq enters ring 3 at user_entry.
+        return;
+    }
+
     if (next->resume_mode != RESUME_IRETQ) {
         scheduler_add_process(next);   // re-queue (takes a fresh ref)
         process_unref(next);           // release pick_next's transferred ref

@@ -675,7 +675,7 @@ int64_t sys_yield(uint64_t arg1, uint64_t arg2, uint64_t arg3,
         return ESRCH;
     }
 
-    // Add current to back of ready queue, pick next
+    // Add current to back of ready queue, pick next.
     scheduler_add_process(current);
     process_t* next = scheduler_pick_next();
     // Never switch to a process with no kernel stack (it has nowhere to take a
@@ -687,12 +687,13 @@ int64_t sys_yield(uint64_t arg1, uint64_t arg2, uint64_t arg3,
 #endif
         next->state = PROCESS_RUNNING;
         process_set_current(next);
-        // TSS rsp0 must be 16-byte aligned: the CPU pushes the iretq frame here
-        // on the next ring3->ring0 transition, and a misaligned stack faults any
-        // aligned SSE store in the entry path.
-        uint64_t rsp0 = ((uint64_t)next->kernel_stack + KERNEL_STACK_SIZE) & ~0xFULL;
-        tss_set_kernel_stack(rsp0);
-        context_switch(current, next);
+        // cooperative_switch_to() sets next's TSS.RSP0 + SYSCALL kernel stack
+        // and resumes next via context_switch (RESUME_CRETURN) or iretq
+        // (RESUME_IRETQ, i.e. a timer-preempted process) as appropriate. This is
+        // what lets a yielding cooperative task hand the CPU to a preempted one
+        // (e.g. the never-yielding CPU burners) instead of starving them.
+        current->resume_mode = RESUME_CRETURN;
+        cooperative_switch_to(current, next);
     }
 
     return ESUCCESS;

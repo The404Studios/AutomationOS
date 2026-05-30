@@ -196,6 +196,24 @@ void schedule(void);  // Scheduler tick - called from timer interrupt
 process_t* scheduler_pick_next(void);
 void scheduler_start(void) NORETURN;  // Start scheduler (does not return)
 
+// Cooperative dispatch helper (scheduler.c). A cooperative resume site
+// (sys_yield / schedule / wq_block_current, all in ring 0 inside a syscall)
+// hands the CPU to `next`. If `next` is RESUME_CRETURN it resumes via the
+// normal context_switch (`ret` to a kernel continuation); if `next` is
+// RESUME_IRETQ (preempted in ring 3) it MUST resume via iretq, NOT `ret` — this
+// helper routes to the correct mechanism and updates TSS.RSP0 + the SYSCALL
+// kernel stack for `next`. Use this instead of calling context_switch() directly
+// at any site that may pick a timer-preempted process.
+void cooperative_switch_to(process_t* from, process_t* next);
+
+#ifdef PREEMPTIVE
+// asm (context_switch.asm): resume a RESUME_IRETQ process from a cooperative
+// (syscall) context by restoring its ring-3 register state and IRETQ-ing to
+// ring 3. Saves `from`'s kernel C-return point first (so `from` can later be
+// resumed by context_switch). Does not return to the caller.
+void context_switch_to_iretq(process_t* from, process_t* to);
+#endif
+
 // SMP Load Balancing (scheduler_smp.c)
 void scheduler_tick(void);                                    // Called on timer tick for load balancing
 void scheduler_get_load_stats(uint32_t* loads, uint32_t max_cpus);  // Get per-CPU load

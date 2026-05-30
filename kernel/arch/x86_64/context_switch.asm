@@ -212,6 +212,7 @@ context_switch_asm:
 
 global context_save_irq
 global context_load_irq
+global context_switch_to_iretq
 
 ; interrupt_frame_t field offsets (must match struct interrupt_frame in sched.h)
 IFRAME_R15      equ 0
@@ -355,5 +356,129 @@ context_load_irq:
     mov qword [rsi + IFRAME_CS], 0x23
     mov qword [rsi + IFRAME_SS], 0x1B
     ret
+
+; ===========================================================================
+; void context_switch_to_iretq(process_t* from, process_t* to);
+;   RDI = from (cooperatively-suspended; its kernel C-return point is saved so
+;               it can later be resumed by context_switch_asm's `ret`)
+;   RSI = to   (a RESUME_IRETQ process: it was preempted in ring 3, so its
+;               cpu_context_t holds the *ring-3* GP regs + RIP/RSP/RFLAGS)
+;
+; This is the bridge that lets a COOPERATIVE site (sys_yield / schedule /
+; wq_block_current, all running in ring 0 inside a syscall) hand the CPU to a
+; preempted RESUME_IRETQ process. context_switch_asm cannot do this: it ends in
+; `ret`, which would jump to `to`'s ring-3 RIP while still at CPL=0 (running user
+; code as the kernel → runaway → #DF). Instead we restore `to`'s full register
+; state and IRETQ to ring 3 — exactly the transfer schedule_from_irq's stub does,
+; but initiated from a syscall stack rather than the timer IRQ frame.
+;
+; Save half is IDENTICAL to context_switch_asm (save `from`'s kernel resume
+; point + RFLAGS + CR3 + FPU). Restore half switches CR3 (PCID-safe), restores
+; FPU + GP regs, then builds a ring-3 iretq frame (SS:RSP, RFLAGS|IF, CS:RIP)
+; on the CURRENT kernel stack and iretqs. Does NOT return to the caller; control
+; resumes in `from` later (via context_switch_asm) when the scheduler re-picks it.
+;
+; The caller MUST have already set TSS.RSP0 + kernel_rsp_save to `to`'s kernel
+; stack (so `to`'s subsequent syscalls/interrupts land on the right stack),
+; exactly as the cooperative context_switch callers already do for `to`.
+context_switch_to_iretq:
+    cli
+
+    ; === Save 'from' context (mirror context_switch_asm save half) ===
+    test rdi, rdi
+    jz .ld_to                         ; from==NULL: nothing to save
+    push rdi
+    add rdi, PROCESS_CONTEXT_OFFSET
+    mov [rdi + CONTEXT_RAX], rax
+    mov [rdi + CONTEXT_RBX], rbx
+    mov [rdi + CONTEXT_RCX], rcx
+    mov [rdi + CONTEXT_RDX], rdx
+    mov [rdi + CONTEXT_RSI], rsi
+    pop rax                           ; original RDI
+    mov [rdi + CONTEXT_RDI], rax
+    mov [rdi + CONTEXT_RBP], rbp
+    mov [rdi + CONTEXT_RSP], rsp
+    mov [rdi + CONTEXT_R8],  r8
+    mov [rdi + CONTEXT_R9],  r9
+    mov [rdi + CONTEXT_R10], r10
+    mov [rdi + CONTEXT_R11], r11
+    mov [rdi + CONTEXT_R12], r12
+    mov [rdi + CONTEXT_R13], r13
+    mov [rdi + CONTEXT_R14], r14
+    mov [rdi + CONTEXT_R15], r15
+    mov rax, [rsp]                    ; kernel return address -> from's RIP
+    mov [rdi + CONTEXT_RIP], rax
+    pushfq
+    pop rax
+    mov [rdi + CONTEXT_RFLAGS], rax
+    mov rax, cr3
+    mov [rdi + CONTEXT_CR3], rax
+    fxsave64 [rdi + CONTEXT_FPU]
+
+.ld_to:
+    ; === Restore 'to' context and IRETQ to ring 3 ===
+    add rsi, PROCESS_CONTEXT_OFFSET
+
+    ; Switch CR3 (PCID-safe), mirroring context_switch_asm.
+    mov rax, cr4
+    test rax, (1 << 17)
+    jz .ld_no_pcid
+    mov rax, [rsi + CONTEXT_CR3]
+    bts rax, 63                       ; preserve TLB (CR4.PCIDE set)
+    mov cr3, rax
+    jmp .ld_cr3_done
+.ld_no_pcid:
+    mov rax, [rsi + CONTEXT_CR3]
+    mov cr3, rax
+.ld_cr3_done:
+
+    ; Restore FPU/SSE.
+    fxrstor64 [rsi + CONTEXT_FPU]
+
+    ; Build the ring-3 IRETQ frame on the CURRENT (caller's) kernel stack.
+    ; Hardware pops, top→bottom: SS, RSP, RFLAGS, CS, RIP. We push in reverse.
+    ; SS=0x1B / CS=0x23 are the ring-3 (RPL=3) user selectors; RFLAGS gets IF=1
+    ; (run with interrupts enabled) and TF=0 (no single-step), matching
+    ; context_load_irq / enter_usermode.
+    mov rax, [rsi + CONTEXT_RFLAGS]
+    or  rax, 0x200                    ; IF = 1
+    and rax, ~0x100                   ; TF = 0
+    mov r11, rax                      ; r11 = ring-3 RFLAGS (restored below via frame)
+
+    push qword 0x1B                   ; SS
+    push qword [rsi + CONTEXT_RSP]    ; RSP (ring-3 user stack)
+    push r11                          ; RFLAGS
+    push qword 0x23                   ; CS
+    push qword [rsi + CONTEXT_RIP]    ; RIP (ring-3 entry/resume point)
+
+    ; Restore GP registers from `to`'s context. Load RSI LAST (it is our base
+    ; pointer). Use the iretq frame already on the stack for control state.
+    mov rax, [rsi + CONTEXT_RAX]
+    mov rbx, [rsi + CONTEXT_RBX]
+    mov rcx, [rsi + CONTEXT_RCX]
+    mov rdx, [rsi + CONTEXT_RDX]
+    mov rdi, [rsi + CONTEXT_RDI]
+    mov rbp, [rsi + CONTEXT_RBP]
+    mov r8,  [rsi + CONTEXT_R8]
+    mov r9,  [rsi + CONTEXT_R9]
+    mov r10, [rsi + CONTEXT_R10]
+    mov r12, [rsi + CONTEXT_R12]
+    mov r13, [rsi + CONTEXT_R13]
+    mov r14, [rsi + CONTEXT_R14]
+    mov r15, [rsi + CONTEXT_R15]
+    mov r11, [rsi + CONTEXT_R11]      ; restore real R11 (clobbered as RFLAGS temp)
+    mov rsi, [rsi + CONTEXT_RSI]      ; RSI last
+
+    ; Load DS/ES/FS/GS with the ring-3 user data selector (iretq does NOT reload
+    ; them; enter_usermode sets them the same way for first ring-3 entry).
+    push rax
+    mov ax, 0x1B
+    mov ds, ax
+    mov es, ax
+    mov fs, ax
+    mov gs, ax
+    pop rax
+
+    iretq                             ; → ring 3 at to->context.rip
 
 %endif ; PREEMPTIVE

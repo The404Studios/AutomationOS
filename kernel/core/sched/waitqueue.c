@@ -124,9 +124,8 @@ void wq_block_current(wait_queue_t* wq) {
     // again until wq_wake_* re-readies it.
     process_t* next = scheduler_pick_next();
 
-    // If nothing else is runnable, idle until something becomes ready (an IRQ
-    // wakeup will re-ready a process and the next pick will succeed). We must
-    // re-enable interrupts to make progress.
+    // If nothing is runnable, idle until something becomes ready (an IRQ wakeup
+    // re-readies a process). We must re-enable interrupts to make progress.
     while (next == NULL) {
         __asm__ volatile("sti; hlt; cli" ::: "memory");
         // If we ourselves were woken in the meantime, stop idling and resume.
@@ -147,17 +146,13 @@ void wq_block_current(wait_queue_t* wq) {
     next->state = PROCESS_RUNNING;
     process_set_current(next);
 
-    if (next->kernel_stack) {
-        uint64_t kstack_top =
-            ((uint64_t)next->kernel_stack + KERNEL_STACK_SIZE) & ~0xFULL;
-        tss_set_kernel_stack(kstack_top);
-    }
-
     // Cooperative (C-return) save: when this process is later re-readied and
     // picked, context_switch() "returns" right here and we fall through back to
-    // the caller of wq_block_current().
+    // the caller of wq_block_current(). cooperative_switch_to() sets next's
+    // TSS/kernel stack and routes RESUME_IRETQ successors (timer-preempted, e.g.
+    // the CPU burners) through iretq so a blocking task can hand off to them.
     current->resume_mode = RESUME_CRETURN;
-    context_switch(current, next);
+    cooperative_switch_to(current, next);
 
     // Resumed here after a wakeup. (Do not touch stale locals; just return.)
 }

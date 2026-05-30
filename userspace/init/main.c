@@ -231,6 +231,34 @@ void _start(void) {
     // prints "WEBAPITEST: PASS" and exits.
     spawn("sbin/webapitest");
 
+#ifdef PREEMPT_STRESS
+    // ========================================================================
+    // PREEMPTIVE-SCHEDULER STRESS WORKLOAD  (compiled ONLY with -DPREEMPT_STRESS,
+    // which scripts/build_all.sh adds when STRESS=1; the plain PREEMPT=1 build
+    // and every cooperative build leave this block ABSENT). It is placed AFTER
+    // all the normal app/desktop spawns above so the compositor + desktop still
+    // come up first, THEN we unleash the abuse.
+    //
+    // cpuburn loops FOREVER without ever yielding/sleeping/blocking. Under the
+    // cooperative kernel the first burner would monopolize the CPU and hang the
+    // box -- which is exactly why this is gated. Under the preemptive kernel the
+    // timer time-slices ring 3, so all six burners (ids 0..5) must make progress
+    // (interleaved heartbeats == fairness/no-starvation), and the three extra
+    // floattest runs exercise SSE save/restore repeatedly under preemption.
+    // ========================================================================
+    print("[INIT] PREEMPT_STRESS: launching CPU burners + float load...\n");
+    spawn_args("sbin/cpuburn", "0");
+    spawn_args("sbin/cpuburn", "1");
+    spawn_args("sbin/cpuburn", "2");
+    spawn_args("sbin/cpuburn", "3");
+    spawn_args("sbin/cpuburn", "4");
+    spawn_args("sbin/cpuburn", "5");
+    spawn("sbin/floattest");
+    spawn("sbin/floattest");
+    spawn("sbin/floattest");
+    print("[INIT] PREEMPT_STRESS: 6 burners + 3 floattest spawned.\n");
+#endif
+
     print("[INIT] All services started!\n");
 
     while (1) {

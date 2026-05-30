@@ -1673,6 +1673,19 @@ static void render_panel(uint32_t *buf, uint32_t w, uint32_t h, uint32_t stride)
     int clk_w = (int)k_strlen(clk) * FONT_W;
     font_draw_string(buf, (int)stride, (int)w, (int)h,
                      (int)w - clk_w - 12, (PANEL_H - FONT_H) / 2, clk, COL_TEXT);
+
+    /* right: an ethernet/network indicator (4 signal bars) just left of the
+     * clock. Neutral color for now (the compositor has no network-status
+     * syscall yet); wire it to a SYS_NET_INFO query later to color it by
+     * connected/disconnected. This surfaces the requested taskbar network icon. */
+    {
+        int32_t nx     = (int32_t)w - clk_w - 12 - 26;
+        int32_t base_y = PANEL_H / 2 + 5;
+        for (int b = 0; b < 4; b++) {
+            int32_t bh = 3 + b * 3;
+            fill_rect(buf, w, h, stride, nx + b * 5, base_y - bh, 3, bh, COL_TEXT_DIM);
+        }
+    }
 }
 
 static void render_dock(uint32_t *buf, uint32_t w, uint32_t h, uint32_t stride,

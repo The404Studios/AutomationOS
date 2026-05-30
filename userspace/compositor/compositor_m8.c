@@ -570,7 +570,7 @@ static void blit_surface_scaled_alpha(uint32_t *buf, uint32_t bw, uint32_t bh, u
 #define RDOCK_FAN_SPARKLES    8   /* sparkle dots drawn around a hovered icon */
 
 /* Number of app entries and folders */
-#define RDOCK_NICONS  16
+#define RDOCK_NICONS  18
 #define RDOCK_NFOLDERS 2
 
 /* App descriptor */
@@ -606,6 +606,8 @@ static const rdock_app_t rdock_apps[RDOCK_NICONS] = {
     { "Bd", "sbin/bubbletd",    0xFF1FA87Au },  /* 13 BubbleTD   */
     { "Wb", "sbin/browser",     0xFF1565C0u },  /* 14 Browser    */
     { "Nm", "sbin/netman",      0xFF00897Bu },  /* 15 NetManager */
+    { "Ch", "sbin/chess",       0xFF5C3A2Au },  /* 16 Chess      */
+    { "As", "sbin/asteroids",   0xFF202840u },  /* 17 Asteroids  */
 };
 
 /* ---- Folder table (Games + Tools) ---- */
@@ -3301,7 +3303,11 @@ static void handle_mouse(uint32_t W, uint32_t H) {
     {
         int32_t lx = launcher_x(), ly = launcher_y(H);
         if (point_in(cx, cy, lx, ly, LAUNCH_SZ, LAUNCH_SZ)) {
-            open_start_menu(W, H);   /* launcher now opens the start menu */
+            /* Launch the Windows-11-style start-menu app (replaces the old
+             * built-in popup). It renders as its own window and closes itself
+             * after launching an app. (void) the old helper to avoid -Wunused. */
+            (void)open_start_menu;
+            syscall(SYS_SPAWN, (long)"sbin/startmenu", 0, 0);
             g_prev_buttons = g_buttons;
             return;
         }

@@ -263,6 +263,7 @@ cc userspace/apps/terminal/sh_git.c      /tmp/sh_git.o
 $LD /tmp/terminal.o /tmp/sh_git.o /tmp/wlc.o /tmp/bf.o -o /tmp/terminal.elf
 build_wl_app userspace/apps/editor/editor.c           editor
 build_wl_app userspace/apps/snake/snake.c             snake
+build_wl_app userspace/apps/asteroids/asteroids.c     asteroids
 build_wl_app userspace/apps/paint/paint.c             paint
 build_wl_app userspace/apps/synth/synth.c             synth
 build_wl_app userspace/apps/tetris/tetris.c           tetris
@@ -341,7 +342,7 @@ rm -rf /tmp/ird && mkdir -p /tmp/ird
 ( cd /tmp/ird && tar xf /mnt/c/Users/wilde/Desktop/Kernel/iso/boot/initrd.img )
 cp /tmp/comp.elf /tmp/ird/sbin/compositor
 cp /tmp/init.elf /tmp/ird/sbin/init
-for e in filemanager calculator clock sysinfo settings sysmon uidemo dateapp applauncher taskman terminal editor snake paint synth tetris game2048 sheet notes calendar stopwatch mines piano dashboard welcome bench breakout pong invaders procmon soundtest solitaire aiconsole screenshot stress musicplayer ide bubbletd startmenu chess forktest; do
+for e in filemanager calculator clock sysinfo settings sysmon uidemo dateapp applauncher taskman terminal editor snake paint synth tetris game2048 sheet notes calendar stopwatch mines piano dashboard welcome bench breakout pong invaders procmon soundtest solitaire aiconsole screenshot stress musicplayer ide bubbletd startmenu chess asteroids forktest; do
     cp /tmp/$e.elf /tmp/ird/sbin/$e
 done
 [ "$IV_OK" = "1" ] && cp /tmp/imageviewer.elf /tmp/ird/sbin/imageviewer

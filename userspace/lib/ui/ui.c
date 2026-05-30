@@ -707,19 +707,31 @@ static void render_widget(ui_app_t* app, ui_widget_t* w) {
 
     case UI_BUTTON: {
         int pressed = hovered && app->btn_prev;
-        u32 face = w->bg;
-        if (pressed)      face = COL_ACCENT;
-        else if (hovered) face = COL_HOVER;
+        int has_caption = (w->text && w->text[0]);
+        if (has_caption) {
+            /* Normal labelled button: opaque face + border + centered caption. */
+            u32 face = w->bg;
+            if (pressed)      face = COL_ACCENT;
+            else if (hovered) face = COL_HOVER;
 
-        fill_round_rect(buf, bw, bh, sp, w->ax, w->ay, w->aw, w->ah, face);
-        stroke_rect(buf, bw, bh, sp, w->ax, w->ay, w->aw, w->ah, COL_BORDER);
+            fill_round_rect(buf, bw, bh, sp, w->ax, w->ay, w->aw, w->ah, face);
+            stroke_rect(buf, bw, bh, sp, w->ax, w->ay, w->aw, w->ah, COL_BORDER);
 
-        /* Center the caption within the button rect. */
-        i32 tw = font_text_width(w->text);
-        i32 tx = w->ax + (w->aw - tw) / 2;
-        i32 ty = w->ay + (w->ah - FONT_H) / 2;
-        if (tx < w->ax) tx = w->ax;
-        font_draw_string(buf, sp, bw, bh, tx, ty, w->text, w->fg);
+            /* Center the caption within the button rect. */
+            i32 tw = font_text_width(w->text);
+            i32 tx = w->ax + (w->aw - tw) / 2;
+            i32 ty = w->ay + (w->ah - FONT_H) / 2;
+            if (tx < w->ax) tx = w->ax;
+            font_draw_string(buf, sp, bw, bh, tx, ty, w->text, w->fg);
+        } else {
+            /* Empty caption => invisible click hotspot (e.g. start-menu tiles
+             * lay an icon + label down first, then a full-tile button on top to
+             * catch the click). Filling here would paint over those siblings and
+             * leave a blank box, so draw NO fill; give border-only hover/press
+             * feedback so the region still reacts without becoming opaque. */
+            if (pressed)      stroke_rect(buf, bw, bh, sp, w->ax, w->ay, w->aw, w->ah, COL_ACCENT);
+            else if (hovered) stroke_rect(buf, bw, bh, sp, w->ax, w->ay, w->aw, w->ah, COL_BORDER);
+        }
         break;
     }
 

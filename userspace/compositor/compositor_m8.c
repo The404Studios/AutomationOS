@@ -655,12 +655,18 @@ typedef struct {
 #define MACT_CLOSE_ALL     2
 #define MACT_ABOUT         3
 #define MACT_NEW_FOLDER    4   /* create /Desktop/NewFolder[N] then rescan */
+#define MACT_WIN_MINIMIZE  5   /* minimize g_menu_target_slot (title-bar path) */
+#define MACT_WIN_MAXIMIZE  6   /* toggle SNAP_MAX on g_menu_target_slot         */
+#define MACT_WIN_CLOSE     7   /* close g_menu_target_slot                      */
+#define MACT_REFRESH       8   /* force a full desktop repaint (best-effort)    */
+#define MACT_DISPLAY_SETTINGS 9 /* spawn sbin/settings                          */
 static int         g_menu_open   = 0;
 static int         g_about_open  = 0;   /* modal About dialog (centered panel) */
 static int         g_menu_is_ctx = 0;   /* 0=start menu, 1=context menu */
 static int32_t     g_menu_x = 0, g_menu_y = 0;
 static int         g_menu_n = 0;
 static int         g_menu_hover = -1;
+static int         g_menu_target_slot = -1;  /* window the ctx menu acts on, -1=desktop */
 static const char *g_menu_label[MENU_MAX];
 static const char *g_menu_path[MENU_MAX];
 static int         g_menu_action[MENU_MAX];
@@ -3092,16 +3098,28 @@ static void open_start_menu(uint32_t W, uint32_t H) {
     if (g_menu_y < PANEL_H + 4) g_menu_y = PANEL_H + 4;
     g_menu_open = 1;
 }
-static void open_context_menu(int32_t cx, int32_t cy, uint32_t W, uint32_t H) {
+/* Open the right-click context menu. `target_slot` is the window under the
+ * cursor (so the menu acts on THAT window), or -1 for the bare desktop. The
+ * item set is chosen per target so the menu is appropriate to what was clicked. */
+static void open_context_menu(int32_t cx, int32_t cy, int target_slot,
+                              uint32_t W, uint32_t H) {
     g_menu_n = 0; g_menu_is_ctx = 1;
-    menu_add("New Folder",   (const char *)0,    MACT_NEW_FOLDER);
-    menu_add("New Terminal", "sbin/terminal",    MACT_NONE);
-    menu_add("Files",        "sbin/filemanager", MACT_NONE);
-    menu_add("Editor",       "sbin/editor",      MACT_NONE);
-    menu_add("Settings",     "sbin/settings",    MACT_NONE);
-    menu_add("Minimize All", (const char *)0,    MACT_MINIMIZE_ALL);
-    menu_add("Close All",    (const char *)0,    MACT_CLOSE_ALL);
-    menu_add("About",        (const char *)0,    MACT_ABOUT);
+    g_menu_target_slot = target_slot;
+    if (target_slot >= 0 && target_slot < MAX_WINDOWS && g_windows[target_slot].used) {
+        /* window context: actions on that specific window (same code paths as
+         * the title-bar minimize/maximize/close buttons). */
+        menu_add("Minimize", (const char *)0, MACT_WIN_MINIMIZE);
+        if (g_windows[target_slot].snap_state == SNAP_MAX)
+            menu_add("Restore",  (const char *)0, MACT_WIN_MAXIMIZE);
+        else
+            menu_add("Maximize", (const char *)0, MACT_WIN_MAXIMIZE);
+        menu_add("Close",    (const char *)0, MACT_WIN_CLOSE);
+    } else {
+        /* desktop context: actions on the workspace. */
+        menu_add("New Folder",       (const char *)0, MACT_NEW_FOLDER);
+        menu_add("Display Settings", (const char *)0, MACT_DISPLAY_SETTINGS);
+        menu_add("Refresh",          (const char *)0, MACT_REFRESH);
+    }
     int32_t mh = menu_height();
     g_menu_x = cx; g_menu_y = cy;
     if (g_menu_x + MENU_W > (int32_t)W - RDOCK_W) g_menu_x = (int32_t)W - RDOCK_W - MENU_W - 4;
@@ -3168,6 +3186,37 @@ static void menu_run(int idx) {
         g_about_open = 1;   /* show the modal About dialog (not a toast) */
     } else if (g_menu_action[idx] == MACT_NEW_FOLDER) {
         desk_new_folder();
+    } else if (g_menu_action[idx] == MACT_DISPLAY_SETTINGS) {
+        syscall(SYS_SPAWN, (long)"sbin/settings", 0, 0);
+    } else if (g_menu_action[idx] == MACT_REFRESH) {
+        desk_scan();        /* re-read desktop icons; scene repaints every frame */
+    } else if (g_menu_action[idx] == MACT_WIN_MINIMIZE ||
+               g_menu_action[idx] == MACT_WIN_MAXIMIZE ||
+               g_menu_action[idx] == MACT_WIN_CLOSE) {
+        /* Act on the window the menu was opened over, mirroring the title-bar
+         * button handlers exactly. Re-validate the slot in case the window was
+         * closed/reaped while the menu was open. */
+        int slot = g_menu_target_slot;
+        if (slot >= 0 && slot < MAX_WINDOWS && g_windows[slot].used &&
+            g_windows[slot].phase != PH_CLOSING &&
+            g_windows[slot].phase != PH_MINIMIZING) {
+            window_t *win = &g_windows[slot];
+            if (g_menu_action[idx] == MACT_WIN_CLOSE) {
+                int32_t id = win->win_id;
+                begin_close(slot);
+                print("[SHELL] close win "); print_num(id); print("\n");
+            } else if (g_menu_action[idx] == MACT_WIN_MINIMIZE) {
+                begin_minimize(slot);
+            } else { /* MACT_WIN_MAXIMIZE: toggle SNAP_MAX (same as title button) */
+                if (win->snap_state == SNAP_MAX) {
+                    start_geom_tween(win, win->saved_x, win->saved_y,
+                                     win->saved_w, win->saved_h);
+                    win->snap_state = SNAP_NONE;
+                } else {
+                    begin_snap_to(slot, SNAP_MAX);
+                }
+            }
+        }
     }
 }
 /* Returns 1 if the click was consumed (selecting a row, or dismissing). */
@@ -3249,15 +3298,17 @@ static void handle_mouse(uint32_t W, uint32_t H) {
             g_menu_hover = (g_cursor_y - (g_menu_y + MENU_HDR_H)) / MENU_ROW_H;
     }
 
-    /* Right-click on EMPTY desktop opens the context menu: not over the dock,
-     * not over a desktop icon, and not over any live window. */
+    /* Right-click opens a CONTEXT-AWARE menu. If a live window is under the
+     * cursor, the menu acts on THAT window (minimize/maximize/close). Otherwise,
+     * on the bare desktop (not over the dock and not over a desktop icon), it
+     * offers desktop actions. Right-clicks on the dock/icons fall through. */
     if (g_rclick_latch) {
         g_rclick_latch = 0;
         int in_region = (g_rclick_cx < (int32_t)W - RDOCK_W &&
                          g_rclick_cy > PANEL_H && g_rclick_cy < (int32_t)H - DOCK_H);
         int on_icon = (desk_icon_at(g_rclick_cx, g_rclick_cy, W, H) >= 0);
-        int on_window = 0;
-        for (int32_t i = g_zcount - 1; i >= 0 && !on_window; i--) {
+        int win_slot = -1;   /* topmost live window under the cursor, or -1 */
+        for (int32_t i = g_zcount - 1; i >= 0 && win_slot < 0; i--) {
             int slot = (int)g_zorder[i];
             if (slot < 0 || slot >= MAX_WINDOWS || !g_windows[slot].used) continue;
             window_t *win = &g_windows[slot];
@@ -3265,10 +3316,18 @@ static void handle_mouse(uint32_t W, uint32_t H) {
             if (win->phase == PH_CLOSING || win->phase == PH_MINIMIZING) continue;
             if (point_in(g_rclick_cx, g_rclick_cy, win->x, win->y,
                          (int32_t)win->w, (int32_t)win->h + TITLEBAR_H))
-                on_window = 1;
+                win_slot = slot;
         }
-        if (in_region && !on_icon && !on_window) {
-            open_context_menu(g_rclick_cx, g_rclick_cy, W, H);
+        if (win_slot >= 0) {
+            /* over a window: menu acts on that window (raise it first to match
+             * the title-bar buttons, which operate on the focused window). */
+            focus_window(win_slot);
+            open_context_menu(g_rclick_cx, g_rclick_cy, win_slot, W, H);
+            g_prev_buttons = g_buttons;
+            return;
+        }
+        if (in_region && !on_icon) {
+            open_context_menu(g_rclick_cx, g_rclick_cy, -1, W, H);
             g_prev_buttons = g_buttons;
             return;
         }

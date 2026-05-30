@@ -388,35 +388,59 @@ void _start(void)
     /* ---- "Pinned" section header ---- */
     ui_label(root, GRID_X_ORIGIN, PIN_LABEL_Y, "Pinned", COL_HEADER);
 
-    /* ---- Pinned tile grid: PIN_ROWS x PIN_COLS ---- */
-    for (int i = 0; i < PIN_COUNT; i++) {
-        int col = i % PIN_COLS;
-        int row = i / PIN_COLS;
-        int tx  = GRID_X_ORIGIN + col * (TILE_W + TILE_GAP);
-        int ty  = PIN_GRID_Y    + row * (TILE_H + TILE_GAP);
+    /* ---- Pinned tile grid: PIN_ROWS x PIN_COLS ----
+     *
+     * IMPORTANT: the UI toolkit caps EVERY widget at UI_MAX_CHILDREN (16)
+     * children (ui.c). Attaching all 32 tiles directly to `root` overflowed
+     * that cap, so tiles past the ~12th (plus the whole Recommended section
+     * and power row) silently failed to attach and never rendered.
+     *
+     * Fix: insert one transparent CONTAINER panel per grid ROW. Each row
+     * container holds <= PIN_COLS (8) tiles, and `root` gains only PIN_ROWS
+     * (4) row-containers instead of 32 tiles. Containers are filled with the
+     * panel background colour (COL_BG) so they are invisible over the bg
+     * panel; tiles are positioned relative to their row container so every
+     * tile keeps its exact original on-screen rectangle. */
+    for (int row = 0; row < PIN_ROWS; row++) {
+        int row_y = PIN_GRID_Y + row * (TILE_H + TILE_GAP);
 
-        /* Tile background panel */
-        ui_widget_t *tile = ui_panel(root, tx, ty, TILE_W, TILE_H, COL_TILE_BG);
+        /* Transparent (bg == panel colour) row container. */
+        ui_widget_t *row_box = ui_panel(root,
+                                        GRID_X_ORIGIN, row_y,
+                                        GRID_TOTAL_W, TILE_H,
+                                        COL_BG);
 
-        /* Coloured icon square (44x44, centered horizontally, 4px from top) */
-        int icon_sz = 36;
-        int icon_x  = (TILE_W - icon_sz) / 2;
-        ui_image_rect(tile, icon_x, 4, icon_sz,
-                      g_pinned[i].icon_color,
-                      g_pinned[i].icon_char,
-                      COL_ICON_FG);
+        for (int col = 0; col < PIN_COLS; col++) {
+            int i = row * PIN_COLS + col;
+            if (i >= PIN_COUNT) break;
 
-        /* App label below the icon */
-        /* Compute x so it's roughly centred (each char = FONT_W = 8 px) */
-        int llen = 0;
-        while (g_pinned[i].label[llen]) llen++;
-        int lx = (TILE_W - llen * 8) / 2;
-        if (lx < 2) lx = 2;
-        g_pin_label_w[i] = ui_label(tile, lx, 42, g_pinned[i].label, COL_SUBTEXT);
+            /* Tile X is relative to the row container; Y is 0 (row top). */
+            int tx = col * (TILE_W + TILE_GAP);
 
-        /* Invisible click button covering the whole tile */
-        ui_button(tile, 0, 0, TILE_W, TILE_H, "",
-                  on_pin_click, (void *)&g_pinned[i]);
+            /* Tile background panel */
+            ui_widget_t *tile = ui_panel(row_box, tx, 0, TILE_W, TILE_H,
+                                         COL_TILE_BG);
+
+            /* Coloured icon square (centered horizontally, 4px from top) */
+            int icon_sz = 36;
+            int icon_x  = (TILE_W - icon_sz) / 2;
+            ui_image_rect(tile, icon_x, 4, icon_sz,
+                          g_pinned[i].icon_color,
+                          g_pinned[i].icon_char,
+                          COL_ICON_FG);
+
+            /* App label below the icon (roughly centred; each char = 8px) */
+            int llen = 0;
+            while (g_pinned[i].label[llen]) llen++;
+            int lx = (TILE_W - llen * 8) / 2;
+            if (lx < 2) lx = 2;
+            g_pin_label_w[i] = ui_label(tile, lx, 42, g_pinned[i].label,
+                                        COL_SUBTEXT);
+
+            /* Invisible click button covering the whole tile */
+            ui_button(tile, 0, 0, TILE_W, TILE_H, "",
+                      on_pin_click, (void *)&g_pinned[i]);
+        }
     }
 
     /* ---- Divider ---- */
@@ -425,54 +449,81 @@ void _start(void)
     /* ---- "Recommended" section header ---- */
     ui_label(root, 16, REC_LABEL_Y, "Recommended", COL_HEADER);
 
-    /* ---- Recommended tiles (2 rows x 6 per row) ---- */
+    /* ---- Recommended tiles (REC_ROWS rows x rec_cols per row) ----
+     *
+     * Same container-per-row scheme as the pinned grid above, so `root`
+     * gains only REC_ROWS row-containers (each holding <= rec_cols tiles)
+     * instead of REC_COUNT tiles. */
     int rec_cols = 6;
     int rec_total_w = rec_cols * REC_TILE_W + (rec_cols - 1) * REC_TILE_GAP;
     int rec_x0 = (WIN_W - rec_total_w) / 2;
 
-    for (int i = 0; i < REC_COUNT; i++) {
-        int col = i % rec_cols;
-        int row = i / rec_cols;
-        int tx  = rec_x0 + col * (REC_TILE_W + REC_TILE_GAP);
-        int ty  = REC_GRID_Y + row * (REC_TILE_H + REC_TILE_GAP);
+    for (int row = 0; row < REC_ROWS; row++) {
+        int row_y = REC_GRID_Y + row * (REC_TILE_H + REC_TILE_GAP);
 
-        ui_widget_t *tile = ui_panel(root, tx, ty, REC_TILE_W, REC_TILE_H, COL_TILE_BG);
+        /* Transparent (bg == panel colour) row container. */
+        ui_widget_t *row_box = ui_panel(root,
+                                        rec_x0, row_y,
+                                        rec_total_w, REC_TILE_H,
+                                        COL_BG);
 
-        /* Small icon glyph on left */
-        ui_image_rect(tile, 4, 4, REC_TILE_H - 8,
-                      g_rec[i].icon_color,
-                      g_rec[i].icon_char, COL_ICON_FG);
+        for (int col = 0; col < rec_cols; col++) {
+            int i = row * rec_cols + col;
+            if (i >= REC_COUNT) break;
 
-        /* Label to the right of icon */
-        g_rec_label_w[i] = ui_label(tile, REC_TILE_H + 2, 8,
-                                    g_rec[i].label, COL_SUBTEXT);
+            /* Tile X relative to row container; Y is 0 (row top). */
+            int tx = col * (REC_TILE_W + REC_TILE_GAP);
 
-        /* Click button */
-        ui_button(tile, 0, 0, REC_TILE_W, REC_TILE_H, "",
-                  on_pin_click, (void *)&g_rec[i]);
+            ui_widget_t *tile = ui_panel(row_box, tx, 0,
+                                         REC_TILE_W, REC_TILE_H, COL_TILE_BG);
+
+            /* Small icon glyph on left */
+            ui_image_rect(tile, 4, 4, REC_TILE_H - 8,
+                          g_rec[i].icon_color,
+                          g_rec[i].icon_char, COL_ICON_FG);
+
+            /* Label to the right of icon */
+            g_rec_label_w[i] = ui_label(tile, REC_TILE_H + 2, 8,
+                                        g_rec[i].label, COL_SUBTEXT);
+
+            /* Click button */
+            ui_button(tile, 0, 0, REC_TILE_W, REC_TILE_H, "",
+                      on_pin_click, (void *)&g_rec[i]);
+        }
     }
 
     /* ---- Bottom divider ---- */
     ui_panel(root, 16, POWER_ROW_Y - 8, WIN_W - 32, 1, COL_DIVIDER);
 
-    /* ---- Power row ---- */
+    /* ---- Power row ----
+     *
+     * Wrapped in one transparent CONTAINER panel so `root` gains a single
+     * child for the whole row (user icon + "User" label + Shut Down +
+     * Restart) instead of four, keeping root's child count under
+     * UI_MAX_CHILDREN. The container covers only the power-row strip (below
+     * the bottom divider), so its COL_BG fill is invisible and never paints
+     * over the tiles above. Child coords are relative to the strip top
+     * (POWER_ROW_Y), preserving every widget's original on-screen position. */
+    ui_widget_t *power_row = ui_panel(root, 0, POWER_ROW_Y,
+                                      WIN_W, POWER_BTN_H, COL_BG);
+
     /* "User" account icon placeholder on the left */
-    ui_image_rect(root, 16, POWER_ROW_Y + (POWER_BTN_H - 32) / 2, 32,
+    ui_image_rect(power_row, 16, (POWER_BTN_H - 32) / 2, 32,
                   0xFF0078D4, 'U', COL_ICON_FG);
-    ui_label(root, 56, POWER_ROW_Y + 10, "User", COL_SUBTEXT);
+    ui_label(power_row, 56, 10, "User", COL_SUBTEXT);
 
     /* Shut Down button (right side) */
-    ui_button(root,
+    ui_button(power_row,
               WIN_W - 2 * (POWER_BTN_W + 8) - 16,
-              POWER_ROW_Y,
+              0,
               POWER_BTN_W, POWER_BTN_H,
               "Shut Down",
               on_shutdown, (void *)0);
 
     /* Restart button */
-    ui_button(root,
+    ui_button(power_row,
               WIN_W - (POWER_BTN_W + 8) - 16,
-              POWER_ROW_Y,
+              0,
               POWER_BTN_W, POWER_BTN_H,
               "Restart",
               on_restart, (void *)0);

@@ -4,8 +4,10 @@ This page documents the **userspace** of AutomationOS: the compositor that paint
 the Windows-like desktop, the small "Wayland-lite" protocol its apps speak, the
 shared client libraries, the bundled application suite, and the on-device C
 compiler that lets the machine build its own programs. Everything here runs in
-**ring 3** (no libc, no floating point — the kernel never enables SSE for user
-tasks, so all math is integer / fixed-point) and is compiled fresh into the
+**ring 3** (no libc; most apps use integer / fixed-point math by convention,
+since the on-device `cc` compiler is integer-only — but SSE/FPU **is** enabled
+and context-switched for user tasks, so gcc-built code uses floats fine, proven
+by `sbin/floattest`) and is compiled fresh into the
 initrd by [`scripts/build_all.sh`](../../scripts/build_all.sh).
 
 The compositor is launched by `init` as `sbin/compositor`; apps are spawned from

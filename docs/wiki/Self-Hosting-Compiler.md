@@ -249,8 +249,11 @@ This is a v1 compiler, and the source is candid about the gaps:
 - **No real type checking.** `cc_type.c` only *infers* types to scale pointer
   arithmetic and choose load widths; it does not diagnose type errors, integer
   promotions, signedness, or `const`.
-- **No floating point** (the kernel never enables SSE for user tasks), no
-  `long double`, no `unsigned`-specific codegen — everything is 64-bit integer.
+- **No floating point in `cc`** — the codegen is integer-only (no `long double`,
+  no float or `unsigned`-specific codegen; everything is 64-bit integer). This is
+  a *compiler* limitation, **not** a kernel one: SSE/FPU is enabled and
+  context-switched for ring 3 (paging.c `cpu_enable_fpu_sse` + per-task
+  `fxsave`/`fxrstor`), so gcc-built userspace uses floats fine — see `sbin/floattest`.
 - **No standard library** — there is no libc, no `printf`, no `malloc`; only the
   two syscall builtins. **No inline `__asm__`** in the C front-end (the assembler
   is a separate path; only the codegen's own emitted asm is assembled).

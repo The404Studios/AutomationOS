@@ -660,6 +660,8 @@ typedef struct {
 #define MACT_WIN_CLOSE     7   /* close g_menu_target_slot                      */
 #define MACT_REFRESH       8   /* force a full desktop repaint (best-effort)    */
 #define MACT_DISPLAY_SETTINGS 9 /* spawn sbin/settings                          */
+#define MACT_WIN_SNAP_LEFT  10  /* snap g_menu_target_slot to the left half      */
+#define MACT_WIN_SNAP_RIGHT 11  /* snap g_menu_target_slot to the right half     */
 static int         g_menu_open   = 0;
 static int         g_about_open  = 0;   /* modal About dialog (centered panel) */
 static int         g_menu_is_ctx = 0;   /* 0=start menu, 1=context menu */
@@ -3113,6 +3115,8 @@ static void open_context_menu(int32_t cx, int32_t cy, int target_slot,
             menu_add("Restore",  (const char *)0, MACT_WIN_MAXIMIZE);
         else
             menu_add("Maximize", (const char *)0, MACT_WIN_MAXIMIZE);
+        menu_add("Snap Left",  (const char *)0, MACT_WIN_SNAP_LEFT);
+        menu_add("Snap Right", (const char *)0, MACT_WIN_SNAP_RIGHT);
         menu_add("Close",    (const char *)0, MACT_WIN_CLOSE);
     } else {
         /* desktop context: actions on the workspace. */
@@ -3192,6 +3196,8 @@ static void menu_run(int idx) {
         desk_scan();        /* re-read desktop icons; scene repaints every frame */
     } else if (g_menu_action[idx] == MACT_WIN_MINIMIZE ||
                g_menu_action[idx] == MACT_WIN_MAXIMIZE ||
+               g_menu_action[idx] == MACT_WIN_SNAP_LEFT ||
+               g_menu_action[idx] == MACT_WIN_SNAP_RIGHT ||
                g_menu_action[idx] == MACT_WIN_CLOSE) {
         /* Act on the window the menu was opened over, mirroring the title-bar
          * button handlers exactly. Re-validate the slot in case the window was
@@ -3207,6 +3213,10 @@ static void menu_run(int idx) {
                 print("[SHELL] close win "); print_num(id); print("\n");
             } else if (g_menu_action[idx] == MACT_WIN_MINIMIZE) {
                 begin_minimize(slot);
+            } else if (g_menu_action[idx] == MACT_WIN_SNAP_LEFT) {
+                begin_snap_to(slot, SNAP_LEFT);
+            } else if (g_menu_action[idx] == MACT_WIN_SNAP_RIGHT) {
+                begin_snap_to(slot, SNAP_RIGHT);
             } else { /* MACT_WIN_MAXIMIZE: toggle SNAP_MAX (same as title button) */
                 if (win->snap_state == SNAP_MAX) {
                     start_geom_tween(win, win->saved_x, win->saved_y,

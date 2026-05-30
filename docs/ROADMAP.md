@@ -25,6 +25,8 @@ that feels like Windows (start menu, taskbar, window snapping, animations) but i
 ### Kernel & boot
 - ✅ x86_64 long-mode kernel, GRUB Multiboot (legacy BIOS), 4-level paging
 - ✅ Cooperative scheduler (`SYS_YIELD`), `fork`/`exec`/`exit`, ring 0/3 separation, ~70 syscalls
+- ✅ **Ring-3 SSE/FPU**: enabled at boot (`paging.c` `cpu_enable_fpu_sse`) + `fxsave`/`fxrstor` per task; proven by `sbin/floattest`
+- ✅ **Gated preemptive scheduler** (`PREEMPT=1` → `kernel-preempt.elf`): PIT-driven, non-preemptible-kernel safety model — **validated, still gated/experimental** (see below)
 - ✅ Boots to the desktop on a **physical ThinkPad T410** (i5-M520 Westmere) *and* QEMU
 - ✅ **Initrd-in-`.bss` rescue** in `boot.asm` (the keystone fix that unblocked real-HW boot)
 - ✅ Frozen-tick safety: every early-boot hardware spin is iteration-bounded (AHCI, PS/2)
@@ -52,11 +54,28 @@ that feels like Windows (start menu, taskbar, window snapping, animations) but i
 - ✅ Networking: e1000 NIC (QEMU), ARP/IPv4/ICMP/UDP/TCP, DNS, TLS/HTTPS
 - ✅ Filesystems: RAM root (ramfs), ext2 + fat32 read, durable disk superblock
 - ✅ Shared libs: keymap (US + shift + caps), fixed-point animation/easing
-- ✅ 32-check boot smoke test (`scripts/smoke_boot.sh`) — currently 32/32
+- ✅ Boot smoke test (`scripts/smoke_boot.sh`) — currently 33/33 (added `FLOATTEST: PASS`)
 
 ---
 
 ## 🚧 In progress / next
+
+### Preemptive scheduler — post-validation roadmap
+
+The gated preemptive scheduler (`PREEMPT=1` → `kernel-preempt.elf`) is **validated**
+(six never-yielding burners time-slice fairly, zero faults, `FLOATTEST: PASS`, desktop
+alive, default smoke 33/33) but stays **opt-in/experimental** until the items below land
+and it has soaked. Stress-test any scheduler change with `bash scripts/stress_preempt.sh`.
+Planned, roughly in order:
+
+1. 🔭 **Scheduler stats** — per-process run counts / total ticks, exposed for Task Manager
+2. 🔭 **Sleep/wakeup primitives** — real timer-driven `sleep`/wait (replace busy-wait)
+3. 🔭 **Priority classes** — wire nice/priority into preemptive time-slicing
+4. 🔭 **Threaded `matbench`** — multi-threaded SIMD matmul (the tensor-runtime payoff)
+5. 🔭 **Render-worker queue** — offload compositor/rasterizer work to preemptible workers
+
+Only once single-core preemption is **bulletproof** (and ideally the default) does **SMP**
+(true multi-core) make sense — it is a separate, larger concurrency-safety project.
 
 - 🚧 **T410 networking**: the Intel **82577LM** NIC is detected but runtime-gated OFF (its
   MMIO bring-up stalls the bus on real hardware). Needs a proper ich8lan PHY bring-up before re-enabling.
@@ -70,7 +89,7 @@ that feels like Windows (start menu, taskbar, window snapping, animations) but i
 ## 🔭 Planned
 
 - 🔭 **Framebuffer write-combining (PAT)** — the next big real-hardware perf multiplier
-- 🔭 Preemptive scheduling + SMP (multi-core) — currently cooperative/single-core by design
+- 🔭 **SMP (multi-core)** — only after single-core preemption is bulletproof and the default; the cooperative kernel ships single-core by design (preemption itself now exists as a gated build, see above)
 - 🔭 **Bluetooth** stack + a real Ethernet driver for the T410 (82577LM)
 - 🔭 Audio output beyond the PC speaker; a real media player
 - 🔭 More of the browser web platform (fetch real pages reliably)

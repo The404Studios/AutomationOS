@@ -197,8 +197,148 @@ instead `ret`s into `process_enter_usermode_trampoline()` (`usermode.c`).
 
 `start_usermode(entry, stack)` (and the per-process trampoline) set `TSS.RSP0` to the
 process's kernel stack and call `enter_usermode()` (`usermode.asm`), which builds an
-IRETQ frame and drops to **ring 3** with user segments **CS = 0x1B, SS/DS = 0x23**.
+IRETQ frame and drops to **ring 3** with user segments **CS = 0x23, SS/DS = 0x1B**.
 `get_cpl()` can confirm the current privilege level (0 kernel / 3 user).
+
+### FPU/SSE is enabled for ring 3
+
+A common misconception is that this kernel is integer-only. It is not: **SSE/FPU is
+enabled at boot and context-switched per task.** `cpu_enable_fpu_sse()` (`paging.c`,
+called from `paging_init()`) clears `CR0.EM`, sets `CR0.MP`/`CR0.NE` and
+`CR4.OSFXSR`/`CR4.OSXMMEXCPT`, then `fninit`s the x87 unit and loads `MXCSR = 0x1F80`
+(all exceptions masked, round-to-nearest). Every context switch `fxsave64`/`fxrstor64`s
+the 512-byte per-task FXSAVE block in the PCB (`context_switch.asm`), so XMM/x87 state is
+preserved across switches in **both** the cooperative and the preemptive paths
+(`context.c` seeds a clean template for new processes). The only thing that can't emit
+float code is the **on-device `cc` compiler** — that's a codegen gap, not a kernel
+restriction; **gcc-built userspace uses floats fine**. This is proven at runtime by
+`sbin/floattest` (scalar `mulss`/`addss`/`divss`, a 2×2 float matmul, and an
+auto-vectorized reduction; its `FLOATTEST: PASS` is a smoke check), and exercised harder
+by `sbin/matbench`, a SIMD (`v4sf`) float matmul benchmark that compares a scalar
+baseline against a hand-vectorized SSE kernel. Ring-3 SSE is the guarded foundation for
+the software rasterizer and tensor kernels.
+
+---
+
+## Preemptive scheduling (gated, experimental)
+
+> **The default build is still cooperative and unchanged.** Everything in this section
+> is compiled **only** under `-DPREEMPTIVE`, which is **off by default**. With the flag
+> unset, the symbols below do not exist, `build/kernel.elf` is byte-for-byte what it was,
+> and the cooperative model above is the whole story. This is a gated, opt-in,
+> *experimental* variant — **not** the default — landed so it can be stress-tested before
+> it ever becomes the default.
+
+### Building the opt-in variant
+
+```sh
+PREEMPT=1 bash scripts/quick_build.sh    # -> build/kernel-preempt.elf
+```
+
+The `PREEMPT=1` gate in `scripts/quick_build.sh` adds `-DPREEMPTIVE` to **both** the
+nasm flags (so `interrupt.asm` and `context_switch.asm` assemble their
+`%ifdef PREEMPTIVE` blocks) **and** the gcc `CFLAGS` (so `scheduler.c` compiles
+`schedule_from_irq()` and `idt.c` points IDT[32] at `irq0_preempt`), and writes a
+**separate** output, `build/kernel-preempt.elf`, so a preemptive build never touches the
+normal `build/kernel.elf`. With `PREEMPT` unset the whole block is skipped.
+
+### How a tick becomes a context switch
+
+In the preemptive build, IDT vector 32 (IRQ0, the PIT) points at **`irq0_preempt`**
+(`interrupt.asm`) instead of the cooperative `irq0`. The PIT still runs at **1000 Hz**
+(`pit_init(1000)`). `irq0_preempt` pushes a full `interrupt_frame_t` onto the kernel
+stack (the GP regs plus the CPU-pushed `RIP/CS/RFLAGS/RSP/SS`), passes a pointer to it to
+**`schedule_from_irq(frame)`**, then — after the C handler may have *rewritten the frame
+in place* — pops the (possibly new) registers and does a single **`iretq`**. That one
+`iretq` is the actual control transfer: CR3 and `TSS.RSP0` were already updated by
+`schedule_from_irq` for the incoming process. The stub bypasses `idt.c`'s `irq_handler`,
+so `schedule_from_irq` sends the PIC EOI itself and calls a weak `pit_tick()` hook to
+keep the tick counter advancing.
+
+### The safety model — a non-preemptible kernel
+
+The linchpin is a **hard ring-3 guard** in `schedule_from_irq`:
+
+> ```c
+> // HARD RING-3 GUARD — non-preemptible kernel (CRITICAL safety).
+> if ((frame->cs & 3) != 3) {
+>     return;  // kernel was running: leave frame untouched, resume it.
+> }
+> ```
+
+If the timer interrupted code whose CS has RPL ≠ 3 — i.e. the **kernel itself** was
+running (a syscall, an IRQ handler, any kernel critical section) — `schedule_from_irq`
+**refuses to switch** and leaves the frame untouched, so the trailing `iretq` simply
+resumes the interrupted kernel code. The timer therefore **only ever preempts userspace,
+never mid-kernel.** This makes the kernel **non-preemptible**, which is what lets a
+codebase that assumes single-threaded kernel execution stay correct: the scheduler can
+never switch away while a kernel data structure is half-updated or a lock is held. It is
+the single most important invariant of this scheduler. (A second guard only preempts a
+process actually in `PROCESS_RUNNING`, so a process blocked in `sti`/`hlt` inside
+`wq_block_current` isn't wrongly re-readied.)
+
+### Two resume mechanisms — and the cooperative→iretq bridge
+
+A process can be suspended two ways, tracked by `resume_mode` in the PCB:
+
+- **`RESUME_CRETURN`** — suspended cooperatively (`SYS_YIELD` or a blocking syscall), or
+  brand-new. Its saved `context.rip` is a **kernel continuation**, so the normal
+  `context_switch()` (which ends in `ret`) resumes it.
+- **`RESUME_IRETQ`** — preempted by the timer IRQ while in **ring 3**, so its saved
+  context holds its *ring-3* `RIP`/`RSP`/regs. A `ret` into that would run user code at
+  CPL 0 (runaway → **#DF**); it must be resumed by restoring the ring-3 state and
+  `iretq`-ing.
+
+`schedule_from_irq` performs an in-place `iretq` swap only when the **incoming** process
+is `RESUME_IRETQ` (it saves the outgoing ring-3 frame with `context_save_irq`, rewrites
+the on-stack frame for the incoming one with `context_load_irq`, then switches CR3
+PCID-safely). A cooperatively-suspended successor is left on the ready queue for the
+cooperative path to pick up.
+
+Because the IRQ path makes many processes `RESUME_IRETQ`, the **cooperative** resume
+sites had a latent bug: `sys_yield`/`schedule`/`wq_block_current` end in `ret`, which
+would jump to a `RESUME_IRETQ` process's ring-3 RIP at CPL 0 (#DF). The fix is a new asm
+helper **`context_switch_to_iretq`** plus a router, **`cooperative_switch_to()`**, which
+sends `RESUME_IRETQ` successors through a proper ring-3 `iretq` and `RESUME_CRETURN`
+through the plain `context_switch`. In a non-preemptive build no process is **ever**
+`RESUME_IRETQ`, so `cooperative_switch_to` is always the plain `context_switch` path —
+identical behaviour to before.
+
+### The fairness fix — IRQ first-dispatch
+
+The first cut of the preemptive scheduler survived faults but **starved new tasks**: the
+IRQ path could only *resume* an already-ring-3 process, so a brand-new process — whose
+first ring-3 entry normally goes through the cooperative trampoline — never started while
+a non-yielding CPU hog monopolized the core. (Stress proof: only burner 0 ran; burners
+1–5 starved.) The fix detects a never-run userspace process by its one reliable
+signature — `context.rip == process_enter_usermode_trampoline` — and gives it its **first
+ring-3 entry directly from the IRQ** by *synthesizing* a fresh `iretq` frame
+(`RIP = user_entry`, `CS = 0x23`, `RSP = user_rsp`, `SS = 0x1B`, `RFLAGS = 0x202`, GP regs
+zeroed; TSS/CR3/PCID set like the resume path). After that the process is `RESUME_IRETQ`
+like any preempted task. A genuine mid-kernel `RESUME_CRETURN` task (`rip != trampoline`)
+still defers to the cooperative path. A gated `[SCHED] first-dispatch …` log line per
+never-run process gives causal proof in the serial trace.
+
+### Validation — the stress harness
+
+`scripts/stress_preempt.sh` is the decisive end-to-end proof (and the regression guard).
+It builds `kernel-preempt.elf`, packages a `STRESS=1` ISO whose `init` spawns **six
+never-yielding `sbin/cpuburn` burners** (integer churn + a 2×2 float/SSE matmul + a dot
+reduction each iteration, so they stress XMM across preemptive switches) plus three
+`floattest` runs, soaks it ~60 s with serial capture, and an `EXIT` trap **always**
+rebuilds the default cooperative kernel so the tree is never left preemptive. The stress
+workload is itself gated (`-DPREEMPT_STRESS`, off by default), so a cooperative build
+never spawns a non-yielder — on the cooperative kernel the first burner would hang the
+box, which is the entire point.
+
+Measured result: **all six burners progress equally** (interleaved heartbeats == fair
+time-slicing of ring 3), **zero** page-faults / GP faults / panics / double-faults,
+`FLOATTEST: PASS` under preemption, and the desktop stays alive. The default cooperative
+build is unaffected and **smoke is 33/33**.
+
+This is real, validated, and committed — but it is still **gated and experimental**, and
+**not the default**. SMP (true multi-core) is a separate, larger concurrency-safety
+project that comes only after single-core preemption is bulletproof.
 
 ---
 
@@ -330,9 +470,13 @@ model from the interrupt side.
 
 To keep this page honest:
 
-- **No preemption.** The timer interrupt only counts ticks; the `time_slice` countdown in
-  `schedule()` is gated off behind the `NOTE` in `scheduler.c`. Tasks switch only at
-  `SYS_YIELD`, `sys_exit`, or a fatal fault.
+- **No preemption *in the default build*.** The default `kernel.elf` is cooperative: the
+  timer interrupt only counts ticks, the `time_slice` countdown in `schedule()` is gated
+  off behind the `NOTE` in `scheduler.c`, and tasks switch only at `SYS_YIELD`,
+  `sys_exit`, or a fatal fault. There **is** now a gated, opt-in preemptive variant
+  (`PREEMPT=1 bash scripts/quick_build.sh` → `build/kernel-preempt.elf`) — validated but
+  experimental and **not** the default. See
+  [Preemptive scheduling](#preemptive-scheduling-gated-experimental) above.
 - **No SMP.** `smp.c`, `lapic.c`, `ipi.c`, `scheduler_smp.c`, `ap_trampoline.asm`, and the
   IPI-based `tlb.c` are present in-tree but excluded from `scripts/quick_build.sh`; the
   build compiles the `#ifndef CONFIG_SMP` scheduler and the single-CPU `tlb_uni.c`.

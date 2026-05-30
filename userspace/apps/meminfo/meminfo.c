@@ -120,17 +120,19 @@ typedef int                i32;
  * ABI structs -- byte-for-byte mirrors of userspace/lib/aictl/aictl.h.
  * --------------------------------------------------------------------- */
 
-/* 48-byte shallow process entry from SYS_PROCLIST. */
+/* 64-byte shallow process entry from SYS_PROCLIST. */
 typedef struct {
     u32  pid;          /* offset  0 */
     u32  parent_pid;   /* offset  4 */
     u32  state;        /* offset  8 */
     u32  flags;        /* offset 12 */
     char name[32];     /* offset 16 .. 47 */
-} procinfo_t;          /* total: 48 bytes */
+    u64  cpu_ticks;    /* offset 48  timer ticks observed while running */
+    u64  ctx_switches; /* offset 56  number of times dispatched */
+} procinfo_t;          /* total: 64 bytes */
 
 /* Compile-time layout assertion (matches aictl.h). */
-typedef char _procinfo_size_assert[sizeof(procinfo_t) == 48 ? 1 : -1];
+typedef char _procinfo_size_assert[sizeof(procinfo_t) == 64 ? 1 : -1];
 
 /* Rich per-process record from SYS_PROC_QUERY. */
 typedef struct {

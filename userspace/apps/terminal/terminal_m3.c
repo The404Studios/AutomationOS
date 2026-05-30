@@ -177,7 +177,8 @@ struct k_dirent {
 /*
  * procinfo_t -- returned by SYS_PROCLIST=44
  *   sc(44, (long)buf, max_entries, 0, ...) → count of entries filled
- *   Each entry is 48 bytes: u32 pid, parent_pid, state, flags; char name[32]
+ *   Each entry is 64 bytes: u32 pid, parent_pid, state, flags; char name[32];
+ *   u64 cpu_ticks; u64 ctx_switches.
  */
 typedef struct {
     u32  pid;
@@ -185,7 +186,9 @@ typedef struct {
     u32  state;
     u32  flags;
     char name[32];
-} procinfo_t;   /* 48 bytes total */
+    u64  cpu_ticks;
+    u64  ctx_switches;
+} procinfo_t;   /* 64 bytes total */
 
 /*
  * proc_detail_t -- returned by SYS_PROC_QUERY=60

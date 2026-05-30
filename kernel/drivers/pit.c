@@ -51,6 +51,14 @@ static inline uint64_t pit_rflags_if(void)
 // EOI is sent by the IRQ dispatch layer (idt.c:irq_handler) after we return.
 static void timer_handler(void) {
     timer_ticks++;
+    // Per-process CPU accounting: charge this 1000 Hz tick to whatever process is
+    // currently RUNNING. Counter only -- does not touch total_time or switch logic.
+    // (The PREEMPTIVE build does the equivalent once at the top of
+    // schedule_from_irq(), which owns IRQ0 instead of this handler.)
+    process_t* c = process_get_current();
+    if (c) {
+        c->cpu_ticks++;
+    }
     scheduler_tick();  // SMP load balancing - redistributes processes across CPUs
 }
 

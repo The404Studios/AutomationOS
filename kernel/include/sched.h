@@ -94,7 +94,17 @@ typedef struct process {
     uint64_t user_entry;             // User-mode entry point (for first run)
     uint64_t user_rsp;               // User-mode stack pointer (for first run)
     uint64_t time_slice;             // Remaining time slice (ticks)
-    uint64_t total_time;             // Total CPU time used
+    uint64_t total_time;             // Total CPU time used (scheduler_smp.c reads this; do not repurpose)
+    // Per-process scheduler statistics (additive; exposed to userspace via
+    // proc_info_t / Task Manager). process_create() memsets the whole PCB, so
+    // both start at 0. Present in BOTH builds.
+    //   ctx_switches: bumped once per dispatch in process_set_current() (the
+    //                 single chokepoint for cooperative + preemptive switches).
+    //   cpu_ticks:    real per-process CPU time -- bumped once per 1000 Hz timer
+    //                 tick for whichever process is RUNNING (PIT IRQ0 handler in
+    //                 the cooperative build; schedule_from_irq() in PREEMPTIVE).
+    uint64_t ctx_switches;           // Number of times this process was dispatched
+    uint64_t cpu_ticks;              // Timer ticks observed while this process was running
     int32_t priority;                // Process priority (nice value: -20 to +19)
     struct process* next;            // Next process in queue
     char name[64];                   // Process name
@@ -171,13 +181,21 @@ process_t* process_get_by_pid(uint32_t pid);
 process_t* process_get_current(void);
 void process_set_current(process_t* proc);
 
-// Userspace-facing process snapshot record (SYS_PROCLIST ABI). MUST stay 48 bytes.
+// Userspace-facing process snapshot record (SYS_PROCLIST ABI). MUST stay 64 bytes.
+// The first 48 bytes are the original layout (pid/parent_pid/state/flags/name) so
+// older 48-byte consumers still read the prefix correctly; the two scheduler-stat
+// fields are appended AFTER name[32] (offsets 48/56, both 8-aligned). Every
+// userspace mirror of this struct (aictl.h procinfo_t, ps/taskman/sysmon/dashboard/
+// terminal/meminfo/aibroker/aiconsole) MUST size its receive buffer to this 64-byte
+// stride, or the kernel's copy_to_user of n*64 bytes overflows it.
 typedef struct {
     uint32_t pid;
     uint32_t parent_pid;
     uint32_t state;        // PROCESS_* enum value
     uint32_t flags;        // reserved (0)
     char     name[32];
+    uint64_t cpu_ticks;    // timer ticks observed while this process was running
+    uint64_t ctx_switches; // number of times this process was dispatched
 } proc_info_t;
 
 // Snapshot the live process table into out[0..max-1]; returns the number filled.

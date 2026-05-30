@@ -118,15 +118,18 @@ static void fmt_u64(u64 v, char *buf)
 }
 
 /* -----------------------------------------------------------------------
- * procinfo_t: 48 bytes matching kernel layout.
- * { unsigned pid, parent_pid, state, flags; char name[32]; }
+ * procinfo_t: 64 bytes matching kernel layout (SYS_PROCLIST proc_info_t).
+ * { unsigned pid, parent_pid, state, flags; char name[32];
+ *   u64 cpu_ticks; u64 ctx_switches; }
  * --------------------------------------------------------------------- */
 typedef struct {
-    unsigned int pid;
-    unsigned int parent_pid;
-    unsigned int state;
-    unsigned int flags;
-    char         name[32];
+    unsigned int       pid;
+    unsigned int       parent_pid;
+    unsigned int       state;
+    unsigned int       flags;
+    char               name[32];
+    unsigned long long cpu_ticks;
+    unsigned long long ctx_switches;
 } procinfo_t;
 
 #define MAX_PROCS  32

@@ -87,13 +87,15 @@ typedef unsigned int       u32;
 typedef unsigned long long u64;
 typedef int                i32;
 
-/* procinfo_t -- returned by SYS_PROCLIST=44, 48 bytes each */
+/* procinfo_t -- returned by SYS_PROCLIST=44, 64 bytes each */
 typedef struct {
     u32  pid;
     u32  parent_pid;
     u32  state;
     u32  flags;
     char name[32];
+    u64  cpu_ticks;
+    u64  ctx_switches;
 } procinfo_t;
 
 /* proc_detail_t -- returned by SYS_PROC_QUERY=60 */

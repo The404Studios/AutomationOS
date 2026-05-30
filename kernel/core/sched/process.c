@@ -355,6 +355,10 @@ void process_set_current(process_t* proc) {
     current_process = proc;
     if (proc) {
         proc->state = PROCESS_RUNNING;
+        // Single chokepoint hit by EVERY dispatch (cooperative schedule/yield/wq
+        // AND preemptive resume/first-dispatch): count one context switch per
+        // dispatch. Counter only; does not alter switch logic.
+        proc->ctx_switches++;
     }
 }
 
@@ -379,6 +383,9 @@ int process_list(proc_info_t* out, int max) {
             out[n].name[k] = p->name[k];
         }
         out[n].name[k] = '\0';
+        // Scheduler stats (appended fields, SYS_PROCLIST 64-byte ABI).
+        out[n].cpu_ticks = p->cpu_ticks;
+        out[n].ctx_switches = p->ctx_switches;
         n++;
     }
     spin_unlock(&process_table_lock);

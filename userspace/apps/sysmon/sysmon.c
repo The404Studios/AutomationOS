@@ -80,14 +80,23 @@
 #define SYS_MEMINFO      43   /* proposed – omitted gracefully if < 0 */
 
 /* ------------------------------------------------------------------ */
-/* Proposed procinfo struct (mirrors what the kernel handler fills)     */
+/* procinfo struct -- byte-for-byte the kernel SYS_PROCLIST ABI         */
+/* (kernel/include/sched.h proc_info_t), exactly 64 bytes:              */
+/*   0  pid, 4 parent_pid, 8 state, 12 flags, 16 name[32],              */
+/*   48 cpu_ticks (u64), 56 ctx_switches (u64).                         */
+/* NOTE: previously this struct interleaved a `cpu_ms` field that did   */
+/* not match the kernel layout (name was read from the wrong offset).   */
+/* It now mirrors the kernel exactly, so name renders correctly and     */
+/* cpu_ticks/ctx_switches are real per-process scheduler stats.         */
 /* ------------------------------------------------------------------ */
 struct procinfo {
-    int           pid;
-    int           ppid;
-    int           state;        /* 0=running 1=ready 2=blocked 3=zombie */
-    unsigned long cpu_ms;
-    char          name[32];
+    unsigned int       pid;          /*  0 */
+    unsigned int       parent_pid;   /*  4 */
+    unsigned int       state;        /*  8  0=created 1=ready 2=running 3=blocked 4=terminated */
+    unsigned int       flags;        /* 12 */
+    char               name[32];     /* 16 */
+    unsigned long long cpu_ticks;    /* 48  timer ticks observed while running */
+    unsigned long long ctx_switches; /* 56  number of times dispatched */
 };
 
 /* ------------------------------------------------------------------ */
@@ -236,8 +245,11 @@ static void fmt_proc_row(char *buf, const struct procinfo *pi) {
     /* State (5 chars) */
     p = sm_append(p, state_name(pi->state));
     *p++ = ' ';
-    /* cpu_ms (right-aligned 8 chars) */
-    p = sm_append(p, sm_utoa(pi->cpu_ms, nb, 8, ' '));
+    /* cpu_ticks (right-aligned 8 chars) -- real per-process CPU time */
+    p = sm_append(p, sm_utoa(pi->cpu_ticks, nb, 8, ' '));
+    *p++ = ' ';
+    /* ctx_switches (right-aligned 7 chars) -- dispatch count */
+    p = sm_append(p, sm_utoa(pi->ctx_switches, nb, 7, ' '));
     *p = '\0';
 }
 

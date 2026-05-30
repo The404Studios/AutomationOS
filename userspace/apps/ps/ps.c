@@ -58,13 +58,15 @@ typedef unsigned long long u64;
 #define PROC_STATE_TERMINATED 4
 
 /* -----------------------------------------------------------------------
- * 48-byte shallow process entry from SYS_PROCLIST (byte-for-byte aictl.h).
+ * 64-byte shallow process entry from SYS_PROCLIST (byte-for-byte aictl.h).
  *   offset  0: u32 pid
  *   offset  4: u32 parent_pid
  *   offset  8: u32 state
  *   offset 12: u32 flags
  *   offset 16: char name[32]
- *   total: 48 bytes
+ *   offset 48: u64 cpu_ticks      (timer ticks observed while running)
+ *   offset 56: u64 ctx_switches   (number of times dispatched)
+ *   total: 64 bytes
  * --------------------------------------------------------------------- */
 typedef struct {
     u32  pid;
@@ -72,10 +74,12 @@ typedef struct {
     u32  state;
     u32  flags;
     char name[32];
+    u64  cpu_ticks;
+    u64  ctx_switches;
 } procinfo_t;
 
 /* Compile-time layout assertion (matches aictl.h). */
-typedef char _procinfo_size_assert[sizeof(procinfo_t) == 48 ? 1 : -1];
+typedef char _procinfo_size_assert[sizeof(procinfo_t) == 64 ? 1 : -1];
 
 /* -----------------------------------------------------------------------
  * Inline syscall helper (3 args is plenty here).
@@ -176,8 +180,8 @@ static long ps_render(void)
     static procinfo_t procs[MAX_PROCS];
     long n = sc(SYS_PROCLIST, (long)procs, MAX_PROCS, 0);
 
-    buf_puts("  PID   PPID  STATE       NAME\n");
-    buf_puts("  ----  ----  ----------  --------------------------------\n");
+    buf_puts("  PID   PPID  STATE          TICKS     CTXSW  NAME\n");
+    buf_puts("  ----  ----  ----------  --------  --------  --------------------------------\n");
 
     if (n < 0) {
         buf_puts("  (process list unavailable)\n");
@@ -192,6 +196,11 @@ static long ps_render(void)
         buf_putu_pad((u64)procs[i].parent_pid, 4);
         buf_puts("  ");
         buf_puts_pad(state_name(procs[i].state), 10);
+        buf_puts("  ");
+        /* Scheduler stats from the 64-byte SYS_PROCLIST record. */
+        buf_putu_pad(procs[i].cpu_ticks, 8);
+        buf_puts("  ");
+        buf_putu_pad(procs[i].ctx_switches, 8);
         buf_puts("  ");
 
         /* Force NUL-termination of the fixed 32-byte name field. */

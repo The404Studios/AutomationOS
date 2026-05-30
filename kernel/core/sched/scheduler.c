@@ -744,6 +744,13 @@ void schedule_from_irq(interrupt_frame_t* frame) {
         return;  // Nothing running yet; leave frame untouched.
     }
 
+    // Per-process CPU accounting (mirror of the cooperative pit.c handler): charge
+    // this timer tick to the currently RUNNING process. Counter only -- it does NOT
+    // alter total_time, the quantum, or any switch decision below. Done here once
+    // per tick (before the ring-3 guard / quantum logic) so cpu_ticks reflects real
+    // wall-clock CPU time consistently with the cooperative build.
+    current->cpu_ticks++;
+
     // HARD RING-3 GUARD — non-preemptible kernel (CRITICAL safety).
     // Only ever switch tasks that the timer interrupted while running in
     // userspace (CPL==3). If the interrupted code segment's RPL is not 3, the

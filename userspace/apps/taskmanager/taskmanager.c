@@ -39,13 +39,15 @@
  * Kernel ABI structs (mirror kernel/include/procapi.h & sched.h)
  * ========================================================================= */
 
-/* SYS_PROCLIST fills proc_info_t[], 48 bytes each */
+/* SYS_PROCLIST fills proc_info_t[], 64 bytes each */
 typedef struct {
-    unsigned int pid;
-    unsigned int parent_pid;
-    unsigned int state;       /* PROCESS_* enum */
-    unsigned int flags;       /* reserved */
-    char         name[32];
+    unsigned int       pid;
+    unsigned int       parent_pid;
+    unsigned int       state;        /* PROCESS_* enum */
+    unsigned int       flags;        /* reserved */
+    char               name[32];
+    unsigned long long cpu_ticks;    /* per-process CPU ticks */
+    unsigned long long ctx_switches; /* per-process dispatch count */
 } proc_info_t;
 
 /* SYS_PROC_QUERY fills proc_detail_t, 64 bytes */

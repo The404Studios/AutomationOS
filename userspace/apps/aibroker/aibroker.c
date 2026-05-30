@@ -97,12 +97,14 @@ typedef unsigned long      usize;
 /* =========================================================================
  * ABI structs (mirror the aictl library / kernel ABI -- do NOT relink it).
  * ====================================================================== */
-typedef struct {            /* 48 bytes -- SYS_PROCLIST entry */
+typedef struct {            /* 64 bytes -- SYS_PROCLIST entry */
     u32  pid;
     u32  parent_pid;
     u32  state;
     u32  flags;
     char name[32];
+    u64  cpu_ticks;
+    u64  ctx_switches;
 } procinfo_t;
 
 typedef struct {            /* 64 bytes -- SYS_PROC_QUERY detail */

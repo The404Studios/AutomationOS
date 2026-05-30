@@ -41,13 +41,17 @@ typedef int                i32;
 
 /* -------------------------------------------------------------------------
  * procinfo_t: shallow process entry returned by SYS_PROCLIST.
- * Exactly 48 bytes to match the kernel ABI.
- *   offset  0: u32 pid         (4 bytes)
- *   offset  4: u32 parent_pid  (4 bytes)
- *   offset  8: u32 state       (4 bytes) 0=created 1=ready 2=running 3=blocked 4=terminated
- *   offset 12: u32 flags       (4 bytes)
- *   offset 16: char name[32]   (32 bytes)
- *   total: 48 bytes
+ * Exactly 64 bytes to match the kernel ABI (kernel/include/sched.h proc_info_t).
+ *   offset  0: u32 pid          (4 bytes)
+ *   offset  4: u32 parent_pid   (4 bytes)
+ *   offset  8: u32 state        (4 bytes) 0=created 1=ready 2=running 3=blocked 4=terminated
+ *   offset 12: u32 flags        (4 bytes)
+ *   offset 16: char name[32]    (32 bytes)
+ *   offset 48: u64 cpu_ticks    (8 bytes) timer ticks observed while running
+ *   offset 56: u64 ctx_switches (8 bytes) number of times dispatched
+ *   total: 64 bytes
+ * The first 48 bytes are the original layout, so older readers keep working;
+ * the two scheduler-stat fields are appended after name[32].
  * ---------------------------------------------------------------------- */
 typedef struct {
     u32  pid;
@@ -55,10 +59,12 @@ typedef struct {
     u32  state;
     u32  flags;
     char name[32];
+    u64  cpu_ticks;
+    u64  ctx_switches;
 } procinfo_t;
 
 /* Compile-time layout assertion. */
-typedef char _procinfo_size_assert[sizeof(procinfo_t) == 48 ? 1 : -1];
+typedef char _procinfo_size_assert[sizeof(procinfo_t) == 64 ? 1 : -1];
 
 /* -------------------------------------------------------------------------
  * proc_detail_t: rich per-process record returned by SYS_PROC_QUERY.

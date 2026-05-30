@@ -14,13 +14,15 @@
  *   SYS_YIELD    = 15  -- yield CPU in tick
  *   SYS_PROCLIST = 44  -- fill procinfo_t array; returns count or -errno
  *
- * procinfo_t layout (EXACTLY 48 bytes, as specified by the kernel ABI):
- *   offset  0: unsigned int pid         (4 bytes)
- *   offset  4: unsigned int parent_pid  (4 bytes)
- *   offset  8: unsigned int state       (4 bytes)
- *   offset 12: unsigned int flags       (4 bytes)
- *   offset 16: char         name[32]    (32 bytes)
- *   total: 48 bytes
+ * procinfo_t layout (EXACTLY 64 bytes, as specified by the kernel ABI):
+ *   offset  0: unsigned int pid          (4 bytes)
+ *   offset  4: unsigned int parent_pid   (4 bytes)
+ *   offset  8: unsigned int state        (4 bytes)
+ *   offset 12: unsigned int flags        (4 bytes)
+ *   offset 16: char         name[32]     (32 bytes)
+ *   offset 48: u64          cpu_ticks    (8 bytes)  -- per-process CPU ticks
+ *   offset 56: u64          ctx_switches (8 bytes)  -- per-process dispatch count
+ *   total: 64 bytes
  *
  *   state: 0=CREATED, 1=READY, 2=RUNNING, 3=BLOCKED, 4=TERMINATED
  *
@@ -85,19 +87,22 @@ static inline long sc(long n, long a1, long a2, long a3)
 }
 
 /* -------------------------------------------------------------------------
- * procinfo_t  -- kernel ABI: exactly 48 bytes.
+ * procinfo_t  -- kernel ABI: exactly 64 bytes.
  * ----------------------------------------------------------------------- */
+typedef unsigned long long tm_u64;
 typedef struct {
     unsigned int pid;         /*  0 */
     unsigned int parent_pid;  /*  4 */
     unsigned int state;       /*  8 */
     unsigned int flags;       /* 12 */
     char         name[32];    /* 16 */
-                              /* total: 48 */
+    tm_u64       cpu_ticks;   /* 48 -- per-process CPU ticks            */
+    tm_u64       ctx_switches;/* 56 -- per-process dispatch count       */
+                              /* total: 64 */
 } procinfo_t;
 
 /* Compile-time size check -- will produce a zero-length array error if wrong. */
-typedef char _procinfo_size_check[sizeof(procinfo_t) == 48 ? 1 : -1];
+typedef char _procinfo_size_check[sizeof(procinfo_t) == 64 ? 1 : -1];
 
 /* -------------------------------------------------------------------------
  * String helpers (no libc).
@@ -157,7 +162,7 @@ static void tm_cat_uint(char **p, unsigned long v, int w, char pad)
 /* -------------------------------------------------------------------------
  * Layout / capacity constants.
  * ----------------------------------------------------------------------- */
-#define WIN_W       560
+#define WIN_W       680   /* widened to fit TICKS + CTXSW columns */
 #define WIN_H       460
 #define MAX_ROWS     12   /* visible process rows */
 #define TICK_PERIOD  30   /* refresh proc list every N frames */
@@ -264,9 +269,10 @@ static const char *state_str(unsigned int s)
 }
 
 /*
- * Build a row string: "PPPPP  NNNNNNNNNNNNNNNN  SSSSS"
- * pid (5), 2 spaces, name (16), 2 spaces, state (5).
- * buf must be >= 40 bytes.
+ * Build a row string:
+ *   "PPPPP  NNNNNNNNNNNNNNNN  SSSSS  TTTTTTTT  CCCCCC"
+ * pid (5), 2sp, name (16), 2sp, state (5), 2sp, cpu_ticks (8), 2sp,
+ * ctx_switches (6). buf must be >= 64 bytes.
  */
 static void fmt_row(char *buf, const procinfo_t *pi)
 {
@@ -282,6 +288,12 @@ static void fmt_row(char *buf, const procinfo_t *pi)
     /* State: 5 chars */
     const char *ss = state_str(pi->state);
     while (*ss) *p++ = *ss++;
+    *p++ = ' '; *p++ = ' ';
+    /* CPU ticks: right-aligned in 8 chars (real per-process CPU time). */
+    tm_cat_uint(&p, (unsigned long)pi->cpu_ticks, 8, ' ');
+    *p++ = ' '; *p++ = ' ';
+    /* Context switches: right-aligned in 6 chars (dispatch count). */
+    tm_cat_uint(&p, (unsigned long)pi->ctx_switches, 6, ' ');
     *p = '\0';
 }
 
@@ -320,7 +332,7 @@ static void refresh_proclist(taskman_t *st)
     /* Update row labels and background panels */
     for (int i = 0; i < MAX_ROWS; i++) {
         if (i < st->proc_count) {
-            char row_buf[48];
+            char row_buf[64];
             fmt_row(row_buf, &st->procs[i]);
             ui_label_set_text(st->row_labels[i], row_buf);
 
@@ -376,7 +388,7 @@ static void on_row_click(void *ud)
        text color as the indicator: bright for selected. */
     for (int i = 0; i < MAX_ROWS; i++) {
         if (i < st->proc_count) {
-            char row_buf[48];
+            char row_buf[64];
             fmt_row(row_buf, &st->procs[i]);
             ui_label_set_text(st->row_labels[i], row_buf);
         }
@@ -516,7 +528,7 @@ void _start(void)
     /* ---- Column header row ---- */
     ui_widget_t *hdr_pnl = ui_panel(root, 8, 40, WIN_W - 16, 24, C_HDR_BG);
     ui_label(hdr_pnl, 8, 4,
-             "  PID    NAME              STATE",
+             "  PID    NAME              STATE     TICKS   CTXSW",
              C_HDR_FG);
 
     /* Separator under header */

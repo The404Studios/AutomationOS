@@ -158,7 +158,7 @@ typedef struct {
 } sysinfo_t;
 
 /* -------------------------------------------------------------------------
- * proc_info_t mirror (from kernel/include/sched.h, for PROCLIST)
+ * proc_info_t mirror (from kernel/include/sched.h, for PROCLIST) -- 64 bytes
  * ----------------------------------------------------------------------- */
 typedef struct {
     u32  pid;
@@ -166,6 +166,8 @@ typedef struct {
     u32  state;
     u32  flags;
     char name[32];
+    u64  cpu_ticks;
+    u64  ctx_switches;
 } proc_info_t;
 
 /* -------------------------------------------------------------------------

@@ -211,7 +211,7 @@ int procapi_sysinfo(sysinfo_t* out)
      * safe to call without additional locking here.
      *
      * We use a stack-local buffer of 256 entries (matching MAX_PROCESSES in
-     * process.c).  Each proc_info_t is 48 bytes -> 48 * 256 = 12 KB.
+     * process.c).  Each proc_info_t is 64 bytes -> 64 * 256 = 16 KB.
      * The kernel stack is 8 KB, which would overflow.  We therefore declare
      * the buffer static (BSS) and guard the implicit single-threaded use with
      * the fact that this path is only ever called from the syscall handler

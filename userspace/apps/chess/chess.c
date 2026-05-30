@@ -32,6 +32,13 @@
 
 #include "../../lib/game/game.h"
 
+/* AOS syscall numbers (game.h only exposes SYS_WRITE). These match
+ * kernel/include/syscall.h -- NOTE: SYS_EXIT=0, and syscall 1 is SYS_FORK,
+ * so an exit MUST use rax=0, never rax=1. */
+#ifndef SYS_EXIT
+#define SYS_EXIT 0
+#endif
+
 /* =========================================================================
  * Serial output helper (no libc).
  * ========================================================================= */
@@ -49,6 +56,13 @@ static void chess_print(const char *s)
     u64 len = 0;
     while (s[len]) len++;
     _sc3(SYS_WRITE, 1, (long)s, (long)len);
+}
+
+/* Terminate the process cleanly. AOS SYS_EXIT == 0 (rax=1 would FORK!). */
+static void chess_exit(int code)
+{
+    _sc3(SYS_EXIT, (long)code, 0, 0);
+    for (;;) { /* unreachable; guard against return */ }
 }
 
 /* =========================================================================
@@ -801,6 +815,7 @@ static int evaluate(u8 b[8][8])
 /* Node counter to cap search budget */
 static int ai_nodes;
 #define AI_NODE_LIMIT  80000
+#define AI_DEPTH       3       /* root search depth (plies) */
 
 /* Minimax with alpha-beta (negamax variant) */
 /* Returns score relative to the player to move (positive = good). */
@@ -829,7 +844,7 @@ static int minimax(u8 b[8][8], int depth, int alpha, int beta,
     for (int i = 0; i < ml.count; i++) {
         int mv = ml.mv[i];
         int fr2 = MOVE_FROM_RANK(mv), ff2 = MOVE_FROM_FILE(mv);
-        int tr2 = MOVE_TO_RANK(mv),   tf2 = MOVE_TO_FILE(mv);
+        int tr2 = MOVE_TO_RANK(mv);
         u8 pc2 = b[fr2][ff2];
         int mv_type = PIECE(pc2);
 
@@ -893,10 +908,11 @@ static int ai_best_move(chess_t *g)
         int tmp2 = ml.mv[i]; ml.mv[i] = ml.mv[j]; ml.mv[j] = tmp2;
     }
 
+    int best_alpha = -30000;
     for (int i = 0; i < ml.count; i++) {
         int mv = ml.mv[i];
         int fr2 = MOVE_FROM_RANK(mv), ff2 = MOVE_FROM_FILE(mv);
-        int tr2 = MOVE_TO_RANK(mv),   tf2 = MOVE_TO_FILE(mv);
+        int tr2 = MOVE_TO_RANK(mv);
         u8 pc2 = g->board[fr2][ff2];
         int mv_type = PIECE(pc2);
 
@@ -904,32 +920,23 @@ static int ai_best_move(chess_t *g)
         if (mv_type == PAWN && g_abs(tr2 - fr2) == 2)
             next_ep = ((fr2 + tr2) / 2) * 8 + ff2;
 
-        int next_ck = ck, next_cq = cq;
-        if (mv_type == KING) { next_ck = 0; next_cq = 0; }
-        if (mv_type == ROOK) {
-            if (colour == WHITE) {
-                if (fr2 == 7 && ff2 == 0) next_cq = 0;
-                if (fr2 == 7 && ff2 == 7) next_ck = 0;
-            } else {
-                if (fr2 == 0 && ff2 == 0) next_cq = 0;
-                if (fr2 == 0 && ff2 == 7) next_ck = 0;
-            }
-        }
-
         u8 tmp_b[8][8];
         apply_move_copy(g->board, tmp_b, mv);
 
+        /* The recursive search switches to the opponent, so it tracks the
+         * opponent's (unchanged) castling rights. The mover's updated rights
+         * only matter two plies deeper, which this depth does not exploit. */
         int opp_colour = (colour == WHITE) ? BLACK : WHITE;
-        /* Pass opponent castling rights more accurately */
         int opp_ck = (opp_colour == WHITE) ? g->w_castle_k : g->b_castle_k;
         int opp_cq = (opp_colour == WHITE) ? g->w_castle_q : g->b_castle_q;
 
-        int score = -minimax(tmp_b, 2, -30000, 30000,
+        int score = -minimax(tmp_b, AI_DEPTH - 1, -30000, -best_alpha,
                              opp_colour, next_ep, opp_ck, opp_cq);
 
         if (score > best_score) {
             best_score = score;
             best_mv    = mv;
+            if (score > best_alpha) best_alpha = score;
         }
 
         if (ai_nodes >= AI_NODE_LIMIT) break;
@@ -1352,7 +1359,7 @@ void _start(void)
     game_t *gctx = game_open(WIN_W, WIN_H, "Chess");
     if (!gctx) {
         chess_print("[CHESS] game_open failed\n");
-        asm volatile("syscall" :: "a"(1), "D"(1) : "rcx","r11","memory");
+        chess_exit(1);
     }
 
     board_reset(&gs);
@@ -1428,6 +1435,5 @@ void _start(void)
     }
 
     chess_print("[CHESS] exit\n");
-    /* exit syscall */
-    asm volatile("syscall" :: "a"(1), "D"(0) : "rcx","r11","memory");
+    chess_exit(0);
 }

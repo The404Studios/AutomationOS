@@ -245,6 +245,7 @@ build_ui_app userspace/apps/uidemo/uidemo.c           uidemo
 build_ui_app userspace/apps/dateapp/dateapp.c         dateapp
 build_ui_app userspace/apps/applauncher/applauncher.c applauncher
 build_ui_app userspace/apps/taskman/taskman.c         taskman
+build_ui_app userspace/apps/startmenu/startmenu.c     startmenu
 
 echo "[all] network apps (netman + browser)..."
 # netman: network manager (ui toolkit + dns lib). Links like a ui app + dns.o.
@@ -282,6 +283,7 @@ build_game_app userspace/apps/breakout/breakout.c     breakout
 build_game_app userspace/apps/pong/pong.c             pong
 build_game_app userspace/apps/invaders/invaders.c     invaders
 build_game_app userspace/apps/solitaire/solitaire.c   solitaire
+build_game_app userspace/apps/chess/chess.c           chess
 
 echo "[all] wl-direct apps (round 7)..."
 build_wl_app userspace/apps/aiconsole/aiconsole.c     aiconsole
@@ -339,7 +341,7 @@ rm -rf /tmp/ird && mkdir -p /tmp/ird
 ( cd /tmp/ird && tar xf /mnt/c/Users/wilde/Desktop/Kernel/iso/boot/initrd.img )
 cp /tmp/comp.elf /tmp/ird/sbin/compositor
 cp /tmp/init.elf /tmp/ird/sbin/init
-for e in filemanager calculator clock sysinfo settings sysmon uidemo dateapp applauncher taskman terminal editor snake paint synth tetris game2048 sheet notes calendar stopwatch mines piano dashboard welcome bench breakout pong invaders procmon soundtest solitaire aiconsole screenshot stress musicplayer ide bubbletd forktest; do
+for e in filemanager calculator clock sysinfo settings sysmon uidemo dateapp applauncher taskman terminal editor snake paint synth tetris game2048 sheet notes calendar stopwatch mines piano dashboard welcome bench breakout pong invaders procmon soundtest solitaire aiconsole screenshot stress musicplayer ide bubbletd startmenu chess forktest; do
     cp /tmp/$e.elf /tmp/ird/sbin/$e
 done
 [ "$IV_OK" = "1" ] && cp /tmp/imageviewer.elf /tmp/ird/sbin/imageviewer
@@ -394,6 +396,12 @@ cp userspace/apps/ide/sample/native/* /tmp/ird/usr/src/native/ 2>/dev/null || tr
 # Bubble Defense as an IDE project, + a Desktop folder for compiled output
 mkdir -p /tmp/ird/usr/src/bubbledefense
 cp userspace/apps/bubbletd/bubbletd.c /tmp/ird/usr/src/bubbledefense/ 2>/dev/null || true
+
+# IDE "New Project" templates (game / app / service starters) -> /usr/src/templates
+mkdir -p /tmp/ird/usr/src/templates/gamestarter /tmp/ird/usr/src/templates/appstarter /tmp/ird/usr/src/templates/servicestarter
+cp userspace/apps/ide/sample/gamestarter/*    /tmp/ird/usr/src/templates/gamestarter/    2>/dev/null || true
+cp userspace/apps/ide/sample/appstarter/*     /tmp/ird/usr/src/templates/appstarter/     2>/dev/null || true
+cp userspace/apps/ide/sample/servicestarter/* /tmp/ird/usr/src/templates/servicestarter/ 2>/dev/null || true
 mkdir -p /tmp/ird/Desktop
 ( cd /tmp/ird && tar --format=ustar --owner=0 --group=0 -cf /mnt/c/Users/wilde/Desktop/Kernel/iso/boot/initrd.img . )
 

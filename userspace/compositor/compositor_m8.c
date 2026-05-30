@@ -1035,6 +1035,23 @@ static int32_t anim_linear_t(window_t *win, long now) {
     return (int32_t)((dt * 256) / win->anim_dur_ms);
 }
 
+/* Eased progress for the VISUAL window animations (open/close/minimize scale).
+ * ease-out-cubic: 1 - (1-t)^3, Q8 in [0,256]. Smooth deceleration instead of a
+ * linear ramp -> a more satisfying, Windows-like feel. The timing/completion
+ * logic keeps using the raw linear t (it must hit exactly 256 at the end). */
+static int32_t anim_eased_t(window_t *win, long now) {
+    int32_t t = anim_linear_t(win, now);
+    if (t <= 0)   return 0;
+    if (t >= 256) return 256;
+    int32_t inv = 256 - t;
+    int64_t i2  = ((int64_t)inv * inv) >> 8;
+    int64_t i3  = (i2 * inv) >> 8;
+    int64_t f   = 256 - i3;
+    if (f < 0)   f = 0;
+    if (f > 256) f = 256;
+    return (int32_t)f;
+}
+
 static void anim_begin(window_t *win, int32_t phase, int32_t dur_ms, long now) {
     win->phase = phase;
     win->anim_dur_ms = dur_ms;
@@ -1482,7 +1499,7 @@ static void render_window_anim(uint32_t *buf, uint32_t w, uint32_t h, uint32_t s
     int32_t clip_y0 = PANEL_H;
     int32_t clip_y1 = (int32_t)h - DOCK_H;
 
-    int32_t lin = anim_linear_t(win, now);
+    int32_t lin = anim_eased_t(win, now);
 
     /* geometry: settled frame top-left */
     int32_t fx = win->x, fy = win->y;
@@ -1589,7 +1606,7 @@ static void render_window_anim(uint32_t *buf, uint32_t w, uint32_t h, uint32_t s
  */
 static void render_window_snapping(uint32_t *buf, uint32_t w, uint32_t h, uint32_t stride,
                                    window_t *win, int focused, long now) {
-    int32_t lin = anim_linear_t(win, now);
+    int32_t lin = anim_eased_t(win, now);
     int32_t e   = ease_in_out_cubic(lin);          /* Q8 progress 0..256 */
 
     int32_t ix = win->from_x + (win->to_x - win->from_x) * e / 256;

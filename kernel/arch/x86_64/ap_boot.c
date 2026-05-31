@@ -12,7 +12,9 @@
  *     ICR (MMIO, already enabled + proven in brick 1).
  *   - Wait with a BOUNDED TSC-deadline timeout (~100 ms) polling a shared
  *     MEMORY flag the AP sets. NEVER an infinite spin, NEVER a panic.
- *   - The AP just marks itself online and `cli; hlt`s forever.
+ *   - The AP marks itself online, then (brick 3.5) loops forever incrementing
+ *     ONLY its own isolated per-CPU heartbeat counter (cpu_hb[1]). No interrupts,
+ *     no hlt, no shared state -- a pure spin that proves it runs independently.
  *
  * THE HARD RULE: an AP that never comes up MUST NOT stop or hang the BSP. Every
  * wait here is a finite deadline; on timeout the caller logs the failure and the
@@ -71,6 +73,26 @@ static uint8_t ap_stack[AP_STACK_SIZE] __attribute__((aligned(16)));
  * ------------------------------------------------------------------------- */
 static volatile uint32_t ap1_online = 0;
 
+/* ---------------------------------------------------------------------------
+ * SMP brick 3.5: independent PER-CPU heartbeat counters (isolation proof).
+ *
+ * Two counters, ONE per logical CPU, placed on SEPARATE 64-byte cache lines so
+ * that CPU0 (BSP) and CPU1 (AP) each only ever touch their OWN line -- this is
+ * the whole point: it proves two cores can safely hammer ISOLATED per-CPU memory
+ * with ZERO shared scheduling/allocator state and ZERO false sharing. The 56-byte
+ * pad fills out the line after the 8-byte counter; aligned(64) guarantees each
+ * struct starts on its own line, so cpu_hb[0] and cpu_hb[1] never collide.
+ *
+ *   cpu_hb[0] = BSP heartbeat (incremented by the BSP proof window in kernel.c)
+ *   cpu_hb[1] = AP  heartbeat (incremented forever by ap_main() below)
+ *
+ * Exported (non-static) so kernel.c can read/increment cpu_hb[0] and display both.
+ * NOT volatile at the struct level -- only the counter field is volatile, which is
+ * enough to keep the compiler from hoisting the increments/reads out of the loops.
+ */
+struct hb { volatile uint64_t v; char pad[56]; } __attribute__((aligned(64)));
+struct hb cpu_hb[2] = {{0, {0}}, {0, {0}}};   /* [0]=BSP, [1]=AP; 64-byte-separated */
+
 /* 10-byte descriptor-table register image (limit + base), matching sgdt/sidt. */
 typedef struct __attribute__((packed)) {
     uint16_t limit;
@@ -111,13 +133,21 @@ static void ap_tsc_delay_us(uint64_t us)
 /*
  * ap_main -- the 64-bit C entry the trampoline jumps to once the AP is in long
  * mode with the kernel GDT/IDT/CR3 and its own stack (RDI = logical cpu id, here
- * always 1). Keep this MINIMAL: mark online, then park.
+ * always 1). Keep this MINIMAL: mark online, then run its private heartbeat.
  *
  * Intentionally does NOT log (two CPUs racing on the 0x3F8 serial port is not
  * MP-safe) -- the BSP prints "CPU 1 online" after it observes the flag. Does NOT
  * touch the scheduler, allocator, or any stateful subsystem. Does NOT enable
- * interrupts. Marks online with a SEQ_CST store so the BSP's ACQUIRE load sees
- * it, then halts forever with interrupts masked.
+ * interrupts (no sti, no hlt, no timer, no handler).
+ *
+ * BRICK 3.5: after publishing online (SEQ_CST so the BSP's ACQUIRE load sees it),
+ * the AP loops FOREVER incrementing ONLY its own counter, cpu_hb[1].v -- nothing
+ * shared, nothing stateful. `pause` is a spin-loop hint (no scheduling, no IPI).
+ * This active spin is the PROOF the AP is independently executing: while the BSP
+ * runs its bounded ~4s proof window (and also paints the framebuffer), this core
+ * is doing nothing but climbing cpu_hb[1], so cpu_hb[1] >> cpu_hb[0] -- that
+ * asymmetry alone shows the AP ran on its own. A properly idling AP is a later
+ * brick; here it deliberately never halts.
  */
 void ap_main(uint64_t cpu)
 {
@@ -126,9 +156,11 @@ void ap_main(uint64_t cpu)
     /* Tell the BSP we reached long mode and are alive. SEQ_CST publish. */
     __atomic_store_n(&ap1_online, 1u, __ATOMIC_SEQ_CST);
 
-    /* Park forever. No interrupts until SMP scheduling exists (a later brick). */
+    /* Heartbeat forever on the AP's OWN isolated cache line. No interrupts, no
+     * hlt, no shared state -- just prove this core is executing independently. */
     for (;;) {
-        __asm__ volatile("cli; hlt");
+        cpu_hb[1].v++;
+        __asm__ volatile("pause");
     }
 }
 

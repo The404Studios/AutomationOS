@@ -227,11 +227,30 @@ static int      g_boot_step  = 0;
  * On real hardware (e.g. the T410) the serial [SMP] log is invisible, so this is
  * how you read whether CPU 1 came online: photograph the boot panel. */
 static const char *g_smp_boot_status = "SMP: (no result)";
+/* Brick 3.5: did CPU 1 (the AP) actually come online? Captured from try_start_cpu1()
+ * during brick-3 bring-up (which runs BEFORE the framebuffer is live) and consulted
+ * later by the BSP proof window: we only spin/display CPU1's heartbeat if the AP is
+ * up, otherwise CPU1 stays 0 and we just run CPU0's counter (no hang). */
+static int g_smp_ap_online = 0;
+/* Brick 3.5: the two ISOLATED per-CPU heartbeat counters, defined in ap_boot.c on
+ * SEPARATE 64-byte cache lines. cpu_hb[0]=BSP, cpu_hb[1]=AP. The BSP increments
+ * ONLY cpu_hb[0] in its proof window and reads both for display; the AP increments
+ * ONLY cpu_hb[1]. struct hb mirrors the ap_boot.c definition exactly. */
+struct hb { volatile uint64_t v; char pad[56]; } __attribute__((aligned(64)));
+extern struct hb cpu_hb[2];
 /* tiny unsigned->decimal appender for the diagnostic framebuffer-geometry marker. */
 static char *u32_dec(char *p, uint32_t v) {
     char t[10]; int n = 0;
     if (v == 0) t[n++] = '0';
     while (v) { t[n++] = (char)('0' + v % 10); v /= 10; }
+    while (n) *p++ = t[--n];
+    return p;
+}
+/* Brick 3.5: append a uint64 as decimal (for the "CPU0=<n> CPU1=<m>" proof line). */
+static char *u64_dec(char *p, uint64_t v) {
+    char t[20]; int n = 0;
+    if (v == 0) t[n++] = '0';
+    while (v) { t[n++] = (char)('0' + (int)(v % 10)); v /= 10; }
     while (n) *p++ = t[--n];
     return p;
 }
@@ -448,8 +467,9 @@ void kernel_main(void* raw_info) {
         int smp_cpu_count = madt_count_cpus();
         if (smp_cpu_count >= 2) {
             if (try_start_cpu1()) {
-                kprintf("[SMP] CPU 1 online\n");        /* AP is now hlt-parked */
+                kprintf("[SMP] CPU 1 online\n");        /* AP now spins its heartbeat */
                 g_smp_boot_status = "SMP: CPU 1 ONLINE";
+                g_smp_ap_online = 1;   /* brick 3.5: AP is up -> its heartbeat will climb */
             } else {
                 kprintf("[SMP] AP failed to start, continuing single-core\n");
                 g_smp_boot_status = "SMP: AP failed (single-core)";
@@ -539,6 +559,62 @@ void kernel_main(void* raw_info) {
             s = " pitch="; while (*s) *p++ = *s++;
             p = u32_dec(p, boot_info->framebuffer_pitch);  *p = 0;
             framebuffer_puts_scaled(fbm, 40u, 60u, 0x0000FFFFu, 3u);
+        }
+
+        /* ---------------------------------------------------------------------
+         * BRICK 3.5: per-CPU heartbeat PROOF WINDOW.
+         *
+         * The framebuffer is live and the SMP/FB markers are painted, but the
+         * userspace compositor has NOT taken the framebuffer yet -- so painting
+         * here is safe. For a bounded ~4 seconds (TSC deadline, same ~3 GHz
+         * convention as ap_boot.c / brick 2), the BSP repeatedly increments ONLY
+         * its own counter cpu_hb[0].v and repaints "CPU0=<n> CPU1=<m>" at a fixed
+         * top-left spot (y=100, just below the markers) so BOTH counters are
+         * visibly climbing on real hardware. Meanwhile the AP (if it came online)
+         * is pure-spinning cpu_hb[1].v on its OWN isolated cache line.
+         *
+         * If the AP did NOT come online (single-core / brick-3 failure) we still
+         * run CPU0's counter; cpu_hb[1] simply stays 0 and we don't hang. NO
+         * scheduler, NO run queue, NO IPI, NO shared state -- just two cores each
+         * touching their own 64-byte-separated counter.
+         * ------------------------------------------------------------------- */
+        {
+            const uint64_t HB_TSC_PER_US = 3000ULL;          /* ~3 GHz estimate    */
+            const uint64_t HB_WINDOW_US  = 4000000ULL;        /* ~4 seconds         */
+            uint64_t hb_start    = rdtsc();
+            uint64_t hb_deadline = HB_WINDOW_US * HB_TSC_PER_US;
+            uint64_t repaint_gate = 0;                        /* throttle repaints  */
+            kprintf("[SMP] heartbeat proof window: BSP spins cpu_hb[0], "
+                    "AP %s cpu_hb[1] (~4s)\n",
+                    g_smp_ap_online ? "spins" : "absent (single-core)");
+            while ((rdtsc() - hb_start) < hb_deadline) {
+                /* BSP touches ONLY its own isolated counter. */
+                cpu_hb[0].v++;
+
+                /* Repaint the live line every ~65536 BSP increments so the on-screen
+                 * "CPU0=.. CPU1=.." is readable (and we don't spend the whole window
+                 * inside the glyph blitter). framebuffer_puts_scaled is BSP-only and
+                 * the compositor isn't up yet, so this paint is safe. */
+                if ((cpu_hb[0].v - repaint_gate) >= 65536ULL) {
+                    repaint_gate = cpu_hb[0].v;
+                    char hbline[64];
+                    char *q = hbline; const char *s = "CPU0=";
+                    while (*s) *q++ = *s++;
+                    q = u64_dec(q, cpu_hb[0].v);
+                    s = " CPU1="; while (*s) *q++ = *s++;
+                    q = u64_dec(q, cpu_hb[1].v);
+                    *q = 0;
+                    framebuffer_puts_scaled(hbline, 40u, 100u, 0x0000FF00u, 2u);
+                }
+                __asm__ volatile("pause");
+            }
+
+            /* Headless verification hook: the framebuffer paint is invisible to
+             * headless QEMU, so ALSO emit the final values on serial. On -smp 2
+             * both are large/nonzero (CPU1 typically MUCH larger -- it pure-spins
+             * while CPU0 also paints); on -smp 1 CPU1 stays 0 (no AP). */
+            kprintf("[SMP] heartbeat: CPU0=%lu CPU1=%lu\n",
+                    cpu_hb[0].v, cpu_hb[1].v);
         }
 #endif
 

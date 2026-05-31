@@ -339,6 +339,27 @@ void kernel_main(void* raw_info) {
     extern int madt_count_cpus(void);
     kprintf("[SMP] detected %d cpus\n", madt_count_cpus());
 
+#ifdef SMP_FOUNDATION
+    /* SMP brick 1 (GATED, SMP=1 build only): bring the BOOTSTRAP PROCESSOR's
+     * Local APIC online and log its APIC ID + version. This is groundwork for
+     * later AP bring-up -- the system STILL runs single-core here.
+     *
+     * SAFE SCOPE: lapic_init() only (a) sets the IA32_APIC_BASE global-enable
+     * bit, (b) writes SIVR (software-enable + spurious vector 0xFF) and TPR=0,
+     * then (c) reads the APIC ID/version. It does NOT mask/disable the 8259 PIC,
+     * does NOT program the IOAPIC, does NOT start the LAPIC timer, and does NOT
+     * touch IDT routing -- so the existing PIC-delivered PIT (IRQ0) and PS/2
+     * keyboard (IRQ1) keep working exactly as before. The LAPIC MMIO base
+     * (~0xFEE00000) is already identity-mapped by vmm_init()'s 1GB->16GB
+     * extension above, so the register reads cannot fault. */
+    extern void lapic_init(void);
+    extern uint32_t lapic_get_id(void);
+    extern uint32_t lapic_get_version(void);
+    lapic_init();
+    kprintf("[SMP] BSP local APIC online: id=%u version=0x%x\n",
+            lapic_get_id(), lapic_get_version());
+#endif
+
     /* Initialize framebuffer if available */
     if (boot_info->framebuffer_addr && boot_info->framebuffer_width > 0) {
         kprintf("[KERNEL] Initializing framebuffer...\n");

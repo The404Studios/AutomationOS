@@ -30,6 +30,29 @@ if [ "${PREEMPT:-0}" = "1" ]; then
     echo "*** PREEMPTIVE build: -DPREEMPTIVE enabled, output -> $KERNEL_OUT ***"
 fi
 
+# =============================================================================
+# OPT-IN SMP FOUNDATION (brick 1: BSP Local APIC bring-up). GATED behind the SMP
+#   env var.   SMP=1 bash scripts/quick_build.sh   ->  build/kernel-smp.elf
+# When SMP is UNSET this whole block is skipped and the build behaves EXACTLY as
+# before: NO -DSMP_FOUNDATION macro, kernel/arch/x86_64/lapic.c is NOT compiled,
+# output stays build/kernel.elf -- byte-for-byte the default kernel.
+#
+# We define the FRESH macro -DSMP_FOUNDATION (NOT -DCONFIG_SMP, which would
+# #ifndef-out the cooperative scheduler and brick the kernel; NOT -DSMP_ENABLE,
+# the stale smp.c gate). kernel.c calls lapic_init() under #ifdef SMP_FOUNDATION,
+# right after the brick-0 "[SMP] detected" line, to bring the BSP local APIC
+# online (safe-enable + read APIC ID/version only -- the PIC/IOAPIC/timer/IDT are
+# left untouched). The lapic.c source is added to the compile list ONLY here, and
+# we write a SEPARATE output so the normal build/kernel.elf is never touched.
+# =============================================================================
+SMP_SOURCES=""
+if [ "${SMP:-0}" = "1" ]; then
+    CFLAGS="$CFLAGS -DSMP_FOUNDATION"
+    KERNEL_OUT="build/kernel-smp.elf"
+    SMP_SOURCES="1"
+    echo "*** SMP build: -DSMP_FOUNDATION enabled, +lapic.c, output -> $KERNEL_OUT ***"
+fi
+
 GOOD=0
 BAD=0
 OBJS=""
@@ -90,6 +113,14 @@ compile kernel/arch/x86_64/paging.c          c_paging
 # NOT pull in either acpi.c or smp.c -- system stays single-core, this only logs
 # "SMP: detected N cpus" so the kernel is AWARE of the core count.
 compile kernel/arch/x86_64/madt.c            c_madt
+# SMP brick 1 (GATED by SMP=1 -> -DSMP_FOUNDATION): the BSP Local APIC driver.
+# Compiled ONLY for the SMP build so the default kernel.elf is byte-for-byte
+# unchanged. lapic.c is real salvage (xAPIC + x2APIC); kernel.c calls lapic_init()
+# under #ifdef SMP_FOUNDATION to bring the BSP local APIC online (enable + read
+# APIC ID/version only -- PIC/IOAPIC/timer/IDT untouched, single-core preserved).
+if [ -n "$SMP_SOURCES" ]; then
+    compile kernel/arch/x86_64/lapic.c       c_lapic
+fi
 compile kernel/drivers/serial.c              c_serial
 compile kernel/drivers/pit.c                 c_pit
 compile kernel/drivers/ps2.c                 c_ps2

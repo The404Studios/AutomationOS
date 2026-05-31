@@ -935,8 +935,12 @@ static void update_game(void)
         else {
             i32 type = roll_zombie_type(g_wave);
             i32 s = rand_range(g_spawn_n);
-            spawn_zombie(type, g_wave, g_spawn_x[s], g_spawn_y[s]);
-            g_to_spawn--;
+            /* Only count a zombie that was actually created. If the field is at
+             * MAX_ZOMBIES, spawn_zombie returns <0; keep the budget so the rest
+             * of the wave still spawns as slots free (otherwise the hardest
+             * waves silently shrink instead of growing). */
+            if (spawn_zombie(type, g_wave, g_spawn_x[s], g_spawn_y[s]) >= 0)
+                g_to_spawn--;
             g_spawn_cd = g_spawn_gap;
         }
     }

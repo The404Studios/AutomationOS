@@ -72,13 +72,91 @@ typedef struct {
     uint64_t bitmap[SCHED_BITMAP_WORDS];       // 140 bits: 1 = non-empty queue
 } runqueue_t;
 
-// Active and expired runqueues (double-buffering)
-static runqueue_t active_rq;
-static runqueue_t expired_rq;
-static uint32_t ready_count = 0;
+// ===========================================================================
+// SMP foundation brick 4: per-CPU structure (cpu_t), at CPU count == 1.
+// ===========================================================================
+// This is a PURE-RENAME BEHAVIORAL NO-OP. The scheduler used to refer to *the*
+// active/expired runqueue and *the* ready count via file-scope globals, which
+// implicitly assumes a single CPU. We relocate that per-CPU state into
+// cpus[cpu_id()] and access it through this_cpu(). Because stubs.c::cpu_id()
+// still returns 0, this_cpu() is ALWAYS &cpus[0], so every relocated field is
+// just reached through cpus[0] instead of directly -- byte-for-byte identical
+// scheduling decisions. The whole value is structural: bricks 5+ (per-CPU idle,
+// per-CPU runqueues, migration, work-stealing) become a rename of cpu_id()'s
+// return instead of a concurrent rewrite of the scheduler.
+//
+// See docs/PERCPU_DESIGN.md. cpu_id() is the hinge (stubs.c, returns 0 today;
+// later reads the LAPIC id). MAX_CPUS is declared locally to avoid pulling in
+// smp.h (which is part of the deferred, uncompiled SMP subsystem).
+#ifndef MAX_CPUS
+#define MAX_CPUS 8
+#endif
+
+// cpu_id(): single-CPU stub in stubs.c (returns 0). Declared here rather than
+// including smp.h so we do not drag in the uncompiled SMP machinery; the symbol
+// resolves to stubs.c at link time (smp.c, which also defines it, is NOT built).
+extern uint32_t cpu_id(void);
+
+// Per-CPU scheduler statistics. The two scheduler stats this kernel tracks
+// (ctx_switches, cpu_ticks) are actually PER-PROCESS fields on process_t (see
+// sched.h), not scheduler globals, so there is nothing to relocate here today.
+// The struct is defined for the brick-5+ shape (a later brick that adds genuine
+// per-CPU counters -- e.g. ticks observed on this CPU -- fills it in); at N=1 it
+// stays zero and unused, which keeps this a no-op.
+typedef struct cpu_stats {
+    uint64_t reserved;  // placeholder so the field exists; unused at N=1
+} cpu_stats_t;
+
+// The per-CPU structure. At N=1 only cpus[0] is ever touched (cpu_id()==0).
+typedef struct cpu {
+    uint32_t    apic_id;        // LAPIC id; 0 for the BSP today
+    int         online;         // 1 for the BSP (this CPU is up)
+    process_t*  current_thread; // currently-running task on THIS cpu (mirror of
+                                // the shared current_process, kept in lockstep at
+                                // the process_set_current() chokepoint -- see the
+                                // note below on why the global is not privatized
+                                // yet). Live and correct; brick 5+ may make it the
+                                // sole authority.
+    process_t*  idle_thread;    // this CPU's idle task. This scheduler has NO
+                                // dedicated idle thread (it keeps running the
+                                // current task when nothing else is ready), so
+                                // this stays NULL today; reserved for a later
+                                // brick that adds a real per-CPU idle task.
+    // The O(1) MLFQ runqueue state, relocated AS-IS from the old file-scope
+    // globals (active_rq / expired_rq / ready_count). ONE runqueue (cpu[0]'s) is
+    // used exactly as before -- genuinely separate per-CPU runqueues with their
+    // own picks are brick 6, NOT now.
+    runqueue_t  rq_active;      // was the global active_rq
+    runqueue_t  rq_expired;     // was the global expired_rq
+    uint32_t    ready_count;    // was the global ready_count
+    cpu_stats_t stats;          // per-CPU scheduler stats (unused at N=1)
+} cpu_t;
+
+static cpu_t cpus[MAX_CPUS];
+
+// THE hinge. cpu_id()==0 today, so this is always &cpus[0]. Scheduler code
+// written against this_cpu()->field resolves correctly when an AP later makes
+// cpu_id() return a real LAPIC id -- with zero edits to this file.
+#define this_cpu()  (&cpus[cpu_id()])
+
+// Keep cpus[].current_thread in lockstep with the shared current_process global.
+// process_set_current() (process.c -- the SINGLE dispatch chokepoint for both the
+// cooperative and preemptive switch paths) calls this so this_cpu()->current_thread
+// always names the task running on THIS cpu. At N=1 it is just an extra store into
+// cpus[0] (cpu_id()==0); it changes NO observable behavior. The shared global
+// remains the authority for the many subsystems that read current_process directly
+// (PE loader, net, kill, ...); a later brick may make current_thread the sole
+// source of truth once those readers are migrated. Defined here (not process.c)
+// because cpus[] is file-local to the scheduler.
+void cpu_set_current_thread(process_t* proc) {
+    this_cpu()->current_thread = proc;
+}
 
 // RACE-001 fix: Global scheduler lock protects runqueues
-// This prevents race conditions when multiple CPUs add/remove processes
+// This prevents race conditions when multiple CPUs add/remove processes.
+// Kept GLOBAL (shared) on purpose: a per-CPU runqueue lock is brick 6, when the
+// runqueues actually become independent. At N=1 one lock guarding cpus[0]'s rq
+// is byte-for-byte the old behavior.
 static spinlock_t scheduler_lock;
 
 // GPF-001 fix: Re-entrancy guard for context switch
@@ -284,9 +362,10 @@ static inline int runqueue_is_empty(const runqueue_t* rq) {
 
 // Swap active and expired runqueues
 static void runqueue_swap(void) {
-    runqueue_t tmp = active_rq;
-    active_rq = expired_rq;
-    expired_rq = tmp;
+    cpu_t* c = this_cpu();
+    runqueue_t tmp = c->rq_active;
+    c->rq_active = c->rq_expired;
+    c->rq_expired = tmp;
 #ifndef SCHEDULER_QUIET
     kprintf("[SCHEDULER] Swapped active/expired runqueues\n");
 #endif
@@ -404,10 +483,16 @@ void scheduler_init(void) {
     // RACE-001 fix: Initialize scheduler lock
     spin_lock_init(&scheduler_lock);
 
-    // Initialize active and expired runqueues
-    runqueue_init(&active_rq);
-    runqueue_init(&expired_rq);
-    ready_count = 0;
+    // SMP brick 4: bring the BSP's per-CPU slot online. At N=1 this is the only
+    // CPU; cpu_id()==0 so this_cpu()==&cpus[0]. apic_id 0 == the BSP. The rest of
+    // cpus[] stays zeroed (.bss) and untouched until APs exist (brick 5+).
+    cpus[0].apic_id = 0;
+    cpus[0].online  = 1;
+
+    // Initialize active and expired runqueues (now living in cpus[0].rq_*).
+    runqueue_init(&this_cpu()->rq_active);
+    runqueue_init(&this_cpu()->rq_expired);
+    this_cpu()->ready_count = 0;
 
     kprintf("[SCHEDULER] O(1) scheduler initialized:\n");
     kprintf("[SCHEDULER]   - Priority levels: %d (0-139)\n", SCHED_PRIORITY_LEVELS);
@@ -467,9 +552,9 @@ void scheduler_add_process(process_t* proc) {
     // This implements round-robin within each priority level
     // When time_slice == 0, process exhausted quantum → expired queue
     // When time_slice > 0, process yielded early → expired queue (maintains fairness)
-    runqueue_enqueue(&expired_rq, proc, priority);
+    runqueue_enqueue(&this_cpu()->rq_expired, proc, priority);
 
-    ready_count++;
+    this_cpu()->ready_count++;
 
     spin_unlock(&scheduler_lock);
 
@@ -526,15 +611,15 @@ void scheduler_yield_requeue(process_t* proc) {
         // Spend one bonus turn: re-enter ACTIVE so this higher-priority process
         // is eligible to be picked again immediately (ahead of lower priorities).
         proc->yield_boost--;
-        runqueue_enqueue(&active_rq, proc, priority);
+        runqueue_enqueue(&this_cpu()->rq_active, proc, priority);
     } else {
         // Out of bonus turns (or never had any): refill from nice and rotate to
         // EXPIRED, guaranteeing lower-priority ready processes get their turn
         // after the next active/expired swap (anti-starvation preserved).
         proc->yield_boost = priority_yield_boost(proc->priority);
-        runqueue_enqueue(&expired_rq, proc, priority);
+        runqueue_enqueue(&this_cpu()->rq_expired, proc, priority);
     }
-    ready_count++;
+    this_cpu()->ready_count++;
     spin_unlock(&scheduler_lock);
 }
 
@@ -564,16 +649,16 @@ void scheduler_remove_process(process_t* proc) {
     int priority = process_get_priority(proc);
 
     // Try to remove from active runqueue first
-    int found = runqueue_remove(&active_rq, proc, priority);
+    int found = runqueue_remove(&this_cpu()->rq_active, proc, priority);
 
     // If not in active, try expired
     if (!found) {
-        found = runqueue_remove(&expired_rq, proc, priority);
+        found = runqueue_remove(&this_cpu()->rq_expired, proc, priority);
     }
 
     if (found) {
         proc->on_queue = 0;
-        ready_count--;
+        this_cpu()->ready_count--;
 
         spin_unlock(&scheduler_lock);
 
@@ -608,11 +693,11 @@ process_t* scheduler_pick_next(void) {
 
 pick_again:
     // Try to pick highest priority process from active runqueue
-    next = runqueue_pick_next(&active_rq);
+    next = runqueue_pick_next(&this_cpu()->rq_active);
 
     if (next == NULL) {
         // Active runqueue is empty - check if expired has processes
-        if (runqueue_is_empty(&expired_rq)) {
+        if (runqueue_is_empty(&this_cpu()->rq_expired)) {
             // Both runqueues are empty - no processes to run
             spin_unlock(&scheduler_lock);
             return NULL;
@@ -622,7 +707,7 @@ pick_again:
         runqueue_swap();
 
         // Try again from newly active runqueue
-        next = runqueue_pick_next(&active_rq);
+        next = runqueue_pick_next(&this_cpu()->rq_active);
 
         if (next == NULL) {
             // Should never happen after swap, but defensive check
@@ -639,7 +724,7 @@ pick_again:
     // had a chance to run. We discard it here and pick again.
     // -------------------------------------------------------------------------
     if (next->state == PROCESS_TERMINATED) {
-        ready_count--;
+        this_cpu()->ready_count--;
         next->on_queue = 0;
         spin_unlock(&scheduler_lock);
 #ifndef SCHEDULER_QUIET
@@ -652,7 +737,7 @@ pick_again:
         goto pick_again;  // Try to pick another process
     }
 
-    ready_count--;
+    this_cpu()->ready_count--;
     next->on_queue = 0;
 
     spin_unlock(&scheduler_lock);

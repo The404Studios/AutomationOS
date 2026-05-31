@@ -508,6 +508,11 @@ process_t* process_get_current(void) {
 
 void process_set_current(process_t* proc) {
     current_process = proc;
+    // SMP brick 4: mirror the current task into this CPU's cpu_t slot. At N=1
+    // (cpu_id()==0) this is just an extra store into cpus[0].current_thread and
+    // changes no observable behavior; it keeps this_cpu()->current_thread live
+    // for the later SMP bricks. The shared global above stays authoritative.
+    cpu_set_current_thread(proc);
     if (proc) {
         proc->state = PROCESS_RUNNING;
         // Single chokepoint hit by EVERY dispatch (cooperative schedule/yield/wq

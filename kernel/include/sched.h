@@ -326,6 +326,13 @@ int process_list(proc_info_t* out, int max);
 // during the critical section of a context switch (GPF-001 fix)
 extern volatile int scheduler_in_switch;
 
+// SMP foundation brick 4: keep the per-CPU cpu_t.current_thread field (in
+// scheduler.c's cpus[cpu_id()]) in lockstep with the shared current_process
+// global. Called from process_set_current() -- the single dispatch chokepoint.
+// At CPU count == 1 (cpu_id()==0) this is a non-observable extra store into
+// cpus[0]; it exists so bricks 5+ can read this_cpu()->current_thread directly.
+void cpu_set_current_thread(process_t* proc);
+
 // Scheduler
 void scheduler_init(void);
 void scheduler_add_process(process_t* proc);

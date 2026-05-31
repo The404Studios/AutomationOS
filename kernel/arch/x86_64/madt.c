@@ -198,3 +198,70 @@ int madt_count_cpus(void)
      * still report at least the bootstrap processor. */
     return count > 0 ? count : 1;
 }
+
+#ifdef SMP_FOUNDATION
+/*
+ * madt_get_apic_id -- return the Local APIC ID of the Nth *enabled* processor
+ * in MADT order (index 0 = the first enabled LAPIC, which on every firmware is
+ * the bootstrap processor; index 1 = the first application processor, etc.).
+ *
+ * Returns -1 if ACPI/MADT is missing/malformed or the index is out of range.
+ *
+ * This is the ONLY piece of information SMP brick 3 needs beyond the CPU count:
+ * the physical APIC ID to target with INIT-SIPI-SIPI. It is READ-ONLY (walks the
+ * same identity-mapped MADT as madt_count_cpus) and shares no state, so it is
+ * safe to call from the single-core boot path. No APIC writes, no side effects.
+ *
+ * GATED behind SMP_FOUNDATION so the DEFAULT build's madt.o is byte-for-byte
+ * unchanged (this symbol is only needed -- and only referenced -- by the SMP
+ * brick-3 AP-start code in ap_boot.c, which is itself SMP=1-only).
+ */
+int madt_get_apic_id(int index)
+{
+    if (index < 0) {
+        return -1;
+    }
+
+    acpi_rsdp_t *rsdp = madt_find_rsdp();
+    if (!rsdp) {
+        return -1;
+    }
+
+    acpi_madt_t *madt = madt_find(rsdp);
+    if (!madt) {
+        return -1;
+    }
+
+    int seen = 0;
+    const uint8_t *ptr = madt->entries;
+    const uint8_t *end = (const uint8_t *)madt + madt->header.length;
+
+    while (ptr + sizeof(acpi_madt_entry_header_t) <= end) {
+        const acpi_madt_entry_header_t *eh =
+            (const acpi_madt_entry_header_t *)ptr;
+
+        if (eh->length == 0) {
+            break; /* malformed; avoid an infinite loop */
+        }
+        if (ptr + eh->length > end) {
+            break; /* entry would run past the table; stop */
+        }
+
+        if (eh->type == ACPI_MADT_TYPE_LOCAL_APIC &&
+            eh->length >= sizeof(acpi_madt_local_apic_t)) {
+            const acpi_madt_local_apic_t *lapic =
+                (const acpi_madt_local_apic_t *)ptr;
+            if (lapic->flags & 1u) { /* bit0 = processor enabled */
+                if (seen == index) {
+                    return (int)lapic->apic_id;
+                }
+                seen++;
+            }
+        }
+
+        ptr += eh->length;
+    }
+
+    return -1; /* fewer than (index+1) enabled processors */
+}
+#endif /* SMP_FOUNDATION */

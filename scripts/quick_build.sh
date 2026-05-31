@@ -50,7 +50,19 @@ if [ "${SMP:-0}" = "1" ]; then
     CFLAGS="$CFLAGS -DSMP_FOUNDATION"
     KERNEL_OUT="build/kernel-smp.elf"
     SMP_SOURCES="1"
-    echo "*** SMP build: -DSMP_FOUNDATION enabled, +lapic.c, output -> $KERNEL_OUT ***"
+    echo "*** SMP build: -DSMP_FOUNDATION enabled, +lapic.c +ap_boot.c +ap_trampoline.asm, output -> $KERNEL_OUT ***"
+
+    # TEST-ONLY knob (brick 3 safe-degradation proof). When SMP_FORCE_AP_FAIL=1 is
+    # ALSO set, ap_boot.c's try_start_cpu1() aims the SIPI at a bogus APIC id (0xFE)
+    # that no CPU answers, so CPU 1 never sets its online flag and the BOUNDED
+    # ~100ms TSC wait must expire -> the BSP logs "AP failed to start, continuing
+    # single-core" and keeps booting. This PROVES the hard rule (AP failure never
+    # hangs/panics the BSP). It is OFF by default and has NO effect on a normal SMP
+    # build (only -DSMP_FOUNDATION is defined). Never set this for a shipping image.
+    if [ "${SMP_FORCE_AP_FAIL:-0}" = "1" ]; then
+        CFLAGS="$CFLAGS -DSMP_FORCE_AP_FAIL"
+        echo "*** SMP_FORCE_AP_FAIL=1: AP start will be forced to FAIL (degradation test) ***"
+    fi
 fi
 
 GOOD=0
@@ -97,6 +109,14 @@ assemble kernel/arch/x86_64/interrupt.asm    asm_interrupt
 assemble kernel/arch/x86_64/syscall.asm      asm_syscall
 assemble kernel/arch/x86_64/context_switch.asm asm_ctxswitch
 assemble kernel/arch/x86_64/usermode.asm     asm_usermode
+# SMP brick 3 (GATED by SMP=1): the 16-bit real-mode -> long-mode AP trampoline.
+# Assembled ONLY for the SMP build, so the default kernel.elf is byte-for-byte
+# unchanged (this section's input does not exist in the default link). The blob
+# is copied to a low page (0x8000) at runtime by ap_boot.c and handed the BSP
+# CR3 + the AP stack + the kernel GDTR/IDTR images via its param block.
+if [ -n "$SMP_SOURCES" ]; then
+    assemble kernel/arch/x86_64/ap_trampoline.asm asm_ap_trampoline
+fi
 
 echo ""
 echo "[2/3] Compiling kernel..."
@@ -120,6 +140,13 @@ compile kernel/arch/x86_64/madt.c            c_madt
 # APIC ID/version only -- PIC/IOAPIC/timer/IDT untouched, single-core preserved).
 if [ -n "$SMP_SOURCES" ]; then
     compile kernel/arch/x86_64/lapic.c       c_lapic
+    # SMP brick 3 (GATED by SMP=1 -> -DSMP_FOUNDATION): the AP-start driver.
+    # Stages the trampoline, sends INIT-SIPI-SIPI to CPU 1, and waits on a
+    # bounded TSC deadline polling a shared memory flag (try_start_cpu1). Defines
+    # the AP's 64-bit entry ap_main() (marks online + cli;hlt). Self-contained
+    # like madt.c -- it does NOT define cpu_id(), so there is no collision with
+    # stubs.c::cpu_id() (smp.c stays uncompiled). Only built for the SMP kernel.
+    compile kernel/arch/x86_64/ap_boot.c     c_ap_boot
 fi
 compile kernel/drivers/serial.c              c_serial
 compile kernel/drivers/pit.c                 c_pit

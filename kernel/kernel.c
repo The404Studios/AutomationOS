@@ -416,6 +416,33 @@ void kernel_main(void* raw_info) {
         kprintf("[SMP] LAPIC timer calibrated: %lu Hz (PIT remains system tick)\n",
                 (unsigned long)hz);
     }
+
+    /* SMP brick 3 (GATED, SMP=1 build only): bring ONE application processor
+     * (CPU 1) online as a bare HEARTBEAT. It reaches long mode, marks itself
+     * online, and hlts forever. NO scheduling, NO AP timer, NO per-CPU runqueue,
+     * NO migration -- those are later bricks. The BSP keeps booting normally.
+     *
+     * THE HARD RULE dominates: AP failure must NEVER stop or hang the BSP boot.
+     * try_start_cpu1() waits on a BOUNDED ~100 ms TSC deadline polling a shared
+     * MEMORY flag (never an infinite spin, never a panic, never MMIO-polling). On
+     * timeout it returns 0 and we log + continue single-core. Either way we fall
+     * through and finish booting the BSP. madt_count_cpus() (brick 0) gives the
+     * count; we only attempt the AP when the firmware reports >= 2 CPUs. */
+    {
+        extern int try_start_cpu1(void);
+        int smp_cpu_count = madt_count_cpus();
+        if (smp_cpu_count >= 2) {
+            if (try_start_cpu1()) {
+                kprintf("[SMP] CPU 1 online\n");        /* AP is now hlt-parked */
+            } else {
+                kprintf("[SMP] AP failed to start, continuing single-core\n");
+            }
+        } else {
+            kprintf("[SMP] single-core (firmware reports %d cpu); no AP to start\n",
+                    smp_cpu_count);
+        }
+        /* Fall through and finish booting the BSP normally -- no matter what. */
+    }
 #endif
 
     /* Initialize framebuffer if available */

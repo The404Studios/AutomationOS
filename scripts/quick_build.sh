@@ -85,6 +85,11 @@ compile kernel/stubs.c                       c_stubs
 compile kernel/arch/x86_64/gdt.c             c_gdt
 compile kernel/arch/x86_64/idt.c             c_idt
 compile kernel/arch/x86_64/paging.c          c_paging
+# SMP brick 0: standalone READ-ONLY ACPI MADT CPU enumerator. Defines only the
+# new symbol madt_count_cpus(); reuses acpi.h struct layouts (no symbols). Does
+# NOT pull in either acpi.c or smp.c -- system stays single-core, this only logs
+# "SMP: detected N cpus" so the kernel is AWARE of the core count.
+compile kernel/arch/x86_64/madt.c            c_madt
 compile kernel/drivers/serial.c              c_serial
 compile kernel/drivers/pit.c                 c_pit
 compile kernel/drivers/ps2.c                 c_ps2

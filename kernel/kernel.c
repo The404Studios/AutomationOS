@@ -332,6 +332,13 @@ void kernel_main(void* raw_info) {
     extern void pci_init(void);
     pci_init();
 
+    /* SMP brick 0: READ-ONLY ACPI MADT enumeration. Makes the kernel AWARE of
+     * how many CPUs the firmware reports. The system stays SINGLE-CORE -- this
+     * only logs the count (no AP bring-up). The identity map covers low ACPI
+     * memory at this point (boot.asm + the VMM extension above). */
+    extern int madt_count_cpus(void);
+    kprintf("[SMP] detected %d cpus\n", madt_count_cpus());
+
     /* Initialize framebuffer if available */
     if (boot_info->framebuffer_addr && boot_info->framebuffer_width > 0) {
         kprintf("[KERNEL] Initializing framebuffer...\n");

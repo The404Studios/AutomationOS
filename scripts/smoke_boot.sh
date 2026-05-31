@@ -38,7 +38,8 @@ MIN_PIDS=4
 # Raised to accommodate the many short-lived boot self-tests (crypto/libs/coreutils
 # each spawn, run a KAT, and exit) plus forktest's 20 forks -- all legitimate exits.
 # +5 for the new short-lived webapitest probe.
-MAX_FREEING=180
+# +5 for threadtest (4 threads + the main process all exit -> legitimate frees).
+MAX_FREEING=185
 
 # ── Colour helpers ─────────────────────────────────────────────────────────
 RED='\033[0;31m'
@@ -674,6 +675,25 @@ check_fork_cow() {
     fi
 }
 
+check_thread() {
+    # init spawns sbin/threadtest, which creates 4 REAL THREADS that share the
+    # parent's address space but have independent stacks + FPU state, joins them,
+    # and verifies: (1) a shared global counter accumulated every thread's atomic
+    # add (shared memory), (2) each result[i]==i written via a per-thread stack
+    # local (independent stacks), (3) each result_f[i] matches its SSE value
+    # (independent FPU across context switches). "THREADTEST: PASS" gates threads.
+    if grep -qF 'THREADTEST: PASS' "$LOG"; then
+        pass "real threads verified ($(grep -F 'THREADTEST: shared_counter=' "$LOG" | head -1 | sed 's/^.*THREADTEST: //'))"
+        return 0
+    elif grep -qF 'THREADTEST: FAIL' "$LOG"; then
+        fail "threads broken: $(grep -F 'THREADTEST: FAIL' "$LOG" | head -1)"
+        return 1
+    else
+        fail "threadtest did not report (thread create/join hung or never ran)"
+        return 1
+    fi
+}
+
 check_browser_wave() {
     # 22-agent browser wave: init spawns the per-layer selftests + browser2.
     # Each app prints "<NAME>: PASS" or "<NAME>: FAIL ..." and exits.
@@ -743,6 +763,7 @@ run_checks() {
         check_no_segment_too_large
         check_no_crash_loop
         check_fork_cow
+        check_thread
         check_heap_extend
         check_aibroker
         check_tools

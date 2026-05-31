@@ -166,3 +166,33 @@ void process_enter_usermode_trampoline(void) {
 
     enter_usermode(entry, stack, cr3);
 }
+
+// First-run trampoline for a THREAD (created via SYS_THREAD_CREATE).
+// Mirrors process_enter_usermode_trampoline, but enters via enter_usermode_thread
+// so the thread starts executing entry(arg) with RDI = arg (SysV first argument).
+// context_switch_asm `ret`s into here on the thread's first dispatch, exactly as
+// for a brand-new process (RESUME_CRETURN).
+void thread_enter_usermode_trampoline(void) {
+    process_t* t = process_get_current();
+    if (!t) {
+        kernel_panic("Thread trampoline: no current process");
+    }
+
+    uint64_t entry = t->user_entry;
+    uint64_t stack = t->user_rsp;
+    uint64_t cr3   = t->context.cr3;
+    uint64_t arg   = t->thread_arg;
+
+    kprintf("[THREAD] TID %d entering usermode: entry=0x%016lx stack=0x%016lx arg=0x%lx\n",
+            t->pid, entry, stack, arg);
+
+    uint64_t kstack_top = (uint64_t)t->kernel_stack + KERNEL_STACK_SIZE;
+    tss_set_kernel_stack(kstack_top);
+
+    extern uint64_t kernel_rsp_save;
+    kernel_rsp_save = kstack_top;
+
+    extern void enter_usermode_thread(uint64_t entry, uint64_t stack,
+                                      uint64_t cr3, uint64_t arg);
+    enter_usermode_thread(entry, stack, cr3, arg);
+}

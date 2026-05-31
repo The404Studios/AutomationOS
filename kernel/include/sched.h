@@ -16,6 +16,7 @@ struct namespace_container;
 struct rlimit_container;
 struct seccomp_filter;
 struct capability_set;
+struct process;
 
 // Process states
 typedef enum {
@@ -25,6 +26,22 @@ typedef enum {
     PROCESS_BLOCKED,
     PROCESS_TERMINATED
 } process_state_t;
+
+// ---------------------------------------------------------------------------
+// wait_object_t — the single blocking primitive (engine in waitqueue.c).
+// The full STRUCT layout is defined HERE (early) so process_t can embed a
+// join wait_object BY VALUE (for threads). The detailed documentation, the
+// WAIT_OBJECT_INITIALIZER macro, and the operations API live further below
+// (right above the wait_queue_t wrapper) — only the struct definition is
+// hoisted. It references only spinlock_t (spinlock.h, included above) and
+// struct process (forward-declared above), both available at this point.
+// ---------------------------------------------------------------------------
+typedef struct wait_object {
+    struct process* waiters;  // intrusive FIFO head (via process_t.wait_next)
+    struct process* tail;     // FIFO tail for O(1) append (preserves wake order)
+    spinlock_t lock;          // protects the waiter list
+    int initialized;          // 0 => zero-initialized; lazily inited on first use
+} wait_object_t;
 
 // CPU context saved during context switch (must be 16-byte aligned)
 //
@@ -203,6 +220,52 @@ typedef struct process {
     // process_create(). Appended at the END to keep the asm context offset valid.
     struct wait_object* wait_on;     // wait_object this process is parked on (or NULL)
     struct process* wait_next;       // intrusive waiter-list link within wait_on
+
+    // ----------------------------------------------------------------------
+    // THREADS (real threads sharing the parent's address space).
+    // A thread is a process_t that SHARES its parent's CR3 (context.cr3) but has
+    // its own kernel_stack, user stack, registers, and FPU state. The three
+    // fields below are what make CR3 lifetime + arg-passing + join correct.
+    // All appended at the END so the assembler's hardcoded PROCESS_CONTEXT_OFFSET
+    // (16) and cpu_context_t offsets stay valid. memset-zeroed by process_create.
+    // ----------------------------------------------------------------------
+    //
+    // as_refcount: ADDRESS-SPACE refcount. A small heap-allocated int* SHARED by
+    // every process_t that runs on the same CR3 (the main process + all its
+    // threads). process_create() allocates a FRESH one initialized to 1 (a normal
+    // process / a fork child each owns its address space). thread_create() does
+    // NOT call paging_create_address_space(): it copies the parent's context.cr3
+    // AND its as_refcount pointer, then atomically increments *as_refcount. On
+    // teardown (process_unref) we atomically decrement *as_refcount and only call
+    // paging_destroy_address_space() when it reaches 0 — i.e. the LAST user of the
+    // CR3 tears it down. This is the single invariant that prevents freeing page
+    // tables out from under a still-running sibling thread (instant triple-fault).
+    int* as_refcount;
+
+    // tgid: THREAD-GROUP ID. For a normally-created process tgid == pid (it is its
+    // own group leader). For a thread, tgid == the creating process's tgid, so all
+    // threads of one process share a tgid. Used as the join permission check
+    // (a thread may only join another thread in the SAME group).
+    uint32_t tgid;
+
+    // is_thread: 1 for a thread created via SYS_THREAD_CREATE, 0 otherwise. Lets
+    // teardown / accounting distinguish a thread from a process without inferring
+    // it from tgid.
+    int is_thread;
+
+    // Thread entry argument: thread_create stashes the user `arg` here; the
+    // thread's first-run trampoline loads it into RDI so the thread begins
+    // executing entry(arg) per the SysV calling convention.
+    uint64_t thread_arg;
+
+    // Thread return value (set by SYS_THREAD_EXIT) and the wait_object a joiner
+    // blocks on (signalled when this thread exits). thread_join copies out
+    // thread_retval after the join wait_object wakes it. The wait_object_t struct
+    // is hoisted to the top of this header so it can be embedded BY VALUE here.
+    // Explicitly initialized by thread_create (wait_object_init); zero-init is
+    // also fine (wo_ensure_init lazily inits a zeroed object).
+    int thread_retval;
+    wait_object_t thread_join_wo;
 } process_t;
 
 // Global pointer to current process (for PE loader and other subsystems)
@@ -212,6 +275,25 @@ extern process_t* current_process;
 void process_init(void);
 process_t* process_create(const char* name, void* entry_point);
 void process_destroy(process_t* proc);
+
+// ----------------------------------------------------------------------------
+// Threads (kernel/core/sched/process.c)
+// ----------------------------------------------------------------------------
+// Create a THREAD of `parent`: a new schedulable process_t that SHARES parent's
+// address space (context.cr3 + as_refcount, refcount incremented) but has its
+// OWN kernel stack, user stack (caller-supplied), registers, and FPU state. The
+// thread begins executing entry(arg) in ring 3 (RDI = arg, SysV). tgid is
+// inherited from the parent so all threads of a process share it. Returns the
+// new thread's PCB (state PROCESS_READY, NOT yet added to the scheduler — caller
+// adds it), or NULL on failure. Does NOT call paging_create_address_space().
+process_t* thread_create(process_t* parent, uint64_t entry, uint64_t arg,
+                         uint64_t user_stack);
+
+// First-run trampoline for a THREAD (kernel/core/usermode.c). Mirrors
+// process_enter_usermode_trampoline but ALSO passes thread_arg in RDI so the
+// thread enters entry(arg). context_switch_asm `ret`s here on the thread's first
+// dispatch (RESUME_CRETURN), exactly like a normal new process.
+void thread_enter_usermode_trampoline(void);
 void process_ref(process_t* proc);      // Increment reference count
 void process_unref(process_t* proc);    // Decrement reference count (frees if 0)
 void process_on_terminate(process_t* child);  // wake parent's waitpid + drain own wait queue
@@ -355,13 +437,10 @@ void irq0_preempt(void);
 // list (sleep_list_push) with wake_deadline set, so whichever of {signal,
 // timeout} happens first wins; the other linkage is cleaned up on resume (or by
 // the timer scan, which unlinks the sleeper from its wait_object too).
-typedef struct wait_object {
-    struct process* waiters;  // intrusive FIFO head (via process_t.wait_next)
-    struct process* tail;     // FIFO tail for O(1) append (preserves wake order)
-    spinlock_t lock;          // protects the waiter list
-    int initialized;          // 0 => zero-initialized; lazily inited on first use
-} wait_object_t;
-
+//
+// NOTE: the wait_object_t STRUCT is defined near the TOP of this header (hoisted
+// so process_t can embed a join object by value); only the macro + the API are
+// declared here.
 #define WAIT_OBJECT_INITIALIZER  { NULL, NULL, { 0, 0xFFFFFFFF, NULL }, 1 }
 
 void wait_object_init(wait_object_t* wo);

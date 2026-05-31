@@ -121,6 +121,13 @@ void _start(void) {
     print("[INIT] Spawning forktest...\n");
     spawn("sbin/forktest");
 
+    // real-threads probe: spawns 4 threads that SHARE this process's address
+    // space but have independent stacks + FPU state, joins them, and prints
+    // THREADTEST: PASS/FAIL. Proves shared memory, independent stacks, and
+    // independent FPU across context switches.
+    print("[INIT] Spawning threadtest...\n");
+    spawn("sbin/threadtest");
+
     // argv handoff probe: verifies exec.c's argv frame + crt0 reach userspace
     // (prints ARGVTEST: PASS with argv[0] = its spawn path).
     print("[INIT] Spawning argvtest...\n");

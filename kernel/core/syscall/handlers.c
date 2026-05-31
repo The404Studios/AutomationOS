@@ -313,6 +313,162 @@ int64_t sys_fork(uint64_t arg1, uint64_t arg2, uint64_t arg3,
     return (int64_t)child->pid;
 }
 
+// ── SYS_THREAD_CREATE ─────────────────────────────────────────────────
+// Create a thread that SHARES the caller's address space (CR3) but has its own
+// kernel stack, user stack, registers and FPU state. The thread begins executing
+// entry(arg) in ring 3. Returns the new tid (== the thread's pid), or a negative
+// errno. The heavy lifting (CR3/as_refcount sharing, kernel stack, trampoline
+// setup) is in thread_create(); here we validate args and schedule it.
+//
+// Args: (entry, arg, user_stack). user_stack is the TOP of a caller-allocated
+// stack (it grows down); thread_create 16-aligns it. We do a light sanity check
+// that entry + user_stack are in the user half — a thread runs the caller's own
+// code/data, so we cannot fully validate them, but we reject obvious garbage.
+int64_t sys_thread_create(uint64_t entry, uint64_t arg, uint64_t user_stack,
+                          uint64_t arg4, uint64_t arg5, uint64_t arg6) {
+    (void)arg4; (void)arg5; (void)arg6;
+
+    process_t* caller = process_get_current();
+    if (!caller) {
+        return ESRCH;
+    }
+    if (entry == 0 || entry >= USER_SPACE_END) {
+        return EINVAL;
+    }
+    if (user_stack == 0 || user_stack >= USER_SPACE_END) {
+        return EINVAL;
+    }
+
+    process_t* t = thread_create(caller, entry, arg, user_stack);
+    if (!t) {
+        return ENOMEM;
+    }
+
+    kprintf("[SYSCALL] sys_thread_create: tid=%d tgid=%d entry=0x%lx arg=0x%lx "
+            "stack=0x%lx (creator '%s' pid=%d)\n",
+            t->pid, t->tgid, entry, arg, user_stack, caller->name, caller->pid);
+
+    // Make the thread schedulable. (thread_create published it into the process
+    // table but did NOT enqueue it — mirror exec/fork which enqueue here.)
+    scheduler_add_process(t);
+
+    return (int64_t)t->pid;
+}
+
+// ── SYS_THREAD_EXIT ───────────────────────────────────────────────────
+// Terminate the calling thread: record its return value, wake any joiner blocked
+// on its join wait_object, mark it TERMINATED, and switch away. The AS-refcount
+// is dropped (and the CR3 torn down iff this was the last user) later, in
+// process_unref(), when the joiner reaps the PCB — exactly the zombie model
+// waitpid uses. Re-uses the existing terminate plumbing (process_on_terminate +
+// scheduler_remove_process + schedule), so a thread with no joiner is reaped by
+// its parent's waitpid path just like any process. Does not return.
+int64_t sys_thread_exit(uint64_t retval, uint64_t arg2, uint64_t arg3,
+                        uint64_t arg4, uint64_t arg5, uint64_t arg6) {
+    (void)arg2; (void)arg3; (void)arg4; (void)arg5; (void)arg6;
+
+    process_t* current = process_get_current();
+    if (!current) {
+        kernel_panic("sys_thread_exit called with no current process");
+        return ESRCH;
+    }
+
+    kprintf("[SYSCALL] sys_thread_exit: tid=%d (tgid=%d) exiting, retval=%d\n",
+            current->pid, current->tgid, (int)retval);
+
+    // Record the return value for the joiner BEFORE marking TERMINATED, so a
+    // joiner woken by the signal below reads the final value.
+    current->thread_retval = (int)retval;
+    current->exit_status = (int)retval;  // also expose via waitpid
+
+    current->state = PROCESS_TERMINATED;
+
+    // Wake any thread blocked in sys_thread_join on THIS thread's join object.
+    // wait_object_signal wakes-all (a thread can in principle be joined by one,
+    // but waking all is harmless: a late joiner just finds it TERMINATED).
+    wait_object_signal(&current->thread_join_wo, 1);
+
+    // Also wake a parent blocked in waitpid() and drain our own wait queue.
+    process_on_terminate(current);
+
+    // Remove from the scheduler and switch away. schedule() drops the scheduler's
+    // "current" reference for a TERMINATED process; the PCB then lives on as a
+    // zombie until the joiner (or parent waitpid) reaps it, which is where
+    // process_unref() finally runs the AS-refcount-gated CR3 teardown.
+    scheduler_remove_process(current);
+    schedule();
+
+    // Not reached.
+    return ESUCCESS;
+}
+
+// ── SYS_THREAD_JOIN ───────────────────────────────────────────────────
+// Block until the target thread (same thread group) exits, copy out its return
+// value, and reap it. Returns 0 on success, or a negative errno:
+//   ESRCH  - no such tid
+//   EPERM  - target is not in the caller's thread group (tgid mismatch)
+//   EINVAL - target is the caller itself, or not a thread
+int64_t sys_thread_join(uint64_t tid, uint64_t retval_out, uint64_t arg3,
+                        uint64_t arg4, uint64_t arg5, uint64_t arg6) {
+    (void)arg3; (void)arg4; (void)arg5; (void)arg6;
+
+    process_t* caller = process_get_current();
+    if (!caller) {
+        return ESRCH;
+    }
+    if ((uint32_t)tid == caller->pid) {
+        return EINVAL;  // a thread cannot join itself
+    }
+
+    // process_get_by_pid returns the target WITH A REFERENCE HELD, which keeps
+    // its PCB (and its join wait_object) alive across our block below.
+    process_t* target = process_get_by_pid((uint32_t)tid);
+    if (!target) {
+        return ESRCH;
+    }
+
+    // Permission: only threads of the SAME group may join each other.
+    if (target->tgid != caller->tgid) {
+        process_unref(target);
+        return EPERM;
+    }
+
+    // Block until the target has terminated. The cooperative scheduler makes the
+    // "check TERMINATED then block" sequence atomic from our perspective (the
+    // target can't run between them), so there is no lost-wakeup race: if it is
+    // already TERMINATED we skip the block entirely; otherwise we block on its
+    // join object and thread_exit's wait_object_signal wakes us.
+    while (target->state != PROCESS_TERMINATED) {
+        (void)wait_object_block(&target->thread_join_wo, 0);
+        // Re-loop to re-check the state (defensive against spurious wakeups).
+    }
+
+    // Copy out the thread's return value, if requested.
+    if (retval_out) {
+        int rv = target->thread_retval;
+        if (copy_to_user((void*)retval_out, &rv, sizeof(rv)) != COPY_SUCCESS) {
+            process_unref(target);
+            return EFAULT;
+        }
+    }
+
+    int joined_tid = (int)target->pid;
+
+    // Reap the zombie — IDENTICAL discipline to sys_waitpid's reap. We still hold
+    // the get_by_pid reference in `target`; we DO NOT drop it separately. Orphan
+    // it first so a concurrent parent waitpid scan can't also try to reap it, then
+    // process_destroy() does scheduler_remove_process (no-op for a terminated,
+    // off-queue thread) + a single process_unref that mirrors waitpid. The final
+    // process_unref inside the teardown runs the AS-refcount-gated CR3 teardown,
+    // tearing the SHARED address space down only if this thread was its last user.
+    target->parent_pid = 0;
+    process_destroy(target);
+
+    kprintf("[SYSCALL] sys_thread_join: tid=%d joined by pid=%d\n",
+            joined_tid, caller->pid);
+    return 0;
+}
+
 // SYS_READ - Read from file descriptor
 int64_t sys_read(uint64_t fd, uint64_t buf, uint64_t count,
                  uint64_t arg4, uint64_t arg5, uint64_t arg6) {

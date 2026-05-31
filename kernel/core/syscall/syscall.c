@@ -119,6 +119,11 @@ void syscall_init(void) {
     // Futex (fast userspace mutex)
     syscall_table[SYS_FUTEX] = sys_futex;
 
+    // Threads (real threads sharing the caller's address space)
+    syscall_table[SYS_THREAD_CREATE] = sys_thread_create;
+    syscall_table[SYS_THREAD_EXIT]   = sys_thread_exit;
+    syscall_table[SYS_THREAD_JOIN]   = sys_thread_join;
+
     // Zero-copy file transfer
     syscall_table[SYS_SENDFILE] = sys_sendfile;
 

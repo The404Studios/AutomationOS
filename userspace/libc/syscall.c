@@ -148,3 +148,20 @@ int setpriority(int which, int who, int prio) {
 long sendfile(int out_fd, int in_fd, off_t* offset, size_t count) {
     return syscall6(SYS_SENDFILE, out_fd, in_fd, (long)offset, count, 0, 0);
 }
+
+// Threads -------------------------------------------------------------------
+// entry runs as entry(arg) on stack_top (the kernel 16-aligns it). The entry
+// function must end by calling thread_exit() (no per-thread crt0 here).
+int thread_create(void (*entry)(void*), void* arg, void* stack_top) {
+    return (int)syscall6(SYS_THREAD_CREATE, (long)entry, (long)arg,
+                         (long)stack_top, 0, 0, 0);
+}
+
+void thread_exit(int retval) {
+    syscall6(SYS_THREAD_EXIT, retval, 0, 0, 0, 0, 0);
+    while (1) { }  // not reached
+}
+
+int thread_join(int tid, int* retval_out) {
+    return (int)syscall6(SYS_THREAD_JOIN, tid, (long)retval_out, 0, 0, 0, 0);
+}

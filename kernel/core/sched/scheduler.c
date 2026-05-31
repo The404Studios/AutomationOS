@@ -1029,15 +1029,28 @@ void schedule_from_irq(interrupt_frame_t* frame) {
     //    RESUME_IRETQ like any preempted ring-3 task. Only never-run userspace
     //    procs match; a yielded/blocked process has rip != trampoline and stays
     //    on the reject/defer path below, untouched.
+    // Detect a never-run task by its trampoline RIP. TWO trampolines qualify:
+    //   * process_enter_usermode_trampoline — a brand-new process/fork child.
+    //   * thread_enter_usermode_trampoline   — a brand-new THREAD (SYS_THREAD_CREATE),
+    //     which additionally needs RDI = thread_arg at first ring-3 entry (SysV
+    //     entry(arg)). Both expect the cooperative path to `ret` into the
+    //     trampoline; a non-yielding CPU hog never enters it, so the same first-
+    //     dispatch synth that rescues starved new processes must also rescue
+    //     starved new threads. We branch on which trampoline it is to decide RDI.
     extern void process_enter_usermode_trampoline(void);
+    extern void thread_enter_usermode_trampoline(void);
+    int is_thread_trampoline =
+        (next->context.rip == (uint64_t)thread_enter_usermode_trampoline);
     if (next->resume_mode != RESUME_IRETQ &&
-        next->context.rip == (uint64_t)process_enter_usermode_trampoline) {
+        (next->context.rip == (uint64_t)process_enter_usermode_trampoline ||
+         is_thread_trampoline)) {
         // Causal-proof trace (gated: runs only in the PREEMPTIVE build, since
         // schedule_from_irq is the IRQ path). One line per never-run process the
         // first time the timer bootstraps it into ring 3 -- so the stress log
         // shows a first-dispatch for each previously-starved burner, then its
         // heartbeats. Naturally once-per-process; rate-limit/remove once stable.
-        kprintf("[SCHED] first-dispatch pid=%d via irq iretq\n", next->pid);
+        kprintf("[SCHED] first-dispatch pid=%d via irq iretq%s\n", next->pid,
+                is_thread_trampoline ? " (thread)" : "");
 
         // Save the OUTGOING current exactly as the RESUME_IRETQ path does:
         // it was interrupted in ring 3, so an iretq frame save is correct.
@@ -1066,6 +1079,11 @@ void schedule_from_irq(interrupt_frame_t* frame) {
         frame->rflags = 0x202;             // IF=1, reserved bit 1
         frame->rsp    = next->user_rsp;    // user stack
         frame->ss     = 0x1B;              // ring-3 user data selector (RPL=3)
+        // A thread enters entry(arg) per SysV: deliver thread_arg in RDI. (For a
+        // process first-dispatch this stays 0, matching the cooperative path.)
+        if (is_thread_trampoline) {
+            frame->rdi = next->thread_arg;
+        }
 
         // Make the incoming process current; it is now ring-3 RESUME_IRETQ.
         next->resume_mode = RESUME_IRETQ;

@@ -71,6 +71,9 @@
 #define SYS_BIND        76 // bind socket to local port/addr
 #define SYS_LISTEN      77 // mark socket as passive (server)
 #define SYS_ACCEPT      78 // accept incoming connection
+#define SYS_THREAD_CREATE 79 // create a thread sharing the caller's address space
+#define SYS_THREAD_EXIT   80 // terminate the calling thread, store retval, wake joiner
+#define SYS_THREAD_JOIN   81 // block until target thread exits; copy out its retval
 #define SYS_NET_INFO    59 // query IP/MAC/link state
 #define SYS_PROC_QUERY  60 // procapi: rich per-process detail
 #define SYS_PROC_CTL    61 // procapi: suspend/resume/kill/setprio
@@ -257,6 +260,17 @@ int64_t sys_blk_write(uint64_t lba, uint64_t count, uint64_t ubuf,
 // Futex (fast userspace mutex) syscall
 int64_t sys_futex(uint64_t uaddr, uint64_t op, uint64_t val,
                   uint64_t timeout, uint64_t uaddr2, uint64_t val3);
+
+// Thread syscalls (real threads sharing the caller's address space).
+//   sys_thread_create(entry, arg, user_stack) -> tid (== new thread's pid)
+//   sys_thread_exit(retval)                    -> does not return
+//   sys_thread_join(tid, retval_out)           -> 0 on success
+int64_t sys_thread_create(uint64_t entry, uint64_t arg, uint64_t user_stack,
+                          uint64_t arg4, uint64_t arg5, uint64_t arg6);
+int64_t sys_thread_exit(uint64_t retval, uint64_t arg2, uint64_t arg3,
+                        uint64_t arg4, uint64_t arg5, uint64_t arg6);
+int64_t sys_thread_join(uint64_t tid, uint64_t retval_out, uint64_t arg3,
+                        uint64_t arg4, uint64_t arg5, uint64_t arg6);
 
 // Zero-copy file-to-socket transfer
 int64_t sys_sendfile(uint64_t out_fd, uint64_t in_fd, uint64_t offset_ptr,

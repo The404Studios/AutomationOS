@@ -162,6 +162,29 @@ process_t* process_create(const char* name, void* entry_point) {
     PROC_LOG("[PROCESS] Created address space CR3=0x%016lx for PID %d\n",
             proc->context.cr3, pid);
 
+    // ADDRESS-SPACE REFCOUNT (threads): a normally-created process (this path is
+    // also taken by fork, which gets a FRESH address space) is the sole user of
+    // its CR3, so start a fresh as_refcount at 1. thread_create() shares this
+    // CR3 + this same as_refcount pointer and bumps it; process_unref() only
+    // tears the CR3 down when it returns to 0. If the small allocation fails we
+    // must abort cleanly (a NULL as_refcount would make teardown undecidable).
+    proc->as_refcount = (int*)kmalloc(sizeof(int));
+    if (!proc->as_refcount) {
+        PROC_LOG("[PROCESS] Failed to allocate as_refcount for PID %d\n", pid);
+        vmm_as_release(proc->context.cr3);
+        paging_destroy_address_space(proc->context.cr3);
+        kfree(proc->kernel_stack);
+        kfree(proc);
+        free_pid(pid);
+        return NULL;
+    }
+    *proc->as_refcount = 1;
+
+    // A normally-created process is its OWN thread-group leader: tgid == pid.
+    // thread_create() overrides tgid to the creator's tgid for threads.
+    proc->tgid = pid;
+    proc->is_thread = 0;
+
     // TODO: Setup user stack once we have userspace
     proc->user_stack = NULL;
 
@@ -202,6 +225,117 @@ process_t* process_create(const char* name, void* entry_point) {
     PROC_LOG("[PROCESS]   Namespaces: %p\n", proc->namespaces);
 
     return proc;
+}
+
+// ===========================================================================
+// thread_create — a schedulable task that SHARES the parent's address space
+// ===========================================================================
+// A thread is a process_t that is identical to a forked process EXCEPT:
+//   (1) it does NOT call paging_create_address_space(): it copies the parent's
+//       context.cr3 and SHARES the parent's as_refcount (atomically bumped), so
+//       the page tables stay alive until the LAST thread/process on them exits.
+//   (2) it has its OWN kernel stack, user stack (caller-supplied), GP regs and
+//       FPU state — only the address space is shared.
+//   (3) it begins executing entry(arg) in ring 3: its first dispatch goes
+//       through thread_enter_usermode_trampoline (RESUME_CRETURN, exactly like a
+//       new process), which loads thread_arg into RDI before enter_usermode_thread.
+// Returns the new thread PCB (READY, NOT yet scheduled — caller schedules it), or
+// NULL on failure. The caller (sys_thread_create) holds the parent ref.
+process_t* thread_create(process_t* parent, uint64_t entry, uint64_t arg,
+                         uint64_t user_stack) {
+    if (!parent || !parent->context.cr3 || !parent->as_refcount) {
+        return NULL;
+    }
+
+    uint32_t pid = allocate_pid();
+    if (pid == 0) {
+        PROC_LOG("[THREAD] No free PID — process table full\n");
+        return NULL;
+    }
+
+    process_t* t = (process_t*)kmalloc(sizeof(process_t));
+    if (!t) {
+        free_pid(pid);
+        return NULL;
+    }
+    memset(t, 0, sizeof(process_t));
+
+    t->pid = pid;
+    t->parent_pid = parent->pid;
+    t->state = PROCESS_CREATED;
+    t->resume_mode = RESUME_CRETURN;     // first run via the trampoline `ret` path
+    t->uid = parent->uid;
+    t->gid = parent->gid;
+    t->time_slice = SCHED_QUANTUM_TICKS;
+    t->total_time = 0;
+    t->priority = parent->priority;      // inherit scheduling class
+    t->next = NULL;
+    t->ref_count = 1;
+    t->vma_list = NULL;                  // thread's own (empty) PCB VMA list; the
+                                         // real mappings live in the shared CR3.
+
+    // Name: "<parent>-thr" (truncated). Purely cosmetic.
+    {
+        size_t k = 0;
+        while (parent->name[k] && k < 58) { t->name[k] = parent->name[k]; k++; }
+        const char* suf = "-thr";
+        for (int s = 0; suf[s] && k < 63; s++) t->name[k++] = suf[s];
+        t->name[k] = '\0';
+    }
+
+    // Own kernel stack (8KB, kmalloc'd) — independent from the parent's.
+    t->kernel_stack = kmalloc(KERNEL_STACK_SIZE);
+    if (!t->kernel_stack) {
+        PROC_LOG("[THREAD] Failed to allocate kernel stack for TID %d\n", pid);
+        kfree(t);
+        free_pid(pid);
+        return NULL;
+    }
+
+    // SHARE the parent's address space: same CR3, same as_refcount, +1 owner.
+    // This is the crux of "a thread shares its parent's address space" and of the
+    // teardown-safety contract: the CR3 now has (at least) two users, and
+    // process_unref() will only destroy it when this count returns to 0.
+    memset(&t->context, 0, sizeof(cpu_context_t));
+    t->context.cr3 = parent->context.cr3;
+    t->as_refcount = parent->as_refcount;
+    __atomic_add_fetch(t->as_refcount, 1, __ATOMIC_SEQ_CST);
+
+    // Thread group: threads of a process share the parent's tgid.
+    t->tgid = parent->tgid;
+    t->is_thread = 1;
+
+    // Stash the entry argument; the trampoline loads it into RDI (SysV: entry(arg)).
+    t->thread_arg = arg;
+    // 16-align the user stack pointer (ABI: RSP%16==0 at the iretq into entry).
+    t->user_entry = entry;
+    t->user_rsp = user_stack & ~0xFULL;
+
+    // First-run kernel context: context_switch_asm `ret`s into the thread
+    // trampoline (RESUME_CRETURN), which reads user_entry/user_rsp/thread_arg/cr3
+    // from this PCB and enter_usermode_thread()s to ring 3 with RDI = arg.
+    extern void thread_enter_usermode_trampoline(void);
+    t->context.rip = (uint64_t)thread_enter_usermode_trampoline;
+    uint64_t kstack_top = (uint64_t)t->kernel_stack + KERNEL_STACK_SIZE;
+    t->context.rsp = kstack_top - 8;     // room for the trampoline's return addr
+    t->context.rflags = 0x202;           // IF=1
+
+    // Initialize the join wait_object so a joiner can block on it.
+    wait_object_init(&t->thread_join_wo);
+
+    t->state = PROCESS_READY;
+
+    // Publish into the process table so process_get_by_pid()/join can find it.
+    spin_lock(&process_table_lock);
+    process_table[pid] = t;
+    spin_unlock(&process_table_lock);
+
+    PROC_LOG("[THREAD] Created thread TID %d (tgid %d) sharing CR3=0x%016lx "
+             "entry=0x%lx arg=0x%lx ustack=0x%lx (AS refs now %d)\n",
+             t->pid, t->tgid, t->context.cr3, entry, arg, t->user_rsp,
+             *t->as_refcount);
+
+    return t;
 }
 
 // Increment process reference count
@@ -287,8 +421,22 @@ void process_unref(process_t* proc) {
             kfree(proc->kernel_stack);  // kernel_stack is kmalloc'd, not a PMM page
         }
 
-        // Free page directory (CR3) - destroy user-space page tables
-        if (proc->context.cr3) {
+        // Free page directory (CR3) - destroy user-space page tables.
+        //
+        // THREADS / ADDRESS-SPACE LIFETIME (critical): the CR3 may be SHARED by
+        // several process_t (the main process + its threads), all pointing at the
+        // SAME as_refcount. We must tear the address space down EXACTLY ONCE, when
+        // the LAST user exits — freeing the page tables while a sibling thread is
+        // still running on them is an instant triple-fault. So we atomically
+        // decrement *as_refcount here and only destroy the CR3 (and free the
+        // refcount cell) when it hits 0. A NULL as_refcount can only happen for a
+        // PCB that never finished process_create(); treat it as "last owner".
+        int last_user = 1;
+        if (proc->as_refcount) {
+            last_user = (__atomic_sub_fetch(proc->as_refcount, 1, __ATOMIC_SEQ_CST) == 0);
+        }
+
+        if (proc->context.cr3 && last_user) {
             uint64_t kernel_cr3 = read_cr3() & ~0xFFF;  // Mask off PCID bits
             uint64_t proc_cr3 = proc->context.cr3 & ~0xFFF;
 
@@ -299,7 +447,14 @@ void process_unref(process_t* proc) {
                 vmm_as_release(proc->context.cr3);  // free the mmap cursor slot before CR3 dies
                 paging_destroy_address_space(proc->context.cr3);
             }
+            // Free the shared as_refcount cell now that the last user is gone.
+            if (proc->as_refcount) {
+                kfree(proc->as_refcount);
+            }
         }
+        // A non-last thread leaves the CR3 and as_refcount intact for the
+        // survivors; it must NOT touch either (no vmm_as_release, no free).
+        proc->as_refcount = NULL;  // this PCB no longer references the cell
 
         // TODO: Free user stack
 

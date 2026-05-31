@@ -25,6 +25,9 @@ typedef unsigned long size_t;
 #define SYS_MAP_FILE 17
 #define SYS_KILL    26
 #define SYS_NICE    27
+#define SYS_THREAD_CREATE 79
+#define SYS_THREAD_EXIT   80
+#define SYS_THREAD_JOIN   81
 #define SYS_GETPRIORITY 28
 #define SYS_SETPRIORITY 29
 #define SYS_OPENDIR 30
@@ -96,5 +99,12 @@ int setpriority(int which, int who, int prio);
 
 // Zero-copy file transfer
 long sendfile(int out_fd, int in_fd, off_t* offset, size_t count);
+
+// Threads (real kernel threads sharing the caller's address space). entry runs
+// as entry(arg) on the supplied stack TOP; entry MUST end by calling
+// thread_exit(). thread_create returns the new tid (>0) or a negative errno.
+int  thread_create(void (*entry)(void*), void* arg, void* stack_top);
+void thread_exit(int retval) __attribute__((noreturn));
+int  thread_join(int tid, int* retval_out);
 
 #endif

@@ -358,6 +358,64 @@ void kernel_main(void* raw_info) {
     lapic_init();
     kprintf("[SMP] BSP local APIC online: id=%u version=0x%x\n",
             lapic_get_id(), lapic_get_version());
+
+    /* SMP brick 2 (GATED, SMP=1 build only): CALIBRATE the BSP's LAPIC timer
+     * frequency -- GROUNDWORK ONLY. We MEASURE how fast the LAPIC timer counts;
+     * we do NOT arm it as a tick. The PIC-delivered PIT (IRQ0) remains the one
+     * and only scheduler tick, so sleep/preempt/scheduler timing is UNCHANGED.
+     *
+     * SAFETY: this is the safe calibration SUBSET only -- it intentionally does
+     * NOT call lapic_timer_init()/lapic_timer_periodic() because those go on to
+     * arm PERIODIC mode (unmasked LVT @ vector 0x20) and install a running tick,
+     * which is forbidden before a much later brick. Here we:
+     *   (a) write the timer LVT MASKED the whole time (LAPIC_TIMER_MASKED),
+     *   (b) set divide=16, load the initial count to 0xFFFFFFFF and let it
+     *       count DOWN across a known TSC busy-wait (udelay equivalent; no PIT),
+     *   (c) read the current-count decrement, compute ticks/second, then
+     *   (d) leave the timer disarmed: LVT MASKED + initial-count 0.
+     * No LVT is unmasked, no interrupt vector is enabled, no IRQ is expected,
+     * no handler is registered, and the 8259/PIT/IOAPIC are never touched. */
+    {
+        extern uint32_t lapic_read(uint32_t reg);
+        extern void lapic_write(uint32_t reg, uint32_t value);
+        extern uint64_t rdtsc(void);
+
+        const uint32_t LVT_TIMER      = 0x0320; /* LAPIC_TIMER  (LVT) */
+        const uint32_t TIMER_ICR      = 0x0380; /* initial count      */
+        const uint32_t TIMER_CCR      = 0x0390; /* current count      */
+        const uint32_t TIMER_DCR      = 0x03E0; /* divide config      */
+        const uint32_t TIMER_MASKED   = 0x00010000;
+        const uint32_t TIMER_DIV_16   = 0x03;
+        const uint32_t DIVISOR        = 16;     /* matches TIMER_DIV_16 */
+
+        /* Keep the timer LVT MASKED for the whole measurement so even if it
+         * were to wrap it can deliver nothing. */
+        lapic_write(LVT_TIMER, TIMER_MASKED);
+        lapic_write(TIMER_DCR, TIMER_DIV_16);
+
+        /* Busy-wait a known 10ms window using the TSC (NOT the PIT). 3 GHz TSC
+         * estimate (perf.h convention) -> 3000 cycles/us. This only defines the
+         * measurement window; the value reported is the LAPIC count rate. */
+        const uint64_t CAL_US    = 10000;          /* 10ms              */
+        const uint64_t TSC_PER_US = 3000;          /* ~3 GHz estimate   */
+        lapic_write(TIMER_ICR, 0xFFFFFFFFu);       /* start counting down */
+        uint64_t tsc_start = rdtsc();
+        uint64_t tsc_target = CAL_US * TSC_PER_US;
+        while ((rdtsc() - tsc_start) < tsc_target) {
+            __asm__ volatile("pause");
+        }
+        uint32_t counted = 0xFFFFFFFFu - lapic_read(TIMER_CCR);
+
+        /* Disarm: stop the count and keep the LVT masked. */
+        lapic_write(TIMER_ICR, 0);
+        lapic_write(LVT_TIMER, TIMER_MASKED);
+
+        /* counted = post-divider ticks in 10ms. Input bus frequency =
+         * counted * DIVISOR / 0.01s = counted * DIVISOR * 100. */
+        uint64_t hz = (uint64_t)counted * DIVISOR * (1000000ULL / CAL_US);
+        kprintf("[SMP] LAPIC timer calibrated: %lu Hz (PIT remains system tick)\n",
+                (unsigned long)hz);
+    }
 #endif
 
     /* Initialize framebuffer if available */

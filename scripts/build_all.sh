@@ -474,6 +474,24 @@ mkdir -p /tmp/ird/Desktop
 echo "[all] installing fresh kernel into ISO tree..."
 cp build/kernel.elf iso/boot/kernel.elf
 
+# Write grub.cfg fresh each build. iso/ is gitignored, so build_all.sh is the
+# tracked source of truth for the boot config. gfxpayload requests the T410's
+# native 1280x800 first, then falls back (1024x768 -> auto) so a framebuffer is
+# always set even on a VBE that lacks native. Pairs with boot.asm's multiboot
+# header video request (also 1280x800).
+echo "[all] writing grub.cfg (native-res request + fallback chain)..."
+mkdir -p iso/boot/grub
+cat > iso/boot/grub/grub.cfg <<'GRUBCFG'
+set timeout=0
+set default=0
+
+menuentry 'AutomationOS' {
+    set gfxpayload=1280x800x32,1280x800,1024x768x32,1024x768,auto
+    multiboot /boot/kernel.elf
+    module /boot/initrd.img
+}
+GRUBCFG
+
 echo "[all] rebuilding ISO..."
 grub-mkrescue -o build/automationos.iso iso/ 2>/dev/null
 echo "[all] DONE: $(stat -c%s build/automationos.iso) byte ISO, $(ls /tmp/ird/sbin | wc -l) sbin entries"

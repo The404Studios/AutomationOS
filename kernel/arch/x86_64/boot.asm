@@ -17,8 +17,11 @@ multiboot_header:
     dd MBCHECKSUM
     dd 0, 0, 0, 0, 0         ; address fields (unused)
     dd 0                      ; mode_type: 0 = linear graphics
-    dd 1024                   ; width
-    dd 768                    ; height
+    ; Request the T410's NATIVE panel resolution (1280x800). GRUB's gfxpayload
+    ; chain in grub.cfg provides safe fallbacks (1024x768 -> auto) for VBEs that
+    ; lack 1280x800, so a framebuffer is always set even when native is missing.
+    dd 1280                   ; width  (was 1024; T410 native is 1280x800)
+    dd 800                    ; height (was 768)
     dd 32                     ; depth
 
 section .boot

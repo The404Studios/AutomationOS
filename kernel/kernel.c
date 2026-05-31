@@ -521,16 +521,15 @@ void kernel_main(void* raw_info) {
         kprintf("[KERNEL] Boot splash drawn!\n");
 
 #ifdef SMP_FOUNDATION
-        /* Paint the SMP/AP result on-screen as a green boot marker, just below
-         * the splash. This is the ONLY way to read the AP result on real hardware
-         * (the T410), where the serial [SMP] log is not visible -- photograph the
-         * panel. One of: "SMP: CPU 1 ONLINE" / "SMP: AP failed (single-core)" /
-         * "SMP: single-core (1 cpu)". Harmlessly overwritten by the compositor. */
-        boot_mark(g_smp_boot_status);
-        /* Diagnostic for the T410 left-bleed (#77): the REAL framebuffer geometry
-         * the kernel got from the bootloader. The live compositor uses pitch as
-         * its stride, so the bleed hinges on whether this pitch is correct/padded.
-         * Photograph this next to the SMP marker. */
+        /* Paint the SMP/AP result + the REAL framebuffer geometry at a FIXED spot
+         * at the TOP-LEFT of the panel (bright cyan, scale 3, ABOVE the splash and
+         * clear of the green device-marker stack -- which scrolls down past the
+         * bottom edge after ~17 markers). This keeps them ALWAYS visible for a
+         * phone photo on real hardware (the T410), where the serial log is invisible.
+         * Overwritten by the compositor when the desktop comes up.
+         *   line 1: "SMP: CPU 1 ONLINE" / "SMP: AP failed (single-core)" / "...1 cpu"
+         *   line 2: "FB <w>x<h> pitch=<p>" -- if pitch != w*4 it's a left-bleed suspect */
+        framebuffer_puts_scaled(g_smp_boot_status, 40u, 20u, 0x0000FFFFu, 3u);
         {
             static char fbm[48];
             char *p = fbm; const char *s = "FB ";
@@ -539,7 +538,7 @@ void kernel_main(void* raw_info) {
             p = u32_dec(p, boot_info->framebuffer_height);
             s = " pitch="; while (*s) *p++ = *s++;
             p = u32_dec(p, boot_info->framebuffer_pitch);  *p = 0;
-            boot_mark(fbm);
+            framebuffer_puts_scaled(fbm, 40u, 60u, 0x0000FFFFu, 3u);
         }
 #endif
 

@@ -490,7 +490,22 @@ cp /tmp/zombietd.elf /tmp/ird/Desktop/ZombieBastion/zombietd.elf 2>/dev/null || 
 ( cd /tmp/ird && tar --format=ustar --owner=0 --group=0 -cf /mnt/c/Users/wilde/Desktop/Kernel/iso/boot/initrd.img . )
 
 echo "[all] installing fresh kernel into ISO tree..."
-cp build/kernel.elf iso/boot/kernel.elf
+# Kernel selection. By DEFAULT (FB_WC unset) this installs build/kernel.elf --
+# the safe, byte-for-byte default kernel -- so the default ISO is untouched.
+# When FB_WC=1 is set we install build/kernel-wc.elf instead (the write-combining
+# kernel produced by `FB_WC=1 bash scripts/quick_build.sh`), so the resulting ISO
+# is the opt-in WC test image. This mirrors how quick_build.sh writes a separate
+# kernel-wc.elf and never lets a WC build clobber the default kernel.elf.
+KERNEL_FOR_ISO="build/kernel.elf"
+if [ "${FB_WC:-0}" = "1" ]; then
+    KERNEL_FOR_ISO="build/kernel-wc.elf"
+    if [ ! -f "$KERNEL_FOR_ISO" ]; then
+        echo "*** FB_WC=1 but $KERNEL_FOR_ISO missing -- run 'FB_WC=1 bash scripts/quick_build.sh' first ***"
+        exit 1
+    fi
+    echo "*** FB_WC build: installing WRITE-COMBINING kernel $KERNEL_FOR_ISO into ISO ***"
+fi
+cp "$KERNEL_FOR_ISO" iso/boot/kernel.elf
 
 # Write grub.cfg fresh each build. iso/ is gitignored, so build_all.sh is the
 # tracked source of truth for the boot config. gfxpayload requests the T410's

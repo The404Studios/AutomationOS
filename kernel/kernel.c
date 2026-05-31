@@ -552,6 +552,20 @@ void kernel_main(void* raw_info) {
             boot_info->framebuffer_width,
             boot_info->framebuffer_height);
 
+#ifdef FB_WC
+        /* GATED Write-Combining (FB_WC=1 build only): now that the FB physical
+         * base/size are known and the pages are mapped (but BEFORE the splash
+         * + compositor hammer the framebuffer), program a variable-range MTRR
+         * to mark the FB region WC so pixel stores coalesce into PCIe bursts.
+         * This whole call vanishes from the DEFAULT build (no -DFB_WC). On the
+         * T410 (FB mapped UC by firmware) this is the speedup; in QEMU the FB
+         * is cached so there is nothing to measure -- it only proves clean boot.
+         * If firmware already marks the region UC, UC wins on overlap (see the
+         * caveat in fb_enable_write_combining): that's why this is opt-in. */
+        kprintf("[KERNEL] FB_WC build: enabling framebuffer write-combining...\n");
+        fb_enable_write_combining(fb_phys, fb_size);
+#endif
+
         /* Enable on-screen boot progress markers (see boot_mark). */
         g_boot_fb_ok = 1;
         g_boot_fb_h  = boot_info->framebuffer_height;

@@ -65,6 +65,32 @@ if [ "${SMP:-0}" = "1" ]; then
     fi
 fi
 
+# =============================================================================
+# OPT-IN FRAMEBUFFER WRITE-COMBINING (display speedup). GATED behind the FB_WC
+#   env var.   FB_WC=1 bash scripts/quick_build.sh   ->  build/kernel-wc.elf
+# When FB_WC is UNSET this whole block is skipped and the build behaves EXACTLY
+# as before: NO -DFB_WC macro, kernel/drivers/framebuffer.c's WC block and
+# kernel.c's fb_enable_write_combining() call both #ifdef out, output stays
+# build/kernel.elf -- byte-for-byte the default kernel.
+#
+# We define -DFB_WC, which (a) compiles fb_enable_write_combining() in
+# framebuffer.c (programs a variable-range MTRR to mark the FB region
+# Write-Combining), (b) declares its prototype in drivers.h, and (c) makes
+# kernel.c call it right after the framebuffer is mapped. The MSR writes batch
+# the otherwise-UNCACHED framebuffer pixel stores into PCIe bursts -- a large
+# fps win on real hardware (the T410) where the firmware maps the FB UC. It is
+# OPT-IN/testable because on MTRR overlap UC wins: if firmware already marks the
+# region UC, the WC MTRR has no effect (so the speedup can only be confirmed on
+# the physical panel, never in QEMU where the FB is cached). A SEPARATE output
+# is written so the normal build/kernel.elf is never touched by a WC build.
+# (Only adds -DFB_WC to the gcc CFLAGS; no extra source files or nasm flags.)
+# =============================================================================
+if [ "${FB_WC:-0}" = "1" ]; then
+    CFLAGS="$CFLAGS -DFB_WC"
+    KERNEL_OUT="build/kernel-wc.elf"
+    echo "*** FB_WC build: -DFB_WC enabled (framebuffer write-combining MTRR), output -> $KERNEL_OUT ***"
+fi
+
 GOOD=0
 BAD=0
 OBJS=""

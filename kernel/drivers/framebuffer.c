@@ -8,6 +8,222 @@
 #include "../include/drivers.h"
 #include "../include/types.h"
 
+#ifdef FB_WC
+/* =========================================================================
+ * GATED Write-Combining (WC) framebuffer acceleration  --  #ifdef FB_WC ONLY
+ * =========================================================================
+ *
+ * NOTHING in this block compiles unless the kernel is built with -DFB_WC
+ * (FB_WC=1 bash scripts/quick_build.sh). The DEFAULT kernel is byte-identical.
+ *
+ * WHY: On the ThinkPad T410 the firmware maps the linear framebuffer UNCACHED
+ * (UC). Every pixel store to a full-screen game therefore round-trips to the
+ * GPU as a single non-buffered write -> ~10 fps. Marking the FB region
+ * Write-Combining (WC) lets the CPU coalesce many small stores into burst
+ * writes across the PCIe link, which on real hardware is a multi-x speedup
+ * for the whole compositor/desktop.
+ *
+ * HOW: We program a single VARIABLE-RANGE MTRR (Memory Type Range Register)
+ * to cover the FB physical range with memory type WC (0x01). We find a FREE
+ * variable MTRR (PHYSMASK valid bit clear) so we never clobber a firmware
+ * MTRR that is already in use.
+ *
+ * HONEST CAVEAT: MTRR overlap rules say UC WINS. If the firmware has already
+ * placed a variable (or fixed) MTRR marking this region UC, our WC MTRR will
+ * NOT take effect (the effective type stays UC). That is exactly why this is
+ * opt-in/testable rather than default-on: it must be validated on the real
+ * T410 panel, where only the user can see the fps change. In QEMU the FB is
+ * cached anyway, so there is nothing to measure there -- we only prove the
+ * setup runs and the kernel still boots cleanly.
+ * ========================================================================= */
+
+#include "../include/kernel.h"   /* kprintf */
+#include "../include/x86_64.h"   /* rdmsr / wrmsr / read_cr0 / write_cr0 / cli / sti */
+
+/* --- IA32 MTRR MSR architecture (Intel SDM Vol 3A, 11.11) --------------- */
+#define IA32_MTRRCAP            0x000000FE  /* RO: VCNT (bits 7:0), FIX (10), WC (8), SMRR (11) */
+#define IA32_MTRR_DEF_TYPE      0x000002FF  /* default type + E (bit 11) + FE (bit 10)         */
+#define IA32_MTRR_PHYSBASE(n)   (0x00000200 + (n) * 2)  /* base | type (bits 7:0)              */
+#define IA32_MTRR_PHYSMASK(n)   (0x00000201 + (n) * 2)  /* mask | V (bit 11)                   */
+
+#define MTRR_TYPE_WC            0x01ULL     /* Write-Combining memory type    */
+#define MTRR_DEFTYPE_E          (1ULL << 11)/* MTRRs enable bit in DEF_TYPE   */
+#define MTRR_PHYSMASK_VALID     (1ULL << 11)/* "this variable MTRR is in use" */
+#define MTRR_PHYSBASE_ADDR_MASK 0xFFFFFFFFFFFFF000ULL  /* base address bits   */
+
+/* CR0.CD (bit 30) = Cache Disable, CR0.NW (bit 29) = Not-Write-through. The
+ * SDM MTRR-modification sequence requires CD=1,NW=0 (caches off) around the
+ * MSR writes, with a WBINVD before and after. */
+#define CR0_CD                  (1ULL << 30)
+#define CR0_NW                  (1ULL << 29)
+
+/* Round v UP to the next power of two (v assumed > 0 and <= 2^62). Returns v
+ * unchanged when it is already a power of two. */
+static uint64_t fb_wc_po2_up(uint64_t v) {
+    if (v == 0) return 1;
+    uint64_t p = 1;
+    while (p < v) {
+        p <<= 1;
+    }
+    return p;
+}
+
+/* Query the CPU's physical-address width via CPUID 0x80000008 (EAX bits 7:0).
+ * Returns a PHYSMASK with the low `maxphysaddr` bits set above bit 12, used to
+ * mask the MTRR PHYSMASK to the architectural width. Falls back to 36 bits
+ * (mask 0x0000000FFFFFF000) if the leaf is unsupported -- the conservative
+ * legacy default that is valid on virtually all x86_64 parts. */
+static uint64_t fb_wc_physmask_bits(void) {
+    uint32_t eax = 0, ebx = 0, ecx = 0, edx = 0;
+    uint8_t  phys_bits = 36;  /* safe default */
+
+    /* Is extended leaf 0x80000008 available? Check max extended leaf first. */
+    __asm__ volatile("cpuid"
+                     : "=a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx)
+                     : "a"(0x80000000U));
+    if (eax >= 0x80000008U) {
+        __asm__ volatile("cpuid"
+                         : "=a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx)
+                         : "a"(0x80000008U));
+        uint8_t reported = (uint8_t)(eax & 0xFF);
+        if (reported >= 32 && reported <= 52) {  /* sanity bound */
+            phys_bits = reported;
+        }
+    }
+
+    /* Mask = bits [phys_bits-1 : 12] set. */
+    uint64_t full = (phys_bits >= 64) ? ~0ULL : ((1ULL << phys_bits) - 1ULL);
+    return full & MTRR_PHYSBASE_ADDR_MASK;
+}
+
+/**
+ * fb_enable_write_combining -- mark [base, base+size) Write-Combining via a
+ * free variable-range MTRR.  GATED: only built/linked under -DFB_WC.
+ *
+ * @param base  physical base of the framebuffer (e.g. 0xFD000000 on the T410)
+ * @param size  framebuffer byte size (pitch * height, ~4 MB at 1280x800x4)
+ *
+ * Steps (Intel SDM Vol 3A "MTRR Considerations"):
+ *   1. Read IA32_MTRRCAP to get VCNT (number of variable MTRRs).
+ *   2. Compute a power-of-two range that COVERS the FB and is BASE-ALIGNED to
+ *      that power of two (an MTRR requirement). If base is not aligned to the
+ *      chosen size, LOG and BAIL -- we never force a misaligned MTRR.
+ *   3. Find a FREE variable MTRR (PHYSMASK.V == 0); never clobber one in use.
+ *   4. Enter the no-caching window (CR0.CD=1, NW=0, WBINVD, disable MTRRs),
+ *      write PHYSBASE=base|WC and PHYSMASK=~(size-1)&physmask|V, then re-enable
+ *      MTRRs, WBINVD, restore CR0. Interrupts are disabled across the change.
+ *   5. Log the slot/base/size/type so the serial log proves it took.
+ */
+void fb_enable_write_combining(uint64_t base, uint64_t size) {
+    if (!base || !size) {
+        kprintf("[FB-WC] skip: invalid base/size (base=0x%lx size=0x%lx)\n",
+                (unsigned long)base, (unsigned long)size);
+        return;
+    }
+
+    /* --- 1. variable MTRR count --------------------------------------- */
+    uint64_t cap   = rdmsr(IA32_MTRRCAP);
+    uint32_t vcnt  = (uint32_t)(cap & 0xFF);
+    if (vcnt == 0) {
+        kprintf("[FB-WC] skip: CPU reports 0 variable MTRRs (cap=0x%lx)\n",
+                (unsigned long)cap);
+        return;
+    }
+
+    /* --- 2. power-of-two range that covers the FB, base-aligned ------- */
+    uint64_t po2 = fb_wc_po2_up(size);
+    /* MTRR base must be aligned to the range size. If the FB base is not
+     * aligned to po2, the smallest legal covering MTRR would have to be the
+     * largest power-of-two that DOES divide base AND still covers size. If no
+     * such single MTRR exists (base poorly aligned), we refuse rather than
+     * mark the wrong physical range WC. */
+    if (base & (po2 - 1)) {
+        /* Base not aligned to the covering po2. Try growing po2 until base is
+         * aligned to it (this also keeps coverage, since po2 only increases),
+         * but cap the growth so we never mark a huge unrelated region WC. A
+         * 4 MB FB at 0xFD000000 is already 64 MB-aligned, so the common case
+         * needs no growth at all. */
+        uint64_t grown = po2;
+        int bailed = 1;
+        for (int i = 0; i < 8; i++) {     /* allow up to 256x growth */
+            if ((base & (grown - 1)) == 0) { bailed = 0; break; }
+            grown <<= 1;
+        }
+        if (bailed) {
+            kprintf("[FB-WC] BAIL: FB base 0x%lx not alignable to a covering "
+                    "power-of-two (size=0x%lx, po2=0x%lx). Not forcing a "
+                    "misaligned MTRR.\n",
+                    (unsigned long)base, (unsigned long)size,
+                    (unsigned long)po2);
+            return;
+        }
+        po2 = grown;
+    }
+
+    /* --- 3. find a FREE variable MTRR (PHYSMASK.V == 0) --------------- */
+    int slot = -1;
+    for (uint32_t i = 0; i < vcnt; i++) {
+        uint64_t mask = rdmsr(IA32_MTRR_PHYSMASK(i));
+        if (!(mask & MTRR_PHYSMASK_VALID)) {
+            slot = (int)i;
+            break;
+        }
+    }
+    if (slot < 0) {
+        kprintf("[FB-WC] BAIL: no free variable MTRR (all %u in use by "
+                "firmware)\n", vcnt);
+        return;
+    }
+
+    /* --- build the PHYSBASE/PHYSMASK values --------------------------- */
+    uint64_t physmask_bits = fb_wc_physmask_bits();
+    uint64_t physbase = (base & MTRR_PHYSBASE_ADDR_MASK) | MTRR_TYPE_WC;
+    uint64_t physmask = ((~(po2 - 1ULL)) & physmask_bits) | MTRR_PHYSMASK_VALID;
+
+    /* --- 4. apply under the SDM MTRR-modification protocol ------------ */
+    /* Disable interrupts across the whole change. */
+    cli();
+
+    /* a) Enter no-fill cache mode: set CR0.CD, clear CR0.NW. */
+    uint64_t cr0_saved = read_cr0();
+    uint64_t cr0_nocache = (cr0_saved | CR0_CD) & ~CR0_NW;
+    write_cr0(cr0_nocache);
+
+    /* b) Flush caches and TLBs (WBINVD then reload CR3). */
+    __asm__ volatile("wbinvd" ::: "memory");
+    write_cr3(read_cr3());
+
+    /* c) Disable MTRRs (clear DEF_TYPE.E) so the table is inert while edited. */
+    uint64_t deftype_saved = rdmsr(IA32_MTRR_DEF_TYPE);
+    wrmsr(IA32_MTRR_DEF_TYPE, deftype_saved & ~MTRR_DEFTYPE_E);
+
+    /* d) Program the chosen variable MTRR pair. */
+    wrmsr(IA32_MTRR_PHYSBASE(slot), physbase);
+    wrmsr(IA32_MTRR_PHYSMASK(slot), physmask);
+
+    /* e) Re-enable MTRRs (restore DEF_TYPE, with E set as before). */
+    wrmsr(IA32_MTRR_DEF_TYPE, deftype_saved | MTRR_DEFTYPE_E);
+
+    /* f) Flush again, then restore CR0 (exit no-fill mode). */
+    __asm__ volatile("wbinvd" ::: "memory");
+    write_cr3(read_cr3());
+    write_cr0(cr0_saved);
+
+    sti();
+
+    /* --- 5. log proof that it took ----------------------------------- */
+    kprintf("[FB-WC] Write-Combining enabled: MTRR slot %d  "
+            "base=0x%lx size=0x%lx (po2=0x%lx) type=WC(0x01)\n",
+            slot, (unsigned long)base, (unsigned long)size,
+            (unsigned long)po2);
+    kprintf("[FB-WC]   PHYSBASE[%d]=0x%lx PHYSMASK[%d]=0x%lx (physmask_bits=0x%lx)\n",
+            slot, (unsigned long)physbase, slot, (unsigned long)physmask,
+            (unsigned long)physmask_bits);
+    kprintf("[FB-WC]   NOTE: if firmware already marks this region UC, UC wins "
+            "on overlap and WC will not take (opt-in/testable by design).\n");
+}
+#endif /* FB_WC */
+
 // Framebuffer state
 static struct {
     uint32_t* buffer;

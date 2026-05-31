@@ -33,6 +33,14 @@ void framebuffer_draw_hline(uint32_t x, uint32_t y, uint32_t length, uint32_t co
 void framebuffer_draw_vline(uint32_t x, uint32_t y, uint32_t length, uint32_t color);
 int  framebuffer_get_info(fb_info_t* out);
 
+#ifdef FB_WC
+/* GATED (only declared under -DFB_WC): program a variable-range MTRR to mark
+ * the framebuffer physical region [base, base+size) Write-Combining, batching
+ * the otherwise-uncached pixel stores into PCIe bursts on real hardware. No-op
+ * to the default build -- this prototype does not exist unless FB_WC is set. */
+void fb_enable_write_combining(uint64_t base, uint64_t size);
+#endif
+
 // Timer driver (PIT - Programmable Interval Timer)
 void pit_init(uint32_t frequency);
 uint64_t timer_get_ticks(void);

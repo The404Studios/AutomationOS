@@ -197,6 +197,12 @@ int wl_poll_event(wl_window *win, int *kind, int *a, int *b, int *c) {
         if (a) *a = ev.ptr.x;
         if (b) *b = ev.ptr.y;
         if (c) *c = ev.ptr.buttons;
+        /* Encode wheel in high bits of 'c' for backward compatibility:
+         * bits 0-15: buttons, bits 16-31: signed wheel delta */
+        if (c && ev.ptr.wheel != 0) {
+            int wheel_packed = (ev.ptr.wheel & 0xFFFF) << 16;
+            *c = (*c & 0xFFFF) | wheel_packed;
+        }
         return 1;
     }
     if (ev.mtype == WL_EVT_KEY) {

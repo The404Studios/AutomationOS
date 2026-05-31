@@ -46,7 +46,7 @@ typedef struct { long mtype; int pid; int shm_id; unsigned int w,h,stride; char 
 typedef struct { long mtype; int win_id; unsigned int x,y,w,h; } wl_commit_req;   /* damage */
 typedef struct { long mtype; int win_id; } wl_destroy_req;
 typedef struct { long mtype; int win_id; } wl_created_evt;
-typedef struct { long mtype; int x,y,buttons; } wl_pointer_evt;
+typedef struct { long mtype; int x,y,buttons,wheel; } wl_pointer_evt;
 typedef struct { long mtype; int keycode,pressed; } wl_key_evt;
 
 #endif /* WL_PROTO_H */

@@ -278,6 +278,7 @@ typedef struct {
 typedef struct {
     int64_t  mtype;
     int32_t  x, y, buttons;
+    int32_t  wheel;  /* mouse wheel delta (positive=scroll up/away, negative=scroll down/toward) */
 } wl_evt_pointer_t;
 
 typedef struct {
@@ -615,7 +616,7 @@ static void blit_surface_scaled_alpha(uint32_t *buf, uint32_t bw, uint32_t bh, u
 #define RDOCK_FAN_SPARKLES    8   /* sparkle dots drawn around a hovered icon */
 
 /* Number of app entries and folders */
-#define RDOCK_NICONS  23
+#define RDOCK_NICONS  24
 #define RDOCK_NFOLDERS 2
 
 /* App descriptor */
@@ -658,6 +659,7 @@ static const rdock_app_t rdock_apps[RDOCK_NICONS] = {
     { "Ph", "sbin/photos",      0xFF2D8B8Bu },  /* 20 Photos     */
     { "Pm", "sbin/pacman",      0xFFFFD60Au },  /* 21 Pac-Man    */
     { "C+", "sbin/clockapp",    0xFF0067C0u },  /* 22 Clock+     */
+    { "Zt", "sbin/zombietd",    0xFF8B0000u },  /* 23 ZombieTD   */
 };
 
 /* ---- Folder table (Games + Tools) ---- */
@@ -2990,6 +2992,7 @@ typedef struct {
 #define EV_REL  1
 #define REL_X   0
 #define REL_Y   1
+#define REL_WHEEL 8
 #define BTN_LEFT_CODE    0x110
 #define BTN_RIGHT_CODE   0x111
 #define BTN_MIDDLE_CODE  0x112
@@ -3002,6 +3005,7 @@ static int32_t g_mouse_fd = -1;
 static int32_t g_cursor_x = 0;
 static int32_t g_cursor_y = 0;
 static int32_t g_buttons  = 0;   /* bit0=left bit1=right bit2=middle */
+static int32_t g_wheel_delta = 0; /* accumulated wheel scroll (reset per frame) */
 /* Per-event click latches. A quick click delivers press+release in the SAME
  * pump_input batch, so the once-per-frame g_buttons edge check misses it. We
  * latch the rising edge as it happens (capturing the cursor position) and
@@ -3020,6 +3024,7 @@ static void send_pointer_to_focus(void) {
     ev.x       = g_cursor_x - win->x;
     ev.y       = g_cursor_y - (win->y + TITLEBAR_H);
     ev.buttons = g_buttons;
+    ev.wheel   = g_wheel_delta;
     sc6(SYS_MSGSND, qid, (long)&ev, (long)(sizeof(ev) - sizeof(int64_t)), 0, 0, 0);
 }
 
@@ -3205,6 +3210,7 @@ static void pump_input(int32_t fd, int keyboard, uint32_t W, uint32_t H) {
         if (e->type == EV_REL) {
             if (e->code == REL_X) { g_cursor_x += e->value; pointer_changed = 1; }
             else if (e->code == REL_Y) { g_cursor_y += e->value; pointer_changed = 1; }
+            else if (e->code == REL_WHEEL) { g_wheel_delta += e->value; }
         } else if (e->type == EV_KEY) {
             int32_t bit = -1;
             if (e->code == BTN_LEFT_CODE)   bit = 0;
@@ -4029,6 +4035,7 @@ void _start(void) {
         }
 
         frame++;
+        g_wheel_delta = 0;  /* reset wheel accumulator for next frame */
         if ((frame % 60) == 0) {
             print("[SHELL] frame "); print_num((long)frame);
             print(" ("); print_num((long)g_zcount);

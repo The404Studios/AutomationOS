@@ -227,6 +227,14 @@ static int      g_boot_step  = 0;
  * On real hardware (e.g. the T410) the serial [SMP] log is invisible, so this is
  * how you read whether CPU 1 came online: photograph the boot panel. */
 static const char *g_smp_boot_status = "SMP: (no result)";
+/* tiny unsigned->decimal appender for the diagnostic framebuffer-geometry marker. */
+static char *u32_dec(char *p, uint32_t v) {
+    char t[10]; int n = 0;
+    if (v == 0) t[n++] = '0';
+    while (v) { t[n++] = (char)('0' + v % 10); v /= 10; }
+    while (n) *p++ = t[--n];
+    return p;
+}
 #endif
 static void boot_mark(const char *label) {
     if (!g_boot_fb_ok) return;
@@ -519,6 +527,20 @@ void kernel_main(void* raw_info) {
          * panel. One of: "SMP: CPU 1 ONLINE" / "SMP: AP failed (single-core)" /
          * "SMP: single-core (1 cpu)". Harmlessly overwritten by the compositor. */
         boot_mark(g_smp_boot_status);
+        /* Diagnostic for the T410 left-bleed (#77): the REAL framebuffer geometry
+         * the kernel got from the bootloader. The live compositor uses pitch as
+         * its stride, so the bleed hinges on whether this pitch is correct/padded.
+         * Photograph this next to the SMP marker. */
+        {
+            static char fbm[48];
+            char *p = fbm; const char *s = "FB ";
+            while (*s) *p++ = *s++;
+            p = u32_dec(p, boot_info->framebuffer_width);  *p++ = 'x';
+            p = u32_dec(p, boot_info->framebuffer_height);
+            s = " pitch="; while (*s) *p++ = *s++;
+            p = u32_dec(p, boot_info->framebuffer_pitch);  *p = 0;
+            boot_mark(fbm);
+        }
 #endif
 
         /* Map framebuffer for userspace access at a fixed virtual address */

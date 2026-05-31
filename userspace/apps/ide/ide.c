@@ -564,8 +564,10 @@ static void init(Ide* a) {
 
     scan_project(a);
 
-    /* Pick a friendly starting file: prefer the Zombie Bastion game source;
-     * else the first .c file; else the first regular file found in the tree. */
+    /* Pick a friendly starting file: prefer "tower.c" (small + parser-safe);
+     * else the first .c file; else the first regular file in the tree. Zombie
+     * Bastion still ships under /usr/src/zombiebastion/ and opens from the tree,
+     * but is NOT the auto-opened default (don't parse a big game file at launch). */
     int pick = -1;
     int first_c = -1;
     int first_file = -1;
@@ -573,7 +575,7 @@ static void init(Ide* a) {
         if (a->entries[i].is_dir) continue;
         if (first_file < 0) first_file = i;
         if (first_c < 0 && ends_with_dot_c(a->entries[i].name)) first_c = i;
-        if (ide_streq(a->entries[i].name, "zombietd.c")) { pick = i; break; }
+        if (ide_streq(a->entries[i].name, "tower.c")) { pick = i; break; }
     }
     if (pick < 0) pick = (first_c >= 0) ? first_c : first_file;
 

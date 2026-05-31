@@ -547,6 +547,139 @@ void matmul_self_test(void)
     }
 }
 
+/* ===========================================================================
+ * USERSPACE -> CPU1 OFFLOAD PATH (the userspace bridge).
+ *
+ * SYS_CPU1_OFFLOAD (handlers.c, gated by SMP_FOUNDATION) lets a NORMAL ring-3
+ * process ask CPU1 to run a kernel matmul on COPIED data and return the result.
+ * The handler does ALL user-memory validation + copy-in/out with the kernel's
+ * safe copy_from_user/copy_to_user helpers; by the time control reaches THIS file
+ * the data is already in trusted kernel buffers. CPU1 therefore runs ONLY the
+ * trusted kernel matmul below on kernel-owned memory -- NO user pointer, NO user
+ * code, NO scheduler, NO migration ever reaches the AP. It stays a pure trusted
+ * coprocessor: the BSP publishes one kernel fn into the single job slot (cpu1_run)
+ * and CPU1 executes exactly that, mirroring the brick-6/8 self-tests.
+ *
+ * BUFFER PLACEMENT (load-bearing -- why NOT .bss.deferred): the offload runs on
+ * demand from a syscall handler while a USER process is current, i.e. with that
+ * process's CR3 active. The boot self-test's mm_A/mm_B/mm_Cdual live in
+ * .bss.deferred, which can be SHADOWED by user pages once a process maps memory at
+ * VA >= 0x200000 (see the mm_* placement note above) -- reading/writing them under
+ * a user CR3 would touch the USER's pages, not the kernel result (this manifested
+ * as the first page of the result being wrong). So the offload uses NO static
+ * buffers at all: the handler hands us kmalloc'd KERNEL-HEAP buffers (heap base
+ * 0xFFFFFFFF90000000, high-half canonical kernel space that is NEVER shadowed by
+ * the low-half user mappings), and CPU1 -- running in the BSP's kernel CR3 -- reads
+ * the operands and writes the result directly into those heap buffers. The handler
+ * then reads them back under the user CR3 safely (high-half, unshadowed).
+ *
+ * SINGLE offload at a time: the one cpu1_job slot serializes dispatch, but each
+ * offload carries its OWN heap buffers (in the job arg below), so there are no
+ * shared result buffers to collide -- concurrent offloads are a later refinement
+ * (the slot itself would need to become multi-entry); for now one-at-a-time.
+ * ------------------------------------------------------------------------- */
+
+/* Offload job arg: the operand/result KERNEL-HEAP pointers + dimension + the AP's
+ * proof-of-execution apic id. A/B/C point at kmalloc'd high-half kernel memory the
+ * handler owns (NOT .bss.deferred), so CPU1 (kernel CR3) and the handler (user CR3)
+ * both address them safely. by_apic is volatile so mm_offload_job's store is not
+ * elided; cross-core visibility of BOTH the result AND by_apic is provided by the
+ * cpu1_job.done RELEASE/ACQUIRE pair (the job runs inside the AP worker loop's
+ * dispatch, before it sets done). */
+static struct {
+    const int32_t *A;
+    const int32_t *B;
+    int64_t       *C;
+    int            n;
+    volatile int   by_apic;
+} mm_off_arg;
+
+/* INT-ONLY square matmul of dimension n (row stride n), rows [row0,row1). A
+ * dimension-parameterized sibling of matmul_band (which is hard-wired to the
+ * MM_N stride for the boot self-test and is left BYTE-IDENTICAL). GP-register
+ * integer math only -- no float/SSE -- so it is safe to run on the AP, which has
+ * no proven SSE state. */
+static void matmul_band_n(int row0, int row1, int n,
+                          const int32_t *A, const int32_t *B, int64_t *C)
+{
+    for (int r = row0; r < row1; r++) {
+        for (int c = 0; c < n; c++) {
+            int64_t s = 0;
+            for (int k = 0; k < n; k++) {
+                s += (int64_t)A[r * n + k] * (int64_t)B[k * n + c];
+            }
+            C[r * n + c] = s;
+        }
+    }
+}
+
+/* The trusted kernel fn CPU1 runs for an offload: compute the WHOLE matrix [0,n)
+ * into the handler's kmalloc'd C from the handler's kmalloc'd A/B, then record the
+ * AP's own apic id so the BSP (and the requesting app) can PROVE apic-1 executed
+ * it. Pure int math on kernel-heap buffers -- nothing user-supplied. */
+static void mm_offload_job(void *a)
+{
+    (void)a;
+    matmul_band_n(0, mm_off_arg.n, mm_off_arg.n,
+                  mm_off_arg.A, mm_off_arg.B, mm_off_arg.C);
+    mm_off_arg.by_apic = (int)lapic_get_id();   /* PROOF: which CPU ran it */
+}
+
+/*
+ * cpu1_offload_matmul -- BSP-side driver for a userspace matmul offload.
+ *
+ * A, B and C_out are KERNEL-HEAP buffers (the syscall handler kmalloc'd them,
+ * validated + copied the user operands into A/B, and will copy C_out back out).
+ * High-half kernel heap is NOT shadowed by user mappings, so it is safe to address
+ * under any CR3 -- crucially CPU1 writes C_out directly. This function publishes
+ * the WHOLE matmul as ONE trusted job to CPU1 (cpu1_submit) with these pointers in
+ * the job arg, then waits a GENEROUS bounded deadline (real compute, not a liveness
+ * probe -> ~2s of TSC). The bound guarantees a wedged/absent AP can never hang the
+ * calling process -- on timeout it returns 0 and the handler maps that to a
+ * negative errno.
+ *
+ * Returns 1 and sets *by_apic_out (the apic id that ran the job, must be 1) on
+ * success; 0 if CPU1 did not finish within the deadline (or args are bad).
+ *
+ * Trust: the fn handed to CPU1 (mm_offload_job) is a KERNEL function; CPU1 runs
+ * only it, on the kernel-owned heap buffers. No user pointer/code reaches the AP.
+ */
+int cpu1_offload_matmul(const int32_t *A, const int32_t *B, int n,
+                        int64_t *C_out, int *by_apic_out)
+{
+    if (n <= 0 || n > MM_N || !A || !B || !C_out) {
+        return 0;
+    }
+
+    /* Publish the operand/result pointers + dimension for CPU1. CPU1 reads/writes
+     * the handler's kmalloc'd kernel-heap buffers directly (no copy into static
+     * .bss, which would be user-CR3-shadow-unsafe at offload time). */
+    mm_off_arg.A       = A;
+    mm_off_arg.B       = B;
+    mm_off_arg.C       = C_out;
+    mm_off_arg.n       = n;
+    mm_off_arg.by_apic = 0;
+
+    /* Publish the WHOLE matmul as one trusted job to CPU1, then wait a GENEROUS
+     * bounded deadline (~2s at the ~3 GHz TSC convention). On timeout cpu1_wait
+     * returns 0 and we bail -- never an infinite spin, never a hang. The cpu1_submit
+     * RELEASE publishes mm_off_arg (incl. the pointers) so the AP's ACQUIRE sees
+     * them; the cpu1_wait ACQUIRE on `done` makes CPU1's writes to C_out + by_apic
+     * visible here before we return. */
+    if (!cpu1_submit(mm_offload_job, &mm_off_arg)) {
+        return 0;
+    }
+    uint64_t deadline = rdtsc() + 2ULL * 1000000ULL * AP_TSC_PER_US;  /* now + 2s */
+    if (!cpu1_wait(deadline)) {
+        return 0;                       /* AP wedged/absent -> caller returns <0 */
+    }
+
+    if (by_apic_out) {
+        *by_apic_out = mm_off_arg.by_apic;
+    }
+    return 1;
+}
+
 /* Stage the trampoline blob + the shared param fields into low memory. */
 static void ap_setup_trampoline(uint64_t kernel_cr3)
 {

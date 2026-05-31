@@ -200,6 +200,14 @@ void _start(void) {
     print("[INIT] Spawning sockettest...\n");
     spawn("sbin/sockettest");
 
+    // cpu1offload: userspace -> CPU1 matmul offload probe. On the SMP kernel it
+    // offloads an int matmul to CPU1 (the trusted coprocessor) via SYS_CPU1_OFFLOAD
+    // and prints "CPU1OFFLOAD: PASS ... by_apic=1"; on the DEFAULT (single-core)
+    // kernel the syscall is unregistered, so it prints "CPU1OFFLOAD: SKIP" and
+    // exits cleanly -- harmless in the default boot.
+    print("[INIT] Spawning cpu1offload...\n");
+    spawn("sbin/cpu1offload");
+
     // wget self-test (URL parse + dotted-quad DNS, no network -> exits).
     spawn("bin/wget");
 

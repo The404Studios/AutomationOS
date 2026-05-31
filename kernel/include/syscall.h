@@ -94,6 +94,19 @@
 #define SYS_BATCH_SUBMIT 82 // batch syscall submission (io_uring-style)
 #define SYS_VMA_TEST    200 // VMA red-black tree testing and benchmarking
 
+// ---- SMP coprocessor offload (GATED: only registered under SMP_FOUNDATION) ----
+// SYS_CPU1_OFFLOAD lets a userspace process hand a kernel-owned compute job (today
+// an integer matrix multiply) to CPU1, the TRUSTED coprocessor. The number is a
+// FIXED, currently-unused slot (83) chosen so it shifts NO existing syscall number
+// and does NOT change MAX_SYSCALLS — the DEFAULT kernel (SMP_FOUNDATION undefined)
+// never registers a handler at this index, so the binary is byte-for-byte
+// unchanged and the syscall returns ENOTSUP (the app then prints SKIP). It is
+// registered + handled ONLY inside #ifdef SMP_FOUNDATION in syscall.c / handlers.c.
+#define SYS_CPU1_OFFLOAD 83 // offload a kernel matmul to CPU1 (trusted coprocessor)
+
+// Job-type selector for SYS_CPU1_OFFLOAD's first argument.
+#define CPU1_JOB_MATMUL  1  // user_arg = { int32 n; int32 A[n*n]; int32 B[n*n]; }
+
 #define MAX_SYSCALLS 256
 
 // Framebuffer info returned by SYS_FB_ACQUIRE (mapped into the caller).
@@ -298,6 +311,12 @@ void epoll_init(void);
 // Performance monitoring syscall
 int64_t sys_perf_report(uint64_t arg1, uint64_t arg2, uint64_t arg3,
                         uint64_t arg4, uint64_t arg5, uint64_t arg6);
+
+// SMP coprocessor offload syscall (defined ONLY under SMP_FOUNDATION in
+// handlers.c; this prototype emits no code, so the default build is unaffected).
+//   sys_cpu1_offload(job_type, user_arg, arg_len, user_res, res_len)
+int64_t sys_cpu1_offload(uint64_t job_type, uint64_t user_arg, uint64_t arg_len,
+                         uint64_t user_res, uint64_t res_len);
 
 // Error codes now live in errno.h (included above) — canonical negative set.
 

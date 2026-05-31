@@ -1574,3 +1574,113 @@ int64_t sys_perf_report(uint64_t arg1, uint64_t arg2, uint64_t arg3,
 // IPC System Call Wrappers
 // ============================================================================
 // Note: These forward to the implementations in kernel/ipc/shm.c and msgqueue.c
+
+#ifdef SMP_FOUNDATION
+// ============================================================================
+// SMP COPROCESSOR OFFLOAD  (the userspace -> CPU1 bridge)
+// ============================================================================
+// SYS_CPU1_OFFLOAD: a NORMAL ring-3 process hands a kernel-owned compute job to
+// CPU1 (the TRUSTED coprocessor) and gets the result back. This whole block is
+// compiled ONLY for the SMP build (SMP_FOUNDATION defined); in the DEFAULT build
+// it vanishes entirely and the syscall is never registered (syscall.c also guards
+// the table entry), so the unregistered number returns ENOTSUP and the default
+// kernel binary is byte-for-byte unchanged.
+//
+// CPU1 stays a pure trusted coprocessor: this handler does ALL user-pointer
+// validation and copy-in/out with the kernel's safe copy_from_user/copy_to_user
+// (never a raw user deref), copies the operands into trusted kernel buffers, and
+// only THEN hands the trusted kernel matmul to CPU1 (cpu1_offload_matmul ->
+// cpu1_submit/cpu1_wait in ap_boot.c). No user pointer, no user code, no
+// scheduler, and no migration ever reaches the AP.
+
+// The trusted-coprocessor matmul driver lives in ap_boot.c (SMP-only). MM_N is
+// the max dimension of the fixed CPU1-reachable buffers (128).
+extern int cpu1_offload_matmul(const int32_t *A, const int32_t *B, int n,
+                               int64_t *C_out, int *by_apic_out);
+#ifndef SMP_MM_N
+#define SMP_MM_N 128   /* must match ap_boot.c MM_N */
+#endif
+
+// sys_cpu1_offload(job_type, user_arg, arg_len, user_res, res_len)
+//
+//   CPU1_JOB_MATMUL: user_arg -> { int32_t n; int32_t A[n*n]; int32_t B[n*n]; }
+//     VALIDATE  n in (0, SMP_MM_N], arg_len == 4 + 2*n*n*4, res_len == n*n*8.
+//     COPY A,B in (safe), dispatch the WHOLE matmul to CPU1, wait (~2s bound),
+//     COPY the int64 result to user_res. Returns 0 on success, negative errno on
+//     any bad pointer / size mismatch / out-of-range n / CPU1 timeout.
+//
+// Single offload at a time (the CPU1 input/result buffers are fixed + shared);
+// concurrent offloads are a later refinement (known limitation).
+int64_t sys_cpu1_offload(uint64_t job_type, uint64_t user_arg, uint64_t arg_len,
+                         uint64_t user_res, uint64_t res_len) {
+    if (job_type != CPU1_JOB_MATMUL) {
+        return ENOTSUP;                 // only the matmul job is defined today
+    }
+    if (user_arg == 0 || user_res == 0) {
+        return EFAULT;                  // null user pointers
+    }
+
+    // 1. Pull just the leading dimension n out of the user arg block (safe copy),
+    //    then bound it BEFORE trusting it for any size arithmetic.
+    int32_t n = 0;
+    if (copy_from_user(&n, (const void*)user_arg, sizeof(n)) != COPY_SUCCESS) {
+        return EFAULT;
+    }
+    if (n <= 0 || n > SMP_MM_N) {
+        return EINVAL;                  // out of range (also guards size overflow)
+    }
+
+    // 2. Exact size contract. n <= 128, so these products fit a uint64 trivially.
+    uint64_t elems     = (uint64_t)n * (uint64_t)n;
+    uint64_t want_arg  = sizeof(int32_t) + 2ULL * elems * sizeof(int32_t);
+    uint64_t want_res  = elems * sizeof(int64_t);
+    if (arg_len != want_arg || res_len != want_res) {
+        return EINVAL;                  // caller's buffer sizes must match exactly
+    }
+
+    // 3. Trusted kernel scratch for the operands + result. CPU1 only ever touches
+    //    the kernel buffers inside cpu1_offload_matmul, never these or any user ptr.
+    size_t ab_bytes = (size_t)(elems * sizeof(int32_t));
+    size_t c_bytes  = (size_t)(elems * sizeof(int64_t));
+    int32_t* kA = (int32_t*)kmalloc(ab_bytes);
+    int32_t* kB = (int32_t*)kmalloc(ab_bytes);
+    int64_t* kC = (int64_t*)kmalloc(c_bytes);
+    if (!kA || !kB || !kC) {
+        if (kA) kfree(kA);
+        if (kB) kfree(kB);
+        if (kC) kfree(kC);
+        return ENOMEM;
+    }
+
+    // 4. Safe copy-in of A and B (A starts after the int32 n; B right after A).
+    const void* uA = (const void*)(user_arg + sizeof(int32_t));
+    const void* uB = (const void*)(user_arg + sizeof(int32_t) + ab_bytes);
+    if (copy_from_user(kA, uA, ab_bytes) != COPY_SUCCESS ||
+        copy_from_user(kB, uB, ab_bytes) != COPY_SUCCESS) {
+        kfree(kA); kfree(kB); kfree(kC);
+        return EFAULT;
+    }
+
+    // 5. Dispatch the WHOLE matmul to CPU1 (trusted coprocessor) and wait the
+    //    bounded deadline. by_apic must read 1 (the AP recorded its own apic id).
+    int by_apic = -1;
+    int ok = cpu1_offload_matmul(kA, kB, (int)n, kC, &by_apic);
+    if (!ok) {
+        kfree(kA); kfree(kB); kfree(kC);
+        return EAGAIN;                  // CPU1 wedged/absent/timed out -> not done
+    }
+
+    // 6. Copy the int64 result back to userspace (safe).
+    if (copy_to_user((void*)user_res, kC, c_bytes) != COPY_SUCCESS) {
+        kfree(kA); kfree(kB); kfree(kC);
+        return EFAULT;
+    }
+
+    kfree(kA); kfree(kB); kfree(kC);
+
+    // Return the apic id that ran the job (>= 0) so the caller can prove CPU1 did
+    // the work. 0 on success is the n=... etc. path; here a positive apic id is the
+    // success signal AND the proof. by_apic is 1 for CPU1.
+    return (int64_t)by_apic;
+}
+#endif /* SMP_FOUNDATION */

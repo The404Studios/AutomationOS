@@ -141,6 +141,15 @@ void syscall_init(void) {
     syscall_table[SYS_EPOLL_CTL]    = sys_epoll_ctl;
     syscall_table[SYS_EPOLL_WAIT]   = sys_epoll_wait;
 
+#ifdef SMP_FOUNDATION
+    // SMP coprocessor offload (the userspace -> CPU1 bridge). Registered ONLY for
+    // the SMP build; the DEFAULT kernel leaves this slot NULL, so the syscall
+    // returns ENOTSUP and the binary is byte-for-byte unchanged. The handler does
+    // all user-pointer validation + copy-in/out and dispatches a trusted kernel
+    // matmul to CPU1 (handlers.c, also SMP_FOUNDATION-gated).
+    syscall_table[SYS_CPU1_OFFLOAD] = sys_cpu1_offload;
+#endif
+
     // Initialize epoll subsystem
     epoll_init();
 

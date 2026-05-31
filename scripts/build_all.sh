@@ -471,6 +471,10 @@ cp userspace/apps/ide/sample/native/* /tmp/ird/usr/src/native/ 2>/dev/null || tr
 # Bubble Defense as an IDE project, + a Desktop folder for compiled output
 mkdir -p /tmp/ird/usr/src/bubbledefense
 cp userspace/apps/bubbletd/bubbletd.c /tmp/ird/usr/src/bubbledefense/ 2>/dev/null || true
+# Zombie Bastion game source = the featured IDE example project (opened by default;
+# the IDE lists+opens both .c and .asm under it and parses it into the LEGO map).
+mkdir -p /tmp/ird/usr/src/zombiebastion
+cp userspace/apps/zombietd/zombietd.c /tmp/ird/usr/src/zombiebastion/ 2>/dev/null || true
 
 # IDE "New Project" templates (game / app / service starters) -> /usr/src/templates
 mkdir -p /tmp/ird/usr/src/templates/gamestarter /tmp/ird/usr/src/templates/appstarter /tmp/ird/usr/src/templates/servicestarter

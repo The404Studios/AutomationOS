@@ -641,6 +641,7 @@ int panel_map_click(Ide* a, Rect r, int mx, int my)
                 /* find the called function in the model and refocus to it */
                 for (j = 0; j < a->model.nfuncs && j < M_MAXFUNCS; j++) {
                     if (map_streq(a->model.funcs[j].name, s->fname)) {
+                        a->prev_focus = a->focus_func;   /* remember for Backspace = back */
                         ide_set_focus(a, j);
                         return 1;
                     }

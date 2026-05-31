@@ -560,11 +560,12 @@ static void init(Ide* a) {
      * not just the single towerdefense demo. scan_dir() recurses into the
      * subdirs, so clicking any file under any project opens it in the editor. */
     ide_strlcpy(a->root, "/usr/src", IDE_PATH);
+    a->prev_focus = 0;
 
     scan_project(a);
 
-    /* Pick a friendly starting file: prefer "tower.c"; else the first .c file;
-     * else the first regular file found anywhere in the tree. */
+    /* Pick a friendly starting file: prefer the Zombie Bastion game source;
+     * else the first .c file; else the first regular file found in the tree. */
     int pick = -1;
     int first_c = -1;
     int first_file = -1;
@@ -572,7 +573,7 @@ static void init(Ide* a) {
         if (a->entries[i].is_dir) continue;
         if (first_file < 0) first_file = i;
         if (first_c < 0 && ends_with_dot_c(a->entries[i].name)) first_c = i;
-        if (ide_streq(a->entries[i].name, "tower.c")) { pick = i; break; }
+        if (ide_streq(a->entries[i].name, "zombietd.c")) { pick = i; break; }
     }
     if (pick < 0) pick = (first_c >= 0) ? first_c : first_file;
 
@@ -1274,18 +1275,19 @@ static void route_click_editor(Ide* a, int mx, int my) {
     if (rect_hit(a->r_e_tree, mx, my)) {
         /* The tree uses the same explorer panel. If clicking a file, open it
          * and focus editor. If clicking to select, focus explorer for keyboard nav. */
-        int was_selected = a->sel_entry;
         panel_explorer_click(a, a->r_e_tree, mx, my);
-        /* If selection changed to a file (not just re-clicking), focus editor for typing.
-         * Otherwise, focus explorer for arrow key navigation. */
-        if (a->sel_entry != was_selected && a->sel_entry < a->nentries && !a->entries[a->sel_entry].is_dir) {
-            a->term_focus = 0;
-            a->explorer_focused = 0;
-            a->editor.focused = 1;
-        } else {
-            a->term_focus = 0;
+        /* Clicking a FILE (even the already-open one) focuses the editor so the
+         * arrow keys move the caret; only a FOLDER keeps the explorer focused for
+         * arrow-key tree nav. (Previously, re-clicking the auto-opened file
+         * latched explorer_focused=1 and the explorer key-block ate the arrows.) */
+        a->term_focus = 0;
+        if (a->sel_entry >= 0 && a->sel_entry < a->nentries &&
+            a->entries[a->sel_entry].is_dir) {
             a->explorer_focused = 1;
             a->editor.focused = 0;
+        } else {
+            a->explorer_focused = 0;
+            a->editor.focused = 1;
         }
         return;
     }
@@ -1578,6 +1580,9 @@ static void handle_key(Ide* a, int keycode, int pressed) {
         if (n > 0) ide_set_focus(a, (a->focus_func + 1) % n);
         break;
     }
+    case KEY_BACKSPC:                 /* go BACK to the previously-focused node */
+        ide_set_focus(a, a->prev_focus);
+        break;
     case KEY_G:
         if (a->model.nactions > 0 && gen_apply_action(a, 0)) {
             model_parse(&a->model, a->src, a->src_len, a->cur_file);

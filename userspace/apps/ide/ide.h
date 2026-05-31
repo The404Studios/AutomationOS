@@ -99,6 +99,7 @@ typedef struct Ide {
     /* analysis */
     Model    model;
     int      focus_func;            /* selected function (mirrors model.focus) */
+    int      prev_focus;            /* previous focus (Backspace = back in map)  */
 
     /* explorer */
     EntryRow entries[IDE_MAXENT];

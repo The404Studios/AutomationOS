@@ -343,7 +343,8 @@ void panel_code(Ide* a, Canvas* cv, Rect r) {
                     int cx = code_x + col * GFX_FW;
                     /* stop once this column has run off the visible region */
                     if (cx >= code_right) break;
-                    if (ch != '\t') {
+                    if (ch != '\t' && (unsigned char)ch >= 0x20 &&
+                        (unsigned char)ch < 0x7F) {
                         gfx_text_clip(cv, cx, ry, src + lstart + i,
                                       cv_class_color(cls[i]),
                                       code_x, code_clip_w);

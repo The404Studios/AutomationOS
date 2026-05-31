@@ -2602,13 +2602,22 @@ static void render_stats_overlay(uint32_t *buf, uint32_t w, uint32_t h, uint32_t
     stat_putu(l2, &p2, (int)sizeof(l2), (long)g_present_px);
     l2[p2] = '\0';
 
+    /* line3: the CPU split. The compositor runs ENTIRELY on CPU0; CPU1 does NO
+     * rendering yet (it's the brick-3.5 heartbeat / soon the brick-5 managed
+     * idle), so it reads "idle". This is the line that shows the second core is
+     * not helping render until bricks 6-8 put worker jobs on it. A real per-CPU
+     * load % is a Batch-3 worker-stats item (once CPU1 actually runs jobs). */
+    char l3[40]; int p3 = 0;
+    stat_puts(l3, &p3, (int)sizeof(l3), "CPU0 render  CPU1 idle");
+    l3[p3] = '\0';
+
     /* Box geometry: top-left, just below the panel so it never fights the panel
-     * title. Width sized to the longer line. */
-    int len = p1 > p2 ? p1 : p2;
+     * title. Width sized to the longest line. */
+    int len = p1 > p2 ? p1 : p2; if (p3 > len) len = p3;
     int32_t bx = 8;
     int32_t by = PANEL_H + 6;
     int32_t bw = len * FONT_W + 12;
-    int32_t bh = 2 * FONT_H + 10;
+    int32_t bh = 3 * FONT_H + 10;
 
     /* translucent dark plate + thin accent border (cheap, readable) */
     blend_rect(buf, w, h, stride, bx, by, bw, bh, 0xC0101418u);
@@ -2618,6 +2627,8 @@ static void render_stats_overlay(uint32_t *buf, uint32_t w, uint32_t h, uint32_t
                      bx + 6, by + 5, l1, 0xFF6FE26Fu);            /* green-ish */
     font_draw_string(buf, (int)stride, (int)w, (int)h,
                      bx + 6, by + 5 + FONT_H, l2, 0xFFE2E27Au);   /* amber-ish */
+    font_draw_string(buf, (int)stride, (int)w, (int)h,
+                     bx + 6, by + 5 + 2 * FONT_H, l3, 0xFF7AC8FFu); /* blue-ish */
 }
 
 /* ====================================================================== */

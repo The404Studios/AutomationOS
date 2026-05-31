@@ -43,6 +43,8 @@
 /* ---- evdev keycodes ---- */
 #define ITK_BACKSPACE 14
 #define ITK_ENTER     28
+#define ITK_UP        103  /* evdev KEY_UP   -- command-history recall (prev) */
+#define ITK_DOWN      108  /* evdev KEY_DOWN -- command-history recall (next) */
 
 /* ---- terminal colors ---- */
 #define IT_BG     TH_PANEL2
@@ -238,15 +240,32 @@ static void it_cmd_run(struct Ide* a, IdeTerm* t) {
     it_puts(t, "run: dispatched (see BUILD tab)\n");
 }
 
+/* ---- command history ring buffer ---- */
+static void it_hist_push(IdeTerm* t, const char* line) {
+    if (!line || !line[0]) return;  /* don't save empty commands */
+    int slot = t->hist_count % IT_HIST_MAX;
+    ide_strlcpy(t->hist[slot], line, IT_HIST_ENT);
+    t->hist_count++;
+}
+
+static const char* it_hist_get(IdeTerm* t, int offset) {
+    if (offset < 0 || offset >= t->hist_count || offset >= IT_HIST_MAX) return 0;
+    int idx = (t->hist_count - 1 - offset) % IT_HIST_MAX;
+    return t->hist[idx];
+}
+
 static void it_execute(struct Ide* a, IdeTerm* t) {
     char cmd[IT_LINEMAX];
     const char* p = t->line;
     int have = it_token(&p, cmd, sizeof(cmd));
     const char* args = p;   /* remainder after the command word */
 
+    /* Push to history before executing (so up-arrow recalls even if cmd fails) */
+    if (have && t->line[0]) it_hist_push(t, t->line);
+
     it_putc(t, '\n');
 
-    if (!have) { it_prompt(t); t->line_len = 0; t->line[0] = 0; return; }
+    if (!have) { it_prompt(t); t->line_len = 0; t->line[0] = 0; t->hist_nav = -1; return; }
 
     if      (it_eq(cmd, "help"))  it_cmd_help(t);
     else if (it_eq(cmd, "clear")) { it_clear(t); }
@@ -267,6 +286,7 @@ static void it_execute(struct Ide* a, IdeTerm* t) {
     it_prompt(t);
     t->line_len = 0;
     t->line[0] = 0;
+    t->hist_nav = -1;   /* reset history navigation */
 }
 
 /* ---- public API ---- */
@@ -276,6 +296,8 @@ void ide_term_init(IdeTerm* t, const char* cwd) {
     it_clear(t);
     t->line_len = 0; t->line[0] = 0;
     t->blink_ms = 0;
+    t->hist_count = 0;
+    t->hist_nav = -1;
     if (cwd && cwd[0]) ide_strlcpy(t->cwd, cwd, IT_CWDMAX);
     else { t->cwd[0] = '/'; t->cwd[1] = 0; }
     it_puts(t, "AutomationOS integrated terminal. Type 'help'.\n");
@@ -298,6 +320,51 @@ int ide_term_key(struct Ide* a, int keycode, char ch, int shift, int ctrl) {
         if (t->line_len > 0) { t->line_len--; t->line[t->line_len] = 0; it_backspace(t); }
         return 1;
     }
+
+    /* Arrow key history navigation (up/down) */
+    if (keycode == ITK_UP) {   /* recall previous command */
+        int available = t->hist_count < IT_HIST_MAX ? t->hist_count : IT_HIST_MAX;
+        if (available > 0) {
+            int next_nav = t->hist_nav + 1;
+            if (next_nav < available) {
+                const char* prev = it_hist_get(t, next_nav);
+                if (prev) {
+                    /* clear current line visually */
+                    for (int i = 0; i < t->line_len; i++) it_backspace(t);
+                    /* load history entry */
+                    ide_strlcpy(t->line, prev, IT_LINEMAX);
+                    t->line_len = ide_strlen(t->line);
+                    /* display it */
+                    it_puts(t, t->line);
+                    t->hist_nav = next_nav;
+                }
+            }
+        }
+        return 1;
+    }
+    if (keycode == ITK_DOWN) {  /* recall next command (toward present) */
+        if (t->hist_nav > 0) {
+            int next_nav = t->hist_nav - 1;
+            const char* next = it_hist_get(t, next_nav);
+            if (next) {
+                /* clear current line */
+                for (int i = 0; i < t->line_len; i++) it_backspace(t);
+                /* load history entry */
+                ide_strlcpy(t->line, next, IT_LINEMAX);
+                t->line_len = ide_strlen(t->line);
+                it_puts(t, t->line);
+                t->hist_nav = next_nav;
+            }
+        } else if (t->hist_nav == 0) {
+            /* back to empty line */
+            for (int i = 0; i < t->line_len; i++) it_backspace(t);
+            t->line[0] = 0;
+            t->line_len = 0;
+            t->hist_nav = -1;
+        }
+        return 1;
+    }
+
     if (ch >= 32 && ch < 127) {
         if (t->line_len < IT_LINEMAX - 1) {
             t->line[t->line_len++] = ch;

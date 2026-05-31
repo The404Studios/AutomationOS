@@ -86,6 +86,13 @@ cc userspace/apps/matbench/matbench.c /tmp/matbench.o; $LD /tmp/crt0.o /tmp/matb
 # scalar reference within epsilon and prints TENSORTEST: PASS. crt0-linked.
 cc userspace/lib/tensor/tensor.c /tmp/tensor.o
 cc userspace/apps/tensortest/tensortest.c /tmp/tensortest.o; $LD /tmp/crt0.o /tmp/tensortest.o /tmp/tensor.o -o /tmp/tensortest.elf
+# matmuljobs: a matmul run THROUGH the userspace job queue (lib/jobs) -- work is
+# partitioned into row-band jobs, dispatched to 2 worker threads on shared memory,
+# drained, and verified bit-identical to the scalar reference. NOT a speedup
+# (single-core); it proves the job-coordination machinery is correct. Bare _start
+# (no crt0), links the jobs queue + the tensor kernels.
+cc userspace/lib/jobs/jobs.c /tmp/jobs.o
+cc userspace/apps/matmuljobs/matmuljobs.c /tmp/matmuljobs.o; $LD /tmp/matmuljobs.o /tmp/jobs.o /tmp/tensor.o -o /tmp/matmuljobs.elf
 
 # Wave: process/disk sysutils + file/text tools (all argv-aware, crt0-linked).
 # ps/kill/free/uptime = process+system info; find/diff/cmp/tee/wcx/xargs = file
@@ -379,7 +386,7 @@ $LD /tmp/crt0.o /tmp/cc.o \
     -o /tmp/cc.elf
 
 echo "[all] canary check (all must be 0):"
-for e in comp init filemanager calculator clock sysinfo settings sysmon uidemo dateapp applauncher taskman terminal editor snake paint synth tetris game2048 sheet notes calendar stopwatch mines piano dashboard welcome bench breakout pong invaders procmon soundtest solitaire aiconsole screenshot stress musicplayer ide bubbletd pacman clockapp forktest threadtest aibroker sed awk tar pkg make meminfo argvtest floattest sleeptest prioritytest matbench tensortest cpuburn blk ps kill free uptime find diff cmp tee wcx xargs gzip cc nettest sockettest wget netman browser cryptotest libtest ping nc grep head tail sort uniq cut tr nl du touch basename dirname uname hostname whoami date less hexdump tlsprobe certtool dhcpc apidemo js futextest epolltest sendfiletest perftest batchtest domtest htmltest csstest layouttest webtest browser2 webapitest; do
+for e in comp init filemanager calculator clock sysinfo settings sysmon uidemo dateapp applauncher taskman terminal editor snake paint synth tetris game2048 sheet notes calendar stopwatch mines piano dashboard welcome bench breakout pong invaders procmon soundtest solitaire aiconsole screenshot stress musicplayer ide bubbletd pacman clockapp forktest threadtest matmuljobs aibroker sed awk tar pkg make meminfo argvtest floattest sleeptest prioritytest matbench tensortest cpuburn blk ps kill free uptime find diff cmp tee wcx xargs gzip cc nettest sockettest wget netman browser cryptotest libtest ping nc grep head tail sort uniq cut tr nl du touch basename dirname uname hostname whoami date less hexdump tlsprobe certtool dhcpc apidemo js futextest epolltest sendfiletest perftest batchtest domtest htmltest csstest layouttest webtest browser2 webapitest; do
     n=$(objdump -d /tmp/$e.elf 2>/dev/null | grep -c "fs:0x28" || true)
     echo "  $e=$n"
 done
@@ -389,7 +396,7 @@ rm -rf /tmp/ird && mkdir -p /tmp/ird
 ( cd /tmp/ird && tar xf /mnt/c/Users/wilde/Desktop/Kernel/iso/boot/initrd.img )
 cp /tmp/comp.elf /tmp/ird/sbin/compositor
 cp /tmp/init.elf /tmp/ird/sbin/init
-for e in filemanager calculator clock sysinfo settings sysmon uidemo dateapp applauncher taskman terminal editor snake paint synth tetris game2048 sheet notes calendar stopwatch mines piano dashboard welcome bench breakout pong invaders procmon soundtest solitaire aiconsole screenshot stress musicplayer ide bubbletd startmenu controlcenter chess asteroids sudoku photos pacman clockapp forktest threadtest; do
+for e in filemanager calculator clock sysinfo settings sysmon uidemo dateapp applauncher taskman terminal editor snake paint synth tetris game2048 sheet notes calendar stopwatch mines piano dashboard welcome bench breakout pong invaders procmon soundtest solitaire aiconsole screenshot stress musicplayer ide bubbletd startmenu controlcenter chess asteroids sudoku photos pacman clockapp forktest threadtest matmuljobs; do
     cp /tmp/$e.elf /tmp/ird/sbin/$e
 done
 [ "$IV_OK" = "1" ] && cp /tmp/imageviewer.elf /tmp/ird/sbin/imageviewer

@@ -39,7 +39,8 @@ MIN_PIDS=4
 # each spawn, run a KAT, and exit) plus forktest's 20 forks -- all legitimate exits.
 # +5 for the new short-lived webapitest probe.
 # +5 for threadtest (4 threads + the main process all exit -> legitimate frees).
-MAX_FREEING=185
+# +5 for matmuljobs (2 worker threads + the main process all exit -> legitimate frees).
+MAX_FREEING=190
 
 # ── Colour helpers ─────────────────────────────────────────────────────────
 RED='\033[0;31m'
@@ -694,6 +695,28 @@ check_thread() {
     fi
 }
 
+check_matmuljobs() {
+    # init spawns sbin/matmuljobs, which runs a float matmul THROUGH the userspace
+    # job queue (lib/jobs): the output rows are partitioned into jobs, dispatched
+    # to worker threads on a SHARED result buffer, drained (blocking futex), the
+    # pool is cleanly shut down (workers joined), and the threaded result is
+    # compared bit-for-bit against the single-threaded scalar reference. This
+    # gates the compute-COORDINATION layer. NOTE: single-core => this is NOT a
+    # speedup (workers time-share one cpu); it proves the machinery is correct.
+    # The real parallel win needs SMP. "matmuljobs: PASS result-matches-ref ..."
+    # means the queue dispatched the work and the result equals the reference.
+    if grep -qF 'matmuljobs: PASS result-matches-ref' "$LOG"; then
+        pass "job queue + worker matmul verified ($(grep -F 'matmuljobs: PASS' "$LOG" | head -1 | sed 's/^.*matmuljobs: PASS //'))"
+        return 0
+    elif grep -qF 'matmuljobs: FAIL' "$LOG"; then
+        fail "job-queue matmul broken: $(grep -F 'matmuljobs: FAIL' "$LOG" | head -1)"
+        return 1
+    else
+        fail "matmuljobs did not report (job queue deadlocked or never ran)"
+        return 1
+    fi
+}
+
 check_browser_wave() {
     # 22-agent browser wave: init spawns the per-layer selftests + browser2.
     # Each app prints "<NAME>: PASS" or "<NAME>: FAIL ..." and exits.
@@ -764,6 +787,7 @@ run_checks() {
         check_no_crash_loop
         check_fork_cow
         check_thread
+        check_matmuljobs
         check_heap_extend
         check_aibroker
         check_tools

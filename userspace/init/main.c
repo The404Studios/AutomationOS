@@ -148,6 +148,16 @@ void _start(void) {
     print("[INIT] Spawning tensortest...\n");
     spawn("sbin/tensortest");
 
+    // matmuljobs: a matmul run THROUGH the userspace job queue -- the rows are
+    // partitioned into jobs, dispatched to worker threads on shared memory,
+    // drained, and verified bit-identical to the scalar reference. This proves
+    // the compute-COORDINATION machinery (submit/pull/compute/collect) is
+    // correct. NOT a speedup: single-core means the workers time-share one cpu,
+    // so it is *slower* than inline -- the parallel win waits for SMP. Prints
+    // "matmuljobs: PASS result-matches-ref ...".
+    print("[INIT] Spawning matmuljobs...\n");
+    spawn("sbin/matmuljobs");
+
     // AI-native layer: the capability-gated command broker (crown jewel) runs a
     // self-test of its tool-bus + policy + ledger + rollback pipeline.
     print("[INIT] Spawning aibroker...\n");

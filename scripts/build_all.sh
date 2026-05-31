@@ -329,6 +329,7 @@ build_wl_app userspace/apps/synth/synth.c             synth
 build_wl_app userspace/apps/tetris/tetris.c           tetris
 build_wl_app userspace/apps/game2048/game2048.c       game2048
 build_wl_app userspace/apps/bubbletd/bubbletd.c       bubbletd
+build_wl_app userspace/apps/zombietd/zombietd.c       zombietd
 build_wl_app userspace/apps/sheet/sheet.c             sheet
 build_wl_app userspace/apps/notes/notes.c             notes
 build_wl_app userspace/apps/calendar/calendar.c       calendar
@@ -392,7 +393,7 @@ $LD /tmp/crt0.o /tmp/cc.o \
     -o /tmp/cc.elf
 
 echo "[all] canary check (all must be 0):"
-for e in comp init filemanager calculator clock sysinfo settings sysmon uidemo dateapp applauncher taskman terminal editor snake paint synth tetris game2048 sheet notes calendar stopwatch mines piano dashboard welcome bench breakout pong invaders procmon soundtest solitaire aiconsole screenshot stress musicplayer ide bubbletd pacman clockapp forktest threadtest matmuljobs aibroker sed awk tar pkg make meminfo argvtest floattest sleeptest prioritytest matbench tensortest cpuburn blk ps kill free uptime find diff cmp tee wcx xargs gzip cc nettest sockettest cpu1offload wget netman browser cryptotest libtest ping nc grep head tail sort uniq cut tr nl du touch basename dirname uname hostname whoami date less hexdump tlsprobe certtool dhcpc apidemo js futextest epolltest sendfiletest perftest batchtest domtest htmltest csstest layouttest webtest browser2 webapitest; do
+for e in comp init filemanager calculator clock sysinfo settings sysmon uidemo dateapp applauncher taskman terminal editor snake paint synth tetris game2048 sheet notes calendar stopwatch mines piano dashboard welcome bench breakout pong invaders procmon soundtest solitaire aiconsole screenshot stress musicplayer ide bubbletd zombietd pacman clockapp forktest threadtest matmuljobs aibroker sed awk tar pkg make meminfo argvtest floattest sleeptest prioritytest matbench tensortest cpuburn blk ps kill free uptime find diff cmp tee wcx xargs gzip cc nettest sockettest cpu1offload wget netman browser cryptotest libtest ping nc grep head tail sort uniq cut tr nl du touch basename dirname uname hostname whoami date less hexdump tlsprobe certtool dhcpc apidemo js futextest epolltest sendfiletest perftest batchtest domtest htmltest csstest layouttest webtest browser2 webapitest; do
     n=$(objdump -d /tmp/$e.elf 2>/dev/null | grep -c "fs:0x28" || true)
     echo "  $e=$n"
 done
@@ -402,7 +403,7 @@ rm -rf /tmp/ird && mkdir -p /tmp/ird
 ( cd /tmp/ird && tar xf /mnt/c/Users/wilde/Desktop/Kernel/iso/boot/initrd.img )
 cp /tmp/comp.elf /tmp/ird/sbin/compositor
 cp /tmp/init.elf /tmp/ird/sbin/init
-for e in filemanager calculator clock sysinfo settings sysmon uidemo dateapp applauncher taskman terminal editor snake paint synth tetris game2048 sheet notes calendar stopwatch mines piano dashboard welcome bench breakout pong invaders procmon soundtest solitaire aiconsole screenshot stress musicplayer ide bubbletd startmenu controlcenter chess asteroids sudoku photos pacman clockapp forktest threadtest matmuljobs; do
+for e in filemanager calculator clock sysinfo settings sysmon uidemo dateapp applauncher taskman terminal editor snake paint synth tetris game2048 sheet notes calendar stopwatch mines piano dashboard welcome bench breakout pong invaders procmon soundtest solitaire aiconsole screenshot stress musicplayer ide bubbletd startmenu controlcenter chess asteroids sudoku photos pacman clockapp zombietd forktest threadtest matmuljobs; do
     cp /tmp/$e.elf /tmp/ird/sbin/$e
 done
 [ "$IV_OK" = "1" ] && cp /tmp/imageviewer.elf /tmp/ird/sbin/imageviewer

@@ -3315,6 +3315,14 @@ static void begin_snap_to(int slot, int32_t kind) {
     if (win->phase == PH_CLOSING || win->phase == PH_MINIMIZING) return;
     int32_t fx, fy; uint32_t cw, ch;
     if (snap_target_rect(kind, &fx, &fy, &cw, &ch) != 0) return;
+    /* Aspect/black-margin fix: never grow a window's frame past the app's OWN
+     * surface (buf_w x buf_h). A fixed-size client (e.g. the 640x400 terminal)
+     * can't fill a bigger frame, so the uncovered area letterboxes to the
+     * wallpaper -- the "black margin on the right". Clamp the snap/maximize target
+     * to the buffer so the window MATCHES the app. (Real grow-to-fill needs a
+     * resize/configure protocol event + per-app reflow -- a separate, larger job.) */
+    if (cw > win->buf_w) cw = win->buf_w;
+    if (ch > win->buf_h) ch = win->buf_h;
     if (win->snap_state == SNAP_NONE) {            /* remember where we came from */
         win->saved_x = win->x; win->saved_y = win->y;
         win->saved_w = win->w; win->saved_h = win->h;

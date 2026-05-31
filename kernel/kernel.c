@@ -468,12 +468,31 @@ void kernel_main(void* raw_info) {
         if (smp_cpu_count >= 2) {
             if (try_start_cpu1()) {
                 kprintf("[SMP] CPU 1 online\n");        /* AP reached long mode */
-                /* Brick 5: the AP now parks in a managed kernel idle loop (it bumps
-                 * its idle-tick counter once, then `hlt`s -- low power, NOT a 100%
-                 * spinner). No interrupts/scheduler on the AP yet; brick 6 adds work. */
-                kprintf("[SMP] CPU 1 -> managed idle (hlt-parked)\n");
-                g_smp_boot_status = "SMP: CPU 1 IDLE";
-                g_smp_ap_online = 1;   /* brick 5: AP is up -> parked in managed idle */
+                /* Brick 6: the AP now runs a managed kernel WORKER loop -- it
+                 * spin-polls ONE job slot. Dispatch a SINGLE trusted job to CPU 1
+                 * to PROVE it can execute BSP-dispatched code and return a correct
+                 * result via shared memory. cpu1_run() submits the job and waits on
+                 * a BOUNDED ~100 ms TSC deadline, so a wedged AP can never hang us.
+                 *
+                 * The job computes sum(1..1000) on CPU 1 and stores it in shared
+                 * memory (g_worktest); 500500 is the known-correct answer. This is
+                 * the first REAL work on the second core: one trusted fn, no
+                 * scheduler, no arbitrary process, no migration. The AP spin-polls
+                 * (it is NOT hlt-parked) because it has no wakeup IRQ yet -- a
+                 * low-power IPI-wake is a future brick. */
+                extern int cpu1_run(void (*fn)(void *), void *arg);
+                extern volatile long g_worktest;
+                extern void worktest(void *a);
+                if (cpu1_run(worktest, (void *)1000) && g_worktest == 500500) {
+                    kprintf("[SMP] CPU 1 ran worker job: sum(1..1000)=%ld "
+                            "(expected 500500)\n", g_worktest);
+                    g_smp_boot_status = "SMP: CPU 1 WORKER OK";
+                } else {
+                    kprintf("[SMP] CPU 1 worker job FAILED or timed out "
+                            "(got %ld)\n", g_worktest);
+                    g_smp_boot_status = "SMP: CPU 1 worker FAIL";
+                }
+                g_smp_ap_online = 1;   /* brick 6: AP is up -> managed worker loop */
             } else {
                 kprintf("[SMP] AP failed to start, continuing single-core\n");
                 g_smp_boot_status = "SMP: AP failed (single-core)";
@@ -576,14 +595,16 @@ void kernel_main(void* raw_info) {
          * top-left spot (y=100, just below the markers) so CPU0's counter is
          * visibly climbing on real hardware.
          *
-         * BRICK 5 update: the AP no longer pure-spins cpu_hb[1]. It bumps cpu_hb[1]
+         * BRICK 6 update: the AP no longer pure-spins cpu_hb[1]. It bumps cpu_hb[1]
          * a SMALL fixed number of times (proof-of-life, so the "CPU1 ran" evidence
-         * is still nonzero) and then PARKS in a managed `hlt` idle loop -- so here
-         * cpu_hb[1] holds a small constant (the proof-of-life count) while CPU0
-         * climbs. That asymmetry is now INVERTED vs brick 3.5 by design: a parked,
-         * low-power AP, not a 100% spinner. If the AP did NOT come online
-         * (single-core / brick-3 failure) cpu_hb[1] stays 0 and we don't hang. NO
-         * scheduler, NO run queue, NO IPI, NO shared state.
+         * is still nonzero) and then runs a managed WORKER loop, spin-polling its
+         * one job slot. By the time this window runs the brick-6 self-test job has
+         * already completed, so no further job is pending -- cpu_hb[1] holds the
+         * small proof-of-life constant while CPU0 climbs. The AP's OWN ap1_idle_ticks
+         * counter, however, climbs the whole time: it busy-polls the slot (it has no
+         * wakeup IRQ yet, so it cannot `hlt`-park between jobs -- IPI-wake is a later
+         * brick). If the AP did NOT come online (single-core / brick-3 failure)
+         * cpu_hb[1] stays 0 and we don't hang. NO scheduler, NO run queue, NO IPI.
          * ------------------------------------------------------------------- */
         {
             const uint64_t HB_TSC_PER_US = 3000ULL;          /* ~3 GHz estimate    */
@@ -593,7 +614,8 @@ void kernel_main(void* raw_info) {
             uint64_t repaint_gate = 0;                        /* throttle repaints  */
             kprintf("[SMP] heartbeat proof window: BSP spins cpu_hb[0], "
                     "AP %s (~4s)\n",
-                    g_smp_ap_online ? "parked in managed idle (cpu_hb[1] frozen)"
+                    g_smp_ap_online ? "spin-polling worker slot (cpu_hb[1] frozen, "
+                                      "idle_ticks climbing)"
                                     : "absent (single-core)");
             while ((rdtsc() - hb_start) < hb_deadline) {
                 /* BSP touches ONLY its own isolated counter. */
@@ -618,14 +640,15 @@ void kernel_main(void* raw_info) {
             }
 
             /* Headless verification hook: the framebuffer paint is invisible to
-             * headless QEMU, so ALSO emit the final values on serial. Brick 5: on
+             * headless QEMU, so ALSO emit the final values on serial. Brick 6: on
              * -smp 2 CPU0 is large (it spins+paints) while CPU1 is a SMALL constant
-             * (the proof-of-life count -- the AP then parked in `hlt`); on -smp 1
-             * CPU1 stays 0 (no AP). Also report the AP's managed-idle wakeup count
-             * (ap1_idle_ticks ~1: it parked on the first hlt with no IRQ armed). */
+             * (the proof-of-life count -- the AP ran its self-test job then resumed
+             * polling); on -smp 1 CPU1 stays 0 (no AP). Also report the AP's idle
+             * poll count (ap1_idle_ticks now CLIMBS: the AP busy-polls its worker
+             * slot because it has no wakeup IRQ yet -- IPI-wake is a later brick). */
             extern volatile uint64_t ap1_idle_ticks;
             kprintf("[SMP] heartbeat: CPU0=%lu CPU1=%lu (proof-of-life); "
-                    "CPU1 idle_ticks=%lu (hlt-parked)\n",
+                    "CPU1 idle_ticks=%lu (worker spin-poll)\n",
                     cpu_hb[0].v, cpu_hb[1].v, ap1_idle_ticks);
         }
 #endif

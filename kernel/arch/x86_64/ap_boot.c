@@ -1,6 +1,7 @@
 /*
- * ap_boot.c -- SMP brick 3/5: bring ONE application processor (CPU 1) online, then
- * park it in a managed kernel idle loop. GATED behind -DSMP_FOUNDATION (SMP=1).
+ * ap_boot.c -- SMP brick 3/5/6: bring ONE application processor (CPU 1) online,
+ * then run a managed kernel worker loop that executes a SINGLE trusted job the BSP
+ * dispatches into one job slot. GATED behind -DSMP_FOUNDATION (SMP=1).
  * ============================================================================
  *
  * Scope (deliberately tiny):
@@ -13,9 +14,11 @@
  *   - Wait with a BOUNDED TSC-deadline timeout (~100 ms) polling a shared
  *     MEMORY flag the AP sets. NEVER an infinite spin, NEVER a panic.
  *   - The AP marks itself online, bumps its isolated per-CPU heartbeat counter
- *     (cpu_hb[1]) a SMALL fixed number of times as proof-of-life, then (brick 5)
- *     enters a MANAGED idle loop: bump idle_ticks, then `hlt`. With no interrupts
- *     armed it parks on the first hlt -- a quiescent, LOW-POWER AP (not a spinner).
+ *     (cpu_hb[1]) a SMALL fixed number of times as proof-of-life, then (brick 6)
+ *     enters a MANAGED WORKER loop: it spin-polls ONE job slot and, when the BSP
+ *     publishes a job, runs that ONE trusted fn and signals done -- otherwise it
+ *     bumps idle_ticks and `pause`s. It cannot `hlt`-park because it has no wakeup
+ *     IRQ yet (IPI-wake is a later brick), so it busy-polls to stay responsive.
  *
  * THE HARD RULE: an AP that never comes up MUST NOT stop or hang the BSP. Every
  * wait here is a finite deadline; on timeout the caller logs the failure and the
@@ -95,15 +98,14 @@ struct hb { volatile uint64_t v; char pad[56]; } __attribute__((aligned(64)));
 struct hb cpu_hb[2] = {{0, {0}}, {0, {0}}};   /* [0]=BSP, [1]=AP; 64-byte-separated */
 
 /* ---------------------------------------------------------------------------
- * SMP brick 5: the AP's managed-idle tick counter.
+ * SMP brick 5/6: the AP's idle tick counter.
  *
- * This is the counter CPU 1 OWNS in its kernel idle loop (ap_main below). Brick 5
- * replaces the brick-3.5 100%-busy `pause` spin with a LOW-POWER idle: the AP bumps
- * idle_ticks once and parks in `hlt`. With NO interrupts armed on the AP (no sti,
- * no timer, no handler), the very first `hlt` halts the core indefinitely, so this
- * counter settles at ~1 -- which is exactly correct: a parked, low-power AP waiting
- * for work, NOT a spinner burning a core. (When brick 6 arms an AP timer / work IPI
- * this same counter will then climb once per wakeup.)
+ * This is the counter CPU 1 OWNS in its kernel worker loop (ap_main below). In
+ * brick 5 the AP hlt-parked (this settled at ~1). In brick 6 the AP spin-polls the
+ * job slot, so it bumps this counter once per idle poll while it WAITS for work --
+ * the counter now climbs. This is the honest cost of brick 6: the AP has NO wakeup
+ * interrupt yet (a low-power IPI-wake that would let it `hlt` between jobs is a
+ * later brick), so to stay responsive to the slot it must busy-poll, not park.
  *
  * Design note (standalone vs cpu_t.idle_ticks): the per-CPU cpu_t/cpus[] array is
  * file-local to scheduler.c and is indexed by cpu_id(), which still returns 0 on the
@@ -115,6 +117,45 @@ struct hb cpu_hb[2] = {{0, {0}}, {0, {0}}};   /* [0]=BSP, [1]=AP; 64-byte-separa
  * the compiler from optimizing the single bump away.
  */
 volatile uint64_t ap1_idle_ticks = 0;   /* CPU 1's managed-idle wakeup counter */
+
+/* ---------------------------------------------------------------------------
+ * SMP brick 6: the ONE job slot the BSP uses to dispatch a SINGLE trusted kernel
+ * worker function to CPU 1. This is the first REAL work on the second core.
+ *
+ * Scope (deliberately one slot, deliberately tiny):
+ *   - The BSP fills fn/arg, clears `done`, then publishes `pending`.
+ *   - The AP worker loop (ap_main) ACQUIRE-loads `pending`; on 1 it runs fn(arg),
+ *     publishes `done`, then clears `pending`.
+ *   - The BSP spins on `done` with a BOUNDED ~100 ms TSC deadline (cpu1_run).
+ *
+ * CPU 1 runs ONLY the trusted `fn` the BSP set here -- there is NO scheduler, NO
+ * task queue, NO arbitrary process, NO migration. One slot, one trusted callback.
+ *
+ * MEMORY ORDERING (why the AP can never run a stale fn/arg, nor miss a job):
+ *   - BSP (cpu1_run): writes fn, arg, then `done=0` (RELAXED), then `pending=1`
+ *     with RELEASE. The RELEASE store on `pending` is a one-way barrier: every
+ *     prior write (fn, arg, done) is visible to any thread that ACQUIRE-loads the
+ *     SAME `pending` and sees the 1.
+ *   - AP (ap_main): ACQUIRE-loads `pending`; observing 1 synchronizes-with the
+ *     BSP's RELEASE, so the fn/arg it then reads are guaranteed the freshly
+ *     published values, never a torn or stale prior pair. It cannot "miss" a job:
+ *     it spin-polls the slot every iteration (pause), so any published `pending=1`
+ *     is seen on a subsequent load. After running, it RELEASE-stores `done=1`
+ *     (publishing g_worktest / any fn side effects) and then clears `pending`.
+ *   - BSP wait: ACQUIRE-loads `done`; observing 1 synchronizes-with the AP's
+ *     RELEASE, so all of fn's shared-memory writes are visible before cpu1_run
+ *     returns 1. `done` is cleared BEFORE `pending` is set, so the BSP can never
+ *     observe a leftover `done=1` from a previous job.
+ * Both fields are `volatile` AND accessed via __atomic_* (acquire/release) so the
+ * compiler neither reorders nor elides them and the CPU's ordering is enforced.
+ * ------------------------------------------------------------------------- */
+typedef void (*cpu_job_fn)(void *);
+static struct {
+    cpu_job_fn       fn;
+    void            *arg;
+    volatile int     pending;
+    volatile int     done;
+} cpu1_job;
 
 /* Tiny proof-of-life: how many times ap_main bumps cpu_hb[1] BEFORE parking in the
  * managed idle. Just enough that the existing brick-3.5 "CPU1 ran" evidence (a
@@ -169,19 +210,30 @@ static void ap_tsc_delay_us(uint64_t us)
  * observes the flag. Does NOT touch the scheduler, allocator, or any stateful
  * subsystem. Does NOT enable interrupts (NO sti, NO timer, NO handler).
  *
- * BRICK 5 (this brick): after publishing online (SEQ_CST so the BSP's ACQUIRE load
+ * BRICK 6 (this brick): after publishing online (SEQ_CST so the BSP's ACQUIRE load
  * sees it), the AP first bumps cpu_hb[1] a SMALL fixed number of times -- a
  * proof-of-life so the existing brick-3.5 "CPU1 ran" evidence (nonzero cpu_hb[1])
- * still holds and shows the AP executed -- and then enters its MANAGED IDLE LOOP:
+ * still holds and shows the AP executed -- and then enters its MANAGED WORKER LOOP:
  *
- *     for (;;) { ap1_idle_ticks++; __asm__ volatile("hlt"); }
+ *     for (;;) {
+ *         if (ACQUIRE-load cpu1_job.pending) {        // BSP published a job
+ *             cpu1_job.fn(cpu1_job.arg);              // run the ONE trusted fn
+ *             RELEASE-store cpu1_job.done = 1;        // publish results
+ *             RELEASE-store cpu1_job.pending = 0;     // free the slot
+ *         } else {
+ *             ap1_idle_ticks++;                       // idle this round
+ *             __asm__ volatile("pause");              // spin-poll hint
+ *         }
+ *     }
  *
- * Because NO interrupts are armed on the AP, the first `hlt` halts this core and it
- * parks there forever (ap1_idle_ticks settles at ~1). That is the WHOLE POINT of
- * brick 5: the AP went from a 100%-busy `pause` spinner (brick 3.5, cpu_hb[1]
- * climbing to millions) to a parked, LOW-POWER core waiting for work. No scheduler,
- * no tasks, no IPI -- just a quiescent, hlt-parked AP. Brick 6 will arm a wakeup
- * source and start dispatching worker jobs; then idle_ticks climbs per wakeup.
+ * The AP SPIN-POLLS the single job slot (it CANNOT take an IPI -- there are NO
+ * interrupts armed on the AP yet, so a low-power IPI-wake is a LATER brick). It
+ * stays out of `hlt` precisely so it remains responsive to the slot. It runs ONLY
+ * the trusted `fn` the BSP set in cpu1_job -- nothing else: NO scheduler, NO task
+ * queue, NO arbitrary process, NO migration. See the cpu1_job comment above for the
+ * full acquire/release reasoning (the AP can never run a stale fn/arg nor miss a
+ * job). ap1_idle_ticks now climbs while the AP waits for work (it is no longer
+ * hlt-parked at ~1) -- that is the honest cost of having no wakeup IRQ yet.
  */
 void ap_main(uint64_t cpu)
 {
@@ -198,14 +250,92 @@ void ap_main(uint64_t cpu)
         __asm__ volatile("pause");
     }
 
-    /* Managed kernel idle loop: bump the idle-tick counter, then HALT (low power).
-     * With no interrupts armed on the AP, the first `hlt` parks the core for good
-     * (idle_ticks ends at ~1) -- a quiescent, low-power AP, NOT a 100% spinner.
-     * NO sti, NO timer, NO handler, NO scheduler. */
+    /* Managed kernel WORKER loop: poll the ONE job slot the BSP dispatches into.
+     * On a pending job, run the trusted fn, publish `done`, then free the slot.
+     * Otherwise idle (bump the tick counter, `pause`). The AP must spin-poll (NOT
+     * `hlt`) because it has no wakeup interrupt yet. NO sti, NO timer, NO handler,
+     * NO scheduler -- it executes ONLY cpu1_job.fn and nothing else. */
     for (;;) {
-        ap1_idle_ticks++;
-        __asm__ volatile("hlt");
+        if (__atomic_load_n(&cpu1_job.pending, __ATOMIC_ACQUIRE)) {
+            /* ACQUIRE on `pending`==1 synchronizes-with the BSP's RELEASE in
+             * cpu1_run, so fn/arg read here are the freshly published values. */
+            cpu1_job.fn(cpu1_job.arg);
+            /* Publish the job's results (e.g. g_worktest) BEFORE marking done so
+             * the BSP's ACQUIRE-load of `done` sees all of fn's writes. */
+            __atomic_store_n(&cpu1_job.done, 1, __ATOMIC_RELEASE);
+            /* Free the slot last. */
+            __atomic_store_n(&cpu1_job.pending, 0, __ATOMIC_RELEASE);
+        } else {
+            ap1_idle_ticks++;
+            __asm__ volatile("pause");
+        }
     }
+}
+
+/* ---------------------------------------------------------------------------
+ * SMP brick 6 self-test job. A trivial, TRUSTED kernel function dispatched to
+ * CPU 1 exactly once after it comes online, to PROVE the AP executes BSP-supplied
+ * code and returns a correct result through shared memory. It sums 1..n on CPU 1
+ * and writes the total to g_worktest; the BSP checks g_worktest == 500500 for
+ * n=1000. Both symbols are non-static so kernel.c's self-test can reference them
+ * (this file is otherwise self-contained; these two are its only cross-file exports
+ * for the test, mirroring how cpu_hb is exported). `g_worktest` is volatile so the
+ * compiler does not elide the store the BSP then reads from another core; the
+ * cross-core visibility ordering is provided by the done RELEASE/ACQUIRE pair. */
+volatile long g_worktest = 0;
+void worktest(void *a)
+{
+    long n = (long)a;
+    long s = 0;
+    for (long i = 1; i <= n; i++) {
+        s += i;
+    }
+    g_worktest = s;
+}
+
+/*
+ * cpu1_run -- BSP-side submit + bounded wait. Hand the ONE trusted worker function
+ * `fn` (with `arg`) to CPU 1 via the single job slot, then wait for it to finish.
+ *
+ * Returns 1 if CPU 1 ran the job and signalled done within the deadline, 0 on
+ * timeout. The wait is a BOUNDED ~100 ms TSC deadline so a wedged/dead AP can NEVER
+ * hang the BSP -- mirroring THE HARD RULE used everywhere else in this file.
+ *
+ * Ordering: clear `done` (RELAXED -- it is republished under the `pending` RELEASE
+ * fence), then RELEASE-store `pending=1`. The RELEASE guarantees the AP, when it
+ * ACQUIRE-observes pending==1, also sees the fn/arg/done we wrote first -- so it
+ * cannot run a stale fn or observe a leftover done=1 from a previous job. We then
+ * ACQUIRE-poll `done`; observing 1 synchronizes-with the AP's RELEASE, making all
+ * of fn's shared-memory side effects visible before we return.
+ *
+ * Trust note: `fn` is a kernel function pointer chosen by the BSP (kernel code),
+ * never user-supplied. CPU 1 runs ONLY what the BSP places here.
+ */
+int cpu1_run(cpu_job_fn fn, void *arg)
+{
+    if (!fn) {
+        return 0;
+    }
+
+    /* Publish the job. fn/arg first, then clear done, then RELEASE pending. */
+    cpu1_job.fn  = fn;
+    cpu1_job.arg = arg;
+    __atomic_store_n(&cpu1_job.done, 0, __ATOMIC_RELAXED);
+    __atomic_store_n(&cpu1_job.pending, 1, __ATOMIC_RELEASE);
+
+    /* BOUNDED wait on the shared MEMORY flag `done` -- a finite ~100 ms TSC
+     * deadline. On expiry return 0 (the AP is wedged/absent) so the BSP keeps
+     * going; never an infinite spin, never a panic. */
+    uint64_t start    = rdtsc();
+    uint64_t deadline = AP_WAIT_US * AP_TSC_PER_US;   /* 100ms * 3000 cyc/us */
+    while (__atomic_load_n(&cpu1_job.done, __ATOMIC_ACQUIRE) == 0) {
+        if ((rdtsc() - start) >= deadline) {
+            return 0;                   /* timeout -> don't hang the BSP */
+        }
+        __asm__ volatile("pause" ::: "memory");
+    }
+
+    return 1;                           /* CPU 1 ran the job and signalled done */
 }
 
 /* Stage the trampoline blob + the shared param fields into low memory. */

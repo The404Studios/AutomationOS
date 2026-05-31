@@ -467,9 +467,13 @@ void kernel_main(void* raw_info) {
         int smp_cpu_count = madt_count_cpus();
         if (smp_cpu_count >= 2) {
             if (try_start_cpu1()) {
-                kprintf("[SMP] CPU 1 online\n");        /* AP now spins its heartbeat */
-                g_smp_boot_status = "SMP: CPU 1 ONLINE";
-                g_smp_ap_online = 1;   /* brick 3.5: AP is up -> its heartbeat will climb */
+                kprintf("[SMP] CPU 1 online\n");        /* AP reached long mode */
+                /* Brick 5: the AP now parks in a managed kernel idle loop (it bumps
+                 * its idle-tick counter once, then `hlt`s -- low power, NOT a 100%
+                 * spinner). No interrupts/scheduler on the AP yet; brick 6 adds work. */
+                kprintf("[SMP] CPU 1 -> managed idle (hlt-parked)\n");
+                g_smp_boot_status = "SMP: CPU 1 IDLE";
+                g_smp_ap_online = 1;   /* brick 5: AP is up -> parked in managed idle */
             } else {
                 kprintf("[SMP] AP failed to start, continuing single-core\n");
                 g_smp_boot_status = "SMP: AP failed (single-core)";
@@ -569,14 +573,17 @@ void kernel_main(void* raw_info) {
          * here is safe. For a bounded ~4 seconds (TSC deadline, same ~3 GHz
          * convention as ap_boot.c / brick 2), the BSP repeatedly increments ONLY
          * its own counter cpu_hb[0].v and repaints "CPU0=<n> CPU1=<m>" at a fixed
-         * top-left spot (y=100, just below the markers) so BOTH counters are
-         * visibly climbing on real hardware. Meanwhile the AP (if it came online)
-         * is pure-spinning cpu_hb[1].v on its OWN isolated cache line.
+         * top-left spot (y=100, just below the markers) so CPU0's counter is
+         * visibly climbing on real hardware.
          *
-         * If the AP did NOT come online (single-core / brick-3 failure) we still
-         * run CPU0's counter; cpu_hb[1] simply stays 0 and we don't hang. NO
-         * scheduler, NO run queue, NO IPI, NO shared state -- just two cores each
-         * touching their own 64-byte-separated counter.
+         * BRICK 5 update: the AP no longer pure-spins cpu_hb[1]. It bumps cpu_hb[1]
+         * a SMALL fixed number of times (proof-of-life, so the "CPU1 ran" evidence
+         * is still nonzero) and then PARKS in a managed `hlt` idle loop -- so here
+         * cpu_hb[1] holds a small constant (the proof-of-life count) while CPU0
+         * climbs. That asymmetry is now INVERTED vs brick 3.5 by design: a parked,
+         * low-power AP, not a 100% spinner. If the AP did NOT come online
+         * (single-core / brick-3 failure) cpu_hb[1] stays 0 and we don't hang. NO
+         * scheduler, NO run queue, NO IPI, NO shared state.
          * ------------------------------------------------------------------- */
         {
             const uint64_t HB_TSC_PER_US = 3000ULL;          /* ~3 GHz estimate    */
@@ -585,8 +592,9 @@ void kernel_main(void* raw_info) {
             uint64_t hb_deadline = HB_WINDOW_US * HB_TSC_PER_US;
             uint64_t repaint_gate = 0;                        /* throttle repaints  */
             kprintf("[SMP] heartbeat proof window: BSP spins cpu_hb[0], "
-                    "AP %s cpu_hb[1] (~4s)\n",
-                    g_smp_ap_online ? "spins" : "absent (single-core)");
+                    "AP %s (~4s)\n",
+                    g_smp_ap_online ? "parked in managed idle (cpu_hb[1] frozen)"
+                                    : "absent (single-core)");
             while ((rdtsc() - hb_start) < hb_deadline) {
                 /* BSP touches ONLY its own isolated counter. */
                 cpu_hb[0].v++;
@@ -610,11 +618,15 @@ void kernel_main(void* raw_info) {
             }
 
             /* Headless verification hook: the framebuffer paint is invisible to
-             * headless QEMU, so ALSO emit the final values on serial. On -smp 2
-             * both are large/nonzero (CPU1 typically MUCH larger -- it pure-spins
-             * while CPU0 also paints); on -smp 1 CPU1 stays 0 (no AP). */
-            kprintf("[SMP] heartbeat: CPU0=%lu CPU1=%lu\n",
-                    cpu_hb[0].v, cpu_hb[1].v);
+             * headless QEMU, so ALSO emit the final values on serial. Brick 5: on
+             * -smp 2 CPU0 is large (it spins+paints) while CPU1 is a SMALL constant
+             * (the proof-of-life count -- the AP then parked in `hlt`); on -smp 1
+             * CPU1 stays 0 (no AP). Also report the AP's managed-idle wakeup count
+             * (ap1_idle_ticks ~1: it parked on the first hlt with no IRQ armed). */
+            extern volatile uint64_t ap1_idle_ticks;
+            kprintf("[SMP] heartbeat: CPU0=%lu CPU1=%lu (proof-of-life); "
+                    "CPU1 idle_ticks=%lu (hlt-parked)\n",
+                    cpu_hb[0].v, cpu_hb[1].v, ap1_idle_ticks);
         }
 #endif
 

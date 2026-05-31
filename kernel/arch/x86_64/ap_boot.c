@@ -1,6 +1,6 @@
 /*
- * ap_boot.c -- SMP brick 3: bring ONE application processor (CPU 1) online as a
- * bare HEARTBEAT, then park it forever. GATED behind -DSMP_FOUNDATION (SMP=1).
+ * ap_boot.c -- SMP brick 3/5: bring ONE application processor (CPU 1) online, then
+ * park it in a managed kernel idle loop. GATED behind -DSMP_FOUNDATION (SMP=1).
  * ============================================================================
  *
  * Scope (deliberately tiny):
@@ -12,9 +12,10 @@
  *     ICR (MMIO, already enabled + proven in brick 1).
  *   - Wait with a BOUNDED TSC-deadline timeout (~100 ms) polling a shared
  *     MEMORY flag the AP sets. NEVER an infinite spin, NEVER a panic.
- *   - The AP marks itself online, then (brick 3.5) loops forever incrementing
- *     ONLY its own isolated per-CPU heartbeat counter (cpu_hb[1]). No interrupts,
- *     no hlt, no shared state -- a pure spin that proves it runs independently.
+ *   - The AP marks itself online, bumps its isolated per-CPU heartbeat counter
+ *     (cpu_hb[1]) a SMALL fixed number of times as proof-of-life, then (brick 5)
+ *     enters a MANAGED idle loop: bump idle_ticks, then `hlt`. With no interrupts
+ *     armed it parks on the first hlt -- a quiescent, LOW-POWER AP (not a spinner).
  *
  * THE HARD RULE: an AP that never comes up MUST NOT stop or hang the BSP. Every
  * wait here is a finite deadline; on timeout the caller logs the failure and the
@@ -93,6 +94,33 @@ static volatile uint32_t ap1_online = 0;
 struct hb { volatile uint64_t v; char pad[56]; } __attribute__((aligned(64)));
 struct hb cpu_hb[2] = {{0, {0}}, {0, {0}}};   /* [0]=BSP, [1]=AP; 64-byte-separated */
 
+/* ---------------------------------------------------------------------------
+ * SMP brick 5: the AP's managed-idle tick counter.
+ *
+ * This is the counter CPU 1 OWNS in its kernel idle loop (ap_main below). Brick 5
+ * replaces the brick-3.5 100%-busy `pause` spin with a LOW-POWER idle: the AP bumps
+ * idle_ticks once and parks in `hlt`. With NO interrupts armed on the AP (no sti,
+ * no timer, no handler), the very first `hlt` halts the core indefinitely, so this
+ * counter settles at ~1 -- which is exactly correct: a parked, low-power AP waiting
+ * for work, NOT a spinner burning a core. (When brick 6 arms an AP timer / work IPI
+ * this same counter will then climb once per wakeup.)
+ *
+ * Design note (standalone vs cpu_t.idle_ticks): the per-CPU cpu_t/cpus[] array is
+ * file-local to scheduler.c and is indexed by cpu_id(), which still returns 0 on the
+ * AP (stubs.c), so the AP cannot index its own slot without a new lapic-id-based
+ * accessor exported across files. This file is deliberately self-contained (see the
+ * header), so we keep the brick-5 counter standalone here -- mirroring cpu_hb -- to
+ * avoid cross-file coupling for a single uint64_t. It is exported (non-static) so the
+ * BSP can read/display it later. Only the field is volatile, which is enough to keep
+ * the compiler from optimizing the single bump away.
+ */
+volatile uint64_t ap1_idle_ticks = 0;   /* CPU 1's managed-idle wakeup counter */
+
+/* Tiny proof-of-life: how many times ap_main bumps cpu_hb[1] BEFORE parking in the
+ * managed idle. Just enough that the existing brick-3.5 "CPU1 ran" evidence (a
+ * nonzero cpu_hb[1]) still shows the AP executed, without it being a busy spinner. */
+#define AP_PROOF_OF_LIFE_TICKS 8u
+
 /* 10-byte descriptor-table register image (limit + base), matching sgdt/sidt. */
 typedef struct __attribute__((packed)) {
     uint16_t limit;
@@ -133,21 +161,27 @@ static void ap_tsc_delay_us(uint64_t us)
 /*
  * ap_main -- the 64-bit C entry the trampoline jumps to once the AP is in long
  * mode with the kernel GDT/IDT/CR3 and its own stack (RDI = logical cpu id, here
- * always 1). Keep this MINIMAL: mark online, then run its private heartbeat.
+ * always 1). Keep this MINIMAL: mark online, prove it ran, then PARK in a managed
+ * kernel idle loop (low power), NOT a busy spin.
  *
  * Intentionally does NOT log (two CPUs racing on the 0x3F8 serial port is not
- * MP-safe) -- the BSP prints "CPU 1 online" after it observes the flag. Does NOT
- * touch the scheduler, allocator, or any stateful subsystem. Does NOT enable
- * interrupts (no sti, no hlt, no timer, no handler).
+ * MP-safe) -- the BSP prints "CPU 1 online" / "CPU 1 -> managed idle" after it
+ * observes the flag. Does NOT touch the scheduler, allocator, or any stateful
+ * subsystem. Does NOT enable interrupts (NO sti, NO timer, NO handler).
  *
- * BRICK 3.5: after publishing online (SEQ_CST so the BSP's ACQUIRE load sees it),
- * the AP loops FOREVER incrementing ONLY its own counter, cpu_hb[1].v -- nothing
- * shared, nothing stateful. `pause` is a spin-loop hint (no scheduling, no IPI).
- * This active spin is the PROOF the AP is independently executing: while the BSP
- * runs its bounded ~4s proof window (and also paints the framebuffer), this core
- * is doing nothing but climbing cpu_hb[1], so cpu_hb[1] >> cpu_hb[0] -- that
- * asymmetry alone shows the AP ran on its own. A properly idling AP is a later
- * brick; here it deliberately never halts.
+ * BRICK 5 (this brick): after publishing online (SEQ_CST so the BSP's ACQUIRE load
+ * sees it), the AP first bumps cpu_hb[1] a SMALL fixed number of times -- a
+ * proof-of-life so the existing brick-3.5 "CPU1 ran" evidence (nonzero cpu_hb[1])
+ * still holds and shows the AP executed -- and then enters its MANAGED IDLE LOOP:
+ *
+ *     for (;;) { ap1_idle_ticks++; __asm__ volatile("hlt"); }
+ *
+ * Because NO interrupts are armed on the AP, the first `hlt` halts this core and it
+ * parks there forever (ap1_idle_ticks settles at ~1). That is the WHOLE POINT of
+ * brick 5: the AP went from a 100%-busy `pause` spinner (brick 3.5, cpu_hb[1]
+ * climbing to millions) to a parked, LOW-POWER core waiting for work. No scheduler,
+ * no tasks, no IPI -- just a quiescent, hlt-parked AP. Brick 6 will arm a wakeup
+ * source and start dispatching worker jobs; then idle_ticks climbs per wakeup.
  */
 void ap_main(uint64_t cpu)
 {
@@ -156,11 +190,21 @@ void ap_main(uint64_t cpu)
     /* Tell the BSP we reached long mode and are alive. SEQ_CST publish. */
     __atomic_store_n(&ap1_online, 1u, __ATOMIC_SEQ_CST);
 
-    /* Heartbeat forever on the AP's OWN isolated cache line. No interrupts, no
-     * hlt, no shared state -- just prove this core is executing independently. */
-    for (;;) {
+    /* Proof-of-life: a SMALL, bounded number of heartbeat bumps so the brick-3.5
+     * "the AP executed" evidence (cpu_hb[1] != 0) still shows -- but NOT a busy
+     * spin. `pause` is just the spin-wait hint for these few iterations. */
+    for (unsigned i = 0; i < AP_PROOF_OF_LIFE_TICKS; i++) {
         cpu_hb[1].v++;
         __asm__ volatile("pause");
+    }
+
+    /* Managed kernel idle loop: bump the idle-tick counter, then HALT (low power).
+     * With no interrupts armed on the AP, the first `hlt` parks the core for good
+     * (idle_ticks ends at ~1) -- a quiescent, low-power AP, NOT a 100% spinner.
+     * NO sti, NO timer, NO handler, NO scheduler. */
+    for (;;) {
+        ap1_idle_ticks++;
+        __asm__ volatile("hlt");
     }
 }
 

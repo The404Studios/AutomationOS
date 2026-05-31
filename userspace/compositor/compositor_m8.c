@@ -173,6 +173,50 @@ static inline long sc6(long n, long a1, long a2, long a3, long a4, long a5, long
     return r;
 }
 
+/* ====================================================================== *
+ *  PERF: frame-dirty gating + on-screen stats overlay                    *
+ * ---------------------------------------------------------------------- *
+ *  composite() re-blits every window into the back buffer each frame, so *
+ *  its cost scales with the number of open windows. On a slow framebuffer *
+ *  (e.g. the ThinkPad T410) the desktop therefore lags more with each app *
+ *  opened. The fix is a frame-dirty flag: when GENUINELY nothing changed  *
+ *  this frame, we skip composite()+present entirely and burn no CPU.      *
+ *                                                                         *
+ *  g_dirty is the gate. EVERY change path sets it (input, window lifecycle, *
+ *  client surface commits, animations, dock hover). When in any doubt the *
+ *  code marks dirty -- a wrongly-SKIPPED frame (stale display) is a worse  *
+ *  bug than a wrongly-DRAWN one, so the bias is hard toward marking dirty. *
+ *                                                                         *
+ *  COMPOSITOR_STATS gates a tiny corner overlay (FPS / frame-time ms /     *
+ *  window count / pixels presented) so the owner can measure "1 app vs 5   *
+ *  apps" live on the T410. It is cheap and toggleable at runtime with     *
+ *  Alt+S (F11/F12 are NOT wired through the kernel PS/2 keymap, so Alt+S    *
+ *  -- which the WM already intercepts as a modifier chord -- is the hook).  *
+ * ---------------------------------------------------------------------- */
+#ifndef COMPOSITOR_STATS
+#define COMPOSITOR_STATS 1        /* 1 = draw the stats overlay (ON by default) */
+#endif
+
+/* Frame-dirty flag. Seeded to 1 so the very first frame (boot fade + initial
+ * desktop) always composites + presents. Set by mark_dirty() on every change
+ * path; cleared in the frame loop after a composite+present. */
+static int g_dirty = 1;
+static inline void mark_dirty(void) { g_dirty = 1; }
+
+/* Stats overlay runtime state. g_stats_on toggles the overlay (Alt+S). The
+ * other fields are sampled each presented frame so the overlay shows live nums. */
+static int      g_stats_on        = COMPOSITOR_STATS;
+static long     g_last_frame_ms   = 0;   /* tick at the last PRESENTED frame    */
+static long     g_frame_dt_ms     = 0;   /* ms since the previous presented frame */
+static long     g_fps_x10         = 0;   /* FPS * 10 (one decimal), smoothed    */
+static uint32_t g_present_px      = 0;   /* pixels written to the FB last present */
+static int      g_present_did     = 0;   /* 1 = present_diff actually wrote      */
+
+/* Forward decl: the toast's remaining-visible duration is defined further down
+ * (next to render_toast), but anim_tick() -- which is above it -- reads it to
+ * keep the frame dirty while a toast is fading in/out. */
+static int32_t g_toast_dur_ms;
+
 /* ---- tiny serial diagnostics ---- */
 static size_t k_strlen(const char *s) { size_t l = 0; while (s[l]) l++; return l; }
 static void print(const char *m) { syscall(SYS_WRITE, 1, (long)m, (long)k_strlen(m)); }
@@ -520,6 +564,7 @@ static void blit_surface_scaled_alpha(uint32_t *buf, uint32_t bw, uint32_t bh, u
  * ---------------------------------------------------------------------- */
 #define KEY_TAB       15
 #define KEY_Q         16
+#define KEY_S         31      /* PERF: Alt+S toggles the stats overlay */
 #define KEY_K         37
 #define KEY_M         50
 #define KEY_LEFTALT   56
@@ -911,6 +956,7 @@ static void z_push_front(int slot) {
         if (g_zorder[i] != slot) g_zorder[w++] = g_zorder[i];
     g_zcount = w;
     g_zorder[g_zcount++] = (int32_t)slot;
+    mark_dirty();    /* PERF: raising/focusing reorders the window stack = repaint */
 }
 
 static void z_remove(int slot) {
@@ -918,6 +964,7 @@ static void z_remove(int slot) {
     for (int32_t i = 0; i < g_zcount; i++)
         if (g_zorder[i] != slot) g_zorder[w++] = g_zorder[i];
     g_zcount = w;
+    mark_dirty();    /* PERF: removing a window from the stack = repaint */
 }
 
 /* M6: MRU ring helpers (front = index 0 = most-recently focused). */
@@ -1074,6 +1121,10 @@ static void anim_begin(window_t *win, int32_t phase, int32_t dur_ms, long now) {
     win->phase = phase;
     win->anim_dur_ms = dur_ms;
     win->anim_start_ms = now;
+    /* PERF: every window animation (open/close/minimize/restore/snap) starts
+     * here. Mark dirty so the first animated frame renders even if it began on
+     * an otherwise-idle frame; anim_tick keeps it dirty for the rest of the run. */
+    mark_dirty();
 }
 
 /*
@@ -1109,6 +1160,12 @@ static void anim_tick(long now) {
         if (!win->used || win->phase == PH_NONE) continue;
         int32_t t = anim_linear_t(win, now);
         if (t < 256) continue;                 /* still animating */
+        /* phase finished THIS frame: mark dirty so the FINAL settled position
+         * renders. Critical for PH_SNAPPING, whose settle step below snaps the
+         * geometry to its destination -- without this the gate could skip the
+         * last frame and leave the window one tween-step short. Also covers the
+         * post-close/minimize/restore repaint (a window vanished/parked). */
+        mark_dirty();
         /* phase finished */
         switch (win->phase) {
             case PH_OPENING:
@@ -1138,6 +1195,33 @@ static void anim_tick(long now) {
                 break;
         }
     }
+
+    /* PERF: keep the frame dirty for as long as ANYTHING is animating, so the
+     * dirty-gate never skips a frame that would have advanced an animation.
+     * This is the single place that covers every per-frame visual motion:
+     *   - window open/close/min/restore/snap phases (PH_* != PH_NONE)
+     *   - the cheap per-window fade-in (fade_alpha < 255)
+     *   - a visible toast (g_toast_dur_ms > 0)
+     *   - right-dock folder open/close tween (anim_t in motion)
+     *   - right-dock icon bounce
+     *   - right-dock magnify scale still settling toward its target
+     * If any is live we mark dirty; the gate then composites+presents this
+     * frame and re-checks next frame, so motion stays smooth.               */
+    for (int s = 0; s < MAX_WINDOWS; s++) {
+        window_t *win = &g_windows[s];
+        if (!win->used) continue;
+        if (win->phase != PH_NONE || win->fade_alpha < 255) { mark_dirty(); break; }
+    }
+    if (g_toast_dur_ms > 0) mark_dirty();
+    for (int fi = 0; fi < RDOCK_NFOLDERS; fi++) {
+        rdock_folder_state_t *fs = &g_rdock_folders[fi];
+        if (fs->open || fs->anim_closing || fs->anim_t > 0) { mark_dirty(); break; }
+    }
+    for (int i = 0; i < RDOCK_TOTAL; i++) {
+        if (g_rdock_icons[i].bounce_active) { mark_dirty(); break; }
+        /* magnify scale still easing toward its target == visible motion */
+        if (g_rdock_icons[i].scale_q8 != g_rdock_icons[i].scale_target) { mark_dirty(); break; }
+    }
 }
 
 /* ====================================================================== *
@@ -1162,8 +1246,13 @@ static void render_desktop(uint32_t *buf, uint32_t w, uint32_t h, uint32_t strid
  * "..". Robust: bails silently if /Desktop can't be opened (e.g. not mounted
  * yet) and just leaves the previous list. */
 static void desk_scan(void) {
+    int prev_count = g_desk_count;
     long dfd = syscall(SYS_OPENDIR, (long)"/Desktop", 0, 0);
-    if (dfd < 0) { g_desk_count = 0; return; }   /* no /Desktop -> nothing */
+    if (dfd < 0) {
+        if (g_desk_count != 0) mark_dirty();     /* icons vanished -> repaint */
+        g_desk_count = 0;
+        return;                                  /* no /Desktop -> nothing */
+    }
 
     int n = 0;
     struct dirent ent;
@@ -1185,6 +1274,13 @@ static void desk_scan(void) {
         n++;
     }
     syscall(SYS_CLOSEDIR, dfd, 0, 0);
+    /* PERF: the periodic /Desktop rescan only changes the screen when the icon
+     * set changed. Use the count as a cheap change proxy and mark dirty so a
+     * newly-created/removed icon repaints (the common case: IDE output, New
+     * Folder). A rename that keeps the same count is rare on /Desktop and is
+     * picked up by the next genuine dirty frame; biasing here would force a full
+     * recomposite every rescan and defeat the gate. */
+    if (n != prev_count) mark_dirty();
     g_desk_count = n;
 }
 
@@ -1803,6 +1899,8 @@ static void toast_show(const char *msg, int32_t dur_ms) {
     g_toast_text[i] = '\0';
     g_toast_start_ms = syscall(SYS_GET_TICKS_MS, 0, 0, 0);
     g_toast_dur_ms   = dur_ms;
+    mark_dirty();    /* PERF: a toast appearing is a visible change; anim_tick
+                      * then keeps the frame dirty while it fades in/out.        */
 }
 
 /* Draw the toast (if active) with its current fade alpha. */
@@ -2439,6 +2537,89 @@ static void draw_about(uint32_t *buf, uint32_t w, uint32_t h, uint32_t stride) {
     font_draw_string(buf, (int)stride, (int)w, (int)h, tx_hint,  py + 168, l_hint, COL_TEXT_DIM);
 }
 
+/* ====================================================================== *
+ *  PERF: on-screen stats overlay (the "measure first" piece)              *
+ * ---------------------------------------------------------------------- *
+ *  A tiny top-left box drawn each presented frame showing live FPS, frame *
+ *  time (ms), composited window count, and pixels pushed to the FB by the *
+ *  last present_diff. This is what lets the owner watch "1 app vs 5 apps"  *
+ *  on the T410 and see where the time goes. Kept cheap: a handful of small *
+ *  fill_rects + ~4 short strings, so measuring never dominates the frame.  *
+ *  Toggle at runtime with Alt+S (see wm_handle_key); default-on via        *
+ *  COMPOSITOR_STATS.                                                       *
+ * ---------------------------------------------------------------------- */
+
+/* Append unsigned `v` (base 10) to dst[] at *pos, bounded by cap. */
+static void stat_putu(char *dst, int *pos, int cap, long v) {
+    char tmp[16]; int n = 0;
+    if (v < 0) v = 0;
+    do { tmp[n++] = (char)('0' + (v % 10)); v /= 10; } while (v > 0 && n < 16);
+    while (n > 0 && *pos < cap - 1) dst[(*pos)++] = tmp[--n];
+}
+/* Append a literal string. */
+static void stat_puts(char *dst, int *pos, int cap, const char *s) {
+    while (*s && *pos < cap - 1) dst[(*pos)++] = *s++;
+}
+
+/* Count windows that composite() would actually blit this frame (live, not
+ * minimized-and-parked). Mirrors the visibility test in the window loop so the
+ * overlay's "win" number matches the real per-frame compositing cost. */
+static int stats_visible_windows(void) {
+    int n = 0;
+    for (int32_t i = 0; i < g_zcount; i++) {
+        int slot = (int)g_zorder[i];
+        if (slot < 0 || slot >= MAX_WINDOWS || !g_windows[slot].used) continue;
+        window_t *win = &g_windows[slot];
+        if (win->phase == PH_NONE && win->minimized) continue;  /* parked: skipped */
+        n++;
+    }
+    return n;
+}
+
+/* Draw the overlay into the back buffer (so present_diff picks it up). Reads the
+ * sampled g_fps_x10 / g_frame_dt_ms / g_present_px globals (updated once per
+ * presented frame in the frame loop). */
+static void render_stats_overlay(uint32_t *buf, uint32_t w, uint32_t h, uint32_t stride) {
+    if (!g_stats_on) return;
+
+    /* Build two short lines so the box stays small.
+     *   line1: "FPS 59.4  3.2ms"
+     *   line2: "win 5  px 18240"                                            */
+    char l1[40]; int p1 = 0;
+    stat_puts(l1, &p1, (int)sizeof(l1), "FPS ");
+    stat_putu(l1, &p1, (int)sizeof(l1), g_fps_x10 / 10);
+    stat_puts(l1, &p1, (int)sizeof(l1), ".");
+    stat_putu(l1, &p1, (int)sizeof(l1), g_fps_x10 % 10);
+    stat_puts(l1, &p1, (int)sizeof(l1), "  ");
+    stat_putu(l1, &p1, (int)sizeof(l1), g_frame_dt_ms);
+    stat_puts(l1, &p1, (int)sizeof(l1), "ms");
+    l1[p1] = '\0';
+
+    char l2[40]; int p2 = 0;
+    stat_puts(l2, &p2, (int)sizeof(l2), "win ");
+    stat_putu(l2, &p2, (int)sizeof(l2), stats_visible_windows());
+    stat_puts(l2, &p2, (int)sizeof(l2), "  px ");
+    stat_putu(l2, &p2, (int)sizeof(l2), (long)g_present_px);
+    l2[p2] = '\0';
+
+    /* Box geometry: top-left, just below the panel so it never fights the panel
+     * title. Width sized to the longer line. */
+    int len = p1 > p2 ? p1 : p2;
+    int32_t bx = 8;
+    int32_t by = PANEL_H + 6;
+    int32_t bw = len * FONT_W + 12;
+    int32_t bh = 2 * FONT_H + 10;
+
+    /* translucent dark plate + thin accent border (cheap, readable) */
+    blend_rect(buf, w, h, stride, bx, by, bw, bh, 0xC0101418u);
+    stroke_rect(buf, w, h, stride, bx, by, bw, bh, 0x800A84FFu);
+
+    font_draw_string(buf, (int)stride, (int)w, (int)h,
+                     bx + 6, by + 5, l1, 0xFF6FE26Fu);            /* green-ish */
+    font_draw_string(buf, (int)stride, (int)w, (int)h,
+                     bx + 6, by + 5 + FONT_H, l2, 0xFFE2E27Au);   /* amber-ish */
+}
+
 /* ====================================================================== */
 static void composite(uint32_t *buf, uint32_t w, uint32_t h, uint32_t stride,
                       int32_t cursor_x, int32_t cursor_y, long now) {
@@ -2485,6 +2666,10 @@ static void composite(uint32_t *buf, uint32_t w, uint32_t h, uint32_t stride,
     /* modal About dialog above everything except the cursor */
     draw_about(buf, w, h, stride);
 
+    /* PERF: stats overlay above the chrome, beneath the cursor (so the cursor
+     * is never occluded by it). Cheap; gated by g_stats_on / COMPOSITOR_STATS. */
+    render_stats_overlay(buf, w, h, stride);
+
     /* cursor on very top */
     draw_cursor(buf, w, h, stride, cursor_x, cursor_y);
 }
@@ -2503,8 +2688,8 @@ static void present(uint32_t *fb, uint32_t *back, uint32_t h, uint32_t stride) {
  * Worst case (everything changed) it degrades to a full copy == present().
  * `w` is the visible width (<= stride); columns in [w,stride) are padding and
  * are left untouched (they're never displayed). */
-static void present_diff(uint32_t *fb, uint32_t *back, uint32_t *prev,
-                         uint32_t w, uint32_t h, uint32_t stride) {
+static uint32_t present_diff(uint32_t *fb, uint32_t *back, uint32_t *prev,
+                             uint32_t w, uint32_t h, uint32_t stride) {
     uint32_t minx = w, miny = h, maxx = 0, maxy = 0;
     int any = 0;
     for (uint32_t y = 0; y < h; y++) {
@@ -2519,7 +2704,7 @@ static void present_diff(uint32_t *fb, uint32_t *back, uint32_t *prev,
             }
         }
     }
-    if (!any) return;                 /* nothing changed: skip the fb write    */
+    if (!any) return 0;               /* nothing changed: skip the fb write    */
     for (uint32_t y = miny; y <= maxy; y++) {
         uint32_t off = y * stride;
         for (uint32_t x = minx; x <= maxx; x++) {
@@ -2527,6 +2712,9 @@ static void present_diff(uint32_t *fb, uint32_t *back, uint32_t *prev,
             prev[off + x] = back[off + x];
         }
     }
+    /* Pixels actually pushed to the slow FB = the changed bounding box area.
+     * Returned so the stats overlay can show present cost per frame. */
+    return (maxx - minx + 1) * (maxy - miny + 1);
 }
 
 /* Boot transition: how long the kernel splash fluidly cross-fades into the
@@ -2763,6 +2951,11 @@ static void drain_inbox(int32_t inbox_qid) {
         long r = sc6(SYS_MSGRCV, inbox_qid, (long)&msg,
                      (long)(sizeof(msg) - sizeof(int64_t)), 0, (long)IPC_NOWAIT, 0);
         if (r < 0) break;
+        /* PERF: ANY client request is a visible change -- a new window (CREATE),
+         * a fresh surface frame the client drew (COMMIT), or a teardown
+         * (DESTROY). Mark dirty unconditionally so the gate recomposites. This
+         * is the choke-point for "a client drew a new frame". */
+        mark_dirty();
         switch (msg.mtype) {
             case WL_REQ_CREATE:  handle_create(&msg.create);   break;
             case WL_REQ_COMMIT:  handle_commit(&msg.commit);   break;
@@ -2909,6 +3102,15 @@ static int wm_handle_key(int32_t keycode, int32_t pressed) {
             if (f >= 0) begin_minimize(f);
             return 1;
         }
+        if (keycode == KEY_S) {
+            /* PERF: toggle the on-screen stats overlay (FPS/frame-time/windows/
+             * pixels). Mark dirty so it appears/disappears on the next frame. */
+            g_stats_on = !g_stats_on;
+            mark_dirty();
+            print("[SHELL] stats overlay ");
+            print(g_stats_on ? "ON\n" : "OFF\n");
+            return 1;
+        }
         if (keycode == KEY_K) {
             /* FORCE QUIT: SIGKILL the focused window's client process, even if
              * it is hung and not draining its event queue. The per-frame liveness
@@ -2928,9 +3130,9 @@ static int wm_handle_key(int32_t keycode, int32_t pressed) {
         }
     }
     /* Consume the key-UP of an intercepted chord too, so the client never sees
-     * a dangling release for a press it never got. (Tab/Q/F4/M/K while Alt held.) */
+     * a dangling release for a press it never got. (Tab/Q/F4/M/K/S while Alt held.) */
     if (keycode == KEY_TAB || keycode == KEY_Q || keycode == KEY_F4 ||
-        keycode == KEY_M   || keycode == KEY_K)
+        keycode == KEY_M   || keycode == KEY_K || keycode == KEY_S)
         return 1;
 
     return 0;                                       /* other Alt+<key>: forward  */
@@ -2976,6 +3178,12 @@ static void pump_input(int32_t fd, int keyboard, uint32_t W, uint32_t H) {
             if (e->type == EV_KEY) {
                 int32_t code    = (int32_t)e->code;
                 int32_t pressed = e->value != 0 ? 1 : 0;
+                /* PERF: any key event may change the display -- a WM chord
+                 * (Alt+Tab raise, Alt+Q close, Alt+M minimize) or a key the
+                 * focused client will redraw in response to (e.g. typing in an
+                 * editor/terminal). Mark dirty for every key event; biasing
+                 * toward an extra recomposite is cheaper than a stale screen. */
+                mark_dirty();
                 /* M6: WM intercepts Alt / Alt+Tab / Alt+Q / Alt+F4 / Alt+M
                  * BEFORE the client ever sees them. Everything else forwards. */
                 if (!wm_handle_key(code, pressed))
@@ -3015,6 +3223,11 @@ static void pump_input(int32_t fd, int keyboard, uint32_t W, uint32_t H) {
         if (g_cursor_y < 0) g_cursor_y = 0;
         if (g_cursor_x >= (int32_t)W) g_cursor_x = (int32_t)W - 1;
         if (g_cursor_y >= (int32_t)H) g_cursor_y = (int32_t)H - 1;
+        /* PERF: the compositor draws the cursor, so ANY cursor move or button
+         * change must repaint (cursor sprite, dock hover-magnify, drag, menu
+         * highlight all key off pointer state). Mark dirty for every pointer
+         * change -- the safest, broadest mouse damage source. */
+        mark_dirty();
         send_pointer_to_focus();
     }
 }
@@ -3335,6 +3548,22 @@ static void handle_mouse(uint32_t W, uint32_t H) {
     int32_t prev_left = g_prev_buttons & 1;
     int32_t release   = !left && prev_left;     /* falling edge = end drag  */
     int32_t cx = g_cursor_x, cy = g_cursor_y;   /* LIVE cursor (drag track) */
+
+    /* PERF: handle_mouse has ~20 state-changing exit paths (focus/raise, drag-
+     * move, snap, minimize, maximize, close, menu open/close, taskbar + dock +
+     * icon clicks, app launch). Rather than instrument each one, mark dirty once
+     * here whenever there is ANY interaction in flight this frame:
+     *   - a pending left-click latch (g_click_latch)  -> a click will dispatch
+     *   - a pending right-click latch (g_rclick_latch) -> a context menu may open
+     *   - an active drag (g_drag_slot >= 0)            -> the window is moving
+     *   - an open popup menu (g_menu_open)             -> hover row may change
+     *   - a held/just-released button                  -> drag end / re-focus
+     * This deliberately over-marks (a no-op click still repaints one frame),
+     * honoring "bias hard toward dirty". Cursor-move-only frames are already
+     * marked in pump_input. */
+    if (g_click_latch || g_rclick_latch || g_drag_slot >= 0 ||
+        g_menu_open  || g_about_open    || left || prev_left)
+        mark_dirty();
 
     /* Track which menu row the cursor is over (for highlight), every frame. */
     if (g_menu_open) {
@@ -3696,6 +3925,8 @@ void _start(void) {
     long t0 = syscall(SYS_GET_TICKS_MS, 0, 0, 0);
     long next = t0;
     uint64_t frame = 0;
+    long last_clock_sec = -1;          /* PERF: last second the panel clock showed */
+    g_last_frame_ms = t0;              /* seed frame-time measurement              */
 
     print("[SHELL] entering frame loop\n");
     for (;;) {
@@ -3722,18 +3953,59 @@ void _start(void) {
          * (e.g. IDE output, New Folder) appear without a restart. */
         if ((frame % DESK_RESCAN_FRAMES) == 0) desk_scan();
 
-        /* e) composite + present. For the first BOOT_FADE_MS, fluidly cross-fade
-         * the kernel boot splash into the freshly-composited desktop. */
-        composite(back, W, H, stride, g_cursor_x, g_cursor_y, now);
-        if (back != hw) {
-            long fade_el = now - boot_ms;
-            if (splash && fade_el >= 0 && fade_el < BOOT_FADE_MS) {
-                uint32_t t = (uint32_t)((fade_el * 256) / BOOT_FADE_MS);
-                present_circle_iris(hw, back, splash, W, H, stride, max_radius, t);
-            } else {
-                if (prev) present_diff(hw, back, prev, W, H, stride);
-                else      present(hw, back, H, stride);
-                splash = (uint32_t *)0;   /* fade complete: stop blending */
+        /* d4) PERF: the panel clock shows HH:MM:SS, so it must repaint once per
+         * second even on an otherwise-idle desktop. Pulse dirty when the second
+         * rolls over; present_diff then pushes only the tiny clock rect. This is
+         * the one perpetual "animation" the gate must never starve. */
+        {
+            long sec = now / 1000;
+            if (sec != last_clock_sec) { last_clock_sec = sec; mark_dirty(); }
+        }
+
+        /* d5) PERF: while the boot iris cross-fade is still running it changes
+         * every frame -- force dirty so the gate can't skip it. */
+        int boot_fading = (back != hw && splash && (now - boot_ms) >= 0 &&
+                           (now - boot_ms) < BOOT_FADE_MS);
+        if (boot_fading) mark_dirty();
+
+        /* e) composite + present -- BUT ONLY WHEN DIRTY. composite() re-blits all
+         * windows (cost scales with window count), and present writes the FB, so
+         * skipping both on a genuinely-unchanged frame is the main perf win for
+         * "many apps open but mostly idle". Every change path sets g_dirty (see
+         * mark_dirty() call sites: input, window lifecycle, client commits,
+         * animations, dock hover, the per-second clock pulse above). When NOT
+         * dirty we present nothing and just yield. For the first BOOT_FADE_MS we
+         * fluidly cross-fade the kernel boot splash into the desktop. */
+        if (g_dirty) {
+            g_dirty = 0;                       /* consume before drawing so a
+                                                * change DURING this frame's draw
+                                                * (e.g. a late inbox msg next
+                                                * iteration) re-arms cleanly.    */
+            composite(back, W, H, stride, g_cursor_x, g_cursor_y, now);
+            if (back != hw) {
+                if (boot_fading) {
+                    uint32_t t = (uint32_t)(((now - boot_ms) * 256) / BOOT_FADE_MS);
+                    present_circle_iris(hw, back, splash, W, H, stride, max_radius, t);
+                    g_present_px = W * H;        /* iris touches the whole screen */
+                    g_present_did = 1;
+                } else {
+                    if (prev) { g_present_px = present_diff(hw, back, prev, W, H, stride); }
+                    else      { present(hw, back, H, stride); g_present_px = W * H; }
+                    g_present_did = (g_present_px != 0);
+                    splash = (uint32_t *)0;      /* fade complete: stop blending */
+                }
+            }
+
+            /* PERF: sample frame-time + FPS at each PRESENTED frame (idle frames
+             * that skip the draw don't count, so FPS reflects real work). Smooth
+             * FPS with a simple IIR so the overlay number is readable. */
+            g_frame_dt_ms = now - g_last_frame_ms;
+            if (g_frame_dt_ms < 0) g_frame_dt_ms = 0;
+            g_last_frame_ms = now;
+            if (g_frame_dt_ms > 0) {
+                long inst_fps_x10 = 10000 / g_frame_dt_ms;   /* (1000/dt)*10 */
+                if (g_fps_x10 == 0) g_fps_x10 = inst_fps_x10;
+                else g_fps_x10 += (inst_fps_x10 - g_fps_x10) / 4;  /* IIR a=1/4 */
             }
         }
 

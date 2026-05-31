@@ -30,6 +30,8 @@ struct Rect;
 #define IT_MAXROWS 60
 #define IT_LINEMAX 256
 #define IT_CWDMAX  256
+#define IT_HIST_MAX 16      /* command history ring buffer size */
+#define IT_HIST_ENT 192     /* max chars per history entry */
 
 typedef struct {
     char  grid[IT_MAXROWS][IT_MAXCOLS]; /* visible scrollback cells       */
@@ -40,6 +42,10 @@ typedef struct {
     char  cwd[IT_CWDMAX];               /* current working directory       */
     int   inited;                       /* 1 after first ide_term_init     */
     int   blink_ms;
+    /* command history ring buffer (16 last commands) */
+    char  hist[IT_HIST_MAX][IT_HIST_ENT];
+    int   hist_count;                   /* total pushed (wraps at max)     */
+    int   hist_nav;                     /* current position (-1 = none)    */
 } IdeTerm;
 
 /* One-time init: clear the grid, set cwd to the project root, print a banner

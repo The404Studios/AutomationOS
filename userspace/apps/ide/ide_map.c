@@ -27,7 +27,7 @@
 #include "ide.h"
 #include "ide_theme.h"
 
-/* ---- card geometry (pixels) ---- */
+/* ---- card geometry (pixels) at 100% zoom ---- */
 #define MAP_HEADER_H   (ROW_H + 2)   /* panel title strip                  */
 #define MAP_CARD_W     214           /* central node width                 */
 #define MAP_CARDHDR_H  22            /* central card header band           */
@@ -41,6 +41,11 @@
 #define MAP_RADIUS     7             /* rounded-corner radius              */
 #define MAP_SHADOW     0x55000000u   /* translucent drop-shadow colour     */
 #define MAP_SHADOW_OFF 3             /* shadow offset (px, down-right)     */
+
+/* Apply zoom scaling to a dimension (zoom is percent, e.g. 100 = 100%). */
+static inline int map_scale(int val, int zoom) {
+    return (val * zoom) / 100;
+}
 
 /* ---------------------------------------------------------------------------
  * Tiny freestanding string helpers (no libc). All bounded + NUL terminating.
@@ -271,6 +276,7 @@ void panel_map(Ide* a, Canvas* cv, Rect r)
     char   buf[96];
     char   fitbuf[8];
     int    i;
+    int    zoom;
 
     if (!a || !cv || r.w <= 0 || r.h <= 0) return;
 
@@ -281,13 +287,24 @@ void panel_map(Ide* a, Canvas* cv, Rect r)
 
     m     = &a->model;
     focus = a->focus_func;
+    zoom  = a->map_zoom;
+    if (zoom < 30) zoom = 30;       /* clamp zoom range 30%-200% */
+    if (zoom > 200) zoom = 200;
 
-    /* Title: "SEMANTIC LEGO MAP - <focusname>". */
+    /* Title: "SEMANTIC LEGO MAP - <focusname> [zoom%]". */
     buf[0] = '\0';
     map_cat(buf, "SEMANTIC LEGO MAP", sizeof(buf));
     if (focus >= 0 && focus < m->nfuncs && m->funcs[focus].name[0]) {
         map_cat(buf, " - ", sizeof(buf));
         map_cat(buf, m->funcs[focus].name, sizeof(buf));
+    }
+    /* Show zoom level in header */
+    if (zoom != 100) {
+        char zbuf[16];
+        map_cat(buf, " [", sizeof(buf));
+        ide_itoa(zoom, zbuf);
+        map_cat(buf, zbuf, sizeof(buf));
+        map_cat(buf, "%]", sizeof(buf));
     }
     gfx_text_clip(cv, r.x + PAD, r.y + (MAP_HEADER_H - GFX_FH) / 2,
                   buf, TH_TEXT_DIM, r.x + PAD, r.w - 2 * PAD);
@@ -319,36 +336,49 @@ void panel_map(Ide* a, Canvas* cv, Rect r)
     /* ----------------------------------------------------------------------
      * CENTRAL NODE CARD geometry. Positioned somewhat left-of-centre so the
      * right column (writes/calls) and absent column have room, then shifted
-     * by the pan offset (map_ox/oy).
+     * by the pan offset (map_ox/oy). All dimensions scaled by zoom.
      * -------------------------------------------------------------------- */
     int nports = f->nports;
     if (nports < 0) nports = 0;
     if (nports > M_MAXPORTS) nports = M_MAXPORTS;
 
-    int card_h = MAP_CARDHDR_H + ROW_H /* "Ports (N)" line */
-               + nports * MAP_PORT_H + PAD * 2;
-    if (card_h < MAP_CARDHDR_H + ROW_H + PAD * 2)
-        card_h = MAP_CARDHDR_H + ROW_H + PAD * 2;
+    /* Apply zoom to all card dimensions */
+    int card_w      = map_scale(MAP_CARD_W, zoom);
+    int cardhdr_h   = map_scale(MAP_CARDHDR_H, zoom);
+    int port_h      = map_scale(MAP_PORT_H, zoom);
+    int sat_w       = map_scale(MAP_SAT_W, zoom);
+    int sat_h       = map_scale(MAP_SAT_H, zoom);
+    int sat_h2      = map_scale(MAP_SAT_H2, zoom);
+    int sat_vgap    = map_scale(MAP_SAT_VGAP, zoom);
+    int col_gap     = map_scale(MAP_COL_GAP, zoom);
+    int sathdr_h    = map_scale(MAP_SATHDR_H, zoom);
+    int shadow_off  = map_scale(MAP_SHADOW_OFF, zoom);
+    int radius      = map_scale(MAP_RADIUS, zoom);
 
-    int cx = body.x + (body.w - MAP_CARD_W) / 2 - 30 + a->map_ox;
+    int card_h = cardhdr_h + ROW_H /* "Ports (N)" line */
+               + nports * port_h + PAD * 2;
+    if (card_h < cardhdr_h + ROW_H + PAD * 2)
+        card_h = cardhdr_h + ROW_H + PAD * 2;
+
+    int cx = body.x + (body.w - card_w) / 2 - 30 + a->map_ox;
     int cy = body.y + (body.h - card_h) / 2 + a->map_oy;
     /* keep the card at least partially on-screen */
     if (cx < body.x + 4) cx = body.x + 4;
     if (cy < body.y + 4) cy = body.y + 4;
 
     int card_left  = cx;
-    int card_right = cx + MAP_CARD_W;
+    int card_right = cx + card_w;
 
     /* Port-row anchors (mid-row y), keyed by port index. Computed up-front so
      * satellite edges can attach precisely before the card is drawn. */
-    int inner_y = cy + MAP_CARDHDR_H + PAD + ROW_H;   /* first port-row top y */
+    int inner_y = cy + cardhdr_h + PAD + ROW_H;   /* first port-row top y */
     int port_y[M_MAXPORTS];
     for (i = 0; i < nports; i++)
-        port_y[i] = inner_y + i * MAP_PORT_H + MAP_PORT_H / 2;
+        port_y[i] = inner_y + i * port_h + port_h / 2;
 
     /* Anchor for a satellite of a given port type: first matching central port
      * row, else the card header midline as a fallback. */
-    int hdr_anchor = cy + MAP_CARDHDR_H + ROW_H / 2;
+    int hdr_anchor = cy + cardhdr_h + ROW_H / 2;
 
     /* ----------------------------------------------------------------------
      * PASS 1 -- lay out every satellite into map_sats[] (no drawing yet).
@@ -356,9 +386,9 @@ void panel_map(Ide* a, Canvas* cv, Rect r)
      *   RIGHT column  : write globals (green) then called functions (yellow)
      *   FAR-RIGHT col : absent ports (dashed red)
      * -------------------------------------------------------------------- */
-    int left_x  = card_left - MAP_COL_GAP - MAP_SAT_W;
-    int right_x = card_right + MAP_COL_GAP;
-    int far_x   = right_x + MAP_SAT_W + MAP_COL_GAP;
+    int left_x  = card_left - col_gap - sat_w;
+    int right_x = card_right + col_gap;
+    int far_x   = right_x + sat_w + col_gap;
 
     /* ---- LEFT: read globals (cyan, "g (read)") ---- */
     {
@@ -374,13 +404,13 @@ void panel_map(Ide* a, Canvas* cv, Rect r)
         int sy = cy;
         for (i = 0; i < nreads; i++) {
             Rect sc;
-            sc.x = left_x; sc.y = sy; sc.w = MAP_SAT_W; sc.h = MAP_SAT_H;
+            sc.x = left_x; sc.y = sy; sc.w = sat_w; sc.h = sat_h;
             buf[0] = '\0';
             map_cat(buf, f->reads[i][0] ? f->reads[i] : "g", sizeof(buf));
             map_cat(buf, " (read)", sizeof(buf));
             /* wire reaches the satellite at its RIGHT edge */
             map_sat_push(sc, MK_READ, TH_CYAN, card_left, ay, 0, buf, 0);
-            sy += MAP_SAT_H + MAP_SAT_VGAP;
+            sy += sat_h + sat_vgap;
         }
     }
 
@@ -412,25 +442,25 @@ void panel_map(Ide* a, Canvas* cv, Rect r)
                 }
 
             Rect sc;
-            sc.x = right_x; sc.y = sy; sc.w = MAP_SAT_W; sc.h = MAP_SAT_H;
+            sc.x = right_x; sc.y = sy; sc.w = sat_w; sc.h = sat_h;
             buf[0] = '\0';
             map_cat(buf, f->writes[i][0] ? f->writes[i] : "g", sizeof(buf));
             map_cat(buf, " (write)", sizeof(buf));
             MapSat* s = map_sat_push(sc, MK_WRITE, TH_GREEN, card_right, wy,
                                      0, buf, 0);
             if (s) s->warn = multi;
-            sy += MAP_SAT_H + MAP_SAT_VGAP;
+            sy += sat_h + sat_vgap;
         }
 
         for (i = 0; i < ncalls; i++) {
             Rect sc;
-            sc.x = right_x; sc.y = sy; sc.w = MAP_SAT_W; sc.h = MAP_SAT_H;
+            sc.x = right_x; sc.y = sy; sc.w = sat_w; sc.h = sat_h;
             buf[0] = '\0';
             map_cat(buf, f->calls[i][0] ? f->calls[i] : "fn", sizeof(buf));
             map_cat(buf, "()", sizeof(buf));
             map_sat_push(sc, MK_CALL, TH_YELLOW, card_right, cy_anchor,
                          0, buf, f->calls[i]);
-            sy += MAP_SAT_H + MAP_SAT_VGAP;
+            sy += sat_h + sat_vgap;
         }
     }
 
@@ -442,12 +472,12 @@ void panel_map(Ide* a, Canvas* cv, Rect r)
             if (p->status != PS_ABSENT) continue;
 
             Rect sc;
-            sc.x = far_x; sc.y = sy; sc.w = MAP_SAT_W; sc.h = MAP_SAT_H2;
+            sc.x = far_x; sc.y = sy; sc.w = sat_w; sc.h = sat_h2;
             MapSat* s = map_sat_push(sc, MK_ABSENT, TH_RED, card_right,
                                      port_y[i], 1,
                                      p->name[0] ? p->name : "gate", 0);
             if (s) s->fit = p->fit;
-            sy += MAP_SAT_H2 + MAP_SAT_VGAP;
+            sy += sat_h2 + sat_vgap;
         }
     }
 
@@ -465,7 +495,7 @@ void panel_map(Ide* a, Canvas* cv, Rect r)
     /* ----------------------------------------------------------------------
      * PASS 2b -- draw the central card on top of the wires.
      * -------------------------------------------------------------------- */
-    map_card(cv, cx, cy, MAP_CARD_W, card_h, MAP_CARDHDR_H, TH_PANEL, TH_PURPLE);
+    map_card(cv, cx, cy, card_w, card_h, cardhdr_h, TH_PANEL, TH_PURPLE);
 
     /* Header = function signature: "ret name(p0, p1, ...)" (abbreviated). */
     buf[0] = '\0';
@@ -486,17 +516,17 @@ void panel_map(Ide* a, Canvas* cv, Rect r)
         }
     }
     map_cat(buf, ")", sizeof(buf));
-    gfx_text_clip(cv, cx + PAD, cy + (MAP_CARDHDR_H - GFX_FH) / 2,
-                  buf, TH_BG, cx + PAD, MAP_CARD_W - 2 * PAD);
+    gfx_text_clip(cv, cx + PAD, cy + (cardhdr_h - GFX_FH) / 2,
+                  buf, TH_BG, cx + PAD, card_w - 2 * PAD);
 
     /* "Ports (N)" sub-heading. */
-    int sub_y = cy + MAP_CARDHDR_H + PAD;
+    int sub_y = cy + cardhdr_h + PAD;
     buf[0] = '\0';
     map_cat(buf, "Ports (", sizeof(buf));
     { char nb[12]; ide_itoa(nports, nb); map_cat(buf, nb, sizeof(buf)); }
     map_cat(buf, ")", sizeof(buf));
     gfx_text_clip(cv, cx + PAD, sub_y, buf, TH_TEXT_DIM,
-                  cx + PAD, MAP_CARD_W - 2 * PAD);
+                  cx + PAD, card_w - 2 * PAD);
 
     /*
      * Port rows: a colored dot (th_port_color), the port name, and the fit as
@@ -504,11 +534,11 @@ void panel_map(Ide* a, Canvas* cv, Rect r)
      */
     for (i = 0; i < nports; i++) {
         Port* p = &f->ports[i];
-        int ry  = inner_y + i * MAP_PORT_H;
+        int ry  = inner_y + i * port_h;
         int mid = port_y[i];
         int is_absent = (p->status == PS_ABSENT);
         uint32_t pc = th_port_color((int)p->type);
-        int ty = ry + (MAP_PORT_H - GFX_FH) / 2;
+        int ty = ry + (port_h - GFX_FH) / 2;
 
         /* dot at the row's leading edge */
         map_dot(cv, cx + PAD + 3, mid, is_absent ? TH_RED : pc);
@@ -517,7 +547,7 @@ void panel_map(Ide* a, Canvas* cv, Rect r)
         gfx_text_clip(cv, cx + PAD + 12, ty,
                       p->name[0] ? p->name : "port",
                       is_absent ? TH_RED : TH_TEXT,
-                      cx + PAD, MAP_CARD_W - 2 * PAD - 48);
+                      cx + PAD, card_w - 2 * PAD - 48);
 
         /* fit score, right-aligned within the card */
         fitbuf[0] = '\0';
@@ -531,10 +561,10 @@ void panel_map(Ide* a, Canvas* cv, Rect r)
         }
         {
             int fw = gfx_textw(fitbuf);
-            int fx = cx + MAP_CARD_W - PAD - fw;
+            int fx = cx + card_w - PAD - fw;
             gfx_text_clip(cv, fx, ty, fitbuf,
                           is_absent ? TH_RED : TH_TEXT_DIM,
-                          cx + PAD, MAP_CARD_W - 2 * PAD);
+                          cx + PAD, card_w - 2 * PAD);
         }
     }
 
@@ -544,7 +574,7 @@ void panel_map(Ide* a, Canvas* cv, Rect r)
     for (i = 0; i < map_nsats && i < MAP_MAXSAT; i++) {
         MapSat* s   = &map_sats[i];
         Rect    sc  = s->r;
-        int     ty  = sc.y + MAP_SATHDR_H + (sc.h - MAP_SATHDR_H - GFX_FH) / 2;
+        int     ty  = sc.y + sathdr_h + (sc.h - sathdr_h - GFX_FH) / 2;
 
         if (s->kind == MK_ABSENT) {
             /* dashed-red two-line card: "(ABSENT)" then "fit 0.NN" */
@@ -566,13 +596,13 @@ void panel_map(Ide* a, Canvas* cv, Rect r)
         }
 
         /* solid card with accent header band */
-        map_card(cv, sc.x, sc.y, sc.w, sc.h, MAP_SATHDR_H, TH_PANEL2, s->accent);
+        map_card(cv, sc.x, sc.y, sc.w, sc.h, sathdr_h, TH_PANEL2, s->accent);
         map_dot(cv, sc.x + PAD + 3, ty + GFX_FH / 2, s->accent);
         gfx_text_clip(cv, sc.x + PAD + 12, ty, s->label, TH_TEXT,
                       sc.x + PAD, sc.w - 2 * PAD - 8);
 
         if (s->warn)   /* multi-writer warning marker (orange) in the corner */
-            map_dot(cv, sc.x + sc.w - PAD - 2, sc.y + MAP_SATHDR_H + PAD,
+            map_dot(cv, sc.x + sc.w - PAD - 2, sc.y + sathdr_h + PAD,
                     TH_ORANGE);
     }
 
@@ -604,16 +634,37 @@ int panel_map_click(Ide* a, Rect r, int mx, int my)
         MapSat* s = &map_sats[i];
         if (!rect_hit(s->r, mx, my)) continue;
 
-        if (s->kind == MK_CALL && s->fname[0]) {
-            /* find the called function in the model and refocus to it */
-            for (j = 0; j < a->model.nfuncs && j < M_MAXFUNCS; j++) {
-                if (map_streq(a->model.funcs[j].name, s->fname)) {
-                    ide_set_focus(a, j);
-                    return 1;
+        /* Handle different satellite types */
+        switch (s->kind) {
+        case MK_CALL:
+            if (s->fname[0]) {
+                /* find the called function in the model and refocus to it */
+                for (j = 0; j < a->model.nfuncs && j < M_MAXFUNCS; j++) {
+                    if (map_streq(a->model.funcs[j].name, s->fname)) {
+                        ide_set_focus(a, j);
+                        return 1;
+                    }
                 }
             }
+            break;
+
+        case MK_READ:
+        case MK_WRITE:
+            /* Future: jump to global definition or show all readers/writers
+             * For now, we could search for the global declaration in the code.
+             * This is a placeholder for revolutionary "navigate by dependency" feature.
+             * The label format is "varname (read)" or "varname (write)"
+             * Extract varname and search for its definition. */
+            /* TODO: Implement global definition lookup */
+            break;
+
+        case MK_ABSENT:
+            /* Clicked an absent port - could show why it's missing or offer to add it
+             * This is revolutionary "auto-fix architecture violations" */
+            /* TODO: Show absent port details or quick-fix menu */
+            break;
         }
-        return 1;   /* clicked a satellite (non-call or unresolved): consume */
+        return 1;   /* clicked a satellite: consume */
     }
     return 1;       /* clicked empty map space: consume */
 }

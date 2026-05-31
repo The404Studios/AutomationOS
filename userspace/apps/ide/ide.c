@@ -48,6 +48,8 @@ static int g_build_view = 0;
 #define KEY_R        19          /* Run the last build (SYS_SPAWN the ELF)        */
 #define KEY_N        49          /* Ctrl+N new project (templates picker)         */
 #define KEY_S        31          /* Ctrl+S save (editor)                          */
+#define KEY_D        32          /* Ctrl+D duplicate line (editor)                */
+#define KEY_K        37          /* Ctrl+Shift+K delete line (editor)             */
 #define KEY_ENTER    28          /* confirm in the New Project modal              */
 #define KEY_BACKSPC  14          /* edit the typed project name                   */
 #define KEY_J        36          /* Ctrl+J toggle bottom panel focus              */
@@ -61,6 +63,9 @@ static int g_build_view = 0;
 #define KEY_DOWN     108
 #define KEY_LEFT     105
 #define KEY_RIGHT    106
+#define KEY_EQUAL    13          /* Ctrl+= zoom in (LEGO map)                     */
+#define KEY_MINUS    12          /* Ctrl+- zoom out (LEGO map)                    */
+#define KEY_0        11          /* Ctrl+0 reset zoom to 100% (LEGO map)          */
 /* PageUp/PageDown ARE in the evdev set we receive (104/109); the editor binds
  * them. Arrow-key scrolling also works in the LEGO workspace. */
 
@@ -209,6 +214,7 @@ void ide_open_file(Ide* a, const char* path) {
     a->funcs_scroll     = 0;
     a->map_ox = 0;
     a->map_oy = 0;
+    a->map_zoom = 100;              /* reset to 100% on file load */
 
     /* Reset the editable editor's caret/scroll/dirty for the new file. */
     ide_editor_reset(a);
@@ -541,6 +547,7 @@ static void init(Ide* a) {
 
     a->viz = VIZ_MAP;
     a->insp_tab = 2;                  /* PORTS                              */
+    a->map_zoom = 100;                /* 100% zoom initially                 */
 
     /* ---- EDITOR workspace defaults (this is the default face) ---- */
     a->ws = WS_EDITOR;
@@ -1242,6 +1249,17 @@ static int handle_ctrl_chord(Ide* a, int keycode) {
     case KEY_N:               /* Ctrl+N: open the New Project templates picker */
         np_open(a);
         return 1;
+    case KEY_EQUAL:           /* Ctrl+= zoom in (LEGO map) */
+        if (a->map_zoom < 200) a->map_zoom += 10;
+        return 1;
+    case KEY_MINUS:           /* Ctrl+- zoom out (LEGO map) */
+        if (a->map_zoom > 30) a->map_zoom -= 10;
+        return 1;
+    case KEY_0:               /* Ctrl+0 reset zoom to 100% */
+        a->map_zoom = 100;
+        a->map_ox = 0;        /* also recenter on zoom reset */
+        a->map_oy = 0;
+        return 1;
     case KEY_B:               /* Ctrl+B: build the open file */
         /* Build what's on screen: flush unsaved editor edits to disk first so
          * tc_build (which re-reads the file) compiles the live buffer, not a
@@ -1259,6 +1277,14 @@ static int handle_ctrl_chord(Ide* a, int keycode) {
         return 1;
     case KEY_S:               /* Ctrl+S: save (editor) */
         ide_editor_save(a);
+        return 1;
+    case KEY_D:               /* Ctrl+D: duplicate line (editor only) */
+        if (a->ws == WS_EDITOR && a->editor.focused)
+            ide_editor_duplicate_line(a);
+        return 1;
+    case KEY_K:               /* Ctrl+Shift+K: delete line (editor only) */
+        if (g_shift_down && a->ws == WS_EDITOR && a->editor.focused)
+            ide_editor_delete_line(a);
         return 1;
     case KEY_E:               /* Ctrl+E: toggle workspace */
         a->ws = (a->ws == WS_EDITOR) ? WS_LEGO : WS_EDITOR;
@@ -1460,17 +1486,41 @@ void _start(void) {
             if (kind == WL_EVENT_POINTER) {
                 a->mouse_x = ea;
                 a->mouse_y = eb;
-                a->buttons = ec;
+                /* Extract buttons (low 16 bits) and wheel (high 16 bits, signed) */
+                a->buttons = ec & 0xFFFF;
+                int wheel_packed = (ec >> 16) & 0xFFFF;
+                int wheel = (wheel_packed & 0x8000) ? (int)(wheel_packed | 0xFFFF0000) : (int)wheel_packed;
 
-                int left_now  = (ec & 1);
+                int left_now  = (a->buttons & 1);
                 int left_prev = (a->prev_buttons & 1);
+
+                /* Handle mouse wheel scrolling (negative=scroll down, positive=scroll up) */
+                if (wheel != 0) {
+                    int scroll_lines = -wheel;  /* invert: wheel up = scroll up = decrease scroll */
+                    if (a->ws == WS_EDITOR) {
+                        if (rect_hit(a->r_e_editor, ea, eb)) {
+                            /* Scroll editor */
+                            a->editor.top_line += scroll_lines;
+                            if (a->editor.top_line < 0) a->editor.top_line = 0;
+                        } else if (rect_hit(a->r_explorer, ea, eb)) {
+                            /* Scroll explorer */
+                            a->explorer_scroll += scroll_lines;
+                            if (a->explorer_scroll < 0) a->explorer_scroll = 0;
+                        }
+                    } else {
+                        /* LEGO workspace: scroll map */
+                        if (rect_hit(a->r_map, ea, eb)) {
+                            a->map_oy += scroll_lines * 20;  /* 20px per notch */
+                        }
+                    }
+                }
 
                 if (a->np.phase != NP_CLOSED) {
                     /* Modal up: it captures the pointer. Only the press edge
                      * matters (select a template / advance); drags are ignored. */
                     if (left_now && !left_prev)
                         np_click(a, ea, eb);
-                    a->prev_buttons = ec;
+                    a->prev_buttons = a->buttons;
                     continue;
                 }
 
@@ -1510,7 +1560,7 @@ void _start(void) {
                     }
                 }
 
-                a->prev_buttons = ec;
+                a->prev_buttons = a->buttons;
             } else if (kind == WL_EVENT_KEY) {
                 handle_key(a, ea, eb);
             }

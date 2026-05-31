@@ -65,4 +65,10 @@ int  ide_editor_dirty(struct Ide* a);
 /* Advance the caret blink animation by dt_ms (call once per frame). */
 void ide_editor_tick(struct Ide* a, int dt_ms);
 
+/* Duplicate the current line (Ctrl+D). */
+void ide_editor_duplicate_line(struct Ide* a);
+
+/* Delete the current line (Ctrl+Shift+K). */
+void ide_editor_delete_line(struct Ide* a);
+
 #endif /* IDE_EDITOR_H */

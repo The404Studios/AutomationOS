@@ -108,6 +108,7 @@ typedef struct Ide {
     VizTab   viz;
     int      explorer_scroll, funcs_scroll, code_scroll, inspector_scroll;
     int      map_ox, map_oy;        /* map pan offset                */
+    int      map_zoom;              /* zoom level: 100 = 100%, 50 = 50%, 200 = 200% */
     int      insp_tab;              /* 0 SYNTAX 1 CATEGORY 2 PORTS 3 CONN 4 DETAILS */
 
     /* editor workspace state */

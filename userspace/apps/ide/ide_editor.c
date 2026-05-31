@@ -157,6 +157,54 @@ void ide_editor_tick(struct Ide* a, int dt_ms) {
     if (a->editor.blink_ms >= 2 * ED_BLINK_MS) a->editor.blink_ms = 0;
 }
 
+/* ---- Ctrl+D: duplicate current line ---- */
+void ide_editor_duplicate_line(struct Ide* a) {
+    Editor* e = &a->editor;
+    int line = e->caret_line;
+    int line_start = ed_line_start(a->src, a->src_len, line);
+    int line_len = ed_line_len(a->src, a->src_len, line);
+
+    /* Check if there's room to duplicate (line + newline + line) */
+    if (a->src_len + line_len + 1 > IDE_SRC_CAP) return;
+
+    /* Insert newline at end of current line, then duplicate line content */
+    int eol = line_start + line_len;
+    if (!ed_insert_byte(a, eol, '\n')) return;
+
+    /* Copy each character from current line to next line */
+    for (int i = 0; i < line_len; i++) {
+        char ch = a->src[line_start + i];
+        if (!ed_insert_byte(a, eol + 1 + i, ch)) break;
+    }
+
+    /* Move caret to duplicated line, same column */
+    e->caret_line++;
+    ed_clamp_caret(a);
+}
+
+/* ---- Ctrl+Shift+K: delete current line ---- */
+void ide_editor_delete_line(struct Ide* a) {
+    Editor* e = &a->editor;
+    int line = e->caret_line;
+    int line_start = ed_line_start(a->src, a->src_len, line);
+    int line_len = ed_line_len(a->src, a->src_len, line);
+
+    /* Delete all chars in line */
+    for (int i = 0; i < line_len; i++) {
+        ed_delete_byte(a, line_start);
+    }
+
+    /* Delete the newline if present (unless it's the last line) */
+    if (line_start < a->src_len && a->src[line_start] == '\n') {
+        ed_delete_byte(a, line_start);
+    }
+
+    /* Keep caret on same line (now contains next line's content) */
+    e->caret_col = 0;
+    e->want_col = 0;
+    ed_clamp_caret(a);
+}
+
 /* Ensure the caret is visible: adjust top_line / left_col so the caret cell is
  * within the body's visible rows/cols. */
 static void ed_scroll_to_caret(struct Ide* a, Rect body) {
@@ -265,11 +313,54 @@ int ide_editor_key(struct Ide* a, int keycode, char ch, int shift, int ctrl) {
             ed_clamp_caret(a);
         }
         return 1;
-    case EDK_HOME: e->caret_col = 0; e->want_col = 0; return 1;
-    case EDK_END:
+    case EDK_HOME: {
+        /* Ctrl+Home: jump to start of file */
+        if (ctrl) {
+            e->caret_line = 0;
+            e->caret_col = 0;
+            e->want_col = 0;
+            return 1;
+        }
+
+        /* Smart Home: toggle between first non-whitespace and column 0 */
+        int line_start = ed_line_start(a->src, a->src_len, e->caret_line);
+        int line_len = ed_line_len(a->src, a->src_len, e->caret_line);
+
+        /* Find first non-whitespace column */
+        int first_nonws = 0;
+        for (int i = 0; i < line_len; i++) {
+            char ch = a->src[line_start + i];
+            if (ch != ' ' && ch != '\t') {
+                first_nonws = i;
+                break;
+            }
+        }
+
+        /* Toggle: if at column 0, go to first non-ws; otherwise go to 0 */
+        if (e->caret_col == 0 && first_nonws > 0) {
+            e->caret_col = first_nonws;
+        } else {
+            e->caret_col = 0;
+        }
+        e->want_col = e->caret_col;
+        return 1;
+    }
+    case EDK_END: {
+        /* Ctrl+End: jump to end of file */
+        if (ctrl) {
+            int last_line = ed_line_count(a->src, a->src_len) - 1;
+            if (last_line < 0) last_line = 0;
+            e->caret_line = last_line;
+            e->caret_col = ed_line_len(a->src, a->src_len, last_line);
+            e->want_col = e->caret_col;
+            return 1;
+        }
+
+        /* Normal End: go to end of current line */
         e->caret_col = ed_line_len(a->src, a->src_len, e->caret_line);
         e->want_col = e->caret_col;
         return 1;
+    }
     case EDK_PAGEUP:
         e->caret_line -= 12; if (e->caret_line < 0) e->caret_line = 0;
         e->caret_col = e->want_col; ed_clamp_caret(a);
@@ -305,10 +396,34 @@ int ide_editor_key(struct Ide* a, int keycode, char ch, int shift, int ctrl) {
     }
     case EDK_ENTER: {
         int off = ed_caret_off(a);
-        if (ed_insert_byte(a, off, '\n')) {
-            e->caret_line++;
-            e->caret_col = 0;
-            e->want_col = 0;
+        if (!ed_insert_byte(a, off, '\n')) return 1;
+
+        e->caret_line++;
+        e->caret_col = 0;
+        e->want_col = 0;
+
+        /* Auto-indent: preserve previous line's leading whitespace */
+        if (e->caret_line > 0) {
+            int prev_line = e->caret_line - 1;
+            int prev_start = ed_line_start(a->src, a->src_len, prev_line);
+            int prev_len = ed_line_len(a->src, a->src_len, prev_line);
+
+            /* Count leading spaces/tabs on previous line */
+            int indent = 0;
+            for (int i = 0; i < prev_len && indent < 64; i++) {
+                char ch = a->src[prev_start + i];
+                if (ch == ' ' || ch == '\t') indent++;
+                else break;
+            }
+
+            /* Insert same indentation on new line */
+            int new_off = ed_caret_off(a);
+            for (int i = 0; i < indent; i++) {
+                char ch = a->src[prev_start + i];
+                if (!ed_insert_byte(a, new_off + i, ch)) break;
+                e->caret_col++;
+            }
+            e->want_col = e->caret_col;
         }
         return 1;
     }

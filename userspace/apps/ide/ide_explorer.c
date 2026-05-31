@@ -179,7 +179,19 @@ void panel_explorer(Ide* a, Canvas* cv, Rect r) {
             uint32_t col = expl_file_color(e->name, selected);
             if (tx + GFX_FW <= clip_x + clip_w)
                 expl_draw_file(cv, tx, ry + (ROW_H - GFX_FH) / 2, TH_TEXT_FAINT);
-            gfx_text_clip(cv, nx, ty, e->name, col, clip_x, clip_w);
+
+            /* Check if this is the currently open file and it's dirty */
+            int is_open = ide_streq(e->path, a->cur_file);
+            int is_dirty = is_open && ide_editor_dirty(a);
+
+            /* Show asterisk for dirty files */
+            if (is_dirty) {
+                /* Draw orange asterisk before filename */
+                gfx_text_clip(cv, nx, ty, "*", TH_ORANGE, clip_x, clip_w);
+                gfx_text_clip(cv, nx + GFX_FW, ty, e->name, col, clip_x, clip_w);
+            } else {
+                gfx_text_clip(cv, nx, ty, e->name, col, clip_x, clip_w);
+            }
         }
     }
 

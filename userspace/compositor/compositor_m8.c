@@ -874,6 +874,47 @@ static void draw_cursor(uint32_t *buf, uint32_t bw, uint32_t bh, uint32_t stride
     }
 }
 
+/* ---- PERF: save-under software cursor (cursor-only fast-path) ----------- *
+ * On a slow framebuffer (ThinkPad T410) moving the mouse used to force a full
+ * scene recomposite every frame because the cursor is the last thing composite()
+ * draws and it is NOT a save-under overlay. To make a cursor-ONLY move cheap, we
+ * keep a copy of the CUR_W*CUR_H block of the back buffer that lies UNDER the
+ * cursor (captured just before the cursor sprite is stamped). A cursor-only frame
+ * then restores that block (erasing the old cursor), re-saves the block at the new
+ * position, redraws the cursor, and lets present_diff() push only the old+new
+ * cursor rects to the framebuffer -- no full composite.
+ *
+ * Clipping MUST match draw_cursor() exactly (per-pixel clip to [0,bw)x[0,bh)) so
+ * the saved/restored set is identical to the pixels the cursor would touch. The
+ * save buffer stores ALL CUR_W*CUR_H cells; off-screen cells are simply skipped on
+ * both save and restore, leaving them untouched (the cursor never wrote them). */
+static uint32_t g_cursor_save[CUR_W * CUR_H];
+static int      g_cursor_saved = 0;
+static int32_t  g_cursor_sx = 0, g_cursor_sy = 0;
+
+static void cursor_save_under(uint32_t *back, uint32_t bw, uint32_t bh,
+                              uint32_t stride, int32_t x, int32_t y) {
+    for (int32_t r = 0; r < CUR_H; r++) {
+        for (int32_t c = 0; c < CUR_W; c++) {
+            int32_t px = x + c, py = y + r;
+            if (px < 0 || py < 0 || px >= (int32_t)bw || py >= (int32_t)bh) continue;
+            g_cursor_save[r * CUR_W + c] = back[(uint32_t)py * stride + (uint32_t)px];
+        }
+    }
+    g_cursor_sx = x; g_cursor_sy = y; g_cursor_saved = 1;
+}
+
+static void cursor_restore(uint32_t *back, uint32_t bw, uint32_t bh, uint32_t stride) {
+    if (!g_cursor_saved) return;
+    for (int32_t r = 0; r < CUR_H; r++) {
+        for (int32_t c = 0; c < CUR_W; c++) {
+            int32_t px = g_cursor_sx + c, py = g_cursor_sy + r;
+            if (px < 0 || py < 0 || px >= (int32_t)bw || py >= (int32_t)bh) continue;
+            back[(uint32_t)py * stride + (uint32_t)px] = g_cursor_save[r * CUR_W + c];
+        }
+    }
+}
+
 /* ====================================================================== *
  *  Window registry                                                        *
  * ====================================================================== */
@@ -2683,6 +2724,12 @@ static void composite(uint32_t *buf, uint32_t w, uint32_t h, uint32_t stride,
      * is never occluded by it). Cheap; gated by g_stats_on / COMPOSITOR_STATS. */
     render_stats_overlay(buf, w, h, stride);
 
+    /* PERF: snapshot the scene UNDER the cursor (pre-sprite) so the next
+     * cursor-only frame can erase the cursor without a full recomposite. Must run
+     * immediately before draw_cursor and use the same coords, so g_cursor_save +
+     * g_cursor_sx/sy stay consistent with what is on screen. */
+    cursor_save_under(buf, w, h, stride, cursor_x, cursor_y);
+
     /* cursor on very top */
     draw_cursor(buf, w, h, stride, cursor_x, cursor_y);
 }
@@ -3005,6 +3052,19 @@ static int32_t g_mouse_fd = -1;
 static int32_t g_cursor_x = 0;
 static int32_t g_cursor_y = 0;
 static int32_t g_buttons  = 0;   /* bit0=left bit1=right bit2=middle */
+
+/* PERF (save-under cursor fast-path): set by pump_input INSTEAD of mark_dirty()
+ * when the only change this frame is cursor motion over inert area (no button /
+ * key / drag / open menu / dock / desktop-icon hover). The main loop then runs
+ * the cheap cursor-only present instead of a full composite. */
+static int g_cursor_only_dirty = 0;
+/* g_drag_slot tracks the window slot being drag-moved (or -1). Defined here
+ * (moved up from below handle_mouse) so pump_input can read it to decide the
+ * cursor fast path -- a drag must always take the full composite path. */
+static int     g_drag_slot   = -1;     /* slot being drag-moved, or -1     */
+/* desk_icon_at() is defined later; pump_input uses it to detect icon-hover (which
+ * paints a cursor-reactive highlight, so such moves must take the full path). */
+static int desk_icon_at(int32_t cx, int32_t cy, uint32_t W, uint32_t H);
 static int32_t g_wheel_delta = 0; /* accumulated wheel scroll (reset per frame) */
 /* Per-event click latches. A quick click delivers press+release in the SAME
  * pump_input batch, so the once-per-frame g_buttons edge check misses it. We
@@ -3187,6 +3247,10 @@ static void pump_input(int32_t fd, int keyboard, uint32_t W, uint32_t H) {
     if (n <= 0) return;
     long count = n / (long)sizeof(input_event_t);
     int pointer_changed = 0;
+    /* PERF: split pointer damage so a CURSOR-ONLY move can take the cheap
+     * save-under present. cursor_moved = REL_X/REL_Y seen; non_cursor_change =
+     * a button edge (which can open menus / start drags / re-focus) -> full path. */
+    int cursor_moved = 0, non_cursor_change = 0;
 
     for (long i = 0; i < count; i++) {
         input_event_t *e = &evs[i];
@@ -3208,9 +3272,9 @@ static void pump_input(int32_t fd, int keyboard, uint32_t W, uint32_t H) {
             continue;
         }
         if (e->type == EV_REL) {
-            if (e->code == REL_X) { g_cursor_x += e->value; pointer_changed = 1; }
-            else if (e->code == REL_Y) { g_cursor_y += e->value; pointer_changed = 1; }
-            else if (e->code == REL_WHEEL) { g_wheel_delta += e->value; }
+            if (e->code == REL_X) { g_cursor_x += e->value; pointer_changed = 1; cursor_moved = 1; }
+            else if (e->code == REL_Y) { g_cursor_y += e->value; pointer_changed = 1; cursor_moved = 1; }
+            else if (e->code == REL_WHEEL) { g_wheel_delta += e->value; non_cursor_change = 1; }
         } else if (e->type == EV_KEY) {
             int32_t bit = -1;
             if (e->code == BTN_LEFT_CODE)   bit = 0;
@@ -3231,6 +3295,7 @@ static void pump_input(int32_t fd, int keyboard, uint32_t W, uint32_t H) {
                     g_buttons &= ~(1 << bit);
                 }
                 pointer_changed = 1;
+                non_cursor_change = 1;   /* button edge -> full path (click/drag/menu) */
             }
         }
     }
@@ -3240,11 +3305,36 @@ static void pump_input(int32_t fd, int keyboard, uint32_t W, uint32_t H) {
         if (g_cursor_y < 0) g_cursor_y = 0;
         if (g_cursor_x >= (int32_t)W) g_cursor_x = (int32_t)W - 1;
         if (g_cursor_y >= (int32_t)H) g_cursor_y = (int32_t)H - 1;
-        /* PERF: the compositor draws the cursor, so ANY cursor move or button
-         * change must repaint (cursor sprite, dock hover-magnify, drag, menu
-         * highlight all key off pointer state). Mark dirty for every pointer
-         * change -- the safest, broadest mouse damage source. */
-        mark_dirty();
+
+        /* PERF: the compositor draws the cursor, so ANY pointer change must
+         * repaint. The FAST path (g_cursor_only_dirty) is taken ONLY when the
+         * sole change is cursor motion over INERT area -- i.e. nothing that the
+         * composite draws keys off the cursor position there. We must therefore
+         * exclude every cursor-reactive element:
+         *   - a button edge / wheel  (non_cursor_change): click/drag/menu/scroll
+         *   - an in-flight window drag (g_drag_slot >= 0)
+         *   - an open popup menu / About dialog (hover row tracks the cursor)
+         *   - the right vertical dock (cx >= W-RDOCK_W): magnify on hover
+         *   - the bottom dock         (cy >= H-DOCK_H): launcher/taskbar hover
+         *   - a desktop icon's hover box (desk_icon_at >= 0): hover highlight
+         * Because the previous full composite painted hover for the PREVIOUS
+         * cursor position, leaving a reactive zone must ALSO take the full path
+         * so the old highlight is erased; we require the cursor to have been
+         * inert last frame too (g_cursor_prev_inert). When unsure, fall back to
+         * the full path (mark_dirty) -- biasing toward correctness over fps. */
+        static int g_cursor_prev_inert = 0;
+        int over_chrome =
+            (g_cursor_x >= (int32_t)W - RDOCK_W) ||     /* right dock strip   */
+            (g_cursor_y >= (int32_t)H - DOCK_H)   ||     /* bottom dock        */
+            (desk_icon_at(g_cursor_x, g_cursor_y, W, H) >= 0);  /* icon hover */
+        int inert_now = !over_chrome && g_drag_slot < 0 &&
+                        !g_menu_open && !g_about_open;
+        if (cursor_moved && !non_cursor_change && inert_now && g_cursor_prev_inert)
+            g_cursor_only_dirty = 1;   /* cheap save-under present in main loop */
+        else
+            mark_dirty();              /* full composite (safe, broad)         */
+        g_cursor_prev_inert = inert_now;
+
         send_pointer_to_focus();
     }
 }
@@ -3253,7 +3343,8 @@ static void pump_input(int32_t fd, int keyboard, uint32_t W, uint32_t H) {
  *  Desktop-shell mouse interaction (hit-testing + drag-move)             *
  * ---------------------------------------------------------------------- */
 static int32_t g_prev_buttons = 0;     /* for left-click edge detection    */
-static int     g_drag_slot   = -1;     /* slot being drag-moved, or -1     */
+/* g_drag_slot moved up to the pointer-state block (near g_buttons) so pump_input
+ * can read it; see its definition there. */
 static int32_t g_drag_dx = 0, g_drag_dy = 0;  /* cursor-to-frame offset    */
 
 static int point_in(int32_t px, int32_t py, int32_t x, int32_t y, int32_t w, int32_t h) {
@@ -4001,11 +4092,18 @@ void _start(void) {
          * animations, dock hover, the per-second clock pulse above). When NOT
          * dirty we present nothing and just yield. For the first BOOT_FADE_MS we
          * fluidly cross-fade the kernel boot splash into the desktop. */
-        if (g_dirty) {
+        /* PERF: the cursor-only fast path is eligible only when double-buffered
+         * with a prev buffer and not mid boot-fade (the fade redraws the whole
+         * screen each frame anyway). If a cursor-only move is pending but NOT
+         * eligible, fall back to the full path so the cursor never freezes. */
+        int can_fast = (g_cursor_only_dirty && !g_dirty &&
+                        back != hw && prev && !boot_fading);
+        if (g_dirty || (g_cursor_only_dirty && !can_fast)) {
             g_dirty = 0;                       /* consume before drawing so a
                                                 * change DURING this frame's draw
                                                 * (e.g. a late inbox msg next
                                                 * iteration) re-arms cleanly.    */
+            g_cursor_only_dirty = 0;           /* full path supersedes it        */
             composite(back, W, H, stride, g_cursor_x, g_cursor_y, now);
             if (back != hw) {
                 if (boot_fading) {
@@ -4031,6 +4129,28 @@ void _start(void) {
                 long inst_fps_x10 = 10000 / g_frame_dt_ms;   /* (1000/dt)*10 */
                 if (g_fps_x10 == 0) g_fps_x10 = inst_fps_x10;
                 else g_fps_x10 += (inst_fps_x10 - g_fps_x10) / 4;  /* IIR a=1/4 */
+            }
+        } else if (can_fast) {
+            /* CURSOR-ONLY FAST PATH: erase the old cursor by restoring the saved
+             * scene block, re-snapshot the scene at the new position, redraw the
+             * cursor, then present only the old+new cursor rects. No composite().
+             * present_diff() keeps prev == back over the visible area (the full
+             * path's invariant), so the next frame's diff is correct either way. */
+            g_cursor_only_dirty = 0;
+            cursor_restore(back, W, H, stride);                       /* erase old cursor */
+            cursor_save_under(back, W, H, stride, g_cursor_x, g_cursor_y);
+            draw_cursor(back, W, H, stride, g_cursor_x, g_cursor_y);
+            g_present_px = present_diff(hw, back, prev, W, H, stride);
+            g_present_did = (g_present_px != 0);
+
+            /* sample frame-time + FPS just like the full path */
+            g_frame_dt_ms = now - g_last_frame_ms;
+            if (g_frame_dt_ms < 0) g_frame_dt_ms = 0;
+            g_last_frame_ms = now;
+            if (g_frame_dt_ms > 0) {
+                long inst_fps_x10 = 10000 / g_frame_dt_ms;
+                if (g_fps_x10 == 0) g_fps_x10 = inst_fps_x10;
+                else g_fps_x10 += (inst_fps_x10 - g_fps_x10) / 4;
             }
         }
 

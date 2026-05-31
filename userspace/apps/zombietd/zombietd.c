@@ -375,10 +375,12 @@ typedef struct {
     i32 atk_cd;        /* ticks until next hit on the base              */
     i32 hurt;          /* frames of hit-flash remaining                 */
     i32 wob;           /* per-zombie phase for a little shamble wobble  */
+    u32 gen;           /* unique id stamped at spawn (slot-reuse guard)  */
 } Zombie;
 
 static Zombie g_zom[MAX_ZOMBIES];
 static i32    g_zom_count = 0;      /* current live count                 */
+static u32    g_zom_gen   = 0;      /* monotonic spawn id (slot-reuse guard) */
 
 static i32 spawn_zombie(i32 type, i32 wave, i32 px, i32 py)
 {
@@ -401,6 +403,7 @@ static i32 spawn_zombie(i32 type, i32 wave, i32 px, i32 py)
             g_zom[i].atk_cd = 0;
             g_zom[i].hurt = 0;
             g_zom[i].wob = (i32)(lcg_rand() & 255u);
+            g_zom[i].gen = ++g_zom_gen;
             g_zom_count++;
             return i;
         }
@@ -508,6 +511,7 @@ typedef struct {
     i32 x, y;        /* current pos (FP) */
     i32 vx, vy;      /* velocity (FP/tick) */
     i32 target;      /* homing target zombie index (-1 = dumb) */
+    u32 tgen;        /* target's gen at fire time (detects slot reuse) */
     i32 ttl;         /* ticks before auto-expire */
     i32 dmg;
     i32 splash;
@@ -531,6 +535,7 @@ static void spawn_proj(i32 sx, i32 sy, i32 tgt, i32 tx, i32 ty,
             g_proj[i].vx = (dx * TO_FP(spd)) / d;
             g_proj[i].vy = (dy * TO_FP(spd)) / d;
             g_proj[i].target = tgt;
+            g_proj[i].tgen = (tgt >= 0) ? g_zom[tgt].gen : 0u;
             g_proj[i].ttl = 80;
             g_proj[i].dmg = dmg;
             g_proj[i].splash = splash;
@@ -847,7 +852,8 @@ static void update_projectiles(void)
         /* Light homing: steer toward the live target so fast zombies still get
          * hit. If the target died, the projectile flies straight and detonates
          * on proximity / expiry. */
-        if (pr->target >= 0 && g_zom[pr->target].alive) {
+        if (pr->target >= 0 && g_zom[pr->target].alive &&
+            g_zom[pr->target].gen == pr->tgen) {
             i32 zx = TO_PX(g_zom[pr->target].x), zy = TO_PX(g_zom[pr->target].y);
             i32 px = TO_PX(pr->x), py = TO_PX(pr->y);
             i32 dx = zx - px, dy = zy - py;

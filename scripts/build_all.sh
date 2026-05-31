@@ -478,6 +478,11 @@ cp userspace/apps/ide/sample/gamestarter/*    /tmp/ird/usr/src/templates/gamesta
 cp userspace/apps/ide/sample/appstarter/*     /tmp/ird/usr/src/templates/appstarter/     2>/dev/null || true
 cp userspace/apps/ide/sample/servicestarter/* /tmp/ird/usr/src/templates/servicestarter/ 2>/dev/null || true
 mkdir -p /tmp/ird/Desktop
+# Zombie Bastion: a Desktop FOLDER holding the game ELF. The compositor shows
+# /Desktop entries as icons; a folder opens the filemanager, where the .elf can
+# be launched. (The dock "Zt" icon launches it directly too.)
+mkdir -p /tmp/ird/Desktop/ZombieBastion
+cp /tmp/zombietd.elf /tmp/ird/Desktop/ZombieBastion/zombietd.elf 2>/dev/null || true
 ( cd /tmp/ird && tar --format=ustar --owner=0 --group=0 -cf /mnt/c/Users/wilde/Desktop/Kernel/iso/boot/initrd.img . )
 
 echo "[all] installing fresh kernel into ISO tree..."

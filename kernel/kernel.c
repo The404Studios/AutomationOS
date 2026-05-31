@@ -221,6 +221,13 @@ static boot_info_t* parse_multiboot(uint64_t mb_info_addr) {
 static int      g_boot_fb_ok = 0;
 static uint32_t g_boot_fb_h  = 0;
 static int      g_boot_step  = 0;
+#ifdef SMP_FOUNDATION
+/* The SMP/AP result, captured during brick-3 bring-up (which runs BEFORE the
+ * framebuffer is live) and painted as an on-screen boot marker AFTER the splash.
+ * On real hardware (e.g. the T410) the serial [SMP] log is invisible, so this is
+ * how you read whether CPU 1 came online: photograph the boot panel. */
+static const char *g_smp_boot_status = "SMP: (no result)";
+#endif
 static void boot_mark(const char *label) {
     if (!g_boot_fb_ok) return;
     uint32_t y = ((g_boot_fb_h > 200u) ? (g_boot_fb_h / 2u + 56u) : 56u)
@@ -434,12 +441,15 @@ void kernel_main(void* raw_info) {
         if (smp_cpu_count >= 2) {
             if (try_start_cpu1()) {
                 kprintf("[SMP] CPU 1 online\n");        /* AP is now hlt-parked */
+                g_smp_boot_status = "SMP: CPU 1 ONLINE";
             } else {
                 kprintf("[SMP] AP failed to start, continuing single-core\n");
+                g_smp_boot_status = "SMP: AP failed (single-core)";
             }
         } else {
             kprintf("[SMP] single-core (firmware reports %d cpu); no AP to start\n",
                     smp_cpu_count);
+            g_smp_boot_status = "SMP: single-core (1 cpu)";
         }
         /* Fall through and finish booting the BSP normally -- no matter what. */
     }
@@ -501,6 +511,15 @@ void kernel_main(void* raw_info) {
             framebuffer_puts_scaled(l2, x2, y2, 0x009FC8FF, s2);  /* blue credit  */
         }
         kprintf("[KERNEL] Boot splash drawn!\n");
+
+#ifdef SMP_FOUNDATION
+        /* Paint the SMP/AP result on-screen as a green boot marker, just below
+         * the splash. This is the ONLY way to read the AP result on real hardware
+         * (the T410), where the serial [SMP] log is not visible -- photograph the
+         * panel. One of: "SMP: CPU 1 ONLINE" / "SMP: AP failed (single-core)" /
+         * "SMP: single-core (1 cpu)". Harmlessly overwritten by the compositor. */
+        boot_mark(g_smp_boot_status);
+#endif
 
         /* Map framebuffer for userspace access at a fixed virtual address */
         /* Userspace framebuffer at 0x40000000 (1GB mark, well within user space) */

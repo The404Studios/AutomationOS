@@ -841,6 +841,13 @@ typedef struct {
     uint32_t *pixels;           /* shmat() base of client's pixel buffer   */
     uint64_t  shm_vaddr;        /* attach addr (for shmdt)                 */
     uint32_t  w, h, stride;     /* surface dims; stride in PIXELS          */
+    /* IMMUTABLE client buffer extent, captured at create time and NEVER
+     * overwritten by snap/maximize (which only rewrite w/h to the maximized
+     * drawable rect). The client's SHM is buf_w*buf_h*4 bytes, so any blit
+     * MUST clamp its SOURCE read to (buf_w,buf_h) or it walks past the mapped
+     * segment and page-faults the compositor. (stride stays == buf_w, so
+     * buf_w is redundant with stride but kept explicit for clarity.)        */
+    uint32_t  buf_w, buf_h;     /* real SHM pixel extent (clamp source read) */
     int32_t   x, y;             /* placement of window FRAME (titlebar top)*/
     char      title[WL_TITLE_MAX];
     int       dirty;            /* set on commit (informational)           */
@@ -1399,10 +1406,16 @@ static void render_window_static(uint32_t *buf, uint32_t w, uint32_t h, uint32_t
                          fx + 8, fy + (TITLEBAR_H - FONT_H) / 2, win->title,
                          focused ? COL_TEXT : COL_TEXT_DIM);
 
-        /* client surface */
+        /* client surface. Clamp the SOURCE read to the client's REAL SHM extent
+         * (buf_w x buf_h): when a window is maximized, win->w/win->h grow to the
+         * maximized rect but the client's buffer stays buf_w x buf_h, so reading
+         * win->w x win->h rows here would walk past the mapped segment and fault
+         * the compositor. Clamping letterboxes the smaller content instead. */
         if (win->pixels) {
+            uint32_t sw = win->w < win->buf_w ? win->w : win->buf_w;
+            uint32_t sh = win->h < win->buf_h ? win->h : win->buf_h;
             blit_surface_clip(buf, w, h, stride,
-                              win->pixels, win->w, win->h, win->stride,
+                              win->pixels, sw, sh, win->stride,
                               client_x, client_y, clip_y0, clip_y1);
         } else {
             int32_t py0 = client_y < clip_y0 ? clip_y0 : client_y;
@@ -1448,8 +1461,11 @@ static void render_window_static(uint32_t *buf, uint32_t w, uint32_t h, uint32_t
 
         /* Client surface: 1:1 scale blit via blit_surface_scaled_alpha */
         if (win->pixels) {
+            /* clamp source read to the real SHM extent (see fast-path note) */
+            uint32_t sw = win->w < win->buf_w ? win->w : win->buf_w;
+            uint32_t sh = win->h < win->buf_h ? win->h : win->buf_h;
             blit_surface_scaled_alpha(buf, w, h, stride,
-                                      win->pixels, win->w, win->h, win->stride,
+                                      win->pixels, sw, sh, win->stride,
                                       client_x, client_y,
                                       256, 256, fa256,
                                       clip_y0, clip_y1);
@@ -1597,10 +1613,13 @@ static void render_window_anim(uint32_t *buf, uint32_t w, uint32_t h, uint32_t s
         }
     }
 
-    /* Animated client content: scaled + alpha-blended about its center. */
+    /* Animated client content: scaled + alpha-blended about its center.
+     * Clamp the source read to the real SHM extent (see fast-path note). */
     if (win->pixels) {
+        uint32_t sw = win->w < win->buf_w ? win->w : win->buf_w;
+        uint32_t sh = win->h < win->buf_h ? win->h : win->buf_h;
         blit_surface_scaled_alpha(buf, w, h, stride,
-                                  win->pixels, win->w, win->h, win->stride,
+                                  win->pixels, sw, sh, win->stride,
                                   draw_client_x, draw_client_y,
                                   scale_num, scale_den, alpha,
                                   clip_y0, clip_y1);
@@ -2633,6 +2652,12 @@ static void handle_create(const wl_req_create_t *req) {
      * client-supplied (and previously unvalidated) req->stride was an OOB-read
      * vector; pin it to w instead. */
     win->stride     = req->w;
+    /* Record the IMMUTABLE SHM extent. snap/maximize rewrite win->w/win->h to
+     * the maximized drawable rect, but the client's SHM stays this size (wl-lite
+     * has no resize event), so every blit clamps its SOURCE read to buf_w/buf_h
+     * to avoid reading past the mapped segment. NEVER overwrite these. */
+    win->buf_w      = req->w;
+    win->buf_h      = req->h;
     win->dirty      = 1;
     win->phase      = PH_NONE;
     win->minimized  = 0;

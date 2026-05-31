@@ -493,6 +493,21 @@ void kernel_main(void* raw_info) {
                     g_smp_boot_status = "SMP: CPU 1 worker FAIL";
                 }
                 g_smp_ap_online = 1;   /* brick 6: AP is up -> managed worker loop */
+
+                /* SMP brick 8: split an INTEGER matrix multiply across CPU0 (BSP)
+                 * and CPU1 (AP) and measure the real speedup -- the payoff of the
+                 * SMP arc. Runs AFTER the brick-6 sum test and only now that CPU 1
+                 * is confirmed online. The BSP submits the BOTTOM band to CPU1
+                 * (cpu1_submit, non-blocking), computes the TOP band itself
+                 * CONCURRENTLY, then cpu1_wait()s on a GENEROUS ~5s deadline (real
+                 * work, not a liveness probe -- on timeout it logs FAIL, never
+                 * hangs). It then verifies the dual-core result bit-for-bit against
+                 * a single-core baseline and logs the split (with by_apic=1 PROVING
+                 * apic-1 ran its band), both cycle counts, the integer speedup, and
+                 * the verify result. INT-ONLY: no float/SSE on the AP path (the AP
+                 * trampoline does not provably enable SSE state on CPU1). */
+                extern void matmul_self_test(void);
+                matmul_self_test();
             } else {
                 kprintf("[SMP] AP failed to start, continuing single-core\n");
                 g_smp_boot_status = "SMP: AP failed (single-core)";

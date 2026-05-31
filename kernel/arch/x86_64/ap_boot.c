@@ -294,24 +294,24 @@ void worktest(void *a)
 }
 
 /*
- * cpu1_run -- BSP-side submit + bounded wait. Hand the ONE trusted worker function
- * `fn` (with `arg`) to CPU 1 via the single job slot, then wait for it to finish.
+ * SMP brick 8: split the blocking primitive into SUBMIT + WAIT so the BSP and the
+ * AP can run their halves of a job CONCURRENTLY (the BSP submits, then does its own
+ * share of the work, then waits). cpu1_run (brick 6) is preserved below as exactly
+ * "submit then wait on the default deadline", so its existing call site is unchanged.
  *
- * Returns 1 if CPU 1 ran the job and signalled done within the deadline, 0 on
- * timeout. The wait is a BOUNDED ~100 ms TSC deadline so a wedged/dead AP can NEVER
- * hang the BSP -- mirroring THE HARD RULE used everywhere else in this file.
+ * cpu1_submit -- publish the job and return IMMEDIATELY (NON-blocking).
  *
- * Ordering: clear `done` (RELAXED -- it is republished under the `pending` RELEASE
- * fence), then RELEASE-store `pending=1`. The RELEASE guarantees the AP, when it
- * ACQUIRE-observes pending==1, also sees the fn/arg/done we wrote first -- so it
- * cannot run a stale fn or observe a leftover done=1 from a previous job. We then
- * ACQUIRE-poll `done`; observing 1 synchronizes-with the AP's RELEASE, making all
- * of fn's shared-memory side effects visible before we return.
+ * Ordering: write fn/arg, then clear `done` (RELAXED -- it is republished under the
+ * `pending` RELEASE fence below), then RELEASE-store `pending=1`. The RELEASE store
+ * is a one-way barrier: when the AP ACQUIRE-observes pending==1 it is guaranteed to
+ * also see the fn/arg/done we wrote first, so it can never run a stale fn or observe
+ * a leftover done=1 from a previous job. Returns 1 if a job was published, 0 if fn
+ * was NULL (nothing to wait on).
  *
  * Trust note: `fn` is a kernel function pointer chosen by the BSP (kernel code),
  * never user-supplied. CPU 1 runs ONLY what the BSP places here.
  */
-int cpu1_run(cpu_job_fn fn, void *arg)
+int cpu1_submit(cpu_job_fn fn, void *arg)
 {
     if (!fn) {
         return 0;
@@ -322,20 +322,229 @@ int cpu1_run(cpu_job_fn fn, void *arg)
     cpu1_job.arg = arg;
     __atomic_store_n(&cpu1_job.done, 0, __ATOMIC_RELAXED);
     __atomic_store_n(&cpu1_job.pending, 1, __ATOMIC_RELEASE);
+    return 1;                           /* submitted -- do NOT wait here */
+}
 
-    /* BOUNDED wait on the shared MEMORY flag `done` -- a finite ~100 ms TSC
-     * deadline. On expiry return 0 (the AP is wedged/absent) so the BSP keeps
-     * going; never an infinite spin, never a panic. */
-    uint64_t start    = rdtsc();
-    uint64_t deadline = AP_WAIT_US * AP_TSC_PER_US;   /* 100ms * 3000 cyc/us */
+/*
+ * cpu1_wait -- bounded wait for the in-flight job to finish.
+ *
+ * ACQUIRE-poll the shared MEMORY flag `done` until it is set or `deadline_tsc`
+ * (an ABSOLUTE rdtsc value) passes. Returns 1 if the AP signalled done within the
+ * deadline, 0 on timeout. Observing done==1 synchronizes-with the AP's RELEASE-store
+ * of done, so all of fn's shared-memory side effects are visible before we return.
+ *
+ * The deadline is supplied by the caller so the SAME primitive serves BOTH a short
+ * ~100ms LIVENESS bound (brick 6 self-test: a wedged AP must never hang us) AND a
+ * GENEROUS multi-second compute bound (brick 8 matmul: real work takes real time).
+ * It polls MEMORY only (never any MMIO/APIC register), so a wedged LAPIC can never
+ * make the BSP spin forever -- the finite deadline always wins.
+ */
+int cpu1_wait(uint64_t deadline_tsc)
+{
     while (__atomic_load_n(&cpu1_job.done, __ATOMIC_ACQUIRE) == 0) {
-        if ((rdtsc() - start) >= deadline) {
+        if (rdtsc() >= deadline_tsc) {
             return 0;                   /* timeout -> don't hang the BSP */
         }
         __asm__ volatile("pause" ::: "memory");
     }
-
     return 1;                           /* CPU 1 ran the job and signalled done */
+}
+
+/*
+ * cpu1_run -- BSP-side submit + bounded wait (brick 6, UNCHANGED behaviour). Hand the
+ * ONE trusted worker function `fn` (with `arg`) to CPU 1 via the single job slot, then
+ * wait for it to finish. Now expressed as cpu1_submit() + cpu1_wait(default deadline).
+ *
+ * Returns 1 if CPU 1 ran the job and signalled done within the deadline, 0 on
+ * timeout. The wait is a BOUNDED ~100 ms TSC deadline so a wedged/dead AP can NEVER
+ * hang the BSP -- mirroring THE HARD RULE used everywhere else in this file. This is
+ * the LIVENESS path (existing brick-6 sum self-test); compute jobs that legitimately
+ * take longer use cpu1_submit + cpu1_wait with a generous deadline instead.
+ *
+ * Trust note: `fn` is a kernel function pointer chosen by the BSP (kernel code),
+ * never user-supplied. CPU 1 runs ONLY what the BSP places here.
+ */
+int cpu1_run(cpu_job_fn fn, void *arg)
+{
+    if (!cpu1_submit(fn, arg)) {
+        return 0;
+    }
+    /* BOUNDED ~100 ms TSC deadline (absolute). On expiry cpu1_wait returns 0 (the
+     * AP is wedged/absent) so the BSP keeps going; never an infinite spin, never a
+     * panic. */
+    uint64_t deadline = rdtsc() + AP_WAIT_US * AP_TSC_PER_US;  /* now + 100ms */
+    return cpu1_wait(deadline);
+}
+
+/* ---------------------------------------------------------------------------
+ * SMP brick 8: split an INTEGER matrix multiply across CPU0 (BSP) and CPU1 (AP)
+ * and measure the real speedup -- the payoff of the SMP arc. The BSP computes the
+ * top band of C while CPU1 computes the bottom band CONCURRENTLY (via cpu1_submit
+ * + own work + cpu1_wait), then the BSP verifies the dual-core result bit-for-bit
+ * against a single-core baseline. CPU1 records its own APIC id into the job arg so
+ * the log can PROVE apic-1 ran the bottom band (not a silent serial fallback on CPU0).
+ *
+ * WHY INTEGER (no float/double/SSE anywhere on the AP path): the AP trampoline does
+ * not provably enable the SSE FPU state (CR0/CR4.OSFXSR) on CPU1, so float/SSE code
+ * on the AP could #UD or compute garbage. Integer math uses GP registers, always
+ * valid in long mode. matmul_band and everything it touches are int-only, so the
+ * compiler emits NO SSE for the AP path. (Float/SSE on the AP is a deferred brick.)
+ *
+ * Buffers are static, in the BSP's page tables (so already mapped + reachable from
+ * the AP). A/B are filled deterministically with SMALL ints so the result is
+ * reproducible and bit-identical between the single- and dual-core runs, and the
+ * int64 accumulator cannot overflow (per-element sum <= N*6*4 ~ 3072, trivially safe).
+ *
+ * .bss.deferred PLACEMENT (load-bearing -- see kernel/linker.ld): these four arrays
+ * total ~384 KiB. Plain .bss is packed in the first ~1.7 MiB, which MUST stay BELOW
+ * the 0x200000 user-ELF load base: each process address space deep-copies the
+ * low-half page tables and userspace binaries link at 0x200000, so any kernel global
+ * at VA >= 0x200000 gets SHADOWED by user pages under that process's CR3. 384 KiB of
+ * extra plain .bss pushes the kernel's critical control state across 0x200000 and the
+ * first usermode entry (PID 2) then GPFs. Emitting these LAST in .bss.deferred (which
+ * the linker places after all control state) keeps control state packed below
+ * 0x200000. Safe for these buffers specifically: the whole matmul self-test runs in
+ * kernel_main BEFORE any userspace process exists (kernel CR3 active, buffers fully
+ * mapped) and they are never touched again afterward -- so even if a later big process
+ * shadows them, nothing reads them. NOT volatile/touched on any user-CR3 hot path.
+ * ------------------------------------------------------------------------- */
+#define MM_N 128                        /* square: C[N][N] = A[N][K=N] * B[N][N] */
+#define MM_DEFERRED __attribute__((section(".bss.deferred")))
+static int32_t mm_A[MM_N * MM_N] MM_DEFERRED;       /* row-major */
+static int32_t mm_B[MM_N * MM_N] MM_DEFERRED;
+static int64_t mm_Csingle[MM_N * MM_N] MM_DEFERRED; /* single-core baseline result */
+static int64_t mm_Cdual[MM_N * MM_N] MM_DEFERRED;   /* dual-core (BSP top + CPU1 bottom) */
+
+/* Fill A/B deterministically with small ints (reproducible, bit-identical runs). */
+void mm_fill(void)
+{
+    for (int i = 0; i < MM_N; i++) {
+        for (int j = 0; j < MM_N; j++) {
+            mm_A[i * MM_N + j] = (int32_t)((i + j) % 7);
+            mm_B[i * MM_N + j] = (int32_t)((i * 3 + j + 1) % 5);
+        }
+    }
+}
+
+/* Compute C rows [row0,row1). INT-ONLY (GP registers): no float/double/SSE, so this
+ * is safe to run on the AP, which has no proven SSE state. C is the caller's buffer
+ * (mm_Csingle for the baseline, mm_Cdual for each parallel band). */
+static void matmul_band(int row0, int row1, int64_t *C)
+{
+    for (int r = row0; r < row1; r++) {
+        for (int c = 0; c < MM_N; c++) {
+            int64_t s = 0;
+            for (int k = 0; k < MM_N; k++) {
+                s += (int64_t)mm_A[r * MM_N + k] * (int64_t)mm_B[k * MM_N + c];
+            }
+            C[r * MM_N + c] = s;
+        }
+    }
+}
+
+/* CPU1's band job + proof-of-execution marker. mm_job runs the bottom band on the AP
+ * and records the AP's own APIC id (lapic_get_id() -- the same id source the rest of
+ * the SMP code uses) into mm_arg.by_apic, so the BSP log can PROVE apic-1 executed
+ * the band. by_apic is volatile so the store is not elided; cross-core visibility of
+ * both the band results AND by_apic is provided by the cpu1_job.done RELEASE/ACQUIRE
+ * pair (mm_job runs INSIDE the AP worker loop's job dispatch, before it sets done). */
+static struct {
+    int           row0;
+    int           row1;
+    int64_t      *C;
+    volatile int  by_apic;
+} mm_arg;
+
+static void mm_job(void *a)
+{
+    (void)a;
+    matmul_band(mm_arg.row0, mm_arg.row1, mm_arg.C);
+    mm_arg.by_apic = (int)lapic_get_id();   /* PROOF: which CPU ran this band */
+}
+
+/*
+ * matmul_self_test -- the brick-8 dual-core self-test, driven by the BSP. Called from
+ * kernel.c AFTER the brick-6 sum test and AFTER CPU 1 is confirmed online.
+ *
+ *   1. Fill A/B deterministically.
+ *   2. SINGLE-CORE baseline: time matmul_band(0,N) on the BSP -> single_cycles.
+ *   3. DUAL-CORE: cpu1_submit(mm_job) for the BOTTOM half [N/2,N), then the BSP
+ *      computes the TOP half [0,N/2) CONCURRENTLY, then cpu1_wait(generous deadline).
+ *      -> dual_cycles. A generous ~5s TSC deadline (NOT the 100ms liveness bound) is
+ *      used because this is REAL work; on timeout we log a clear FAIL and skip the
+ *      speedup line rather than hang.
+ *   4. CORRECTNESS: compare mm_Cdual vs mm_Csingle element-by-element.
+ *   5. LOG (kprintf, same logger as the surrounding SMP code): the split + by_apic
+ *      proof, raw single/dual cycles (%lu, 64-bit), an INTEGER speedup (x.xx), and
+ *      the verify result.
+ *
+ * INT-ONLY throughout (the speedup is computed with integer math; no float anywhere),
+ * so nothing on the AP path emits SSE.
+ */
+void matmul_self_test(void)
+{
+    /* 1. Deterministic inputs. */
+    mm_fill();
+
+    /* 2. Single-core baseline (whole matrix on the BSP). */
+    uint64_t t0 = rdtsc();
+    matmul_band(0, MM_N, mm_Csingle);
+    uint64_t t1 = rdtsc();
+    uint64_t single_cycles = t1 - t0;
+
+    /* 3. Dual-core: CPU1 takes the bottom band, the BSP takes the top band, in
+     *    parallel. mm_arg.by_apic starts 0; mm_job sets it to the AP's apic id. */
+    mm_arg.row0    = MM_N / 2;
+    mm_arg.row1    = MM_N;
+    mm_arg.C       = mm_Cdual;
+    mm_arg.by_apic = 0;
+
+    t0 = rdtsc();
+    int submitted = cpu1_submit(mm_job, &mm_arg);   /* CPU1: bottom half, async   */
+    matmul_band(0, MM_N / 2, mm_Cdual);             /* BSP : top half, concurrent */
+    /* GENEROUS compute deadline (~5s of TSC at the ~3 GHz convention) -- this is
+     * real work, not a liveness probe. On timeout: clear FAIL, no hang. */
+    uint64_t deadline = rdtsc() + 5ULL * 1000000ULL * AP_TSC_PER_US;
+    int finished = submitted && cpu1_wait(deadline);
+    t1 = rdtsc();
+    uint64_t dual_cycles = t1 - t0;
+
+    if (!finished) {
+        kprintf("[SMP] matmul DUAL-CORE job did not finish within deadline "
+                "(submitted=%d) -- FAIL, skipping speedup\n", submitted);
+        kprintf("[SMP] matmul verify: FAIL (CPU1 band did not complete)\n");
+        return;
+    }
+
+    /* 4. Correctness: dual must equal single, element-for-element. */
+    int mismatches = 0;
+    for (int i = 0; i < MM_N * MM_N; i++) {
+        if (mm_Cdual[i] != mm_Csingle[i]) {
+            mismatches++;
+        }
+    }
+
+    /* 5. Log the split (with the by_apic PROOF), the raw cycle counts, the integer
+     *    speedup, and the verify result. */
+    kprintf("[SMP] matmul %dx%d split CPU0[0..%d) + CPU1[%d..%d) by_apic=%d\n",
+            MM_N, MM_N, MM_N / 2, MM_N / 2, MM_N, mm_arg.by_apic);
+    kprintf("[SMP] matmul single=%lu cycles dual=%lu cycles\n",
+            single_cycles, dual_cycles);
+
+    /* Integer speedup x100 (no float): single/dual to two decimals. Guard div-by-0. */
+    if (dual_cycles > 0) {
+        uint64_t speedup_x100 = (single_cycles * 100ULL) / dual_cycles;
+        kprintf("[SMP] matmul speedup=%lu.%02lux\n",
+                speedup_x100 / 100ULL, speedup_x100 % 100ULL);
+    } else {
+        kprintf("[SMP] matmul speedup=n/a (dual_cycles==0)\n");
+    }
+
+    if (mismatches == 0) {
+        kprintf("[SMP] matmul verify: OK\n");
+    } else {
+        kprintf("[SMP] matmul verify: FAIL (%d mismatches)\n", mismatches);
+    }
 }
 
 /* Stage the trampoline blob + the shared param fields into low memory. */

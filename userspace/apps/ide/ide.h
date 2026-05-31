@@ -50,12 +50,14 @@ typedef enum {
 
 #define IDE_SRC_CAP   131072   /* 128 KB max open file              */
 #define IDE_MAXENT    256      /* explorer directory entries        */
+#define IDE_MAXCOLLAPSE 48     /* max simultaneously-collapsed folders */
 #define IDE_PATH      192
 
 typedef struct {
     char name[128];
     int  is_dir;
     int  depth;       /* indent level in the tree                 */
+    int  collapsed;   /* dir only: 1 = children hidden (render hint) */
     char path[IDE_PATH];
 } EntryRow;
 
@@ -102,6 +104,8 @@ typedef struct Ide {
     EntryRow entries[IDE_MAXENT];
     int      nentries;
     int      sel_entry;
+    char     collapsed_paths[IDE_MAXCOLLAPSE][IDE_PATH]; /* folders the user collapsed */
+    int      n_collapsed;
 
     /* UI */
     Workspace ws;                   /* EDITOR (default) or LEGO       */
@@ -117,6 +121,10 @@ typedef struct Ide {
     BottomTab btab;                 /* TERMINAL / BUILD / PROBLEMS       */
     int       bottom_h;             /* current bottom-dock height (px)   */
     int       term_focus;           /* 1 = terminal owns keys, 0 = editor*/
+    int       explorer_focused;     /* 1 = explorer owns keys (arrows/enter) */
+    int       goto_active;          /* 1 = go-to-line prompt active */
+    char      goto_buf[8];          /* line number input buffer (max 7 digits + NUL) */
+    int       goto_len;             /* current length of goto_buf */
     int       win_w, win_h;         /* last known window size (responsive)*/
 
     /* layout rects (recomputed each frame by ide.c) */
@@ -156,6 +164,12 @@ int  gen_apply_action(Ide* a, int idx);
 /* ---- helpers ide.c provides for panels (selection plumbing) ---- */
 /* Load file `path` into a->src, set cur_file, re-parse+re-analyze, focus 0. */
 void ide_open_file(Ide* a, const char* path);
+/* Explorer folder collapse/expand (ide.c). collapsed state is kept by path so
+ * it survives the tree re-scan; rebuild_visible_entries re-scans hiding the
+ * children of collapsed folders and restores the selection. */
+int  ide_is_collapsed(Ide* a, const char* path);
+void ide_toggle_collapsed(Ide* a, const char* path);
+void rebuild_visible_entries(Ide* a);
 /* Set the focused function (re-runs analyze for that focus). */
 void ide_set_focus(Ide* a, int func_idx);
 /* Open the "New Project" templates modal (Ctrl+N / topbar [+ NEW] button).

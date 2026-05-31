@@ -257,6 +257,13 @@ static void path_join(char* out, int cap, const char* dir, const char* name) {
     ide_strlcat(out, name, cap);
 }
 
+/* Is `path` currently in the user's collapsed-folders set? */
+int ide_is_collapsed(Ide* a, const char* path) {
+    for (int i = 0; i < a->n_collapsed; i++)
+        if (ide_streq(a->collapsed_paths[i], path)) return 1;
+    return 0;
+}
+
 static void scan_dir(Ide* a, const char* dir, int depth) {
     if (a->nentries >= IDE_MAXENT) return;
     if (depth > 16) return;           /* hard guard against cycles         */
@@ -282,6 +289,7 @@ static void scan_dir(Ide* a, const char* dir, int depth) {
         e->is_dir = (ents[i].type == IDE_DT_DIR);
         e->depth  = depth;
         path_join(e->path, IDE_PATH, dir, nm);
+        e->collapsed = e->is_dir ? ide_is_collapsed(a, e->path) : 0;
         a->nentries++;
     }
 
@@ -291,9 +299,10 @@ static void scan_dir(Ide* a, const char* dir, int depth) {
      * each subdir fresh (the shared scratch above is reused per call). */
     for (int r = first_row; r < last_row; r++) {
         if (a->nentries >= IDE_MAXENT) return;
-        if (a->entries[r].is_dir) {
+        if (a->entries[r].is_dir && !ide_is_collapsed(a, a->entries[r].path)) {
             /* Copy the path locally: scan_dir may grow a->entries and the row
-             * pointer/path stays valid (fixed array), but be defensive. */
+             * pointer/path stays valid (fixed array), but be defensive.
+             * Collapsed folders are listed but NOT recursed into. */
             char sub[IDE_PATH];
             ide_strlcpy(sub, a->entries[r].path, IDE_PATH);
             scan_dir(a, sub, depth + 1);
@@ -305,7 +314,42 @@ static void scan_project(Ide* a) {
     a->nentries = 0;
     a->sel_entry = 0;
     a->explorer_scroll = 0;
+    a->n_collapsed = 0;          /* a freshly opened project starts fully expanded */
     scan_dir(a, a->root, 0);
+}
+
+/* Toggle a folder's collapsed state (by path) in the small collapsed set. */
+void ide_toggle_collapsed(Ide* a, const char* path) {
+    for (int i = 0; i < a->n_collapsed; i++) {
+        if (ide_streq(a->collapsed_paths[i], path)) {
+            for (int j = i; j < a->n_collapsed - 1; j++)
+                ide_strlcpy(a->collapsed_paths[j], a->collapsed_paths[j + 1], IDE_PATH);
+            a->n_collapsed--;
+            return;
+        }
+    }
+    if (a->n_collapsed < IDE_MAXCOLLAPSE)
+        ide_strlcpy(a->collapsed_paths[a->n_collapsed++], path, IDE_PATH);
+}
+
+/* Re-scan the tree (collapsed folders not recursed into) and restore the
+ * selection by path, since hiding/showing children shifts indices. */
+void rebuild_visible_entries(Ide* a) {
+    char selpath[IDE_PATH];
+    selpath[0] = 0;
+    if (a->sel_entry >= 0 && a->sel_entry < a->nentries)
+        ide_strlcpy(selpath, a->entries[a->sel_entry].path, IDE_PATH);
+
+    a->nentries = 0;
+    scan_dir(a, a->root, 0);
+
+    a->sel_entry = 0;
+    if (selpath[0]) {
+        for (int i = 0; i < a->nentries; i++)
+            if (ide_streq(a->entries[i].path, selpath)) { a->sel_entry = i; break; }
+    }
+    if (a->explorer_scroll > a->nentries - 1) a->explorer_scroll = a->nentries - 1;
+    if (a->explorer_scroll < 0) a->explorer_scroll = 0;
 }
 
 /* ===========================================================================
@@ -554,6 +598,10 @@ static void init(Ide* a) {
     a->btab = BTAB_TERMINAL;
     a->bottom_h = 200;                /* initial bottom-dock height (px)     */
     a->term_focus = 0;                /* editor has keys initially           */
+    a->explorer_focused = 0;          /* explorer unfocused initially        */
+    a->goto_active = 0;               /* go-to-line inactive initially       */
+    a->goto_len = 0;
+    a->n_collapsed = 0;               /* all folders expanded initially      */
     a->editor.focused = 1;
     ide_editor_reset(a);
     ide_term_init(&a->term, a->root); /* terminal starts in the project root */
@@ -1091,6 +1139,35 @@ static void render_editor(Ide* a, Canvas* cv) {
     editor_status (a, cv, a->r_status);
 
     render_newproj(a, cv);                     /* modal overlay (if open)    */
+
+    /* Go-to-line prompt overlay (bottom-center, inline) */
+    if (a->goto_active) {
+        int prompt_w = 200;
+        int prompt_h = 30;
+        int px = (cv->w - prompt_w) / 2;
+        int py = cv->h - 60;  /* 60px from bottom */
+
+        /* Background box */
+        gfx_fill(cv, px, py, prompt_w, prompt_h, TH_PANEL2);
+        gfx_stroke(cv, px, py, prompt_w, prompt_h, TH_CYAN);
+
+        /* Prompt text */
+        int tx = px + 8;
+        int ty = py + (prompt_h - GFX_FH) / 2;
+        gfx_text(cv, tx, ty, "Go to line:", TH_TEXT);
+
+        /* User input */
+        int input_x = tx + 11 * GFX_FW + 8;
+        gfx_text(cv, input_x, ty, a->goto_buf, TH_GREEN);
+
+        /* Blinking cursor */
+        static int blink_counter = 0;
+        blink_counter++;
+        if ((blink_counter / 30) % 2 == 0) {  /* blink every ~0.5s at 60fps */
+            int cursor_x = input_x + a->goto_len * GFX_FW;
+            gfx_vline(cv, cursor_x, ty, GFX_FH, TH_GREEN);
+        }
+    }
 }
 
 /* ===========================================================================
@@ -1195,22 +1272,38 @@ static void route_click_editor(Ide* a, int mx, int my) {
     if (editor_topbar_click(a, a->r_topbar, mx, my)) return;
 
     if (rect_hit(a->r_e_tree, mx, my)) {
-        /* The tree uses the same explorer panel; opening a file gives the
-         * editor focus so the user can type immediately. */
+        /* The tree uses the same explorer panel. If clicking a file, open it
+         * and focus editor. If clicking to select, focus explorer for keyboard nav. */
+        int was_selected = a->sel_entry;
         panel_explorer_click(a, a->r_e_tree, mx, my);
-        a->term_focus = 0;
-        a->editor.focused = 1;
+        /* If selection changed to a file (not just re-clicking), focus editor for typing.
+         * Otherwise, focus explorer for arrow key navigation. */
+        if (a->sel_entry != was_selected && a->sel_entry < a->nentries && !a->entries[a->sel_entry].is_dir) {
+            a->term_focus = 0;
+            a->explorer_focused = 0;
+            a->editor.focused = 1;
+        } else {
+            a->term_focus = 0;
+            a->explorer_focused = 1;
+            a->editor.focused = 0;
+        }
         return;
     }
     if (rect_hit(a->r_e_editor, mx, my)) {
         a->term_focus = 0;
+        a->explorer_focused = 0;
+        a->editor.focused = 1;
         ide_editor_click(a, a->r_e_editor, mx, my);
         return;
     }
     if (editor_btabs_click(a, a->r_e_btabs, mx, my)) return;
     if (rect_hit(a->r_e_bottom, mx, my)) {
         /* clicking the bottom dock body focuses the terminal (when shown) */
-        if (a->btab == BTAB_TERMINAL) { a->term_focus = 1; a->editor.focused = 0; }
+        if (a->btab == BTAB_TERMINAL) {
+            a->term_focus = 1;
+            a->explorer_focused = 0;
+            a->editor.focused = 0;
+        }
         return;
     }
 }
@@ -1278,6 +1371,13 @@ static int handle_ctrl_chord(Ide* a, int keycode) {
     case KEY_S:               /* Ctrl+S: save (editor) */
         ide_editor_save(a);
         return 1;
+    case KEY_G:               /* Ctrl+G: go to line (editor only) */
+        if (a->ws == WS_EDITOR && a->editor.focused) {
+            a->goto_active = 1;
+            a->goto_len = 0;
+            a->goto_buf[0] = '\0';
+        }
+        return 1;
     case KEY_D:               /* Ctrl+D: duplicate line (editor only) */
         if (a->ws == WS_EDITOR && a->editor.focused)
             ide_editor_duplicate_line(a);
@@ -1329,6 +1429,50 @@ static void handle_key(Ide* a, int keycode, int pressed) {
         return;
     }
 
+    /* Go-to-line prompt captures keys (digits, Enter, Esc, Backspace) */
+    if (a->goto_active) {
+        if (keycode == KEY_ESC) {
+            a->goto_active = 0;
+            return;
+        }
+        if (keycode == KEY_BACKSPC) {
+            if (a->goto_len > 0) {
+                a->goto_len--;
+                a->goto_buf[a->goto_len] = '\0';
+            }
+            return;
+        }
+        if (keycode == KEY_ENTER) {
+            /* Parse line number and jump */
+            int line = 0;
+            for (int i = 0; i < a->goto_len; i++) {
+                if (a->goto_buf[i] >= '0' && a->goto_buf[i] <= '9') {
+                    line = line * 10 + (a->goto_buf[i] - '0');
+                }
+            }
+            if (line > 0) {
+                /* Jump to line (1-indexed for user, 0-indexed internally) */
+                a->editor.caret_line = line - 1;
+                a->editor.caret_col = 0;
+                a->editor.want_col = 0;
+                /* Clamp to valid range */
+                extern int ed_line_count(const char* src, int len);
+                int total = ed_line_count(a->src, a->src_len);
+                if (a->editor.caret_line >= total) a->editor.caret_line = total - 1;
+                if (a->editor.caret_line < 0) a->editor.caret_line = 0;
+            }
+            a->goto_active = 0;
+            return;
+        }
+        /* Type digits 0-9 */
+        char ch = ide_keycode_ascii(keycode, g_shift_down);
+        if (ch >= '0' && ch <= '9' && a->goto_len < 7) {
+            a->goto_buf[a->goto_len++] = ch;
+            a->goto_buf[a->goto_len] = '\0';
+        }
+        return;
+    }
+
     /* Ctrl chords first (work in both workspaces). handle_ctrl_chord only
      * returns 1 for keys we actually bind (B/R/S/E/J/`). If g_ctrl_down is set
      * but the key is NOT a bound chord, we deliberately FALL THROUGH to normal
@@ -1345,8 +1489,52 @@ static void handle_key(Ide* a, int keycode, int pressed) {
     /* ESC always exits (matches the LEGO workspace's original behaviour). */
     if (keycode == KEY_ESC) { ide_exit(0); return; }
 
-    /* ============ EDITOR workspace: route typing to editor/terminal ======= */
+    /* ============ EDITOR workspace: route typing to editor/terminal/explorer ======= */
     if (a->ws == WS_EDITOR) {
+        /* Explorer keyboard navigation (arrows + Enter) */
+        if (a->explorer_focused) {
+            if (keycode == KEY_UP) {
+                if (a->sel_entry > 0) a->sel_entry--;
+                /* Scroll to keep selection visible */
+                if (a->sel_entry < a->explorer_scroll)
+                    a->explorer_scroll = a->sel_entry;
+                return;
+            }
+            if (keycode == KEY_DOWN) {
+                if (a->sel_entry < a->nentries - 1) a->sel_entry++;
+                /* Scroll to keep selection visible (approximate visible rows) */
+                int vis = (a->r_e_tree.h - (ROW_H + 2)) / ROW_H;
+                if (a->sel_entry >= a->explorer_scroll + vis)
+                    a->explorer_scroll = a->sel_entry - vis + 1;
+                return;
+            }
+            if (keycode == KEY_ENTER) {
+                /* Open selected file or toggle folder */
+                if (a->sel_entry >= 0 && a->sel_entry < a->nentries) {
+                    EntryRow* e = &a->entries[a->sel_entry];
+                    if (e->is_dir) {
+                        /* Toggle folder collapse (same as clicking it) */
+                        ide_toggle_collapsed(a, e->path);
+                        rebuild_visible_entries(a);
+                    } else {
+                        /* Open file and focus editor for typing */
+                        ide_open_file(a, e->path);
+                        a->explorer_focused = 0;
+                        a->editor.focused = 1;
+                    }
+                }
+                return;
+            }
+            /* Esc unfocuses explorer, focuses editor */
+            if (keycode == KEY_ESC) {
+                a->explorer_focused = 0;
+                a->editor.focused = 1;
+                return;
+            }
+            /* Any other key while explorer focused: ignore (don't type in editor) */
+            return;
+        }
+
         char ch = ide_keycode_ascii(keycode, g_shift_down);
         if (a->term_focus)
             ide_term_key(a, keycode, ch, g_shift_down, 0);

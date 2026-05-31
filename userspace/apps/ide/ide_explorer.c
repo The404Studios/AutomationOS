@@ -97,6 +97,12 @@ void panel_explorer(Ide* a, Canvas* cv, Rect r) {
     /* Panel background. */
     gfx_fill(cv, r.x, r.y, r.w, r.h, TH_PANEL);
 
+    /* Focus indicator: draw a thin cyan border when explorer is focused */
+    if (a->explorer_focused && a->ws == WS_EDITOR) {
+        gfx_stroke(cv, r.x, r.y, r.w, r.h, TH_CYAN);
+        gfx_stroke(cv, r.x + 1, r.y + 1, r.w - 2, r.h - 2, TH_CYAN);
+    }
+
     /* Header bar + title, with the project root basename appended. */
     gfx_fill(cv, r.x, r.y, r.w, EXPL_HEADER_H, TH_HEADER);
     gfx_hline(cv, r.x, r.y + EXPL_HEADER_H - 1, r.w, TH_BORDER);
@@ -170,9 +176,10 @@ void panel_explorer(Ide* a, Canvas* cv, Rect r) {
         int nx = tx + EXPL_GLYPH_W;             /* text starts after glyph  */
 
         if (e->is_dir) {
-            /* Folder glyph in yellow, name in primary text (bold feel). */
+            /* Folder glyph: yellow when expanded, dim when collapsed. */
+            uint32_t fcol = e->collapsed ? TH_TEXT_DIM : TH_YELLOW;
             if (tx + GFX_FW <= clip_x + clip_w)
-                expl_draw_folder(cv, tx, ry + (ROW_H - GFX_FH) / 2, TH_YELLOW);
+                expl_draw_folder(cv, tx, ry + (ROW_H - GFX_FH) / 2, fcol);
             gfx_text_clip(cv, nx, ty, e->name, TH_TEXT, clip_x, clip_w);
         } else {
             /* File glyph + suffix-aware name colour. */
@@ -235,8 +242,13 @@ int panel_explorer_click(Ide* a, Rect r, int mx, int my) {
     if (idx < 0 || idx >= a->nentries) return 1;
 
     a->sel_entry = idx;
-    if (!a->entries[idx].is_dir)
+    if (a->entries[idx].is_dir) {
+        /* Clicking a folder toggles collapse/expand. */
+        ide_toggle_collapsed(a, a->entries[idx].path);
+        rebuild_visible_entries(a);
+    } else {
         ide_open_file(a, a->entries[idx].path);
+    }
 
     return 1;
 }

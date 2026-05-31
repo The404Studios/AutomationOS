@@ -46,7 +46,7 @@ static inline Rect ed_body(Rect r) {
 
 /* Count newline-delimited lines (a non-empty buffer with no trailing '\n'
  * still has its final partial line counted; an empty buffer is 1 line). */
-static int ed_line_count(const char* src, int len) {
+int ed_line_count(const char* src, int len) {   /* non-static: ide.c's go-to-line uses it */
     int n = 1, i;
     if (len <= 0) return 1;
     for (i = 0; i < len; i++) if (src[i] == '\n') n++;

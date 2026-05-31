@@ -2168,6 +2168,17 @@ static void render_right_dock(uint32_t *buf, uint32_t w, uint32_t h, uint32_t st
         int32_t boff = rdock_bounce_offset(i, now);
         tx -= boff;
 
+        /* Keep the (possibly hover-magnified) tile fully inside the buffer WIDTH.
+         * icon_for_app / ic_fill_rect draw their rows UNCLIPPED, and a real-HW
+         * framebuffer whose pitch == width*4 (e.g. the T410: 1024 wide, pitch 4096)
+         * has NO stride slack -- so a tile overflowing the RIGHT edge wraps onto the
+         * next row's LEFT edge: the "left bleed" (#77). Anchor the magnified tile to
+         * the right edge so it grows LEFTWARD (into the screen) instead of off-screen.
+         * Clamp BEFORE the hover test so detection matches the drawn position. QEMU
+         * hides this only because its VBE reports a padded pitch > width*4. */
+        if (tx + sz > (int32_t)w) tx = (int32_t)w - sz;
+        if (tx < 0) tx = 0;
+
         /* Skip any icon whose (possibly hover-magnified) tile is not FULLY
          * inside the drawable strip. icon_for_app / ic_fill_rect write their
          * tile rows UNCLIPPED, so a partially-off-screen tile would scribble

@@ -10,11 +10,13 @@ extern ipi_handle_reschedule
 extern ipi_handle_tlb_flush
 extern ipi_handle_function_call
 extern ipi_handle_stop
+extern ipi_handle_tlb_flush_all
 
 global ipi_reschedule_handler
 global ipi_tlb_flush_handler
 global ipi_function_call_handler
 global ipi_stop_handler
+global ipi_tlb_flush_all_handler
 
 ; Common IPI handler prologue
 %macro IPI_HANDLER_PROLOGUE 0
@@ -82,3 +84,9 @@ ipi_stop_handler:
 .halt:
     hlt
     jmp .halt
+
+; IPI_TLB_FLUSH_ALL handler (vector 0x45)
+ipi_tlb_flush_all_handler:
+    IPI_HANDLER_PROLOGUE
+    call ipi_handle_tlb_flush_all
+    IPI_HANDLER_EPILOGUE

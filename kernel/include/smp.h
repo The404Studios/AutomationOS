@@ -78,6 +78,15 @@ typedef struct {
     uint64_t page_cache_hits;           // Cache hit count
     uint64_t page_cache_misses;         // Cache miss count
     spinlock_t page_cache_lock;         // Cache lock
+
+    // Health monitoring (leak detection + stall detection)
+    struct {
+        uint32_t ownership_allocs;      // Total ownership allocations
+        uint32_t ownership_frees;       // Total ownership frees
+        uint32_t ownership_leaks;       // Detected leaks (allocs - frees)
+        volatile uint64_t heartbeat;    // Incremented by timer tick (for stall detection)
+        uint64_t last_heartbeat;        // Previous heartbeat value (for stall detection)
+    } health;
 } percpu_data_t;
 
 // CPU information structure
@@ -193,5 +202,8 @@ static inline uint32_t cpumask_count(cpumask_t mask) {
 // Debug and statistics
 void smp_print_info(void);
 void smp_print_stats(void);
+
+// Health monitoring
+bool health_monitor_detect_stalls(void);
 
 #endif // SMP_H

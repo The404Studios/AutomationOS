@@ -16,11 +16,13 @@
  */
 
 // IPI function call structure
+// NOTE: When wait=true, this lives on sender's stack (blocked until completion).
+//       When wait=false, caller MUST ensure this outlives all target IPIs (heap/static).
 typedef struct ipi_call {
     void (*func)(void* data);           // Function to call
     void* data;                         // Argument
-    volatile uint32_t done_count;       // Number of CPUs that finished
-    volatile uint32_t ack_count;        // Number of CPUs that acknowledged
+    uint32_t done_count;                // Number of CPUs that finished (atomic)
+    uint32_t ack_count;                 // Number of CPUs that acknowledged (atomic)
     cpumask_t target_mask;              // Target CPUs
     bool wait;                          // Wait for completion?
 } ipi_call_t;

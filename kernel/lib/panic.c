@@ -18,6 +18,85 @@ int errno = 0;
 /* Maximum memory dump lines around fault address */
 #define MEMORY_DUMP_LINES 4
 
+/* Page fault error code flags */
+#define PF_PRESENT   (1 << 0)  /* Page was present (protection violation) */
+#define PF_WRITE     (1 << 1)  /* Write access */
+#define PF_USER      (1 << 2)  /* User-mode access */
+#define PF_RESERVED  (1 << 3)  /* Reserved bit violation */
+#define PF_INSTR     (1 << 4)  /* Instruction fetch */
+
+/*
+ * Decode and display exception details
+ * Analyzes CR2 (fault address) and error code to provide human-readable
+ * diagnostic information about the fault type and cause
+ *
+ * This function provides enhanced diagnostics for page faults by decoding
+ * the error code bits and providing actionable diagnostic information.
+ */
+void decode_exception(uint64_t cr2, uint64_t error_code) {
+    kprintf("Exception decoder analysis:\n");
+
+    /* Analyze fault address */
+    if (cr2 == 0 || cr2 < 0x1000) {
+        kprintf("  \033[1;31m[CRITICAL]\033[0m Null pointer dereference at 0x%016llx\n", cr2);
+    } else if (cr2 >= 0xFFFF800000000000ULL) {
+        kprintf("  Fault address: 0x%016llx (kernel space)\n", cr2);
+    } else {
+        kprintf("  Fault address: 0x%016llx (user space)\n", cr2);
+    }
+
+    /* Decode error code bits */
+    kprintf("  Error code: 0x%llx [", error_code);
+
+    if (error_code & PF_PRESENT) {
+        kprintf("PROTECTION-VIOLATION ");
+    } else {
+        kprintf("NOT-PRESENT ");
+    }
+
+    if (error_code & PF_WRITE) {
+        kprintf("WRITE ");
+    } else {
+        kprintf("READ ");
+    }
+
+    if (error_code & PF_USER) {
+        kprintf("USER-MODE ");
+    } else {
+        kprintf("SUPERVISOR ");
+    }
+
+    if (error_code & PF_RESERVED) {
+        kprintf("RESERVED-BIT ");
+    }
+
+    if (error_code & PF_INSTR) {
+        kprintf("INSTRUCTION-FETCH ");
+    }
+
+    kprintf("]\n");
+
+    /* Provide specific diagnostic messages */
+    if (!(error_code & PF_PRESENT)) {
+        kprintf("  \033[1;33m[DIAGNOSIS]\033[0m Page not present in page table\n");
+        kprintf("              Possible causes: unmapped memory, demand paging needed, or use-after-free\n");
+    } else if (error_code & PF_WRITE) {
+        kprintf("  \033[1;33m[DIAGNOSIS]\033[0m Write to read-only page at 0x%016llx\n", cr2);
+        kprintf("              Possible causes: const/rodata modification, COW fault, or protection error\n");
+    } else if (error_code & PF_INSTR) {
+        kprintf("  \033[1;33m[DIAGNOSIS]\033[0m Instruction fetch from NX (no-execute) page at 0x%016llx\n", cr2);
+        kprintf("              Possible causes: stack/heap execution, DEP violation, or JIT issue\n");
+    } else if (error_code & PF_USER) {
+        kprintf("  \033[1;33m[DIAGNOSIS]\033[0m User-mode access to supervisor page at 0x%016llx\n", cr2);
+        kprintf("              Possible causes: improper page table flags or privilege escalation attempt\n");
+    } else if (error_code & PF_RESERVED) {
+        kprintf("  \033[1;31m[CRITICAL]\033[0m Reserved bit set in page table entry\n");
+        kprintf("              This indicates page table corruption\n");
+    }
+
+    kprintf("\n");
+}
+
 /*
  * Print stack trace by walking frame pointers
  * Attempts to unwind the call stack for debugging

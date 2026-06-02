@@ -483,6 +483,16 @@ void kernel_main(void* raw_info) {
                 extern int cpu1_run(void (*fn)(void *), void *arg);
                 extern volatile long g_worktest;
                 extern void worktest(void *a);
+                /* Initialize the cpu1_job slot's ownership descriptors to the
+                 * OWNED birth state BEFORE the first cpu1_submit(). Without this,
+                 * the descriptors sit in .bss as all-zeroes: magic==0 (not
+                 * OWN_MAGIC), so the first own_transition() in cpu1_submit would
+                 * trip own_validate()'s ASSERT_ALWAYS(magic==OWN_MAGIC) and panic.
+                 * cpu1_submit re-inits per job too, but this seeds a valid slot for
+                 * any pre-submit orphan check and makes the first submit's own_init
+                 * a no-op rather than a from-garbage reset. */
+                extern void cpu1_job_init(void);
+                cpu1_job_init();
                 if (cpu1_run(worktest, (void *)1000) && g_worktest == 500500) {
                     kprintf("[SMP] CPU 1 ran worker job: sum(1..1000)=%ld "
                             "(expected 500500)\n", g_worktest);
@@ -519,6 +529,13 @@ void kernel_main(void* raw_info) {
         }
         /* Fall through and finish booting the BSP normally -- no matter what. */
     }
+
+    // Start health monitor thread (5-second sampling)
+    extern void health_monitor_init(void);
+    extern void health_monitor_start_thread(void);
+    health_monitor_init();
+    health_monitor_start_thread();
+    kprintf("[HEALTH] Monitor started (5s sampling)\n");
 #endif
 
     /* Initialize framebuffer if available */

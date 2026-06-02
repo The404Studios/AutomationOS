@@ -173,6 +173,21 @@ if [ -n "$SMP_SOURCES" ]; then
     # like madt.c -- it does NOT define cpu_id(), so there is no collision with
     # stubs.c::cpu_id() (smp.c stays uncompiled). Only built for the SMP kernel.
     compile kernel/arch/x86_64/ap_boot.c     c_ap_boot
+    # SMP race-fix support (GATED by SMP=1): reference counting (kref.c) and the
+    # ownership state machine (ownership.c). ap_boot.c's cpu1_job slot uses
+    # own_init/own_transition/own_orphan to track CPU0<->CPU1 buffer handoff and to
+    # safely orphan in-flight jobs when a process exits; sys_cpu1_offload() (in the
+    # SMP-only block of handlers.c) uses kmalloc_ref/kput for refcounted offload
+    # buffers. Both are referenced ONLY under SMP_FOUNDATION, so they are linked
+    # ONLY in the SMP kernel -- the default kernel.elf stays byte-for-byte
+    # unchanged. ownership.c depends on kref.c, so kref.c is compiled first.
+    compile kernel/core/mem/kref.c           c_kref
+    compile kernel/core/mem/ownership.c      c_ownership
+    # Health monitor (session 3): runtime observability - heartbeat, leak detection,
+    # deadlock detection, stall detection. Provides health_monitor_tick() for scheduler,
+    # health_monitor_record_alloc/free() for kref/ownership, and health_monitor_report()
+    # for diagnostics. Only built in SMP kernel.
+    compile kernel/core/health_monitor.c    c_health_monitor
 fi
 compile kernel/drivers/serial.c              c_serial
 compile kernel/drivers/pit.c                 c_pit

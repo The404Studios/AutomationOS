@@ -3,6 +3,10 @@
 #include "../../include/kernel.h"
 #include "../../include/string.h"
 #include "../../include/tlb.h"
+#ifdef SMP_FOUNDATION
+#include "ipi.h"
+#include "lapic.h"
+#endif
 
 #define ENTRIES_PER_TABLE 512
 
@@ -783,17 +787,21 @@ uint64_t paging_create_address_space(void) {
         next_pcid++;
 
         // Handle PCID exhaustion (recycle PCIDs if needed)
-        // BUG-013 fix: Flush ALL TLB entries before recycling PCIDs
+        // BUG-013 fix: Flush ALL TLB entries for ALL PCIDs before recycling
         if (next_pcid >= 4096) {
-            kprintf("[PAGING] Warning: PCID exhausted, recycling from 1\n");
-            kprintf("[PAGING] Flushing all TLB entries before PCID recycling\n");
+            kprintf("[PAGING] PCID exhausted, recycling from 1 (all-context flush)\n");
 
-            // Flush TLB on ALL CPUs by reloading CR3 without PCID preservation
-            uint64_t cr3 = read_cr3() & ~CR3_NO_FLUSH;
-            write_cr3(cr3);
+            // Flush ALL PCIDs on local CPU
+            tlb_flush_all_contexts_local();
 
-            // TODO: Send IPI to other CPUs to flush their TLBs
-            // For now, this flushes current CPU's TLB
+            #ifdef SMP_FOUNDATION
+            // Remote CPU flush deferred: The AP in SMP_FOUNDATION runs with the BSP's
+            // CR3 (shared page tables) and executes no userspace (single kernel worker),
+            // so PCID recycling on the AP is moot. Remote TLB-flush-all will be added
+            // in a later brick when the AP runs its own address spaces.
+            // (Sending IPI_TLB_FLUSH_ALL here would be a no-op: the AP has no IDT gate
+            // for vector 0x45 and runs with interrupts permanently masked.)
+            #endif
 
             next_pcid = 1;
         }

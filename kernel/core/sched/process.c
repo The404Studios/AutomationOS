@@ -398,6 +398,24 @@ void process_unref(process_t* proc) {
             spin_unlock(&process_table_lock);
         }
 
+#ifdef SMP_FOUNDATION
+        // CPU1 job orphan cleanup: if this process owns a pending CPU1 job we must
+        // NOT block indefinitely (violates the async goal) and must NOT free any
+        // buffers CPU1 is still touching. cpu1_orphan_jobs() is two-phase: it first
+        // GRACE-WAITS up to ~100 ms for the in-flight job to drain cleanly (the
+        // common case -- no orphan needed), and only if it is STILL pending does it
+        // orphan it (clear owner_pid so the result is dropped, and transition the
+        // arg/result ownership descriptors TRANSFERRED -> ORPHANED). The offload
+        // BUFFERS are kref'd (kmalloc_ref in sys_cpu1_offload); the handler's own
+        // kput frees them only once CPU1 is also done -- so no UAF and no leak. The
+        // exiting process returns promptly (<= ~100 ms, usually instantly), bounded
+        // on a finite TSC deadline so a wedged AP can never hang teardown. job_seq
+        // guards against the slot being recycled by a newer job mid-wait. Called
+        // AFTER process_table_lock is dropped, so the grace-wait holds no locks.
+        extern void cpu1_orphan_jobs(uint32_t exiting_pid);
+        cpu1_orphan_jobs(proc->pid);
+#endif
+
         // Release IPC resources owned by this process (SysV shm/msg). Must run
         // while proc->pid is still valid and BEFORE the address space is torn
         // down, so deferred-destroy segments are accounted correctly.

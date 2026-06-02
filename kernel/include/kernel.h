@@ -22,6 +22,9 @@
 void kernel_panic(const char* message) NORETURN;
 void assert_failed(const char* expr, const char* file, int line) NORETURN;
 
+// Exception decoder (for use by exception handlers before calling panic)
+void decode_exception(uint64_t cr2, uint64_t error_code);
+
 // Debug assertions (enabled in debug builds)
 #ifdef DEBUG
 #define ASSERT(expr) \

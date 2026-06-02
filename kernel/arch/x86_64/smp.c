@@ -122,15 +122,15 @@ int register_cpu_offline_callback(cpu_offline_cb_t cb) {
 }
 
 void preempt_disable(void) {
-    __atomic_add_fetch(&percpu_data[cpu_id()].preempt_count, 1, __ATOMIC_SEQ_CST);
+    __atomic_add_fetch(&percpu_data[cpu_id()].preempt_count, 1, __ATOMIC_ACQUIRE);
 }
 
 void preempt_enable(void) {
-    __atomic_sub_fetch(&percpu_data[cpu_id()].preempt_count, 1, __ATOMIC_SEQ_CST);
+    __atomic_sub_fetch(&percpu_data[cpu_id()].preempt_count, 1, __ATOMIC_RELEASE);
 }
 
 bool preempt_is_disabled(void) {
-    return percpu_data[cpu_id()].preempt_count > 0;
+    return __atomic_load_n(&percpu_data[cpu_id()].preempt_count, __ATOMIC_ACQUIRE) > 0;
 }
 
 int cpu_offline(uint32_t cpu) {
@@ -304,8 +304,9 @@ void smp_detect_cpus(void) {
         p += h->length;
     }
 
-    smp_num_cpus = (count == 0) ? 1 : count;
-    kprintf("[SMP] Detected %u CPU(s)\n", smp_num_cpus);
+    uint32_t final_count = (count == 0) ? 1 : count;
+    __atomic_store_n(&smp_num_cpus, final_count, __ATOMIC_RELEASE);
+    kprintf("[SMP] Detected %u CPU(s)\n", final_count);
 }
 
 /* Capture the running kernel's GDTR/IDTR and copy the trampoline + params. */
@@ -497,6 +498,35 @@ void smp_print_stats(void) {
         kprintf("CPU %u: ticks=%llu irqs=%llu\n",
                 cpu, p->total_ticks, p->interrupt_count);
     }
+}
+
+/**
+ * health_monitor_detect_stalls - Detect CPU stalls by checking heartbeat progression
+ *
+ * Checks if each online CPU's heartbeat counter has advanced since the last check.
+ * If a heartbeat is stuck, the CPU is likely stalled (deadlock, infinite loop, etc.).
+ *
+ * Returns: true if at least one stall was detected, false otherwise
+ */
+bool health_monitor_detect_stalls(void) {
+    bool stall_found = false;
+
+    uint32_t num_online = __atomic_load_n(&smp_num_online, __ATOMIC_SEQ_CST);
+    for (int cpu = 0; cpu < num_online; cpu++) {
+        uint64_t current = cpu_data(cpu)->health.heartbeat;
+        uint64_t prev = cpu_data(cpu)->health.last_heartbeat;
+
+        if (current == prev) {
+            // Heartbeat not advancing = stall
+            kprintf("[HEALTH] CPU%d stall: heartbeat stuck at %llu\n",
+                    cpu, current);
+            stall_found = true;
+        }
+
+        cpu_data(cpu)->health.last_heartbeat = current;
+    }
+
+    return stall_found;
 }
 
 #endif /* SMP_ENABLE */

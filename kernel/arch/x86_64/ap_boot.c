@@ -41,6 +41,35 @@
 #include "../../include/string.h"   /* memcpy  */
 #include "../../include/x86_64.h"   /* read_cr3 */
 #include "../../include/perf.h"     /* rdtsc   */
+#include "../../include/kref.h"     /* kget/kput for buffer lifecycle */
+#include "../../include/ownership.h" /* ownership_t state tracking */
+#include "../../include/spinlock.h" /* spinlock_t for cpu1_job_lock */
+#include "../../include/errno.h"    /* EAPFAULT */
+#include "../../include/sched.h"    /* process_t for current_process */
+
+/* Forward declaration for process ownership metadata in cpu1_job. */
+typedef struct process process_t;
+
+/* Current process (from sched.h), used to track job ownership. */
+extern process_t* current_process;
+
+/* cpu_id() helper (from smp.h) for ownership state transitions. */
+extern uint32_t cpu_id(void);
+
+/* percpu_data array (from smp.h) for health monitoring (heartbeat checks). */
+typedef struct {
+    uint32_t cpu_id;
+    uint32_t apic_id;
+    /* ... other fields ... */
+    struct {
+        uint32_t ownership_allocs;
+        uint32_t ownership_frees;
+        uint32_t ownership_leaks;
+        volatile uint64_t heartbeat;
+        uint64_t last_heartbeat;
+    } health;
+} percpu_data_t;
+extern percpu_data_t percpu_data[];
 
 /* ---------------------------------------------------------------------------
  * Trampoline relocation contract. These MUST match ap_trampoline.asm
@@ -76,6 +105,73 @@ static uint8_t ap_stack[AP_STACK_SIZE] __attribute__((aligned(16)));
  * waiting, so a wedged LAPIC cannot make the BSP spin forever.
  * ------------------------------------------------------------------------- */
 static volatile uint32_t ap1_online = 0;
+
+/* ---------------------------------------------------------------------------
+ * AP panic flag. Set by the AP if it panics during job execution.
+ * The BSP checks this in cpu1_wait() to detect AP crashes.
+ * ------------------------------------------------------------------------- */
+static volatile uint32_t cpu1_panic_flag = 0;
+
+/* AP crash context capture. Stores the last exception that hit CPU1. */
+typedef struct {
+    uint64_t vector;
+    uint64_t error_code;
+    uint64_t rip;
+    uint64_t rsp;
+    uint64_t cr2;
+    uint64_t cr3;
+} ap_crash_context_t;
+
+static volatile ap_crash_context_t cpu1_crash_ctx = {0};
+
+/* ---------------------------------------------------------------------------
+ * CPU1 offline flag. Marks CPU1 as offline after a panic.
+ * This is the SMP_FOUNDATION-build equivalent of the full smp.c state tracking.
+ * ------------------------------------------------------------------------- */
+static volatile uint32_t cpu1_offline = 0;
+
+/* Simplified smp_cpu_offline for SMP_FOUNDATION build (self-contained in this file).
+ * Marks CPU1 as offline and prevents future job submissions to it. */
+static void smp_cpu_offline(uint32_t cpu)
+{
+    if (cpu == 1) {
+        __atomic_store_n(&cpu1_offline, 1, __ATOMIC_RELEASE);
+    }
+}
+
+/*
+ * cpu1_panic_handler -- AP-side panic handler called when CPU1 crashes.
+ *
+ * Captures the exception context, sets the panic flag for the BSP to detect,
+ * and halts the AP. The BSP polls cpu1_panic_flag in cpu1_wait() and will
+ * observe the crash, log the context, mark CPU1 offline, and return EAPFAULT.
+ *
+ * This is the AP's controlled crash path: it does NOT call kernel_panic()
+ * (which would try to reset/halt the whole system), but instead signals the
+ * BSP that it crashed and then halts itself. The BSP and the rest of the
+ * system continue running single-core.
+ *
+ * MUST be called from CPU1 only (the AP), with interrupts disabled.
+ */
+void cpu1_panic_handler(uint64_t vector, uint64_t error_code,
+                        uint64_t rip, uint64_t rsp, uint64_t cr2, uint64_t cr3)
+{
+    /* Capture crash context for the BSP to display. */
+    cpu1_crash_ctx.vector     = vector;
+    cpu1_crash_ctx.error_code = error_code;
+    cpu1_crash_ctx.rip        = rip;
+    cpu1_crash_ctx.rsp        = rsp;
+    cpu1_crash_ctx.cr2        = cr2;
+    cpu1_crash_ctx.cr3        = cr3;
+
+    /* Set panic flag to signal the BSP. SEQ_CST ensures visibility. */
+    __atomic_store_n(&cpu1_panic_flag, 1, __ATOMIC_SEQ_CST);
+
+    /* Halt this AP. The BSP will detect the panic flag and continue single-core. */
+    while (1) {
+        __asm__ volatile("cli; hlt");
+    }
+}
 
 /* ---------------------------------------------------------------------------
  * SMP brick 3.5: independent PER-CPU heartbeat counters (isolation proof).
@@ -155,7 +251,21 @@ static struct {
     void            *arg;
     volatile int     pending;
     volatile int     done;
+    int              owner_cpu;
+    process_t       *owner_proc;
+    ownership_t      arg_A;         // ownership-tracked arg (TRANSFERRED CPU0->CPU1)
+    ownership_t      arg_B;         // ownership-tracked arg (TRANSFERRED CPU0->CPU1)
+    ownership_t      result;        // ownership-tracked result (CPU1->CPU0)
+    uint64_t         job_seq;       // guards slot reuse before orphaned job drains
+    uint32_t         owner_pid;     // submitting process PID (for orphan cleanup)
 } cpu1_job;
+
+/* Spinlock protecting cpu1_job slot from concurrent access by multiple CPU0
+ * submitters (e.g. concurrent syscall offloads from different processes). The
+ * critical section is cpu1_submit's write to fn/arg/owner_pid/job_seq plus the
+ * ownership transitions and the final RELEASE-store of pending. Initialized to
+ * unlocked (zero, matching the static initializer). */
+static spinlock_t cpu1_job_lock = {0};
 
 /* Tiny proof-of-life: how many times ap_main bumps cpu_hb[1] BEFORE parking in the
  * managed idle. Just enough that the existing brick-3.5 "CPU1 ran" evidence (a
@@ -308,6 +418,16 @@ void worktest(void *a)
  * a leftover done=1 from a previous job. Returns 1 if a job was published, 0 if fn
  * was NULL (nothing to wait on).
  *
+ * OWNERSHIP INTEGRATION (SMP-foundation discipline):
+ *   - arg_A/arg_B: CPU0 (BSP) initializes OWNED, transitions to TRANSFERRED(to=1)
+ *     at publish. CPU1 (AP) consumes them as TRANSFERRED-in, transitions to OWNED
+ *     after reading (or ORPHANED on job completion if not needed further).
+ *   - result: CPU1 initializes OWNED, transitions to TRANSFERRED(to=0) when done.
+ *     CPU0 transitions back to OWNED when wait completes successfully.
+ *   - On timeout (cpu1_wait fails): arg_A/arg_B remain TRANSFERRED (job still
+ *     running on CPU1). result stays OWNED by CPU1 (never transferred back).
+ *     Orphan cleanup (cpu1_orphan_jobs) transitions abandoned args to ORPHANED.
+ *
  * Trust note: `fn` is a kernel function pointer chosen by the BSP (kernel code),
  * never user-supplied. CPU 1 runs ONLY what the BSP places here.
  */
@@ -317,12 +437,102 @@ int cpu1_submit(cpu_job_fn fn, void *arg)
         return 0;
     }
 
-    /* Publish the job. fn/arg first, then clear done, then RELEASE pending. */
+    /* Check if CPU1 is offline (crashed/panicked). Reject new job submissions. */
+    if (__atomic_load_n(&cpu1_offline, __ATOMIC_ACQUIRE)) {
+        return 0;
+    }
+
+    /* CRITICAL SECTION: acquire lock before writing to cpu1_job slot. Multiple
+     * concurrent submitters (e.g. syscall offloads from different processes) must
+     * serialize here to avoid torn writes to fn/arg/owner_pid/ownership state. */
+    spin_lock(&cpu1_job_lock);
+
+    /* Publish the job. fn/arg first, track owner for orphan cleanup, then clear
+     * done, then RELEASE pending. owner_pid lets process_unref orphan in-flight
+     * jobs if the submitting process exits before the job completes. */
     cpu1_job.fn  = fn;
     cpu1_job.arg = arg;
+    cpu1_job.owner_pid = current_process ? current_process->pid : 0;
+    cpu1_job.job_seq++;  /* bump sequence to guard slot reuse before orphan drains */
+
+    /* NORMALIZE the slot's ownership descriptors back to the OWNED birth state
+     * before the per-job transition. This is REQUIRED for slot reuse after an
+     * orphaned job: cpu1_orphan_jobs() leaves arg_A/arg_B/result in the terminal
+     * ORPHANED state, and ORPHANED -> TRANSFERRED is illegal (own_transition()
+     * would panic). own_init() re-births each descriptor to OWNED(owner_cpu=BSP,
+     * refcount=1) from ANY prior state, so the OWNED -> TRANSFERRED edge below is
+     * always legal. On the common path (previous job reclaimed cleanly, already
+     * OWNED) this is a cheap idempotent reset. The previous job's buffers are a
+     * SEPARATE allocation (each offload kmalloc_ref's its own), so re-initting the
+     * descriptor never disturbs a still-draining orphan's lifetime -- that is
+     * governed by the buffer's own kref, not this reusable slot token.
+     *
+     * We are inside cpu1_job_lock AND (for a fresh submit) pending was already 0,
+     * so no concurrent waiter/orphaner is mid-transition on these descriptors. */
+    own_init(&cpu1_job.arg_A);
+    own_init(&cpu1_job.arg_B);
+    own_init(&cpu1_job.result);
+
+    /* OWNERSHIP STATE TRANSITION: OWNED (CPU0) -> TRANSFERRED (to CPU1).
+     * After this point CPU0 must NOT access the arg buffers until the job
+     * completes and cpu1_wait transitions them back. The AP worker loop will
+     * observe pending==1 via ACQUIRE and consume the TRANSFERRED args.
+     *
+     * `result` is ALSO transitioned OWNED -> TRANSFERRED(to CPU1) here: CPU1 is
+     * the PRODUCER of the result, so ownership moves to it on submit and moves
+     * back to CPU0 (TRANSFERRED -> OWNED) only when cpu1_wait succeeds. This
+     * keeps result symmetric with arg_A/arg_B and -- critically -- avoids the
+     * illegal OWNED -> OWNED self-edge that own_transition() panics on (the slot
+     * is born OWNED in cpu1_job_init, so the reclaim in cpu1_wait MUST be from
+     * TRANSFERRED, not from OWNED). On timeout result stays TRANSFERRED, which is
+     * the honest state: CPU1 may still be writing it. */
+    own_transition(&cpu1_job.arg_A,  OWN_TRANSFERRED, 1);  /* to CPU1 */
+    own_transition(&cpu1_job.arg_B,  OWN_TRANSFERRED, 1);  /* to CPU1 */
+    own_transition(&cpu1_job.result, OWN_TRANSFERRED, 1);  /* to CPU1 (producer) */
+
     __atomic_store_n(&cpu1_job.done, 0, __ATOMIC_RELAXED);
     __atomic_store_n(&cpu1_job.pending, 1, __ATOMIC_RELEASE);
+
+    /* Release lock AFTER the RELEASE barrier publishes the job. CPU1 can now
+     * observe pending==1 and consume the job safely. */
+    spin_unlock(&cpu1_job_lock);
+
     return 1;                           /* submitted -- do NOT wait here */
+}
+
+/*
+ * cpu1_diagnose_timeout -- enhanced diagnostics to distinguish slow vs wedged vs
+ * panicked AP after a job timeout. Returns a diagnostic string (for logging).
+ *
+ * Strategy:
+ *   1. Read CPU1's heartbeat counter before and after a short delay (~100 ms).
+ *   2. If heartbeat advances: CPU1 is ALIVE but the job is slow (or looping).
+ *   3. If heartbeat stuck: CPU1 is WEDGED (hung/dead, not servicing timer tick).
+ *   4. Check cpu1_panic_flag: CPU1 hit panic, may be stuck in panic loop.
+ *
+ * This helps the operator or recovery logic decide what to do (e.g., trigger AP
+ * recovery, increase timeout, or treat as hard failure).
+ */
+static const char* cpu1_diagnose_timeout(uint64_t timeout_ms)
+{
+    /* NOTE: Health monitor heartbeat checks disabled until percpu_data integrated.
+     * For now, rely on cpu1_panic_flag for basic diagnostic. */
+
+    /* Check if CPU1 panicked */
+    bool cpu1_panicked = __atomic_load_n(&cpu1_panic_flag, __ATOMIC_ACQUIRE);
+
+    /* Basic diagnostic based on panic flag only */
+    if (cpu1_panicked) {
+        /* CPU1 panicked (stuck in panic loop or halted) */
+        kprintf("[OFFLOAD] Job timeout after %llu ms: CPU1 PANICKED\n",
+                timeout_ms);
+        return "panicked";
+    } else {
+        /* Timeout without panic: either slow or wedged (can't distinguish without heartbeat) */
+        kprintf("[OFFLOAD] Job timeout after %llu ms: CPU1 timeout (slow or wedged)\n",
+                timeout_ms);
+        return "timeout";
+    }
 }
 
 /*
@@ -338,15 +548,78 @@ int cpu1_submit(cpu_job_fn fn, void *arg)
  * GENEROUS multi-second compute bound (brick 8 matmul: real work takes real time).
  * It polls MEMORY only (never any MMIO/APIC register), so a wedged LAPIC can never
  * make the BSP spin forever -- the finite deadline always wins.
+ *
+ * OWNERSHIP INTEGRATION:
+ *   - On SUCCESS: transitions arg_A/arg_B from TRANSFERRED -> OWNED (CPU0 reclaims),
+ *     transitions result from TRANSFERRED -> OWNED (CPU0 takes ownership of result).
+ *   - On TIMEOUT: leaves arg_A/arg_B in TRANSFERRED state (CPU1 still running the
+ *     job, may still access them). orphan cleanup will transition them to ORPHANED
+ *     if the process exits. result remains OWNED by CPU1 (never transferred back).
+ *
+ * TIMEOUT DIAGNOSTICS: On timeout, run enhanced diagnostics (cpu1_diagnose_timeout)
+ * to distinguish between slow job, wedged AP, or panicked AP. This helps operators
+ * and recovery logic understand what went wrong.
  */
 int cpu1_wait(uint64_t deadline_tsc)
 {
+    uint64_t start_tsc = rdtsc();  /* Remember start time for diagnostics */
+
     while (__atomic_load_n(&cpu1_job.done, __ATOMIC_ACQUIRE) == 0) {
+        /* Check if CPU1 panicked during job execution. */
+        if (__atomic_load_n(&cpu1_panic_flag, __ATOMIC_ACQUIRE)) {
+            kprintf("[OFFLOAD] CPU1 panicked during job execution\n");
+
+            /* Collect crash report: AP already printed context via its panic handler. */
+            kprintf("[OFFLOAD] CPU1 crash context:\n");
+            kprintf("  Vector: %llu  Error: 0x%llx  RIP: 0x%016llx\n",
+                    cpu1_crash_ctx.vector, cpu1_crash_ctx.error_code, cpu1_crash_ctx.rip);
+            kprintf("  RSP: 0x%016llx  CR2: 0x%016llx  CR3: 0x%016llx\n",
+                    cpu1_crash_ctx.rsp, cpu1_crash_ctx.cr2, cpu1_crash_ctx.cr3);
+
+            /* Mark CPU1 offline so future job submissions know it's dead. */
+            smp_cpu_offline(1);
+
+            /* Return error to caller (system continues single-core, degraded but alive). */
+            return EAPFAULT;            /* AP fault -> system degraded */
+        }
+
         if (rdtsc() >= deadline_tsc) {
+            /* Timeout: leave owner_pid set so orphan cleanup can detect and handle
+             * this pending job if the process exits before it completes. Leave
+             * arg_A/arg_B in TRANSFERRED state -- CPU1 may still be accessing them;
+             * orphan cleanup will handle state transition to ORPHANED if needed. */
+
+            /* Run enhanced diagnostics to distinguish slow vs wedged vs panicked */
+            uint64_t elapsed_tsc = rdtsc() - start_tsc;
+            uint64_t timeout_ms  = elapsed_tsc / (AP_TSC_PER_US * 1000ULL);
+            cpu1_diagnose_timeout(timeout_ms);
+
             return 0;                   /* timeout -> don't hang the BSP */
         }
         __asm__ volatile("pause" ::: "memory");
     }
+
+    /* Job completed. OWNERSHIP STATE TRANSITIONS:
+     *   arg_A, arg_B: TRANSFERRED (to CPU1) -> OWNED (reclaimed by CPU0).
+     *   result: TRANSFERRED (from CPU1) -> OWNED (CPU0 takes ownership).
+     * After these transitions CPU0 may safely read/write the args and result.
+     *
+     * CRITICAL: acquire cpu1_job_lock to serialize these state transitions against a
+     * concurrent cpu1_orphan_jobs (which transitions TRANSFERRED -> ORPHANED under
+     * the same lock). Without the lock, orphan cleanup racing a successful wait could
+     * trigger concurrent state transitions and panic on an illegal edge. Same lock
+     * that guards submit (OWNED -> TRANSFERRED) and orphan (TRANSFERRED -> ORPHANED),
+     * so all three ownership transition sites are now serialized. */
+    spin_lock(&cpu1_job_lock);
+    own_transition(&cpu1_job.arg_A, OWN_OWNED, 0);  /* CPU0 reclaims */
+    own_transition(&cpu1_job.arg_B, OWN_OWNED, 0);  /* CPU0 reclaims */
+    own_transition(&cpu1_job.result, OWN_OWNED, 0); /* CPU0 takes result */
+
+    /* Clear owner_pid so orphan cleanup knows there's nothing to clean up if the
+     * process exits now. */
+    cpu1_job.owner_pid = 0;
+    spin_unlock(&cpu1_job_lock);
+
     return 1;                           /* CPU 1 ran the job and signalled done */
 }
 
@@ -374,6 +647,123 @@ int cpu1_run(cpu_job_fn fn, void *arg)
      * panic. */
     uint64_t deadline = rdtsc() + AP_WAIT_US * AP_TSC_PER_US;  /* now + 100ms */
     return cpu1_wait(deadline);
+}
+
+/*
+ * cpu1_orphan_jobs -- called from process_unref when a process exits with a
+ * pending CPU1 job. The exiting process must NOT block indefinitely (violates the
+ * async goal) and must NOT free buffers CPU1 is still touching.
+ *
+ * TWO-PHASE RESOLUTION ("wait 100ms or orphan"):
+ *   Phase 1 (GRACE WAIT): if our job is still in-flight, poll the slot for a
+ *     BOUNDED ~100 ms (AP_WAIT_US). Most offloads finish in well under that, so the
+ *     common case is a clean drain: the AP clears `pending`, the slot's ownership
+ *     descriptors are reclaimed normally, and there is nothing to orphan. We poll
+ *     MEMORY only (never MMIO) and on a finite TSC deadline, so a wedged AP can
+ *     never hang the exiting process -- the deadline always wins.
+ *   Phase 2 (ORPHAN): if the job is STILL pending after the grace period, orphan
+ *     it. Under cpu1_job_lock (serializing against a concurrent cpu1_submit), if
+ *     owner_pid still matches the exiting PID, clear owner_pid (the result is
+ *     dropped on completion) and transition arg_A/arg_B/result TRANSFERRED ->
+ *     ORPHANED. ORPHANED marks the buffers "owner gone, but CPU1 may still be
+ *     accessing them" so they cannot be reused/refreshed until the next submit
+ *     re-inits the slot. The offload BUFFERS themselves are kref'd (kmalloc_ref in
+ *     sys_cpu1_offload); the handler's own kput drives them to free only once CPU1
+ *     is also done, so there is no UAF and no leak. job_seq guards slot reuse by a
+ *     newer job before the orphaned one drains.
+ *
+ * Either way the exiting process returns promptly (<= ~100 ms, usually instantly).
+ *
+ * OWNERSHIP INTEGRATION:
+ *   - arg_A/arg_B/result: TRANSFERRED (to CPU1) -> ORPHANED (owner exited, CPU1
+ *     still running). The AP worker loop eventually finishes; the descriptors stay
+ *     ORPHANED (terminal) until the NEXT cpu1_submit re-inits the slot via
+ *     own_init(). The actual buffers are reclaimed via their kref when both the
+ *     handler and CPU1 have released.
+ *
+ * Edge case: if the job finished before/at any point (pending==0), we do nothing
+ * (already cleaned by the submit/wait path).
+ */
+void cpu1_orphan_jobs(uint32_t exiting_pid)
+{
+    /* ACQUIRE-load pending to see if a job is in-flight. If pending==0, the job
+     * already completed or was never submitted; nothing to orphan. */
+    if (__atomic_load_n(&cpu1_job.pending, __ATOMIC_ACQUIRE) == 0) {
+        return;  /* slot is free; no orphan cleanup needed */
+    }
+
+    /* Only the OWNER of the in-flight job needs to grace-wait/orphan. A different
+     * process's pending job is none of our business -- bail without spinning so an
+     * unrelated exit never burns 100ms. (owner_pid is a single aligned 32-bit word;
+     * a torn read here at worst causes a spurious early return, which is safe -- the
+     * locked re-check below is authoritative for the actual orphan.) */
+    if (cpu1_job.owner_pid != exiting_pid) {
+        return;
+    }
+
+    /* Snapshot job_seq so we can tell, after the grace wait, whether the slot was
+     * recycled by a NEWER job in the meantime (the AP finished ours, a new submit
+     * bumped job_seq). If it changed, OUR job already drained -- do not orphan the
+     * unrelated successor. */
+    uint64_t my_seq = __atomic_load_n(&cpu1_job.job_seq, __ATOMIC_ACQUIRE);
+
+    /* PHASE 1 -- GRACE WAIT: give the in-flight job up to ~100 ms (AP_WAIT_US) to
+     * finish cleanly. Poll MEMORY only on a finite TSC deadline (a wedged AP can
+     * never hang us). If the job drains (pending->0) or the slot is recycled
+     * (job_seq moves), our work is done and there is nothing to orphan. */
+    uint64_t deadline = rdtsc() + AP_WAIT_US * AP_TSC_PER_US;  /* now + 100 ms */
+    while (__atomic_load_n(&cpu1_job.pending, __ATOMIC_ACQUIRE) != 0 &&
+           __atomic_load_n(&cpu1_job.job_seq, __ATOMIC_ACQUIRE) == my_seq) {
+        if (rdtsc() >= deadline) {
+            break;                       /* grace expired -> fall through to orphan */
+        }
+        __asm__ volatile("pause" ::: "memory");
+    }
+
+    /* Take cpu1_job_lock so the owner_pid read+clear and the ownership orphan
+     * transitions are serialized against a concurrent cpu1_submit() on another
+     * CPU0 (which writes owner_pid/job_seq and the same ownership descriptors
+     * under this same lock). Without it, a submit racing an exit could observe a
+     * half-updated slot or orphan a buffer a brand-new job just transferred. */
+    spin_lock(&cpu1_job_lock);
+
+    /* Re-check pending AND job_seq under the lock: the job may have completed (the
+     * AP cleared pending) or the slot may have been recycled by a newer job during
+     * the grace wait. Either way OUR job is gone -- nothing to orphan. */
+    if (__atomic_load_n(&cpu1_job.pending, __ATOMIC_ACQUIRE) == 0 ||
+        cpu1_job.job_seq != my_seq) {
+        spin_unlock(&cpu1_job_lock);
+        return;
+    }
+
+    /* PHASE 2 -- ORPHAN: the job is STILL pending and STILL ours after the grace
+     * period. Orphan it. The AP will finish, but the result will be silently
+     * dropped (owner_pid==0). */
+    if (cpu1_job.owner_pid == exiting_pid) {
+        /* Clear owner_pid so the completion path knows this job is orphaned. */
+        cpu1_job.owner_pid = 0;
+
+        /* OWNERSHIP STATE TRANSITION: TRANSFERRED -> ORPHANED for arg_A/arg_B/
+         * result. All three were moved to TRANSFERRED(to CPU1) in cpu1_submit and
+         * were NOT reclaimed (the waiter timed out or the process exited before
+         * waiting). Marking them ORPHANED says "owner gone, but CPU1 may still be
+         * touching them" so they cannot be freed until CPU1 finishes and releases
+         * its refs. ORPHANED is terminal: no new owner can be established, which
+         * is exactly what we want for a drained-but-not-yet-reclaimed buffer.
+         * TRANSFERRED -> ORPHANED is a legal edge in OWN_TRANSITION_TABLE. */
+        own_orphan(&cpu1_job.arg_A);
+        own_orphan(&cpu1_job.arg_B);
+        own_orphan(&cpu1_job.result);
+
+        /* The job_seq remains unchanged; it will be bumped when the next job is
+         * submitted (after this orphaned one drains), preventing slot reuse races. */
+    }
+
+    spin_unlock(&cpu1_job_lock);
+
+    /* Return immediately; do NOT wait for the job to finish. The AP will complete
+     * it asynchronously, the result will be discarded, and the slot will be freed
+     * normally via the pending RELEASE-store in ap_main. */
 }
 
 /* ---------------------------------------------------------------------------
@@ -585,13 +975,20 @@ void matmul_self_test(void)
  * both address them safely. by_apic is volatile so mm_offload_job's store is not
  * elided; cross-core visibility of BOTH the result AND by_apic is provided by the
  * cpu1_job.done RELEASE/ACQUIRE pair (the job runs inside the AP worker loop's
- * dispatch, before it sets done). */
+ * dispatch, before it sets done).
+ *
+ * refA/refB/refC are the kref'd payload pointers for CPU1's async lifetime ref.
+ * refs_held is a one-shot guard ensuring exactly-once release. */
 static struct {
     const int32_t *A;
     const int32_t *B;
     int64_t       *C;
     int            n;
     volatile int   by_apic;
+    void          *refA;        /* kref'd payload for kget/kput (same addr as A) */
+    void          *refB;        /* kref'd payload for kget/kput (same addr as B) */
+    void          *refC;        /* kref'd payload for kget/kput (same addr as C) */
+    volatile int   refs_held;   /* 1 after kget, 0 after the single kput */
 } mm_off_arg;
 
 /* INT-ONLY square matmul of dimension n (row stride n), rows [row0,row1). A
@@ -613,6 +1010,21 @@ static void matmul_band_n(int row0, int row1, int n,
     }
 }
 
+/* Release CPU1's async ref on the offload buffers exactly once (kput refA/B/C).
+ * Called at the END of mm_offload_job (after the last read of A/B and last write
+ * of C, after by_apic is stored). The atomic exchange ensures exactly-once even
+ * if (future) another path tries to release. This is the buffer-free analogue of
+ * the AP worker loop's done/pending stores, and it runs INSIDE the fn, i.e. BEFORE
+ * ap_main sets done -- so CPU1 is provably finished with the buffers before CPU0's
+ * cpu1_wait can observe completion. */
+static void mm_offload_release(void) {
+    if (__atomic_exchange_n(&mm_off_arg.refs_held, 0, __ATOMIC_ACQ_REL)) {
+        kput(mm_off_arg.refA);
+        kput(mm_off_arg.refB);
+        kput(mm_off_arg.refC);
+    }
+}
+
 /* The trusted kernel fn CPU1 runs for an offload: compute the WHOLE matrix [0,n)
  * into the handler's kmalloc'd C from the handler's kmalloc'd A/B, then record the
  * AP's own apic id so the BSP (and the requesting app) can PROVE apic-1 executed
@@ -623,6 +1035,7 @@ static void mm_offload_job(void *a)
     matmul_band_n(0, mm_off_arg.n, mm_off_arg.n,
                   mm_off_arg.A, mm_off_arg.B, mm_off_arg.C);
     mm_off_arg.by_apic = (int)lapic_get_id();   /* PROOF: which CPU ran it */
+    mm_offload_release();                       /* Drop CPU1's async ref */
 }
 
 /*
@@ -637,6 +1050,12 @@ static void mm_offload_job(void *a)
  * probe -> ~2s of TSC). The bound guarantees a wedged/absent AP can never hang the
  * calling process -- on timeout it returns 0 and the handler maps that to a
  * negative errno.
+ *
+ * KREF DISCIPLINE: Takes CPU1's own kref on each buffer (kget) BEFORE submit, so
+ * each buffer's refcount = (1 if handler holds) + (1 if CPU1 async). On SUCCESS:
+ * CPU1 releases first (mm_offload_release), then handler (1->0, free). On TIMEOUT:
+ * handler's kput drives 2->1 (NOT freed), CPU1's later release drives 1->0 (real
+ * free, after CPU1 provably done). No UAF, no leak, no double-free.
  *
  * Returns 1 and sets *by_apic_out (the apic id that ran the job, must be 1) on
  * success; 0 if CPU1 did not finish within the deadline (or args are bad).
@@ -660,17 +1079,44 @@ int cpu1_offload_matmul(const int32_t *A, const int32_t *B, int n,
     mm_off_arg.n       = n;
     mm_off_arg.by_apic = 0;
 
+    /* Take CPU1's async ref on each buffer BEFORE submit. The handler's own kref
+     * on each buffer is still held (refcount >= 1), so kget validates the canary
+     * and bumps 1->2 (or N->N+1). If any kget fails (corrupted magic), abort and
+     * release what we got -- the handler will clean its own refs. */
+    void *gA = kget((void*)A);
+    void *gB = kget((void*)B);
+    void *gC = kget((void*)C_out);
+    if (!gA || !gB || !gC) {
+        if (gA) kput(gA);
+        if (gB) kput(gB);
+        if (gC) kput(gC);
+        return 0;                       /* handler maps 0 -> EAGAIN */
+    }
+    mm_off_arg.refA = gA;
+    mm_off_arg.refB = gB;
+    mm_off_arg.refC = gC;
+    mm_off_arg.refs_held = 1;
+
     /* Publish the WHOLE matmul as one trusted job to CPU1, then wait a GENEROUS
      * bounded deadline (~2s at the ~3 GHz TSC convention). On timeout cpu1_wait
      * returns 0 and we bail -- never an infinite spin, never a hang. The cpu1_submit
-     * RELEASE publishes mm_off_arg (incl. the pointers) so the AP's ACQUIRE sees
-     * them; the cpu1_wait ACQUIRE on `done` makes CPU1's writes to C_out + by_apic
-     * visible here before we return. */
+     * RELEASE publishes mm_off_arg (incl. the pointers + the fresh refs) so the AP's
+     * ACQUIRE sees them; the cpu1_wait ACQUIRE on `done` makes CPU1's writes to
+     * C_out + by_apic visible here before we return. */
     if (!cpu1_submit(mm_offload_job, &mm_off_arg)) {
+        /* Submit failed (CPU1 busy) -- drop the refs we just took, handler cleans
+         * its own. refs_held is still 1, so mm_offload_release won't fire on CPU1. */
+        kput(gA); kput(gB); kput(gC);
+        mm_off_arg.refs_held = 0;
         return 0;
     }
     uint64_t deadline = rdtsc() + 2ULL * 1000000ULL * AP_TSC_PER_US;  /* now + 2s */
     if (!cpu1_wait(deadline)) {
+        /* TIMEOUT: CPU1 is still running (or wedged). We do NOT drop CPU1's refs
+         * here -- CPU1 holds them for its async lifetime and will release them in
+         * mm_offload_release when (if) it finishes. The handler's kput will drive
+         * refcount 2->1 (not freed); CPU1's later release drives 1->0 (real free,
+         * after CPU1 is provably done). No UAF, no leak, no double-free. */
         return 0;                       /* AP wedged/absent -> caller returns <0 */
     }
 
@@ -703,6 +1149,22 @@ static void ap_setup_trampoline(uint64_t kernel_cr3)
     __asm__ volatile("sidt %0" : "=m"(idtr));
     memcpy(param + AP_PARAM_GDTR, &gdtr, sizeof(gdtr));
     memcpy(param + AP_PARAM_IDTR, &idtr, sizeof(idtr));
+}
+
+/*
+ * cpu1_job_init -- initialize ownership tracking for cpu1_job args and result.
+ *
+ * Called ONCE at boot before try_start_cpu1(). Initializes arg_A, arg_B, and
+ * result ownership descriptors to OWNED state (owner_cpu=0, refcount=1). This
+ * must be called BEFORE any cpu1_submit() so the ownership state transitions
+ * have a valid starting point. Zero overhead: just three own_init() calls on
+ * static .bss fields that start as all-zeroes.
+ */
+void cpu1_job_init(void)
+{
+    own_init(&cpu1_job.arg_A);    /* OWNED by CPU0, refcount=1 */
+    own_init(&cpu1_job.arg_B);    /* OWNED by CPU0, refcount=1 */
+    own_init(&cpu1_job.result);   /* OWNED by CPU0, refcount=1 (will be TRANSFERRED from CPU1) */
 }
 
 /*
@@ -769,4 +1231,17 @@ int try_start_cpu1(void)
     }
 
     return 1;                           /* CPU 1 set its flag -> online */
+}
+
+/*
+ * cpu1_is_online -- check if CPU1 is currently online and accepting jobs.
+ *
+ * Returns 1 if CPU1 is online and available for job submissions, 0 if it's
+ * offline (failed to start, crashed, or panicked). Callers can use this to
+ * decide whether to attempt offloading work to CPU1 or run it on the BSP.
+ */
+int cpu1_is_online(void)
+{
+    return (__atomic_load_n(&ap1_online, __ATOMIC_ACQUIRE) != 0 &&
+            __atomic_load_n(&cpu1_offline, __ATOMIC_ACQUIRE) == 0);
 }

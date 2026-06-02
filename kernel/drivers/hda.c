@@ -4,6 +4,7 @@
 #include "../include/x86_64.h"
 #include "../include/types.h"
 #include "../include/drivers.h"   /* serial_write, serial_putchar, timer_get_ticks, timer_get_frequency */
+#include "../include/syscall.h"   /* sys_yield */
 
 // Global HDA controller instance
 static hda_controller_t* g_hda_ctrl = NULL;
@@ -23,7 +24,7 @@ void hda_msleep(uint32_t ms) {
     uint64_t start = timer_get_ticks();
     uint64_t end = start + (ms * timer_get_frequency() / 1000);
     while (timer_get_ticks() < end) {
-        hlt();
+        sys_yield(0, 0, 0, 0, 0, 0);  // Scheduler-aware sleep
     }
 }
 

@@ -124,6 +124,29 @@ static inline void write_cr3(uint64_t val) {
     asm volatile("mov %0, %%cr3" : : "r"(val));
 }
 
+// CR3 bits
+#define CR3_NO_FLUSH (1ULL << 63)  // Bit 63: preserve TLB entries on CR3 load
+
+static inline uint64_t read_cr4(void) {
+    uint64_t val;
+    asm volatile("mov %%cr4, %0" : "=r"(val));
+    return val;
+}
+
+static inline void write_cr4(uint64_t val) {
+    asm volatile("mov %0, %%cr4" : : "r"(val) : "memory");
+}
+
+// CR4 bits
+#define CR4_PCIDE (1ULL << 17)
+
+// CPUID feature detection for INVPCID
+static inline bool cpu_has_invpcid(void) {
+    uint32_t a, b, c, d;
+    asm volatile("cpuid" : "=a"(a), "=b"(b), "=c"(c), "=d"(d) : "a"(7), "c"(0));
+    return (b >> 10) & 1;
+}
+
 // Critical section helpers for interrupt disabling
 // NOTE: save_flags_cli() and restore_flags() are defined in spinlock.h
 // to avoid duplicate definitions. Include spinlock.h if you need them.

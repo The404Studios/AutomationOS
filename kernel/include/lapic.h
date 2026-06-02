@@ -90,10 +90,12 @@
 
 // IPI types
 #define IPI_RESCHEDULE          0x40  // Force reschedule
-#define IPI_TLB_FLUSH           0x41  // TLB flush
+#define IPI_TLB_FLUSH           0x41  // TLB flush (lazy)
 #define IPI_FUNCTION_CALL       0x42  // Call function on remote CPU
 #define IPI_STOP                0x43  // Stop CPU
 #define IPI_TEST                0x44  // Test IPI
+#define IPI_TLB_FLUSH_ALL       0x45  // TLB flush all contexts (PCID recycle)
+#define IPI_AP_PANIC            0x46  // AP panic notification
 
 // LAPIC initialization
 void lapic_init(void);

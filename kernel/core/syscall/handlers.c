@@ -2,6 +2,7 @@
 #include "../../include/kernel.h"
 #include "../../include/sched.h"
 #include "../../include/mem.h"
+#include "../../include/kref.h"
 #include "../../include/drivers.h"
 #include "../../include/vfs.h"
 #include "../../include/input.h"
@@ -1609,8 +1610,9 @@ extern int cpu1_offload_matmul(const int32_t *A, const int32_t *B, int n,
 //     COPY the int64 result to user_res. Returns 0 on success, negative errno on
 //     any bad pointer / size mismatch / out-of-range n / CPU1 timeout.
 //
-// Single offload at a time (the CPU1 input/result buffers are fixed + shared);
-// concurrent offloads are a later refinement (known limitation).
+// Buffers are reference-counted (kmalloc_ref). CPU1 takes its own kref at submit
+// (kget in cpu1_offload_matmul) and releases at completion (mm_offload_release),
+// enabling safe cleanup on timeout and preparing for concurrent offloads.
 int64_t sys_cpu1_offload(uint64_t job_type, uint64_t user_arg, uint64_t arg_len,
                          uint64_t user_res, uint64_t res_len) {
     if (job_type != CPU1_JOB_MATMUL) {
@@ -1640,15 +1642,17 @@ int64_t sys_cpu1_offload(uint64_t job_type, uint64_t user_arg, uint64_t arg_len,
 
     // 3. Trusted kernel scratch for the operands + result. CPU1 only ever touches
     //    the kernel buffers inside cpu1_offload_matmul, never these or any user ptr.
+    //    Use kmalloc_ref so each buffer is independently refcounted -- allows
+    //    multiple concurrent offloads and safe cleanup on any error path.
     size_t ab_bytes = (size_t)(elems * sizeof(int32_t));
     size_t c_bytes  = (size_t)(elems * sizeof(int64_t));
-    int32_t* kA = (int32_t*)kmalloc(ab_bytes);
-    int32_t* kB = (int32_t*)kmalloc(ab_bytes);
-    int64_t* kC = (int64_t*)kmalloc(c_bytes);
+    int32_t* kA = (int32_t*)kmalloc_ref(ab_bytes);
+    int32_t* kB = (int32_t*)kmalloc_ref(ab_bytes);
+    int64_t* kC = (int64_t*)kmalloc_ref(c_bytes);
     if (!kA || !kB || !kC) {
-        if (kA) kfree(kA);
-        if (kB) kfree(kB);
-        if (kC) kfree(kC);
+        if (kA) kput(kA);
+        if (kB) kput(kB);
+        if (kC) kput(kC);
         return ENOMEM;
     }
 
@@ -1657,26 +1661,34 @@ int64_t sys_cpu1_offload(uint64_t job_type, uint64_t user_arg, uint64_t arg_len,
     const void* uB = (const void*)(user_arg + sizeof(int32_t) + ab_bytes);
     if (copy_from_user(kA, uA, ab_bytes) != COPY_SUCCESS ||
         copy_from_user(kB, uB, ab_bytes) != COPY_SUCCESS) {
-        kfree(kA); kfree(kB); kfree(kC);
+        kput(kA); kput(kB); kput(kC);
         return EFAULT;
     }
 
     // 5. Dispatch the WHOLE matmul to CPU1 (trusted coprocessor) and wait the
     //    bounded deadline. by_apic must read 1 (the AP recorded its own apic id).
+    //    CPU1 takes its own kref on each buffer at submit (via kget in
+    //    cpu1_offload_matmul) and releases in mm_offload_release when done. Refcount
+    //    semantics: CPU0 handler holds 1, CPU1 bumps to 2 at submit. On SUCCESS:
+    //    CPU1 releases first (2->1), then CPU0 here (1->0, free). On TIMEOUT: CPU0's
+    //    kput drives 2->1 (NOT freed), CPU1's later release drives 1->0 (real free,
+    //    after CPU1 is provably done). No UAF, no leak, no double-free.
     int by_apic = -1;
     int ok = cpu1_offload_matmul(kA, kB, (int)n, kC, &by_apic);
     if (!ok) {
-        kfree(kA); kfree(kB); kfree(kC);
+        kput(kA); kput(kB); kput(kC);
         return EAGAIN;                  // CPU1 wedged/absent/timed out -> not done
     }
 
     // 6. Copy the int64 result back to userspace (safe).
     if (copy_to_user((void*)user_res, kC, c_bytes) != COPY_SUCCESS) {
-        kfree(kA); kfree(kB); kfree(kC);
+        kput(kA); kput(kB); kput(kC);
         return EFAULT;
     }
 
-    kfree(kA); kfree(kB); kfree(kC);
+    // 7. Drop our references. On success CPU1 has already released (in
+    //    mm_offload_release at job completion), so this drives count 1->0 and frees.
+    kput(kA); kput(kB); kput(kC);
 
     // Return the apic id that ran the job (>= 0) so the caller can prove CPU1 did
     // the work. 0 on success is the n=... etc. path; here a positive apic id is the

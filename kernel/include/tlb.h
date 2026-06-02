@@ -42,6 +42,14 @@ void tlb_flush_pending(void);
 // Called when remote CPU sends IPI_TLB_FLUSH
 void tlb_handle_ipi_flush(void);
 
+// Flush all TLB entries for all PCIDs on current CPU
+// Used during PCID recycling to prevent stale PCID reuse
+void tlb_flush_all_contexts_local(void);
+
+// IPI handler for TLB flush all contexts
+// Called when remote CPU sends IPI_TLB_FLUSH_ALL
+void tlb_handle_ipi_flush_all_contexts(void);
+
 // Print TLB statistics
 void tlb_print_stats(void);
 

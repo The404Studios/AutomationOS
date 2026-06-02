@@ -93,7 +93,7 @@ extern void irq0_preempt(void);
 extern void idt_flush(uint64_t idt_ptr);
 
 // Set an IDT gate
-static void idt_set_gate(uint8_t num, uint64_t handler, uint16_t selector, uint8_t flags) {
+void idt_set_gate(uint8_t num, uint64_t handler, uint16_t selector, uint8_t flags) {
     idt[num].offset_low = handler & 0xFFFF;
     idt[num].offset_mid = (handler >> 16) & 0xFFFF;
     idt[num].offset_high = (handler >> 32) & 0xFFFFFFFF;

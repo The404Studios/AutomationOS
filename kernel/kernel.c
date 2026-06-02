@@ -13,6 +13,7 @@
 #include "include/tss.h"
 #include "include/string.h"
 #include "include/ipc.h"
+#include "include/health_monitor.h"
 
 typedef struct {
     uint32_t magic;
@@ -531,8 +532,6 @@ void kernel_main(void* raw_info) {
     }
 
     // Start health monitor thread (5-second sampling)
-    extern void health_monitor_init(void);
-    extern void health_monitor_start_thread(void);
     health_monitor_init();
     health_monitor_start_thread();
     kprintf("[HEALTH] Monitor started (5s sampling)\n");

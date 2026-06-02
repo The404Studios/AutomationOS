@@ -457,6 +457,12 @@ process_t* scheduler_pick_next(void) {
 
 // Scheduler tick - called from timer interrupt
 void scheduler_tick(void) {
+#ifdef SMP_FOUNDATION
+    // Health monitor heartbeat: proves this CPU is alive and servicing ticks
+    extern void health_monitor_tick(void);
+    health_monitor_tick();
+#endif
+
     spin_lock(&tick_lock);
     global_tick_count++;
     uint64_t tick = global_tick_count;

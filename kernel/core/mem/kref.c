@@ -140,6 +140,11 @@ void* kmalloc_ref_dtor(size_t size, void (*dtor)(void* payload)) {
     hdr->size = (uint32_t)size;  // safe cast: size < SIZE_MAX - sizeof(hdr)
     hdr->dtor = dtor;
 
+#ifdef SMP_FOUNDATION
+    extern void health_monitor_record_alloc(void);
+    health_monitor_record_alloc();
+#endif
+
     /* Return pointer to payload (user never sees the header) */
     return (void*)(hdr + 1);
 }
@@ -186,6 +191,11 @@ int kput(void* ptr) {
 
         /* Poison magic so a later double-kput is caught */
         hdr->magic = 0;
+
+#ifdef SMP_FOUNDATION
+        extern void health_monitor_record_free(void);
+        health_monitor_record_free();
+#endif
 
         /* Free the entire allocation (header + payload) */
         kfree(hdr);

@@ -135,6 +135,18 @@ int procapi_ctl(uint32_t pid, uint32_t verb, uint64_t arg)
         return ESRCH;
     }
 
+    /* Authorization: a process may control another only with the same UID; root
+     * (uid 0) may control anyone. Mirrors the check in sys_kill (kill.c) -- this
+     * path applies the same suspend/resume/kill/reprioritize operations and must
+     * gate them the same way. Today everything runs as uid 0 so this allows all
+     * callers, but it closes the cross-owner control gap under a future MU model. */
+    {
+        process_t* caller = process_get_current();
+        if (caller && caller->uid != 0 && caller->uid != proc->uid) {
+            return EPERM;
+        }
+    }
+
     switch (verb) {
 
     case PROCAPI_CTL_SUSPEND:

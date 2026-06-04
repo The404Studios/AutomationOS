@@ -51,6 +51,13 @@ int64_t sys_kill(uint64_t pid, uint64_t sig, uint64_t arg3,
         return EINVAL;
     }
 
+    // Reject PIDs that don't fit in 32 bits BEFORE the (uint32_t) casts below,
+    // so a value like 0x1_00000001 can't truncate to a valid low PID (e.g. 1 =
+    // init) and signal the wrong process.
+    if (pid > 0xFFFFFFFFULL) {
+        return ESRCH;
+    }
+
     // Special case: sig=0 just checks if process exists.
     // process_get_by_pid takes a ref; process_unref drops it before return.
     // Ref balance: +1 (get_by_pid) -1 (unref) = 0. Correct.

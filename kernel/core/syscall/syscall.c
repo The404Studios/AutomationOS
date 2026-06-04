@@ -93,6 +93,10 @@ void syscall_init(void) {
     syscall_table[SYS_UNLINK] = sys_unlink;
     syscall_table[SYS_RENAME] = sys_rename;
     syscall_table[SYS_MKDIR] = sys_mkdir;
+    syscall_table[SYS_TRUNCATE] = sys_truncate;
+    syscall_table[SYS_FTRUNCATE] = sys_ftruncate;
+    syscall_table[SYS_FSYNC] = sys_fsync;
+    syscall_table[SYS_SYNC] = sys_sync;
 
     // Block device syscalls (AHCI/SATA persistence)
     syscall_table[SYS_BLK_READ] = sys_blk_read;
@@ -141,12 +145,18 @@ void syscall_init(void) {
     syscall_table[SYS_EPOLL_CTL]    = sys_epoll_ctl;
     syscall_table[SYS_EPOLL_WAIT]   = sys_epoll_wait;
 
-#ifdef SMP_FOUNDATION
+#if defined(SMP_FOUNDATION) && !defined(SMP_SCHED_DISPATCH)
     // SMP coprocessor offload (the userspace -> CPU1 bridge). Registered ONLY for
-    // the SMP build; the DEFAULT kernel leaves this slot NULL, so the syscall
-    // returns ENOTSUP and the binary is byte-for-byte unchanged. The handler does
-    // all user-pointer validation + copy-in/out and dispatches a trusted kernel
+    // the coprocessor SMP build; the DEFAULT kernel leaves this slot NULL, so the
+    // syscall returns ENOTSUP and the binary is byte-for-byte unchanged. The handler
+    // does all user-pointer validation + copy-in/out and dispatches a trusted kernel
     // matmul to CPU1 (handlers.c, also SMP_FOUNDATION-gated).
+    //
+    // NOT registered under SMP_SCHED_DISPATCH: in SCHEDULER mode CPU1 runs
+    // ap_scheduler_loop, NOT the cpu1_job worker loop, so an offload would publish a
+    // job nobody services and time out silently. Leaving the slot NULL makes the
+    // syscall return ENOTSUP immediately (the cpu1offload userspace test then SKIPs
+    // cleanly instead of timing out / FAILing). Mode separation, per the SMP audit.
     syscall_table[SYS_CPU1_OFFLOAD] = sys_cpu1_offload;
 #endif
 

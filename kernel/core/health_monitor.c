@@ -67,20 +67,20 @@ static void health_monitor_thread(void* arg) {
         health_monitor_sample();
 
         /* Detect anomalies */
-        uint32_t stalls = health_monitor_detect_stalls();
-        uint32_t leaks = health_monitor_detect_leaks();
+        bool stalls = health_monitor_detect_stalls();
+        bool leaks = health_monitor_detect_leaks();
         bool deadlock = health_monitor_detect_deadlock();
 
         if (deadlock) {
             kprintf("[HEALTH] SYSTEM DEADLOCK: all CPUs frozen!\n");
             health_monitor_report();
-        } else if (stalls > 0) {
-            kprintf("[HEALTH] CPU stall detected on %u CPU(s)!\n", stalls);
+        } else if (stalls) {
+            kprintf("[HEALTH] CPU stall detected!\n");
             health_monitor_report();
         }
 
-        if (leaks > 0) {
-            kprintf("[HEALTH] Memory leak detected on %u CPU(s)!\n", leaks);
+        if (leaks) {
+            kprintf("[HEALTH] Memory leak detected!\n");
             health_monitor_report();
         }
     }
@@ -112,7 +112,7 @@ void health_monitor_start_thread(void) {
     }
 
     /* Mark as ready and add to scheduler */
-    monitor_proc->state = PROCESS_READY;
+    process_set_ready(monitor_proc);
     scheduler_add_process(monitor_proc);
 
     kprintf("[HEALTH] Health monitor thread scheduled\n");
@@ -148,14 +148,14 @@ void health_monitor_sample(void) {
  * Compares current heartbeat to last_heartbeat for each online CPU.
  * A CPU is considered stalled if its heartbeat has not advanced.
  *
- * Returns: Number of stalled CPUs detected
+ * Returns: true if any CPU is stalled, false otherwise
  */
-uint32_t health_monitor_detect_stalls(void) {
+bool health_monitor_detect_stalls(void) {
     uint32_t stalled = 0;
 
     /* Skip stall detection on first sample (no baseline yet) */
     if (g_system_health.sample_count <= 1) {
-        return 0;
+        return false;
     }
 
     for (int cpu = 0; cpu < smp_num_online; cpu++) {
@@ -173,7 +173,7 @@ uint32_t health_monitor_detect_stalls(void) {
         g_system_health.stalls_detected += stalled;
     }
 
-    return stalled;
+    return stalled > 0;
 }
 
 /**
@@ -182,9 +182,9 @@ uint32_t health_monitor_detect_stalls(void) {
  * Computes ownership_leaks = ownership_allocs - ownership_frees for each CPU.
  * A leak is reported if the difference exceeds a threshold (100 objects).
  *
- * Returns: Number of CPUs with suspected leaks
+ * Returns: true if any CPU has suspected leaks, false otherwise
  */
-uint32_t health_monitor_detect_leaks(void) {
+bool health_monitor_detect_leaks(void) {
     uint32_t leaked_cpus = 0;
     const uint32_t LEAK_THRESHOLD = 100;
 
@@ -204,7 +204,7 @@ uint32_t health_monitor_detect_leaks(void) {
         }
     }
 
-    return leaked_cpus;
+    return leaked_cpus > 0;
 }
 
 /**
@@ -443,7 +443,7 @@ uint32_t health_monitor_get_total_leaks(void) {
  *
  * @note This function does NOT return (calls kernel_panic which halts the system)
  */
-void health_monitor_recover_deadlock(void) {
+NORETURN void health_monitor_recover_deadlock(void) {
     kprintf("\n");
     kprintf("\033[1;31m"); /* Red bold */
     kprintf("╔════════════════════════════════════════════════════════════╗\n");

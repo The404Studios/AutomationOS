@@ -56,6 +56,7 @@
 #include "../../include/kernel.h"
 #include "../../include/spinlock.h"
 #include "../../include/slab.h"
+#include "../../include/string.h"
 
 /* =========================================================================
  * Constants
@@ -539,6 +540,98 @@ static inline bool heap_owns(void* ptr) {
 }
 
 /* =========================================================================
+ * krealloc — reallocate memory to new size, preserving contents
+ * =========================================================================
+ * If ptr is NULL, behaves like kmalloc(new_size).
+ * If new_size is 0, behaves like kfree(ptr) and returns NULL.
+ * Otherwise, allocates new_size bytes, copies min(old_size, new_size) bytes
+ * from old to new, frees old, and returns new pointer.
+ * Returns NULL on allocation failure (old allocation is unchanged).
+ * ========================================================================= */
+
+void* krealloc(void* ptr, size_t new_size) {
+    if (!heap_initialized) kernel_panic("Heap not initialized");
+    if (!ptr) return kmalloc(new_size);
+    if (new_size == 0) {
+        kfree(ptr);
+        return NULL;
+    }
+
+    if (!heap_owns(ptr)) {
+        kprintf("[KREALLOC] REJECTED non-heap pointer: %p\n", ptr);
+        return NULL;
+    }
+
+    /* Check if this is a slab allocation */
+    if (slab_enabled) {
+        uintptr_t page_base = (uintptr_t)ptr & ~(PAGE_SIZE - 1);
+        uint64_t* magic_ptr = (uint64_t*)page_base;
+        if (*magic_ptr == 0x51AB0BACE51AB0BULL) {
+            /* Slab allocation: we don't know the exact old size, so always
+             * allocate new, copy a conservative amount, and free old */
+            void* new_ptr = kmalloc(new_size);
+            if (!new_ptr) return NULL;
+            /* Copy up to new_size bytes (slab objects are at least as large
+             * as their size class, so this is safe for common realloc patterns) */
+            size_t copy_limit = (new_size < 4096) ? new_size : 4096;
+            memcpy(new_ptr, ptr, copy_limit);
+            slab_free(NULL, ptr);
+            return new_ptr;
+        }
+    }
+
+    /* Heap allocation: extract block header to get exact old size */
+    block_t* block = (block_t*)((uint8_t*)ptr - sizeof(block_t));
+    if (!block_magic_ok(block)) {
+        kprintf("[KREALLOC] bad magic in block header\n");
+        return NULL;
+    }
+
+    size_t old_size = block->size;
+
+    /* If new size fits in current block (within 16-byte rounding), reuse it */
+    size_t aligned_new = ALIGN_UP(new_size, 16);
+    if (aligned_new <= old_size && old_size - aligned_new < 256) {
+        /* Size change is small enough to reuse the block without splitting */
+        return ptr;
+    }
+
+    /* Allocate new block, copy data, free old */
+    void* new_ptr = kmalloc(new_size);
+    if (!new_ptr) return NULL;
+
+    size_t copy_size = (new_size < old_size) ? new_size : old_size;
+    memcpy(new_ptr, ptr, copy_size);
+
+    kfree(ptr);
+    return new_ptr;
+}
+
+/* =========================================================================
+ * kcalloc — allocate zero-initialized array
+ * =========================================================================
+ * Allocates memory for an array of count elements of size bytes each,
+ * and zeroes the memory. Returns NULL on overflow or allocation failure.
+ * ========================================================================= */
+
+void* kcalloc(size_t count, size_t size) {
+    if (!heap_initialized) kernel_panic("Heap not initialized");
+    if (count == 0 || size == 0) return NULL;
+
+    /* Check for overflow: count * size must fit in size_t */
+    if (count > (SIZE_MAX / size)) return NULL;
+
+    size_t total = count * size;
+    void* ptr = kmalloc(total);
+    if (!ptr) return NULL;
+
+    /* Zero the memory */
+    memset(ptr, 0, total);
+
+    return ptr;
+}
+
+/* =========================================================================
  * kfree
  * ========================================================================= */
 
@@ -621,6 +714,120 @@ void kfree(void* ptr) {
     bin_push(block);
 
     spin_unlock(&heap_lock);
+}
+
+/* =========================================================================
+ * heap_shrink — return free pages at the end of the heap to the PMM
+ * =========================================================================
+ * Scans backwards from heap_mapped_end to find free blocks that cover whole
+ * pages at the tail of the heap. Unmaps those pages, updates heap_mapped_end,
+ * and removes the freed blocks from their bins. Returns the number of bytes
+ * freed (always a multiple of PAGE_SIZE). Never shrinks below HEAP_SIZE.
+ *
+ * Call this periodically when heap usage drops (e.g., after bulk frees) to
+ * prevent the one-way ratchet effect. Safe to call at any time; if no tail
+ * pages are free, returns 0 immediately. Thread-safe (acquires heap_lock).
+ * ========================================================================= */
+size_t heap_shrink(void) {
+#ifdef HEAP_TEST_HOST
+    return 0;   /* host unit-test heap is a fixed buffer; cannot shrink */
+#else
+    if (!heap_initialized) return 0;
+
+    spin_lock(&heap_lock);
+
+    uint64_t original_end = heap_mapped_end;
+    uint64_t base_size = HEAP_START + HEAP_SIZE;
+
+    /* Never shrink below the initial HEAP_SIZE */
+    if (heap_mapped_end <= base_size) {
+        spin_unlock(&heap_lock);
+        return 0;
+    }
+
+    /* Walk backwards from the end, looking for free blocks that cover entire
+     * page-aligned tail regions. Stop when we hit an allocated block or reach
+     * the base size. */
+    uint64_t shrink_to = heap_mapped_end;
+
+    /* Find the last block in the heap by walking the physical chain from
+     * heap_first. In a production implementation we'd maintain a heap_last
+     * pointer, but for now this is O(n) in the number of blocks. */
+    block_t* last = NULL;
+    for (block_t* b = heap_first; b; b = block_next_phys(b)) {
+        last = b;
+    }
+
+    /* Walk backwards from the last block, coalescing free tail pages */
+    while (last && shrink_to > base_size) {
+        /* Is this block free and does it extend to the current shrink boundary? */
+        uint64_t block_end = (uint64_t)last + sizeof(block_t) + last->size;
+        if (!block_is_free(last) || block_end != shrink_to) {
+            /* Can't shrink past an allocated block or a gap */
+            break;
+        }
+
+        /* How much of this block can we free (page-aligned from the end)? */
+        uint64_t block_start = (uint64_t)last;
+        uint64_t freeable_end = shrink_to;
+        uint64_t freeable_start = ALIGN_UP(block_start, PAGE_SIZE);
+
+        /* If the block doesn't cover at least one whole page, stop */
+        if (freeable_start >= freeable_end) {
+            break;
+        }
+
+        /* Ensure we don't shrink below base_size */
+        if (freeable_start < base_size) {
+            freeable_start = base_size;
+        }
+        if (freeable_start >= freeable_end) {
+            break;
+        }
+
+        /* Unmap the pages from [freeable_start, freeable_end) and return them to PMM */
+        uint64_t num_pages = (freeable_end - freeable_start) / PAGE_SIZE;
+        for (uint64_t i = 0; i < num_pages; i++) {
+            uint64_t va = freeable_end - (i + 1) * PAGE_SIZE;
+            void* phys = vmm_get_physical((void*)va);
+            if (phys) {
+                vmm_unmap_page((void*)va);
+                pmm_free_page(phys);
+            }
+        }
+
+        /* Update shrink boundary */
+        shrink_to = freeable_start;
+
+        /* If the block is entirely freed, remove it from its bin and update
+         * the heap_mapped_end. If it's only partially freed, split it. */
+        if (freeable_start == block_start) {
+            /* Entire block freed; remove from bin */
+            bin_remove(last);
+            /* Move to previous block */
+            last = last->prev_phys;
+        } else {
+            /* Partial shrink: trim the block */
+            bin_remove(last);
+            last->size = freeable_start - block_start - sizeof(block_t);
+            bin_push(last);
+            break;  /* Can't shrink further */
+        }
+    }
+
+    heap_mapped_end = shrink_to;
+    size_t freed = original_end - shrink_to;
+
+    spin_unlock(&heap_lock);
+
+    if (freed > 0) {
+        kprintf("[HEAP] shrunk -%lu KB -> %lu MB mapped\n",
+                (unsigned long)(freed / 1024),
+                (unsigned long)((heap_mapped_end - HEAP_START) / (1024 * 1024)));
+    }
+
+    return freed;
+#endif
 }
 
 /* =========================================================================
@@ -730,10 +937,44 @@ void heap_selftest(void) {
         uint8_t* p = (uint8_t*)ptrs[i];
         if (p[0] != 0xAB || p[CHUNK - 1] != 0xCD) { ok = 0; break; }
     }
+
+    uint64_t grown_end = heap_mapped_end;
     for (int i = 0; i < n; i++) kfree(ptrs[i]);
 
-    kprintf("[HEAP] HEAPEXT RESULT: %s (grew %lu->%lu MB over %d allocs)\n",
+    /* Test heap_shrink: after freeing all the grown allocations, the heap
+     * should be able to shrink back toward (but not necessarily to) the
+     * initial size. */
+    size_t shrunk = heap_shrink();
+    uint64_t after_shrink = heap_mapped_end;
+
+    kprintf("[HEAP] HEAPEXT RESULT: %s (grew %lu->%lu MB over %d allocs, shrunk %lu KB->%lu MB)\n",
             ok ? "PASS" : "FAIL",
             (unsigned long)((start_end - HEAP_START) / (1024 * 1024)),
-            (unsigned long)((heap_mapped_end - HEAP_START) / (1024 * 1024)), n);
+            (unsigned long)((grown_end - HEAP_START) / (1024 * 1024)), n,
+            (unsigned long)(shrunk / 1024),
+            (unsigned long)((after_shrink - HEAP_START) / (1024 * 1024)));
+
+    /* Shrink validation: should have freed some pages (unless all allocations
+     * were within the base heap size, which is unlikely given CHUNK=256KB) */
+    if (grown_end > start_end && shrunk == 0) {
+        kprintf("[HEAP] WARNING: heap grew but shrink returned 0 bytes\n");
+    }
+}
+
+/* =========================================================================
+ * Production-safe heap statistics (always available, no MEM_DEBUG required)
+ * =========================================================================
+ * These functions provide runtime heap usage visibility without debug overhead.
+ * Unlike the MEM_DEBUG counters, these track only the essential metrics that
+ * production systems need: current usage, total capacity, and mapped size.
+ * ========================================================================= */
+
+uint64_t heap_get_used_bytes(void) {
+    return heap_used;
+}
+
+void heap_get_stats(uint64_t* used_bytes, uint64_t* total_bytes, uint64_t* mapped_bytes) {
+    if (used_bytes)   *used_bytes   = heap_used;
+    if (total_bytes)  *total_bytes  = HEAP_MAX_SIZE;
+    if (mapped_bytes) *mapped_bytes = heap_mapped_end - HEAP_START;
 }

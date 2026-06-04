@@ -174,12 +174,21 @@ int wait_object_block(wait_object_t* wo, uint64_t deadline_or_0) {
     // context_switch exactly: pick a successor, hand it the CPU. The current
     // (blocked) process is NOT re-added to the ready queue, so it will not run
     // again until a signal or the timer re-readies it.
+    process_t* idle = scheduler_idle_thread();
     process_t* next = scheduler_pick_next();
 
     // If nothing is runnable, idle until something becomes ready (an IRQ wakeup —
     // a signal-side scheduler_add_process or the timer scan — re-readies a
     // process). We must re-enable interrupts to make progress.
-    while (next == NULL) {
+    //
+    // scheduler_pick_next() returns the IDLE THREAD (never NULL) when both
+    // runqueues are empty. In this cooperative path we must NOT switch into it:
+    // the idle thread runs `sti;hlt` forever in ring 0 and never calls schedule(),
+    // so a later IRQ that re-readies us would never switch back — a permanent hang,
+    // and cooperative_switch_to() into idle's synthetic never-run context can fault
+    // outright. So treat `idle` exactly like "nothing runnable": halt HERE on our
+    // own kernel stack and re-check pick_next() after each IRQ wakeup.
+    while (next == NULL || next == idle) {
         __asm__ volatile("sti; hlt; cli" ::: "memory");
         // If we ourselves were woken in the meantime, stop idling and resume.
         if (current->state != PROCESS_BLOCKED) {
@@ -188,7 +197,7 @@ int wait_object_block(wait_object_t* wo, uint64_t deadline_or_0) {
         next = scheduler_pick_next();
     }
 
-    if (next != NULL && next != current) {
+    if (next != NULL && next != idle && next != current) {
         next->state = PROCESS_RUNNING;
         process_set_current(next);
 
@@ -254,7 +263,7 @@ static process_t* wo_wake_one_proc(wait_object_t* wo) {
         sleep_list_remove(proc);
         proc->wake_deadline = 0;
 
-        proc->state = PROCESS_READY;
+        process_set_ready(proc);
         scheduler_add_process(proc);  // takes its own reference
         process_unref(proc);          // release the object-ref; scheduler holds one
         return proc;

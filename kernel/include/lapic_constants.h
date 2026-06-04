@@ -21,6 +21,11 @@
 #define LAPIC_TIMER_VECTOR      0x20        /* Default timer interrupt vector */
 #define LAPIC_TIMER_DIVIDE_16   16          /* Timer divisor value */
 
+/* SMP scheduler Brick E: CPU1's LAPIC timer vector. MUST differ from 0x20 (=32),
+ * which is IDT[32] = the PIC IRQ0 cooperative handler (it does a PIC EOI). CPU1's
+ * timer ISR EOIs the LAPIC instead, so we route it to a dedicated vector. */
+#define AP_LAPIC_TIMER_VECTOR   0x40        /* CPU1 periodic LAPIC timer (64) */
+
 /* TSC Frequency Estimation */
 #define TSC_FREQ_ESTIMATE_MHZ   3000        /* Approximate TSC frequency (3 GHz) */
 #define TSC_TICKS_PER_US        (TSC_FREQ_ESTIMATE_MHZ)

@@ -92,6 +92,10 @@
 #define SYS_EPOLL_CTL    74 // add/modify/remove watched fds     (kernel/core/syscall/epoll.c)
 #define SYS_EPOLL_WAIT   75 // block until events ready          (kernel/core/syscall/epoll.c)
 #define SYS_BATCH_SUBMIT 82 // batch syscall submission (io_uring-style)
+#define SYS_TRUNCATE    84  // truncate file to specified length
+#define SYS_FTRUNCATE   85  // truncate file via file descriptor
+#define SYS_FSYNC       86  // flush file data to storage
+#define SYS_SYNC        87  // flush all dirty data to storage
 #define SYS_VMA_TEST    200 // VMA red-black tree testing and benchmarking
 
 // ---- SMP coprocessor offload (GATED: only registered under SMP_FOUNDATION) ----
@@ -223,6 +227,14 @@ int64_t sys_rename(uint64_t oldpath, uint64_t newpath, uint64_t arg3,
                    uint64_t arg4, uint64_t arg5, uint64_t arg6);
 int64_t sys_mkdir(uint64_t path, uint64_t mode, uint64_t arg3,
                   uint64_t arg4, uint64_t arg5, uint64_t arg6);
+int64_t sys_truncate(uint64_t path, uint64_t length, uint64_t arg3,
+                     uint64_t arg4, uint64_t arg5, uint64_t arg6);
+int64_t sys_ftruncate(uint64_t fd, uint64_t length, uint64_t arg3,
+                      uint64_t arg4, uint64_t arg5, uint64_t arg6);
+int64_t sys_fsync(uint64_t fd, uint64_t arg2, uint64_t arg3,
+                  uint64_t arg4, uint64_t arg5, uint64_t arg6);
+int64_t sys_sync(uint64_t arg1, uint64_t arg2, uint64_t arg3,
+                 uint64_t arg4, uint64_t arg5, uint64_t arg6);
 
 // Memory / framebuffer / time syscalls (M1 graphics platform)
 int64_t sys_mmap(uint64_t hint, uint64_t len, uint64_t prot, uint64_t flags,

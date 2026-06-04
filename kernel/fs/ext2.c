@@ -65,6 +65,12 @@ static int ext2_read_inode(ext2_fs_data_t* fs_data, uint32_t inode_num, ext2_ino
 
     ext2_superblock_t* sb = fs_data->superblock;
 
+    // Untrusted on-disk superblock: s_inodes_per_group is the divisor below; a
+    // corrupt/crafted image with 0 here would #DE (ring-0 divide-by-zero). Reject.
+    if (sb->s_inodes_per_group == 0) {
+        return -1;
+    }
+
     // Calculate block group
     uint32_t group = (inode_num - 1) / sb->s_inodes_per_group;
     uint32_t index = (inode_num - 1) % sb->s_inodes_per_group;
@@ -76,11 +82,23 @@ static int ext2_read_inode(ext2_fs_data_t* fs_data, uint32_t inode_num, ext2_ino
     // Get inode table block
     uint32_t inode_table_block = fs_data->group_desc[group].bg_inode_table;
 
-    // Calculate inode position
+    // Calculate inode position. inode_size is also untrusted on-disk: if it is 0
+    // or exceeds the block size, inodes_per_block would be 0 and the divisions
+    // below would #DE. Reject before dividing.
     uint32_t inode_size = sb->s_inode_size ? sb->s_inode_size : EXT2_GOOD_OLD_INODE_SIZE;
+    if (inode_size == 0 || inode_size > fs_data->block_size) {
+        return -1;
+    }
     uint32_t inodes_per_block = fs_data->block_size / inode_size;
+    if (inodes_per_block == 0) {
+        return -1;
+    }
     uint32_t block_offset = index / inodes_per_block;
     uint32_t inode_offset = index % inodes_per_block;
+    // Ensure the inode fully fits inside the block buffer we memcpy from below.
+    if ((uint64_t)inode_offset * inode_size + sizeof(ext2_inode_t) > fs_data->block_size) {
+        return -1;
+    }
 
     // Read block containing the inode
     void* block_buffer = kmalloc(fs_data->block_size);
@@ -433,12 +451,23 @@ static vfs_dentry_t* ext2_vfs_lookup(vfs_inode_t* dir, const char* name) {
             continue;
         }
 
-        // Parse directory entries
+        // Parse directory entries. The loop bound requires the fixed 8-byte entry
+        // header (inode+rec_len+name_len+file_type) to be fully inside the block
+        // before we dereference it — otherwise a record near the block tail would
+        // read entry->rec_len/name_len past the kmalloc(block_size) buffer.
         uint32_t offset = 0;
-        while (offset < fs_data->block_size) {
+        while (offset + 8u <= fs_data->block_size) {
             ext2_dir_entry_t* entry = (ext2_dir_entry_t*)((uint8_t*)block_buffer + offset);
 
             if (entry->rec_len == 0 || entry->inode == 0) {
+                break;
+            }
+
+            // Untrusted on-disk rec_len/name_len: the record must cover its header
+            // plus the name, and must not run past the block. Otherwise the memcmp
+            // below (reading name_len bytes at entry->name) overruns the buffer.
+            if (entry->rec_len < 8u + (uint32_t)entry->name_len ||
+                offset + entry->rec_len > fs_data->block_size) {
                 break;
             }
 
@@ -554,6 +583,27 @@ vfs_superblock_t* ext2_mount(const char* source, uint32_t flags) {
         return NULL;
     }
 
+    // Validate untrusted on-disk superblock numerics BEFORE using them as shift
+    // amounts / divisors. A corrupt or crafted image must not be able to trigger a
+    // ring-0 #DE (divide-by-zero) or a multi-GB kmalloc:
+    //   - s_log_block_size > 2 makes (1024 << n) overflow toward 0 (div-by-zero in
+    //     read_inode) or a huge block_size (huge per-block kmalloc). ext2 only
+    //     defines block sizes 1024/2048/4096, i.e. n in {0,1,2}.
+    //   - s_blocks_per_group == 0 is the divisor at groups_count below (#DE).
+    //   - s_inodes_per_group == 0 is the divisor in read_inode (#DE).
+    if (fs_data->superblock->s_log_block_size > 2 ||
+        fs_data->superblock->s_blocks_per_group == 0 ||
+        fs_data->superblock->s_inodes_per_group == 0) {
+        kprintf("[EXT2] Rejecting image: invalid superblock geometry "
+                "(log_block_size=%u blocks_per_group=%u inodes_per_group=%u)\n",
+                fs_data->superblock->s_log_block_size,
+                fs_data->superblock->s_blocks_per_group,
+                fs_data->superblock->s_inodes_per_group);
+        kfree(fs_data->superblock);
+        kfree(fs_data);
+        return NULL;
+    }
+
     // Calculate block size
     fs_data->block_size = 1024 << fs_data->superblock->s_log_block_size;
     kprintf("[EXT2] Block size: %u bytes\n", fs_data->block_size);
@@ -657,20 +707,31 @@ vfs_superblock_t* ext2_mount(const char* source, uint32_t flags) {
  * Unmount an ext2 filesystem
  */
 void ext2_unmount(vfs_superblock_t* sb) {
-    if (!sb || !sb->private_data) {
+    if (!sb) {
         return;
     }
 
-    ext2_fs_data_t* fs_data = (ext2_fs_data_t*)sb->private_data;
-
-    if (fs_data->superblock) {
-        kfree(fs_data->superblock);
-    }
-    if (fs_data->group_desc) {
-        kfree(fs_data->group_desc);
+    // Free the root inode if present
+    if (sb->root) {
+        vfs_inode_put(sb->root);
+        sb->root = NULL;
     }
 
-    kfree(fs_data);
+    // Free ext2-specific data
+    if (sb->private_data) {
+        ext2_fs_data_t* fs_data = (ext2_fs_data_t*)sb->private_data;
+
+        if (fs_data->superblock) {
+            kfree(fs_data->superblock);
+        }
+        if (fs_data->group_desc) {
+            kfree(fs_data->group_desc);
+        }
+
+        kfree(fs_data);
+        sb->private_data = NULL;
+    }
+
     kfree(sb);
 }
 

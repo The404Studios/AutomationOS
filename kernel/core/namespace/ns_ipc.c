@@ -1,6 +1,7 @@
 #include "../../include/namespace.h"
 #include "../../include/kernel.h"
 #include "../../include/mem.h"
+#include "../../include/ipc.h"
 
 // External namespace ID counter
 extern uint32_t next_namespace_id;
@@ -27,21 +28,21 @@ ipc_namespace_t* ipc_namespace_create(void) {
 
     // Initialize fields
     ns->id = __atomic_fetch_add(&next_namespace_id, 1, __ATOMIC_SEQ_CST);
-    ns->table = NULL;  // Will be initialized by IPC subsystem
     ns->ref_count = 1;
 
-    kprintf("[IPC_NS] Created IPC namespace %d\n", ns->id);
-
-    // TODO: Initialize IPC tables for this namespace
-    // When IPC subsystem is implemented, this should:
-    // 1. Initialize shared memory segment table
-    // 2. Initialize semaphore array table
-    // 3. Initialize message queue table
-    //
+    // Initialize IPC table for this namespace
     // Each namespace maintains separate IPC identifier spaces:
     // - Key to ID mappings (ftok keys -> IPC IDs)
     // - ID to object mappings (IPC IDs -> actual objects)
     // - Permission checks (IPC_CREAT, IPC_EXCL, access modes)
+    ns->table = ipc_table_create();
+    if (!ns->table) {
+        kprintf("[IPC_NS] Failed to create IPC table for namespace %d\n", ns->id);
+        kfree(ns);
+        return NULL;
+    }
+
+    kprintf("[IPC_NS] Created IPC namespace %d\n", ns->id);
 
     return ns;
 }
@@ -57,20 +58,13 @@ void ipc_namespace_destroy(ipc_namespace_t* ns) {
 
     kprintf("[IPC_NS] Destroying IPC namespace %d\n", ns->id);
 
-    // TODO: Cleanup IPC objects in this namespace
-    // When IPC subsystem is implemented, this should:
-    // 1. Destroy all shared memory segments
-    //    - Detach all attached processes
-    //    - Free physical memory backing the segments
-    // 2. Destroy all semaphore arrays
-    //    - Wake up any processes waiting on semaphores
-    //    - Free semaphore structures
-    // 3. Destroy all message queues
-    //    - Free queued messages
-    //    - Wake up blocked senders/receivers
-    //
+    // Cleanup IPC objects in this namespace
+    // This destroys all shared memory segments and message queues
     // Note: IPC objects can outlive the processes that created them
     // (unless created with IPC_RMID), so we must explicitly clean up
+    if (ns->table) {
+        ipc_table_destroy(ns->table);
+    }
 
     kfree(ns);
 }

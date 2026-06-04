@@ -46,6 +46,10 @@
 #include "../../include/spinlock.h" /* spinlock_t for cpu1_job_lock */
 #include "../../include/errno.h"    /* EAPFAULT */
 #include "../../include/sched.h"    /* process_t for current_process */
+#include "../../include/smp.h"      /* percpu_data_t for health monitor */
+#ifdef SMP_SCHED
+#include "../../include/lapic_constants.h"  /* AP_LAPIC_TIMER_VECTOR (Brick E) */
+#endif
 
 /* Forward declaration for process ownership metadata in cpu1_job. */
 typedef struct process process_t;
@@ -56,20 +60,8 @@ extern process_t* current_process;
 /* cpu_id() helper (from smp.h) for ownership state transitions. */
 extern uint32_t cpu_id(void);
 
-/* percpu_data array (from smp.h) for health monitoring (heartbeat checks). */
-typedef struct {
-    uint32_t cpu_id;
-    uint32_t apic_id;
-    /* ... other fields ... */
-    struct {
-        uint32_t ownership_allocs;
-        uint32_t ownership_frees;
-        uint32_t ownership_leaks;
-        volatile uint64_t heartbeat;
-        uint64_t last_heartbeat;
-    } health;
-} percpu_data_t;
-extern percpu_data_t percpu_data[];
+/* percpu_data array (from smp.h) for health monitoring (heartbeat checks).
+ * The typedef is in smp.h, so we just declare the array here. */
 
 /* ---------------------------------------------------------------------------
  * Trampoline relocation contract. These MUST match ap_trampoline.asm
@@ -290,6 +282,87 @@ extern void     lapic_send_startup(uint32_t apic_id, uint32_t vector);
 /* Brick-0 MADT helpers (kernel/arch/x86_64/madt.c). */
 extern int madt_get_apic_id(int index);   /* APIC id of Nth enabled CPU, or -1 */
 
+#ifdef SMP_SCHED
+/* ===========================================================================
+ * SMP SCHEDULER Brick A: a REAL cpu_id().
+ * ---------------------------------------------------------------------------
+ * The coprocessor build uses stubs.c::cpu_id()==0 (single logical CPU). With
+ * -DSMP_SCHED we instead map the running core's hardware xAPIC id to a small
+ * logical id (BSP->0, AP1->1) so per-CPU state (current process, runqueue, TSS)
+ * can be indexed by CPU. We capture CPU1's hardware APIC id ONCE in
+ * try_start_cpu1() (BSP context, from the MADT) into g_ap1_apic_id; cpu_id()
+ * then reads its own xAPIC id via lapic_get_id() and compares.
+ *
+ * Ordering note: before try_start_cpu1() runs, g_ap1_apic_id is the sentinel
+ * 0xFFFFFFFF, so cpu_id() returns 0 for everyone -- identical to the old stub.
+ * After capture, only the core whose xAPIC id == g_ap1_apic_id reports 1; the
+ * BSP (and any unexpected core) reports 0. lapic_get_id() is a cheap MMIO read
+ * of LAPIC[0x20]>>24, valid on both cores once their LAPIC is enabled (the BSP
+ * in lapic_init(), the AP in the trampoline before ap_main). */
+static volatile uint32_t g_ap1_apic_id = 0xFFFFFFFFu;  /* CPU1 hw APIC id (set in try_start_cpu1) */
+
+uint32_t cpu_id(void)
+{
+    uint32_t self = lapic_get_id();
+    if (self == __atomic_load_n(&g_ap1_apic_id, __ATOMIC_ACQUIRE)) {
+        return 1u;
+    }
+    return 0u;   /* BSP, or any core we have not enumerated -> logical 0 */
+}
+
+/* Checkpoint evidence: the AP stores its own cpu_id() here so the BSP can print
+ * it MP-safely (ap_main must NOT touch the serial port -- two cores racing on
+ * 0x3F8 is not MP-safe). Expected value after CPU1 comes online: 1. */
+volatile uint32_t g_ap_observed_cpuid = 0xFFFFFFFFu;
+
+/* Brick B: the AP loads its OWN TSS (selector 0x38) via this gdt.c helper. */
+extern void gdt_ap_load_tss(void);
+
+/* Brick B checkpoint: the AP records its loaded Task Register selector here (via
+ * `str`) so the BSP can print it MP-safely. Expected after gdt_ap_load_tss(): 0x38. */
+volatile uint16_t g_ap_observed_tr = 0xFFFFu;
+
+/* Read the current Task Register selector (str = Store Task Register). */
+static inline uint16_t ap_read_tr(void)
+{
+    uint16_t tr;
+    __asm__ volatile("str %0" : "=r"(tr));
+    return tr;
+}
+
+/* Brick E: CPU1 LAPIC timer tick count. Only CPU1 writes it (single-writer), the
+ * BSP reads it for the checkpoint -> volatile is enough, no lock. */
+volatile uint64_t ap_timer_ticks = 0;
+
+/*
+ * lapic_tick -- the C handler for CPU1's LAPIC timer ISR (ap_lapic_timer_isr).
+ * `frame` is the interrupt_frame_t the asm stub built (used by Brick F to switch).
+ *
+ * BRICK E (this brick): prove the timer + EOI plumbing ONLY. Bump the per-CPU tick
+ * counter and EOI the LAPIC (NOT the PIC -- a PIC EOI here would wedge the BSP's
+ * IRQ0). Do NOT call schedule_from_irq yet, so the frame is left untouched and the
+ * iretq simply resumes whatever CPU1 was doing (its coprocessor worker loop).
+ */
+void lapic_tick(void* frame)
+{
+    ap_timer_ticks++;
+    extern void lapic_eoi(void);
+    lapic_eoi();                 /* LAPIC EOI (lapic_write(LAPIC_EOI, 0)) FIRST */
+
+#if defined(SMP_SCHED_DISPATCH)
+    /* Brick F: drive CPU1's preemptive dispatch. The EOI above already happened, so
+     * the LAPIC is ready for the next tick regardless of which process we resume.
+     * ap_schedule_from_irq is the AP-safe dispatcher (no global current, no PIC EOI);
+     * it may rewrite the frame in place to switch processes (F3+). In F1 its ring-3
+     * guard returns immediately (CPU1 is in its ring-0 scheduler loop). */
+    /* ap_schedule_from_irq is declared in sched.h (included above) under this gate. */
+    ap_schedule_from_irq((interrupt_frame_t*)frame);
+#else
+    (void)frame;
+#endif
+}
+#endif /* SMP_SCHED */
+
 /* TSC convention used across the SMP bricks: ~3 GHz estimate => 3000 cycles/us.
  * Used ONLY to bound the wait; the exact real frequency does not matter because
  * we only need a finite deadline (faster TSC -> shorter wait, slower -> longer,
@@ -349,6 +422,52 @@ void ap_main(uint64_t cpu)
 {
     (void)cpu;
 
+#ifdef SMP_SCHED
+    /* Brick B: load CPU1's OWN TSS (selector 0x38) FIRST, before anything else and
+     * before any sti. From here CPU1's ring-3 entries / #DF use ITS rsp0 + ITS IST1
+     * stack, never CPU0's. ltr is CPU-local and needs no interrupts; the BSP already
+     * installed gdt[7-8] in tss_init(). */
+    gdt_ap_load_tss();
+    g_ap_observed_tr = ap_read_tr();         /* expect 0x38 */
+
+    /* Brick C: program CPU1's OWN SYSCALL MSRs (STAR/LSTAR/FMASK/EFER.SCE are
+     * per-CPU). CPU1's LSTAR -> syscall_entry_cpu1, which loads kernel_rsp_save_arr[1]
+     * -- so when CPU1 runs ring-3 code (Brick F) its SYSCALLs use ITS kernel stack,
+     * never CPU0's. Harmless now (CPU1 issues no SYSCALL until it dispatches). */
+    {
+        extern void syscall_msr_init_ap(void);
+        syscall_msr_init_ap();
+    }
+
+#ifdef SMP_SCHED_DISPATCH
+    /* Brick F: ENABLE SSE on CPU1. The AP trampoline brings up long mode but does
+     * NOT enable SSE (CR4.OSFXSR), and context_switch_asm uses fxsave64/fxrstor64 to
+     * save/restore FPU state on EVERY context switch -- those #UD/#GP if SSE is off,
+     * silently wedging CPU1 the instant ap_enter_scheduler does its first switch.
+     * Set CR0.MP=1, CR0.EM=0 (no FPU emulation) and CR4.OSFXSR|OSXMMEXCPT (enable
+     * fxsave/fxrstor + SSE), matching what the BSP did at boot. Per-CPU control regs. */
+    {
+        uint64_t cr0, cr4;
+        __asm__ volatile("mov %%cr0, %0" : "=r"(cr0));
+        cr0 &= ~(1ULL << 2);                 /* EM = 0 (no x87 emulation) */
+        cr0 |=  (1ULL << 1);                 /* MP = 1 */
+        __asm__ volatile("mov %0, %%cr0" :: "r"(cr0));
+        __asm__ volatile("mov %%cr4, %0" : "=r"(cr4));
+        cr4 |= (1ULL << 9) | (1ULL << 10);   /* OSFXSR | OSXMMEXCPT */
+        __asm__ volatile("mov %0, %%cr4" :: "r"(cr4));
+    }
+#endif
+
+    /* Brick A checkpoint: record what THIS core's REAL cpu_id() reports BEFORE we
+     * publish ap1_online. Because the SEQ_CST store of ap1_online below acts as a
+     * release, the BSP's ACQUIRE-load of ap1_online synchronizes-with this store,
+     * so by the time the BSP prints the checkpoint it is guaranteed to observe the
+     * value here (expect 1) rather than the .bss sentinel. g_ap1_apic_id was
+     * published by the BSP (RELEASE) before the SIPI that started us, so cpu_id()'s
+     * ACQUIRE-load of it sees CPU1's hardware APIC id. */
+    g_ap_observed_cpuid = cpu_id();
+#endif
+
     /* Tell the BSP we reached long mode and are alive. SEQ_CST publish. */
     __atomic_store_n(&ap1_online, 1u, __ATOMIC_SEQ_CST);
 
@@ -360,11 +479,50 @@ void ap_main(uint64_t cpu)
         __asm__ volatile("pause");
     }
 
-    /* Managed kernel WORKER loop: poll the ONE job slot the BSP dispatches into.
-     * On a pending job, run the trusted fn, publish `done`, then free the slot.
-     * Otherwise idle (bump the tick counter, `pause`). The AP must spin-poll (NOT
-     * `hlt`) because it has no wakeup interrupt yet. NO sti, NO timer, NO handler,
-     * NO scheduler -- it executes ONLY cpu1_job.fn and nothing else. */
+#ifdef SMP_SCHED
+    /* Brick E: arm CPU1's OWN LAPIC timer (100 Hz) at the dedicated vector 0x40 and
+     * ENABLE INTERRUPTS for the first time on CPU1. From here the timer ISR fires
+     * periodically -> lapic_tick() EOIs the LAPIC + bumps ap_timer_ticks, then iretq
+     * resumes the worker loop below. No scheduling yet (Brick F). The PIC delivers
+     * legacy IRQs to the BSP only, and CPU1's other LVTs are masked at reset, so the
+     * ONLY interrupt CPU1 takes is its local timer (and, handled, a 0xFF spurious).
+     * This is the FIRST sti on CPU1. */
+    {
+        /* Software-enable CPU1's OWN LAPIC first (set SIVR.enable + TPR=0 + the
+         * IA32_APIC_BASE global-enable). The AP never ran lapic_init(), so its LAPIC
+         * is software-disabled and would deliver no timer interrupts. xAPIC MMIO is
+         * CPU-local (no x2APIC here), so this programs the AP's own LAPIC. */
+        extern void lapic_enable(void);
+        extern void lapic_timer_init_vector(uint32_t frequency, uint8_t vector);
+        lapic_enable();
+        lapic_timer_init_vector(100, AP_LAPIC_TIMER_VECTOR);
+        __asm__ volatile("sti");
+    }
+#endif
+
+#if defined(SMP_SCHED) && defined(SMP_SCHED_DISPATCH)
+    /* SCHEDULER MODE (Brick F): CPU1 hands itself to the AP-safe scheduler loop
+     * instead of the coprocessor worker loop. From here CPU1's LAPIC timer drives
+     * ap_schedule_from_irq() and the loop cooperatively runs CPU1's own runqueue
+     * processes. CPU1 no longer services cpu1_job (the BSP skips the matmul/worktest
+     * offload self-tests in this mode). ap_scheduler_loop() NEVER returns. */
+    {
+        /* SCHEDULER MODE: run ap_scheduler_loop directly on the AP boot stack. CPU1's
+         * idle thread (cpus[1].current_thread, set in scheduler_init_secondary_cpu)
+         * is the SAVE TARGET for this loop's execution: the first cooperative switch
+         * (idle->thread) saves THIS boot-stack state into idle->context, and a later
+         * switch back restores it -- self-consistent (idle always resumes the loop on
+         * the boot stack, which is a valid static buffer). NEVER returns. */
+        extern void ap_scheduler_loop(void);
+        ap_scheduler_loop();
+        kernel_panic("ap_scheduler_loop returned (must never happen)");
+    }
+#endif
+
+    /* COPROCESSOR MODE (default SMP_SCHED / SMP=1): managed kernel WORKER loop.
+     * Poll the ONE job slot the BSP dispatches into. On a pending job, run the
+     * trusted fn, publish `done`, then free the slot. Otherwise idle (bump the tick
+     * counter, `pause`). It executes ONLY cpu1_job.fn -- NO scheduler. */
     for (;;) {
         if (__atomic_load_n(&cpu1_job.pending, __ATOMIC_ACQUIRE)) {
             /* ACQUIRE on `pending`==1 synchronizes-with the BSP's RELEASE in
@@ -1189,6 +1347,13 @@ int try_start_cpu1(void)
     }
     uint32_t aid = (uint32_t)ap_apic;
 
+#ifdef SMP_SCHED
+    /* Brick A: publish CPU1's hardware xAPIC id so cpu_id() can map it -> logical
+     * 1. RELEASE so the AP (once it runs cpu_id() in ap_main) observes the value.
+     * Captured here in the BSP from the MADT, before the SIPI. */
+    __atomic_store_n(&g_ap1_apic_id, aid, __ATOMIC_RELEASE);
+#endif
+
 #ifdef SMP_FORCE_AP_FAIL
     /* Forced-failure mode: send the SIPI to a bogus APIC id (0xFE) that no CPU
      * answers, so ap1_online is never set and the bounded wait must expire. This
@@ -1244,4 +1409,24 @@ int cpu1_is_online(void)
 {
     return (__atomic_load_n(&ap1_online, __ATOMIC_ACQUIRE) != 0 &&
             __atomic_load_n(&cpu1_offline, __ATOMIC_ACQUIRE) == 0);
+}
+
+/* ============================================================================
+ * SMP Infrastructure for Health Monitor
+ * ============================================================================
+ * The health monitor needs cpu_data() and smp_num_online, which are normally
+ * defined in smp.c. Since the SMP_FOUNDATION build doesn't include smp.c,
+ * we provide minimal definitions here to support health monitoring.
+ */
+
+/* Per-CPU data array (normally from smp.c) */
+percpu_data_t percpu_data[MAX_CPUS];
+
+/* Number of online CPUs (normally from smp.c) */
+uint32_t smp_num_online = 2;  /* BSP + AP1 for SMP_FOUNDATION */
+
+/* Get per-CPU data pointer (normally from smp.c) */
+percpu_data_t* cpu_data(uint32_t cpu) {
+    if (cpu >= MAX_CPUS) return (void*)0;
+    return &percpu_data[cpu];
 }

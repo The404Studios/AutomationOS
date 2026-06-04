@@ -85,6 +85,32 @@ static inline int fpu_state_is_uninitialised(const uint8_t* fpu_state) {
     return (mxcsr == 0);
 }
 
+#if defined(SMP_SCHED) && defined(SMP_SCHED_DISPATCH)
+// Initialize the FPU template ONCE, eagerly. Called from scheduler_init() on the
+// BSP BEFORE CPU1 is brought online, so CPU1's context_prime_fpu() (and CPU0's first
+// context_switch) never race to lazily fpu_init_template() concurrently (audit fix).
+void context_fpu_template_init(void) {
+    if (!fpu_template_ready) fpu_init_template();
+}
+
+// AP-safe FPU priming (Brick F3 fix D6). The CPU1 dispatcher (ap_cooperative_schedule)
+// calls context_switch_asm() DIRECTLY, bypassing context_switch()'s template priming
+// above — so a fresh process's all-zero fpu_state would fxrstor MXCSR=0 (all SSE
+// exceptions unmasked) and a ring-3 app's first SSE op would #XM with no handler.
+// Call this on `to` BEFORE the AP's context_switch_asm. It writes ONLY `to`'s own
+// fpu_state (no global state), so it is safe to run on CPU1. Idempotent: only primes
+// the uninitialised (memset-zeroed) sentinel; an already-saved FPU state is left alone.
+void context_prime_fpu(process_t* to) {
+    if (!to) return;
+    if (__builtin_expect(!fpu_template_ready, 0)) {
+        fpu_init_template();
+    }
+    if (fpu_state_is_uninitialised(to->context.fpu_state)) {
+        __builtin_memcpy(to->context.fpu_state, fpu_template, 512);
+    }
+}
+#endif
+
 // C wrapper for context switching
 void context_switch(process_t* from, process_t* to) {
     // Start performance measurement

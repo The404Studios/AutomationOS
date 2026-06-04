@@ -66,7 +66,14 @@ int64_t sys_exit(uint64_t status, uint64_t arg2, uint64_t arg3,
 // child's address space.  Returns 0 on success, -1 if any allocation fails.
 static int fork_copy_user_pages(process_t* child) {
     uint64_t parent_cr3 = read_cr3() & ~0xFFFULL;
-    uint64_t* parent_pml4 = (uint64_t*)parent_cr3;
+    // Walk the parent's page tables + copy its pages via the DIRECT MAP. fork runs
+    // under the PARENT's CR3 and NEVER switches to kernel CR3, so dereferencing the
+    // parent's PT/PD/PDPT pages and copying its frames via raw phys==virt would #PF
+    // on any frame the parent's mutated identity map doesn't cover (the phys==virt
+    // bug family; the twin of the exec/cow/vma sites). PHYS_TO_DIRECT resolves on the
+    // shared higher-half alias regardless of CR3. (vmm_map_page() args below stay RAW
+    // physical -- they are PTE values, not derefs.)
+    uint64_t* parent_pml4 = (uint64_t*)PHYS_TO_DIRECT(parent_cr3);
 
     // Point all subsequent vmm_map_page() calls at the child's PML4.
     paging_set_target(child->context.cr3);
@@ -83,11 +90,11 @@ static int fork_copy_user_pages(process_t* child) {
     for (int pml4i = 0; pml4i < 256; pml4i++) {
         if (!(parent_pml4[pml4i] & PAGE_PRESENT)) continue;
 
-        uint64_t* pdpt = (uint64_t*)(parent_pml4[pml4i] & ~0xFFFULL);
+        uint64_t* pdpt = (uint64_t*)PHYS_TO_DIRECT(parent_pml4[pml4i] & ~0xFFFULL);
         for (int pdpti = 0; pdpti < 512; pdpti++) {
             if (!(pdpt[pdpti] & PAGE_PRESENT)) continue;
 
-            uint64_t* pd = (uint64_t*)(pdpt[pdpti] & ~0xFFFULL);
+            uint64_t* pd = (uint64_t*)PHYS_TO_DIRECT(pdpt[pdpti] & ~0xFFFULL);
             for (int pdi = 0; pdi < 512; pdi++) {
                 if (!(pd[pdi] & PAGE_PRESENT)) continue;
 
@@ -107,13 +114,14 @@ static int fork_copy_user_pages(process_t* child) {
                         uint64_t va = base_va + (pti * PAGE_SIZE);
                         void* new_page = pmm_alloc_page();
                         if (!new_page) goto fail;
-                        memcpy(new_page, (void*)(base_phys + pti * PAGE_SIZE), PAGE_SIZE);
+                        memcpy(PHYS_TO_DIRECT(new_page),
+                               PHYS_TO_DIRECT(base_phys + pti * PAGE_SIZE), PAGE_SIZE);
                         vmm_map_page((void*)va, new_page, base_flags);
                     }
                     continue;
                 }
 
-                uint64_t* pt = (uint64_t*)(pd[pdi] & ~0xFFFULL);
+                uint64_t* pt = (uint64_t*)PHYS_TO_DIRECT(pd[pdi] & ~0xFFFULL);
                 for (int pti = 0; pti < 512; pti++) {
                     if (!(pt[pti] & PAGE_PRESENT)) continue;
                     if (!(pt[pti] & PAGE_USER))   continue;   // skip kernel pages
@@ -167,7 +175,7 @@ static int fork_copy_user_pages(process_t* child) {
                     // saturated) of an owned page.
                     void* new_page = pmm_alloc_page();
                     if (!new_page) goto fail;
-                    memcpy(new_page, (void*)phys, PAGE_SIZE);
+                    memcpy(PHYS_TO_DIRECT(new_page), PHYS_TO_DIRECT(phys), PAGE_SIZE);
                     vmm_map_page((void*)va, new_page, flags);
                     n_eager++;
                 }
@@ -1241,16 +1249,25 @@ int64_t sys_rename(uint64_t oldpath, uint64_t newpath, uint64_t arg3,
         return EFAULT;
     }
 
-    // Copy old path from userspace
-    char kernel_oldpath[MAX_PATH_LEN];
+    // MAX_PATH_LEN is 4096 and KERNEL_STACK_SIZE is 8192, so TWO such buffers on
+    // the kernel stack overflow it (ring-3 triggerable stack smash). Heap-allocate
+    // both path buffers instead.
+    char* kernel_oldpath = (char*)kmalloc(MAX_PATH_LEN);
+    char* kernel_newpath = (char*)kmalloc(MAX_PATH_LEN);
+    if (!kernel_oldpath || !kernel_newpath) {
+        if (kernel_oldpath) kfree(kernel_oldpath);
+        if (kernel_newpath) kfree(kernel_newpath);
+        return ENOMEM;
+    }
+
     if (copy_user_string(kernel_oldpath, (const void*)oldpath, MAX_PATH_LEN) != COPY_SUCCESS) {
+        kfree(kernel_oldpath); kfree(kernel_newpath);
         return EFAULT;
     }
     kernel_oldpath[MAX_PATH_LEN - 1] = '\0';
 
-    // Copy new path from userspace
-    char kernel_newpath[MAX_PATH_LEN];
     if (copy_user_string(kernel_newpath, (const void*)newpath, MAX_PATH_LEN) != COPY_SUCCESS) {
+        kfree(kernel_oldpath); kfree(kernel_newpath);
         return EFAULT;
     }
     kernel_newpath[MAX_PATH_LEN - 1] = '\0';
@@ -1260,12 +1277,12 @@ int64_t sys_rename(uint64_t oldpath, uint64_t newpath, uint64_t arg3,
     if (result < 0) {
         kprintf("[SYSCALL] sys_rename: Failed to rename %s to %s\n",
                 kernel_oldpath, kernel_newpath);
-        return result;
+    } else {
+        kprintf("[SYSCALL] sys_rename: Renamed %s to %s\n",
+                kernel_oldpath, kernel_newpath);
     }
-
-    kprintf("[SYSCALL] sys_rename: Renamed %s to %s\n",
-            kernel_oldpath, kernel_newpath);
-    return 0;
+    kfree(kernel_oldpath); kfree(kernel_newpath);
+    return result < 0 ? result : 0;
 }
 
 // SYS_MKDIR - create a directory (parents created as needed)
@@ -1292,6 +1309,79 @@ int64_t sys_mkdir(uint64_t path, uint64_t mode, uint64_t arg3,
     if (result < 0) {
         return result;
     }
+    return 0;
+}
+
+// SYS_TRUNCATE - truncate file to specified length
+int64_t sys_truncate(uint64_t path, uint64_t length, uint64_t arg3,
+                     uint64_t arg4, uint64_t arg5, uint64_t arg6) {
+    (void)arg3; (void)arg4; (void)arg5; (void)arg6;
+
+    if (!path) {
+        return EFAULT;
+    }
+
+    // Copy path from userspace
+    char kernel_path[MAX_PATH_LEN];
+    if (copy_user_string(kernel_path, (const void*)path, MAX_PATH_LEN) != COPY_SUCCESS) {
+        return EFAULT;
+    }
+    kernel_path[MAX_PATH_LEN - 1] = '\0';
+
+    // Truncate file
+    int result = vfs_truncate(kernel_path, (off_t)length);
+    if (result < 0) {
+        kprintf("[SYSCALL] sys_truncate: Failed to truncate %s to %lld\n",
+                kernel_path, (long long)length);
+        return result;
+    }
+
+    return 0;
+}
+
+// SYS_FTRUNCATE - truncate file via file descriptor
+int64_t sys_ftruncate(uint64_t fd, uint64_t length, uint64_t arg3,
+                      uint64_t arg4, uint64_t arg5, uint64_t arg6) {
+    (void)arg3; (void)arg4; (void)arg5; (void)arg6;
+
+    // Truncate file
+    int result = vfs_ftruncate((int)fd, (off_t)length);
+    if (result < 0) {
+        kprintf("[SYSCALL] sys_ftruncate: Failed to truncate fd %lld to %lld\n",
+                (long long)fd, (long long)length);
+        return result;
+    }
+
+    return 0;
+}
+
+// SYS_FSYNC - flush file data to storage
+int64_t sys_fsync(uint64_t fd, uint64_t arg2, uint64_t arg3,
+                  uint64_t arg4, uint64_t arg5, uint64_t arg6) {
+    (void)arg2; (void)arg3; (void)arg4; (void)arg5; (void)arg6;
+
+    // Flush file
+    int result = vfs_fsync((int)fd);
+    if (result < 0) {
+        kprintf("[SYSCALL] sys_fsync: Failed to sync fd %lld\n", (long long)fd);
+        return result;
+    }
+
+    return 0;
+}
+
+// SYS_SYNC - flush all dirty data to storage
+int64_t sys_sync(uint64_t arg1, uint64_t arg2, uint64_t arg3,
+                 uint64_t arg4, uint64_t arg5, uint64_t arg6) {
+    (void)arg1; (void)arg2; (void)arg3; (void)arg4; (void)arg5; (void)arg6;
+
+    // Flush all dirty data
+    int result = vfs_sync();
+    if (result < 0) {
+        kprintf("[SYSCALL] sys_sync: Failed to sync all filesystems\n");
+        return result;
+    }
+
     return 0;
 }
 

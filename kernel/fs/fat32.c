@@ -636,20 +636,31 @@ vfs_superblock_t* fat32_mount(const char* source, uint32_t flags) {
  * Unmount a FAT32 filesystem
  */
 void fat32_unmount(vfs_superblock_t* sb) {
-    if (!sb || !sb->private_data) {
+    if (!sb) {
         return;
     }
 
-    fat32_fs_data_t* fs_data = (fat32_fs_data_t*)sb->private_data;
-
-    if (fs_data->boot_sector) {
-        kfree(fs_data->boot_sector);
-    }
-    if (fs_data->fat) {
-        kfree(fs_data->fat);
+    // Free the root inode if present
+    if (sb->root) {
+        vfs_inode_put(sb->root);
+        sb->root = NULL;
     }
 
-    kfree(fs_data);
+    // Free FAT32-specific data
+    if (sb->private_data) {
+        fat32_fs_data_t* fs_data = (fat32_fs_data_t*)sb->private_data;
+
+        if (fs_data->boot_sector) {
+            kfree(fs_data->boot_sector);
+        }
+        if (fs_data->fat) {
+            kfree(fs_data->fat);
+        }
+
+        kfree(fs_data);
+        sb->private_data = NULL;
+    }
+
     kfree(sb);
 }
 

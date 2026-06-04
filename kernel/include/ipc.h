@@ -91,7 +91,8 @@ int64_t sys_shmctl(uint64_t shmid, uint64_t cmd, uint64_t buf,
 void shm_init(void);
 shm_segment_t* shm_find_by_key(key_t key);
 shm_segment_t* shm_find_by_id(ipc_id_t id);
-void shm_cleanup_process(uint32_t pid);
+struct process;
+void shm_cleanup_process(struct process* proc);
 
 // ============================================================================
 // Message Queues

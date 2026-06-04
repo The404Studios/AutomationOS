@@ -157,7 +157,7 @@ process_t* exec_create_process(const char* path, const char* name,
     // For now, we'll handle this in the assembly context switch code
 
     // Mark as ready to run
-    proc->state = PROCESS_READY;
+    process_set_ready(proc);
 
     EXEC_LOG("[EXEC] Process created: PID=%d entry=0x%016lx stack=0x%016lx\n",
             proc->pid, entry, stack);
@@ -453,11 +453,39 @@ int elf_load_and_exec(void* elf_data, size_t elf_size, const char* name) {
                     // proc CR3 (paging_set_target(proc->cr3) is in effect); this only
                     // reads page-table memory and is unaffected by the live CR3 switch.
                     uint64_t pte = paging_get_pte(vaddr);
+                    // SAFETY (kernel self-protection): if phase 1's vmm_map_page()
+                    // did NOT install a private 4KB frame for this page — it ran out
+                    // of memory backing a very large segment, so the page is STILL
+                    // the inherited 2MB identity huge page (PS bit 7) or not present
+                    // (pte==0) — then `dphys` below would be the IDENTITY physical of
+                    // vaddr, i.e. KERNEL RAM. A big app's BSS VA range (photos: 35MB,
+                    // VA 0x208000..0x2405728) overlaps the low physical RAM where the
+                    // kernel heap/slabs live, so a memset/memcpy through such a dphys
+                    // scribbles the kernel (seen: slab headers zeroed -> SLABDIAG ->
+                    // kmalloc #GP). Never populate via a non-private frame; abort the
+                    // load cleanly so the kernel stays intact.
+                    if ((pte & 0x1) == 0 || (pte & (1ULL << 7))) {
+                        write_cr3(caller_cr3);
+                        kprintf("[EXEC] PROTECT: seg %d page %lu/%lu vaddr=%p not backed by a "
+                                "private frame (pte=0x%lx); segment too large for free RAM — "
+                                "failing load (kernel protected)\n",
+                                i, j, num_pages, (void*)vaddr, pte);
+                        elf_cleanup_failed_load(proc);
+                        return ELF_ERR_NOMEM;
+                    }
                     // Mask off BOTH the low flag bits AND the high flag bits.
                     // ~0xFFF alone leaves bit 63 (PAGE_NX) set for NX data pages,
                     // producing a non-canonical pointer that #GPs on the store
                     // below; use the architectural phys-addr mask instead.
                     uint8_t* dphys = (uint8_t*)(pte & 0x000FFFFFFFFFF000ULL);  // identity-mapped
+
+                    // [SLABPROBE] ground-truth: does this BSS page's identity physical
+                    // point at a LIVE slab page (so the memset below corrupts it)?
+                    if (*(volatile uint64_t*)dphys == 0x51AB0BACE51AB0BULL) {
+                        kprintf("[SLABPROBE] exec '%s' seg %d pg %lu ZEROING LIVE SLAB "
+                                "dphys=%p va=%p pte=0x%lx\n", proc->name, i, j,
+                                (void*)dphys, (void*)vaddr, (unsigned long)pte);
+                    }
 
                     uint64_t page_lo = j * PAGE_SIZE;              // region offset of page start
                     uint64_t page_hi = page_lo + PAGE_SIZE;        // region offset of page end
@@ -543,7 +571,14 @@ int elf_load_and_exec(void* elf_data, size_t elf_size, const char* name) {
             elf_cleanup_failed_load(proc);
             return ELF_ERR_NOMEM;
         }
-        memset(phys_page, 0, PAGE_SIZE);
+        // Zero the freshly-allocated frame via the DIRECT MAP. The active CR3 here is
+        // the CALLER's (a PROCESS CR3 whenever a running process spawns this exec).
+        // A process CR3's low identity map can be split/partial/mutated and need NOT
+        // cover a HIGH physical frame, so a raw memset(phys_page) -- phys==virt --
+        // #PFs (THE churn crash). PHYS_TO_DIRECT() resolves through PML4[256], the
+        // shared higher-half alias present + immutable in EVERY CR3 -- always mapped,
+        // no CR3 switch.
+        memset(PHYS_TO_DIRECT(phys_page), 0, PAGE_SIZE);
         // Stack is writable data: W + NX (never executable).
         vmm_map_page((void*)top_page, phys_page, PAGE_PRESENT | PAGE_WRITE | PAGE_USER | PAGE_NX);
         stack_top_phys = phys_page;
@@ -563,7 +598,8 @@ int elf_load_and_exec(void* elf_data, size_t elf_size, const char* name) {
 
         // Stack is writable data: W + NX (never executable).
         vmm_map_page((void*)vaddr, phys_page, PAGE_PRESENT | PAGE_WRITE | PAGE_USER | PAGE_NX);
-        memset(phys_page, 0, PAGE_SIZE);
+        // Zero via the DIRECT MAP (always mapped on any CR3; see LAZY branch note).
+        memset(PHYS_TO_DIRECT(phys_page), 0, PAGE_SIZE);
 
         if (i == 0 || i == num_stack_pages - 1) {
             EXEC_LOG("[EXEC]   Stack page %lu: vaddr=0x%016lx -> phys=%p\n", i, vaddr, phys_page);
@@ -595,9 +631,14 @@ int elf_load_and_exec(void* elf_data, size_t elf_size, const char* name) {
     // no physical handle to the top page, fall back to the old empty frame.
     uint64_t stack_ptr;
     if (stack_top_phys) {
+        // The argv frame is written THROUGH the stack-top frame (U2P below). Same
+        // wrong-CR3 hazard as the stack memset above: under the caller's process CR3
+        // a high frame need not be identity-mapped. Address it via the DIRECT MAP
+        // (PML4[256], shared + present in every CR3) instead of the raw phys -- no
+        // CR3 switch needed.
         enum { EXEC_MAX_ARGS = 16 };
         uint64_t top   = USER_STACK_TOP;                       // exclusive end
-        uint64_t pbase = (uint64_t)(uintptr_t)stack_top_phys;  // phys of [top-4096, top)
+        uint64_t pbase = (uint64_t)(uintptr_t)PHYS_TO_DIRECT(stack_top_phys); // direct-map alias of [top-4096, top)
         uint64_t pfloor = top - PAGE_SIZE;                     // low bound of the page
         #define U2P(uva) ((char*)(uintptr_t)(pbase + ((uva) - pfloor)))
 
@@ -682,7 +723,7 @@ int elf_load_and_exec(void* elf_data, size_t elf_size, const char* name) {
     EXEC_LOG("[EXEC]   Kernel RSP=0x%016lx CR3=0x%016lx\n", proc->context.rsp, proc->context.cr3);
 
     // Mark as ready to run
-    proc->state = PROCESS_READY;
+    process_set_ready(proc);
     EXEC_LOG("[EXEC] Process state set to READY\n");
 
     // Add to scheduler

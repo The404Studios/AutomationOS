@@ -435,11 +435,27 @@ int vfs_rename(const char* oldpath, const char* newpath) {
 
     vfs_dentry_t* dentry = old_entries[old_index];
 
+    // Self-rename (same directory, same name) is a no-op. Without this guard the
+    // destination-removal loop below matches THIS very dentry (same parent + same
+    // name), vfs_dentry_free()s it, and the name memcpy / re-insert further down
+    // is then a use-after-free + directory corruption.
+    if (old_parent == new_parent && strcmp(old_filename, new_filename) == 0) {
+        vfs_inode_put(old_parent);
+        vfs_inode_put(new_parent);
+        return 0;
+    }
+
     // Check if destination exists and remove it
     if (new_parent->private_data) {
         vfs_dentry_t** new_entries = (vfs_dentry_t**)new_parent->private_data;
         for (uint64_t i = 0; i < new_parent->data_capacity; i++) {
             if (new_entries[i] && strcmp(new_entries[i]->name, new_filename) == 0) {
+                // Never free the source dentry itself (defensive: e.g. case-folded
+                // collisions). The self-rename short-circuit above is the primary
+                // guard; this prevents any residual aliasing from freeing `dentry`.
+                if (new_entries[i] == dentry) {
+                    continue;
+                }
                 // Destination exists - remove it. vfs_dentry_free() drops the
                 // inode reference, so don't put it separately (double-free).
                 vfs_dentry_t* old_dentry = new_entries[i];

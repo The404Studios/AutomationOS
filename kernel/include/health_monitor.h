@@ -3,6 +3,7 @@
 
 #include "types.h"
 #include "kernel.h"
+#include "smp.h"
 
 /*
  * health_monitor.h — System Health and Liveness Monitoring
@@ -27,8 +28,8 @@
  *
  *   // Periodic sampling (e.g., timer tick on CPU 0)
  *   health_monitor_sample();
- *   uint32_t stalls = health_monitor_detect_stalls();
- *   uint32_t leaks = health_monitor_detect_leaks();
+ *   bool stalls = health_monitor_detect_stalls();
+ *   bool leaks = health_monitor_detect_leaks();
  *   if (stalls || leaks) {
  *       health_monitor_report();
  *   }
@@ -115,11 +116,11 @@ void health_monitor_sample(void);
  * Compares current heartbeat to last_heartbeat for each online CPU. A CPU is
  * considered stalled if its heartbeat has not advanced since the last sample.
  *
- * Returns: Number of stalled CPUs detected
+ * Returns: true if any CPU is stalled, false otherwise
  *
  * Side effects: Updates system_health.stalls_detected counter
  */
-uint32_t health_monitor_detect_stalls(void);
+bool health_monitor_detect_stalls(void);
 
 /**
  * health_monitor_detect_leaks — Detect CPUs with growing memory ownership leaks
@@ -127,7 +128,7 @@ uint32_t health_monitor_detect_stalls(void);
  * Computes ownership_leaks = ownership_allocs - ownership_frees for each CPU.
  * A leak is reported if the difference exceeds a threshold (e.g., 100 objects).
  *
- * Returns: Number of CPUs with suspected leaks
+ * Returns: true if any CPU has suspected leaks, false otherwise
  *
  * Side effects: Updates per_cpu_health.ownership_leaks field for each CPU
  *
@@ -135,7 +136,7 @@ uint32_t health_monitor_detect_stalls(void);
  * (e.g., persistent cache entries). Pair with temporal analysis (trending up
  * over multiple samples) for higher confidence.
  */
-uint32_t health_monitor_detect_leaks(void);
+bool health_monitor_detect_leaks(void);
 
 /**
  * health_monitor_detect_deadlock — Detect system-wide deadlock condition
@@ -266,6 +267,6 @@ const per_cpu_health_t* health_monitor_get_cpu_health(uint32_t cpu_id);
  *
  * @note This function does NOT return (calls kernel_panic)
  */
-void health_monitor_recover_deadlock(void) NORETURN;
+NORETURN void health_monitor_recover_deadlock(void);
 
 #endif // HEALTH_MONITOR_H

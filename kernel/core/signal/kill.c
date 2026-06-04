@@ -192,7 +192,7 @@ int64_t sys_kill(uint64_t pid, uint64_t sig, uint64_t arg3,
             kprintf("[KILL] Sending SIGCONT to process %u (%s)\n",
                     target->pid, target->name);
             if (target->state == PROCESS_BLOCKED) {
-                target->state = PROCESS_READY;
+                process_set_ready(target);
                 scheduler_add_process(target);
                 // Note: scheduler_add_process() calls process_ref() internally,
                 // so after this call target->ref_count is incremented by 1 for

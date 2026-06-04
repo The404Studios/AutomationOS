@@ -216,6 +216,10 @@ ssize_t vfs_read(int fd, void* buf, size_t count);
 ssize_t vfs_write(int fd, const void* buf, size_t count);
 int vfs_close(int fd);
 off_t vfs_lseek(int fd, off_t offset, int whence);
+int vfs_truncate(const char* path, off_t length);
+int vfs_ftruncate(int fd, off_t length);
+int vfs_fsync(int fd);
+int vfs_sync(void);
 
 // File information
 int vfs_stat(const char* path, vfs_stat_t* buf);

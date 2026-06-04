@@ -68,37 +68,53 @@ static uint32_t next_shm_id = 1;   // Next segment ID to allocate
 static spinlock_t shm_lock;        // Protects both tables
 
 // ─── Per-process attachment tracking ───────────────────────────────────────
-// Without this, a process that ATTACHES another process's segment and then dies
-// without shmdt() leaves the segment's attach_count permanently inflated, so an
-// IPC_RMID'd segment is never freed (a real leak — #7). We record one
-// (pid, id) entry per successful shmat and drop it on shmdt; on process death
-// shm_cleanup_process() replays the dead pid's entries to decrement attach_count
-// accurately. A small fixed table is fine (compositor + a handful of clients);
-// if it ever fills, attachments simply fall back to the old (leaky) behavior.
-#define SHM_MAX_ATTACHES 128
-typedef struct { uint32_t pid; ipc_id_t id; } shm_attach_rec_t;
-static shm_attach_rec_t shm_attaches[SHM_MAX_ATTACHES];   // pid==0 => empty slot
+// Each process_t has a singly-linked list of shm_attachment_t nodes tracking
+// its active SHM attachments. On shmat() we prepend a node; on shmdt() we
+// remove it; on process death shm_cleanup_process() walks the list to decrement
+// attach_count for each segment. This makes cleanup O(n) where n is the number
+// of attachments THIS process holds (typically 1-5) instead of O(128).
 
-// Caller must hold shm_lock.
-static void shm_attach_record(uint32_t pid, ipc_id_t id) {
-    for (uint32_t i = 0; i < SHM_MAX_ATTACHES; i++) {
-        if (shm_attaches[i].pid == 0) {
-            shm_attaches[i].pid = pid;
-            shm_attaches[i].id  = id;
-            return;
-        }
+// Add an attachment to the process's list. Caller must hold shm_lock.
+static void shm_attach_add(process_t* proc, ipc_id_t shm_id, void* virt_addr, size_t size, uint32_t flags) {
+    shm_attachment_t* att = (shm_attachment_t*)kmalloc(sizeof(shm_attachment_t));
+    if (!att) {
+        kprintf("[SHM] WARNING: failed to allocate attachment record for PID %u\n", proc->pid);
+        return;
     }
-    kprintf("[SHM] attach record table full; PID %u attach of %d untracked\n", pid, id);
+    att->shm_id = shm_id;
+    att->virt_addr = virt_addr;
+    att->size = size;
+    att->flags = flags;
+    att->next = proc->shm_attachments;
+    proc->shm_attachments = att;
 }
 
-// Caller must hold shm_lock. Removes ONE matching (pid,id) record.
-static void shm_attach_unrecord(uint32_t pid, ipc_id_t id) {
-    for (uint32_t i = 0; i < SHM_MAX_ATTACHES; i++) {
-        if (shm_attaches[i].pid == pid && shm_attaches[i].id == id) {
-            shm_attaches[i].pid = 0;
-            return;
+// Remove an attachment from the process's list. Caller must hold shm_lock.
+// Returns true if found and removed, false otherwise.
+static bool shm_attach_remove(process_t* proc, ipc_id_t shm_id) {
+    shm_attachment_t** pp = &proc->shm_attachments;
+    while (*pp) {
+        if ((*pp)->shm_id == shm_id) {
+            shm_attachment_t* victim = *pp;
+            *pp = victim->next;
+            kfree(victim);
+            return true;
         }
+        pp = &(*pp)->next;
     }
+    return false;
+}
+
+// Free all attachments in a process's list. Called by shm_cleanup_process.
+// Caller must hold shm_lock.
+static void shm_attach_free_all(process_t* proc) {
+    shm_attachment_t* att = proc->shm_attachments;
+    while (att) {
+        shm_attachment_t* next = att->next;
+        kfree(att);
+        att = next;
+    }
+    proc->shm_attachments = NULL;
 }
 
 // ─── Internal helpers ─────────────────────────────────────────────────────
@@ -507,7 +523,7 @@ int64_t sys_shmat(uint64_t shmid, uint64_t shmaddr, uint64_t shmflg,
 
     seg->attach_count++;
     seg->attach_time = timer_get_ticks();
-    shm_attach_record(current->pid, seg->id);   // for cleanup on process death
+    shm_attach_add(current, seg->id, (void*)virt_addr, seg->size, flags);
 
     spin_unlock(&shm_lock);
 
@@ -601,7 +617,7 @@ int64_t sys_shmdt(uint64_t shmaddr, uint64_t arg2, uint64_t arg3,
     if (seg->attach_count > 0) {
         seg->attach_count--;
     }
-    shm_attach_unrecord(current->pid, seg->id);   // drop the tracking record
+    shm_attach_remove(current, seg->id);   // drop the tracking record
     seg->detach_time = timer_get_ticks();
 
     ipc_id_t seg_id = seg->id;   // save before potential free
@@ -811,7 +827,9 @@ typedef struct {
 #define SHM_CLEANUP_MAX 64
 static shm_deferred_free_t cleanup_work[SHM_CLEANUP_MAX];
 
-void shm_cleanup_process(uint32_t pid) {
+void shm_cleanup_process(process_t* proc) {
+    if (!proc) return;
+    uint32_t pid = proc->pid;
     kprintf("[SHM] Cleanup for PID %d\n", pid);
 
     /*
@@ -826,19 +844,31 @@ void shm_cleanup_process(uint32_t pid) {
      */
     uint32_t nfree = 0;
 
+    // proc is passed in by the caller (process_unref teardown). Do NOT re-look it
+    // up via process_get_by_pid(): by the time this runs the PCB has ALREADY been
+    // removed from process_table, so the lookup returned NULL and the entire
+    // cleanup became a silent no-op — every owned shm segment and attachment node
+    // leaked. (And taking a ref during ref_count==0 teardown would recurse on
+    // unref.) The caller owns the sole reference; use proc directly.
     spin_lock(&shm_lock);
 
-    // Pass 0: replay this pid's attachment records so attach_count is accurate
-    // even though the dying process never called shmdt(). Fixes the leak where a
-    // non-owner attacher's death left an IPC_RMID'd segment pinned forever.
-    for (uint32_t a = 0; a < SHM_MAX_ATTACHES; a++) {
-        if (shm_attaches[a].pid != pid) continue;
-        shm_segment_t* seg = shm_find_by_id(shm_attaches[a].id);
+    // Pass 0: walk the process's attachment list and decrement attach_count for
+    // each segment. This is O(n) where n is the number of attachments THIS
+    // process holds (typically 1-5) instead of O(128) scanning the global array.
+    // Fixes the leak where a non-owner attacher's death left an IPC_RMID'd
+    // segment pinned forever.
+    shm_attachment_t* att = proc->shm_attachments;
+    while (att) {
+        shm_segment_t* seg = shm_find_by_id(att->shm_id);
         if (seg && seg->attach_count > 0) {
             seg->attach_count--;
+            kprintf("[SHM] Cleanup PID %d: decremented attach_count for segment %d\n",
+                    pid, att->shm_id);
         }
-        shm_attaches[a].pid = 0;
+        att = att->next;
     }
+    // Free the entire attachment list now that we've processed all entries.
+    shm_attach_free_all(proc);
 
     for (uint32_t i = 0; i < SHM_TABLE_SIZE; i++) {
         shm_segment_t* seg = id_table[i];

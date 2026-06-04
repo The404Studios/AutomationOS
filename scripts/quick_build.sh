@@ -63,6 +63,43 @@ if [ "${SMP:-0}" = "1" ]; then
         CFLAGS="$CFLAGS -DSMP_FORCE_AP_FAIL"
         echo "*** SMP_FORCE_AP_FAIL=1: AP start will be forced to FAIL (degradation test) ***"
     fi
+
+    # =========================================================================
+    # SMP SCHEDULER master sub-gate (real per-CPU scheduling: CPU1 runs actual
+    # processes). GATED behind SMP_SCHED=1, which REQUIRES SMP=1 (it lives inside
+    # this block). When SMP_SCHED is unset, the build is today's coprocessor
+    # kernel EXACTLY (cpu1_submit/cpu1_wait, cpu_id()==0 from stubs.c) -- a clean
+    # rollback. When set, -DSMP_SCHED is added on top of -DSMP_FOUNDATION and
+    # EVERY scheduler change is wrapped #ifdef SMP_SCHED:
+    #   - ap_boot.c defines a REAL cpu_id() (xAPIC id -> logical id), so stubs.c's
+    #     cpu_id() #ifndef-s out (no duplicate symbol).
+    # Build:  SMP=1 SMP_SCHED=1 bash scripts/quick_build.sh  -> build/kernel-smp.elf
+    # =========================================================================
+    if [ "${SMP_SCHED:-0}" = "1" ]; then
+        CFLAGS="$CFLAGS -DSMP_SCHED"
+        # syscall.asm's %ifdef SMP_SCHED path (swapgs + GS-base per-CPU kernel RSP,
+        # Brick C) needs the macro at ASSEMBLE time too -- nasm doesn't see CFLAGS.
+        NASMFLAGS="$NASMFLAGS -DSMP_SCHED"
+        echo "*** SMP_SCHED build: real per-CPU scheduling enabled (-DSMP_SCHED, gcc+nasm) ***"
+
+        # =====================================================================
+        # SMP_SCHED_DISPATCH (Brick F) -- BRUTALLY gated 2nd sub-gate, REQUIRES
+        # SMP_SCHED. When set, CPU1 switches from COPROCESSOR mode (the cpu1_job
+        # worker loop servicing matmul offload) to SCHEDULER mode: ap_main enters
+        # ap_scheduler_loop() and CPU1's LAPIC timer drives ap_schedule_from_irq()
+        # to context-switch CPU1 between its own runqueue processes. This is the
+        # triple-fault frontier (AP ring-3 dispatch), built sub-brick by sub-brick
+        # (F1 skeleton -> F2 kernel thread -> F3 ring-3 -> F4/F5 apps). With this
+        # UNSET, SMP_SCHED is exactly A-E (CPU1 = coprocessor, instant rollback).
+        # Needs the macro in BOTH gcc + nasm (interrupt.asm/context_switch.asm).
+        # Build: SMP=1 SMP_SCHED=1 SMP_SCHED_DISPATCH=1 bash scripts/quick_build.sh
+        # =====================================================================
+        if [ "${SMP_SCHED_DISPATCH:-0}" = "1" ]; then
+            CFLAGS="$CFLAGS -DSMP_SCHED_DISPATCH"
+            NASMFLAGS="$NASMFLAGS -DSMP_SCHED_DISPATCH"
+            echo "*** SMP_SCHED_DISPATCH: CPU1 in SCHEDULER mode (AP ring-3 dispatch) ***"
+        fi
+    fi
 fi
 
 # =============================================================================
@@ -89,6 +126,14 @@ if [ "${FB_WC:-0}" = "1" ]; then
     CFLAGS="$CFLAGS -DFB_WC"
     KERNEL_OUT="build/kernel-wc.elf"
     echo "*** FB_WC build: -DFB_WC enabled (framebuffer write-combining MTRR), output -> $KERNEL_OUT ***"
+fi
+
+# OPT-IN slab-corruption hardware watchpoint (debug-branch tooling). SLAB_WATCH=1
+# arms DR0/DR1 on the first slab page in the observed corruption region and logs the
+# stray writer's RIP via the #DB handler. NOT for shipping builds; default off.
+if [ "${SLAB_WATCH:-0}" = "1" ]; then
+    CFLAGS="$CFLAGS -DSLAB_WATCH"
+    echo "*** SLAB_WATCH build: DR0/DR1 slab-corruption watchpoint enabled ***"
 fi
 
 GOOD=0
@@ -173,6 +218,9 @@ if [ -n "$SMP_SOURCES" ]; then
     # like madt.c -- it does NOT define cpu_id(), so there is no collision with
     # stubs.c::cpu_id() (smp.c stays uncompiled). Only built for the SMP kernel.
     compile kernel/arch/x86_64/ap_boot.c     c_ap_boot
+    # SMP brick 8.5 (GATED by SMP=1): rapid-fire CPU1 offload stress test (100
+    # sequential offloads to check for races in job slot reuse).
+    compile kernel/arch/x86_64/test_rapid_cpu1.c c_test_rapid_cpu1
     # SMP race-fix support (GATED by SMP=1): reference counting (kref.c) and the
     # ownership state machine (ownership.c). ap_boot.c's cpu1_job slot uses
     # own_init/own_transition/own_orphan to track CPU0<->CPU1 buffer handoff and to
@@ -245,6 +293,11 @@ compile kernel/core/mem/vma_region.c         c_vma_region
 compile kernel/core/procapi/procapi.c        c_procapi
 compile kernel/ipc/clipboard.c               c_clipboard
 compile kernel/ipc/notify.c                  c_notify
+# IPC umbrella initializer: kernel.c calls ipc_init() (shm/msg/notify/clipboard
+# init in order). ipc.c has 0 bytes .bss and only references already-linked
+# symbols, so it is safe in BOTH the default and SMP builds. Was missing from the
+# build list, leaving ipc_init undefined and breaking the strict link.
+compile kernel/ipc/ipc.c                      c_ipc
 compile kernel/core/sched/scheduler.c        c_scheduler
 compile kernel/core/sched/process.c          c_process
 compile kernel/core/sched/context.c          c_context

@@ -272,6 +272,29 @@ void lapic_timer_init(uint32_t frequency) {
             frequency, ticks_per_quantum);
 }
 
+#ifdef SMP_SCHED
+// SMP scheduler Brick E: arm THIS CPU's LAPIC timer in periodic mode at a CUSTOM
+// vector. Identical to lapic_timer_init() except the LVT vector is a parameter, so
+// CPU1 can use AP_LAPIC_TIMER_VECTOR (0x40) instead of the hardcoded 0x20 (=IDT[32],
+// the PIC irq0 handler). Each CPU's LAPIC timer + CCR is local, so calibrating here
+// on the AP measures the AP's own timer. `vector` carries the mode bits already
+// cleared (we OR in PERIODIC).
+void lapic_timer_init_vector(uint32_t frequency, uint8_t vector) {
+    lapic_write(LAPIC_TIMER, LAPIC_TIMER_MASKED);
+    lapic_write(LAPIC_TIMER_DCR, LAPIC_TIMER_DIV_16);
+
+    lapic_write(LAPIC_TIMER_ICR, 0xFFFFFFFF);
+    udelay(TIMER_CALIBRATE_US);
+    uint32_t ticks = 0xFFFFFFFF - lapic_read(LAPIC_TIMER_CCR);
+
+    uint32_t ticks_per_quantum = (ticks * frequency) / 1000;
+    if (ticks_per_quantum == 0) ticks_per_quantum = 1;
+
+    lapic_write(LAPIC_TIMER, (uint32_t)vector | LAPIC_TIMER_PERIODIC);
+    lapic_write(LAPIC_TIMER_ICR, ticks_per_quantum);
+}
+#endif
+
 // Start LAPIC timer in one-shot mode
 void lapic_timer_oneshot(uint64_t microseconds) {
     // Calculate ticks (approximate)

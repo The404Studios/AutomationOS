@@ -117,11 +117,10 @@ typedef struct cpu {
                                 // note below on why the global is not privatized
                                 // yet). Live and correct; brick 5+ may make it the
                                 // sole authority.
-    process_t*  idle_thread;    // this CPU's idle task. This scheduler has NO
-                                // dedicated idle thread (it keeps running the
-                                // current task when nothing else is ready), so
-                                // this stays NULL today; reserved for a later
-                                // brick that adds a real per-CPU idle task.
+    process_t*  idle_thread;    // this CPU's idle task. A kernel thread that
+                                // runs when no other processes are ready. It
+                                // halts with interrupts enabled (sti; hlt) to
+                                // consume zero CPU. Created by scheduler_init().
     // The O(1) MLFQ runqueue state, relocated AS-IS from the old file-scope
     // globals (active_rq / expired_rq / ready_count). ONE runqueue (cpu[0]'s) is
     // used exactly as before -- genuinely separate per-CPU runqueues with their
@@ -466,7 +465,7 @@ void sleep_list_wake_due(uint64_t now) {
             *link = it->sleep_next;
             it->sleep_next = NULL;
             if (it->state == PROCESS_BLOCKED) {
-                it->state = PROCESS_READY;
+                process_set_ready(it);
                 scheduler_add_process(it);
             }
             // *link now points at the successor; do NOT advance link.
@@ -477,11 +476,101 @@ void sleep_list_wake_due(uint64_t now) {
     restore_flags(flags);
 }
 
+// ===========================================================================
+// Idle thread function - runs when no other processes are ready
+// ===========================================================================
+// This is a minimal kernel thread that executes when all runqueues are empty.
+// It consumes zero CPU by halting until the next interrupt (HLT instruction).
+// The timer interrupt will wake it, re-run the scheduler, and either pick a
+// newly-ready process or return here to halt again.
+//
+// CRITICAL: This must run with interrupts ENABLED (sti before hlt), otherwise
+// the CPU would halt forever (no interrupt to wake it). The sti/hlt sequence
+// is atomic on x86-64: interrupts are checked AFTER hlt completes, so there
+// is no race between enabling interrupts and halting.
+//
+// This runs in kernel mode (ring 0) with the idle thread's kernel stack, NOT
+// in user mode. It never returns - the scheduler switches away from it when
+// a real process becomes ready.
+static void idle_thread_func(void) {
+    kprintf("[SCHEDULER] Idle thread started (CPU %d)\n", cpu_id());
+
+    while (1) {
+        // Halt with interrupts enabled - wake on next interrupt
+        // This is the x86-64 idle loop pattern: atomically enable IRQs and halt
+        __asm__ volatile("sti; hlt" ::: "memory");
+
+        // When we wake here (timer interrupt), loop back to hlt unless the
+        // scheduler switches us out. In practice the timer's schedule() call
+        // picks a newly-ready process and we never return here - but if both
+        // runqueues stay empty we re-halt immediately.
+    }
+}
+
+// Create the per-CPU idle thread. Called once during scheduler_init() for the
+// BSP (cpu 0). In an SMP build this would be called for each AP too.
+// Returns the created idle thread PCB, or NULL on failure.
+static process_t* create_idle_thread(uint32_t cpu_id_val, int adopt_pid0) {
+    (void)cpu_id_val;
+    // Allocate the idle thread PCB (memset-zeroed by process_create)
+    process_t* idle = process_create("idle", (void*)idle_thread_func);
+    if (!idle) {
+        return NULL;
+    }
+
+    // The BSP's idle thread (adopt_pid0=1) is re-homed onto the reserved PID 0.
+    // process_create() hands out PID 1 to this (the first-ever process); leaving it
+    // there bumps /sbin/init to PID 2, and init.c exits with "Not PID 1!". Moving
+    // idle to slot 0 makes the first real process (init) PID 1. See process_adopt_pid0().
+    // A secondary CPU's idle thread (adopt_pid0=0) is created AFTER init already has
+    // PID 1, so it just takes the next free PID -- it is never enqueued (a fallback
+    // only), so its PID is irrelevant to scheduling.
+    if (adopt_pid0) {
+        process_adopt_pid0(idle);
+    }
+
+    // The idle thread is a KERNEL thread: it runs in ring 0, not ring 3.
+    // Set its context.rip to the idle function and rsp to its kernel stack.
+    // It has NO user stack or user entry (user_rsp/user_entry stay 0).
+    idle->context.rip = (uint64_t)idle_thread_func;
+    idle->context.rsp = (uint64_t)idle->kernel_stack + KERNEL_STACK_SIZE - 16;
+    idle->context.rflags = 0x202;  // IF=1 (interrupts enabled), bit 1 reserved
+    // context.cr3 is already set by process_create (kernel page table)
+
+    // Idle runs at the LOWEST priority (nice +19 -> priority 139)
+    idle->priority = 19;  // IDLE priority
+
+    // Idle never exhausts its quantum (it yields via hlt), but set a nominal
+    // slice so priority_time_slice doesn't return 0.
+    idle->time_slice = 1;
+
+    // Idle is always RESUME_CRETURN (it's a kernel thread, never preempted in
+    // ring 3). When the scheduler switches to it, context_switch `ret`s into
+    // idle_thread_func above.
+    idle->resume_mode = RESUME_CRETURN;
+
+    // Mark it ready but do NOT add to runqueue - it's the fallback when the
+    // runqueue is empty, not a normal schedulable process.
+    process_set_ready(idle);
+
+    return idle;
+}
+
 void scheduler_init(void) {
     kprintf("[SCHEDULER] Initializing O(1) multi-level feedback queue scheduler...\n");
 
     // RACE-001 fix: Initialize scheduler lock
     spin_lock_init(&scheduler_lock);
+
+#if defined(SMP_SCHED) && defined(SMP_SCHED_DISPATCH)
+    // Audit fix: eagerly build the FPU template HERE (BSP, before CPU1 is brought
+    // online) so CPU1's context_prime_fpu() never races CPU0's first context_switch
+    // to lazily initialize it. Idempotent.
+    {
+        extern void context_fpu_template_init(void);
+        context_fpu_template_init();
+    }
+#endif
 
     // SMP brick 4: bring the BSP's per-CPU slot online. At N=1 this is the only
     // CPU; cpu_id()==0 so this_cpu()==&cpus[0]. apic_id 0 == the BSP. The rest of
@@ -494,13 +583,363 @@ void scheduler_init(void) {
     runqueue_init(&this_cpu()->rq_expired);
     this_cpu()->ready_count = 0;
 
+    // Create the idle thread for this CPU (BSP). This is the fallback when no
+    // other processes are runnable. It is added to the runqueue at the lowest
+    // priority (nice +19 -> priority 139), so it only runs when nothing else is
+    // ready. Also stored in cpu_t.idle_thread for reference.
+    this_cpu()->idle_thread = create_idle_thread(cpu_id(), 1 /* adopt PID 0 */);
+    if (!this_cpu()->idle_thread) {
+        kernel_panic("scheduler_init: Failed to create idle thread");
+    }
+
+    // The idle thread is NOT enqueued. It is a FALLBACK that scheduler_pick_next()
+    // returns only when both runqueues are empty — never a regular queued process.
+    // (Enqueuing it breaks the active/expired model: as a live entry in rq_active
+    // it keeps active non-empty, so pick_next never swaps in rq_expired, and any
+    // process queued to expired — i.e. EVERY freshly spawned process — can never be
+    // picked. That froze the whole system right after init spawned its services.)
+
     kprintf("[SCHEDULER] O(1) scheduler initialized:\n");
     kprintf("[SCHEDULER]   - Priority levels: %d (0-139)\n", SCHED_PRIORITY_LEVELS);
     kprintf("[SCHEDULER]   - Time slice: %d ticks\n", DEFAULT_TIME_SLICE);
     kprintf("[SCHEDULER]   - Algorithm: Active/Expired double-buffering\n");
     kprintf("[SCHEDULER]   - Complexity: O(1) enqueue, O(1) dequeue, O(1) pick_next\n");
     kprintf("[SCHEDULER]   - SMP-safe: Yes\n");
+    kprintf("[SCHEDULER]   - Idle thread: PID %d\n", this_cpu()->idle_thread->pid);
 }
+
+#ifdef SMP_SCHED
+// ===========================================================================
+// scheduler_init_secondary_cpu() — SMP scheduler Brick D
+// ===========================================================================
+// Populate a secondary CPU's per-CPU slot (cpus[cpu]) so that, once that CPU
+// starts taking timer interrupts and calling schedule_from_irq()/scheduler_pick_next()
+// (Bricks E/F), this_cpu() resolves to a fully-formed cpu_t: its own empty
+// active/expired runqueues, its own ready_count, and its OWN idle thread (with its
+// OWN kernel stack) as the empty-runqueue fallback.
+//
+// MUST be called by the BSP AFTER /sbin/init has claimed PID 1 (the idle thread
+// here does NOT adopt PID 0; it takes a normal free PID, which is fine because it
+// is never enqueued). Runs on the BSP -- it only writes cpus[cpu] data; the target
+// CPU is still in the coprocessor loop (no dispatch yet, Brick D takes no IRQ on it).
+// Returns 1 on success, 0 on failure (caller logs + continues; AP just stays a
+// coprocessor).
+int scheduler_init_secondary_cpu(uint32_t cpu, uint32_t apic_id) {
+    if (cpu == 0 || cpu >= MAX_CPUS) return 0;
+
+    cpus[cpu].apic_id = apic_id;
+    cpus[cpu].online  = 1;
+
+    runqueue_init(&cpus[cpu].rq_active);
+    runqueue_init(&cpus[cpu].rq_expired);
+    cpus[cpu].ready_count = 0;
+
+    process_t* idle = create_idle_thread(cpu, 0 /* do NOT adopt PID 0 */);
+    if (!idle) {
+        cpus[cpu].online = 0;
+        return 0;
+    }
+    cpus[cpu].current_thread = idle;   // start CPU as "running idle" until it dispatches
+    cpus[cpu].idle_thread    = idle;
+
+    /* NOTE: CPU1's idle thread runs the AP scheduler loop on the AP BOOT stack (see
+     * ap_main). Its pre-seeded context (idle_thread_func / idle->kernel_stack from
+     * create_idle_thread) is the SAVE TARGET only: the first cooperative switch
+     * (idle->thread) overwrites idle->context with the live boot-stack loop state via
+     * fxsave64/context_switch_asm, and later switches back restore exactly that. So
+     * idle is self-consistent without an explicit rip/cr3 override here. */
+
+    kprintf("[SCHEDULER] CPU%u secondary slot online: idle PID %d stack=%p "
+            "(CPU0 idle PID %d stack=%p) rq_active=%p\n",
+            cpu, idle->pid, (void*)idle->kernel_stack,
+            cpus[0].idle_thread->pid, (void*)cpus[0].idle_thread->kernel_stack,
+            (void*)&cpus[cpu].rq_active);
+    return 1;
+}
+
+// Enqueue `proc` onto a SPECIFIC CPU's EXPIRED runqueue (cross-CPU pinning) — the
+// affinity primitive for Brick F. Mirrors scheduler_add_process()'s exact ref /
+// lock / idempotency discipline, but targets cpus[cpu].rq instead of this_cpu()'s
+// (scheduler_add_process always uses this_cpu(), so the BSP can't use it to pin to
+// CPU1). The global scheduler_lock covers ALL CPUs' runqueues, so this is safe to
+// call from the BSP for a CPU1 queue. Takes a ref that pick_next() later transfers.
+void scheduler_add_process_to_cpu(process_t* proc, uint32_t cpu) {
+    if (!proc || cpu >= MAX_CPUS) return;
+    if (proc->state == PROCESS_TERMINATED) return;
+    // Idle is the empty-runqueue FALLBACK and must NEVER be enqueued (enqueuing it
+    // breaks the active/expired invariant and leaks a ref). Guard explicitly.
+    if (proc == cpus[cpu].idle_thread) return;
+
+    // Single critical section: (check on_queue, take the queue's ref, set the flag,
+    // enqueue) are done atomically under scheduler_lock so a concurrent
+    // scheduler_remove_process can't orphan the ref (process_ref is a lock-free
+    // atomic add, safe to call here). Tighter than the legacy scheduler_add_process
+    // (which refs outside the lock) -- the AP path must be race-clean.
+    spin_lock(&scheduler_lock);
+    if (!proc->on_queue) {
+        process_ref(proc);                   // queue holds a ref (UAF guard)
+        process_set_ready(proc);
+        proc->on_queue = 1;
+        int priority = process_get_priority(proc);
+        runqueue_enqueue(&cpus[cpu].rq_expired, proc, priority);
+        cpus[cpu].ready_count++;
+    }
+    spin_unlock(&scheduler_lock);
+}
+#endif /* SMP_SCHED */
+
+#if defined(SMP_SCHED) && defined(SMP_SCHED_DISPATCH)
+// ===========================================================================
+// AP-SAFE SCHEDULER (Brick F) — CPU1 SCHEDULER-MODE dispatch
+// ===========================================================================
+// A DEDICATED dispatcher for CPU1, the AP-safe twin of the BSP's
+// schedule()/schedule_from_irq(). Two non-negotiable rules that make it AP-safe:
+//   1. NEVER write the global current_process. It uses cpu_set_current_thread()
+//      (which writes ONLY this_cpu()->current_thread == cpus[1].current_thread).
+//      Writing the global from CPU1 would corrupt the BSP's notion of "current".
+//   2. NEVER do a PIC EOI. The LAPIC timer ISR (lapic_tick) already EOIs the LAPIC;
+//      a PIC EOI from CPU1 would wedge the BSP's IRQ0.
+// scheduler_pick_next(), scheduler_add_process(), runqueue_* are all this_cpu()-
+// based, so on CPU1 they naturally operate on cpus[1]'s runqueue.
+//
+// Built sub-brick by sub-brick (see docs/SMP_SCHEDULER_PLAN.md, user's F1..F5 split):
+//   F1 (this commit): SKELETON. Only ever "schedules" CPU1 idle. No context switch,
+//      no user process. Proves the loop + ISR run on CPU1 with 0 panics.
+//   F2: cooperative switch idle <-> ONE pinned KERNEL thread (context_switch_asm).
+//   F3: preempt/dispatch ONE pinned RING-3 process (context_save_irq/load_irq).
+//   F4/F5: real apps on CPU1, compositor pinned to CPU0.
+
+// ap_schedule_from_irq() — CPU1 LAPIC-timer preemption entry. Called from
+// lapic_tick() AFTER the LAPIC EOI. The HARD ring-3 guard comes FIRST: only ever
+// preempt code the timer caught running in ring 3 (CPL==3). CPU1's scheduler loop
+// runs in ring 0, so in F1 this returns immediately every tick (the skeleton
+// proof). Doing the guard before ANY scheduler_lock acquisition ALSO prevents a
+// same-CPU self-deadlock: CPU1 must never try to take scheduler_lock from this ISR
+// while the ring-0 code it interrupted already holds it.
+void ap_schedule_from_irq(interrupt_frame_t* frame) {
+    if ((frame->cs & 3) != 3) {
+        return;  // kernel/idle interrupted: never preempt. (F1: ALWAYS taken.)
+    }
+    // F3+ adds: per-CPU quantum decrement, scheduler_pick_next() on cpus[1],
+    //           context_save_irq(current)/context_load_irq(next), CR3 switch,
+    //           cpu_set_current_thread(next). All without touching the global.
+    (void)frame;
+}
+
+// ap_cooperative_schedule() — the cooperative half (the AP's voluntary yield/idle
+// check). Pick CPU1's next runnable; if it's the idle fallback (empty runqueue) or
+// the current thread, return so the caller hlts. Otherwise context_switch_asm() to
+// it (cooperative ring-0 switch). F2 proves idle -> ONE pinned kernel thread.
+//
+// AP-safety: cpu_set_current_thread() writes ONLY cpus[1].current_thread (NEVER the
+// global current_process — that would clobber the BSP). scheduler_pick_next()/
+// scheduler_add_process() are this_cpu()-based so they act on cpus[1]'s runqueue.
+void ap_cooperative_schedule(void) {
+    cpu_t* cpu = this_cpu();                  // CPU1 (cpu_id()==1)
+    process_t* current = cpu->current_thread; // idle (initially)
+    process_t* next = scheduler_pick_next();  // this_cpu()-based -> cpus[1].rq
+    if (next == cpu->idle_thread || next == current) {
+        return;  // nothing else runnable (pick_next gives idle on an empty rq; it
+                 // transfers NO ref for the idle fallback, so nothing to release).
+    }
+
+    // Requeue the outgoing thread ONLY if it is a runnable non-idle process that
+    // voluntarily yielded (state still RUNNING). The idle fallback is never queued.
+    if (current != cpu->idle_thread && current->state == PROCESS_RUNNING) {
+        scheduler_add_process(current);       // this_cpu()==cpus[1] -> cpus[1].rq
+    }
+
+    cpu_set_current_thread(next);             // cpus[1].current_thread = next (per-CPU)
+    next->state = PROCESS_RUNNING;
+
+    // Point CPU1's TSS.RSP0 + SYSCALL kernel stack at `next`'s kernel stack (no-op
+    // for a pure ring-0 kernel thread, required once `next` is a ring-3 process).
+    if (next->kernel_stack) {
+        uint64_t kstack = ((uint64_t)next->kernel_stack + KERNEL_STACK_SIZE) & ~0xFULL;
+        tss_set_kernel_stack(kstack);         // cpu_id()==1 -> tss_array[1]/kernel_rsp_save_arr[1]
+    }
+
+    // Fix D6: prime `next`'s FPU state (context_switch_asm fxrstor's it directly,
+    // bypassing context_switch()'s template priming) so a fresh process's MXCSR is
+    // clean, not the all-zero #XM trap. Writes only next's own fpu_state (AP-safe).
+    context_prime_fpu(next);
+
+    // Cooperative ring-0 context switch. Saves `current`'s kernel resume point into
+    // its context and `ret`s into `next`. Control returns here only when `current`
+    // is later switched back in (e.g. `next` yields/blocks/exits).
+    context_switch_asm(current, next);
+}
+
+// ap_enter_scheduler() — ap_main's one-way entry into SCHEDULER mode (fix D1). Jumps
+// CPU1 into its idle thread, which RUNS ap_scheduler_loop on idle->kernel_stack.
+// context_switch_asm(NULL, idle): from==NULL skips the save, restores idle's context
+// (CR3=idle's PML4, FPU, RSP=idle->kernel_stack, RIP=ap_scheduler_loop, IF=1) and
+// 'ret's into it. The AP boot stack is abandoned (ap_main never returns). NEVER
+// returns. After this, idle is a proper running process so all later switches into
+// and out of idle are self-consistent (no boot-stack overwrite of idle->context).
+// Diagnostic: how far CPU1 got through scheduler-mode entry (BSP reads it; the AP
+// must not touch the serial port). 3 = ap_scheduler_loop running.
+// (The earlier ap_enter_scheduler / context_switch_asm(NULL, idle) approach wedged
+// CPU1 at the from=NULL fxrstor-before-stack-switch path -- REMOVED. ap_main runs
+// ap_scheduler_loop() directly on the boot stack instead; idle is the save target.)
+volatile uint64_t ap_dbg_stage = 0;
+
+// ---------------------------------------------------------------------------
+// Brick F2 test workload: ONE pinned ring-0 kernel thread.
+// ---------------------------------------------------------------------------
+// A trivial kernel thread that increments a shared counter forever. Pinned to CPU1
+// (enqueued onto cpus[1].rq). The AP scheduler loop's first ap_cooperative_schedule()
+// switches CPU1 into it; the BSP then reads ap_kthread_counter climbing — PROVING
+// CPU1 context-switched into a scheduled thread and runs it in parallel with CPU0's
+// desktop. It runs in ring 0, so the LAPIC timer's ap_schedule_from_irq ring-3 guard
+// leaves it un-preempted (F3 exercises ring-3 preemption).
+volatile uint64_t ap_kthread_counter = 0;
+
+static void ap_test_kthread_fn(void) {
+    for (;;) {
+        ap_kthread_counter++;
+        __asm__ volatile("pause");
+    }
+}
+
+// Called ONCE by the BSP (after scheduler_init_secondary_cpu, so cpus[1] is ready
+// and init owns PID 1). Creates the kernel thread and pins it to CPU1.
+void ap_spawn_test_kthread(void) {
+    process_t* t = process_create("ap_ktest", (void*)ap_test_kthread_fn);
+    if (!t) {
+        kprintf("[SMP] Brick F2: failed to create AP test kthread\n");
+        return;
+    }
+    t->context.rip    = (uint64_t)ap_test_kthread_fn;
+    t->context.rsp    = (uint64_t)t->kernel_stack + KERNEL_STACK_SIZE - 16;
+    t->context.rflags = 0x202;                 // IF=1 (runs with interrupts enabled)
+    t->priority       = 0;
+    t->time_slice     = 1;
+    t->resume_mode    = RESUME_CRETURN;        // kernel thread: resumes via ctx_switch ret
+    scheduler_add_process_to_cpu(t, 1);        // pin to CPU1
+    kprintf("[SMP] Brick F2: pinned AP test kthread PID %d to CPU1 (kernel stack=%p)\n",
+            t->pid, (void*)t->kernel_stack);
+}
+
+// ap_scheduler_loop() — CPU1's top-level SCHEDULER-mode loop (replaces the
+// coprocessor worker loop under SMP_SCHED_DISPATCH). Runs forever on the AP's boot
+// stack with cpus[1].current_thread == cpus[1].idle_thread (set by Brick D's
+// scheduler_init_secondary_cpu). Each pass cooperatively checks CPU1's runqueue,
+// then hlts until the next LAPIC tick wakes it. NEVER returns.
+void ap_scheduler_loop(void) {
+    // D7 guard: this loop uses this_cpu()->rq (== cpus[cpu_id()].rq). If cpu_id()
+    // ever returned 0 on the AP (LAPIC not enabled / apic_id unmapped), CPU1 would
+    // operate on the BSP's runqueue and corrupt CPU0. Convert that silent
+    // cross-CPU corruption into a loud halt -- the ONE latent issue whose blast
+    // radius is the BSP. (cpu_id() is verified ==1 by the Brick A checkpoint;
+    // ap_main enables the LAPIC + populates cpus[1].apic_id before we get here.)
+    if (cpu_id() != 1) {
+        kernel_panic("ap_scheduler_loop: cpu_id() != 1 -- AP would corrupt CPU0's runqueue");
+    }
+    extern volatile uint64_t ap_dbg_stage;
+    ap_dbg_stage = 3;
+    for (;;) {
+        ap_cooperative_schedule();
+        __asm__ volatile("hlt");
+    }
+}
+#endif // SMP_SCHED && SMP_SCHED_DISPATCH
+
+// ===========================================================================
+// scheduler_shutdown() — quiesce scheduler for reboot/poweroff or SMP CPU-offline
+// ===========================================================================
+// Teardown counterpart to scheduler_init(). Drains all runqueues (active and
+// expired), clears the global sleep list, and releases references to all queued
+// processes. After this call the scheduler is STOPPED — no further scheduling
+// can occur. Intended for:
+//   • System reboot/poweroff (power.c power_shutdown path): stops all CPUs,
+//     cleanly drains all tasks before halting.
+//   • SMP CPU-offline (brick teardown): when taking an AP offline, drains its
+//     per-CPU runqueue and migrates or terminates its tasks before marking the
+//     CPU unavailable.
+// The scheduler_lock is KEPT initialized (not destroyed): it is a simple spinlock
+// with no heap allocation, so there is nothing to free. Re-initializing it after
+// shutdown (e.g. for a kexec-style reload) is safe.
+//
+// Process ref discipline:
+//   • Each runqueue slot holds ONE process_ref per enqueued process (taken by
+//     scheduler_add_process). Dequeuing here releases that ref via process_unref.
+//   • The sleep list does NOT hold a ref directly (the ref is on the process's
+//     wait_object); we only clear the list structure, not unref sleepers.
+//   • The current_process global ref is NOT touched here (callers like
+//     power_shutdown own the decision to terminate/unref the running task).
+// Idempotent: calling twice is safe (a drained scheduler is left drained).
+void scheduler_shutdown(void) {
+    kprintf("[SCHEDULER] Shutting down scheduler (draining runqueues and sleep list)...\n");
+
+    // 1) Acquire the scheduler lock to prevent concurrent add/remove operations
+    //    while we drain. This blocks any timer IRQ that tries to re-queue a
+    //    process mid-shutdown.
+    spin_lock(&scheduler_lock);
+
+    uint32_t drained_count = 0;
+
+    // 2) Drain the ACTIVE runqueue: dequeue every priority level, releasing
+    //    the scheduler's reference for each process.
+    for (int prio = 0; prio < SCHED_PRIORITY_LEVELS; prio++) {
+        process_t* proc;
+        while ((proc = runqueue_dequeue(&this_cpu()->rq_active, prio)) != NULL) {
+            proc->on_queue = 0;
+            this_cpu()->ready_count--;
+            drained_count++;
+#ifndef SCHEDULER_QUIET
+            kprintf("[SCHEDULER] Drained from active[%d]: '%s' (PID %d)\n",
+                    prio, proc->name, proc->pid);
+#endif
+            // Release the reference that scheduler_add_process took.
+            process_unref(proc);
+        }
+    }
+
+    // 3) Drain the EXPIRED runqueue.
+    for (int prio = 0; prio < SCHED_PRIORITY_LEVELS; prio++) {
+        process_t* proc;
+        while ((proc = runqueue_dequeue(&this_cpu()->rq_expired, prio)) != NULL) {
+            proc->on_queue = 0;
+            this_cpu()->ready_count--;
+            drained_count++;
+#ifndef SCHEDULER_QUIET
+            kprintf("[SCHEDULER] Drained from expired[%d]: '%s' (PID %d)\n",
+                    prio, proc->name, proc->pid);
+#endif
+            process_unref(proc);
+        }
+    }
+
+    // 4) Clear the global sleep list. We do NOT unref the sleepers here (their
+    //    refs are on the wait_objects they are parked on; the wait-object teardown
+    //    or process termination owns those refs). We only clear the intrusive
+    //    sleep_next linkage so no timer wakeup scan can touch a stale list.
+    uint64_t flags = save_flags_cli();
+    process_t* sleeper = g_sleep_list;
+    uint32_t sleep_count = 0;
+    while (sleeper) {
+        process_t* next = sleeper->sleep_next;
+        sleeper->sleep_next = NULL;
+        sleeper = next;
+        sleep_count++;
+    }
+    g_sleep_list = NULL;
+    restore_flags(flags);
+
+    // 5) Mark the BSP offline (mirrors the scheduler_init online=1 step). At
+    //    N=1 this is cosmetic; at N>1 (SMP brick 5+) it prevents a CPU-offline
+    //    flow from re-using a drained CPU's runqueue. The scheduler is STOPPED.
+    this_cpu()->online = 0;
+
+    spin_unlock(&scheduler_lock);
+
+    kprintf("[SCHEDULER] Scheduler shutdown complete\n");
+    kprintf("[SCHEDULER]   - Runqueues drained: %u processes\n", drained_count);
+    kprintf("[SCHEDULER]   - Sleep list cleared: %u sleepers\n", sleep_count);
+    kprintf("[SCHEDULER]   - Status: STOPPED\n");
+}
+
 
 void scheduler_add_process(process_t* proc) {
     PERF_START(PERF_OP_SCHEDULER_ADD);
@@ -535,7 +974,7 @@ void scheduler_add_process(process_t* proc) {
     // RACE-001 fix: Acquire scheduler lock before queue manipulation
     spin_lock(&scheduler_lock);
 
-    proc->state = PROCESS_READY;
+    process_set_ready(proc);
     proc->on_queue = 1;
 
     // CRITICAL: Do NOT reset time_slice here!
@@ -603,7 +1042,7 @@ void scheduler_yield_requeue(process_t* proc) {
     process_ref(proc);
 
     spin_lock(&scheduler_lock);
-    proc->state = PROCESS_READY;
+    process_set_ready(proc);
     proc->on_queue = 1;
     int priority = process_get_priority(proc);
 
@@ -698,9 +1137,11 @@ pick_again:
     if (next == NULL) {
         // Active runqueue is empty - check if expired has processes
         if (runqueue_is_empty(&this_cpu()->rq_expired)) {
-            // Both runqueues are empty - no processes to run
+            // Both runqueues are empty: nothing runnable. Return the idle thread,
+            // which is NOT enqueued (see scheduler_init) — it is the dedicated
+            // fallback that runs only in this all-empty state.
             spin_unlock(&scheduler_lock);
-            return NULL;
+            return this_cpu()->idle_thread;
         }
 
         // Swap active and expired runqueues
@@ -710,9 +1151,10 @@ pick_again:
         next = runqueue_pick_next(&this_cpu()->rq_active);
 
         if (next == NULL) {
-            // Should never happen after swap, but defensive check
+            // Expired was non-empty but yielded nothing pickable (all entries
+            // drained as terminated): fall back to the idle thread.
             spin_unlock(&scheduler_lock);
-            return NULL;
+            return this_cpu()->idle_thread;
         }
     }
 
@@ -784,6 +1226,14 @@ pick_again:
     return next;
 }
 
+// Expose this CPU's idle thread. The idle thread is NOT a queued process; it is
+// the fallback scheduler_pick_next() returns when both runqueues are empty.
+// Cooperative blocking paths (wait_object_block) must recognise it so they idle
+// in place rather than context_switch into idle's synthetic kernel context.
+process_t* scheduler_idle_thread(void) {
+    return this_cpu()->idle_thread;
+}
+
 // ===========================================================================
 // cooperative_switch_to() — hand the CPU to `next` from a cooperative site
 // ===========================================================================
@@ -842,17 +1292,17 @@ void schedule(void) {
 
     process_t* current = process_get_current();
 
-    // If no current process, pick one
+    // If no current process, pick one (may be idle thread if queues are empty)
     if (current == NULL) {
         process_t* next = scheduler_pick_next();
-        if (next) {
-            next->state = PROCESS_RUNNING;
-            process_set_current(next);
+        // scheduler_pick_next() always returns a valid process now (real process
+        // or idle thread), so no NULL check needed.
+        next->state = PROCESS_RUNNING;
+        process_set_current(next);
 #ifndef SCHEDULER_QUIET
-            kprintf("[SCHEDULER] Started process '%s' (PID %d) with time slice %d\n",
-                    next->name, next->pid, next->time_slice);
+        kprintf("[SCHEDULER] Started process '%s' (PID %d) with time slice %d\n",
+                next->name, next->pid, next->time_slice);
 #endif
-        }
         return;
     }
 
@@ -878,39 +1328,38 @@ void schedule(void) {
                 current->name, current->pid);
 #endif
         process_t* next = scheduler_pick_next();
-        if (next) {
-            next->state = PROCESS_RUNNING;
-            process_set_current(next);
+        // scheduler_pick_next() now always returns a valid process (either a
+        // real runnable process or the idle thread), so we no longer need to
+        // check for NULL. The idle thread case is a valid switch target.
+        next->state = PROCESS_RUNNING;
+        process_set_current(next);
 
-            // Stash the dead process pointer before the context switch so we
-            // can release its reference after we return in the new process's
-            // context (or, in the cooperative case, so it never gets back on
-            // the queue).
-            process_t* dead = current;
+        // Stash the dead process pointer before the context switch so we
+        // can release its reference after we return in the new process's
+        // context (or, in the cooperative case, so it never gets back on
+        // the queue).
+        process_t* dead = current;
 
-            // Cooperative (C-return) save path.  The context of the dead
-            // process is saved here so the assembly stub can return — but
-            // because dead->state == PROCESS_TERMINATED and scheduler_add_process
-            // rejects TERMINATED processes, this saved context is never used.
-            // cooperative_switch_to routes RESUME_IRETQ successors through iretq
-            // (a dead process can hand off to a timer-preempted one safely).
-            dead->resume_mode = RESUME_CRETURN;
-            cooperative_switch_to(dead, next);
+        // Cooperative (C-return) save path.  The context of the dead
+        // process is saved here so the assembly stub can return — but
+        // because dead->state == PROCESS_TERMINATED and scheduler_add_process
+        // rejects TERMINATED processes, this saved context is never used.
+        // cooperative_switch_to routes RESUME_IRETQ successors through iretq
+        // (a dead process can hand off to a timer-preempted one safely).
+        dead->resume_mode = RESUME_CRETURN;
+        cooperative_switch_to(dead, next);
 
-            // -------------------------------------------------------------------
-            // KILL-FIX-002 (continued): Release the dead process's "current"
-            // reference NOW.  context_switch() returns here when the *next*
-            // process is eventually switched away from and this kernel stack
-            // frame is resumed.  At that point `dead` holds the process that
-            // was terminated; we release its scheduler reference exactly once.
-            // scheduler_add_process() ensures TERMINATED processes are never
-            // re-queued, so `dead` can never become current again — making this
-            // unref safe and non-repeating.
-            // -------------------------------------------------------------------
-            process_unref(dead);
-        } else {
-            kernel_panic("[SCHEDULER] No processes to run after exit");
-        }
+        // -------------------------------------------------------------------
+        // KILL-FIX-002 (continued): Release the dead process's "current"
+        // reference NOW.  context_switch() returns here when the *next*
+        // process is eventually switched away from and this kernel stack
+        // frame is resumed.  At that point `dead` holds the process that
+        // was terminated; we release its scheduler reference exactly once.
+        // scheduler_add_process() ensures TERMINATED processes are never
+        // re-queued, so `dead` can never become current again — making this
+        // unref safe and non-repeating.
+        // -------------------------------------------------------------------
+        process_unref(dead);
         return;
     }
 
@@ -935,16 +1384,21 @@ void schedule(void) {
 
         process_t* next = scheduler_pick_next();
 
-        if (next == NULL) {
-            // No other processes - continue current with a fresh priority-scaled slice
+        // scheduler_pick_next() now always returns a valid process (either a
+        // real runnable process or the idle thread). If next == current, it
+        // means pick_next returned the only process in the queue (which was
+        // current itself, just re-added above). In that case, just refill its
+        // quantum and continue - no context switch needed.
+        if (next == current) {
+            // Only process in the system - continue with a fresh quantum
             current->time_slice = priority_time_slice(current->priority);
             current->state = PROCESS_RUNNING;
 #ifndef SCHEDULER_QUIET
-            kprintf("[SCHEDULER] No other processes, continuing '%s' (PID %d) with fresh time slice\n",
+            kprintf("[SCHEDULER] Only process in system, continuing '%s' (PID %d) with fresh time slice\n",
                     current->name, current->pid);
 #endif
         } else {
-            // Context switch to next process
+            // Context switch to next process (may be idle thread)
             next->state = PROCESS_RUNNING;
 #ifndef SCHEDULER_QUIET
             kprintf("[SCHEDULER] Context switching: '%s' (PID %d) -> '%s' (PID %d), time slice: %d\n",
@@ -1073,13 +1527,25 @@ void schedule_from_irq(interrupt_frame_t* frame) {
         current->need_resched = 1;
     }
 
-    // 3) Pick a successor. If none, refill and continue current.
+    // 3) Pick a successor. scheduler_pick_next() always returns a valid process
+    //    (real process or idle thread). If next == current, it means current was
+    //    the only process in the queue (re-added earlier); refill and continue.
     process_t* next = scheduler_pick_next();
-    if (next == NULL || next == current) {
-        if (next == current) {
-            // pick_next returned current (it was the only one re-queued earlier
-            // in some races); just refill and continue.
-        }
+    process_t* idle = scheduler_idle_thread();
+    // If the only runnable task is current itself OR the idle fallback (no OTHER
+    // ring-3 process is ready), just keep current running with a fresh quantum.
+    // Critically, do NOT let next==idle fall through to the RESUME_CRETURN reject
+    // branch below: that branch would scheduler_add_process(idle) — idle must NEVER
+    // be enqueued (it is the empty-runqueue fallback, not a queued task; enqueuing
+    // it breaks the active/expired invariant and starves the expired queue) — and
+    // process_unref(idle), which underflows idle's refcount (pick_next transfers no
+    // ref for the idle fallback) toward a premature free. That was the ROOT CAUSE
+    // of the preempt hang: a CPU-bound burner that is the only runnable process has
+    // its quantum expire ~100x/sec, each time enqueuing+unref'ing idle. (A
+    // TERMINATED current with next==idle is the genuine going-idle case and still
+    // falls through to the conservative panic below.)
+    if (next == current ||
+        (next == idle && current->state != PROCESS_TERMINATED)) {
         if (current->state != PROCESS_TERMINATED) {
             current->time_slice = priority_time_slice(current->priority);
             current->need_resched = 0;
@@ -1206,13 +1672,22 @@ void schedule_from_irq(interrupt_frame_t* frame) {
     }
 
     if (next->resume_mode != RESUME_IRETQ) {
+        // The incoming process is RESUME_CRETURN (kernel thread or yielded user
+        // process). We cannot resume it from the IRQ path (iretq can't jump to
+        // kernel code). Re-queue it and continue current... but if current is
+        // TERMINATED, we have a problem: we can't continue a dead process, and we
+        // can't switch to the kernel thread from here. This should only happen if
+        // the idle thread was picked (all user processes terminated), which means
+        // the system is shutting down. Panic rather than resuming a dead process.
+        if (current->state == PROCESS_TERMINATED) {
+            kernel_panic("schedule_from_irq: Cannot switch to kernel thread from "
+                         "IRQ when current is terminated (system shutting down?)");
+        }
         scheduler_add_process(next);   // re-queue (takes a fresh ref)
         process_unref(next);           // release pick_next's transferred ref
-        if (current->state != PROCESS_TERMINATED) {
-            current->time_slice = priority_time_slice(current->priority);
-            current->need_resched = 0;
-            current->state = PROCESS_RUNNING;
-        }
+        current->time_slice = priority_time_slice(current->priority);
+        current->need_resched = 0;
+        current->state = PROCESS_RUNNING;
         return;  // frame untouched
     }
 
@@ -1271,14 +1746,14 @@ void scheduler_start(void) {
     kprintf("[SCHEDULER] Starting scheduler...\n");
     kprintf("[SCHEDULER] ========================================\n");
 
-    // Pick the first process to run
+    // Pick the first process to run (may be idle thread if no user processes)
     kprintf("[SCHEDULER] Picking first process from ready queue...\n");
     process_t* first = scheduler_pick_next();
 
-    if (!first) {
-        kprintf("[SCHEDULER] ERROR: No processes in ready queue!\n");
-        kernel_panic("scheduler_start: No processes to run");
-    }
+    // scheduler_pick_next() now always returns a valid process (either a real
+    // runnable process or the idle thread), so we no longer panic on empty queue.
+    // The idle thread is a valid boot target - it will halt until an interrupt
+    // (e.g., a device driver) readies a real process.
 
     kprintf("[SCHEDULER] First process selected: '%s' (PID %d)\n", first->name, first->pid);
     kprintf("[SCHEDULER]   Entry point: 0x%016lx\n", first->context.rip);
@@ -1313,19 +1788,148 @@ void scheduler_start(void) {
     kprintf("[SCHEDULER] TSS.RSP0 set to 0x%016lx (kernel stack top)\n", kstack_top);
     kprintf("[SCHEDULER]   Kernel stack base: 0x%016lx\n", (uint64_t)first->kernel_stack);
 
-    // CRITICAL: Enable interrupts AFTER TSS.RSP0 is set
-    // This prevents race where timer IRQ fires before kernel stack is configured
-    // NOTE: Do NOT sti() here - IRETQ in enter_usermode sets IF=1 in RFLAGS
-    // This avoids timer interrupt firing before we transition to ring 3
-    kprintf("[SCHEDULER] ========================================\n");
-    kprintf("[SCHEDULER] Transitioning to ring 3 (user mode)...\n");
-    kprintf("[SCHEDULER]   RIP=0x%016lx RSP=0x%016lx CR3=0x%016lx\n",
-            first->user_entry, first->user_rsp, first->context.cr3);
-    kprintf("[SCHEDULER] ========================================\n");
-    enter_usermode(first->user_entry, first->user_rsp, first->context.cr3);
+    // Check if the first process is the idle thread (kernel thread) or a user
+    // process. The idle thread has user_entry == 0 (it's kernel-only), so we
+    // jump directly to its kernel function instead of entering ring 3.
+    if (first->user_entry == 0) {
+        // Idle thread or other kernel thread: jump directly to its kernel function.
+        // context.rip points at idle_thread_func (or whatever kernel function).
+        kprintf("[SCHEDULER] ========================================\n");
+        kprintf("[SCHEDULER] Starting kernel thread '%s'...\n", first->name);
+        kprintf("[SCHEDULER]   RIP=0x%016lx RSP=0x%016lx CR3=0x%016lx\n",
+                first->context.rip, first->context.rsp, first->context.cr3);
+        kprintf("[SCHEDULER] ========================================\n");
 
-    // Should never reach here - enter_usermode does not return
-    kernel_panic("scheduler_start: Returned from enter_usermode");
+        // Switch to the idle thread's kernel stack and jump to its entry.
+        // This is a one-way jump (no return) - the idle thread runs forever.
+        __asm__ volatile(
+            "mov %0, %%rsp\n"       // Load idle thread's kernel stack
+            "mov %1, %%cr3\n"       // Load idle thread's page table (kernel CR3)
+            "push $0\n"             // Dummy return address (never used)
+            "jmp *%2\n"             // Jump to idle_thread_func
+            :: "r"(first->context.rsp), "r"(first->context.cr3), "r"(first->context.rip)
+            : "memory"
+        );
+    } else {
+        // User process: transition to ring 3 as normal.
+        // CRITICAL: Enable interrupts AFTER TSS.RSP0 is set
+        // This prevents race where timer IRQ fires before kernel stack is configured
+        // NOTE: Do NOT sti() here - IRETQ in enter_usermode sets IF=1 in RFLAGS
+        // This avoids timer interrupt firing before we transition to ring 3
+        kprintf("[SCHEDULER] ========================================\n");
+        kprintf("[SCHEDULER] Transitioning to ring 3 (user mode)...\n");
+        kprintf("[SCHEDULER]   RIP=0x%016lx RSP=0x%016lx CR3=0x%016lx\n",
+                first->user_entry, first->user_rsp, first->context.cr3);
+        kprintf("[SCHEDULER] ========================================\n");
+        enter_usermode(first->user_entry, first->user_rsp, first->context.cr3);
+    }
+
+    // Should never reach here
+    kernel_panic("scheduler_start: Returned from initial dispatch");
+}
+
+// ===========================================================================
+// Per-CPU Statistics Accessors and Reset Functions
+// ===========================================================================
+// These functions provide access to and manipulation of per-CPU scheduler
+// statistics. At N=1 (single CPU), they operate on cpus[0]. When SMP is
+// enabled (brick 5+), they will work across all online CPUs.
+
+// Get the ready_count for a specific CPU
+// Returns the number of processes in the ready queue for the given CPU.
+uint32_t scheduler_get_ready_count(uint32_t cpu_id) {
+    if (cpu_id >= MAX_CPUS) {
+        return 0;
+    }
+    return cpus[cpu_id].ready_count;
+}
+
+// Get the ready_count for the current CPU
+// Convenience wrapper that operates on this_cpu().
+uint32_t scheduler_get_current_ready_count(void) {
+    return this_cpu()->ready_count;
+}
+
+// Reset the ready_count for a specific CPU
+// Used during CPU bring-up or runqueue reinitialization.
+void scheduler_reset_ready_count(uint32_t cpu_id) {
+    if (cpu_id >= MAX_CPUS) {
+        return;
+    }
+    spin_lock(&scheduler_lock);
+    cpus[cpu_id].ready_count = 0;
+    spin_unlock(&scheduler_lock);
+}
+
+// Get per-CPU statistics for a specific CPU
+// Copies the cpu_stats_t structure for the given CPU into the provided buffer.
+// Returns 0 on success, -1 if cpu_id is invalid.
+int scheduler_get_cpu_stats(uint32_t cpu_id, cpu_stats_t* out_stats) {
+    if (cpu_id >= MAX_CPUS || !out_stats) {
+        return -1;
+    }
+    // No lock needed for reading a single uint64_t (atomic on x86-64)
+    out_stats->reserved = cpus[cpu_id].stats.reserved;
+    return 0;
+}
+
+// Reset per-CPU statistics for a specific CPU
+// Used during CPU bring-up or statistics collection resets.
+void scheduler_reset_cpu_stats(uint32_t cpu_id) {
+    if (cpu_id >= MAX_CPUS) {
+        return;
+    }
+    // No lock needed for writing a single uint64_t (atomic on x86-64)
+    cpus[cpu_id].stats.reserved = 0;
+}
+
+// Reset per-CPU statistics for all CPUs
+// Iterates through all online CPUs and resets their statistics.
+void scheduler_reset_all_cpu_stats(void) {
+    for (uint32_t i = 0; i < MAX_CPUS; i++) {
+        if (cpus[i].online) {
+            scheduler_reset_cpu_stats(i);
+        }
+    }
+}
+
+// Validate ready_count against actual runqueue contents
+// Debugging function that counts processes in both runqueues and compares
+// against ready_count. Returns 0 if counts match, -1 otherwise.
+// WARNING: Must be called with scheduler_lock held or with interrupts disabled.
+int scheduler_validate_ready_count(uint32_t cpu_id) {
+    if (cpu_id >= MAX_CPUS) {
+        return -1;
+    }
+
+    uint32_t actual_count = 0;
+    cpu_t* cpu = &cpus[cpu_id];
+
+    // Count processes in active runqueue
+    for (int prio = 0; prio < SCHED_PRIORITY_LEVELS; prio++) {
+        process_t* proc = cpu->rq_active.queues[prio];
+        while (proc) {
+            actual_count++;
+            proc = proc->next;
+        }
+    }
+
+    // Count processes in expired runqueue
+    for (int prio = 0; prio < SCHED_PRIORITY_LEVELS; prio++) {
+        process_t* proc = cpu->rq_expired.queues[prio];
+        while (proc) {
+            actual_count++;
+            proc = proc->next;
+        }
+    }
+
+    if (actual_count != cpu->ready_count) {
+        kprintf("[SCHEDULER] ERROR: CPU %d ready_count mismatch: expected %d, actual %d\n",
+                cpu_id, cpu->ready_count, actual_count);
+        return -1;
+    }
+
+    return 0;
 }
 
 #endif // CONFIG_SMP

@@ -2,6 +2,9 @@
 #include "../../include/kernel.h"
 #include "../../include/spinlock.h"
 #include "../../include/smp.h"
+#include "../../include/x86_64.h"   // read_cr3/write_cr3: free-list nodes live at
+                                    // physical addrs and must be walked under the
+                                    // kernel CR3 (which identity-maps all RAM).
 
 static void* pmm_alloc_page_slow(void);
 static void pmm_free_page_slow(void* page_addr);
@@ -128,6 +131,11 @@ void pmm_reserve_initrd(uint64_t start, uint64_t size) {
     pmm_initrd_end = ALIGN_UP(start + size, MIN_PAGE_SIZE);
 }
 
+/* CPU hotplug callback: reclaim cache when a CPU goes offline */
+static void pmm_cpu_offline_callback(uint32_t cpu) {
+    pmm_reclaim_cpu_cache(cpu);
+}
+
 /* Mark a page as free in both the free-list and the bitmap.
  * Internal helper — caller must hold global_pmm_lock.           */
 static void pmm_add_page_locked(uint64_t addr) {
@@ -222,6 +230,16 @@ void pmm_init(memory_map_entry_t* mmap, uint32_t mmap_count) {
     kprintf("[PMM] Total memory: %u MB (below 1GB)\n", (uint32_t)(total_memory / (1024 * 1024)));
     kprintf("[PMM] Memory range: %p - %p\n", memory_start, memory_end);
     kprintf("[PMM] Per-CPU caches: %u pages per CPU\n", PER_CPU_CACHE_SIZE);
+
+    // NOTE: the per-CPU cache reclaim primitive pmm_reclaim_cpu_cache() (and its
+    // wrapper pmm_cpu_offline_callback) are ready, but we do NOT register them
+    // with register_cpu_offline_callback() here: that registry — and the
+    // cpu_offline() path that would fire it — live in arch/x86_64/smp.c, which is
+    // intentionally NOT compiled into the SMP-foundation build (it collides with
+    // stubs.c::cpu_id() and pulls in the stale full-SMP layer). Wiring the
+    // callback in would leave an unresolved symbol and break the strict link with
+    // no live offline dispatch to call it anyway. Re-register here once a real
+    // cpu_offline() brick lands in the compiled SMP path.
 }
 
 /**
@@ -231,28 +249,40 @@ void pmm_init(memory_map_entry_t* mmap, uint32_t mmap_count) {
  */
 static void* pmm_alloc_page_slow(void) {
     spin_lock(&global_pmm_lock);
+    void* slow_result = NULL;
 
-    // Find first non-empty free list
-    for (int order = 0; order <= MAX_ORDER; order++) {
-        if (free_lists[order] != NULL) {
-            page_t* page = free_lists[order];
-            free_lists[order] = page->next;
+    // Allocate by scanning the authoritative BITMAP — NOT the embedded page_t free
+    // list. A free-list node lives AT the page's physical address, so once a page
+    // is used as DATA (the contiguous allocator leaves such pages on the list, and
+    // an shm/CoW page's first bytes overwrite the embedded ->next) dereferencing
+    // it walks into clobbered/unmapped memory and #PFs the kernel — the cause of
+    // the "large shm after free-list churn" crash (a node at ~276MB). The bitmap
+    // is a kernel global (mapped on every CR3, never corrupted) and needs NO page
+    // dereference, so this path can never fault on page metadata. A SET bit == FREE
+    // (see bitmap_is_free). The rotating word hint keeps it ~O(1) amortized; the
+    // per-CPU cache batches refills so this runs rarely.
+    uint64_t total_pfns = total_memory / MIN_PAGE_SIZE;
+    if (total_pfns == 0 || total_pfns > BITMAP_TOTAL_PAGES) total_pfns = BITMAP_TOTAL_PAGES;
+    uint64_t total_words = (total_pfns + 63) / 64;
+    uint64_t hint = (pmm_bitmap_hint < total_words) ? pmm_bitmap_hint : 0;
 
-            page->is_free = false;
-            used_memory += MIN_PAGE_SIZE;
-
-            /* Keep bitmap consistent */
-            uint64_t pfn = pfn_of((void*)page);
-            if (pfn < BITMAP_TOTAL_PAGES)
-                bitmap_set_used(pfn);
-
-            spin_unlock(&global_pmm_lock);
-            return (void*)page;
-        }
+    for (uint64_t scanned = 0; scanned < total_words; scanned++) {
+        uint64_t w = hint + scanned;
+        if (w >= total_words) w -= total_words;           /* wrap around */
+        uint64_t bits = pmm_bitmap[w];
+        if (bits == 0) continue;                          /* no free page in this word */
+        uint64_t bit = (uint64_t)__builtin_ctzll(bits);   /* lowest free bit */
+        uint64_t pfn = w * 64 + bit;
+        if (pfn == 0 || pfn >= total_pfns) continue;      /* skip pfn 0 / past-RAM tail */
+        bitmap_set_used(pfn);
+        used_memory += MIN_PAGE_SIZE;
+        pmm_bitmap_hint = w;
+        slow_result = addr_of_pfn(pfn);
+        break;
     }
 
     spin_unlock(&global_pmm_lock);
-    return NULL;  // Out of memory
+    return slow_result;                  // NULL == out of memory
 }
 
 /**
@@ -272,6 +302,7 @@ static void* pmm_alloc_page_slow(void) {
 void* pmm_alloc_page(void) {
     // Get current CPU ID for per-CPU page cache (enables SMP performance)
     uint32_t current_cpu = cpu_id();
+    if (current_cpu >= MAX_CPUS) current_cpu = 0;   // defensive: never index cpu_caches OOB
     per_cpu_page_cache_t* cache = &cpu_caches[current_cpu];
 
     spin_lock(&cache->lock);
@@ -282,6 +313,8 @@ void* pmm_alloc_page(void) {
         cache->alloc_fast++;
         void* page = cache->pages[cache->count];
         spin_unlock(&cache->lock);
+        if (page && *(volatile uint64_t*)page == 0x51AB0BACE51AB0BULL)
+            kprintf("[SLABPROBE] pmm_alloc(fast) handed out LIVE SLAB %p\n", page);
         return page;
     }
 
@@ -331,30 +364,33 @@ void* pmm_alloc_page(void) {
         // Completely out of memory
         kernel_panic("PMM: Out of memory");
     }
+    if (*(volatile uint64_t*)result == 0x51AB0BACE51AB0BULL)
+        kprintf("[SLABPROBE] pmm_alloc(slow) handed out LIVE SLAB %p\n", result);
     return result;
 }
 
 /**
- * Slow path: free page to global free lists
- * MUST be called with cache lock held
+ * Slow path: return a page to the global pool by clearing its BITMAP bit.
+ *
+ * Bitmap-only (matches pmm_alloc_page_slow): we do NOT write the page_t header or
+ * push onto the embedded free list. Writing page->is_free/next AT the freed page's
+ * physical address has the same fault hazard as reading it (a high physical page
+ * may be unmapped on the live user CR3), and the free list is no longer consulted
+ * by the allocator anyway. Clearing the bitmap bit is sufficient and never
+ * dereferences page memory, so it cannot fault.
  */
 static void pmm_free_page_slow(void* page_addr) {
     if (page_addr == NULL) return;
 
     spin_lock(&global_pmm_lock);
 
-    page_t* page = (page_t*)page_addr;
-    page->is_free = true;
-    page->order = 0;
-    page->next = free_lists[0];
-    free_lists[0] = page;
-
     used_memory -= MIN_PAGE_SIZE;
 
-    /* Keep bitmap consistent */
     uint64_t pfn = pfn_of(page_addr);
-    if (pfn < BITMAP_TOTAL_PAGES)
+    if (pfn < BITMAP_TOTAL_PAGES) {
         bitmap_set_free(pfn);
+        pmm_bitmap_hint = pfn / 64;   /* bias the next alloc here (locality + reuse) */
+    }
 
     spin_unlock(&global_pmm_lock);
 }
@@ -408,11 +444,46 @@ void pmm_free_page(void* page_addr) {
         return;
     }
 
+    // SPURIOUS-LIVE-SLAB-FREE DETECTOR + GUARD: a live slab page carries
+    // SLAB_MAGIC (0x51AB0BACE51AB0B) at offset 0, and the slab allocator zeroes
+    // that magic BEFORE it returns the page here (slab.c slab_free/destroy). So a
+    // page that STILL reads SLAB_MAGIC is a LIVE slab being freed by a stray /
+    // aliased pointer (e.g. an address-space teardown freeing a page that was
+    // double-allocated as both a kmalloc slab AND a process page table). Caching
+    // it hands the live slab to the next pmm_alloc_page(), which zeroes it ->
+    // header magic=0 -> kmalloc later pops a wild free_list (the SLABDIAG crash).
+    // BLOCK the free (leak the page; far cheaper than corrupting the heap) and
+    // report the caller chain so the underlying double-allocation is root-caused.
+    if (*(volatile uint64_t*)page_addr == 0x51AB0BACE51AB0BULL) {
+        kprintf("[PMM] BLOCKED free of a LIVE slab page %p (caller ra=%p<-%p<-%p) — leaking it to protect the heap\n",
+                page_addr, __builtin_return_address(0),
+                __builtin_return_address(1), __builtin_return_address(2));
+        return;
+    }
+
     // Get current CPU ID for per-CPU page cache (enables SMP performance)
     uint32_t current_cpu = cpu_id();
+    if (current_cpu >= MAX_CPUS) current_cpu = 0;   // defensive: never index cpu_caches OOB
     per_cpu_page_cache_t* cache = &cpu_caches[current_cpu];
 
     spin_lock(&cache->lock);
+
+    // Cache-aware double-free guard. A frame parked in this per-CPU cache keeps its
+    // BITMAP bit USED (see the note below), so the bitmap-based double-free check
+    // earlier in this function CANNOT see it. Without this scan, freeing a frame
+    // twice while it is still cached pushes it onto cache->pages[] twice — it is
+    // then handed to TWO different callers, one of which uses it as a live page
+    // table while the other writes it as a data page, scribbling the page-table
+    // bytes and corrupting the kernel identity map (observed: a NOT-PRESENT kernel
+    // #PF inside memset on a ~272MB page after heavy spawn/kill churn; the split
+    // PD entry's PT had a zeroed PTE). Reject the duplicate free.
+    for (uint32_t k = 0; k < cache->count; k++) {
+        if (cache->pages[k] == page_addr) {
+            spin_unlock(&cache->lock);
+            kprintf("[PMM] BLOCKED double-free of cached page %p\n", page_addr);
+            return;
+        }
+    }
 
     // Fast path: add to cache if not full
     if (cache->count < PER_CPU_CACHE_SIZE) {
@@ -645,19 +716,12 @@ found:
      * We have a run [run_start, run_start + run_len) with run_len >= count.
      * Mark exactly `count` pages used and update accounting.
      */
+    // Bitmap-only: mark the run used. We do NOT touch the page_t headers or the
+    // embedded free list — the allocator is driven entirely by the bitmap now, so
+    // the contiguous path and the single-page slow path stay coherent without ever
+    // dereferencing physical page memory (no clobbered-node / unmapped-page #PF).
     for (uint64_t i = 0; i < (uint64_t)count; i++) {
-        uint64_t pfn = run_start + i;
-        bitmap_set_used(pfn);
-
-        /*
-         * Mark the page_t metadata used so that any stale free-list
-         * reference is detectable.  The page may still be on the free-list
-         * chain, but is_free = false signals that it is no longer available.
-         * (pmm_alloc_page_slow only pops the head; this is the defensive
-         * guard for any future list traversal.)
-         */
-        page_t* pg = (page_t*)addr_of_pfn(pfn);
-        pg->is_free = false;
+        bitmap_set_used(run_start + i);
     }
     used_memory += (uint64_t)count * MIN_PAGE_SIZE;
 
@@ -733,6 +797,20 @@ void pmm_free_pages(void* base, size_t count) {
 
         void* page_addr = addr_of_pfn(pfn);
         page_t* page = (page_t*)page_addr;
+
+        // LIVE-SLAB GUARD (same rationale as pmm_free_page): a page still carrying
+        // SLAB_MAGIC is a live kmalloc slab. Freeing it here would bitmap_set_free a
+        // live slab page (-> double-alloc -> the next alloc_page_table zeroes it ->
+        // slab header magic=0 -> SLABDIAG) AND scribble page_t fields over the slab.
+        // This fires when a contiguous free runs into live slabs (e.g. a wrong
+        // count, or a per-page-allocated shm segment freed as one contiguous run).
+        // Skip+leak the page and report the caller so the bad free is root-caused.
+        if (*(volatile uint64_t*)page_addr == 0x51AB0BACE51AB0BULL) {
+            kprintf("[PMM] BLOCKED contiguous free of a LIVE slab page %p (range %p+%lu, caller ra=%p<-%p) — leaking it to protect the heap\n",
+                    page_addr, base, (unsigned long)count,
+                    __builtin_return_address(0), __builtin_return_address(1));
+            continue;
+        }
 
         if (page->is_free) {
             /*
@@ -854,6 +932,58 @@ void pmm_report_cache_stats(void) {
         kprintf("  CPU %d: Fast=%llu Slow=%llu Hit Rate=%llu%% Cached=%u\n",
                 cpu, cache->alloc_fast, cache->alloc_slow, hit_rate, cache->count);
     }
+}
+
+/**
+ * pmm_reclaim_cpu_cache - flush a per-CPU page cache back to the global pool.
+ *
+ * Must be called when a CPU goes offline (CPU hot-unplug) to prevent stranding
+ * up to PER_CPU_CACHE_SIZE pages in an unreachable cache. Without this function,
+ * CPU hot-unplug would leak memory.
+ *
+ * Thread safety: The caller is responsible for ensuring the target CPU is already
+ * offline (not running) before calling this function. Typically invoked from the
+ * cpu_offline() path after the CPU state has been set to CPU_STATE_OFFLINE.
+ *
+ * Lock ordering: Acquires cache->lock then releases it before calling
+ * pmm_free_page_slow (which acquires global_pmm_lock), preventing deadlock.
+ *
+ * Returns: Number of pages reclaimed from the cache.
+ */
+uint32_t pmm_reclaim_cpu_cache(uint32_t cpu) {
+    if (cpu >= MAX_CPUS) {
+        kprintf("[PMM] WARNING: Attempt to reclaim cache for invalid CPU %u\n", cpu);
+        return 0;
+    }
+
+    per_cpu_page_cache_t* cache = &cpu_caches[cpu];
+    uint32_t reclaimed = 0;
+
+    spin_lock(&cache->lock);
+
+    // Copy all cached pages to a local array before returning them.
+    // This avoids holding cache->lock while calling pmm_free_page_slow
+    // (which acquires global_pmm_lock), preventing lock-order violation.
+    void* pages_to_free[PER_CPU_CACHE_SIZE];
+    uint32_t count = cache->count;
+    for (uint32_t i = 0; i < count; i++) {
+        pages_to_free[i] = cache->pages[i];
+    }
+    cache->count = 0;
+
+    spin_unlock(&cache->lock);
+
+    // Now return all pages to the global pool (updates bitmap + free-list)
+    for (uint32_t i = 0; i < count; i++) {
+        pmm_free_page_slow(pages_to_free[i]);
+        reclaimed++;
+    }
+
+    if (reclaimed > 0) {
+        kprintf("[PMM] Reclaimed %u pages from CPU %u cache\n", reclaimed, cpu);
+    }
+
+    return reclaimed;
 }
 
 /* -----------------------------------------------------------------------

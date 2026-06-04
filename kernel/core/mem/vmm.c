@@ -1,6 +1,7 @@
 #include "../../include/mem.h"
 #include "../../include/kernel.h"
 #include "../../include/x86_64.h"  // read_cr3() for the live address-space walk
+#include "../../include/sched.h"   // process_t for vmm_get_cr3 fallback
 
 // External string functions
 extern void* memcpy(void* dest, const void* src, size_t count);
@@ -11,6 +12,10 @@ extern void paging_map_page(void* virt, void* phys, uint64_t flags);
 extern void paging_unmap_page(void* virt);
 extern uint64_t paging_create_address_space(void);
 extern void paging_destroy_address_space(uint64_t cr3);
+extern void paging_set_target(uint64_t cr3);
+extern void paging_reset_target(void);
+extern int paging_modify_pte_flags(void* virt, uint64_t new_flags);
+extern uint64_t paging_kernel_cr3(void);
 
 /*
  * paging_get_pte - walk the ACTIVE page tables and return the raw PTE for
@@ -225,6 +230,53 @@ static bool user_range_is_accessible(uint64_t addr, size_t n, bool need_write) {
 }
 
 /*
+ * vmm_get_physical - translate a virtual address to its physical address.
+ *
+ * DESIGN
+ * ------
+ * Walks the active page tables using paging_get_pte() to retrieve the leaf
+ * page-table entry for the given virtual address.  Extracts the physical
+ * page frame number from the PTE and combines it with the page offset from
+ * the virtual address to produce the complete physical address.
+ *
+ * For 2MB huge pages, the PDE is the leaf entry and contains a 2MB-aligned
+ * physical address; we extract bits 20:12 from virt as the huge-page offset.
+ *
+ * Returns NULL if the virtual address is not mapped (any level in the page
+ * table walk is absent).
+ *
+ * USAGE
+ * -----
+ * Used by debugging tools, page-fault handlers, and DMA setup routines that
+ * need to translate kernel or user virtual addresses to physical addresses.
+ * Should not be called on unmapped addresses without checking the PTE first.
+ */
+void* vmm_get_physical(void* virt) {
+    uint64_t vaddr = (uint64_t)virt;
+
+    // Get the page table entry for this virtual address
+    uint64_t pte = paging_get_pte(vaddr);
+
+    // If not present, return NULL
+    if (!(pte & PAGE_PRESENT)) {
+        return NULL;
+    }
+
+    // Check if this is a 2MB huge page (bit 7 set in PDE)
+    if (pte & (1ULL << 7)) {
+        // Huge page: extract 2MB-aligned physical address and add offset
+        uint64_t phys_base = pte & 0x000FFFFFFFE00000ULL;  // Bits 51:21
+        uint64_t offset = vaddr & 0x1FFFFFULL;              // Bits 20:0
+        return (void*)(phys_base | offset);
+    } else {
+        // 4KB page: extract 4KB-aligned physical address and add offset
+        uint64_t phys_base = pte & 0x000FFFFFFFFFF000ULL;  // Bits 51:12
+        uint64_t offset = vaddr & 0xFFFULL;                 // Bits 11:0
+        return (void*)(phys_base | offset);
+    }
+}
+
+/*
  * Bulk copy helpers (8-byte aligned fast path + byte tail).
  * We keep these self-contained so vmm.c does not depend on memcpy from
  * another agent's lib/string.c.  The external memcpy() declared above is
@@ -305,40 +357,309 @@ int copy_from_user(void* kernel_dst, const void* user_src, size_t n) {
 
 /*
  * Extended VMM operations for PE loader / Win32 subsystem
- * These are stub implementations that allocate from the kernel heap
- * until full per-process address space management is implemented.
+ * ========================================================
+ * These functions provide per-process virtual memory allocation with optional
+ * fixed-address placement for PE image loading and Win32 VirtualAlloc support.
+ *
+ * vmm_ctx is expected to be a CR3 value (address space identifier). If NULL,
+ * the current process's CR3 is used as a fallback (allows PE loader to work
+ * even when process->vmm is not initialized).
  */
 
-void* vmm_alloc(void* vmm_ctx, size_t size, int prot) {
-    (void)vmm_ctx; (void)prot;
-    /* TODO: Implement proper per-process allocation */
-    void* addr = kmalloc(size);
-    if (addr) {
-        uint8_t* p = (uint8_t*)addr;
-        for (size_t i = 0; i < size; i++) p[i] = 0;
+// Forward declaration to access current process
+extern process_t* current_process;
+
+static uint64_t vmm_get_cr3(void* vmm_ctx) {
+    if (vmm_ctx) {
+        return (uint64_t)vmm_ctx;
     }
+    // Fallback to current process's CR3
+    if (current_process && current_process->context.cr3) {
+        return current_process->context.cr3;
+    }
+    return 0;
+}
+
+void* vmm_alloc(void* vmm_ctx, size_t size, int prot) {
+    if (size == 0) {
+        return NULL;
+    }
+
+    // Get the target CR3 (vmm_ctx or fallback to current process)
+    uint64_t cr3 = vmm_get_cr3(vmm_ctx);
+    if (!cr3) {
+        kprintf("[VMM] vmm_alloc: No valid address space available\n");
+        return NULL;
+    }
+
+    // Translate VMM_PROT_* flags to PAGE_* flags for the paging layer
+    uint32_t vma_prot = 0;
+    if (prot & VMM_PROT_READ)  vma_prot |= PAGE_PRESENT | PAGE_USER;
+    if (prot & VMM_PROT_WRITE) vma_prot |= PAGE_WRITE;
+    // VMM_PROT_EXEC: NX bit handling would go here when implemented
+
+    // Use the existing vmm_mmap_anon infrastructure which:
+    // - Allocates from the per-address-space bump allocator
+    // - Eagerly maps fresh physical pages
+    // - Marks pages as PTE_OWNED for automatic cleanup
+    // - Returns user-space virtual addresses
+    void* addr = vmm_mmap_anon(cr3, size, vma_prot);
+
+    if (!addr) {
+        kprintf("[VMM] vmm_alloc: Failed to allocate %zu bytes in AS %p\n",
+                size, vmm_ctx);
+        return NULL;
+    }
+
     return addr;
 }
 
 void* vmm_alloc_at(void* vmm_ctx, void* addr, size_t size, int prot) {
-    (void)vmm_ctx; (void)prot;
-    /* TODO: Implement allocation at specific address */
-    if (addr) {
-        /* Cannot guarantee specific address with kmalloc, fall back */
-        return vmm_alloc(vmm_ctx, size, prot);
+    if (size == 0) {
+        return NULL;
     }
-    return vmm_alloc(vmm_ctx, size, prot);
+
+    // Get the target CR3 (vmm_ctx or fallback to current process)
+    uint64_t cr3 = vmm_get_cr3(vmm_ctx);
+    if (!cr3) {
+        kprintf("[VMM] vmm_alloc_at: No valid address space available\n");
+        return NULL;
+    }
+
+    // Validate the requested address is in user space
+    uint64_t requested_addr = (uint64_t)addr;
+    if (requested_addr == 0 || requested_addr >= USER_SPACE_END) {
+        kprintf("[VMM] vmm_alloc_at: Invalid address %p (must be in user space)\n", addr);
+        return NULL;
+    }
+
+    // Check if the address is page-aligned (PE images typically require alignment)
+    if ((requested_addr & (PAGE_SIZE - 1)) != 0) {
+        kprintf("[VMM] vmm_alloc_at: Address %p not page-aligned\n", addr);
+        return NULL;
+    }
+    uint64_t aligned_size = ALIGN_UP(size, PAGE_SIZE);
+    uint64_t npages = aligned_size / PAGE_SIZE;
+
+    // Reject zero / overflowing sizes and ranges that would extend PAST user
+    // space. Line 431 above only bounds the START; without bounding the END,
+    // (requested_addr + aligned_size) can wrap around 2^64 and slip past the
+    // USER_SPACE_END check, mapping kernel memory as user-accessible. We compare
+    // via subtraction (USER_SPACE_END - aligned_size) so the check itself never
+    // overflows. `aligned_size < size` catches an ALIGN_UP wrap on a huge size.
+    if (size == 0 || aligned_size < size ||
+        aligned_size > USER_SPACE_END ||
+        requested_addr > USER_SPACE_END - aligned_size) {
+        kprintf("[VMM] vmm_alloc_at: size %lu at %p exceeds user space\n",
+                (unsigned long)size, addr);
+        return NULL;
+    }
+
+    // Translate VMM_PROT_* to PAGE_* flags
+    uint64_t flags = PAGE_PRESENT | PAGE_USER;
+    if (prot & VMM_PROT_WRITE) {
+        flags |= PAGE_WRITE;
+    }
+    // NX handling: when VMM_PROT_EXEC is NOT set, we should set PAGE_NX
+    // For now, all pages are executable (PAGE_NX not set)
+
+    // Check if the requested range overlaps existing mappings by walking the
+    // page tables. This prevents silently overwriting existing allocations.
+    // We save the current CR3, switch to the target, check the PTEs, then restore.
+    uint64_t saved_cr3 = read_cr3();
+    write_cr3(cr3);
+
+    // Simple overlap check: verify the target range is not already mapped.
+    // A full implementation would check every page or consult a VMA tree.
+    // For now, check first and last page as a basic sanity test.
+    uint64_t first_pte = paging_get_pte(requested_addr);
+    uint64_t last_pte = paging_get_pte(requested_addr + aligned_size - PAGE_SIZE);
+
+    // Restore the original CR3
+    write_cr3(saved_cr3);
+
+    if ((first_pte & PAGE_PRESENT) || (last_pte & PAGE_PRESENT)) {
+        kprintf("[VMM] vmm_alloc_at: Address range %p-%p already mapped\n",
+                addr, (void*)(requested_addr + aligned_size));
+        return NULL;
+    }
+
+    // Allocate and map pages at the requested address
+    for (uint64_t i = 0; i < npages; i++) {
+        void* phys = pmm_alloc_page();
+        if (!phys) {
+            kprintf("[VMM] vmm_alloc_at: OOM after %lu/%lu pages\n",
+                    (unsigned long)i, (unsigned long)npages);
+
+            // Rollback: free pages allocated so far
+            if (i > 0) {
+                vmm_unmap_range_into(cr3, requested_addr, i * PAGE_SIZE, true);
+            }
+            return NULL;
+        }
+
+        // Zero the physical page (PE loader expects zero-initialized memory)
+        uint8_t* page_ptr = (uint8_t*)phys;
+        for (size_t j = 0; j < PAGE_SIZE; j++) {
+            page_ptr[j] = 0;
+        }
+
+        // Map into the target address space at the requested address
+        int result = vmm_map_phys_into(cr3, requested_addr + i * PAGE_SIZE,
+                                       (uint64_t)phys, PAGE_SIZE, flags);
+        if (result != 0) {
+            kprintf("[VMM] vmm_alloc_at: Failed to map page at %p\n",
+                    (void*)(requested_addr + i * PAGE_SIZE));
+            pmm_free_page(phys);
+
+            // Rollback
+            if (i > 0) {
+                vmm_unmap_range_into(cr3, requested_addr, i * PAGE_SIZE, true);
+            }
+            return NULL;
+        }
+    }
+
+    return addr;
 }
 
 void vmm_free(void* vmm_ctx, void* addr, size_t size) {
-    (void)vmm_ctx; (void)size;
-    if (addr) kfree(addr);
+    if (!addr || size == 0) {
+        return;
+    }
+
+    // Get the target CR3 (vmm_ctx or fallback to current process)
+    uint64_t cr3 = vmm_get_cr3(vmm_ctx);
+    if (!cr3) {
+        kprintf("[VMM] vmm_free: No valid address space available\n");
+        return;
+    }
+    uint64_t vaddr = (uint64_t)addr;
+
+    // Validate address is in user space
+    if (vaddr >= USER_SPACE_END) {
+        kprintf("[VMM] vmm_free: Invalid address %p (not in user space)\n", addr);
+        return;
+    }
+
+    // Free the pages via vmm_munmap if in the anon window, otherwise use
+    // the general unmap+free path. vmm_munmap already does bounds checking.
+    if (vaddr >= VMM_ANON_VA_BASE) {
+        // This was allocated via vmm_alloc, use munmap
+        vmm_munmap(cr3, vaddr, size);
+    } else {
+        // This was allocated via vmm_alloc_at at a fixed address outside
+        // the normal anon window (e.g., PE image base). Unmap and free.
+        vmm_unmap_range_into(cr3, vaddr, size, true);
+    }
 }
 
+/*
+ * vmm_protect - change protection flags on a virtual memory region
+ * =================================================================
+ * Modifies the page-table protection bits for all pages in the range
+ * [addr, addr+size) in the specified address space (vmm_ctx is the CR3 value).
+ *
+ * Used by:
+ *   - PE loader: setting section permissions (.text = RX, .data = RW, .rdata = R)
+ *   - Win32 VirtualProtect(): runtime page-protection changes
+ *   - Win32 VirtualFree(MEM_DECOMMIT): marking pages inaccessible
+ *
+ * Parameters:
+ *   vmm_ctx - CR3 value of the target address space (NULL = fail)
+ *   addr    - starting virtual address (will be page-aligned down)
+ *   size    - size in bytes (will be rounded up to page boundary)
+ *   prot    - new protection flags (VMM_PROT_READ, VMM_PROT_WRITE, VMM_PROT_EXEC)
+ *
+ * Returns:
+ *    0 on success
+ *   -1 on failure (invalid vmm_ctx, address out of range, or unmapped page)
+ *
+ * Implementation:
+ *   - Aligns addr down and size up to PAGE_SIZE boundaries
+ *   - Translates VMM_PROT_* to PAGE_* flags
+ *   - Saves the current paging target, switches to the target CR3
+ *   - Walks each page in the range and calls paging_modify_pte_flags()
+ *   - Restores the original paging target
+ */
 int vmm_protect(void* vmm_ctx, void* addr, size_t size, int prot) {
-    (void)vmm_ctx; (void)addr; (void)size; (void)prot;
-    /* TODO: Implement page protection changes */
-    return 0;
+    if (!vmm_ctx || !addr || size == 0) {
+        return -1;
+    }
+
+    uint64_t cr3 = (uint64_t)vmm_ctx;
+    uint64_t vaddr = (uint64_t)addr;
+
+    // Validate address is in user space
+    if (vaddr >= USER_SPACE_END) {
+        kprintf("[VMM] vmm_protect: Address %p is not in user space\n", addr);
+        return -1;
+    }
+
+    // Align address down to page boundary and size up
+    uint64_t aligned_addr = vaddr & ~(PAGE_SIZE - 1);
+    uint64_t end_addr = (vaddr + size + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+    uint64_t aligned_size = end_addr - aligned_addr;
+
+    // Check end address doesn't overflow into kernel space
+    if (aligned_addr + aligned_size > USER_SPACE_END) {
+        kprintf("[VMM] vmm_protect: Range %p-%p extends into kernel space\n",
+                (void*)aligned_addr, (void*)(aligned_addr + aligned_size));
+        return -1;
+    }
+
+    // Translate VMM_PROT_* flags to PAGE_* flags
+    uint64_t page_flags = 0;
+
+    // PROT_NONE (0x00): clear PRESENT bit to make page inaccessible
+    // Used by VirtualFree(MEM_DECOMMIT) to mark pages as unavailable while
+    // keeping the virtual address space reserved.
+    if (prot == VMM_PROT_NONE) {
+        // Clear PRESENT bit - page will fault if accessed
+        // Keep USER bit so the entry is still recognized as user-space
+        page_flags = PAGE_USER;
+    } else {
+        // Any non-zero protection: page is accessible
+        page_flags = PAGE_PRESENT | PAGE_USER;
+
+        if (prot & VMM_PROT_WRITE) {
+            page_flags |= PAGE_WRITE;
+        }
+
+        // NX (No-Execute) bit: set if VMM_PROT_EXEC is NOT set
+        // NOTE: This requires EFER.NXE to be enabled (should be done in paging_init)
+        if (!(prot & VMM_PROT_EXEC)) {
+            page_flags |= PAGE_NX;
+        }
+    }
+
+    // Save current paging target and switch to the target address space
+    uint64_t saved_target = read_cr3() & 0x000FFFFFFFFFF000ULL;
+    paging_set_target(cr3);
+
+    // Modify protection on each page in the range
+    uint64_t npages = aligned_size / PAGE_SIZE;
+    int result = 0;
+
+    for (uint64_t i = 0; i < npages; i++) {
+        void* page_addr = (void*)(aligned_addr + i * PAGE_SIZE);
+
+        if (paging_modify_pte_flags(page_addr, page_flags) != 0) {
+            kprintf("[VMM] vmm_protect: Failed to modify PTE flags for page %p (not mapped?)\n",
+                    page_addr);
+            result = -1;
+            // Continue trying to modify remaining pages rather than abort
+        }
+    }
+
+    // Restore original paging target
+    paging_reset_target();
+    uint64_t kernel_cr3 = paging_kernel_cr3();
+    if (saved_target != kernel_cr3) {
+        paging_set_target(saved_target);
+    }
+
+    return result;
 }
 
 /*

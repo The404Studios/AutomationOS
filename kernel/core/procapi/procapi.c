@@ -156,7 +156,7 @@ int procapi_ctl(uint32_t pid, uint32_t verb, uint64_t arg)
          */
         kprintf("[PROCAPI] Resuming PID %u (%s)\n", proc->pid, proc->name);
         if (proc->state == PROCESS_BLOCKED) {
-            proc->state = PROCESS_READY;
+            process_set_ready(proc);
         }
         break;
 

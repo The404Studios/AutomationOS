@@ -374,7 +374,7 @@ void scheduler_add_process(process_t* proc) {
     uint64_t flags;
 
     spin_lock_irqsave(&rq->lock, &flags);
-    proc->state = PROCESS_READY;
+    process_set_ready(proc);
     cpu_runqueue_enqueue_locked(rq, proc);
     spin_unlock_irqrestore(&rq->lock, flags);
 

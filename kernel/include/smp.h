@@ -203,7 +203,4 @@ static inline uint32_t cpumask_count(cpumask_t mask) {
 void smp_print_info(void);
 void smp_print_stats(void);
 
-// Health monitoring
-bool health_monitor_detect_stalls(void);
-
 #endif // SMP_H

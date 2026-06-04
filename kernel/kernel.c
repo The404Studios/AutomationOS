@@ -452,6 +452,21 @@ void kernel_main(void* raw_info) {
                 (unsigned long)hz);
     }
 
+#ifdef SMP_SCHED
+    /* Brick B: install the per-CPU TSS array + both GDT TSS descriptors NOW, BEFORE
+     * try_start_cpu1() -- the AP's ap_main() does `ltr 0x38` (gdt_ap_load_tss) as
+     * its first action, so CPU1's TSS descriptor (gdt[7-8]) must already exist or
+     * the ltr #GPs. The default build keeps its single tss_init() later (just before
+     * scheduler_start); under SMP_SCHED that late call is #ifndef-skipped so we
+     * initialize exactly once, here. The BSP entering ring 3 happens much later
+     * (scheduler_start), so loading the BSP TSS early is harmless. */
+    {
+        extern void tss_init(void);
+        kprintf("[SMP] Brick B: installing per-CPU TSS array before AP bring-up...\n");
+        tss_init();
+    }
+#endif
+
     /* SMP brick 3 (GATED, SMP=1 build only): bring ONE application processor
      * (CPU 1) online as a bare HEARTBEAT. It reaches long mode, marks itself
      * online, and hlts forever. NO scheduling, NO AP timer, NO per-CPU runqueue,
@@ -469,6 +484,23 @@ void kernel_main(void* raw_info) {
         if (smp_cpu_count >= 2) {
             if (try_start_cpu1()) {
                 kprintf("[SMP] CPU 1 online\n");        /* AP reached long mode */
+#ifdef SMP_SCHED
+                /* Brick A checkpoint: a REAL cpu_id(). The BSP must report 0; the
+                 * AP recorded its own cpu_id() into g_ap_observed_cpuid (expect 1)
+                 * during ap_main. Printed here by the BSP so the AP never races the
+                 * serial port. */
+                {
+                    extern uint32_t cpu_id(void);
+                    extern volatile uint32_t g_ap_observed_cpuid;
+                    extern volatile uint16_t g_ap_observed_tr;
+                    uint16_t bsp_tr;
+                    __asm__ volatile("str %0" : "=r"(bsp_tr));
+                    kprintf("[SMP] Brick A cpu_id: BSP=%u (expect 0), AP=%u (expect 1)\n",
+                            cpu_id(), g_ap_observed_cpuid);
+                    kprintf("[SMP] Brick B TR: BSP=0x%x (expect 0x28), AP=0x%x (expect 0x38)\n",
+                            bsp_tr, g_ap_observed_tr);
+                }
+#endif
                 /* Brick 6: the AP now runs a managed kernel WORKER loop -- it
                  * spin-polls ONE job slot. Dispatch a SINGLE trusted job to CPU 1
                  * to PROVE it can execute BSP-dispatched code and return a correct
@@ -481,6 +513,15 @@ void kernel_main(void* raw_info) {
                  * scheduler, no arbitrary process, no migration. The AP spin-polls
                  * (it is NOT hlt-parked) because it has no wakeup IRQ yet -- a
                  * low-power IPI-wake is a future brick. */
+#ifdef SMP_SCHED_DISPATCH
+                /* SCHEDULER MODE (Brick F): CPU1 runs ap_scheduler_loop(), NOT the
+                 * cpu1_job worker loop, so the coprocessor offload self-tests
+                 * (worktest / matmul / rapid-offload) would submit jobs nobody
+                 * services and just burn their deadlines. Skip them entirely. */
+                kprintf("[SMP] CPU1 in SCHEDULER mode (Brick F): coprocessor "
+                        "offload self-tests skipped\n");
+                g_smp_ap_online = 1;
+#else
                 extern int cpu1_run(void (*fn)(void *), void *arg);
                 extern volatile long g_worktest;
                 extern void worktest(void *a);
@@ -519,6 +560,13 @@ void kernel_main(void* raw_info) {
                  * trampoline does not provably enable SSE state on CPU1). */
                 extern void matmul_self_test(void);
                 matmul_self_test();
+
+                /* SMP brick 8.5: rapid-fire CPU1 offload stress test (100 sequential
+                 * offloads in a tight loop to check for races in job slot reuse,
+                 * ownership state transitions, and the cpu1_job_lock spinlock). */
+                extern int test_rapid_cpu1_offload(void);
+                test_rapid_cpu1_offload();
+#endif /* !SMP_SCHED_DISPATCH */
             } else {
                 kprintf("[SMP] AP failed to start, continuing single-core\n");
                 g_smp_boot_status = "SMP: AP failed (single-core)";
@@ -531,10 +579,13 @@ void kernel_main(void* raw_info) {
         /* Fall through and finish booting the BSP normally -- no matter what. */
     }
 
-    // Start health monitor thread (5-second sampling)
+    // Health monitor: initialize the state now, but DEFER starting its kernel
+    // THREAD until AFTER /sbin/init is loaded. The monitor thread is a
+    // process_create(); if it runs here (before init) it grabs PID 1, so init
+    // ends up PID 2 and aborts ("Not PID 1!") -- which is exactly why the SMP
+    // desktop failed to start. See the deferred health_monitor_start_thread()
+    // right after init's elf_load_and_exec below.
     health_monitor_init();
-    health_monitor_start_thread();
-    kprintf("[HEALTH] Monitor started (5s sampling)\n");
 #endif
 
     /* Initialize framebuffer if available */
@@ -695,6 +746,38 @@ void kernel_main(void* raw_info) {
             kprintf("[SMP] heartbeat: CPU0=%lu CPU1=%lu (proof-of-life); "
                     "CPU1 idle_ticks=%lu (worker spin-poll)\n",
                     cpu_hb[0].v, cpu_hb[1].v, ap1_idle_ticks);
+#ifdef SMP_SCHED
+            /* Brick E checkpoint: CPU1 armed its LAPIC timer (100 Hz, vector 0x40)
+             * and did sti before this ~4s window. ap_timer_ticks must have CLIMBED
+             * (≈400) -- proving CPU1 takes interrupts and EOIs the LAPIC correctly
+             * (a wrong EOI would have wedged the BSP's IRQ0 -> frozen desktop). */
+            {
+                extern volatile uint64_t ap_timer_ticks;
+                kprintf("[SMP] Brick E: CPU1 LAPIC timer ticks=%lu (expect ~400 over 4s; "
+                        ">0 proves CPU1 takes IRQs + EOIs LAPIC)\n", ap_timer_ticks);
+#ifdef SMP_SCHED_DISPATCH
+                {
+                    extern volatile uint64_t ap_dbg_stage;
+                    kprintf("[SMP] DBG: ap_dbg_stage=%lu (1=enter,2=pre-switch,3=loop running)\n",
+                            ap_dbg_stage);
+                }
+#endif
+            }
+#ifdef SMP_SCHED_DISPATCH
+            /* Brick F2 checkpoint: ap_kthread_counter climbing proves CPU1 actually
+             * context-switched INTO the pinned kernel thread and is running it in
+             * parallel with CPU0's desktop. Read it twice ~spaced to show motion. */
+            {
+                extern volatile uint64_t ap_kthread_counter;
+                uint64_t c1 = ap_kthread_counter;
+                for (volatile int d = 0; d < 2000000; d++) { __asm__ volatile("pause"); }
+                uint64_t c2 = ap_kthread_counter;
+                kprintf("[SMP] Brick F2: AP kthread counter %lu -> %lu (delta=%lu; "
+                        ">0 proves CPU1 ran the pinned kernel thread)\n",
+                        c1, c2, c2 - c1);
+            }
+#endif
+#endif
         }
 #endif
 
@@ -724,7 +807,11 @@ void kernel_main(void* raw_info) {
     boot_mark("timer (PIT)");
     extern void pit_init(uint32_t freq_hz);
     pit_init(1000);
-    kprintf("[KERNEL] Timer: tick counter armed (1000 Hz, no preemption)\n");
+#ifdef PREEMPTIVE
+    kprintf("[KERNEL] Timer: 1000 Hz, PREEMPTIVE (IRQ0 -> schedule_from_irq; ring-3 time-slicing)\n");
+#else
+    kprintf("[KERNEL] Timer: tick counter armed (1000 Hz, cooperative)\n");
+#endif
     boot_mark("timer ok");
 
     // Storage: generic block layer + AHCI/SATA driver (#13). PMM, heap, PCI and
@@ -1013,20 +1100,72 @@ void kernel_main(void* raw_info) {
                 if (pid > 0) {
                     kprintf("[KERNEL] Init process started (PID %d)\n", pid);
 
+#ifdef SMP_FOUNDATION
+                    /* Deferred from the SMP brick above: start the health-monitor
+                     * kernel thread NOW that /sbin/init has claimed PID 1, so the
+                     * monitor thread takes a later PID instead of stealing PID 1. */
+                    health_monitor_start_thread();
+                    kprintf("[HEALTH] Monitor thread started (5s sampling)\n");
+#endif
+
+#ifdef SMP_SCHED
+                    /* Brick D: populate CPU1's per-CPU scheduler slot (idle thread +
+                     * empty runqueues + online) now that init owns PID 1, so CPU1's
+                     * idle takes a normal free PID instead of stealing PID 1. CPU1 is
+                     * still a coprocessor (no dispatch yet, Bricks E/F); this is pure
+                     * BSP-side data init that those bricks build on. */
+                    {
+                        extern int madt_get_apic_id(int index);
+                        int ap_apic = madt_get_apic_id(1);
+                        uint32_t ap_apic_id = (ap_apic < 0) ? 1u : (uint32_t)ap_apic;
+                        if (scheduler_init_secondary_cpu(1, ap_apic_id)) {
+                            kprintf("[SMP] Brick D: CPU1 scheduler slot initialized\n");
+#ifdef SMP_SCHED_DISPATCH
+                            /* Brick F2: pin ONE ring-0 kernel test thread to CPU1.
+                             * CPU1's ap_scheduler_loop context-switches into it on
+                             * the next tick. Spin briefly on the BSP, then read
+                             * ap_kthread_counter: a positive delta PROVES CPU1 did
+                             * the first real AP context switch and is running the
+                             * thread in parallel with CPU0. (The earlier heartbeat
+                             * window ran before this spawn, hence its delta=0.) */
+                            ap_spawn_test_kthread();
+                            {
+                                extern volatile uint64_t ap_kthread_counter;
+                                uint64_t c0 = ap_kthread_counter;
+                                for (volatile long d = 0; d < 8000000L; d++) {
+                                    __asm__ volatile("pause");
+                                }
+                                uint64_t c1 = ap_kthread_counter;
+                                kprintf("[SMP] Brick F2 VERIFY: AP kthread counter "
+                                        "%lu -> %lu (delta=%lu; >0 proves the FIRST "
+                                        "AP context switch into a scheduled thread)\n",
+                                        c0, c1, c1 - c0);
+                            }
+#endif
+                        } else {
+                            kprintf("[SMP] Brick D: CPU1 slot init FAILED (CPU1 stays coprocessor)\n");
+                        }
+                    }
+#endif
+
                     /* Initialize TSS for ring 3 transitions */
+#ifdef SMP_SCHED
+                    /* Brick B: already initialized the per-CPU TSS earlier (before
+                     * AP bring-up); do NOT re-run it here (would re-zero/re-ltr). */
+                    kprintf("[KERNEL] TSS already initialized (per-CPU, pre-AP)\n");
+#else
                     kprintf("[KERNEL] Initializing TSS for usermode...\n");
                     tss_init();
                     kprintf("[KERNEL] TSS initialized\n");
+#endif
 
                     /* Initialize syscall dispatch table */
                     extern void syscall_init(void);
                     syscall_init();
 
-                    /* Initialize IPC subsystems (shared memory, message queues) */
-                    extern void shm_init(void);
-                    extern void msg_init(void);
-                    shm_init();
-                    msg_init();
+                    /* Initialize IPC subsystems (shared memory, message queues, notifications, clipboard) */
+                    extern void ipc_init(void);
+                    ipc_init();
 
                     /* Initialize SYSCALL/SYSRET MSRs for userspace */
                     extern void syscall_msr_init(void);

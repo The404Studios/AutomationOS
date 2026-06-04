@@ -482,6 +482,15 @@ static void icmp_echo_reply(const eth_hdr_t* eh, const ipv4_hdr_t* ip,
     uint16_t off = eth_build(f, eh->src, ETH_P_IP);
 
     ipv4_hdr_t* oip = (ipv4_hdr_t*)(f + off);
+    // Clamp the echoed ICMP length so the whole reply fits g_frame[ETH_MAX_FRAME].
+    // oic lands at off + sizeof(ipv4_hdr_t), so at most ETH_MAX_FRAME-off-20 ICMP
+    // bytes fit. Without this, a reassembled/oversized (fragmented) echo request
+    // overflows g_frame by up to 16 bytes AND net_send emits a bogus ~65K on-wire
+    // length. Clamp BEFORE ip_total so the memcpy and net_send below both use it.
+    {
+        uint16_t max_icmp = (uint16_t)(ETH_MAX_FRAME - off - sizeof(ipv4_hdr_t));
+        if (icmp_len > max_icmp) icmp_len = max_icmp;
+    }
     uint16_t ip_total = (uint16_t)(sizeof(ipv4_hdr_t) + icmp_len);
     oip->ver_ihl   = 0x45;
     oip->tos       = 0;
@@ -496,8 +505,7 @@ static void icmp_echo_reply(const eth_hdr_t* eh, const ipv4_hdr_t* ip,
     oip->checksum  = net_htons(inet_checksum(oip, sizeof(ipv4_hdr_t)));
 
     icmp_hdr_t* oic = (icmp_hdr_t*)((uint8_t*)oip + sizeof(ipv4_hdr_t));
-    if (icmp_len > ETH_MTU) icmp_len = ETH_MTU;
-    memcpy(oic, req, icmp_len);
+    memcpy(oic, req, icmp_len);   // icmp_len already clamped to fit g_frame above
     oic->type     = ICMP_ECHO_REPLY;
     oic->code     = 0;
     oic->checksum = 0;

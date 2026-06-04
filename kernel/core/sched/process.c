@@ -54,6 +54,28 @@ static void free_pid(uint32_t pid) {
     spin_unlock(&process_table_lock);
 }
 
+// Relocate an already-created process onto the reserved PID 0 (the idle thread).
+// allocate_pid() never hands out 0 (it scans from index 1), so the FIRST
+// process_create() — the per-CPU idle thread in scheduler_init() — is given PID 1
+// and bumps /sbin/init to PID 2. init.c hard-requires getpid()==1 and exits(1)
+// otherwise ("Not PID 1!"), so we re-home idle into slot 0: free its allocated
+// PID back to the pool, reserve slot 0, and move its table entry. After this the
+// first real allocate_pid() returns 1, which init receives. No-op for a NULL arg
+// or a process already at PID 0.
+void process_adopt_pid0(process_t* proc) {
+    if (!proc || proc->pid == 0) return;
+    spin_lock(&process_table_lock);
+    uint32_t old = proc->pid;
+    if (old < MAX_PROCESSES && process_table[old] == proc) {
+        process_table[old] = NULL;
+        pid_used[old] = 0;
+    }
+    proc->pid = 0;
+    pid_used[0] = 1;            // keep slot 0 reserved (allocate_pid never returns 0)
+    process_table[0] = proc;
+    spin_unlock(&process_table_lock);
+}
+
 void process_init(void) {
     PROC_LOG("[PROCESS] Initializing process management...\n");
 
@@ -66,6 +88,91 @@ void process_init(void) {
     }
 
     PROC_LOG("[PROCESS] Process table initialized (max %d processes, SMP-safe)\n", MAX_PROCESSES);
+}
+
+// ===========================================================================
+// process_cleanup — teardown counterpart to process_init()
+// ===========================================================================
+// Walks the entire process table and forcibly terminates/frees all live
+// processes, preventing PCB + address-space leaks on kernel shutdown. This
+// is the single-point cleanup that process_init() was missing.
+//
+// Safe teardown sequence per process:
+//   1. Mark TERMINATED (cooperative paths stop scheduling it)
+//   2. Remove from scheduler (releases scheduler's reference)
+//   3. Unref our table reference (triggers full PCB teardown if ref==0)
+//
+// Two-phase approach: Phase 1 collects all live processes under the lock (with
+// extra refs so they don't vanish mid-cleanup). Phase 2 releases the lock and
+// performs the complex teardown (process_on_terminate, scheduler_remove_process,
+// process_unref) without holding locks.
+//
+// Called from kernel shutdown/halt path. Runs with interrupts disabled (no
+// concurrent process_create/destroy). The table lock is still acquired out
+// of discipline (safe even at shutdown), but no real contention is expected.
+void process_cleanup(void) {
+    PROC_LOG("[PROCESS] Cleaning up process table...\n");
+
+    // Phase 1: collect all live processes under the lock
+    process_t* to_cleanup[MAX_PROCESSES];
+    int cleanup_count = 0;
+
+    spin_lock(&process_table_lock);
+    for (int i = 0; i < MAX_PROCESSES; i++) {
+        process_t* proc = process_table[i];
+        if (proc) {
+            // Take an extra ref so the process doesn't vanish while we work on it
+            process_ref(proc);
+            to_cleanup[cleanup_count++] = proc;
+
+            // Mark TERMINATED
+            proc->state = PROCESS_TERMINATED;
+
+            // Clear table slot and free PID
+            process_table[i] = NULL;
+            pid_used[i] = 0;
+        }
+    }
+    spin_unlock(&process_table_lock);
+
+    // Phase 2: outside the lock, terminate and unref each process
+    for (int i = 0; i < cleanup_count; i++) {
+        process_t* proc = to_cleanup[i];
+
+        PROC_LOG("[PROCESS] Cleaning up PID %d (%s) refcount=%d\n",
+                 proc->pid, proc->name, proc->ref_count);
+
+        // Wake waiters (parent blocked in waitpid, or own child_wait queue)
+        process_on_terminate(proc);
+
+        // Try to remove from scheduler (if it was enqueued). This releases
+        // the scheduler's reference. Safe even if already removed.
+        extern void scheduler_remove_process(process_t* proc);
+        scheduler_remove_process(proc);
+
+        // Drop the table's reference (our +ref above will be the last one after
+        // scheduler_remove_process released its ref, so this should trigger the
+        // final teardown)
+        process_unref(proc);
+    }
+
+    // Final leak check: walk the table one more time to see if anything survived
+    int leaked_count = 0;
+    spin_lock(&process_table_lock);
+    for (int i = 0; i < MAX_PROCESSES; i++) {
+        if (process_table[i] != NULL) {
+            leaked_count++;
+            PROC_LOG("[PROCESS] LEAK: PID %d still in table after cleanup\n", i);
+        }
+    }
+    spin_unlock(&process_table_lock);
+
+    if (leaked_count > 0) {
+        PROC_LOG("[PROCESS] WARNING: %d processes leaked after cleanup\n", leaked_count);
+    }
+
+    PROC_LOG("[PROCESS] Process cleanup complete: %d processes terminated\n",
+             cleanup_count);
 }
 
 process_t* process_create(const char* name, void* entry_point) {
@@ -323,7 +430,8 @@ process_t* thread_create(process_t* parent, uint64_t entry, uint64_t arg,
     // Initialize the join wait_object so a joiner can block on it.
     wait_object_init(&t->thread_join_wo);
 
-    t->state = PROCESS_READY;
+    // Mark READY (CREATED->READY transition)
+    process_set_ready(t);
 
     // Publish into the process table so process_get_by_pid()/join can find it.
     spin_lock(&process_table_lock);
@@ -416,10 +524,12 @@ void process_unref(process_t* proc) {
         cpu1_orphan_jobs(proc->pid);
 #endif
 
-        // Release IPC resources owned by this process (SysV shm/msg). Must run
-        // while proc->pid is still valid and BEFORE the address space is torn
-        // down, so deferred-destroy segments are accounted correctly.
-        shm_cleanup_process(proc->pid);
+        // Release IPC resources owned by this process (SysV shm/msg). shm cleanup
+        // takes the process_t* directly (NOT a pid lookup): process_table[pid] has
+        // already been nulled above, so a by-pid lookup would return NULL and skip
+        // all cleanup (segment/attachment leak). msg cleanup scans by owner_pid so
+        // it still uses the pid.
+        shm_cleanup_process(proc);
         msg_cleanup_process(proc->pid);
 
         // Close any file descriptors the process still had open (per-process fd
@@ -522,6 +632,65 @@ process_t* process_get_by_pid(uint32_t pid) {
 
 process_t* process_get_current(void) {
     return current_process;
+}
+
+// ===========================================================================
+// process_set_ready — validated CREATED/BLOCKED -> READY transition
+// ===========================================================================
+// THE single chokepoint for marking a process READY (schedulable). Validates
+// the transition is legal (CREATED->READY or BLOCKED->READY) and logs illegal
+// attempts (TERMINATED->READY would silently resurrect a zombie; READY->READY
+// is a no-op but may indicate caller confusion). Returns 0 on success, -1 if
+// the transition was rejected.
+//
+// Callers: health_monitor.c, procapi.c, kill.c, waitqueue.c, scheduler.c
+// (sleep wakeup), exec.c, thread_create, and any code that needs to activate
+// a newly-created or blocked process. Use this INSTEAD of direct
+// `proc->state = PROCESS_READY` assignments to catch resurrection bugs.
+int process_set_ready(process_t* proc) {
+    if (!proc) {
+        return -1;
+    }
+
+    process_state_t old = proc->state;
+
+    // Valid transitions: CREATED->READY (initial activation), BLOCKED->READY (wake)
+    if (old == PROCESS_CREATED || old == PROCESS_BLOCKED) {
+        proc->state = PROCESS_READY;
+        return 0;
+    }
+
+    // RUNNING->READY is the cooperative yield/requeue transition. A process that
+    // voluntarily yields (sys_yield -> scheduler_yield_requeue) or is rotated by
+    // the scheduler is still marked RUNNING at the moment it is put back on the
+    // ready queue; the subsequent context_switch() saves its context so it can be
+    // resumed later. This is legal and happens on EVERY yield, so allow it. (The
+    // dangerous transition this chokepoint guards against is TERMINATED->READY
+    // below — resurrecting a zombie — which stays rejected.)
+    if (old == PROCESS_RUNNING) {
+        proc->state = PROCESS_READY;
+        return 0;
+    }
+
+    // READY->READY is a harmless idempotent no-op: the cooperative requeue paths
+    // (scheduler_add_process / scheduler_yield_requeue) call process_set_ready and
+    // are guarded against double-enqueue by proc->on_queue, so a process can be
+    // marked READY while already READY without harm. This fires constantly for
+    // CPU-bound, frequently-requeued tasks (e.g. the priority-test burners under
+    // preemption — 70k lines/boot), so it is NOT logged. Still tolerated.
+    if (old == PROCESS_READY) {
+        return 0;  // tolerate (idempotent)
+    }
+
+    // TERMINATED->READY is illegal (resurrection)
+    if (old == PROCESS_TERMINATED) {
+        kprintf("[PROCESS] ERROR: rejected TERMINATED->READY transition for "
+                "process %u (%s) — cannot resurrect a zombie\n",
+                proc->pid, proc->name);
+        return -1;
+    }
+
+    return -1;  // unknown state
 }
 
 void process_set_current(process_t* proc) {

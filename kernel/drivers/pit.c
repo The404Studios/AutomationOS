@@ -68,6 +68,17 @@ static void timer_handler(void) {
     scheduler_tick();  // SMP load balancing - redistributes processes across CPUs
 }
 
+// PREEMPTIVE build: irq0_preempt -> schedule_from_irq() OWNS IRQ0 instead of
+// timer_handler() above, and calls pit_tick() to advance the millisecond tick
+// counter (scheduler.c provides a weak no-op fallback). Without this STRONG
+// definition, timer_ticks would never advance in PREEMPT -- freezing
+// timer_get_ticks(), blocking sleep wakeups, and uptime. Defined here because
+// timer_ticks is file-static to pit.c. Harmless in the cooperative build (where
+// pit_tick() is never called -- timer_handler() does the increment instead).
+void pit_tick(void) {
+    timer_ticks++;
+}
+
 // Initialize PIT
 void pit_init(uint32_t frequency) {
     kprintf("[PIT] Initializing Programmable Interval Timer...\n");

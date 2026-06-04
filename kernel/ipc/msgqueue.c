@@ -7,6 +7,17 @@
 #include "../include/string.h"
 #include "../include/drivers.h"   // timer_get_ticks()
 
+// Per-operation tracing. SILENT by default: msgrcv/msgsnd are on the hot path
+// (the compositor and every windowed app poll their event queue many times per
+// second), so unconditional kprintf here floods the serial with 100k+ lines per
+// boot — under TCG that serial I/O dominates wall-clock and starves late-boot
+// apps. Build with -DIPC_VERBOSE to re-enable the trace.
+#ifdef IPC_VERBOSE
+#define MQ_LOG(...) kprintf(__VA_ARGS__)
+#else
+#define MQ_LOG(...) ((void)0)
+#endif
+
 /*
  * Message Queue Implementation
  * ============================
@@ -190,7 +201,7 @@ int64_t sys_msgget(uint64_t key, uint64_t msgflg, uint64_t arg3,
         return IPC_EINVAL;
     }
 
-    kprintf("[MSGGET] key=%d flags=0x%x (PID %d)\n", k, flags, current->pid);
+    MQ_LOG("[MSGGET] key=%d flags=0x%x (PID %d)\n", k, flags, current->pid);
 
     spin_lock(&msg_lock);
 
@@ -200,17 +211,17 @@ int64_t sys_msgget(uint64_t key, uint64_t msgflg, uint64_t arg3,
         if (existing) {
             if (flags & IPC_EXCL) {
                 spin_unlock(&msg_lock);
-                kprintf("[MSGGET] Queue exists and IPC_EXCL specified\n");
+                MQ_LOG("[MSGGET] Queue exists and IPC_EXCL specified\n");
                 return IPC_EEXIST;
             }
             spin_unlock(&msg_lock);
-            kprintf("[MSGGET] Returning existing queue %d\n", existing->id);
+            MQ_LOG("[MSGGET] Returning existing queue %d\n", existing->id);
             return existing->id;
         }
 
         if (!(flags & IPC_CREAT)) {
             spin_unlock(&msg_lock);
-            kprintf("[MSGGET] Queue not found and IPC_CREAT not specified\n");
+            MQ_LOG("[MSGGET] Queue not found and IPC_CREAT not specified\n");
             return IPC_ENOENT;
         }
     }
@@ -228,7 +239,7 @@ int64_t sys_msgget(uint64_t key, uint64_t msgflg, uint64_t arg3,
         }
         if (next_msg_id == start) {
             spin_unlock(&msg_lock);
-            kprintf("[MSGGET] No free queue slots\n");
+            MQ_LOG("[MSGGET] No free queue slots\n");
             return IPC_ENOMEM;
         }
     }
@@ -237,7 +248,7 @@ int64_t sys_msgget(uint64_t key, uint64_t msgflg, uint64_t arg3,
     msg_queue_t* q = (msg_queue_t*)kmalloc(sizeof(msg_queue_t));
     if (!q) {
         spin_unlock(&msg_lock);
-        kprintf("[MSGGET] Failed to allocate queue structure\n");
+        MQ_LOG("[MSGGET] Failed to allocate queue structure\n");
         return IPC_ENOMEM;
     }
 
@@ -271,7 +282,7 @@ int64_t sys_msgget(uint64_t key, uint64_t msgflg, uint64_t arg3,
 
     spin_unlock(&msg_lock);
 
-    kprintf("[MSGGET] Created queue %d: key=%d\n", q->id, k);
+    MQ_LOG("[MSGGET] Created queue %d: key=%d\n", q->id, k);
 
     return q->id;
 }
@@ -309,7 +320,7 @@ int64_t sys_msgsnd(uint64_t msqid, uint64_t msgp, uint64_t msgsz,
         return IPC_EINVAL;
     }
 
-    kprintf("[MSGSND] msqid=%d size=%lu flags=0x%x (PID %d)\n",
+    MQ_LOG("[MSGSND] msqid=%d size=%lu flags=0x%x (PID %d)\n",
             id, size, flags, current->pid);
 
     // Copy message type from user space (just the int64_t header field)
@@ -319,7 +330,7 @@ int64_t sys_msgsnd(uint64_t msqid, uint64_t msgp, uint64_t msgsz,
     }
 
     if (header.mtype <= 0) {
-        kprintf("[MSGSND] Invalid message type: %ld\n", header.mtype);
+        MQ_LOG("[MSGSND] Invalid message type: %ld\n", header.mtype);
         return IPC_EINVAL;
     }
 
@@ -351,14 +362,14 @@ int64_t sys_msgsnd(uint64_t msqid, uint64_t msgp, uint64_t msgsz,
     if (!q) {
         spin_unlock(&msg_lock);
         kfree(node);
-        kprintf("[MSGSND] Queue %d not found\n", id);
+        MQ_LOG("[MSGSND] Queue %d not found\n", id);
         return IPC_EINVAL;
     }
 
     if (!msg_check_permission(q, current->uid, current->gid, true)) {
         spin_unlock(&msg_lock);
         kfree(node);
-        kprintf("[MSGSND] Permission denied\n");
+        MQ_LOG("[MSGSND] Permission denied\n");
         return IPC_EACCES;
     }
 
@@ -368,7 +379,7 @@ int64_t sys_msgsnd(uint64_t msqid, uint64_t msgp, uint64_t msgsz,
         if (flags & IPC_NOWAIT) {
             return IPC_EAGAIN;
         }
-        kprintf("[MSGSND] Queue full (blocking not implemented)\n");
+        MQ_LOG("[MSGSND] Queue full (blocking not implemented)\n");
         return IPC_EAGAIN;
     }
 
@@ -387,7 +398,7 @@ int64_t sys_msgsnd(uint64_t msqid, uint64_t msgp, uint64_t msgsz,
 
     spin_unlock(&msg_lock);
 
-    kprintf("[MSGSND] Sent message type=%ld size=%lu to queue %d\n",
+    MQ_LOG("[MSGSND] Sent message type=%ld size=%lu to queue %d\n",
             header.mtype, size, id);
 
     return IPC_SUCCESS;
@@ -429,7 +440,7 @@ int64_t sys_msgrcv(uint64_t msqid, uint64_t msgp, uint64_t msgsz,
         return IPC_EINVAL;
     }
 
-    kprintf("[MSGRCV] msqid=%d size=%lu type=%ld flags=0x%x (PID %d)\n",
+    MQ_LOG("[MSGRCV] msqid=%d size=%lu type=%ld flags=0x%x (PID %d)\n",
             id, size, type, flags, current->pid);
 
     // Pre-allocate a kernel bounce buffer for the payload BEFORE taking the
@@ -451,14 +462,14 @@ int64_t sys_msgrcv(uint64_t msqid, uint64_t msgp, uint64_t msgsz,
     if (!q) {
         spin_unlock(&msg_lock);
         if (tmp) kfree(tmp);
-        kprintf("[MSGRCV] Queue %d not found\n", id);
+        MQ_LOG("[MSGRCV] Queue %d not found\n", id);
         return IPC_EINVAL;
     }
 
     if (!msg_check_permission(q, current->uid, current->gid, false)) {
         spin_unlock(&msg_lock);
         if (tmp) kfree(tmp);
-        kprintf("[MSGRCV] Permission denied\n");
+        MQ_LOG("[MSGRCV] Permission denied\n");
         return IPC_EACCES;
     }
 
@@ -491,7 +502,7 @@ int64_t sys_msgrcv(uint64_t msqid, uint64_t msgp, uint64_t msgsz,
         if (flags & IPC_NOWAIT) {
             return IPC_ENOMSG;
         }
-        kprintf("[MSGRCV] No matching message (blocking not implemented)\n");
+        MQ_LOG("[MSGRCV] No matching message (blocking not implemented)\n");
         return IPC_ENOMSG;
     }
 
@@ -544,7 +555,7 @@ int64_t sys_msgrcv(uint64_t msqid, uint64_t msgp, uint64_t msgsz,
     }
     if (tmp) kfree(tmp);
 
-    kprintf("[MSGRCV] Received message type=%ld size=%lu from queue %d\n",
+    MQ_LOG("[MSGRCV] Received message type=%ld size=%lu from queue %d\n",
             mtype_snapshot, copy_size, id);
 
     return (int64_t)copy_size;
@@ -577,7 +588,7 @@ int64_t sys_msgctl(uint64_t msqid, uint64_t cmd, uint64_t buf,
         return IPC_EINVAL;
     }
 
-    kprintf("[MSGCTL] msqid=%d cmd=0x%x (PID %d)\n", id, command, current->pid);
+    MQ_LOG("[MSGCTL] msqid=%d cmd=0x%x (PID %d)\n", id, command, current->pid);
 
     spin_lock(&msg_lock);
 
@@ -585,7 +596,7 @@ int64_t sys_msgctl(uint64_t msqid, uint64_t cmd, uint64_t buf,
     msg_queue_t* q = msg_find_by_id(id);
     if (!q) {
         spin_unlock(&msg_lock);
-        kprintf("[MSGCTL] Queue %d not found\n", id);
+        MQ_LOG("[MSGCTL] Queue %d not found\n", id);
         return IPC_EINVAL;
     }
 
@@ -613,7 +624,7 @@ int64_t sys_msgctl(uint64_t msqid, uint64_t cmd, uint64_t buf,
             kfree(q);
             spin_unlock(&msg_lock);
 
-            kprintf("[MSGCTL] Deleted queue %d\n", id);
+            MQ_LOG("[MSGCTL] Deleted queue %d\n", id);
             return IPC_SUCCESS;
 
         case IPC_STAT:
@@ -646,7 +657,7 @@ int64_t sys_msgctl(uint64_t msqid, uint64_t cmd, uint64_t buf,
  * sys_msgctl(IPC_RMID) does, but without the permission check (kernel path).
  */
 void msg_cleanup_process(uint32_t pid) {
-    kprintf("[MSG] Cleanup for PID %d\n", pid);
+    MQ_LOG("[MSG] Cleanup for PID %d\n", pid);
 
     spin_lock(&msg_lock);
 
@@ -668,7 +679,7 @@ void msg_cleanup_process(uint32_t pid) {
             m = next;
         }
 
-        kprintf("[MSG] Cleanup PID %d: deleted queue %d\n", pid, q->id);
+        MQ_LOG("[MSG] Cleanup PID %d: deleted queue %d\n", pid, q->id);
         kfree(q);
     }
 

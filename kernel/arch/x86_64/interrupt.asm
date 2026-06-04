@@ -274,3 +274,68 @@ irq0_preempt:
     iretq
 
 %endif ; PREEMPTIVE
+
+; ===========================================================================
+; SMP SCHEDULER (Brick E/F) — CPU1 LAPIC timer entry stub
+; ===========================================================================
+; Assembled ONLY when -DSMP_SCHED is passed to nasm. CPU1 arms its LAPIC timer at
+; vector AP_LAPIC_TIMER_VECTOR (0x40, NOT 0x20=IDT[32] which is the PIC irq0 stub).
+; This stub builds an interrupt_frame_t identical to irq0_preempt's so the SAME
+; schedule_from_irq() can later (Brick F) rewrite it in place for an AP context
+; switch. Brick E: lapic_tick() just EOIs the LAPIC + bumps a tick counter and
+; leaves the frame untouched, so iretq simply resumes the interrupted code.
+%ifdef SMP_SCHED
+
+extern lapic_tick
+
+global ap_lapic_timer_isr
+ap_lapic_timer_isr:
+    cli                              ; interrupt gate already clears IF; explicit
+    push qword 0x40                  ; int_no = AP_LAPIC_TIMER_VECTOR; frame->int_no
+    push rax
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push rbp
+    push r8
+    push r9
+    push r10
+    push r11
+    push r12
+    push r13
+    push r14
+    push r15                         ; [rsp] now == &frame->r15 (offset 0)
+
+    mov rdi, rsp                     ; RDI = interrupt_frame_t*
+    call lapic_tick                  ; Brick E: EOI+count (frame untouched).
+                                     ; Brick F: may rewrite the frame for a switch.
+
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rbp
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    pop rax
+
+    add rsp, 8                       ; discard int_no
+    iretq
+
+; LAPIC spurious-interrupt vector (0xFF). Per Intel, a spurious interrupt needs NO
+; EOI; the handler must clobber nothing and simply return. Shared IDT gate, but
+; only CPU1 (with an active LAPIC) is likely to ever see it.
+global ap_spurious_isr
+ap_spurious_isr:
+    iretq
+
+%endif ; SMP_SCHED

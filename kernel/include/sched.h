@@ -266,6 +266,14 @@ typedef struct process {
     // also fine (wo_ensure_init lazily inits a zeroed object).
     int thread_retval;
     wait_object_t thread_join_wo;
+
+    // Per-process shared memory attachment list. Each successful shmat() adds a
+    // shm_attachment_t node to this singly-linked list; shmdt() removes it. On
+    // process teardown shm_cleanup_process() walks this list instead of scanning
+    // the entire global shm_attaches[] array, making cleanup O(n) where n is the
+    // number of attachments THIS process holds (typically 1-5) instead of O(128).
+    // Appended at the END to keep the assembler's hardcoded context offset valid.
+    struct shm_attachment* shm_attachments;
 } process_t;
 
 // Global pointer to current process (for PE loader and other subsystems)
@@ -273,7 +281,9 @@ extern process_t* current_process;
 
 // Process table management
 void process_init(void);
+void process_cleanup(void);  // Teardown counterpart: terminate all live processes
 process_t* process_create(const char* name, void* entry_point);
+void process_adopt_pid0(process_t* proc);   // re-home a process onto reserved PID 0 (idle thread)
 void process_destroy(process_t* proc);
 
 // ----------------------------------------------------------------------------
@@ -300,6 +310,7 @@ void process_on_terminate(process_t* child);  // wake parent's waitpid + drain o
 process_t* process_get_by_pid(uint32_t pid);
 process_t* process_get_current(void);
 void process_set_current(process_t* proc);
+int process_set_ready(process_t* proc); // Validated CREATED/BLOCKED->READY transition (ret 0=OK, -1=rejected)
 
 // Userspace-facing process snapshot record (SYS_PROCLIST ABI). MUST stay 64 bytes.
 // The first 48 bytes are the original layout (pid/parent_pid/state/flags/name) so
@@ -335,6 +346,7 @@ void cpu_set_current_thread(process_t* proc);
 
 // Scheduler
 void scheduler_init(void);
+void scheduler_shutdown(void);  // Teardown: drain runqueues, release locks, clear sleep list
 void scheduler_add_process(process_t* proc);
 // Cooperative-yield re-queue with priority weighting. Use INSTEAD of
 // scheduler_add_process() from sys_yield(): a process with above-normal priority
@@ -347,7 +359,26 @@ void scheduler_yield_requeue(process_t* proc);
 void scheduler_remove_process(process_t* proc);
 void schedule(void);  // Scheduler tick - called from timer interrupt
 process_t* scheduler_pick_next(void);
+process_t* scheduler_idle_thread(void);   // the per-CPU idle fallback (NOT a queued process)
 void scheduler_start(void) NORETURN;  // Start scheduler (does not return)
+
+#ifdef SMP_SCHED
+// SMP scheduler Brick D: populate a secondary CPU's per-CPU slot (runqueues +
+// idle thread + online). Call on the BSP AFTER /sbin/init has PID 1. Returns 1 ok.
+int scheduler_init_secondary_cpu(uint32_t cpu, uint32_t apic_id);
+// Brick F: enqueue `proc` onto a SPECIFIC CPU's runqueue (cross-CPU affinity pin).
+void scheduler_add_process_to_cpu(process_t* proc, uint32_t cpu);
+#endif
+
+#if defined(SMP_SCHED) && defined(SMP_SCHED_DISPATCH)
+// SMP scheduler Brick F: the AP-safe dispatcher for CPU1 (scheduler mode). NEVER
+// touches the global current_process; NEVER does a PIC EOI. See scheduler.c.
+void ap_scheduler_loop(void) NORETURN;            // CPU1's top-level scheduler loop
+void ap_cooperative_schedule(void);               // CPU1 voluntary yield/idle check
+void ap_schedule_from_irq(interrupt_frame_t* frame); // CPU1 LAPIC-timer preemption
+void ap_spawn_test_kthread(void);                 // F2: pin one kernel thread to CPU1
+void context_prime_fpu(process_t* to);            // F3 fix D6: AP-safe FPU prime (context.c)
+#endif
 
 // Cooperative dispatch helper (scheduler.c). A cooperative resume site
 // (sys_yield / schedule / wq_block_current, all in ring 0 inside a syscall)
@@ -386,6 +417,18 @@ void sleep_list_wake_due(uint64_t now);
 void scheduler_tick(void);                                    // Called on timer tick for load balancing
 void scheduler_get_load_stats(uint32_t* loads, uint32_t max_cpus);  // Get per-CPU load
 void scheduler_print_stats(void);                            // Print load balancing statistics
+
+// Per-CPU Statistics and Diagnostics (scheduler.c)
+// Forward declaration of cpu_stats_t (defined in scheduler.c)
+typedef struct cpu_stats cpu_stats_t;
+
+uint32_t scheduler_get_ready_count(uint32_t cpu_id);          // Get ready_count for specific CPU
+uint32_t scheduler_get_current_ready_count(void);             // Get ready_count for current CPU
+void scheduler_reset_ready_count(uint32_t cpu_id);            // Reset ready_count for specific CPU
+int scheduler_get_cpu_stats(uint32_t cpu_id, cpu_stats_t* out_stats);  // Get per-CPU stats
+void scheduler_reset_cpu_stats(uint32_t cpu_id);              // Reset stats for specific CPU
+void scheduler_reset_all_cpu_stats(void);                     // Reset stats for all CPUs
+int scheduler_validate_ready_count(uint32_t cpu_id);          // Validate ready_count integrity
 
 // Context switching
 void context_switch(process_t* from, process_t* to);

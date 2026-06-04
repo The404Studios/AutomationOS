@@ -137,6 +137,9 @@ void* acpi_find_table(const char* signature) {
 
     // Use XSDT if available (64-bit), otherwise RSDT (32-bit)
     if (acpi_state.xsdt) {
+        // A malformed length < the header size would underflow the unsigned
+        // subtraction below into a huge entry count -> OOB reads past the table.
+        if (acpi_state.xsdt->header.length < sizeof(acpi_table_header_t)) return NULL;
         uint32_t entries = (acpi_state.xsdt->header.length - sizeof(acpi_table_header_t)) / 8;
 
         for (uint32_t i = 0; i < entries; i++) {
@@ -150,6 +153,7 @@ void* acpi_find_table(const char* signature) {
             }
         }
     } else if (acpi_state.rsdt) {
+        if (acpi_state.rsdt->header.length < sizeof(acpi_table_header_t)) return NULL;
         uint32_t entries = (acpi_state.rsdt->header.length - sizeof(acpi_table_header_t)) / 4;
 
         for (uint32_t i = 0; i < entries; i++) {
@@ -399,10 +403,20 @@ int acpi_parse_madt(acpi_madt_t* madt) {
     uint8_t* end = (uint8_t*)madt + madt->header.length;
 
     while (ptr < end) {
+        // Need the 2-byte entry header to read type+length without overrunning.
+        if (ptr + sizeof(acpi_madt_entry_header_t) > end) {
+            break;
+        }
         acpi_madt_entry_header_t* header = (acpi_madt_entry_header_t*)ptr;
 
         if (header->length == 0) {
             break;  // malformed; avoid infinite loop
+        }
+        // The whole entry (header->length bytes) must fit inside the table; a
+        // malformed length that overruns `end` would make the per-type handlers
+        // below read fields past the MADT buffer (kernel-memory over-read at boot).
+        if (ptr + header->length > end) {
+            break;
         }
 
         switch (header->type) {

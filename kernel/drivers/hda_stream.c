@@ -403,6 +403,11 @@ int hda_stream_write(hda_stream_t* stream, const void* data, uint32_t size) {
     const uint8_t* src = (const uint8_t*)data;
 
     while (written < size) {
+        if (stream->buffer_size == 0) break;                  // nothing to write into
+        // Guard the unsigned subtraction below: if position somehow reached/passed
+        // buffer_size on entry (stale/DMA-updated), (buffer_size - position) would
+        // underflow to ~4GB of "space" -> writes far past the ring buffer.
+        if (stream->position >= stream->buffer_size) stream->position = 0;
         uint32_t space = stream->buffer_size - stream->position;
         uint32_t to_write = (size - written < space) ? (size - written) : space;
 

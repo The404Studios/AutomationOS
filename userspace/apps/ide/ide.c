@@ -352,6 +352,33 @@ void rebuild_visible_entries(Ide* a) {
     if (a->explorer_scroll < 0) a->explorer_scroll = 0;
 }
 
+/* Re-scan the project (fully expanded) and reveal a build artifact: select the
+ * row whose path == sel_path (the produced ELF), or failing that the build
+ * folder `dir`, scrolling it into view. Called after a successful build so the
+ * new build/ folder + ELF are immediately visible and openable. The tree is
+ * enumerated live (real readdir), so a freshly-created folder/file shows up. */
+void ide_reveal_dir(Ide* a, const char* dir, const char* sel_path) {
+    if (!a) return;
+    scan_project(a);                       /* full rescan, all folders expanded */
+
+    int hit = -1;
+    if (sel_path && sel_path[0]) {
+        for (int i = 0; i < a->nentries; i++)
+            if (ide_streq(a->entries[i].path, sel_path)) { hit = i; break; }
+    }
+    if (hit < 0 && dir && dir[0]) {
+        for (int i = 0; i < a->nentries; i++)
+            if (ide_streq(a->entries[i].path, dir)) { hit = i; break; }
+    }
+    if (hit >= 0) {
+        a->sel_entry = hit;
+        /* Scroll so the selected row sits a few lines down from the top. */
+        a->explorer_scroll = hit > 3 ? hit - 3 : 0;
+        if (a->explorer_scroll > a->nentries - 1) a->explorer_scroll = a->nentries - 1;
+        if (a->explorer_scroll < 0) a->explorer_scroll = 0;
+    }
+}
+
 /* ===========================================================================
  * "New Project" flow: pick a template under /usr/src/templates/, name it, then
  * clone the template directory into /usr/src/<name>/ and open its main .c.
@@ -1346,11 +1373,13 @@ static int handle_ctrl_chord(Ide* a, int keycode) {
     case KEY_N:               /* Ctrl+N: open the New Project templates picker */
         np_open(a);
         return 1;
-    case KEY_EQUAL:           /* Ctrl+= zoom in (LEGO map) */
-        if (a->map_zoom < 200) a->map_zoom += 10;
+    case KEY_EQUAL:           /* Ctrl+= zoom in (LEGO map): scale max 1.00 (100%) */
+        a->map_zoom += 10;
+        if (a->map_zoom > 100) a->map_zoom = 100;   /* clamp to 1.00 (max scale) */
         return 1;
-    case KEY_MINUS:           /* Ctrl+- zoom out (LEGO map) */
-        if (a->map_zoom > 30) a->map_zoom -= 10;
+    case KEY_MINUS:           /* Ctrl+- zoom out (LEGO map): scale min 0.01 (1%) */
+        a->map_zoom -= 10;
+        if (a->map_zoom < 1) a->map_zoom = 1;       /* clamp to 0.01 (min scale) */
         return 1;
     case KEY_0:               /* Ctrl+0 reset zoom to 100% */
         a->map_zoom = 100;

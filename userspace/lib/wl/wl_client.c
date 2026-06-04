@@ -161,6 +161,50 @@ wl_window *wl_create_window(wl_u32 w, wl_u32 h, const char *title) {
     return &g_window;
 }
 
+/* Reallocate the window's pixel buffer to w x h in response to a compositor
+ * WL_EVT_CONFIGURE (e.g. maximize). Allocates a NEW shm segment, maps it, points
+ * g_window at it, tells the compositor the new shm_id (WL_REQ_RESIZE), then
+ * detaches the OLD mapping. The old SHM segment stays alive until the compositor
+ * also detaches it (it re-attaches on WL_REQ_RESIZE), so there is no torn read. */
+static void wl_resize_buffer(wl_u32 w, wl_u32 h) {
+    if (w == 0 || h == 0 || w > 4096u || h > 4096u) return;
+    if (w == g_window.w && h == g_window.h) return;          /* no-op */
+
+    wl_u32 stride = w * 4u;
+    unsigned long bytes = (unsigned long)stride * (unsigned long)h;
+
+    long shm_id = sc(SYS_SHMGET, IPC_PRIVATE, (long)bytes, IPC_CREAT | 0666, 0, 0, 0);
+    if (shm_id < 0) { wl_print("[WL] resize shmget failed\n"); return; }
+    long va = sc(SYS_SHMAT, shm_id, 0, 0, 0, 0, 0);
+    if (va < 0) { wl_print("[WL] resize shmat failed\n"); return; }
+
+    /* Point the window at the new buffer BEFORE notifying so the app's next draw
+     * lands in the buffer the compositor is about to map. */
+    g_window.shm_id = (int)shm_id;
+    g_window.w      = w;
+    g_window.h      = h;
+    g_window.stride = stride;
+    g_window.pixels = (wl_u32 *)va;
+
+    wl_resize_req req;
+    req.mtype  = WL_REQ_RESIZE;
+    req.win_id = g_window.win_id;
+    req.shm_id = (int)shm_id;
+    req.w      = w;
+    req.h      = h;
+    req.stride = stride;
+    long msgsz = (long)(sizeof(req) - sizeof(long));
+    sc(SYS_MSGSND, g_inbox_qid, (long)&req, msgsz, 0, 0, 0);
+
+    /* NOTE: we deliberately do NOT shmdt the OLD mapping. An app that re-reads
+     * win->pixels each frame (e.g. the IDE) picks up the new buffer immediately;
+     * an app that CACHED the old pointer keeps drawing into the (now-orphaned but
+     * still-mapped) old buffer, which the compositor simply ignores -- it shows
+     * the new buffer. Detaching here would page-fault such a caching app. The old
+     * segment is reclaimed when the process exits; the per-resize leak is bounded
+     * and a far better tradeoff than crashing a client.) */
+}
+
 void wl_commit(wl_window *win) {
     if (!win || win->win_id < 0) return;
 
@@ -183,14 +227,26 @@ int wl_poll_event(wl_window *win, int *kind, int *a, int *b, int *c) {
     /* Receive the first pending event of ANY type (type 0), non-blocking.
        The largest event payload determines the receive buffer size. */
     union {
-        long           mtype;
-        wl_pointer_evt ptr;
-        wl_key_evt     key;
+        long             mtype;
+        wl_pointer_evt   ptr;
+        wl_key_evt       key;
+        wl_configure_evt cfg;
     } ev;
 
     long want = (long)(sizeof(ev) - sizeof(long));
     long rr = sc(SYS_MSGRCV, g_reply_qid, (long)&ev, want, 0, IPC_NOWAIT, 0);
     if (rr < 0) return 0;       /* ENOMSG / nothing pending */
+
+    if (ev.mtype == WL_EVT_CONFIGURE) {
+        /* Compositor wants us at a new size: reallocate the buffer, then report
+         * WL_EVENT_RESIZE so the app can invalidate any cached geometry. */
+        wl_resize_buffer(ev.cfg.w, ev.cfg.h);
+        if (kind) *kind = WL_EVENT_RESIZE;
+        if (a) *a = (int)g_window.w;
+        if (b) *b = (int)g_window.h;
+        if (c) *c = 0;
+        return 1;
+    }
 
     if (ev.mtype == WL_EVT_POINTER) {
         if (kind) *kind = WL_EVENT_POINTER;

@@ -316,6 +316,24 @@ void _start(void) {
 
     print("[INIT] All services started!\n");
 
+#ifdef GAMETEST_RUN
+    /* Empirical "every app actually runs" harness: spawns each game + key app,
+     * lets it run its init+render loop ~2s, checks it survives, prints
+     * GAMETEST: <name> PASS/FAIL + a final GAMETEST: PASS/FAIL. Only compiled
+     * when init is built with -DGAMETEST_RUN (GAMETEST=1); the normal boot is
+     * unaffected. */
+    print("[INIT] GAMETEST: spawning game/app survival harness...\n");
+    spawn("sbin/gametest");
+#endif
+
+#ifdef IDE_AUTOSTART
+    /* IDE=1 build: open the Semantic LEGO Map IDE last so it lands on TOP of the
+     * default desktop apps (for IDE iteration + screenshots). Normal boot leaves
+     * the IDE launchable from the dock/start-menu instead. */
+    print("[INIT] IDE_AUTOSTART: opening sbin/ide...\n");
+    spawn("sbin/ide");
+#endif
+
     while (1) {
         int status;
         int pid = (int)syscall(SYS_WAITPID, -1, (long)&status, 0);

@@ -374,6 +374,63 @@ void font2_draw_scaled(unsigned int *px, int stride,
 }
 
 /* =========================================================================
+ * font2_draw_scaled_clip — bounds-safe + horizontally-clipped scaled draw.
+ *
+ * Identical glyph replication to font2_draw_scaled, but every destination
+ * pixel is gated on the buffer bounds [0,maxw)x[0,maxh) and the horizontal
+ * clip window [clip_x0,clip_x1). UI code must use THIS (not the unchecked
+ * font2_draw_scaled) so text near a panel/buffer edge can never scribble past
+ * the surface. Whole glyphs fully left of the clip window are skipped quickly.
+ * ========================================================================= */
+void font2_draw_scaled_clip(unsigned int *px, int stride, int maxw, int maxh,
+                            int clip_x0, int clip_x1,
+                            int x, int y,
+                            const char *str, int scale,
+                            unsigned int argb)
+{
+    int cx = x;
+    int s, row, col, br, bc;
+
+    if (!str || !px) return;
+    s = f2_clamp_scale(scale);
+    if (clip_x0 < 0) clip_x0 = 0;
+    if (clip_x1 > maxw) clip_x1 = maxw;
+
+    while (*str) {
+        char c = *str++;
+        int cell_w = FONT_W * s;
+        if ((unsigned char)c < 0x20u) { cx += cell_w; continue; }
+
+        /* Whole cell outside the clip window horizontally -> skip cheaply. */
+        if (cx >= clip_x1) break;                 /* nothing more can be visible */
+        if (cx + cell_w <= clip_x0) { cx += cell_w; continue; }
+
+        {
+            const unsigned char *glyph = f2_glyph(c);
+            for (row = 0; row < FONT_H; row++) {
+                unsigned char bits = glyph[row];
+                int dest_row_base = y + row * s;
+                if (bits == 0) continue;
+                for (col = 0; col < FONT_W; col++) {
+                    if (!f2_bit(bits, col)) continue;
+                    for (br = 0; br < s; br++) {
+                        int by = dest_row_base + br;
+                        if (by < 0 || by >= maxh) continue;
+                        for (bc = 0; bc < s; bc++) {
+                            int bx = cx + col * s + bc;
+                            if (bx < clip_x0 || bx >= clip_x1) continue;
+                            if (bx < 0 || bx >= maxw) continue;
+                            px[by * stride + bx] = argb;
+                        }
+                    }
+                }
+            }
+        }
+        cx += cell_w;
+    }
+}
+
+/* =========================================================================
  * font2_draw_aa
  *
  * Anti-aliasing via 2× supersampling + 2×2 box downsample.

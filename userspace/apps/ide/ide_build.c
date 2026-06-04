@@ -78,6 +78,10 @@ void ide_do_build(Ide* a) {
     tc_build(a->cur_file, &g_res);
     g_have = 1;
     g_runmsg[0] = 0;
+    /* On success, reveal the build/ folder + auto-select the produced ELF so the
+     * user can immediately see and open the artifact in the explorer. */
+    if (g_res.ok)
+        ide_reveal_dir(a, g_res.out_dir, g_res.out_path);
 }
 
 void ide_do_run(Ide* a) {

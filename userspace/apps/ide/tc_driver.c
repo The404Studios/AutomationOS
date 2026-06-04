@@ -98,6 +98,23 @@ static const char* find_ext(const char* path)
     return dot;
 }
 
+/* Copy the directory part of `path` (everything up to, not including, the final
+ * separator) into out[0..cap-1]. If there is no separator, out becomes "" (the
+ * current/relative dir). Always NUL-terminates. */
+static void dirname_of(const char* path, char* out, int cap)
+{
+    int last = -1, i;
+    if (!out || cap <= 0) return;
+    out[0] = '\0';
+    if (!path) return;
+    for (i = 0; path[i]; i++)
+        if (path[i] == '/' || path[i] == '\\') last = i;
+    if (last < 0) return;                 /* no directory component */
+    if (last > cap - 1) last = cap - 1;
+    for (i = 0; i < last; i++) out[i] = path[i];
+    out[i] = '\0';
+}
+
 /* Derive the basename (no directory, no extension) into out[0..cap-1]. */
 static void basename_noext(const char* path, char* out, int cap)
 {
@@ -230,37 +247,52 @@ int tc_build(const char* path, TcResult* res)
     }
     res->elf_len = elen;
 
-    /* 6. output path "/Desktop/<base>" and write the ELF; fall back to
-     *    "/tmp/<base>" if the Desktop write fails for any reason so a build
-     *    never silently fails. */
+    /* 6. Output goes into a dedicated "build/" folder NEXT TO the source file
+     *    (e.g. /usr/src/towerdefense/build/tower.elf) so the project explorer --
+     *    which is rooted at the project tree -- can enumerate and reveal it. The
+     *    artifact keeps a ".elf" suffix so it is obvious in the tree (and is
+     *    still directly SYS_SPAWN-able). Falls back to /tmp/build so a build
+     *    never silently fails even if the source dir is read-only. */
     basename_noext(path, base, (int)sizeof(base));
 
     /* preview is independent of where we write. */
     copy_preview(res, g_asm);
 
-    /* Ensure /Desktop exists (ignore "already exists" / any mkdir error). */
-    ide_sc(67 /* SYS_MKDIR */, (long)"/Desktop", 0755, 0, 0, 0, 0);
-
-    /* Try /Desktop first. */
-    sk_copy(res->out_path, "/Desktop/", (int)sizeof(res->out_path));
+    /* Build "<srcdir>/build" into res->out_dir (srcdir empty -> "build"). */
     {
-        int n = ide_strlen(res->out_path);
-        sk_copy(res->out_path + n, base,
-                (int)sizeof(res->out_path) - n);
+        char dir[160];
+        dirname_of(path, dir, (int)sizeof(dir));
+        int n = 0;
+        if (dir[0]) {
+            n  = sk_copy(res->out_dir, dir, (int)sizeof(res->out_dir));
+            n += sk_copy(res->out_dir + n, "/build", (int)sizeof(res->out_dir) - n);
+        } else {
+            n = sk_copy(res->out_dir, "build", (int)sizeof(res->out_dir));
+        }
     }
 
-    /* 7. write the ELF, with /tmp fallback. */
+    /* mkdir the build folder (recursive; ignore "already exists"/errors). */
+    ide_sc(67 /* SYS_MKDIR */, (long)res->out_dir, 0755, 0, 0, 0, 0);
+
+    /* out_path = "<out_dir>/<base>.elf" */
+    {
+        int n = sk_copy(res->out_path, res->out_dir, (int)sizeof(res->out_path));
+        n += sk_copy(res->out_path + n, "/", (int)sizeof(res->out_path) - n);
+        n += sk_copy(res->out_path + n, base, (int)sizeof(res->out_path) - n);
+        sk_copy(res->out_path + n, ".elf", (int)sizeof(res->out_path) - n);
+    }
+
+    /* 7. write the ELF, with a /tmp/build fallback. */
     if (ide_write_file(res->out_path, (char*)g_elf, elen) < 0) {
-        /* Fall back to /tmp/<base> (the original behavior). */
-        sk_copy(res->out_path, "/tmp/", (int)sizeof(res->out_path));
-        {
-            int n = ide_strlen(res->out_path);
-            sk_copy(res->out_path + n, base,
-                    (int)sizeof(res->out_path) - n);
-        }
+        /* Source dir not writable -> fall back to /tmp/build/<base>.elf. */
+        ide_sc(67 /* SYS_MKDIR */, (long)"/tmp/build", 0755, 0, 0, 0, 0);
+        sk_copy(res->out_dir, "/tmp/build", (int)sizeof(res->out_dir));
+        int n = sk_copy(res->out_path, "/tmp/build/", (int)sizeof(res->out_path));
+        n += sk_copy(res->out_path + n, base, (int)sizeof(res->out_path) - n);
+        sk_copy(res->out_path + n, ".elf", (int)sizeof(res->out_path) - n);
         if (ide_write_file(res->out_path, (char*)g_elf, elen) < 0) {
             res->ok = 0;
-            set_msg(res, "elf write failed (/Desktop and /tmp)");
+            set_msg(res, "elf write failed (build/ and /tmp/build)");
             return 0;
         }
     }

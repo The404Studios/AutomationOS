@@ -113,7 +113,7 @@ typedef struct Ide {
     VizTab   viz;
     int      explorer_scroll, funcs_scroll, code_scroll, inspector_scroll;
     int      map_ox, map_oy;        /* map pan offset                */
-    int      map_zoom;              /* zoom level: 100 = 100%, 50 = 50%, 200 = 200% */
+    int      map_zoom;              /* scale x100: 100 = 1.00 (max), 1 = 0.01 (min); clamped 0.01..1.00 */
     int      insp_tab;              /* 0 SYNTAX 1 CATEGORY 2 PORTS 3 CONN 4 DETAILS */
 
     /* editor workspace state */
@@ -165,6 +165,10 @@ int  gen_apply_action(Ide* a, int idx);
 /* ---- helpers ide.c provides for panels (selection plumbing) ---- */
 /* Load file `path` into a->src, set cur_file, re-parse+re-analyze, focus 0. */
 void ide_open_file(Ide* a, const char* path);
+/* Re-scan the project tree and reveal `dir` (the build folder), auto-selecting
+ * `sel_path` (the produced ELF) if present. Used after a successful build so the
+ * artifact is visible + openable in the explorer. (ide.c) */
+void ide_reveal_dir(Ide* a, const char* dir, const char* sel_path);
 /* Explorer folder collapse/expand (ide.c). collapsed state is kept by path so
  * it survives the tree re-scan; rebuild_visible_entries re-scans hiding the
  * children of collapsed folders and restores the selection. */

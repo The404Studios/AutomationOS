@@ -405,10 +405,10 @@ void ide_term_render(struct Ide* a, Canvas* cv, Rect r) {
         int py = oy + rr * GFX_FH;
         if (py + GFX_FH > body.y + body.h) break;
         for (int cc = 0; cc < cols; cc++) {
-            char chr = t->grid[rr][cc];
-            if (chr == ' ' || chr == 0) continue;
+            char chr[2] = { t->grid[rr][cc], 0 };   /* NUL-terminated single glyph */
+            if (chr[0] == ' ' || chr[0] == 0) continue;
             int px = ox + cc * GFX_FW;
-            gfx_text_clip(cv, px, py, &chr, IT_FG, ox, cols * GFX_FW);
+            gfx_text_clip(cv, px, py, chr, IT_FG, ox, cols * GFX_FW);
         }
     }
 
@@ -419,8 +419,8 @@ void ide_term_render(struct Ide* a, Canvas* cv, Rect r) {
         if (py + GFX_FH <= body.y + body.h)
             gfx_fill(cv, px, py, GFX_FW, GFX_FH, IT_CURSOR);
         /* re-draw the char under the caret in the bg color for contrast */
-        char chr = t->grid[t->cur_row][t->cur_col];
-        if (chr != ' ' && chr != 0)
-            gfx_text_clip(cv, px, py, &chr, IT_BG, ox, cols * GFX_FW);
+        char chr[2] = { t->grid[t->cur_row][t->cur_col], 0 };
+        if (chr[0] != ' ' && chr[0] != 0)
+            gfx_text_clip(cv, px, py, chr, IT_BG, ox, cols * GFX_FW);
     }
 }

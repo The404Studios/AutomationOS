@@ -3,6 +3,7 @@
  */
 #include "ide_gfx.h"
 #include "../../lib/font/bitfont.h"
+#include "../../lib/font2/font2.h"
 
 #define A(c) (((c) >> 24) & 0xFFu)
 #define R(c) (((c) >> 16) & 0xFFu)
@@ -134,7 +135,9 @@ void gfx_dashed(Canvas* c, int x0, int y0, int x1, int y1, uint32_t col, int das
 }
 
 void gfx_text(Canvas* c, int x, int y, const char* s, uint32_t col) {
-    font_draw_string((unsigned int*)c->px, c->stride, c->w, c->h, x, y, s, col | 0xFF000000u);
+    /* Crisp scaled text (IDE_UI_SCALE), bounds-clipped to the canvas. */
+    font2_draw_scaled_clip((unsigned int*)c->px, c->stride, c->w, c->h,
+                           0, c->w, x, y, s, IDE_UI_SCALE, col | 0xFF000000u);
 }
 
 void gfx_text_n(Canvas* c, int x, int y, const char* s, int n, uint32_t col) {
@@ -148,15 +151,11 @@ void gfx_text_n(Canvas* c, int x, int y, const char* s, int n, uint32_t col) {
 
 void gfx_text_clip(Canvas* c, int x, int y, const char* s, uint32_t col,
                    int clip_x, int clip_w) {
-    /* draw char-by-char, skipping any glyph outside [clip_x, clip_x+clip_w) */
-    col |= 0xFF000000u;
-    int cx = x;
-    for (int i = 0; s[i]; i++) {
-        if (cx + GFX_FW > clip_x && cx < clip_x + clip_w)
-            font_draw_char((unsigned int*)c->px, c->stride, c->w, c->h, cx, y, s[i], col);
-        cx += GFX_FW;
-        if (cx >= clip_x + clip_w) break;
-    }
+    /* Scaled text horizontally clipped to [clip_x, clip_x+clip_w) and bounded to
+     * the canvas. font2_draw_scaled_clip handles per-pixel clipping internally. */
+    font2_draw_scaled_clip((unsigned int*)c->px, c->stride, c->w, c->h,
+                           clip_x, clip_x + clip_w, x, y, s,
+                           IDE_UI_SCALE, col | 0xFF000000u);
 }
 
 int gfx_textw(const char* s) { int n = 0; if (s) while (s[n]) n++; return n * GFX_FW; }

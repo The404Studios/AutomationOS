@@ -7,8 +7,14 @@
 
 #include <stdint.h>
 
-#define GFX_FW 8     /* font cell width  (bitfont 8x16) */
-#define GFX_FH 16    /* font cell height                */
+/* UI text scale: the base bitmap font is 8x16; at IDE_UI_SCALE=2 the whole IDE
+ * renders crisp 16x32 text (the desktop felt "too small"). GFX_FW/GFX_FH are the
+ * single source of truth the layout math is built on, so bumping them here scales
+ * the entire IDE coherently; the fixed pixel constants in ide_theme.h are grown
+ * proportionally to match. Text is drawn via font2_draw_scaled_clip (bounds-safe). */
+#define IDE_UI_SCALE 2
+#define GFX_FW (8  * IDE_UI_SCALE)   /* font cell width                 */
+#define GFX_FH (16 * IDE_UI_SCALE)   /* font cell height                */
 
 typedef struct {
     uint32_t* px;    /* ARGB32 pixels        */

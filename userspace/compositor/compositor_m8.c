@@ -108,6 +108,7 @@ typedef long                int64_t;    /* match <stdint.h> __INT64_TYPE__  (LP6
 #define SYS_WRITE         3
 #define SYS_OPEN          4
 #define SYS_YIELD         15
+#define SYS_SLEEP          9      /* blocking ms sleep (frees the CPU for clients) */
 #define SYS_SPAWN         16
 #define SYS_SHMAT         19
 #define SYS_SHMDT         20
@@ -194,7 +195,7 @@ static inline long sc6(long n, long a1, long a2, long a3, long a4, long a5, long
  *  -- which the WM already intercepts as a modifier chord -- is the hook).  *
  * ---------------------------------------------------------------------- */
 #ifndef COMPOSITOR_STATS
-#define COMPOSITOR_STATS 1        /* 1 = draw the stats overlay (ON by default) */
+#define COMPOSITOR_STATS 0        /* 0 = stats overlay HIDDEN by default; Alt+S toggles it on */
 #endif
 
 /* Frame-dirty flag. Seeded to 1 so the very first frame (boot fade + initial
@@ -240,11 +241,13 @@ typedef struct { uint64_t vaddr; uint32_t width, height, pitch, bpp; } fb_acquir
 #define WL_REQ_CREATE   1
 #define WL_REQ_COMMIT   2
 #define WL_REQ_DESTROY  3
+#define WL_REQ_RESIZE   4   /* client reallocated its buffer (new shm_id)         */
 
 /* server -> client message types */
 #define WL_EVT_CREATED  1
 #define WL_EVT_POINTER  2
 #define WL_EVT_KEY      3
+#define WL_EVT_CONFIGURE 4  /* ask client to resize to w x h                      */
 
 #define WL_TITLE_MAX    48
 
@@ -270,10 +273,26 @@ typedef struct {
     int32_t  win_id;
 } wl_req_destroy_t;
 
+/* client -> server: new buffer after a WL_EVT_CONFIGURE (byte-compatible with
+ * wl_resize_req in wl_proto.h: long==int64_t, int==int32_t, uint==uint32_t). */
+typedef struct {
+    int64_t  mtype;
+    int32_t  win_id;
+    int32_t  shm_id;
+    uint32_t w, h, stride;
+} wl_req_resize_t;
+
 typedef struct {
     int64_t  mtype;
     int32_t  win_id;
 } wl_evt_created_t;
+
+/* server -> client: ask the client to resize to w x h. */
+typedef struct {
+    int64_t  mtype;
+    int32_t  win_id;
+    uint32_t w, h;
+} wl_evt_configure_t;
 
 typedef struct {
     int64_t  mtype;
@@ -293,6 +312,7 @@ typedef union {
     wl_req_create_t  create;
     wl_req_commit_t  commit;
     wl_req_destroy_t destroy;
+    wl_req_resize_t  resize;
     char             raw[128];
 } wl_inbox_msg_t;
 
@@ -526,18 +546,20 @@ static void blit_surface_scaled_alpha(uint32_t *buf, uint32_t bw, uint32_t bh, u
 #define BTN_MIN         0xFFFFBD47u   /* minimize box (amber)                */
 #define WIN_PLACEHOLDER 0xFF1C1C1Eu   /* shown if a client has no shm yet    */
 
+/* GUI SCALE: restored to ~1.0x chrome (user: the 0.75x shrink made the GUI "too
+ * small"). These are the pre-shrink values; text-bearing bars stay >= 16px font + pad. */
 #define TITLEBAR_H  28
 #define BORDER_W    1
-#define WIN_RADIUS  8                 /* rounded window outer-corner radius   */
+#define WIN_RADIUS  6                 /* rounded window outer-corner radius   */
 
 /* chrome geometry */
 #define PANEL_H     28
-#define DOCK_H      44
-#define LAUNCH_SZ   36                 /* launcher button is 36x36            */
+#define DOCK_H      34
+#define LAUNCH_SZ   36                 /* launcher button                     */
 #define TASK_W      120                /* taskbar button width                */
 #define TASK_H      32                 /* taskbar button height               */
-#define CLOSE_SZ    14                 /* titlebar close box hit/visual size  */
-#define MIN_SZ      14                 /* titlebar minimize box hit/visual    */
+#define CLOSE_SZ    12                 /* titlebar close box hit/visual size  */
+#define MIN_SZ      12                 /* titlebar minimize box hit/visual    */
 
 /* animation tunables (ms) */
 #define ANIM_OPEN_MS    180
@@ -570,6 +592,7 @@ static void blit_surface_scaled_alpha(uint32_t *buf, uint32_t bw, uint32_t bh, u
 #define KEY_M         50
 #define KEY_LEFTALT   56
 #define KEY_F4        62
+#define KEY_ENTER     28      /* Alt+Enter toggles maximize (fullscreen-to-work-area) */
 
 /* M6: snap target kinds (also used as the "currently snapped" tag) */
 #define SNAP_NONE     0
@@ -583,9 +606,9 @@ static void blit_surface_scaled_alpha(uint32_t *buf, uint32_t bw, uint32_t bh, u
 /* ======================================================================
  * M8: RIGHT-SIDE MACOS-STYLE VERTICAL DOCK
  * ====================================================================== */
-#define RDOCK_W          64    /* width of the right dock strip (px)          */
-#define RDOCK_ICON_BASE  52    /* base (non-magnified) icon tile size (px)    */
-#define RDOCK_PAD         6    /* gap between icon tiles (px)                 */
+#define RDOCK_W          48    /* width of the right dock strip (px) — 0.75x  */
+#define RDOCK_ICON_BASE  40    /* base (non-magnified) icon tile size (px)    */
+#define RDOCK_PAD         5    /* gap between icon tiles (px)                 */
 #define RDOCK_CORNER      8    /* rounded corner radius for icon tiles        */
 #define RDOCK_MARGIN_TOP 40    /* top margin inside the dock strip            */
 
@@ -1013,6 +1036,22 @@ static int32_t client_reply_qid(window_t *win) {
                    (long)(IPC_CREAT | 0666), 0, 0, 0, 0);
     if (qid >= 0) win->reply_qid = (int32_t)qid;
     return (int32_t)qid;
+}
+
+/* Ask a window's client to resize its surface to w x h (WL_EVT_CONFIGURE). The
+ * client reallocates its shm buffer and replies WL_REQ_RESIZE; until then the
+ * blit source-clamps to the old buf_w/buf_h keep rendering safe. Used on
+ * maximize/restore/snap so the frame can fill crisply instead of letterboxing. */
+static void send_configure(window_t *win, uint32_t w, uint32_t h) {
+    if (!win) return;
+    int32_t qid = client_reply_qid(win);
+    if (qid < 0) return;
+    wl_evt_configure_t ev;
+    ev.mtype  = WL_EVT_CONFIGURE;
+    ev.win_id = win->win_id;
+    ev.w = w;
+    ev.h = h;
+    sc6(SYS_MSGSND, qid, (long)&ev, (long)(sizeof(ev) - sizeof(int64_t)), 0, 0, 0);
 }
 
 /* ====================================================================== *
@@ -2683,8 +2722,12 @@ static void composite(uint32_t *buf, uint32_t w, uint32_t h, uint32_t stride,
      * is never occluded by it). Cheap; gated by g_stats_on / COMPOSITOR_STATS. */
     render_stats_overlay(buf, w, h, stride);
 
-    /* cursor on very top */
-    draw_cursor(buf, w, h, stride, cursor_x, cursor_y);
+    /* NOTE: the cursor is NOT drawn here. `back` is the cursor-less SCENE so the
+     * frame loop can move the cursor (overlay it on the framebuffer at present
+     * time) WITHOUT recompositing the whole scene -- the smooth-mouse fast path.
+     * present_diff(back, prev) detects any real scene change (incl. hover FX);
+     * the cursor is overlaid separately by present_cursor(). */
+    (void)cursor_x; (void)cursor_y;
 }
 
 static void present(uint32_t *fb, uint32_t *back, uint32_t h, uint32_t stride) {
@@ -2728,6 +2771,51 @@ static uint32_t present_diff(uint32_t *fb, uint32_t *back, uint32_t *prev,
     /* Pixels actually pushed to the slow FB = the changed bounding box area.
      * Returned so the stats overlay can show present cost per frame. */
     return (maxx - minx + 1) * (maxy - miny + 1);
+}
+
+/* SMOOTH-MOUSE FAST PATH state: where the cursor sprite is currently painted on
+ * the framebuffer (so we can erase it from there), and whether the pointer moved
+ * this frame. `back` is the cursor-less scene; `prev` mirrors it. */
+static int      g_cursor_moved = 0;
+static int32_t  g_cur_drawn_x  = -1000, g_cur_drawn_y = -1000;
+
+/* Copy the scene rect [x,x+w) x [y,y+h) from `back` to BOTH the framebuffer and
+ * `prev` (prev tracks the cursor-less scene, so present_diff stays coherent).
+ * Clipped to the screen. Used to erase the old cursor / paint the new one's
+ * background before the sprite goes on top. Returns pixels written. */
+static uint32_t blit_back_rect(uint32_t *fb, uint32_t *back, uint32_t *prev,
+                               int32_t x, int32_t y, int32_t w, int32_t h,
+                               uint32_t scr_w, uint32_t scr_h, uint32_t stride) {
+    int32_t x1 = x < 0 ? 0 : x, y1 = y < 0 ? 0 : y;
+    int32_t x2 = x + w, y2 = y + h;
+    if (x2 > (int32_t)scr_w) x2 = (int32_t)scr_w;
+    if (y2 > (int32_t)scr_h) y2 = (int32_t)scr_h;
+    if (x1 >= x2 || y1 >= y2) return 0;
+    for (int32_t yy = y1; yy < y2; yy++) {
+        uint32_t off = (uint32_t)yy * stride;
+        for (int32_t xx = x1; xx < x2; xx++) {
+            fb[off + xx]   = back[off + xx];
+            if (prev) prev[off + xx] = back[off + xx];
+        }
+    }
+    return (uint32_t)((x2 - x1) * (y2 - y1));
+}
+
+/* Move the cursor sprite from (ox,oy) to (nx,ny) on the framebuffer WITHOUT
+ * recompositing the scene: restore the scene under the OLD sprite, restore the
+ * scene under the NEW spot, then overlay the arrow at the new spot. Tiny: two
+ * 12x19 rects + the sprite. This is what makes mouse movement smooth + lag-free
+ * across the whole screen (the old code re-rendered + re-scanned the FULL frame
+ * on every pointer event -> the bottom-of-screen lag the user reported). */
+static uint32_t present_cursor(uint32_t *fb, uint32_t *back, uint32_t *prev,
+                               int32_t ox, int32_t oy, int32_t nx, int32_t ny,
+                               uint32_t scr_w, uint32_t scr_h, uint32_t stride) {
+    uint32_t px = 0;
+    px += blit_back_rect(fb, back, prev, ox, oy, CUR_W, CUR_H, scr_w, scr_h, stride);
+    if (nx != ox || ny != oy)
+        px += blit_back_rect(fb, back, prev, nx, ny, CUR_W, CUR_H, scr_w, scr_h, stride);
+    draw_cursor(fb, scr_w, scr_h, stride, nx, ny);   /* arrow on very top */
+    return px;
 }
 
 /* Boot transition: how long the kernel splash fluidly cross-fades into the
@@ -2958,6 +3046,42 @@ static void handle_destroy(const wl_req_destroy_t *req) {
     print("[COMP] client disconnected win="); print_num(id); print("\n");
 }
 
+/* WL_REQ_RESIZE: the client reallocated its pixel buffer to a new size + shm
+ * segment (responding to a WL_EVT_CONFIGURE). Re-attach the new segment and
+ * adopt the new buffer extent. This is the ONLY place buf_w/buf_h/shm change
+ * after create. Geometry is validated against the framebuffer (like create) so
+ * a bogus size can't make later blits read past the mapped segment. The new
+ * segment is mapped BEFORE the old is detached, so a failed shmat keeps the
+ * window rendering with its existing buffer rather than going blank. */
+static void handle_resize(const wl_req_resize_t *req) {
+    int slot = slot_by_win_id(req->win_id);
+    if (slot < 0) return;
+    if (req->w == 0 || req->h == 0 || req->w > g_fb_w || req->h > g_fb_h) {
+        print("[COMP] rejecting resize: bad geometry win="); print_num(req->win_id);
+        print("\n");
+        return;
+    }
+    window_t *win = &g_windows[slot];
+    long addr = sc6(SYS_SHMAT, (long)req->shm_id, 0, 0, 0, 0, 0);
+    if (addr <= 0) {
+        print("[COMP] resize shmat FAILED shm_id="); print_num(req->shm_id);
+        print(" r="); print_num(addr); print("\n");
+        return;                                  /* keep the old buffer */
+    }
+    uint64_t old_vaddr = win->shm_vaddr;
+    win->shm_id    = req->shm_id;
+    win->shm_vaddr = (uint64_t)addr;
+    win->pixels    = (uint32_t *)addr;
+    win->buf_w     = req->w;                      /* the immutable extent moves here */
+    win->buf_h     = req->h;
+    win->stride    = req->w;                      /* tightly packed, pinned to w */
+    win->dirty     = 1;
+    if (old_vaddr) sc6(SYS_SHMDT, (long)old_vaddr, 0, 0, 0, 0, 0);
+    print("[COMP] resize win="); print_num(req->win_id);
+    print(" to "); print_num((long)req->w); print("x"); print_num((long)req->h);
+    print("\n");
+}
+
 static void drain_inbox(int32_t inbox_qid) {
     wl_inbox_msg_t msg;
     for (;;) {
@@ -2973,6 +3097,7 @@ static void drain_inbox(int32_t inbox_qid) {
             case WL_REQ_CREATE:  handle_create(&msg.create);   break;
             case WL_REQ_COMMIT:  handle_commit(&msg.commit);   break;
             case WL_REQ_DESTROY: handle_destroy(&msg.destroy); break;
+            case WL_REQ_RESIZE:  handle_resize(&msg.resize);   break;
             default: break;
         }
     }
@@ -3085,6 +3210,12 @@ static void alttab_advance(void) {
     }
 }
 
+/* Forward decls: the Alt+Enter maximize chord below reuses the snap helpers that
+ * are defined later in the file (window-management section). */
+static void begin_snap_to(int slot, int32_t kind);
+static void start_geom_tween(window_t *win, int32_t to_x, int32_t to_y,
+                             uint32_t to_w, uint32_t to_h);
+
 /* Returns 1 if the key was consumed by the WM (do not forward to client). */
 static int wm_handle_key(int32_t keycode, int32_t pressed) {
     /* Track the Alt modifier. */
@@ -3118,6 +3249,25 @@ static int wm_handle_key(int32_t keycode, int32_t pressed) {
             if (f >= 0) begin_minimize(f);
             return 1;
         }
+        if (keycode == KEY_ENTER) {
+            /* Alt+Enter: toggle maximize on the focused window (same path as the
+             * titlebar maximize box). With a full-work-area client buffer the
+             * window fills the screen; smaller fixed buffers fill up to their
+             * own surface until the resize/configure protocol lands. */
+            int f = focused_slot();
+            if (f >= 0) {
+                window_t* win = &g_windows[f];
+                if (win->snap_state == SNAP_MAX) {
+                    send_configure(win, win->saved_w, win->saved_h);  /* shrink buffer back */
+                    start_geom_tween(win, win->saved_x, win->saved_y,
+                                     win->saved_w, win->saved_h);
+                    win->snap_state = SNAP_NONE;
+                } else {
+                    begin_snap_to(f, SNAP_MAX);
+                }
+            }
+            return 1;
+        }
         if (keycode == KEY_S) {
             /* PERF: toggle the on-screen stats overlay (FPS/frame-time/windows/
              * pixels). Mark dirty so it appears/disappears on the next frame. */
@@ -3148,7 +3298,8 @@ static int wm_handle_key(int32_t keycode, int32_t pressed) {
     /* Consume the key-UP of an intercepted chord too, so the client never sees
      * a dangling release for a press it never got. (Tab/Q/F4/M/K/S while Alt held.) */
     if (keycode == KEY_TAB || keycode == KEY_Q || keycode == KEY_F4 ||
-        keycode == KEY_M   || keycode == KEY_K || keycode == KEY_S)
+        keycode == KEY_M   || keycode == KEY_K || keycode == KEY_S ||
+        keycode == KEY_ENTER)
         return 1;
 
     return 0;                                       /* other Alt+<key>: forward  */
@@ -3240,11 +3391,33 @@ static void pump_input(int32_t fd, int keyboard, uint32_t W, uint32_t H) {
         if (g_cursor_y < 0) g_cursor_y = 0;
         if (g_cursor_x >= (int32_t)W) g_cursor_x = (int32_t)W - 1;
         if (g_cursor_y >= (int32_t)H) g_cursor_y = (int32_t)H - 1;
-        /* PERF: the compositor draws the cursor, so ANY cursor move or button
-         * change must repaint (cursor sprite, dock hover-magnify, drag, menu
-         * highlight all key off pointer state). Mark dirty for every pointer
-         * change -- the safest, broadest mouse damage source. */
-        mark_dirty();
+        /* SMOOTH-MOUSE FAST PATH: a pure pointer move only needs the cursor
+         * SPRITE moved (present_cursor), not a full scene recomposite+rescan.
+         * We force a real scene recomposite (mark_dirty) ONLY when the move can
+         * change non-cursor pixels: near hover-reactive chrome (top panel, bottom
+         * dock, right-dock magnify field, a window titlebar), while a menu/dialog
+         * is open, a snap preview or toast is live, or a window is animating --
+         * plus a periodic safety net so a missed hover can never linger. Button
+         * changes always recomposite (handled by the click latch + handle_mouse).
+         * Otherwise it's a pure move and the fast path handles it downstream. */
+        static uint32_t g_cursor_safety = 0;
+        g_cursor_moved = 1;
+        int hover = (g_cursor_y < PANEL_H) ||
+                    (g_cursor_y > (int32_t)H - DOCK_H) ||
+                    (g_cursor_x > (int32_t)W - RDOCK_W - RDOCK_MAG_INFLUENCE) ||
+                    g_menu_open || g_about_open ||
+                    g_snap_armed != SNAP_NONE || g_toast_dur_ms > 0 ||
+                    (g_buttons != 0);                /* dragging / press-drag */
+        if (!hover) {
+            for (int wi = 0; wi < MAX_WINDOWS; wi++) {
+                if (!g_windows[wi].used) continue;
+                if (g_windows[wi].phase != PH_NONE) { hover = 1; break; }
+                int32_t wx = g_windows[wi].x, wy = g_windows[wi].y;
+                if (g_cursor_x >= wx && g_cursor_x < wx + (int32_t)g_windows[wi].w &&
+                    g_cursor_y >= wy && g_cursor_y < wy + TITLEBAR_H) { hover = 1; break; }
+            }
+        }
+        if (hover || (g_cursor_safety++ & 15) == 0) mark_dirty();
         send_pointer_to_focus();
     }
 }
@@ -3332,19 +3505,18 @@ static void begin_snap_to(int slot, int32_t kind) {
     if (win->phase == PH_CLOSING || win->phase == PH_MINIMIZING) return;
     int32_t fx, fy; uint32_t cw, ch;
     if (snap_target_rect(kind, &fx, &fy, &cw, &ch) != 0) return;
-    /* Aspect/black-margin fix: never grow a window's frame past the app's OWN
-     * surface (buf_w x buf_h). A fixed-size client (e.g. the 640x400 terminal)
-     * can't fill a bigger frame, so the uncovered area letterboxes to the
-     * wallpaper -- the "black margin on the right". Clamp the snap/maximize target
-     * to the buffer so the window MATCHES the app. (Real grow-to-fill needs a
-     * resize/configure protocol event + per-app reflow -- a separate, larger job.) */
-    if (cw > win->buf_w) cw = win->buf_w;
-    if (ch > win->buf_h) ch = win->buf_h;
     if (win->snap_state == SNAP_NONE) {            /* remember where we came from */
         win->saved_x = win->x; win->saved_y = win->y;
         win->saved_w = win->w; win->saved_h = win->h;
     }
     win->snap_state = kind;
+    /* GROW-TO-FILL (resize/configure protocol): ask the client to reallocate its
+     * pixel buffer to the snap target so the window fills the frame crisply for
+     * ANY app (terminal, games), instead of clamping the frame down to the app's
+     * fixed buffer. The blit source-clamps (buf_w/buf_h) keep rendering safe until
+     * the client's WL_REQ_RESIZE arrives and updates buf_w/buf_h. */
+    if (cw != win->buf_w || ch != win->buf_h)
+        send_configure(win, cw, ch);
     start_geom_tween(win, fx, fy, cw, ch);
     print("[SHELL] snap win "); print_num(win->win_id);
     print(" kind="); print_num(kind); print("\n");
@@ -3493,6 +3665,7 @@ static void menu_run(int idx) {
                 begin_snap_to(slot, SNAP_RIGHT);
             } else { /* MACT_WIN_MAXIMIZE: toggle SNAP_MAX (same as title button) */
                 if (win->snap_state == SNAP_MAX) {
+                    send_configure(win, win->saved_w, win->saved_h);
                     start_geom_tween(win, win->saved_x, win->saved_y,
                                      win->saved_w, win->saved_h);
                     win->snap_state = SNAP_NONE;
@@ -3779,7 +3952,9 @@ static void handle_mouse(uint32_t W, uint32_t H) {
         int32_t max_y = fy + (TITLEBAR_H - MIN_SZ) / 2;
         if (point_in(cx, cy, max_x, max_y, MIN_SZ, MIN_SZ)) {
             if (win->snap_state == SNAP_MAX) {
-                /* restore: tween back to the saved pre-maximize geometry */
+                /* restore: shrink the client buffer back, then tween to the
+                 * saved pre-maximize geometry */
+                send_configure(win, win->saved_w, win->saved_h);
                 start_geom_tween(win, win->saved_x, win->saved_y,
                                  win->saved_w, win->saved_h);
                 win->snap_state = SNAP_NONE;
@@ -4001,25 +4176,54 @@ void _start(void) {
          * animations, dock hover, the per-second clock pulse above). When NOT
          * dirty we present nothing and just yield. For the first BOOT_FADE_MS we
          * fluidly cross-fade the kernel boot splash into the desktop. */
-        if (g_dirty) {
-            g_dirty = 0;                       /* consume before drawing so a
+        if (g_dirty || g_cursor_moved) {
+            /* No double buffer (mmap failed, back==hw) -> no cursor fast path is
+             * possible; recomposite the whole scene on any change and draw the
+             * cursor directly. The fast path below needs back!=hw + prev. */
+            int scene = g_dirty || (back == hw && g_cursor_moved);
+            g_dirty = 0;                        /* consume before drawing so a
                                                 * change DURING this frame's draw
                                                 * (e.g. a late inbox msg next
                                                 * iteration) re-arms cleanly.    */
-            composite(back, W, H, stride, g_cursor_x, g_cursor_y, now);
+            /* Recomposite the cursor-less SCENE only when something other than the
+             * pointer changed. A pure pointer move skips this (the expensive bit:
+             * re-blitting every window + the full back-vs-prev scan) and just
+             * slides the cursor sprite below. */
+            if (scene) composite(back, W, H, stride, g_cursor_x, g_cursor_y, now);
             if (back != hw) {
                 if (boot_fading) {
                     uint32_t t = (uint32_t)(((now - boot_ms) * 256) / BOOT_FADE_MS);
                     present_circle_iris(hw, back, splash, W, H, stride, max_radius, t);
+                    present_cursor(hw, back, prev, g_cur_drawn_x, g_cur_drawn_y,
+                                   g_cursor_x, g_cursor_y, W, H, stride);
+                    g_cur_drawn_x = g_cursor_x; g_cur_drawn_y = g_cursor_y;
                     g_present_px = W * H;        /* iris touches the whole screen */
                     g_present_did = 1;
                 } else {
-                    if (prev) { g_present_px = present_diff(hw, back, prev, W, H, stride); }
-                    else      { present(hw, back, H, stride); g_present_px = W * H; }
-                    g_present_did = (g_present_px != 0);
-                    splash = (uint32_t *)0;      /* fade complete: stop blending */
+                    uint32_t px = 0;
+                    if (scene) {
+                        if (prev) px = present_diff(hw, back, prev, W, H, stride);
+                        else      { present(hw, back, H, stride); px = W * H; }
+                        splash = (uint32_t *)0;  /* fade complete: stop blending */
+                    }
+                    /* Slide/overlay the cursor sprite (tiny: 2 small rects). Runs
+                     * every frame the pointer moved -- this is the smooth-mouse,
+                     * no-bottom-lag path -- and also re-asserts the sprite over a
+                     * fresh scene present. */
+                    px += present_cursor(hw, back, prev, g_cur_drawn_x, g_cur_drawn_y,
+                                         g_cursor_x, g_cursor_y, W, H, stride);
+                    g_cur_drawn_x = g_cursor_x; g_cur_drawn_y = g_cursor_y;
+                    g_present_px = px;
+                    g_present_did = (px != 0);
                 }
+            } else {
+                /* back==hw: composite() wrote the cursor-less scene straight to the
+                 * framebuffer; drop the cursor sprite on top. */
+                draw_cursor(hw, W, H, stride, g_cursor_x, g_cursor_y);
+                g_present_px = W * H;
+                g_present_did = 1;
             }
+            g_cursor_moved = 0;
 
             /* PERF: sample frame-time + FPS at each PRESENTED frame (idle frames
              * that skip the draw don't count, so FPS reflects real work). Smooth
@@ -4042,15 +4246,21 @@ void _start(void) {
             print(" windows)\n");
         }
 
-        /* f) ALWAYS yield at least once per frame so init and clients get
-         * scheduled even when a frame exceeds the 16ms budget. */
-        syscall(SYS_YIELD, 0, 0, 0);
+        /* f) Frame pacing. On the COOPERATIVE scheduler the old code busy-YIELDED
+         * until the 16ms budget elapsed -- but a yielding process stays RUNNABLE,
+         * so the compositor only re-checked the clock when the round-robin cycled
+         * back to it, massively OVERSHOOTING the budget (frames ~100ms+ => ~9 FPS
+         * with several apps open). Instead BLOCK-SLEEP the remainder: the kernel
+         * drops us from the runqueue, runs the clients, and wakes us right at the
+         * deadline -- so we present on a steady ~60Hz cadence and clients still get
+         * their full share of CPU. If we overran the budget, just yield once. */
+        now = syscall(SYS_GET_TICKS_MS, 0, 0, 0);
         next += 16;
-        for (;;) {
-            now = syscall(SYS_GET_TICKS_MS, 0, 0, 0);
-            if (now >= next) break;
-            syscall(SYS_YIELD, 0, 0, 0);
-        }
+        long sleep_ms = next - now;
+        if (sleep_ms > 16) sleep_ms = 16;              /* clamp after a stall */
+        if (sleep_ms >= 1) syscall(SYS_SLEEP, sleep_ms, 0, 0);
+        else               syscall(SYS_YIELD, 0, 0, 0);
+        now = syscall(SYS_GET_TICKS_MS, 0, 0, 0);
         if (next < now - 64) next = now;     /* resync after a clock jump */
     }
 }

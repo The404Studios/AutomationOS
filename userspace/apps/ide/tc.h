@@ -70,6 +70,7 @@ typedef struct {
     int    ok;                       /* 1 = produced a runnable ELF        */
     TcLang lang;
     char   out_path[160];            /* ELF written here                   */
+    char   out_dir[160];             /* the build/ folder the ELF lives in */
     int    code_len, elf_len;
     char   asm_preview[1536];        /* first ~lines of generated asm      */
     TcDiag diags[TC_MAXDIAG]; int ndiags;

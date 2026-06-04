@@ -19,13 +19,28 @@ cc() { gcc $CF -c "$1" -o "$2"; }
 # cooperative init is built byte-for-byte as before (no burners ever spawned).
 INIT_EXTRA=""
 if [ "${STRESS:-0}" = "1" ]; then
-    INIT_EXTRA="-DPREEMPT_STRESS"
+    INIT_EXTRA="$INIT_EXTRA -DPREEMPT_STRESS"
     echo "*** STRESS build: init compiled with -DPREEMPT_STRESS (spawns cpuburners) ***"
+fi
+# GAMETEST=1 adds -DGAMETEST_RUN to the init compile ONLY, so init spawns
+# sbin/gametest (the spawn+survive harness over all games + key apps). Unset =>
+# the normal boot is byte-for-byte unchanged.
+if [ "${IDE:-0}" = "1" ]; then
+    INIT_EXTRA="$INIT_EXTRA -DIDE_AUTOSTART"
+    echo "*** IDE build: init compiled with -DIDE_AUTOSTART (auto-opens sbin/ide) ***"
+fi
+if [ "${GAMETEST:-0}" = "1" ]; then
+    INIT_EXTRA="$INIT_EXTRA -DGAMETEST_RUN"
+    echo "*** GAMETEST build: init compiled with -DGAMETEST_RUN (spawns sbin/gametest) ***"
 fi
 
 echo "[all] shared libs..."
 cc userspace/lib/font/bitfont.c /tmp/bf.o
+cc userspace/lib/font2/font2.c /tmp/font2.o   # scaled (2x) text renderer for IDE/chrome
 cc userspace/lib/wl/wl_client.c /tmp/wlc.o
+# g3d: software 3D rasterizer (Q16.16 fixed-point vec3/mat4 + z-buffer triangle
+# fill). No GPU; renders into the wl window's ARGB32 buffer. Used by cube3d + ray.
+cc userspace/lib/g3d/g3d.c      /tmp/g3d.o
 cc userspace/lib/ui/ui.c        /tmp/ui.o
 cc userspace/lib/keymap/keymap.c /tmp/keymap.o
 cc userspace/lib/game/game.c    /tmp/game.o
@@ -78,6 +93,10 @@ cc userspace/apps/cpuburn/cpuburn.c /tmp/cpuburn.o; $LD /tmp/crt0.o /tmp/cpuburn
 # low*1.3. Works in BOTH the cooperative and preemptive builds. crt0-linked;
 # includes userspace/lib/sched_class.h (named classes + sched_setclass()).
 cc userspace/apps/prioritytest/prioritytest.c /tmp/prioritytest.o; $LD /tmp/crt0.o /tmp/prioritytest.o -o /tmp/prioritytest.elf
+# gametest: spawn+survive harness over all 16 games + key desktop apps (verifies
+# each actually runs its init+render loop without crashing). init spawns it only
+# under -DGAMETEST_RUN (GAMETEST=1). crt0-linked.
+cc userspace/apps/gametest/gametest.c /tmp/gametest.o; $LD /tmp/crt0.o /tmp/gametest.o -o /tmp/gametest.elf
 # matbench: SIMD float matmul benchmark -- scalar baseline vs hand-vectorized SSE
 # (gcc v4sf), with a correctness check + a measured speedup. First tensor-runtime brick.
 cc userspace/apps/matbench/matbench.c /tmp/matbench.o; $LD /tmp/crt0.o /tmp/matbench.o -o /tmp/matbench.elf
@@ -317,6 +336,12 @@ $LD /tmp/terminal.o /tmp/sh_git.o /tmp/wlc.o /tmp/bf.o /tmp/keymap.o -o /tmp/ter
 build_wl_app userspace/apps/editor/editor.c           editor
 build_wl_app userspace/apps/snake/snake.c             snake
 build_wl_app userspace/apps/asteroids/asteroids.c     asteroids
+# cube3d / ray: software 3D (g3d lib). They need wl + bitfont + g3d, so they do
+# NOT fit build_wl_app (which omits g3d.o) -- link explicitly.
+cc userspace/apps/cube3d/cube3d.c /tmp/cube3d.o
+$LD /tmp/cube3d.o /tmp/wlc.o /tmp/bf.o /tmp/g3d.o -o /tmp/cube3d.elf
+cc userspace/apps/ray/ray.c       /tmp/ray.o
+$LD /tmp/ray.o    /tmp/wlc.o /tmp/bf.o /tmp/g3d.o -o /tmp/ray.elf
 build_wl_app userspace/apps/sudoku/sudoku.c           sudoku
 build_wl_app userspace/apps/pacman/pacman.c           pacman
 build_wl_app userspace/apps/clockapp/clockapp.c       clockapp
@@ -376,7 +401,7 @@ echo "[all] IDE (Semantic LEGO Map)..."
 IDE_SRCS="ide ide_sys ide_gfx ide_lex ide_ast ide_pcore ide_pdecl ide_pstmt ide_pexpr ide_astprint ide_parse ide_semantic ide_explorer ide_funcs ide_map ide_codeview ide_inspector ide_runtime ide_chrome ide_gen elf_write as_x64 cc_type cc_codegen cc_expr tc_driver ide_build ide_editor ide_term"
 IDE_OBJS=""
 for s in $IDE_SRCS; do cc userspace/apps/ide/$s.c /tmp/ide_$s.o; IDE_OBJS="$IDE_OBJS /tmp/ide_$s.o"; done
-$LD $IDE_OBJS /tmp/wlc.o /tmp/bf.o /tmp/keymap.o -o /tmp/ide.elf
+$LD $IDE_OBJS /tmp/wlc.o /tmp/bf.o /tmp/font2.o /tmp/keymap.o -o /tmp/ide.elf
 
 # cc: the on-device C compiler (the self-hosting flagship). It is a thin driver
 # that REUSES the IDE's verified toolchain objects (lexer/parser/codegen/
@@ -393,17 +418,22 @@ $LD /tmp/crt0.o /tmp/cc.o \
     -o /tmp/cc.elf
 
 echo "[all] canary check (all must be 0):"
-for e in comp init filemanager calculator clock sysinfo settings sysmon uidemo dateapp applauncher taskman terminal editor snake paint synth tetris game2048 sheet notes calendar stopwatch mines piano dashboard welcome bench breakout pong invaders procmon soundtest solitaire aiconsole screenshot stress musicplayer ide bubbletd zombietd pacman clockapp forktest threadtest matmuljobs aibroker sed awk tar pkg make meminfo argvtest floattest sleeptest prioritytest matbench tensortest cpuburn blk ps kill free uptime find diff cmp tee wcx xargs gzip cc nettest sockettest cpu1offload wget netman browser cryptotest libtest ping nc grep head tail sort uniq cut tr nl du touch basename dirname uname hostname whoami date less hexdump tlsprobe certtool dhcpc apidemo js futextest epolltest sendfiletest perftest batchtest domtest htmltest csstest layouttest webtest browser2 webapitest; do
+for e in comp init filemanager calculator clock sysinfo settings sysmon uidemo dateapp applauncher taskman terminal editor snake paint synth tetris game2048 sheet notes calendar stopwatch mines piano dashboard welcome bench breakout pong invaders procmon soundtest solitaire aiconsole screenshot stress musicplayer ide bubbletd zombietd pacman clockapp forktest threadtest matmuljobs aibroker sed awk tar pkg make meminfo argvtest floattest sleeptest prioritytest matbench tensortest cpuburn blk ps kill free uptime find diff cmp tee wcx xargs gzip cc nettest sockettest cpu1offload wget netman browser cryptotest libtest ping nc grep head tail sort uniq cut tr nl du touch basename dirname uname hostname whoami date less hexdump tlsprobe certtool dhcpc apidemo js futextest epolltest sendfiletest perftest batchtest domtest htmltest csstest layouttest webtest browser2 webapitest cube3d ray chess asteroids sudoku photos startmenu controlcenter gametest; do
     n=$(objdump -d /tmp/$e.elf 2>/dev/null | grep -c "fs:0x28" || true)
     echo "  $e=$n"
 done
 
 echo "[all] packaging initrd..."
-rm -rf /tmp/ird && mkdir -p /tmp/ird
-( cd /tmp/ird && tar xf /mnt/c/Users/wilde/Desktop/Kernel/iso/boot/initrd.img )
+rm -rf /tmp/ird && mkdir -p /tmp/ird/sbin /tmp/ird/bin
+# Seed from the existing initrd if it is present and non-empty (preserves any
+# static files baked into a prior image). The explicit mkdir above guarantees
+# sbin/ and bin/ exist even when iso/boot/initrd.img is the empty bootstrap stub
+# (fresh checkout / cleaned tree) — otherwise the first `cp ... /tmp/ird/sbin/`
+# below fails with "No such file or directory" and the whole initrd is empty.
+( cd /tmp/ird && tar xf /mnt/c/Users/wilde/Desktop/Kernel/iso/boot/initrd.img 2>/dev/null || true )
 cp /tmp/comp.elf /tmp/ird/sbin/compositor
 cp /tmp/init.elf /tmp/ird/sbin/init
-for e in filemanager calculator clock sysinfo settings sysmon uidemo dateapp applauncher taskman terminal editor snake paint synth tetris game2048 sheet notes calendar stopwatch mines piano dashboard welcome bench breakout pong invaders procmon soundtest solitaire aiconsole screenshot stress musicplayer ide bubbletd startmenu controlcenter chess asteroids sudoku photos pacman clockapp zombietd forktest threadtest matmuljobs; do
+for e in filemanager calculator clock sysinfo settings sysmon uidemo dateapp applauncher taskman terminal editor snake paint synth tetris game2048 sheet notes calendar stopwatch mines piano dashboard welcome bench breakout pong invaders procmon soundtest solitaire aiconsole screenshot stress musicplayer ide bubbletd startmenu controlcenter chess asteroids sudoku photos pacman clockapp zombietd forktest threadtest matmuljobs cube3d ray; do
     cp /tmp/$e.elf /tmp/ird/sbin/$e
 done
 [ "$IV_OK" = "1" ] && cp /tmp/imageviewer.elf /tmp/ird/sbin/imageviewer
@@ -423,6 +453,7 @@ cp /tmp/sleeptest.elf /tmp/ird/sbin/sleeptest
 # prioritytest -> /sbin (init spawns it after the boot storm drains). Proves
 # priority classes shift CPU share by comparing two children's cpu_ticks.
 cp /tmp/prioritytest.elf /tmp/ird/sbin/prioritytest
+cp /tmp/gametest.elf /tmp/ird/sbin/gametest
 # cpuburn -> /sbin (init spawns sbin/cpuburn under PREEMPT_STRESS). Shipped in
 # every initrd but only spawned by a STRESS=1 init, so it is inert otherwise.
 cp /tmp/cpuburn.elf /tmp/ird/sbin/cpuburn
@@ -504,6 +535,17 @@ if [ "${FB_WC:-0}" = "1" ]; then
         exit 1
     fi
     echo "*** FB_WC build: installing WRITE-COMBINING kernel $KERNEL_FOR_ISO into ISO ***"
+fi
+# SMP=1 installs the SMP_FOUNDATION kernel (build/kernel-smp.elf from
+# `SMP=1 bash scripts/quick_build.sh`) so the desktop runs on the multi-core kernel
+# (needs QEMU -smp 2 / real >=2-core hardware). Mirrors the FB_WC opt-in.
+if [ "${SMP:-0}" = "1" ]; then
+    KERNEL_FOR_ISO="build/kernel-smp.elf"
+    if [ ! -f "$KERNEL_FOR_ISO" ]; then
+        echo "*** SMP=1 but $KERNEL_FOR_ISO missing -- run 'SMP=1 bash scripts/quick_build.sh' first ***"
+        exit 1
+    fi
+    echo "*** SMP build: installing SMP_FOUNDATION kernel $KERNEL_FOR_ISO into ISO ***"
 fi
 cp "$KERNEL_FOR_ISO" iso/boot/kernel.elf
 

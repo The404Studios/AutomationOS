@@ -40,6 +40,10 @@ typedef struct {
 /* Event kinds reported by wl_poll_event() via *kind (mirror WL_EVT_*). */
 #define WL_EVENT_POINTER 2   /* a=x, b=y, c=buttons   */
 #define WL_EVENT_KEY     3   /* a=keycode, b=pressed  */
+#define WL_EVENT_RESIZE  4   /* a=new_w, b=new_h; win->{w,h,stride,pixels} ALREADY
+                              * updated by the library (it reallocated the buffer).
+                              * Apps that re-read win->w/h each frame need no action;
+                              * apps caching geometry should invalidate it here. */
 
 /*
  * Connect to the compositor.

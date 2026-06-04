@@ -230,8 +230,10 @@ typedef struct {
     char     fname[M_NAME];   /* for MK_CALL: the called function name   */
 } MapSat;
 
-/* Upper bound: reads + writes + calls + absent ports, all M-capped. */
-#define MAP_MAXSAT (M_MAXREFS + M_MAXREFS + M_MAXCALLS + M_MAXPORTS)
+/* Upper bound: reads + writes + calls + absent ports + inbound callers, all
+ * M-capped. The + M_MAXFUNCS reserves room for the FAR-LEFT caller column so a
+ * heavily-called function's callers are never silently dropped by map_sat_push. */
+#define MAP_MAXSAT (M_MAXREFS + M_MAXREFS + M_MAXCALLS + M_MAXPORTS + M_MAXFUNCS)
 
 static MapSat map_sats[MAP_MAXSAT];
 static int    map_nsats;
@@ -288,8 +290,8 @@ void panel_map(Ide* a, Canvas* cv, Rect r)
     m     = &a->model;
     focus = a->focus_func;
     zoom  = a->map_zoom;
-    if (zoom < 30) zoom = 30;       /* clamp zoom range 30%-200% */
-    if (zoom > 200) zoom = 200;
+    if (zoom < 1)   zoom = 1;        /* clamp scale range 0.01 (1%) .. 1.00 (100%) */
+    if (zoom > 100) zoom = 100;
 
     /* Title: "SEMANTIC LEGO MAP - <focusname> [zoom%]". */
     buf[0] = '\0';
@@ -410,6 +412,40 @@ void panel_map(Ide* a, Canvas* cv, Rect r)
             map_cat(buf, " (read)", sizeof(buf));
             /* wire reaches the satellite at its RIGHT edge */
             map_sat_push(sc, MK_READ, TH_CYAN, card_left, ay, 0, buf, 0);
+            sy += sat_h + sat_vgap;
+        }
+    }
+
+    /* ---- FAR-LEFT: inbound CALLERS (blue) -- every function in the model that
+     * CALLS the focused one. This makes the graph bidirectional: previously the
+     * map only showed "what I call"; now it also shows "who calls me", so a leaf
+     * handler (no outbound calls) is still reachable/visible from its callers.
+     * Reuses MK_CALL so the existing click-to-navigate path jumps to the caller. */
+    {
+        int caller_x = left_x - col_gap - sat_w;
+        int sy = cy;
+        int j;
+        for (j = 0; j < m->nfuncs && j < M_MAXFUNCS; j++) {
+            Func* g;
+            int   c, ncalls, calls_focus = 0;
+            if (j == focus) continue;                 /* self shown centrally */
+            g = &m->funcs[j];
+            if (!g->name[0]) continue;
+            ncalls = g->ncalls;
+            if (ncalls < 0) ncalls = 0;
+            if (ncalls > M_MAXCALLS) ncalls = M_MAXCALLS;
+            for (c = 0; c < ncalls; c++)
+                if (g->calls[c][0] && f->name[0] &&
+                    map_streq(g->calls[c], f->name)) { calls_focus = 1; break; }
+            if (!calls_focus) continue;
+
+            Rect sc;
+            sc.x = caller_x; sc.y = sy; sc.w = sat_w; sc.h = sat_h;
+            buf[0] = '\0';
+            map_cat(buf, g->name, sizeof(buf));
+            map_cat(buf, "() ->", sizeof(buf));       /* "-> " calls into us */
+            /* wire reaches the central card's LEFT edge at the header line */
+            map_sat_push(sc, MK_CALL, TH_BLUE, card_left, hdr_anchor, 0, buf, g->name);
             sy += sat_h + sat_vgap;
         }
     }

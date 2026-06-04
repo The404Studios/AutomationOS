@@ -48,6 +48,7 @@
 /* Mask an arbitrary pointer down to its containing 4KB page base. */
 #define SLAB_PAGE_MASK   (~((uintptr_t)PAGE_SIZE - 1))
 
+
 /* Sanity canary stored in each slab header; detects a free of a pointer that
  * does not belong to any slab (e.g. a heap or stack pointer). */
 #define SLAB_MAGIC       0x51AB0BACE51AB0BULL
@@ -161,7 +162,17 @@ static slab_t* slab_grow(slab_cache_t* c) {
 
     if (!page) return NULL;   /* out of physical memory */
 
-    slab_t* s = (slab_t*)page;
+    /* SHADOW-IMMUNITY: address the slab (header, free-list, and every object we
+     * hand to kmalloc callers) through the DIRECT MAP, never the low identity
+     * (phys==virt) address. The kernel runs identity-mapped low, so a raw page
+     * pointer (~tens of MB) collides with user ELF segments that exec maps at the
+     * SAME low VAs (apps link at 0x200000; a big BSS reaches the slab region).
+     * Under that process's CR3 the identity VA is shadowed by the user's frame,
+     * so reading s->magic via identity sees the user page (magic=0) — the
+     * slab-churn "corruption". PML4[256] (direct map) is shared higher-half and
+     * NEVER shadowed by user low VAs, so PHYS_TO_DIRECT(page) is correct on ANY
+     * CR3. (DMA buffers still come from pmm_alloc_page directly — see ahci.c.) */
+    slab_t* s = (slab_t*)PHYS_TO_DIRECT(page);
     s->magic       = SLAB_MAGIC;
     s->cache       = c;
     s->next        = NULL;
@@ -170,8 +181,10 @@ static slab_t* slab_grow(slab_cache_t* c) {
     s->total_slots = c->slots_per_slab;
     s->free_count  = c->slots_per_slab;
 
-    /* First slot begins after the header, aligned up to the cache's alignment. */
-    uintptr_t first = round_up((uintptr_t)page + sizeof(slab_t), c->align);
+    /* First slot begins after the header, aligned up to the cache's alignment.
+     * Carve from the DIRECT-MAP base `s` so every slot pointer is a direct-map
+     * (shadow-immune) address. */
+    uintptr_t first = round_up((uintptr_t)s + sizeof(slab_t), c->align);
 
     /* Thread every slot onto the intrusive free-list. Pushing in ascending
      * index order leaves the highest-address slot at the head; the exact order
@@ -269,8 +282,24 @@ void* slab_alloc(slab_cache_t* c) {
         }
     }
 
-    /* Pop the free-list head. */
+    /* SLABDIAG + RECOVERY: a valid free slot lives inside THIS slab's page, and a
+     * live slab keeps its magic + sane counts. A free-list head pointing outside
+     * the page, a bad magic, or total_slots==0 means an external writer (a stale
+     * pointer to this physical page from a prior life, e.g. a freed file buffer)
+     * clobbered the slab header/slot. Rather than #GP on the deref below, ORPHAN
+     * the poisoned partial list (leak it — its next/prev are garbage so we cannot
+     * safely traverse it) and grow a fresh slab so kmalloc keeps working. */
     void* obj = s->free_list;
+    if (s->magic != SLAB_MAGIC || s->total_slots == 0 ||
+        (obj && ((uintptr_t)obj & SLAB_PAGE_MASK) != (uintptr_t)s)) {
+        kprintf("[SLAB] partial slab %p of cache '%s' has a corrupt header "
+                "(magic=%lx total=%u) — orphaning it and growing a fresh slab\n",
+                s, c->name ? c->name : "?", (unsigned long)s->magic, s->total_slots);
+        c->partial = NULL;          /* drop the whole poisoned partial chain */
+        s = slab_grow(c);           /* fresh backing page (re-links c->partial) */
+        if (!s) { spin_unlock(&c->lock); return NULL; }
+        obj = s->free_list;
+    }
     s->free_list = *(void**)obj;
     s->free_count--;
 
@@ -345,7 +374,7 @@ void slab_free(slab_cache_t* c, void* obj) {
         s->magic = 0;                       /* invalidate before release */
         spin_unlock(&c->lock);
         PERF_END(PERF_OP_SLAB_FREE);
-        pmm_free_page((void*)s);            /* PMM call without cache lock */
+        pmm_free_page((void*)DIRECT_TO_PHYS(s));  /* s is direct-map → PMM wants phys */
         return;
     }
 
@@ -373,7 +402,7 @@ void slab_cache_destroy(slab_cache_t* c) {
         while (s) {
             slab_t* next = s->next;
             s->magic = 0;
-            pmm_free_page((void*)s);
+            pmm_free_page((void*)DIRECT_TO_PHYS(s));   /* direct-map → phys */
             s = next;
         }
     }

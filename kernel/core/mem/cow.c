@@ -54,13 +54,24 @@ void cow_init(void) {
     uint64_t entries = COW_TABLE_ENTRIES;
     size_t bytes = (size_t)entries * sizeof(uint8_t);          // 1 MB
     size_t pages = (bytes + PAGE_SIZE - 1) / PAGE_SIZE;        // 256
-    cow_table = (uint8_t*)pmm_alloc_pages(pages);
-    if (!cow_table) {
+    /* SHADOW-IMMUNITY (same family as the slab fix): the refcount table is a LOW
+     * physical run (pmm_alloc_pages), so its raw pointer is a low identity VA that
+     * a large user binary's ELF/BSS segment can shadow under that process's CR3.
+     * cow_incref/unref/handle_write all run under a PROCESS CR3 (fork, CoW fault,
+     * and process-exit teardown via cow_unref), so a shadowed cow_table[pfn] would
+     * read/write the USER's frame instead of the refcount byte -> silent refcount
+     * corruption -> premature free / double-owner (UAF). Address the table through
+     * the DIRECT MAP (PML4[256], shared higher-half, never shadowed); every
+     * cow_table[pfn] access below is then CR3-independent. The PMM still tracks the
+     * underlying frames in phys; this table is never DMA'd or handed to hardware. */
+    void* cow_table_phys = pmm_alloc_pages(pages);
+    if (!cow_table_phys) {
         cow_table_len = 0;
         kprintf("[COW] disabled: refcount table alloc (%lu pages) failed\n",
                 (unsigned long)pages);
         return;
     }
+    cow_table = (uint8_t*)PHYS_TO_DIRECT(cow_table_phys);
     memset(cow_table, 0, bytes);
     cow_table_len = entries;
     kprintf("[COW] refcount table: %lu entries (%lu KB) at %p\n",
@@ -111,15 +122,20 @@ int cow_unref(uint64_t phys) {
 // Walk the LIVE address space (current CR3) to the leaf PTE for `va`, returning
 // a writable pointer to it, or NULL if there is no 4KB leaf mapping.
 static uint64_t* cow_walk_pte(uint64_t va) {
-    uint64_t* pml4 = (uint64_t*)(read_cr3() & COW_PHYS_MASK);
+    /* Walk the page-table pages through the DIRECT MAP, not raw phys==virt. The
+     * tables are low frames whose identity VAs a user segment can shadow under
+     * this same (faulting) CR3; reading them via PHYS_TO_DIRECT is CR3-independent
+     * and shadow-immune (and is empty-low-half ready). The returned PTE pointer is
+     * a direct-map address — writable, since the alias is W (USER-cleared, NX). */
+    uint64_t* pml4 = (uint64_t*)PHYS_TO_DIRECT(read_cr3() & COW_PHYS_MASK);
     uint64_t i4 = (va >> 39) & 0x1FF, i3 = (va >> 30) & 0x1FF;
     uint64_t i2 = (va >> 21) & 0x1FF, i1 = (va >> 12) & 0x1FF;
     if (!(pml4[i4] & PAGE_PRESENT)) return NULL;
-    uint64_t* pdpt = (uint64_t*)(pml4[i4] & COW_PHYS_MASK);
+    uint64_t* pdpt = (uint64_t*)PHYS_TO_DIRECT(pml4[i4] & COW_PHYS_MASK);
     if (!(pdpt[i3] & PAGE_PRESENT) || (pdpt[i3] & (1ULL << 7))) return NULL;
-    uint64_t* pd = (uint64_t*)(pdpt[i3] & COW_PHYS_MASK);
+    uint64_t* pd = (uint64_t*)PHYS_TO_DIRECT(pdpt[i3] & COW_PHYS_MASK);
     if (!(pd[i2] & PAGE_PRESENT) || (pd[i2] & (1ULL << 7))) return NULL;
-    uint64_t* pt = (uint64_t*)(pd[i2] & COW_PHYS_MASK);
+    uint64_t* pt = (uint64_t*)PHYS_TO_DIRECT(pd[i2] & COW_PHYS_MASK);
     if (!(pt[i1] & PAGE_PRESENT)) return NULL;
     return &pt[i1];
 }
@@ -150,10 +166,13 @@ int cow_handle_write(uint64_t fault_addr) {
     }
     spin_unlock(&cow_lock);
 
-    // Shared: hand this writer a private, writable copy.
+    // Shared: hand this writer a private, writable copy. Copy via the DIRECT MAP:
+    // this runs in the CoW fault handler under the FAULTING process's CR3, whose low
+    // identity map may not cover a high `nf`/`phys` frame (phys==virt bug family).
+    // PHYS_TO_DIRECT() resolves through the shared higher-half alias on any CR3.
     void* nf = pmm_alloc_page();
     if (!nf) return 0;                        // OOM -> let caller kill the process
-    memcpy(nf, (void*)phys, PAGE_SIZE);
+    memcpy(PHYS_TO_DIRECT(nf), PHYS_TO_DIRECT(phys), PAGE_SIZE);
 
     uint64_t flags = (e & ~COW_PHYS_MASK & ~PTE_COW) | PAGE_WRITE | PTE_OWNED;
     *pte = ((uint64_t)(uintptr_t)nf & COW_PHYS_MASK) | flags;

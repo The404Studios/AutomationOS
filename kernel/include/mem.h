@@ -3,6 +3,35 @@
 
 #include "types.h"
 
+/*
+ * DIRECT MAP (phys==virt bug-family fix)
+ * ======================================
+ * A second virtual alias of all physical RAM (0..16GB) at an UNUSED higher-half
+ * PML4 slot (PML4[256] -> base 0xFFFF800000000000). Set up in paging_init() by
+ * aliasing the identity PDPT into PML4[256]: since DIRECT_MAP_BASE+phys and 0+phys
+ * yield identical PDPT/PD indices, the same PDPT maps phys at both addresses.
+ *
+ * WHY: the LOW identity map (phys==virt, PML4[0]) is DEEP-COPIED + MUTATED per
+ * process (exec splits its huge pages), so a kernel deref of a raw physical frame
+ * as `(void*)phys` can #PF when the CURRENT CR3 is a process whose identity map no
+ * longer covers that frame (the churn crash class). PML4[256] lives in the SHARED
+ * higher-half (copied BY REFERENCE into every process CR3, never mutated/freed), so
+ * PHYS_TO_DIRECT(phys) ALWAYS resolves on ANY CR3 with no per-access CR3 switch.
+ *
+ * RULE: any kernel code that dereferences a raw physical frame as a pointer MUST
+ * go through PHYS_TO_DIRECT(phys), never `(void*)phys` directly.
+ */
+#define DIRECT_MAP_BASE   0xFFFF800000000000ULL
+#define DIRECT_MAP_SPAN   (16ULL * 1024 * 1024 * 1024)   /* 0..16GB, matches the identity extent */
+#define PHYS_TO_DIRECT(p) ((void*)(DIRECT_MAP_BASE + (uint64_t)(p)))
+/* Inverse: recover the physical address from a direct-map pointer. Used where a
+ * subsystem hands a direct-map pointer back to the PMM (which works in phys),
+ * e.g. the slab allocator frees its backing page. */
+#define DIRECT_TO_PHYS(p) ((uint64_t)(p) - DIRECT_MAP_BASE)
+/* True iff `p` is a direct-map pointer (in [BASE, BASE+SPAN)). */
+#define IS_DIRECT_PTR(p)  ((uint64_t)(p) >= DIRECT_MAP_BASE && \
+                           (uint64_t)(p) <  DIRECT_MAP_BASE + DIRECT_MAP_SPAN)
+
 // Boot memory map entry (must match boot_enhanced.h layout)
 typedef struct {
     uint64_t base;
@@ -71,6 +100,9 @@ uint64_t pmm_get_used_memory(void);
 
 /* Get available physical memory in bytes */
 uint64_t pmm_get_free_memory(void);
+
+/* Reclaim per-CPU page cache when a CPU goes offline (prevents page stranding on hot-unplug) */
+uint32_t pmm_reclaim_cpu_cache(uint32_t cpu);
 
 /*
  * Virtual Memory Manager (VMM)
@@ -177,11 +209,26 @@ void heap_init(void);
 /* Allocate kernel memory, returns NULL on failure */
 void* kmalloc(size_t size);
 
+/* Reallocate kernel memory to new size, preserving contents. Returns NULL on failure. */
+void* krealloc(void* ptr, size_t new_size);
+
+/* Allocate zero-initialized array of count elements of size bytes each. Returns NULL on failure. */
+void* kcalloc(size_t count, size_t size);
+
 /* Free previously allocated kernel memory */
 void kfree(void* ptr);
 
 /* Benchmark slab allocator efficiency vs. traditional heap */
 void heap_slab_benchmark(void);
+
+/* Shrink heap by returning free pages at the end to PMM (returns bytes freed) */
+size_t heap_shrink(void);
+
+/* Get current heap usage in bytes (always available, production-safe) */
+uint64_t heap_get_used_bytes(void);
+
+/* Get heap allocation statistics (production-safe version, always available) */
+void heap_get_stats(uint64_t* used_bytes, uint64_t* total_bytes, uint64_t* mapped_bytes);
 
 /* Memory leak tracking (enabled with MEM_DEBUG) */
 #ifdef MEM_DEBUG
@@ -324,8 +371,15 @@ void vmm_free(void* vmm_ctx, void* addr, size_t size);
 int vmm_protect(void* vmm_ctx, void* addr, size_t size, int prot);
 
 /* Protection flags for vmm_alloc/vmm_protect */
+#define VMM_PROT_NONE    0x00
 #define VMM_PROT_READ    0x01
 #define VMM_PROT_WRITE   0x02
 #define VMM_PROT_EXEC    0x04
+
+/* Compatibility aliases for PE loader / Win32 */
+#define PROT_NONE   VMM_PROT_NONE
+#define PROT_READ   VMM_PROT_READ
+#define PROT_WRITE  VMM_PROT_WRITE
+#define PROT_EXEC   VMM_PROT_EXEC
 
 #endif

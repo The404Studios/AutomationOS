@@ -34,24 +34,31 @@ static spinlock_t process_table_lock;
 // in [1, MAX_PROCESSES) on success, or 0 if the table is full (caller returns
 // NULL rather than panicking).
 static uint32_t allocate_pid(void) {
-    spin_lock(&process_table_lock);
+    // IRQ-safe: process_unref() may run in hard-IRQ context and now ALWAYS takes
+    // process_table_lock (TOCTOU fix). A plain spin_lock here would let an IRQ that
+    // unrefs self-deadlock against this same-CPU holder. spin_lock_irqsave masks
+    // interrupts for the (short) duration we hold the lock.
+    uint64_t flags;
+    spin_lock_irqsave(&process_table_lock, &flags);
     for (uint32_t i = 1; i < MAX_PROCESSES; i++) {
         if (!pid_used[i]) {
             pid_used[i] = 1;
-            spin_unlock(&process_table_lock);
+            spin_unlock_irqrestore(&process_table_lock, flags);
             return i;
         }
     }
-    spin_unlock(&process_table_lock);
+    spin_unlock_irqrestore(&process_table_lock, flags);
     return 0;  // no free PID
 }
 
 // Return a PID to the pool so it can be reused.
 static void free_pid(uint32_t pid) {
     if (pid == 0 || pid >= MAX_PROCESSES) return;
-    spin_lock(&process_table_lock);
+    // IRQ-safe (see allocate_pid): IRQ-context process_unref() also takes this lock.
+    uint64_t flags;
+    spin_lock_irqsave(&process_table_lock, &flags);
     pid_used[pid] = 0;
-    spin_unlock(&process_table_lock);
+    spin_unlock_irqrestore(&process_table_lock, flags);
 }
 
 // Relocate an already-created process onto the reserved PID 0 (the idle thread).
@@ -64,7 +71,9 @@ static void free_pid(uint32_t pid) {
 // or a process already at PID 0.
 void process_adopt_pid0(process_t* proc) {
     if (!proc || proc->pid == 0) return;
-    spin_lock(&process_table_lock);
+    // IRQ-safe (see allocate_pid): IRQ-context process_unref() also takes this lock.
+    uint64_t flags;
+    spin_lock_irqsave(&process_table_lock, &flags);
     uint32_t old = proc->pid;
     if (old < MAX_PROCESSES && process_table[old] == proc) {
         process_table[old] = NULL;
@@ -73,7 +82,7 @@ void process_adopt_pid0(process_t* proc) {
     proc->pid = 0;
     pid_used[0] = 1;            // keep slot 0 reserved (allocate_pid never returns 0)
     process_table[0] = proc;
-    spin_unlock(&process_table_lock);
+    spin_unlock_irqrestore(&process_table_lock, flags);
 }
 
 void process_init(void) {
@@ -117,7 +126,9 @@ void process_cleanup(void) {
     process_t* to_cleanup[MAX_PROCESSES];
     int cleanup_count = 0;
 
-    spin_lock(&process_table_lock);
+    // IRQ-safe (see allocate_pid): IRQ-context process_unref() also takes this lock.
+    uint64_t flags;
+    spin_lock_irqsave(&process_table_lock, &flags);
     for (int i = 0; i < MAX_PROCESSES; i++) {
         process_t* proc = process_table[i];
         if (proc) {
@@ -133,7 +144,7 @@ void process_cleanup(void) {
             pid_used[i] = 0;
         }
     }
-    spin_unlock(&process_table_lock);
+    spin_unlock_irqrestore(&process_table_lock, flags);
 
     // Phase 2: outside the lock, terminate and unref each process
     for (int i = 0; i < cleanup_count; i++) {
@@ -158,14 +169,14 @@ void process_cleanup(void) {
 
     // Final leak check: walk the table one more time to see if anything survived
     int leaked_count = 0;
-    spin_lock(&process_table_lock);
+    spin_lock_irqsave(&process_table_lock, &flags);
     for (int i = 0; i < MAX_PROCESSES; i++) {
         if (process_table[i] != NULL) {
             leaked_count++;
             PROC_LOG("[PROCESS] LEAK: PID %d still in table after cleanup\n", i);
         }
     }
-    spin_unlock(&process_table_lock);
+    spin_unlock_irqrestore(&process_table_lock, flags);
 
     if (leaked_count > 0) {
         PROC_LOG("[PROCESS] WARNING: %d processes leaked after cleanup\n", leaked_count);
@@ -313,10 +324,14 @@ process_t* process_create(const char* name, void* entry_point) {
     // Initialize sandbox flags
     proc->sandbox_flags = 0;
 
-    // RACE-002 fix: Add to process table with lock protection
-    spin_lock(&process_table_lock);
-    process_table[pid] = proc;
-    spin_unlock(&process_table_lock);
+    // RACE-002 fix: Add to process table with lock protection.
+    // IRQ-safe (see allocate_pid): IRQ-context process_unref() also takes this lock.
+    {
+        uint64_t flags;
+        spin_lock_irqsave(&process_table_lock, &flags);
+        process_table[pid] = proc;
+        spin_unlock_irqrestore(&process_table_lock, flags);
+    }
 
     PROC_LOG("[PROCESS] Created process '%s' (PID %d)\n", proc->name, proc->pid);
     PROC_LOG("[PROCESS]   Entry point: %p\n", entry_point);
@@ -434,9 +449,13 @@ process_t* thread_create(process_t* parent, uint64_t entry, uint64_t arg,
     process_set_ready(t);
 
     // Publish into the process table so process_get_by_pid()/join can find it.
-    spin_lock(&process_table_lock);
-    process_table[pid] = t;
-    spin_unlock(&process_table_lock);
+    // IRQ-safe (see allocate_pid): IRQ-context process_unref() also takes this lock.
+    {
+        uint64_t flags;
+        spin_lock_irqsave(&process_table_lock, &flags);
+        process_table[pid] = t;
+        spin_unlock_irqrestore(&process_table_lock, flags);
+    }
 
     PROC_LOG("[THREAD] Created thread TID %d (tgid %d) sharing CR3=0x%016lx "
              "entry=0x%lx arg=0x%lx ustack=0x%lx (AS refs now %d)\n",
@@ -486,25 +505,62 @@ void process_on_terminate(process_t* child) {
 void process_unref(process_t* proc) {
     if (!proc) return;
 
-    // BUG-008 fix: Use atomic decrement (SMP-safe)
-    // Only ONE CPU will see the transition to 0
-    uint32_t old_count = __atomic_sub_fetch(&proc->ref_count, 1, __ATOMIC_SEQ_CST);
+    // TOCTOU fix: do the FINAL decrement and the table-slot NULL in the SAME
+    // critical section under process_table_lock.
+    //
+    // The old code decremented ref_count OUTSIDE the lock and then took the lock
+    // only to NULL the slot. That left a window where the PCB was still published
+    // in process_table[pid] with ref_count already at 0: a concurrent
+    // process_get_by_pid() could take the lock, observe the still-published slot,
+    // and process_ref() it back to 1 — resurrecting an object this CPU has already
+    // committed to freeing. The unref'ing CPU then NULLs the slot and frees the
+    // PCB, leaving the resurrecter with a dangling pointer (UAF / double-free).
+    // Benign on the current uniprocessor build (only CPU0 schedules, so no other
+    // context runs between the decrement and the lock) but a guaranteed UAF once
+    // AP scheduling goes live.
+    //
+    // By decrementing UNDER the lock and NULLing the slot in the same section,
+    // every process_get_by_pid() either (a) refs before our decrement — then it
+    // observes ref_count > 0 and we do NOT free — or (b) runs after we NULL the
+    // slot — then it sees NULL and returns NULL. There is no observe-and-ref gap.
+    //
+    // IRQ-SAFETY / DEADLOCK: process_unref() can be reached from a hard IRQ
+    // (wait_object_signal() -> wo_wake_one_proc() -> process_unref(), documented
+    // IRQ-safe in waitqueue.c). process_table_lock is a plain (non-IRQ) spinlock,
+    // so if a non-IRQ holder is interrupted by an IRQ-context unref that takes the
+    // same lock, the CPU self-deadlocks. We therefore acquire it IRQ-safe here
+    // (spin_lock_irqsave): interrupts are masked for the (tiny, allocation-free)
+    // duration of the decrement + slot NULL, so no IRQ-context unref can land
+    // while we hold it. The heavy teardown below runs AFTER the lock is dropped
+    // and interrupts are restored, exactly as before.
+    uint64_t ptl_flags;
+    spin_lock_irqsave(&process_table_lock, &ptl_flags);
 
-    if (old_count == 0) {
-        // Only the CPU that decremented from 1 to 0 will enter here
-        // This prevents double-free race condition
+    uint32_t new_count = __atomic_sub_fetch(&proc->ref_count, 1, __ATOMIC_SEQ_CST);
+
+    if (new_count != 0) {
+        // Not the last reference (or a getter re-reffed in the gap we just closed).
+        // Nothing to free; just drop the lock and return.
+        spin_unlock_irqrestore(&process_table_lock, ptl_flags);
+        return;
+    }
+
+    // We are the single CPU that drove ref_count 1 -> 0 while holding the lock.
+    // No concurrent process_get_by_pid() can observe-and-ref this PCB anymore:
+    // unpublish it from the table NOW, in the same critical section, before we
+    // drop the lock. The PID is returned to the pool here too.
+    if (proc->pid < MAX_PROCESSES) {
+        process_table[proc->pid] = NULL;
+        pid_used[proc->pid] = 0;
+    }
+
+    spin_unlock_irqrestore(&process_table_lock, ptl_flags);
+
+    {
+        // Only the CPU that decremented from 1 to 0 reaches here.
+        // This prevents double-free race condition.
         PROC_LOG("[PROCESS] Freeing process '%s' (PID %d) - ref_count reached 0\n",
                 proc->name, proc->pid);
-
-        // RACE-002 fix: Remove from process table with lock protection, and
-        // return the PID to the pool so it can be reused (prevents the eventual
-        // "table full" panic on long-running, app-churning sessions).
-        if (proc->pid < MAX_PROCESSES) {
-            spin_lock(&process_table_lock);
-            process_table[proc->pid] = NULL;
-            pid_used[proc->pid] = 0;
-            spin_unlock(&process_table_lock);
-        }
 
 #ifdef SMP_FOUNDATION
         // CPU1 job orphan cleanup: if this process owns a pending CPU1 job we must
@@ -617,13 +673,22 @@ process_t* process_get_by_pid(uint32_t pid) {
     }
 
     // RACE-002 fix: Read process_table[] with lock AND take reference
-    // This prevents the process from being freed while caller uses it
-    spin_lock(&process_table_lock);
+    // This prevents the process from being freed while caller uses it.
+    //
+    // IRQ-SAFE (TOCTOU fix): this acquisition MUST mask interrupts. process_unref()
+    // now does its final decrement + slot-NULL under this same lock, and may run in
+    // hard-IRQ context (wait_object_signal path). A plain spin_lock here would let
+    // such an IRQ fire while we hold the lock and self-deadlock. With interrupts
+    // masked, the decrement-vs-ref race is fully serialized: we either ref a PCB
+    // whose ref_count is still > 0 (it cannot reach 0 and free until our ref is
+    // dropped), or we read a NULL slot that a completed unref already cleared.
+    uint64_t flags;
+    spin_lock_irqsave(&process_table_lock, &flags);
     process_t* proc = process_table[pid];
     if (proc) {
         process_ref(proc);  // Increment ref count before returning
     }
-    spin_unlock(&process_table_lock);
+    spin_unlock_irqrestore(&process_table_lock, flags);
 
     return proc;
 
@@ -715,7 +780,9 @@ int process_list(proc_info_t* out, int max) {
         return 0;
     }
     int n = 0;
-    spin_lock(&process_table_lock);
+    // IRQ-safe (see allocate_pid): IRQ-context process_unref() also takes this lock.
+    uint64_t flags;
+    spin_lock_irqsave(&process_table_lock, &flags);
     for (int i = 0; i < MAX_PROCESSES && n < max; i++) {
         process_t* p = process_table[i];
         if (!p) {
@@ -735,6 +802,6 @@ int process_list(proc_info_t* out, int max) {
         out[n].ctx_switches = p->ctx_switches;
         n++;
     }
-    spin_unlock(&process_table_lock);
+    spin_unlock_irqrestore(&process_table_lock, flags);
     return n;
 }

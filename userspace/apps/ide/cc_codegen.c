@@ -615,6 +615,10 @@ static void cc_collect_globals(Cg* g, const AstNode* tu)
                             if (t[k] >= '0' && t[k] <= '9') {
                                 len = len * 10 + (t[k] - '0');
                                 have = 1;
+                                /* Clamp before the next *10 so an oversized or
+                                 * adversarial dimension can't overflow the
+                                 * signed int (UB) or blow up the .data emit. */
+                                if (len > CC_MAXARRLEN) len = CC_MAXARRLEN;
                             }
                             k++;
                         }

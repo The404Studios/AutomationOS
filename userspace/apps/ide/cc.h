@@ -28,6 +28,10 @@
 #define CC_MAXGLOBALS  64
 #define CC_MAXSTR      64
 #define CC_NAME        48
+/* Upper bound on a global array's element count. Caps the digit accumulator in
+ * the "int x[N]" parser so a huge/overflowing N can neither wrap the signed int
+ * nor drive a runaway "dq 0"-per-element emit in cc_emit_data_section. */
+#define CC_MAXARRLEN   65536
 
 typedef struct { char name[CC_NAME]; int off; int size; } CcLocal;   /* off = -(bytes from rbp) */
 typedef struct { char name[CC_NAME]; char type[CC_NAME]; int size; int is_arr; int arrlen; } CcGlobal;

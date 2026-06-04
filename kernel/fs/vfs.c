@@ -1209,6 +1209,11 @@ int vfs_mkdir(const char* path, uint32_t mode) {
 
     // Copy parent path
     size_t parent_len = last_slash - path;
+    // Clamp to the buffer so an over-long parent component can't overflow
+    // parent_path[VFS_MAX_PATH] (matches vfs_rmdir / vfs_unlink).
+    if (parent_len >= VFS_MAX_PATH) {
+        parent_len = VFS_MAX_PATH - 1;
+    }
     if (parent_len == 0) {
         parent_path[0] = '/';
         parent_path[1] = '\0';

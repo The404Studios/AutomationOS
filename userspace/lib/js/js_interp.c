@@ -132,6 +132,7 @@ static js_u32 to_uint32(double d)
 static js_completion eval_block(js_vm *vm, js_node *block, js_env *env,
                                 js_value *out, int new_scope);
 static js_completion eval_expr(js_vm *vm, js_node *n, js_env *env, js_value *out);
+static js_completion eval_expr_inner(js_vm *vm, js_node *n, js_env *env, js_value *out);
 
 /* hoist function declarations (and var names) in a statement list */
 static void hoist(js_vm *vm, js_node **stmts, int n, js_env *env);
@@ -423,7 +424,25 @@ js_completion js_call_function(js_vm *vm, js_value fnv, js_value thisv,
 /* ------------------------------------------------------------------ */
 /*  Expression evaluation                                              */
 /* ------------------------------------------------------------------ */
+/* Depth-guarded entry. A left-associative chain (a-a-a-...) parses iteratively
+ * (flat) but evals recursively through n->a, so the parser's depth cap can't
+ * cover this -- eval_expr needs its own bound. Reuse vm->depth (shared with the
+ * call-frame guard) so total native recursion is bounded by JS_MAX_CALL_DEPTH. */
 static js_completion eval_expr(js_vm *vm, js_node *n, js_env *env, js_value *out)
+{
+    js_completion c;
+    if (vm->depth >= JS_MAX_CALL_DEPTH) {
+        *out = js_mk_undef();
+        js_throw_str(vm, "Maximum call stack size exceeded");
+        return CMP_THROW;
+    }
+    vm->depth++;
+    c = eval_expr_inner(vm, n, env, out);
+    vm->depth--;
+    return c;
+}
+
+static js_completion eval_expr_inner(js_vm *vm, js_node *n, js_env *env, js_value *out)
 {
     *out = js_mk_undef();
     if (!n) return CMP_NORMAL;
@@ -953,8 +972,17 @@ static js_completion exec_stmt(js_vm *vm, js_node *n, js_env *env, js_value *out
             js_value exc = vm->exception;
             vm->has_exception = 0;
             js_env *cenv = js_env_new(vm, env);
-            if (n->str) js_env_define(vm, cenv, n->str, exc, 0);
-            c = eval_block(vm, n->b_, cenv, &bv, 0);
+            if (!cenv) {
+                /* OOM allocating the catch scope: surface as a throw (and let
+                 * the finally block below still run) instead of NULL-deref'ing
+                 * cenv in js_env_define -- matches the NODE_FOR/eval_block OOM
+                 * guards elsewhere in this file. */
+                js_throw_str(vm, "out of memory");
+                c = CMP_THROW;
+            } else {
+                if (n->str) js_env_define(vm, cenv, n->str, exc, 0);
+                c = eval_block(vm, n->b_, cenv, &bv, 0);
+            }
         }
         /* finally always runs */
         if (n->c) {

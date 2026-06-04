@@ -1319,7 +1319,11 @@ static int json_stringify(js_vm *vm, js_value t, js_value *a, int n, js_value *o
 /* --- JSON.parse --- */
 typedef struct { js_vm *vm; const char *p; const char *end; int err; } jparse;
 static void jp_ws(jparse *j) { while (j->p<j->end && (*j->p==' '||*j->p=='\t'||*j->p=='\n'||*j->p=='\r')) j->p++; }
-static js_value jp_value(jparse *j);
+/* Cap recursion so deeply-nested JSON (e.g. '['.repeat(50000)) can't overflow
+ * the user stack. The stringify side already guards (depth>32); the parser
+ * did not. 128 is far beyond any real document. */
+#define JSON_MAX_DEPTH 128
+static js_value jp_value(jparse *j, int depth);
 
 static js_value jp_string(jparse *j)
 {
@@ -1360,8 +1364,9 @@ static js_value jp_string(jparse *j)
     return js_mk_str(js_str_new(j->vm, buf, n));
 }
 
-static js_value jp_value(jparse *j)
+static js_value jp_value(jparse *j, int depth)
 {
+    if (depth > JSON_MAX_DEPTH) { j->err = 1; return js_mk_undef(); }
     jp_ws(j);
     if (j->p >= j->end) { j->err = 1; return js_mk_undef(); }
     char c = *j->p;
@@ -1378,7 +1383,7 @@ static js_value jp_value(jparse *j)
             jp_ws(j);
             if (j->p>=j->end || *j->p!=':') { j->err=1; break; }
             j->p++;
-            js_value val = jp_value(j);
+            js_value val = jp_value(j, depth + 1);
             js_obj_set(j->vm, o, key.u.s, val);
             jp_ws(j);
             if (j->p<j->end && *j->p==',') { j->p++; continue; }
@@ -1393,7 +1398,7 @@ static js_value jp_value(jparse *j)
         jp_ws(j);
         if (j->p<j->end && *j->p==']') { j->p++; return js_mk_obj(arr); }
         for (;;) {
-            js_value v = jp_value(j);
+            js_value v = jp_value(j, depth + 1);
             js_arr_push(j->vm, arr, v);
             jp_ws(j);
             if (j->p<j->end && *j->p==',') { j->p++; continue; }
@@ -1419,7 +1424,7 @@ static int json_parse(js_vm *vm, js_value t, js_value *a, int n, js_value *out)
     (void)t;
     js_string *s = js_to_string(vm, arg(a,n,0));
     jparse j = { vm, s->data, s->data + s->len, 0 };
-    js_value v = jp_value(&j);
+    js_value v = jp_value(&j, 0);
     if (j.err) { js_throw_str(vm, "Unexpected token in JSON"); return -1; }
     *out = v; return 0;
 }

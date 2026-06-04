@@ -362,9 +362,14 @@ int js_obj_delete(js_object *o, js_string *key)
 /* ================================================================== */
 /*  Array element store                                               */
 /* ================================================================== */
+/* Upper bound on array element count. Refusing absurd sizes up front keeps the
+ * newcap doubling below from overflowing to 0 (-> infinite loop) and avoids a
+ * pointless giant allocation; the caller treats a -1 return as "couldn't grow". */
+#define JS_MAX_ARRAY_ELEMS (1u << 20)
 static int arr_grow(js_vm *vm, js_object *a, js_usize want)
 {
     if (want <= a->ecap) return 0;
+    if (want > JS_MAX_ARRAY_ELEMS) return -1;
     js_usize newcap = a->ecap ? a->ecap * 2 : 8;
     while (newcap < want) newcap *= 2;
     js_value *ne = (js_value *)js_arena_alloc(vm, newcap * sizeof(js_value));
@@ -509,7 +514,13 @@ int js_set_prop(js_vm *vm, js_value obj, js_string *key, js_value v)
             double dn = js_to_number(vm, v);
             js_usize nl = (js_usize)dn;
             if (nl < o->length) o->length = nl;
-            else if (nl > o->length) { arr_grow(vm, o, nl); o->length = nl; }
+            else if (nl > o->length) {
+                /* Grow first; only extend length if the backing store actually
+                 * grew, else cap to real capacity so indexed reads can never
+                 * run past o->elems (was: length set unconditionally -> OOB). */
+                if (arr_grow(vm, o, nl) != 0) o->length = o->ecap;
+                else o->length = nl;
+            }
             return 0;
         }
         js_usize idx;

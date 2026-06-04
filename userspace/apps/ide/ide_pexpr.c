@@ -78,8 +78,17 @@ static AstNode* px_assignment(Parser* p);
 static AstNode* px_conditional(Parser* p);
 static AstNode* px_binary(Parser* p, int min_prec);
 static AstNode* px_unary(Parser* p);
+static AstNode* px_unary_inner(Parser* p);
 static AstNode* px_postfix(Parser* p);
 static AstNode* px_primary(Parser* p);
+
+/* Bound native C-stack recursion through the expression parser. Every nesting
+ * level (parens, prefix unary, casts) funnels through px_unary, so guarding it
+ * alone caps depth -- the statement layer has the analogous g_stmt_depth, but
+ * a single expression never touches that (it bumps once per statement). 64 is
+ * far beyond any real expression yet well under the ~64KB user-stack ceiling. */
+#define EXPR_MAX_DEPTH 64
+static int g_expr_depth = 0;
 
 /* Make a best-effort placeholder spanning the current token and advance once
  * so callers can always rely on forward progress. */
@@ -345,6 +354,19 @@ static int px_try_cast_type(Parser* p, char* out, int cap, Tok** open_out, Tok**
 }
 
 static AstNode* px_unary(Parser* p) {
+    /* depth-guarded entry: stop recursing past the cap so adversarial nesting
+     * (deeply nested parens / prefix unary / casts) can't blow the C stack. */
+    AstNode* r;
+    if (g_expr_depth >= EXPR_MAX_DEPTH) {
+        return px_error_node(p, "expression nesting too deep");
+    }
+    g_expr_depth++;
+    r = px_unary_inner(p);
+    g_expr_depth--;
+    return r;
+}
+
+static AstNode* px_unary_inner(Parser* p) {
     Tok* t = pk(p);
 
     /* sizeof  (either "sizeof expr" or "sizeof ( typename )") */

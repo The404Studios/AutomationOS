@@ -229,11 +229,15 @@ static int parse_length_ex(const char *v, int *ok, int *unit_out)
     else if (*v == '-') { sign = -1; v++; }
     int whole = 0;
     int saw = 0;
-    while (*v >= '0' && *v <= '9') { whole = whole * 10 + (*v - '0'); v++; saw = 1; }
+    /* Cap the accumulators so a pathological value (e.g. "padding: 9999...9px")
+     * cannot overflow the signed int and feed garbage into the box-model math
+     * in layout.c. We keep consuming digits (so the unit suffix still parses)
+     * but stop growing once past a sane bound -- 1e6 px is already absurd. */
+    while (*v >= '0' && *v <= '9') { if (whole < 1000000) whole = whole * 10 + (*v - '0'); v++; saw = 1; }
     int frac = 0, frac_div = 1;
     if (*v == '.') {
         v++;
-        while (*v >= '0' && *v <= '9') { frac = frac * 10 + (*v - '0'); frac_div *= 10; v++; saw = 1; }
+        while (*v >= '0' && *v <= '9') { if (frac_div < 1000000) { frac = frac * 10 + (*v - '0'); frac_div *= 10; } v++; saw = 1; }
     }
     if (!saw) { if (ok) *ok = 0; return 0; }
     double val = (double)whole + (double)frac / (double)frac_div;

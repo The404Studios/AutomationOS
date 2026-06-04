@@ -99,7 +99,22 @@ static uint32_t elf_pf_to_page_flags(uint32_t p_flags) {
  * Allocates pages, maps them to user virtual addresses, and copies segment data.
  * Handles BSS (p_memsz > p_filesz) by zero-filling the remainder.
  */
-static int elf_load_segment(const elf64_phdr_t* phdr, const void* elf_data) {
+static int elf_load_segment(const elf64_phdr_t* phdr, const void* elf_data,
+                            uint64_t file_size) {
+    // Reject a malformed/hostile PT_LOAD segment BEFORE trusting its sizes:
+    //  - p_vaddr + p_memsz overflow (wrap)  -> a tiny vaddr_end but a HUGE
+    //    num_pages (underflow), asking the PMM for an astronomical allocation.
+    //  - p_filesz > p_memsz                 -> the file copy below overruns the
+    //    allocated segment into adjacent pages.
+    //  - p_offset + p_filesz past the file  -> the memcpy SOURCE (elf_data +
+    //    p_offset) reads past the ELF buffer into other kernel memory.
+    if (phdr->p_memsz && phdr->p_vaddr + phdr->p_memsz < phdr->p_vaddr)
+        return ELF_ERR_INVALID;
+    if (phdr->p_filesz > phdr->p_memsz)
+        return ELF_ERR_INVALID;
+    if (phdr->p_offset > file_size || phdr->p_filesz > file_size - phdr->p_offset)
+        return ELF_ERR_INVALID;
+
     // Calculate aligned boundaries
     uint64_t vaddr_start = ALIGN_DOWN(phdr->p_vaddr, PAGE_SIZE);
     uint64_t vaddr_end = ALIGN_UP(phdr->p_vaddr + phdr->p_memsz, PAGE_SIZE);
@@ -111,10 +126,12 @@ static int elf_load_segment(const elf64_phdr_t* phdr, const void* elf_data) {
             (phdr->p_flags & PF_W) ? "W" : "-",
             (phdr->p_flags & PF_X) ? "X" : "-");
 
-    // Validate segment is in user space
-    if (vaddr_start >= USER_SPACE_END) {
-        kprintf("[ELF]   ERROR: Segment vaddr 0x%016lx is outside user space\n",
-                vaddr_start);
+    // Validate the WHOLE segment range is in user space. Checking only
+    // vaddr_start let a large segment start in user space but extend past
+    // USER_SPACE_END, mapping pages at kernel virtual addresses.
+    if (vaddr_start >= USER_SPACE_END || vaddr_end > USER_SPACE_END) {
+        kprintf("[ELF]   ERROR: Segment [0x%016lx,0x%016lx) is outside user space\n",
+                vaddr_start, vaddr_end);
         return ELF_ERR_PERM;
     }
 
@@ -321,7 +338,7 @@ int elf_load(const char* path, int argc, char** argv,
 
     for (int i = 0; i < ehdr->e_phnum; i++) {
         if (phdr[i].p_type == PT_LOAD) {
-            int ret = elf_load_segment(&phdr[i], elf_data);
+            int ret = elf_load_segment(&phdr[i], elf_data, file_size);
             if (ret != ELF_SUCCESS) {
                 return ret;
             }

@@ -209,6 +209,17 @@ font_glyph_t* font_rasterize_glyph_internal(font_t* font, uint32_t codepoint) {
     int width = x1 - x0;
     int height = y1 - y0;
 
+    /* Clamp glyph dimensions. A hostile font (tiny unitsPerEm -> huge scale, or
+     * extreme glyph bbox) can drive width/height into the tens of thousands,
+     * overflowing the int width*height in the malloc below into a small/negative
+     * size while MakeGlyphBitmap still rasters the full width*height extent
+     * (heap overflow). Also caps a pure memory-exhaustion DoS. 4096px is far
+     * beyond any real rendered glyph. */
+    if (width  < 0) width  = 0;
+    if (height < 0) height = 0;
+    if (width  > 4096) width  = 4096;
+    if (height > 4096) height = 4096;
+
     // Allocate glyph structure
     font_glyph_t* glyph = calloc(1, sizeof(font_glyph_t));
     if (!glyph) return NULL;

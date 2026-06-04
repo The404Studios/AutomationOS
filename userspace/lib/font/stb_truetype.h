@@ -1671,6 +1671,12 @@ static int stbtt__close_shape(stbtt_vertex *vertices, int num_vertices, int was_
    return num_vertices;
 }
 
+/* Composite-glyph recursion guard: a self-referential or cyclic composite glyph
+ * in an untrusted .ttf would otherwise recurse unbounded and overflow the user
+ * stack. Single-threaded font rendering, so a file-local counter suffices. */
+#define STBTT__MAX_COMPOSITE_DEPTH 8
+static int stbtt__glyph_depth = 0;
+
 static int stbtt__GetGlyphShapeTT(const stbtt_fontinfo *info, int glyph_index, stbtt_vertex **pvertices)
 {
    stbtt_int16 numberOfContours;
@@ -1855,8 +1861,14 @@ static int stbtt__GetGlyphShapeTT(const stbtt_fontinfo *info, int glyph_index, s
          m = (float) STBTT_sqrt(mtx[0]*mtx[0] + mtx[1]*mtx[1]);
          n = (float) STBTT_sqrt(mtx[2]*mtx[2] + mtx[3]*mtx[3]);
 
-         // Get indexed glyph.
-         comp_num_verts = stbtt_GetGlyphShape(info, gidx, &comp_verts);
+         // Get indexed glyph (depth-guarded against self/cyclic composites).
+         if (stbtt__glyph_depth < STBTT__MAX_COMPOSITE_DEPTH) {
+            stbtt__glyph_depth++;
+            comp_num_verts = stbtt_GetGlyphShape(info, gidx, &comp_verts);
+            stbtt__glyph_depth--;
+         } else {
+            comp_num_verts = 0;   // too deeply nested: skip this component
+         }
          if (comp_num_verts > 0) {
             // Transform vertices.
             for (i = 0; i < comp_num_verts; ++i) {

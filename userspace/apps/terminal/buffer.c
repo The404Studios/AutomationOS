@@ -12,6 +12,13 @@
  * Create terminal buffer
  */
 terminal_buffer_t *buffer_create(uint32_t cols, uint32_t rows) {
+    /* Floor degenerate dimensions to 1 (matches buffer_resize's guard). A 0
+     * here makes malloc(0) and later `rows - 1`/`cols - 1` underflow to
+     * UINT32_MAX, indexing cells[] wildly out of bounds. Reachable via repeated
+     * pane splits shrinking a sub-pane below one cell. */
+    if (cols == 0) cols = 1;
+    if (rows == 0) rows = 1;
+
     terminal_buffer_t *buffer = (terminal_buffer_t *)malloc(sizeof(terminal_buffer_t));
     if (!buffer) {
         return NULL;

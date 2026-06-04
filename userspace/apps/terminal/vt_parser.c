@@ -333,10 +333,16 @@ static void execute_control(vt_parser_t *parser, uint8_t byte) {
 
         case 0x09: // HT - Horizontal Tab
             {
-                // Move to next tab stop
+                // Move to next tab stop. tab_stops is a fixed bool[256]; never
+                // index past it (cols can exceed 256 on a wide/4K terminal).
+                // Past column 256 fall back to default 8-column stops.
                 uint32_t next_tab = buffer->cursor.x + 1;
-                while (next_tab < buffer->cols && !parser->tab_stops[next_tab]) {
+                while (next_tab < buffer->cols && next_tab < 256 &&
+                       !parser->tab_stops[next_tab]) {
                     next_tab++;
+                }
+                if (next_tab >= 256) {
+                    next_tab = ((buffer->cursor.x >> 3) + 1) << 3;  /* next mult of 8 */
                 }
                 buffer->cursor.x = (next_tab < buffer->cols) ? next_tab : buffer->cols - 1;
             }
@@ -768,6 +774,13 @@ static void print_char(vt_parser_t *parser, uint32_t codepoint) {
             buffer->cursor.x = buffer->cols - 1;
         }
     }
+
+    // Defensive clamp: a restored cursor (DECRC after a window shrink) can land
+    // at cursor.y >= rows; never let the cells[] index escape the grid (the
+    // same guard buffer_write_char already has). cursor.x is bounded by the
+    // autowrap block above.
+    if ((uint32_t)buffer->cursor.y >= buffer->rows)
+        buffer->cursor.y = buffer->rows ? buffer->rows - 1 : 0;
 
     // Write character
     uint32_t offset = buffer->cursor.y * buffer->cols + buffer->cursor.x;

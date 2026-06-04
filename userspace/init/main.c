@@ -113,8 +113,10 @@ void _start(void) {
 
     // NOTE: the right-side dock IS the launcher now, so we no longer auto-open
     // the Applications grid window (it duplicated the dock + covered the desktop).
-    print("[INIT] Spawning date/clock...\n");
-    spawn("sbin/dateapp");
+    // DECLUTTER: dateapp ("Date & Time") is no longer auto-opened either -- it
+    // duplicated the panel clock + the Clock+ app and just added a boot window to
+    // the cascade. It remains launchable from the dock.
+    // spawn("sbin/dateapp");
 
     // fork/CoW correctness probe: runs once, prints FORKTEST RESULT to serial,
     // exits. Verifies fork address-space isolation (eager copy today, CoW next).

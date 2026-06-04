@@ -3041,6 +3041,29 @@ void _start(void) {
 
         int kind, a, b, c;
         while (wl_poll_event(win, &kind, &a, &b, &c)) {
+            if (kind == WL_EVENT_RESIZE) {
+                /*
+                 * Maximize / snap. The library has ALREADY reallocated the
+                 * buffer and updated win->{w,h,stride,pixels}; we only refresh
+                 * our cached geometry so every subsequent write is bounded to
+                 * the new surface. Recompute the text grid from the new size
+                 * (clamped to the static grid[] dimensions) so content reflows,
+                 * refresh the cached PIXEL stride, and clamp the cursor into the
+                 * new grid. render() reads win->w/win->h fresh and clears the
+                 * full surface, so the new margins are painted (no garbage).
+                 */
+                g_cols = (int)(win->w / FONT_W);
+                g_rows = (int)(win->h / FONT_H);
+                if (g_cols > MAX_COLS) g_cols = MAX_COLS;
+                if (g_rows > MAX_ROWS) g_rows = MAX_ROWS;
+                if (g_cols < 1) g_cols = 1;
+                if (g_rows < 1) g_rows = 1;
+                stride_px = win->stride / 4u;
+                if (cur_col >= g_cols) cur_col = g_cols - 1;
+                if (cur_row >= g_rows) cur_row = g_rows - 1;
+                dirty = 1;
+                continue;
+            }
             if (kind != WL_EVENT_KEY) continue;   /* ignore pointer for now */
             int keycode = a;
             int pressed = b;

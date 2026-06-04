@@ -281,6 +281,16 @@ $LD /tmp/crt0.o /tmp/webapitest.o $WEB_OBJS $JS_OBJS $JS_WEB_OBJS $HTTPS_OBJS -o
 echo "[all] net tools (ping/nc)..."
 cc userspace/apps/ping/ping.c /tmp/ping.o; $LD /tmp/crt0.o /tmp/ping.o /tmp/dns.o -o /tmp/ping.elf
 cc userspace/apps/nc/nc.c     /tmp/nc.o;   $LD /tmp/crt0.o /tmp/nc.o   /tmp/dns.o -o /tmp/nc.elf
+# sophisticated networking tools (read the wired stack: e1000 + ARP/IP/UDP/TCP + sockets)
+cc userspace/apps/netinfo/netinfo.c /tmp/netinfo.o; $LD /tmp/crt0.o /tmp/netinfo.o            -o /tmp/netinfo.elf
+cc userspace/apps/netscan/netscan.c /tmp/netscan.o; $LD /tmp/crt0.o /tmp/netscan.o /tmp/dns.o -o /tmp/netscan.elf
+cc userspace/apps/tcping/tcping.c   /tmp/tcping.o;  $LD /tmp/crt0.o /tmp/tcping.o  /tmp/dns.o -o /tmp/tcping.elf
+cc userspace/apps/dig/dig.c         /tmp/dig.o;     $LD /tmp/crt0.o /tmp/dig.o                -o /tmp/dig.elf
+cc userspace/apps/httpget/httpget.c /tmp/httpget.o; $LD /tmp/crt0.o /tmp/httpget.o /tmp/dns.o -o /tmp/httpget.elf
+cc userspace/apps/pktmon/pktmon.c   /tmp/pktmon.o;  $LD /tmp/crt0.o /tmp/pktmon.o             -o /tmp/pktmon.elf
+cc userspace/apps/httpd/httpd.c     /tmp/httpd.o;   $LD /tmp/crt0.o /tmp/httpd.o              -o /tmp/httpd.elf
+cc userspace/apps/traceroute/traceroute.c /tmp/traceroute.o; $LD /tmp/crt0.o /tmp/traceroute.o /tmp/dns.o -o /tmp/traceroute.elf
+cc userspace/apps/arp/arp.c         /tmp/arp.o;     $LD /tmp/crt0.o /tmp/arp.o     /tmp/dns.o -o /tmp/arp.elf
 
 # ---- coreutils expansion + system info (argv-aware, crt0-linked) ----
 echo "[all] coreutils expansion..."
@@ -292,7 +302,7 @@ done
 # Toolkit apps: <app> + ui + wl + bitfont
 build_ui_app() {   # $1=src $2=name
     cc "$1" /tmp/$2.o
-    $LD /tmp/$2.o /tmp/ui.o /tmp/wlc.o /tmp/bf.o -o /tmp/$2.elf
+    $LD /tmp/$2.o /tmp/ui.o /tmp/wlc.o /tmp/bf.o /tmp/font2.o -o /tmp/$2.elf
 }
 # wl-direct apps: <app> + wl + bitfont
 build_wl_app() {   # $1=src $2=name
@@ -322,7 +332,7 @@ build_ui_app userspace/apps/controlcenter/controlcenter.c controlcenter
 echo "[all] network apps (netman + browser)..."
 # netman: network manager (ui toolkit + dns lib). Links like a ui app + dns.o.
 cc userspace/apps/netman/netman.c /tmp/netman.o
-$LD /tmp/netman.o /tmp/ui.o /tmp/wlc.o /tmp/bf.o /tmp/dns.o -o /tmp/netman.elf
+$LD /tmp/netman.o /tmp/ui.o /tmp/wlc.o /tmp/bf.o /tmp/font2.o /tmp/dns.o -o /tmp/netman.elf
 # browser: wl-direct web browser (HTTP + HTTPS + simplified HTML render). Links
 # the full HTTPS stack (http+dns+deflate+tlsconn+crypto/tls) + wl+bf.
 cc userspace/apps/browser/browser.c /tmp/browser.o
@@ -379,7 +389,7 @@ build_wl_app userspace/apps/stress/stress.c           stress
 
 echo "[all] lib-linked apps (aictl / audio)..."
 cc userspace/apps/procmon/procmon.c   /tmp/procmon.o
-$LD /tmp/procmon.o /tmp/aictl.o /tmp/ui.o /tmp/wlc.o /tmp/bf.o -o /tmp/procmon.elf
+$LD /tmp/procmon.o /tmp/aictl.o /tmp/ui.o /tmp/wlc.o /tmp/bf.o /tmp/font2.o -o /tmp/procmon.elf
 cc userspace/apps/soundtest/soundtest.c /tmp/soundtest.o
 $LD /tmp/soundtest.o /tmp/audio.o /tmp/wlc.o /tmp/bf.o -o /tmp/soundtest.elf
 cc userspace/apps/musicplayer/musicplayer.c /tmp/musicplayer.o
@@ -418,7 +428,7 @@ $LD /tmp/crt0.o /tmp/cc.o \
     -o /tmp/cc.elf
 
 echo "[all] canary check (all must be 0):"
-for e in comp init filemanager calculator clock sysinfo settings sysmon uidemo dateapp applauncher taskman terminal editor snake paint synth tetris game2048 sheet notes calendar stopwatch mines piano dashboard welcome bench breakout pong invaders procmon soundtest solitaire aiconsole screenshot stress musicplayer ide bubbletd zombietd pacman clockapp forktest threadtest matmuljobs aibroker sed awk tar pkg make meminfo argvtest floattest sleeptest prioritytest matbench tensortest cpuburn blk ps kill free uptime find diff cmp tee wcx xargs gzip cc nettest sockettest cpu1offload wget netman browser cryptotest libtest ping nc grep head tail sort uniq cut tr nl du touch basename dirname uname hostname whoami date less hexdump tlsprobe certtool dhcpc apidemo js futextest epolltest sendfiletest perftest batchtest domtest htmltest csstest layouttest webtest browser2 webapitest cube3d ray chess asteroids sudoku photos startmenu controlcenter gametest; do
+for e in comp init filemanager calculator clock sysinfo settings sysmon uidemo dateapp applauncher taskman terminal editor snake paint synth tetris game2048 sheet notes calendar stopwatch mines piano dashboard welcome bench breakout pong invaders procmon soundtest solitaire aiconsole screenshot stress musicplayer ide bubbletd zombietd pacman clockapp forktest threadtest matmuljobs aibroker sed awk tar pkg make meminfo argvtest floattest sleeptest prioritytest matbench tensortest cpuburn blk ps kill free uptime find diff cmp tee wcx xargs gzip cc nettest sockettest cpu1offload wget netman browser cryptotest libtest ping nc netinfo netscan tcping dig httpget pktmon httpd traceroute arp grep head tail sort uniq cut tr nl du touch basename dirname uname hostname whoami date less hexdump tlsprobe certtool dhcpc apidemo js futextest epolltest sendfiletest perftest batchtest domtest htmltest csstest layouttest webtest browser2 webapitest cube3d ray chess asteroids sudoku photos startmenu controlcenter gametest; do
     n=$(objdump -d /tmp/$e.elf 2>/dev/null | grep -c "fs:0x28" || true)
     echo "  $e=$n"
 done
@@ -484,7 +494,7 @@ cp /tmp/wget.elf    /tmp/ird/bin/wget
 cp /tmp/netman.elf  /tmp/ird/sbin/netman
 cp /tmp/browser.elf /tmp/ird/sbin/browser
 # net tools + coreutils expansion -> /bin (shell-spawnable).
-for t in ping nc grep head tail sort uniq cut tr nl du touch basename dirname uname hostname whoami date less hexdump tlsprobe certtool dhcpc apidemo js; do
+for t in ping nc netinfo netscan tcping dig httpget pktmon httpd traceroute arp grep head tail sort uniq cut tr nl du touch basename dirname uname hostname whoami date less hexdump tlsprobe certtool dhcpc apidemo js; do
     cp /tmp/$t.elf /tmp/ird/bin/$t
 done
 # KAT self-test harnesses -> /sbin (init spawns them at boot).

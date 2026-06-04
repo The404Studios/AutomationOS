@@ -173,21 +173,31 @@ static inline u32 rng(void) { g_rand = g_rand * 1664525u + 1013904223u; return g
 /* random in [lo, hi] inclusive */
 static i32 rng_range(i32 lo, i32 hi) { return lo + (i32)(rng() % (u32)(hi - lo + 1)); }
 
+/* ---- live letterbox clip bounds ----
+ * The fixed canvas is WIN_W x WIN_H, drawn top-left. When the compositor makes
+ * the window SMALLER than the canvas, blindly writing up to WIN_W/WIN_H would
+ * overrun the (smaller) reallocated buffer and page-fault the process. These
+ * shrink to min(canvas, window) on resize so every pixel write stays inside the
+ * CURRENT buffer; they never exceed the canvas, so a larger window just letter-
+ * boxes (margins cleared by clear_surface()). */
+static i32 g_clip_w = WIN_W;
+static i32 g_clip_h = WIN_H;
+
 /* ====================================================================== *
  *  Vector draw helpers (outlines, no fills) -- self-contained Bresenham
  * ====================================================================== */
 static inline void put_px(u32 *buf, u32 stride, i32 x, i32 y, u32 c)
 {
-    if (x < 0 || x >= WIN_W || y < 0 || y >= WIN_H) return;
+    if (x < 0 || x >= g_clip_w || y < 0 || y >= g_clip_h) return;
     buf[(u32)y * stride + (u32)x] = c;
 }
 
-/* clear: fill full window with one colour */
+/* clear: fill the canvas region with one colour (clamped to the live window) */
 static void clear(u32 *buf, u32 stride, u32 c)
 {
-    for (i32 y = 0; y < WIN_H; y++) {
+    for (i32 y = 0; y < g_clip_h; y++) {
         u32 *row = buf + (u32)y * stride;
-        for (i32 x = 0; x < WIN_W; x++) row[x] = c;
+        for (i32 x = 0; x < g_clip_w; x++) row[x] = c;
     }
 }
 
@@ -196,8 +206,8 @@ static void fill_rect(u32 *buf, u32 stride, i32 x, i32 y, i32 w, i32 h, u32 c)
 {
     i32 x1 = x < 0 ? 0 : x, y1 = y < 0 ? 0 : y;
     i32 x2 = x + w, y2 = y + h;
-    if (x2 > WIN_W) x2 = WIN_W;
-    if (y2 > WIN_H) y2 = WIN_H;
+    if (x2 > g_clip_w) x2 = g_clip_w;
+    if (y2 > g_clip_h) y2 = g_clip_h;
     for (i32 yy = y1; yy < y2; yy++) {
         u32 *row = buf + (u32)yy * stride;
         for (i32 xx = x1; xx < x2; xx++) row[xx] = c;
@@ -629,7 +639,7 @@ static void draw_hud(u32 *buf, u32 stride)
     char num[12]; i32 nl = fmt_u32(num, g_score);
     for (i32 i = 0; i < nl; i++) line[n++] = num[i];
     line[n] = '\0';
-    font_draw_string(buf, (i32)stride, WIN_W, WIN_H, 8, 6, line, COL_HUD);
+    font_draw_string(buf, (i32)stride, g_clip_w, g_clip_h, 8, 6, line, COL_HUD);
 
     /* Wave top-right. */
     char wbuf[24]; n = 0;
@@ -639,7 +649,7 @@ static void draw_hud(u32 *buf, u32 stride)
     for (i32 i = 0; i < nl; i++) wbuf[n++] = num[i];
     wbuf[n] = '\0';
     i32 ww = font_text_width(wbuf);
-    font_draw_string(buf, (i32)stride, WIN_W, WIN_H, WIN_W - ww - 8, 6, wbuf, COL_DIM);
+    font_draw_string(buf, (i32)stride, g_clip_w, g_clip_h, WIN_W - ww - 8, 6, wbuf, COL_DIM);
 
     /* Lives: small ship icons under the score. */
     for (i32 i = 0; i < g_lives; i++)
@@ -649,7 +659,21 @@ static void draw_hud(u32 *buf, u32 stride)
 static void center_text(u32 *buf, u32 stride, i32 y, const char *s, u32 c)
 {
     i32 w = font_text_width(s);
-    font_draw_string(buf, (i32)stride, WIN_W, WIN_H, (WIN_W - w) / 2, y, s, c);
+    font_draw_string(buf, (i32)stride, g_clip_w, g_clip_h, (WIN_W - w) / 2, y, s, c);
+}
+
+/* Letterbox helper: paint the FULL current window surface black so the margins
+ * around the fixed WIN_W x WIN_H canvas are never stale garbage after a resize
+ * (compositor Maximize/snap). Bounded strictly to the live win->w/h/stride, so
+ * a smaller-than-canvas window can never overflow the (re)allocated buffer. */
+static void clear_surface(wl_window *win)
+{
+    u32 stride = win->stride / 4u;          /* pixels per row, current buffer */
+    u32 w = win->w, h = win->h;
+    for (u32 y = 0; y < h; y++) {
+        u32 *row = win->pixels + (u64)y * stride;
+        for (u32 x = 0; x < w; x++) row[x] = COL_BG;
+    }
 }
 
 static void render(u32 *buf, u32 stride)
@@ -702,6 +726,10 @@ void _start(void)
         for (;;) sc(SYS_YIELD, 0, 0, 0, 0, 0, 0);
     }
     u32 stride = win->stride / 4u;
+    /* Clamp the fixed canvas to the actual surface in case the compositor
+     * honored a different initial size (letterbox if larger, clip if smaller). */
+    g_clip_w = ((i32)win->w < WIN_W) ? (i32)win->w : WIN_W;
+    g_clip_h = ((i32)win->h < WIN_H) ? (i32)win->h : WIN_H;
 
     u64 now = (u64)sc(SYS_GET_TICKS_MS, 0, 0, 0, 0, 0, 0);
     game_init(now);
@@ -715,6 +743,18 @@ void _start(void)
         /* ---- drain input (track held keys for rotate/thrust) ---- */
         int kind, a, b, cev;
         while (wl_poll_event(win, &kind, &a, &b, &cev)) {
+            if (kind == WL_EVENT_RESIZE) {
+                /* The library already reallocated the buffer and updated
+                 * win->{w,h,stride,pixels}. Refresh our cached stride so every
+                 * later write uses the CURRENT row pitch, and clamp the canvas
+                 * blit to min(canvas, window) so a SMALLER window can never
+                 * overflow the (smaller) buffer. The fixed canvas stays
+                 * top-left and the new margins get cleared via clear_surface(). */
+                stride = win->stride / 4u;
+                g_clip_w = ((i32)win->w < WIN_W) ? (i32)win->w : WIN_W;
+                g_clip_h = ((i32)win->h < WIN_H) ? (i32)win->h : WIN_H;
+                continue;
+            }
             if (kind != WL_EVENT_KEY) continue;
             i32 down = (b == 1);
             switch (a) {
@@ -752,6 +792,10 @@ void _start(void)
         }
         if (guard == 0 && (t - last) > (FRAME_MS * 8)) last = t; /* resync */
 
+        /* Letterbox: paint the whole (possibly larger) surface black first so
+         * margins around the fixed 640x480 canvas are clean, then draw the
+         * canvas at top-left via render() using the live stride. */
+        clear_surface(win);
         render(win->pixels, stride);
         wl_commit(win);
         sc(SYS_YIELD, 0, 0, 0, 0, 0, 0);

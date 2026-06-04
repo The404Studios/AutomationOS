@@ -1195,6 +1195,27 @@ void _start(void) {
         int kind, a, b, c;
 
         while (wl_poll_event(win, &kind, &a, &b, &c)) {
+            if (kind == WL_EVENT_RESIZE) {
+                /*
+                 * The library has ALREADY reallocated the buffer and updated
+                 * win->{w,h,stride,pixels}.  Refresh the cached stride and
+                 * recompute the text grid for the new size so the full new
+                 * surface is painted and content reflows.  Clamp to the
+                 * static array bounds (MAX_COLS/OUT_ROWS) and clamp the
+                 * cursor so every subsequent write stays in-bounds.
+                 */
+                stride_px  = win->stride / 4u;
+                g_cols     = (int)(win->w / FONT_W);
+                g_out_rows = (int)(win->h / FONT_H) - INPUT_ROWS;
+                if (g_cols < 1)            g_cols     = 1;
+                if (g_cols > MAX_COLS)     g_cols     = MAX_COLS;
+                if (g_out_rows < 1)        g_out_rows = 1;
+                if (g_out_rows > OUT_ROWS) g_out_rows = OUT_ROWS;
+                if (out_col >= g_cols)     out_col    = g_cols - 1;
+                if (out_row >= g_out_rows) out_row    = g_out_rows - 1;
+                dirty = 1;
+                continue;
+            }
             if (kind != WL_EVENT_KEY) continue;
             int keycode = a;
             int pressed = b;

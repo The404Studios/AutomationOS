@@ -396,15 +396,47 @@ static const char UA_CSS[] =
 /* 800*600 ARGB32 = 1 920 000 bytes (~1.83 MB). */
 static u32 g_fb[VP_W * VP_H];  /* our software framebuffer (ARGB32) */
 
-/* Copy g_fb into a wl_window (if available). */
+/* Copy g_fb into a wl_window (if available).
+ *
+ * The window may have been resized by the compositor (Maximize / snap): the
+ * wl library already reallocated win->pixels and updated win->{w,h,stride}, so
+ * the destination geometry is whatever win now reports -- it is NOT VP_W x VP_H.
+ * We render into a fixed VP_W x VP_H software framebuffer (g_fb), so on present
+ * we LETTERBOX: copy the overlapping region clamped to BOTH g_fb and the live
+ * window, addressing the destination with the CURRENT win->stride, then fill any
+ * margins of the (larger) window with the chrome background so the new area is
+ * never stale garbage. Every destination write is bounded to win->w/win->h via
+ * win->stride/4, so a SMALLER window can never overflow the reallocated buffer. */
 static void fb_commit_to_window(wl_window *win)
 {
-    if (!win) return;
-    /* Pixel-copy g_fb -> win->pixels */
-    u32 *dst = win->pixels;
-    const u32 *src = g_fb;
-    u32 count = (u32)(VP_W * VP_H);
-    for (u32 i = 0; i < count; i++) dst[i] = src[i];
+    if (!win || !win->pixels) return;
+
+    u32 *dst        = win->pixels;
+    const u32 *src  = g_fb;
+    u32 dst_pitch   = win->stride / 4;          /* destination pixels per row */
+    u32 win_w       = win->w;
+    u32 win_h       = win->h;
+    if (dst_pitch == 0 || win_w == 0 || win_h == 0) { wl_commit(win); return; }
+
+    /* Overlap of our fixed canvas with the live window. */
+    u32 copy_w = win_w  < (u32)VP_W ? win_w  : (u32)VP_W;
+    u32 copy_h = win_h  < (u32)VP_H ? win_h  : (u32)VP_H;
+    if (copy_w > dst_pitch) copy_w = dst_pitch;  /* never exceed real stride */
+
+    for (u32 row = 0; row < win_h; row++) {
+        u32 *drow = dst + (u64)row * dst_pitch;
+        if (row < copy_h) {
+            const u32 *srow = src + (u64)row * VP_W;
+            u32 col = 0;
+            for (; col < copy_w; col++) drow[col] = srow[col];
+            /* Right margin (window wider than canvas): chrome background. */
+            for (; col < win_w && col < dst_pitch; col++) drow[col] = 0xFFF0F0F0u;
+        } else {
+            /* Bottom margin (window taller than canvas): chrome background. */
+            for (u32 col = 0; col < win_w && col < dst_pitch; col++)
+                drow[col] = 0xFFF0F0F0u;
+        }
+    }
     wl_commit(win);
 }
 
@@ -1383,6 +1415,18 @@ int main(int argc, char **argv)
                             default: break;
                         }
                     }
+                } else if (kind == WL_EVENT_RESIZE) {
+                    /* Compositor Maximize / snap resized the window. The wl lib
+                     * has ALREADY reallocated win->pixels and updated
+                     * win->{w,h,stride} (a=new_w, b=new_h), so there is nothing
+                     * to allocate here. We render into a fixed VP_W x VP_H
+                     * canvas, so the present path (fb_commit_to_window) reads the
+                     * live win->stride/w/h every frame and letterboxes + clears
+                     * the new margins -- all we must do is force a fresh paint so
+                     * the whole new surface is repainted (no stale garbage).
+                     * (void)a/b: the size is read straight from win at present. */
+                    (void)a; (void)b; (void)c;
+                    need_repaint = 1;
                 }
             }
         }

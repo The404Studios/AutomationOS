@@ -20,6 +20,32 @@
 #include "../wl/wl_client.h"
 #include "../font/bitfont.h"
 
+/* Scalable text renderer (userspace/lib/font2), linked into every toolkit app. */
+extern void font2_draw_cell_clip(unsigned int *px, int stride, int maxw, int maxh,
+                                 int clip_x0, int clip_x1, int x, int y,
+                                 const char *str, int cell_w, int cell_h,
+                                 unsigned int argb);
+
+/* GLOBAL UI SCALE for the toolkit (matches the compositor chrome default so the
+ * whole desktop is consistent). Every widget's window size + layout coords are
+ * scaled by UI_S at create/attach time, so positions, sizes and the cursor all
+ * live in the SAME scaled pixel space (no input remap needed); text renders via
+ * font2 at the scaled cell (g_ui_cw x g_ui_ch). Keeping the base FONT_W/FONT_H
+ * for the widget-size MATH (then scaling once in attach_child) avoids double
+ * scaling. 130% => 10x20, readable on a real panel. */
+#define UI_PCT     130
+#define UI_S(v)    (((v) * UI_PCT) / 100)
+#define UI_CELL_W  (8  * UI_PCT / 100)
+#define UI_CELL_H  (16 * UI_PCT / 100)
+static const int g_ui_cw = UI_CELL_W;
+static const int g_ui_ch = UI_CELL_H;
+
+/* Drop-in scaled text: position is already in scaled space; render at the cell. */
+static void ui_text(unsigned int *buf, int sp, int bw, int bh,
+                    int x, int y, const char *s, unsigned int col) {
+    font2_draw_cell_clip(buf, sp, bw, bh, 0, bw, x, y, s, g_ui_cw, g_ui_ch, col);
+}
+
 /* ---- syscall numbers (per task spec) ---- */
 #define SYS_WRITE         3
 #define SYS_YIELD         15
@@ -255,10 +281,12 @@ static ui_app_t* app_alloc(void) {
 static int attach_child(ui_widget_t* parent, ui_widget_t* child,
                         i32 rx, i32 ry, i32 w, i32 h) {
     if (parent->nchildren >= UI_MAX_CHILDREN) return -1;
-    child->ax = parent->ax + rx;
-    child->ay = parent->ay + ry;
-    child->aw = w;
-    child->ah = h;
+    /* Scale the relative offset + size once, here, into the parent's (already
+     * scaled) absolute space -- so the whole widget tree lays out at UI scale. */
+    child->ax = parent->ax + UI_S(rx);
+    child->ay = parent->ay + UI_S(ry);
+    child->aw = UI_S(w);
+    child->ah = UI_S(h);
     parent->children[parent->nchildren++] = child;
     return 0;
 }
@@ -273,7 +301,8 @@ ui_app_t* ui_app_create(const char* title, int w, int h) {
         return 0;
     }
 
-    wl_window* win = wl_create_window((wl_u32)w, (wl_u32)h, title);
+    /* Create the window at the SCALED size so the scaled layout fits. */
+    wl_window* win = wl_create_window((wl_u32)UI_S(w), (wl_u32)UI_S(h), title);
     if (!win) {
         ui_log("[UI] wl_create_window FAILED\n");
         return 0;
@@ -367,7 +396,7 @@ void ui_label_set_text(ui_widget_t* w, const char* text) {
     if (!w) return;
     ui_strlcpy(w->text, text, UI_TEXT_CAP);
     if (w->kind == UI_LABEL)
-        w->aw = (i32)ui_strlen(w->text) * FONT_W;
+        w->aw = (i32)ui_strlen(w->text) * g_ui_cw;  /* scaled width matches render */
 }
 
 void ui_app_set_tick(ui_app_t* app, void (*tick)(void* ud), void* ud) {
@@ -700,8 +729,8 @@ static void render_widget(ui_app_t* app, ui_widget_t* w) {
 
     case UI_LABEL: {
         /* Vertically center the 16px glyph cell within the label's box. */
-        i32 ty = w->ay + (w->ah - FONT_H) / 2;
-        font_draw_string(buf, sp, bw, bh, w->ax, ty, w->text, w->fg);
+        i32 ty = w->ay + (w->ah - g_ui_ch) / 2;
+        ui_text(buf, sp, bw, bh, w->ax, ty, w->text, w->fg);
         break;
     }
 
@@ -717,12 +746,12 @@ static void render_widget(ui_app_t* app, ui_widget_t* w) {
             fill_round_rect(buf, bw, bh, sp, w->ax, w->ay, w->aw, w->ah, face);
             stroke_rect(buf, bw, bh, sp, w->ax, w->ay, w->aw, w->ah, COL_BORDER);
 
-            /* Center the caption within the button rect. */
-            i32 tw = font_text_width(w->text);
+            /* Center the caption within the button rect (scaled text width). */
+            i32 tw = (i32)ui_strlen(w->text) * g_ui_cw;
             i32 tx = w->ax + (w->aw - tw) / 2;
-            i32 ty = w->ay + (w->ah - FONT_H) / 2;
+            i32 ty = w->ay + (w->ah - g_ui_ch) / 2;
             if (tx < w->ax) tx = w->ax;
-            font_draw_string(buf, sp, bw, bh, tx, ty, w->text, w->fg);
+            ui_text(buf, sp, bw, bh, tx, ty, w->text, w->fg);
         } else {
             /* Empty caption => invisible click hotspot (e.g. start-menu tiles
              * lay an icon + label down first, then a full-tile button on top to
@@ -738,47 +767,48 @@ static void render_widget(ui_app_t* app, ui_widget_t* w) {
     /* ---- v2 widget drawing ---- */
 
     case UI_CHECKBOX: {
-        /* 16x16 box */
+        /* box scales with the UI cell so it matches the label height */
+        i32 bx = UI_S(16);
         u32 box_color = hovered ? COL_HOVER : COL_SURFACE;
-        fill_rect(buf, bw, bh, sp, w->ax, w->ay, 16, 16, box_color);
-        stroke_rect(buf, bw, bh, sp, w->ax, w->ay, 16, 16, COL_BORDER);
+        fill_rect(buf, bw, bh, sp, w->ax, w->ay, bx, bx, box_color);
+        stroke_rect(buf, bw, bh, sp, w->ax, w->ay, bx, bx, COL_BORDER);
 
         if (w->checked) {
-            /* Draw a simple check mark: two filled rects forming a "v" */
-            /* Filled inner rectangle as check */
-            fill_rect(buf, bw, bh, sp, w->ax + 3, w->ay + 3, 10, 10, COL_CHECK_FILL);
-            /* X mark styled check — simple cross diagonals via 2 lines */
-            /* Use a solid inner square for simplicity in freestanding env */
+            /* Filled inner square as the check glyph */
+            fill_rect(buf, bw, bh, sp, w->ax + UI_S(3), w->ay + UI_S(3),
+                      bx - UI_S(6), bx - UI_S(6), COL_CHECK_FILL);
         }
 
         /* Label text to the right */
         if (w->text[0]) {
-            i32 ty = w->ay + (16 - FONT_H) / 2;
-            font_draw_string(buf, sp, bw, bh, w->ax + 20, ty, w->text, w->fg);
+            i32 ty = w->ay + (bx - g_ui_ch) / 2;
+            ui_text(buf, sp, bw, bh, w->ax + bx + UI_S(4), ty, w->text, w->fg);
         }
         break;
     }
 
     case UI_SLIDER: {
-        /* Track (horizontal bar, vertically centered in 20px height) */
-        i32 track_y  = w->ay + 8;
-        i32 track_h  = 4;
+        /* Track (horizontal bar, vertically centered), all metrics scaled */
+        i32 track_y  = w->ay + UI_S(8);
+        i32 track_h  = UI_S(4);
+        i32 inset    = UI_S(8);
         fill_rect(buf, bw, bh, sp,
-                  w->ax + 8, track_y, w->aw - 16, track_h, COL_SLIDER_TRK);
+                  w->ax + inset, track_y, w->aw - inset * 2, track_h, COL_SLIDER_TRK);
 
         /* Filled portion from left to knob */
         i32 knob_cx = slider_knob_cx(w);
-        i32 fill_w  = knob_cx - (w->ax + 8);
+        i32 fill_w  = knob_cx - (w->ax + inset);
         if (fill_w > 0)
             fill_rect(buf, bw, bh, sp,
-                      w->ax + 8, track_y, fill_w, track_h, COL_ACCENT);
+                      w->ax + inset, track_y, fill_w, track_h, COL_ACCENT);
 
-        /* Knob: 12x12 circle approximated as rounded rect */
+        /* Knob approximated as a rounded rect, scaled */
+        i32 ks = UI_S(12);
         u32 knob_col = (hovered || w->sl_dragging) ? COL_ACCENT : COL_SLIDER_KNOB;
         fill_round_rect(buf, bw, bh, sp,
-                        knob_cx - 6, w->ay + 4, 12, 12, knob_col);
+                        knob_cx - ks / 2, w->ay + UI_S(4), ks, ks, knob_col);
         stroke_rect(buf, bw, bh, sp,
-                    knob_cx - 6, w->ay + 4, 12, 12, COL_BORDER);
+                    knob_cx - ks / 2, w->ay + UI_S(4), ks, ks, COL_BORDER);
         break;
     }
 
@@ -787,14 +817,13 @@ static void render_widget(ui_app_t* app, ui_widget_t* w) {
         fill_rect(buf, bw, bh, sp, w->ax, w->ay, w->aw, w->ah, w->bg);
         stroke_rect(buf, bw, bh, sp, w->ax, w->ay, w->aw, w->ah, border_col);
 
-        /* Text content, clipped to the box */
-        i32 ty = w->ay + (w->ah - FONT_H) / 2;
-        i32 cx = w->ax + 4;
-        i32 cw = w->aw - 8;
+        /* Text content, clipped to the box (scaled cell via ui_text clip window) */
+        i32 ty = w->ay + (w->ah - g_ui_ch) / 2;
+        i32 cx = w->ax + UI_S(4);
+        i32 cw = w->aw - UI_S(8);
         if (cw > 0) {
-            font_draw_string_clipped(buf, sp, bw, bh,
-                                     cx, w->ay, cw, w->ah,
-                                     cx, ty, w->tb_buf, w->fg);
+            font2_draw_cell_clip(buf, sp, bw, bh, cx, cx + cw,
+                                 cx, ty, w->tb_buf, g_ui_cw, g_ui_ch, w->fg);
         }
 
         /* Blinking caret when focused */
@@ -802,12 +831,12 @@ static void render_widget(ui_app_t* app, ui_widget_t* w) {
             int blink = (app->frame >> 3) & 1;   /* blink every 8 frames */
             if (blink) {
                 unsigned long tlen = ui_strlen(w->tb_buf);
-                i32 caret_x = cx + (i32)tlen * FONT_W;
+                i32 caret_x = cx + (i32)tlen * g_ui_cw;
                 /* Clamp caret inside box */
-                i32 right_edge = w->ax + w->aw - 4;
+                i32 right_edge = w->ax + w->aw - UI_S(4);
                 if (caret_x > right_edge) caret_x = right_edge;
                 fill_rect(buf, bw, bh, sp,
-                          caret_x, w->ay + 3, 1, w->ah - 6, COL_TEXT);
+                          caret_x, w->ay + UI_S(3), 1, w->ah - UI_S(6), COL_TEXT);
             }
         }
         break;
@@ -832,10 +861,12 @@ static void render_widget(ui_app_t* app, ui_widget_t* w) {
         stroke_rect(buf, bw, bh, sp,
                     w->ax, w->ay, w->aw, w->ah, COL_BORDER);
         if (w->ir_glyph) {
-            /* Center the single glyph */
-            i32 gx = w->ax + (w->aw - FONT_W) / 2;
-            i32 gy = w->ay + (w->ah - FONT_H) / 2;
-            font_draw_char(buf, sp, bw, bh, gx, gy, w->ir_glyph, w->ir_fg);
+            /* Center the single glyph (scaled cell via font2) */
+            i32 gx = w->ax + (w->aw - g_ui_cw) / 2;
+            i32 gy = w->ay + (w->ah - g_ui_ch) / 2;
+            char gs[2] = { (char)w->ir_glyph, 0 };
+            font2_draw_cell_clip(buf, sp, bw, bh, 0, bw, gx, gy, gs,
+                                 g_ui_cw, g_ui_ch, w->ir_fg);
         }
         break;
     }
@@ -1120,6 +1151,16 @@ void ui_app_run(ui_app_t* app) {
             } else if (kind == WL_EVENT_KEY) {
                 /* a=keycode, b=pressed */
                 dispatch_key(app, a, b);
+            } else if (kind == WL_EVENT_RESIZE) {
+                /* Compositor resized our buffer (maximize / restore / snap).
+                 * wl_poll_event already re-pointed win->{w,h,stride,pixels} to
+                 * the new buffer; re-sync the root so its background fill covers
+                 * the WHOLE new surface (a=new_w, b=new_h). Widgets keep their
+                 * absolute (top-left-anchored) positions — no relayout needed for
+                 * the fixed toolkit layouts, but the window now fills the screen
+                 * instead of letterboxing stale content. */
+                app->root->aw = (i32)win->w;
+                app->root->ah = (i32)win->h;
             }
         }
 

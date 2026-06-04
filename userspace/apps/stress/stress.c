@@ -581,6 +581,12 @@ static void render(wl_window *win, i32 mx, i32 my,
     u32  spx  = win->stride / 4u;
     char tmp1[32], tmp2[32];
 
+    /* Report area height derived from the LIVE window height so the panel
+     * reflows on resize/maximize instead of using the fixed-size constant.
+     * Clamp to >=0 in case a very short window puts REPORT_Y past the bottom. */
+    i32 report_h = (i32)bh - REPORT_Y;
+    if (report_h < 0) report_h = 0;
+
     /* ---- Background ---- */
     fill_rect(buf, bw, bh, spx, 0, 0, (i32)bw, (i32)bh, C_BG);
 
@@ -625,7 +631,7 @@ static void render(wl_window *win, i32 mx, i32 my,
                               "+", C_BTN_HOVER, mx, my);
 
     /* ---- Report panel ---- */
-    fill_rect(buf, bw, bh, spx, 0, REPORT_Y, (i32)bw, REPORT_H, C_PANEL);
+    fill_rect(buf, bw, bh, spx, 0, REPORT_Y, (i32)bw, report_h, C_PANEL);
 
     /* Two-column layout: left = counters, right = leak watch. */
     i32 col2 = (i32)bw / 2 + 8;
@@ -684,7 +690,7 @@ static void render(wl_window *win, i32 mx, i32 my,
     i32 ry2  = REPORT_Y + 10;
 
     /* Vertical divider. */
-    fill_rect(buf, bw, bh, spx, col2 - 4, REPORT_Y, 1, REPORT_H, C_SEP);
+    fill_rect(buf, bw, bh, spx, col2 - 4, REPORT_Y, 1, report_h, C_SEP);
 
     draw_text(buf, spx, bw, bh, col2, ry2, "LEAK WATCH", C_ACCENT);
     ry2 += lh;

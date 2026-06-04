@@ -1341,6 +1341,14 @@ static void draw_panel(Canvas *c)
 
 static void render(Canvas *c)
 {
+    /* Letterbox: clear the FULL current surface first so that when the window
+     * is larger than the fixed WIN_W x WIN_H layout the new right/bottom margins
+     * are painted black instead of showing stale garbage. fill_rect clamps to
+     * c->w/c->h, so this is safe (and cheap) at the default size too -- the rest
+     * of the fixed layout below overpaints the canvas region. */
+    if (c->w > WIN_W || c->h > WIN_H)
+        fill_rect(c, 0, 0, c->w, c->h, COL_BLACK);
+
     draw_field(c);
 
     /* hover range for a placed turret when nothing is being placed/inspected */
@@ -1566,6 +1574,17 @@ void _start(void)
                 prev_btn = btn;
             } else if (kind == WL_EVENT_KEY) {
                 if (eb == 1) handle_key(ea);   /* eb = pressed */
+            } else if (kind == WL_EVENT_RESIZE) {
+                /* The library has ALREADY reallocated the buffer and updated
+                 * win->{w,h,stride,pixels}. Refresh the cached Canvas so every
+                 * draw this frame is bounded to the CURRENT surface (the old
+                 * cv.buf would be a stale/dangling pointer). This is a fixed-
+                 * canvas game: the layout stays anchored at (0,0) and render()
+                 * clears the full new surface, letterboxing the margins. */
+                cv.buf = win->pixels;
+                cv.stride = (i32)(win->stride / 4u);
+                cv.w = (i32)win->w;
+                cv.h = (i32)win->h;
             }
         }
 

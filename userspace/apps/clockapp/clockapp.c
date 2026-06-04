@@ -202,13 +202,22 @@ static void ms_to_mmsscc(char *dst, i64 ms)
  * ========================================================================= */
 static u32 *FB;          /* shared pixel buffer            */
 static u32  STRIDE;      /* stride in pixels (stride/4)    */
+/*
+ * Current (live) surface size in pixels.  The fixed WIN_W/WIN_H above describe
+ * the *design* layout; CUR_W/CUR_H track the actual buffer after a compositor
+ * resize so every pixel write stays in bounds (a stray write page-faults the
+ * process).  The app letterboxes: layout stays at the design size, clipped to
+ * the live surface, and the full surface is cleared each frame.
+ */
+static i32  CUR_W;       /* live window width  in pixels   */
+static i32  CUR_H;       /* live window height in pixels   */
 
 static void fill_rect(i32 x, i32 y, i32 w, i32 h, u32 color)
 {
     i32 x1 = x < 0 ? 0 : x;
     i32 y1 = y < 0 ? 0 : y;
-    i32 x2 = x + w; if (x2 > WIN_W) x2 = WIN_W;
-    i32 y2 = y + h; if (y2 > WIN_H) y2 = WIN_H;
+    i32 x2 = x + w; if (x2 > CUR_W) x2 = CUR_W;
+    i32 y2 = y + h; if (y2 > CUR_H) y2 = CUR_H;
     for (i32 yy = y1; yy < y2; yy++) {
         u32 *row = FB + (u32)yy * STRIDE;
         for (i32 xx = x1; xx < x2; xx++) row[xx] = color;
@@ -220,7 +229,7 @@ static void vline(i32 x, i32 y, i32 len, u32 c) { fill_rect(x, y, 1, len, c); }
 
 static void pset(i32 x, i32 y, u32 color)
 {
-    if (x < 0 || x >= WIN_W || y < 0 || y >= WIN_H) return;
+    if (x < 0 || x >= CUR_W || y < 0 || y >= CUR_H) return;
     FB[(u32)y * STRIDE + (u32)x] = color;
 }
 
@@ -315,7 +324,7 @@ static void circle_outline(i32 cx, i32 cy, i32 r, u32 color)
  * ========================================================================= */
 static void text(i32 x, i32 y, const char *s, u32 color)
 {
-    font_draw_string(FB, (int)STRIDE, WIN_W, WIN_H, x, y, s, color);
+    font_draw_string(FB, (int)STRIDE, CUR_W, CUR_H, x, y, s, color);
 }
 
 static void text_center(i32 cx, i32 y, const char *s, u32 color)
@@ -437,6 +446,8 @@ void _start(void)
     }
     FB     = win->pixels;
     STRIDE = win->stride / 4u;
+    CUR_W  = (i32)win->w;
+    CUR_H  = (i32)win->h;
     print("[CLOCK+] window ready\n");
 
     /* ---- App state ---- */
@@ -484,6 +495,14 @@ void _start(void)
                 prev_btn = btn;
             } else if (kind == WL_EVENT_KEY) {
                 if (eb == 1) { key_press = 1; keycode = ea; }
+            } else if (kind == WL_EVENT_RESIZE) {
+                /* The library has ALREADY reallocated the buffer and updated
+                 * win->{w,h,stride,pixels}; refresh our cached pointers so
+                 * every subsequent write is bounded to the new surface. */
+                FB     = win->pixels;
+                STRIDE = win->stride / 4u;
+                CUR_W  = (i32)win->w;
+                CUR_H  = (i32)win->h;
             }
         }
 
@@ -642,11 +661,14 @@ void _start(void)
         }
 
         /* =========================== RENDER ========================== */
-        fill_rect(0, 0, WIN_W, WIN_H, COL_WIN_BG);
+        /* Clear the FULL live surface so a grow/maximize leaves no stale
+         * garbage in the margins (letterbox: design layout stays fixed and is
+         * clipped/centered within whatever surface the compositor gave us). */
+        fill_rect(0, 0, CUR_W, CUR_H, COL_WIN_BG);
 
         /* ---- Left navigation rail ---- */
-        fill_rect(0, 0, RAIL_W, WIN_H, COL_RAIL_BG);
-        vline(RAIL_W, 0, WIN_H, COL_CARD_EDGE);
+        fill_rect(0, 0, RAIL_W, CUR_H, COL_RAIL_BG);
+        vline(RAIL_W, 0, CUR_H, COL_CARD_EDGE);
         text(RAIL_PAD, 22, "Clock+", COL_TEXT);
         text(RAIL_PAD, 40, "AutomationOS", COL_TEXT_DIM);
 
@@ -670,7 +692,7 @@ void _start(void)
         }
 
         /* ---- Content card ---- */
-        round_rect_bordered(CT_X - 12, CT_Y - 12, CT_W + 24, WIN_H - CT_Y - 16,
+        round_rect_bordered(CT_X - 12, CT_Y - 12, CT_W + 24, CUR_H - CT_Y - 16,
                             12, COL_CARD, COL_CARD_EDGE);
         /* Pane title. */
         text_scaled(CT_X, CT_Y, PANE_NAME[pane], 2, COL_TEXT);
@@ -752,7 +774,7 @@ void _start(void)
             int firing = alarm_firing;
             /* Flash the card content red on/off while firing. */
             if (firing && ((now / 300) & 1) == 0)
-                fill_round_rect(CT_X - 2, CT_Y + 52, CT_W + 4, WIN_H - CT_Y - 80,
+                fill_round_rect(CT_X - 2, CT_Y + 52, CT_W + 4, CUR_H - CT_Y - 80,
                                 10, COL_FLASH);
 
             u32 lblc = (firing && ((now / 300) & 1) == 0) ? COL_TEXT_ON_AC : COL_TEXT_DIM;
@@ -818,7 +840,7 @@ void _start(void)
                 int tw = font_text_width(badge);
                 text(CT_X + CT_W - 40 - tw, ly + (40 - FONT_H) / 2, badge, bc);
             }
-            text(CT_X + 40, WIN_H - 44, "Space: arm/disarm   R: stop", COL_TEXT_DIM);
+            text(CT_X + 40, CUR_H - 44, "Space: arm/disarm   R: stop", COL_TEXT_DIM);
         }
 
         /* =================== TIMER PANE =================== */
@@ -829,7 +851,7 @@ void _start(void)
             if (left < 0) left = 0;
 
             if (done && ((now / 300) & 1) == 0)
-                fill_round_rect(CT_X - 2, CT_Y + 52, CT_W + 4, WIN_H - CT_Y - 80,
+                fill_round_rect(CT_X - 2, CT_Y + 52, CT_W + 4, CUR_H - CT_Y - 80,
                                 10, COL_FLASH);
             u32 onflash = (done && ((now / 300) & 1) == 0);
             u32 numc = onflash ? COL_TEXT_ON_AC : COL_TEXT;
@@ -870,7 +892,7 @@ void _start(void)
             draw_button(bx, by, bw, bh, timer_running ? "Pause" : "Start",
                         !timer_running, hit(mx, my, bx, by, bw, bh), 1);
             draw_button(rx, by, rw, bh, "Reset", 0, hit(mx, my, rx, by, rw, bh), 1);
-            text(CT_X + 40, WIN_H - 44, "Space: start/pause   R: reset", COL_TEXT_DIM);
+            text(CT_X + 40, CUR_H - 44, "Space: start/pause   R: reset", COL_TEXT_DIM);
         }
 
         /* =================== STOPWATCH PANE =================== */
@@ -911,7 +933,7 @@ void _start(void)
                     text(CT_X + CT_W - 56 - lw2, ry, lt, COL_ACCENT);
                 }
             }
-            text(CT_X + 40, WIN_H - 44,
+            text(CT_X + 40, CUR_H - 44,
                  "Space: start/stop   L: lap   R: reset", COL_TEXT_DIM);
         }
 

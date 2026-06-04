@@ -300,6 +300,13 @@ static u64 last_drop_ms;
 /* Soft-drop */
 static i32 soft_drop;
 
+/* Live window surface dimensions (refreshed every frame / on resize).
+ * The fixed 360x640 canvas is letterboxed into the top-left of whatever
+ * surface the compositor gives us; all pixel writes clip to these so a
+ * resize (grow or shrink) never reads/writes outside win->pixels. */
+static int cur_w = WIN_W;
+static int cur_h = WIN_H;
+
 /* ------------------------------------------------------------------ */
 /* Board helpers                                                        */
 /* ------------------------------------------------------------------ */
@@ -444,10 +451,10 @@ static void fill_rect(u32 *fb, int stride, int x, int y, int w, int h, u32 col)
 {
     for (int row = 0; row < h; row++) {
         int py = y + row;
-        if (py < 0 || py >= WIN_H) continue;
+        if (py < 0 || py >= cur_h) continue;
         for (int cx = 0; cx < w; cx++) {
             int px = x + cx;
-            if (px < 0 || px >= WIN_W) continue;
+            if (px < 0 || px >= cur_w) continue;
             fb[py * stride + px] = col;
         }
     }
@@ -499,7 +506,7 @@ static void draw_ghost_cell(u32 *fb, int stride, int px, int py, int cs, u32 col
 /* ------------------------------------------------------------------ */
 static void draw_text(u32 *fb, int stride, int x, int y, const char *s, u32 col)
 {
-    font_draw_string(fb, stride, WIN_W, WIN_H, x, y, s, col);
+    font_draw_string(fb, stride, cur_w, cur_h, x, y, s, col);
 }
 
 static void draw_num(u32 *fb, int stride, int x, int y, u32 v, u32 col)
@@ -507,7 +514,7 @@ static void draw_num(u32 *fb, int stride, int x, int y, u32 v, u32 col)
     char buf[12];
     int  len;
     itoa_buf(v, buf, &len);
-    font_draw_string(fb, stride, WIN_W, WIN_H, x, y, buf, col);
+    font_draw_string(fb, stride, cur_w, cur_h, x, y, buf, col);
 }
 
 /* Draw "LABEL\n value" in two lines. */
@@ -565,8 +572,14 @@ static void render(wl_window *win)
     u32 *fb     = win->pixels;
     int  stride = (int)(win->stride / 4);
 
-    /* ---- background ---- */
-    fill_rect(fb, stride, 0, 0, WIN_W, WIN_H, COL_BG);
+    /* Refresh live surface dims (the compositor may have resized us). All
+     * subsequent clipping uses these, so writes stay inside win->pixels. */
+    cur_w = (int)win->w;
+    cur_h = (int)win->h;
+
+    /* ---- background: clear the WHOLE surface so letterbox margins around
+     *      the fixed 360x640 canvas are never stale garbage ---- */
+    fill_rect(fb, stride, 0, 0, cur_w, cur_h, COL_BG);
 
     /* ---- panel background ---- */
     fill_rect(fb, stride, PANEL_X - 4, 0, WIN_W - PANEL_X + 4, WIN_H, COL_PANEL_BG);
@@ -663,9 +676,9 @@ static void render(wl_window *win)
             int bx = px0, by = py;
             int bsz = PREV_CS * 4 + 4;
             for (int ry = by; ry < by + bsz; ry++) {
-                if (ry < 0 || ry >= WIN_H) continue;
+                if (ry < 0 || ry >= cur_h) continue;
                 for (int rx = bx; rx < bx + bsz; rx++) {
-                    if (rx < 0 || rx >= WIN_W) continue;
+                    if (rx < 0 || rx >= cur_w) continue;
                     u32 p = fb[ry * stride + rx];
                     fb[ry * stride + rx] =
                         0xFF000000 |
@@ -698,10 +711,10 @@ static void render(wl_window *win)
                 int cpy = PF_Y + r * CELL;
                 for (int dy = 0; dy < CELL; dy++) {
                     int ry = cpy + dy;
-                    if (ry < 0 || ry >= WIN_H) continue;
+                    if (ry < 0 || ry >= cur_h) continue;
                     for (int dx = 0; dx < CELL; dx++) {
                         int rx = cpx + dx;
-                        if (rx < 0 || rx >= WIN_W) continue;
+                        if (rx < 0 || rx >= cur_w) continue;
                         u32 p = fb[ry * stride + rx];
                         fb[ry * stride + rx] =
                             0xFF000000 |
@@ -727,10 +740,10 @@ static void render(wl_window *win)
                 int cpy = PF_Y + r * CELL;
                 for (int dy = 0; dy < CELL; dy++) {
                     int ry = cpy + dy;
-                    if (ry < 0 || ry >= WIN_H) continue;
+                    if (ry < 0 || ry >= cur_h) continue;
                     for (int dx = 0; dx < CELL; dx++) {
                         int rx = cpx + dx;
-                        if (rx < 0 || rx >= WIN_W) continue;
+                        if (rx < 0 || rx >= cur_w) continue;
                         u32 p = fb[ry * stride + rx];
                         fb[ry * stride + rx] =
                             0xFF000000 |
@@ -894,8 +907,17 @@ void _start(void)
         /* ---- poll input ---- */
         int kind, a, b, c;
         while (win && wl_poll_event(win, &kind, &a, &b, &c)) {
-            if (kind == WL_EVENT_KEY)
+            if (kind == WL_EVENT_KEY) {
                 handle_key(a, b);
+            } else if (kind == WL_EVENT_RESIZE) {
+                /* Library already reallocated the buffer and updated
+                 * win->{w,h,stride,pixels}. Refresh our cached surface
+                 * dims so the next render's clipping (and the full-surface
+                 * background clear) match the new size. The fixed canvas
+                 * is letterboxed at (0,0); no rescale needed. */
+                cur_w = (int)win->w;
+                cur_h = (int)win->h;
+            }
         }
 
         /* ---- gravity ---- */

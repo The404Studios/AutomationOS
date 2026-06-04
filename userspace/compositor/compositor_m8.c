@@ -552,7 +552,7 @@ static void blit_surface_scaled_alpha(uint32_t *buf, uint32_t bw, uint32_t bh, u
  * used only in functions further down, so the macro-order is fine. */
 #define TITLEBAR_H  (FONT_H + 12)
 #define BORDER_W    1
-#define WIN_RADIUS  6                 /* rounded window outer-corner radius   */
+#define WIN_RADIUS  8                 /* rounded window outer-corner radius (matches dock/menu) */
 
 /* chrome geometry (font-cell-derived; track the global UI zoom) */
 #define PANEL_H     (FONT_H + 12)
@@ -641,7 +641,7 @@ static void blit_surface_scaled_alpha(uint32_t *buf, uint32_t bw, uint32_t bh, u
 #define RDOCK_FAN_SPARKLES    8   /* sparkle dots drawn around a hovered icon */
 
 /* Number of app entries and folders */
-#define RDOCK_NICONS  24
+#define RDOCK_NICONS  14
 #define RDOCK_NFOLDERS 2
 
 /* App descriptor */
@@ -660,37 +660,32 @@ typedef struct {
 } rdock_folder_t;
 
 /* ---- App table ---- */
+/* Curated dock: the core apps as loose icons + a Games and a Tools folder for
+ * the rest. The long-tail demo/game apps (notes, paint, chess, asteroids,
+ * sudoku, controlcenter, photos, bubbletd, zombietd, dateapp) are still built
+ * and launchable from the file manager / terminal -- they're just no longer
+ * cluttering the dock strip. Folder members[] index into THIS array. */
 static const rdock_app_t rdock_apps[RDOCK_NICONS] = {
     { "Te", "sbin/terminal",    0xFF1E6FB5u },  /* 0  Terminal   */
     { "Fi", "sbin/filemanager", 0xFF2E8B57u },  /* 1  Files      */
-    { "Ed", "sbin/editor",      0xFF8B6914u },  /* 2  Editor     */
-    { "No", "sbin/notes",       0xFFB8860Bu },  /* 3  Notes      */
-    { "Ca", "sbin/calculator",  0xFF555577u },  /* 4  Calculator */
-    { "Cl", "sbin/clock",       0xFF336699u },  /* 5  Clock      */
-    { "Pa", "sbin/paint",       0xFF8B3A3Au },  /* 6  Paint      */
-    { "Sn", "sbin/snake",       0xFF2D6A2Du },  /* 7  Snake      */
-    { "Tt", "sbin/tetris",      0xFF6B2D8Bu },  /* 8  Tetris     */
-    { "20", "sbin/game2048",    0xFF8B4513u },  /* 9  2048       */
-    { "St", "sbin/settings",    0xFF444466u },  /* 10 Settings   */
-    { "Da", "sbin/dateapp",     0xFF336677u },  /* 11 Date       */
-    { "Id", "sbin/ide",         0xFF2D6A8Bu },  /* 12 IDE        */
-    { "Bd", "sbin/bubbletd",    0xFF1FA87Au },  /* 13 BubbleTD   */
-    { "Wb", "sbin/browser",     0xFF1565C0u },  /* 14 Browser    */
-    { "Nm", "sbin/netman",      0xFF00897Bu },  /* 15 NetManager */
-    { "Ch", "sbin/chess",       0xFF5C3A2Au },  /* 16 Chess      */
-    { "As", "sbin/asteroids",   0xFF202840u },  /* 17 Asteroids  */
-    { "Su", "sbin/sudoku",      0xFF6D4C9Fu },  /* 18 Sudoku     */
-    { "Cc", "sbin/controlcenter", 0xFF0A84FFu },/* 19 ControlCtr */
-    { "Ph", "sbin/photos",      0xFF2D8B8Bu },  /* 20 Photos     */
-    { "Pm", "sbin/pacman",      0xFFFFD60Au },  /* 21 Pac-Man    */
-    { "C+", "sbin/clockapp",    0xFF0067C0u },  /* 22 Clock+     */
-    { "Zt", "sbin/zombietd",    0xFF8B0000u },  /* 23 ZombieTD   */
+    { "Id", "sbin/ide",         0xFF2D6A8Bu },  /* 2  IDE        */
+    { "Wb", "sbin/browser",     0xFF1565C0u },  /* 3  Browser    */
+    { "Nm", "sbin/netman",      0xFF00897Bu },  /* 4  NetManager */
+    { "St", "sbin/settings",    0xFF444466u },  /* 5  Settings   */
+    { "Ca", "sbin/calculator",  0xFF555577u },  /* 6  Calculator */
+    { "Cl", "sbin/clock",       0xFF336699u },  /* 7  Clock      */
+    { "Ed", "sbin/editor",      0xFF8B6914u },  /* 8  Editor     */
+    { "Sn", "sbin/snake",       0xFF2D6A2Du },  /* 9  Snake      */
+    { "Tt", "sbin/tetris",      0xFF6B2D8Bu },  /* 10 Tetris     */
+    { "20", "sbin/game2048",    0xFF8B4513u },  /* 11 2048       */
+    { "Pm", "sbin/pacman",      0xFFFFD60Au },  /* 12 Pac-Man    */
+    { "C+", "sbin/clockapp",    0xFF0067C0u },  /* 13 Clock+     */
 };
 
-/* ---- Folder table (Games + Tools) ---- */
+/* ---- Folder table (Games + Tools); members[] index into rdock_apps[] ---- */
 static const rdock_folder_t rdock_folders[RDOCK_NFOLDERS] = {
-    { "Gm", 0xFF3A3A5Cu, { 7, 8, 9, 21 }, 4 },   /* Games  (+Pac-Man) */
-    { "Tl", 0xFF3A5C3Au, { 4, 5, 2, 22 }, 4 },   /* Tools  (+Clock+)  */
+    { "Gm", 0xFF3A3A5Cu, { 9, 10, 11, 12 }, 4 },   /* Games: snake/tetris/2048/pacman */
+    { "Tl", 0xFF3A5C3Au, { 6, 7, 8, 13 }, 4 },     /* Tools: calc/clock/editor/clock+ */
 };
 
 /* ---- Per-icon animation state ---- */
@@ -1297,12 +1292,30 @@ static void anim_tick(long now) {
  *  Compositing                                                            *
  * ====================================================================== */
 
-/* Wallpaper: full-screen vertical navy gradient (per scanline). */
+/* Wallpaper: full-screen vertical navy gradient. PERF: the per-scanline gradient
+ * color is CACHED and recomputed only when the height changes -- previously
+ * lerp_color() ran for every scanline every composite (a few % of frame cost on
+ * an idle desktop). The fill itself still runs each frame (it's the background). */
 static void render_desktop(uint32_t *buf, uint32_t w, uint32_t h, uint32_t stride) {
-    for (uint32_t y = 0; y < h; y++) {
-        uint32_t c = lerp_color(WALL_TOP, WALL_BOT, y, h ? h - 1 : 1);
-        uint32_t *r = buf + y * stride;
-        for (uint32_t x = 0; x < w; x++) r[x] = c;
+    static uint32_t grad[2160];          /* cached column gradient (>= 4K tall)  */
+    static uint32_t grad_h = 0;
+    if (h <= 2160) {
+        if (h != grad_h) {
+            for (uint32_t y = 0; y < h; y++)
+                grad[y] = lerp_color(WALL_TOP, WALL_BOT, y, h ? h - 1 : 1);
+            grad_h = h;
+        }
+        for (uint32_t y = 0; y < h; y++) {
+            uint32_t c = grad[y];
+            uint32_t *r = buf + y * stride;
+            for (uint32_t x = 0; x < w; x++) r[x] = c;
+        }
+    } else {                              /* absurd height: original uncached path */
+        for (uint32_t y = 0; y < h; y++) {
+            uint32_t c = lerp_color(WALL_TOP, WALL_BOT, y, h ? h - 1 : 1);
+            uint32_t *r = buf + y * stride;
+            for (uint32_t x = 0; x < w; x++) r[x] = c;
+        }
     }
 }
 
@@ -1411,7 +1424,7 @@ static void render_desktop_icons(uint32_t *buf, uint32_t w, uint32_t h, uint32_t
         if (hovered)
             fill_round_rect(buf, w, h, stride, tx - 6, ty - 2,
                             DESK_TILE + 12, DESK_TILE + DESK_LABEL_GAP + FONT_H + 4,
-                            6, 0x40FFFFFFu);
+                            8, 0x550A84FFu);   /* accent-blue hover glow (was flat white) */
 
         /* the icon art (drawn FULLY inside the clamped tile) */
         if (di->is_dir) {
@@ -1910,19 +1923,28 @@ static void render_dock(uint32_t *buf, uint32_t w, uint32_t h, uint32_t stride,
         if (bx + TASK_W > (int32_t)w) break;        /* ran out of dock space */
         int hover = (cur_x >= bx && cur_x < bx + TASK_W &&
                      cur_y >= by && cur_y < by + TASK_H);
-        uint32_t bg = (s == focused) ? COL_HOVER : (hover ? COL_HOVER : COL_PANEL);
+        /* Distinct focus vs hover: the active window is ACCENT-filled with a
+         * bottom accent bar + white label; a hovered (non-active) button gets a
+         * subtle lift (a slightly larger rounded backing) for a fluid feel. */
+        if (hover && s != focused)
+            fill_round_rect(buf, w, h, stride, bx - 1, by - 1, TASK_W + 2, TASK_H + 2, 5, COL_HOVER);
+        uint32_t bg = (s == focused) ? COL_ACCENT : (hover ? COL_HOVER : COL_PANEL);
         fill_round_rect(buf, w, h, stride, bx, by, TASK_W, TASK_H, 4, bg);
-        stroke_rect(buf, w, h, stride, bx, by, TASK_W, TASK_H, COL_BORDER);
+        stroke_rect(buf, w, h, stride, bx, by, TASK_W, TASK_H,
+                    (s == focused) ? COL_ACCENT : COL_BORDER);
+        if (s == focused)                              /* active-window accent bar */
+            fill_round_rect(buf, w, h, stride, bx + 3, by + TASK_H - 3, TASK_W - 6, 2, 1, COL_TEXT);
         /* minimized windows get a dim accent dot to show they're parked */
         if (g_windows[s].minimized)
-            fill_round_rect(buf, w, h, stride, bx + 4, by + TASK_H / 2 - 2, 4, 4, 2, COL_ACCENT);
+            fill_round_rect(buf, w, h, stride, bx + 4, by + TASK_H / 2 - 2, 4, 4, 2,
+                            (s == focused) ? COL_TEXT : COL_ACCENT);
         char t[20];
         truncate_title(g_windows[s].title[0] ? g_windows[s].title : "window",
                        t, (TASK_W - 12) / FONT_W);
         cz_text(buf, (int)stride, (int)w, (int)h,
                          bx + (g_windows[s].minimized ? 12 : 6),
                          by + (TASK_H - FONT_H) / 2, t,
-                         (s == focused) ? COL_TEXT : COL_TEXT_DIM);
+                         (s == focused) ? 0xFFFFFFFFu : COL_TEXT_DIM);
         idx++;
     }
 }
@@ -2564,12 +2586,14 @@ static void draw_menu(uint32_t *buf, uint32_t w, uint32_t h, uint32_t stride) {
                MENU_W - 16, 1, 0x40FFFFFFu); /* divider */
     for (int i = 0; i < g_menu_n; i++) {
         int32_t ry = g_menu_y + MENU_HDR_H + i * MENU_ROW_H;
-        if (i == g_menu_hover)
+        int hov = (i == g_menu_hover);
+        if (hov)
             fill_round_rect(buf, w, h, stride, g_menu_x + 4, ry + 1,
                             MENU_W - 8, MENU_ROW_H - 2, 4, COL_ACCENT);
+        /* hovered row gets white text on the accent fill for proper contrast */
         cz_text(buf, (int)stride, (int)w, (int)h,
                          g_menu_x + 14, ry + (MENU_ROW_H - FONT_H) / 2,
-                         g_menu_label[i], COL_TEXT);
+                         g_menu_label[i], hov ? 0xFFFFFFFFu : COL_TEXT);
     }
 }
 
@@ -2700,6 +2724,10 @@ static void render_stats_overlay(uint32_t *buf, uint32_t w, uint32_t h, uint32_t
                      bx + 6, by + 5 + 2 * FONT_H, l3, 0xFF7AC8FFu); /* blue-ish */
 }
 
+/* Alt+Tab selection overlay (body defined after the Alt+Tab state in the WM
+ * section; forward-declared here so composite() can call it). */
+static void render_alttab_overlay(uint32_t *buf, uint32_t w, uint32_t h, uint32_t stride);
+
 /* ====================================================================== */
 static void composite(uint32_t *buf, uint32_t w, uint32_t h, uint32_t stride,
                       int32_t cursor_x, int32_t cursor_y, long now) {
@@ -2728,6 +2756,9 @@ static void composite(uint32_t *buf, uint32_t w, uint32_t h, uint32_t stride,
     /* M6: snap preview over windows (below chrome) */
     render_snap_preview(buf, w, h, stride);
 
+    /* Alt+Tab selection highlight over the windows (below chrome) */
+    render_alttab_overlay(buf, w, h, stride);
+
     /* always-on-top chrome (drawn AFTER windows) */
     render_panel(buf, w, h, stride);
     render_dock(buf, w, h, stride, cursor_x, cursor_y);
@@ -2746,9 +2777,10 @@ static void composite(uint32_t *buf, uint32_t w, uint32_t h, uint32_t stride,
     /* modal About dialog above everything except the cursor */
     draw_about(buf, w, h, stride);
 
-    /* PERF: stats overlay above the chrome, beneath the cursor (so the cursor
-     * is never occluded by it). Cheap; gated by g_stats_on / COMPOSITOR_STATS. */
-    render_stats_overlay(buf, w, h, stride);
+    /* PERF: stats overlay above the chrome, beneath the cursor (so the cursor is
+     * never occluded). Guard the CALL on g_stats_on so the default (overlay off)
+     * pays zero function-call / string-format cost every composite. */
+    if (g_stats_on) render_stats_overlay(buf, w, h, stride);
 
     /* NOTE: the cursor is NOT drawn here. `back` is the cursor-less SCENE so the
      * frame loop can move the cursor (overlay it on the framebuffer at present
@@ -2943,17 +2975,22 @@ static void handle_create(const wl_req_create_t *req) {
         return;
     }
 
-    /* Validate client-supplied geometry BEFORE trusting it for SHM blits. The
-     * client's pixel buffer is w*h*4 bytes; a bogus (zero or larger-than-screen)
-     * w/h or an inconsistent stride would make every frame's blit read far past
-     * the end of the attached segment (OOB read of compositor memory). A window
-     * bigger than the display is invalid regardless. */
-    if (req->w == 0 || req->h == 0 || req->w > g_fb_w || req->h > g_fb_h) {
-        print("[COMP] rejecting create: bad geometry w="); print_num((long)req->w);
+    /* Validate client-supplied geometry BEFORE trusting it for SHM blits. A zero
+     * dimension is fatal (no buffer). A request LARGER than the display is NOT
+     * rejected -- an app may legitimately ask to open "maximized" without knowing
+     * the screen size -- instead we CLAMP the DISPLAY size (win->w/h) to the
+     * framebuffer while keeping the real buffer stride + SHM extent (buf_w/buf_h)
+     * so every blit still source-clamps within the mapped segment (no OOB read).
+     * The client re-reads its own win->w/h and reflows; on a screen at least as
+     * large as the request (the common case) nothing is clamped. */
+    if (req->w == 0 || req->h == 0) {
+        print("[COMP] rejecting create: zero geometry w="); print_num((long)req->w);
         print(" h="); print_num((long)req->h); print(" pid="); print_num(req->pid);
         print("\n");
         return;
     }
+    uint32_t disp_w = req->w > g_fb_w ? g_fb_w : req->w;
+    uint32_t disp_h = req->h > g_fb_h ? g_fb_h : req->h;
 
     window_t *win = &g_windows[slot];
     for (size_t i = 0; i < sizeof(*win); i++) ((char *)win)[i] = 0;
@@ -2962,12 +2999,13 @@ static void handle_create(const wl_req_create_t *req) {
     win->client_pid = req->pid;
     win->reply_qid  = -1;
     win->shm_id     = req->shm_id;
-    win->w          = req->w;
-    win->h          = req->h;
-    /* Force stride to the validated width (in pixels). All clients allocate a
-     * tightly-packed w*h*4 buffer, so stride == w. Deriving it from the
-     * client-supplied (and previously unvalidated) req->stride was an OOB-read
-     * vector; pin it to w instead. */
+    win->w          = disp_w;   /* DISPLAY size: clamped to the framebuffer    */
+    win->h          = disp_h;
+    /* Force stride to the REAL buffer width (in pixels). All clients allocate a
+     * tightly-packed req->w * req->h * 4 buffer, so stride == req->w; the blit
+     * source-clamps cols to min(win->w, buf_w) and rows to win->h, both within
+     * the segment. Deriving stride from the client-supplied (unvalidated)
+     * req->stride was an OOB-read vector; pin it to the real width instead. */
     win->stride     = req->w;
     /* Record the IMMUTABLE SHM extent. snap/maximize rewrite win->w/win->h to
      * the maximized drawable rect, but the client's SHM stays this size (wl-lite
@@ -3226,6 +3264,33 @@ static void alttab_raise(int slot) {
     if (slot < 0 || slot >= MAX_WINDOWS || !g_windows[slot].used) return;
     z_push_front(slot);                            /* raise visually + focus   */
     print("[SHELL] alt-tab focus win "); print_num(g_windows[slot].win_id); print("\n");
+}
+
+/* Alt+Tab selection overlay: while a cycle is live, glow an accent border around
+ * the window that WILL be focused on Alt-release + show its title centered, so
+ * the user can see what they're switching to. */
+static void render_alttab_overlay(uint32_t *buf, uint32_t w, uint32_t h, uint32_t stride) {
+    if (!g_alttab_live || g_mru_count == 0) return;
+    if (g_alttab_pos < 0 || g_alttab_pos >= g_mru_count) return;
+    int slot = (int)g_mru[g_alttab_pos];
+    if (slot < 0 || slot >= MAX_WINDOWS || !g_windows[slot].used) return;
+    window_t *win = &g_windows[slot];
+    /* enclose the FULL frame incl. its BORDER_W borders, with a small margin */
+    int32_t fx = win->x - BORDER_W - 3, fy = win->y - BORDER_W - 3;
+    int32_t fw = (int32_t)win->w + 2 * BORDER_W + 6;
+    int32_t fh = (int32_t)(TITLEBAR_H + win->h) + 2 * BORDER_W + 6;
+    stroke_rect(buf, w, h, stride, fx,     fy,     fw,     fh,     0xFF0A84FFu);
+    stroke_rect(buf, w, h, stride, fx - 1, fy - 1, fw + 2, fh + 2, 0x900A84FFu);
+    stroke_rect(buf, w, h, stride, fx - 2, fy - 2, fw + 4, fh + 4, 0x500A84FFu);
+    const char *t = win->title[0] ? win->title : "window";
+    int tl = 0; while (t[tl] && tl < WL_TITLE_MAX) tl++;
+    int pill_w = tl * FONT_W + 24;
+    int pill_h = FONT_H + 14;
+    int32_t pxc = (int32_t)w / 2 - pill_w / 2;
+    int32_t pyc = (int32_t)h / 2 - pill_h / 2;
+    blend_rect (buf, w, h, stride, pxc, pyc, pill_w, pill_h, 0xE0101418u);
+    stroke_rect(buf, w, h, stride, pxc, pyc, pill_w, pill_h, 0xFF0A84FFu);
+    cz_text(buf, (int)stride, (int)w, (int)h, pxc + 12, pyc + 7, t, 0xFFFFFFFFu);
 }
 
 /* Pick the next focusable (used, not minimized, not closing) slot when Alt+Tab

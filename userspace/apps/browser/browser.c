@@ -193,8 +193,8 @@ static int k_utoa(unsigned long v, char *out, int cap)
 /* =========================================================================
  * Geometry / colours
  * ========================================================================= */
-#define WIN_W      720
-#define WIN_H      520              /* +20 vs old 500 to fit the tab bar     */
+#define WIN_W      720              /* initial window width  (resizable)     */
+#define WIN_H      520              /* initial window height (resizable)     */
 
 #define TAB_BAR_H  20               /* tab strip at very top                 */
 #define CHROME_H   28               /* address-bar toolbar height            */
@@ -202,25 +202,66 @@ static int k_utoa(unsigned long v, char *out, int cap)
 #define STATUS_H   18               /* bottom status bar height              */
 #define CONTENT_X  6
 #define CONTENT_Y  (TOOLBAR_H + 4)
-#define CONTENT_W  (WIN_W - 2 * CONTENT_X)
-#define CONTENT_BOT (WIN_H - STATUS_H)
-#define CONTENT_H  (CONTENT_BOT - CONTENT_Y)
-#define VIS_ROWS   (CONTENT_H / FONT_H)
-#define CONTENT_COLS (CONTENT_W / FONT_W)   /* max chars per rendered line   */
+
+/* ---- Width/height-derived geometry is RUNTIME state so the page reflows on
+ * compositor resize (Maximize / snap). g_win_w / g_win_h cache the current
+ * win->w / win->h; recompute_geometry() rederives everything below from them.
+ * These identifiers are deliberately the same names the old macros used, so
+ * every existing use site is unchanged. recompute_geometry(WIN_W, WIN_H) is
+ * called once at startup so the values are valid before the first draw. */
+static int g_win_w = WIN_W;         /* current window width  (pixels)        */
+static int g_win_h = WIN_H;         /* current window height (pixels)        */
+static int CONTENT_W;               /* content area width    (pixels)        */
+static int CONTENT_BOT;             /* y where content ends / status begins  */
+static int CONTENT_H;               /* content area height   (pixels)        */
+static int VIS_ROWS;                /* visible text rows in the content area */
+static int CONTENT_COLS;            /* max chars per rendered line (wrap)    */
 
 /* address bar geometry (relative to TAB_BAR_H baseline) */
 #define ADDR_X     6
 #define ADDR_Y     (TAB_BAR_H + 4)
 #define GO_W       40
 #define GO_H       20
-#define ADDR_W     (WIN_W - ADDR_X - GO_W - 12 - 56)
+static int ADDR_W;                  /* address-bar width (stretches w/ window)*/
 #define ADDR_H     20
-#define BACK_X     (WIN_W - 52)
-#define GO_X       (ADDR_X + ADDR_W + 6)
+static int BACK_X;                  /* Back button x (anchored to right edge) */
+static int GO_X;                    /* Go button x (right of the address bar) */
 
 /* tab bar geometry */
 #define TAB_MAX_W  110              /* max label width in pixels             */
 #define TAB_PLUS_W 20               /* '+' new-tab button width              */
+
+/*
+ * recompute_geometry -- rederive all width/height-dependent layout metrics
+ * from a window size. Mirrors the original compile-time expressions exactly,
+ * so passing (WIN_W, WIN_H) reproduces the default layout byte-for-byte.
+ * Clamped so a tiny window can never produce a negative/zero content extent
+ * (every drawn pixel is additionally clipped to win->w/h by fill_rect /
+ * font_draw_*, so this is belt-and-suspenders against a degenerate size).
+ */
+static void recompute_geometry(int win_w, int win_h)
+{
+    if (win_w < 120) win_w = 120;   /* keep chrome buttons from colliding   */
+    if (win_h < (TOOLBAR_H + STATUS_H + FONT_H))
+        win_h = TOOLBAR_H + STATUS_H + FONT_H;
+    g_win_w = win_w;
+    g_win_h = win_h;
+
+    CONTENT_W   = win_w - 2 * CONTENT_X;
+    if (CONTENT_W < FONT_W) CONTENT_W = FONT_W;
+    CONTENT_BOT = win_h - STATUS_H;
+    CONTENT_H   = CONTENT_BOT - CONTENT_Y;
+    if (CONTENT_H < FONT_H) CONTENT_H = FONT_H;
+    VIS_ROWS    = CONTENT_H / FONT_H;
+    if (VIS_ROWS < 1) VIS_ROWS = 1;
+    CONTENT_COLS = CONTENT_W / FONT_W;
+    if (CONTENT_COLS < 1) CONTENT_COLS = 1;
+
+    ADDR_W = win_w - ADDR_X - GO_W - 12 - 56;
+    if (ADDR_W < FONT_W) ADDR_W = FONT_W;
+    BACK_X = win_w - 52;
+    GO_X   = ADDR_X + ADDR_W + 6;
+}
 
 #define COL_BG          0xFF101418u
 #define COL_CHROME      0xFF1B2230u
@@ -2319,13 +2360,14 @@ static void on_pointer(int x, int y, int buttons, int *prev_btn)
         if (!(*prev_btn & 1)) {
             /* tab bar click */
             if (y >= 0 && y < TAB_BAR_H) {
-                /* '+' button */
-                int px = (int)(WIN_W) - TAB_PLUS_W;
+                /* '+' button (use the LIVE width so the hit-test tracks the
+                 * render side, which uses bw == win->w, after a resize). */
+                int px = g_win_w - TAB_PLUS_W;
                 if (x >= px) {
                     tab_open_new();
                 } else {
                     /* tab label click */
-                    int usable = WIN_W - TAB_PLUS_W - 2;
+                    int usable = g_win_w - TAB_PLUS_W - 2;
                     int tw = (g_ntabs > 0) ? usable / g_ntabs : usable;
                     if (tw > TAB_MAX_W) tw = TAB_MAX_W;
                     if (tw < 20) tw = 20;
@@ -2365,6 +2407,10 @@ static void on_pointer(int x, int y, int buttons, int *prev_btn)
 void _start(void)
 {
     serial_puts("[BROWSER] starting\n");
+
+    /* seed the runtime layout geometry from the initial window size BEFORE any
+     * layout_render() runs (show_welcome / navigate word-wrap to CONTENT_COLS). */
+    recompute_geometry(WIN_W, WIN_H);
 
     /* zero global state */
     k_memset(g_tabs,    0, sizeof(g_tabs));
@@ -2422,6 +2468,20 @@ void _start(void)
                 on_key(a, b);
             } else if (kind == WL_EVENT_POINTER) {
                 on_pointer(a, b, c, &prev_btn);
+            } else if (kind == WL_EVENT_RESIZE) {
+                /* The library has ALREADY reallocated the buffer and updated
+                 * win->{w,h,stride,pixels}; we only rederive layout. Reflow the
+                 * content (word-wrap width + visible rows) to the new size and
+                 * re-wrap every tab so a later tab switch isn't stale. */
+                recompute_geometry((int)win->w, (int)win->h);
+                int save_atab = g_atab;
+                for (int ti = 0; ti < g_ntabs; ti++) {
+                    if (!g_tabs[ti].alive) continue;
+                    g_atab = ti;
+                    layout_render();       /* re-wraps T->render to CONTENT_COLS */
+                    clamp_scroll();        /* keep scroll within new VIS_ROWS    */
+                }
+                g_atab = save_atab;
             }
         }
 

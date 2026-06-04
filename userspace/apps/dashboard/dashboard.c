@@ -600,9 +600,17 @@ void _start(void)
 
     /* ---- Frame loop ---- */
     for (;;) {
-        /* Drain input events (mouse/keyboard -- not used, but drain anyway). */
+        /* Drain input events (mouse/keyboard -- not used, but drain anyway).
+         * On WL_EVENT_RESIZE the library has ALREADY reallocated the buffer and
+         * updated win->{w,h,stride,pixels}; we re-read win->w/h/pixels fresh
+         * every frame below, so the only cached value to refresh is the stride
+         * (spx). We recompute it before each render, which covers resize. */
         int kind, ea, eb, ec;
         while (wl_poll_event(win, &kind, &ea, &eb, &ec)) { /* discard */ }
+
+        /* Refresh stride-in-pixels each frame so a resize that changes the
+         * buffer pitch cannot push writes out of bounds. */
+        spx = win->stride / 4u;
 
         /* --- Data acquisition --- */
 

@@ -200,12 +200,28 @@ void game_present(game_t *g)
     u32 stride_px = ctx->win->stride / 4u;
     const u32 *src = ctx->bb;
     u32       *dst = ctx->win->pixels;
-    int w = ctx->w, h = ctx->h;
+    int gw = ctx->w, gh = ctx->h;
+    int ww = (int)ctx->win->w, wh = (int)ctx->win->h;
 
-    for (int y = 0; y < h; y++) {
-        const u32 *srow = src + y * w;
+    /* The game keeps its FIXED internal resolution (gw x gh). If the compositor
+     * gave us a LARGER surface (maximize / snap), letterbox: clear the whole
+     * surface to black so the margins around the top-left game image aren't
+     * stale garbage. Top-left anchoring keeps mouse/coord mapping consistent. */
+    if (ww > gw || wh > gh) {
+        for (int y = 0; y < wh; y++) {
+            u32 *drow = dst + y * stride_px;
+            for (int x = 0; x < ww; x++) drow[x] = 0xFF000000u;
+        }
+    }
+
+    /* Blit clamped to the actual surface so a SMALLER window can never overflow
+     * the compositor buffer (snap-to-half could be < the game's native size). */
+    int bw = gw < ww ? gw : ww;
+    int bh = gh < wh ? gh : wh;
+    for (int y = 0; y < bh; y++) {
+        const u32 *srow = src + y * gw;
         u32       *drow = dst + y * stride_px;
-        for (int x = 0; x < w; x++) {
+        for (int x = 0; x < bw; x++) {
             drow[x] = srow[x];
         }
     }

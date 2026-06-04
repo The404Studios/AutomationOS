@@ -21,11 +21,24 @@
 ipi_stats_t ipi_stats[MAX_CPUS];
 
 // Function call queue (per-CPU)
-// Stores POINTERS to caller's ipi_call_t (caller must ensure lifetime).
+// Stores call requests BY VALUE so they do NOT depend on the sender's stack
+// lifetime. This is what makes wait==false (fire-and-forget) safe: the sender
+// may return immediately and reclaim its stack frame while the target CPU is
+// still draining the queue.
+//   - func/data are copied into the queue and owned by it.
+//   - done_ptr points at the sender's done_count and is non-NULL ONLY when the
+//     sender is blocking in wait==true (and is therefore guaranteed alive until
+//     done_count is signalled). For wait==false there is no waiter, so done_ptr
+//     is NULL and the target performs no write-back to sender memory.
 // Queue indices are protected by call_queue_lock; the lock is the ordering authority.
 #define IPI_CALL_QUEUE_SIZE 16
 #define IPI_WAIT_TIMEOUT_MS 5000  // 5 seconds timeout for IPI completion
-static ipi_call_t* call_queue[MAX_CPUS][IPI_CALL_QUEUE_SIZE];
+typedef struct ipi_call_entry {
+    ipi_func_t func;       // Function to call
+    void*      data;       // Argument
+    uint32_t*  done_ptr;   // &sender->done_count (wait==true) or NULL (wait==false)
+} ipi_call_entry_t;
+static ipi_call_entry_t call_queue[MAX_CPUS][IPI_CALL_QUEUE_SIZE];
 static uint32_t call_queue_head[MAX_CPUS];  // Protected by call_queue_lock
 static uint32_t call_queue_tail[MAX_CPUS];  // Protected by call_queue_lock
 static spinlock_t call_queue_lock[MAX_CPUS];
@@ -158,8 +171,8 @@ void ipi_tlb_flush_page(void* addr) {
     ipi_tlb_flush_all();
 }
 
-// Enqueue function call
-static int enqueue_call(uint32_t cpu, ipi_call_t* call) {
+// Enqueue function call (copies the request BY VALUE into the queue)
+static int enqueue_call(uint32_t cpu, ipi_func_t func, void* data, uint32_t* done_ptr) {
     spin_lock(&call_queue_lock[cpu]);
 
     uint32_t next = (call_queue_tail[cpu] + 1) % IPI_CALL_QUEUE_SIZE;
@@ -169,15 +182,18 @@ static int enqueue_call(uint32_t cpu, ipi_call_t* call) {
         return -1;
     }
 
-    call_queue[cpu][call_queue_tail[cpu]] = call;  // Store pointer, not value
+    ipi_call_entry_t* slot = &call_queue[cpu][call_queue_tail[cpu]];
+    slot->func = func;          // Store value, not a pointer into caller stack
+    slot->data = data;
+    slot->done_ptr = done_ptr;
     call_queue_tail[cpu] = next;
 
     spin_unlock(&call_queue_lock[cpu]);
     return 0;
 }
 
-// Dequeue function call (returns POINTER to call, not a copy)
-static bool dequeue_call(uint32_t cpu, ipi_call_t** call) {
+// Dequeue function call (copies the entry out BY VALUE)
+static bool dequeue_call(uint32_t cpu, ipi_call_entry_t* out) {
     spin_lock(&call_queue_lock[cpu]);
 
     if (call_queue_head[cpu] == call_queue_tail[cpu]) {
@@ -186,7 +202,7 @@ static bool dequeue_call(uint32_t cpu, ipi_call_t** call) {
         return false;
     }
 
-    *call = call_queue[cpu][call_queue_head[cpu]];  // Return pointer
+    *out = call_queue[cpu][call_queue_head[cpu]];  // Copy out by value
     call_queue_head[cpu] = (call_queue_head[cpu] + 1) % IPI_CALL_QUEUE_SIZE;
 
     spin_unlock(&call_queue_lock[cpu]);
@@ -213,7 +229,11 @@ int ipi_call_function(uint32_t cpu, ipi_func_t func, void* data, bool wait) {
     call.ack_count = 0;
     call.target_mask = CPUMASK_CPU(cpu);
 
-    if (enqueue_call(cpu, &call) != 0) {
+    // Only pass a write-back pointer when the sender will block (wait==true) and
+    // is therefore guaranteed alive until done_count is signalled. For wait==false
+    // the queued copy owns everything and the target writes nothing back into this
+    // (about-to-be-reclaimed) stack frame.
+    if (enqueue_call(cpu, func, data, wait ? &call.done_count : NULL) != 0) {
         kprintf("[IPI] Function call queue full for CPU %u\n", cpu);
         return -1;
     }
@@ -258,6 +278,11 @@ int ipi_call_function_many(cpumask_t mask, ipi_func_t func, void* data, bool wai
 
     uint32_t target_count = 0;
 
+    // Only hand the target a write-back pointer when the sender will block
+    // (wait==true) and thus outlives the targets. For wait==false the queued
+    // copies are self-contained and nothing is written back to this stack frame.
+    uint32_t* done_ptr = wait ? &call.done_count : NULL;
+
     // Enqueue on all target CPUs
     uint32_t ncpus = __atomic_load_n(&smp_num_cpus, __ATOMIC_ACQUIRE);
     for (uint32_t cpu = 0; cpu < ncpus; cpu++) {
@@ -266,7 +291,7 @@ int ipi_call_function_many(cpumask_t mask, ipi_func_t func, void* data, bool wai
                 // Same CPU, call directly
                 func(data);
             } else {
-                if (enqueue_call(cpu, &call) == 0) {
+                if (enqueue_call(cpu, func, data, done_ptr) == 0) {
                     target_count++;
                 }
             }
@@ -388,14 +413,20 @@ void ipi_handle_function_call(void) {
     uint32_t cpu = cpu_id();
     ipi_stats[cpu].function_call_received++;
 
-    // Process all pending function calls
-    ipi_call_t* call;
-    while (dequeue_call(cpu, &call)) {
+    // Process all pending function calls. The entry is a by-value copy, so it is
+    // valid regardless of the sender's stack lifetime (fixes the wait==false
+    // use-after-return).
+    ipi_call_entry_t entry;
+    while (dequeue_call(cpu, &entry)) {
         // Execute function
-        call->func(call->data);
+        entry.func(entry.data);
 
-        // Mark as done on the SHARED object (not a throwaway copy)
-        __atomic_add_fetch(&call->done_count, 1, __ATOMIC_RELEASE);
+        // Signal completion only for waiting senders. done_ptr is NULL for
+        // fire-and-forget (wait==false), so we never write into a reclaimed
+        // sender stack frame.
+        if (entry.done_ptr) {
+            __atomic_add_fetch(entry.done_ptr, 1, __ATOMIC_RELEASE);
+        }
     }
 
     // Send EOI

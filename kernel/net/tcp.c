@@ -225,14 +225,20 @@ static void tcp_send_ack(sock_t* s) {
     tcp_xmit(s, TCP_ACK, s->snd_nxt, s->rcv_nxt, NULL, 0);
 }
 
-/* Append in-order stream bytes into the socket RX ring (drop overflow). */
-static void rx_ring_push(sock_t* s, const uint8_t* p, uint16_t n) {
+/* Append in-order stream bytes into the socket RX ring. Returns the number of
+ * bytes actually stored (< n if the ring filled). Callers MUST advance rcv_nxt
+ * by the returned count only -- advancing by the full n would ACK bytes we
+ * dropped, so the peer frees them and never retransmits (silent stream loss). */
+static uint16_t rx_ring_push(sock_t* s, const uint8_t* p, uint16_t n) {
+    uint16_t pushed = 0;
     for (uint16_t i = 0; i < n; i++) {
         if (s->rx_used >= SOCK_RXBUF_SIZE) break;   /* ring full -> drop */
         s->rxbuf[s->rx_tail] = p[i];
         s->rx_tail = (s->rx_tail + 1) % SOCK_RXBUF_SIZE;
         s->rx_used++;
+        pushed++;
     }
+    return pushed;
 }
 
 static uint32_t rx_ring_pop(sock_t* s, uint8_t* dst, uint32_t want) {
@@ -256,11 +262,13 @@ static void tcp_ooo_drain(sock_t* s) {
 
     /* Keep flushing as long as the saved segment becomes in-order. */
     while (slot->valid && slot->seq == s->rcv_nxt) {
-        uint16_t n = slot->len;
-        if (n > (uint16_t)(SOCK_RXBUF_SIZE - s->rx_used))
-            n = (uint16_t)(SOCK_RXBUF_SIZE - s->rx_used);
-        rx_ring_push(s, slot->data, n);
-        s->rcv_nxt += n;
+        /* Only consume the slot if the WHOLE segment fits. Partially pushing it
+         * and clearing the slot would drop the tail forever while advancing
+         * rcv_nxt past it (an ACK lie). If it can't fit yet, leave it valid and
+         * retry after the app drains the ring. */
+        uint16_t freeb = (uint16_t)(SOCK_RXBUF_SIZE - s->rx_used);
+        if (slot->len > freeb) break;
+        s->rcv_nxt += rx_ring_push(s, slot->data, slot->len);
         slot->valid = false;
         /* No more slots; a real implementation would loop over an array. */
     }
@@ -483,6 +491,20 @@ void tcp_input(uint32_t src_ip, uint32_t dst_ip,
             sock_t* base = sock_table_base();
             if (!base) return;
 
+            /* Enforce the listener's backlog before allocating. Count children
+             * still belonging to this listener (SYN_RCVD handshakes + queued
+             * established-but-unaccepted ones; accepted children have
+             * parent==NULL). Without this a SYN flood drains the shared 16-slot
+             * socket table and starves ALL networking process-wide. Dropping
+             * the SYN here lets a legitimate peer retransmit later. */
+            int pending = 0;
+            for (int i = 0; i < SOCK_MAX; i++)
+                if (base[i].used && base[i].parent == s) pending++;
+            int blcap = s->backlog;
+            if (blcap <= 0) blcap = 1;
+            if (blcap > SOCK_MAX) blcap = SOCK_MAX;
+            if (pending >= blcap) return;  /* backlog full: drop SYN */
+
             sock_t* child = NULL;
             int child_idx = -1;
             for (int i = 0; i < SOCK_MAX; i++) {
@@ -597,8 +619,9 @@ void tcp_input(uint32_t src_ip, uint32_t dst_ip,
 
             if (seq == s->rcv_nxt) {
                 /* --- In-order segment --- */
-                rx_ring_push(s, payload, payload_len);
-                s->rcv_nxt += payload_len;
+                /* Advance only by bytes actually buffered: if the ring is full
+                 * the dropped tail stays un-ACKed so the peer retransmits it. */
+                s->rcv_nxt += rx_ring_push(s, payload, payload_len);
                 /* Try to merge any previously-saved OOO segment. */
                 tcp_ooo_drain(s);
                 tcp_send_ack(s);
@@ -610,8 +633,7 @@ void tcp_input(uint32_t src_ip, uint32_t dst_ip,
                 const uint8_t* new_start = payload + trim;
                 uint16_t       new_len   = (uint16_t)(payload_len - trim);
                 if (new_len > 0) {
-                    rx_ring_push(s, new_start, new_len);
-                    s->rcv_nxt += new_len;
+                    s->rcv_nxt += rx_ring_push(s, new_start, new_len);
                     tcp_ooo_drain(s);
                 }
                 tcp_send_ack(s);

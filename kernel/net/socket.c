@@ -532,6 +532,32 @@ int sock_close(int s) {
         (so->state == TCP_ESTABLISHED || so->state == TCP_CLOSE_WAIT)) {
         tcp_close(so);   /* send FIN, drive a few polls */
     }
+
+    /* Unlink from listener bookkeeping BEFORE zeroing, so no accept_queue /
+     * accept_next dangles at this freed slot (else a later sock_accept would
+     * hand back a wiped or reused socket). */
+    if (so->parent) {
+        /* We are a child possibly still queued on the parent's accept_queue. */
+        sock_t* lst = so->parent;
+        if (lst->accept_queue == so) {
+            lst->accept_queue = so->accept_next;
+        } else {
+            for (sock_t* it = lst->accept_queue; it; it = it->accept_next) {
+                if (it->accept_next == so) { it->accept_next = so->accept_next; break; }
+            }
+        }
+    }
+    if (so->state == TCP_LISTEN && so->accept_queue) {
+        /* Closing a listener: orphan its queued children so none points back
+         * at this freed slot. */
+        for (sock_t* c = so->accept_queue; c; ) {
+            sock_t* nx = c->accept_next;
+            c->parent = NULL;
+            c->accept_next = NULL;
+            c = nx;
+        }
+    }
+
     memset(so, 0, sizeof(*so));
     return SOCK_OK;
 }

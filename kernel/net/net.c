@@ -544,7 +544,11 @@ static void ipv4_input(const eth_hdr_t* eh, const uint8_t* ip_start,
 
     /* If fragmented, reassemble. */
     if (is_fragment) {
-        uint8_t reasm_buf[FRAG_BUF_SIZE];
+        /* FRAG_BUF_SIZE is 64KB -- WAY past the 8KB/16KB kernel stack, so this
+         * MUST NOT be a stack array (any fragmented packet would smash the
+         * stack). Static .bss instead; the net RX path is single-threaded on
+         * this uniprocessor kernel, same assumption as net.frags et al. */
+        static uint8_t reasm_buf[FRAG_BUF_SIZE];
         uint16_t reasm_len = 0;
         int r = ip_reassemble(ip, ip_avail, reasm_buf, &reasm_len);
         if (r < 0) return; /* error */
@@ -563,7 +567,13 @@ static void ipv4_input(const eth_hdr_t* eh, const uint8_t* ip_start,
     if (ip->proto == IPPROTO_ICMP) {
         uint16_t icmp_len = tot - ihl;
         if (icmp_len < sizeof(icmp_hdr_t)) return;
-        const icmp_hdr_t* ic = (const icmp_hdr_t*)(ip_start + ihl);
+        /* Derive the ICMP header from `ip`, NOT ip_start: after reassembly `ip`
+         * points at reasm_buf while ip_start still points at the small original
+         * fragment. Reading icmp_len (reassembled-length) bytes from ip_start
+         * would read past the 1518-byte NIC buffer (OOB read leaked on the wire)
+         * and parse stale first-fragment bytes. On the non-fragment path
+         * ip == ip_start so this is unchanged. */
+        const icmp_hdr_t* ic = (const icmp_hdr_t*)((const uint8_t*)ip + ihl);
 
         if (ic->type == ICMP_ECHO_REPLY) {
             net.got_echo_reply = true;

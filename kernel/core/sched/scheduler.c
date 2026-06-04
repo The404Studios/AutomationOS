@@ -1393,6 +1393,16 @@ void schedule(void) {
             // Only process in the system - continue with a fresh quantum
             current->time_slice = priority_time_slice(current->priority);
             current->state = PROCESS_RUNNING;
+            // Release the EXTRA reference scheduler_add_process() took above and
+            // scheduler_pick_next() then "transferred" back to us: we are NOT
+            // switching away (current keeps running), so the transferred ref is
+            // surplus. Without this, ref_count climbs by one for every expired
+            // quantum a sole process runs (~100x/s under PREEMPT) -> the PCB,
+            // 8KB kernel stack and address space never reach ref 0 / get freed,
+            // and the PID is never reclaimed. Mirrors the process_unref(next) on
+            // schedule_from_irq's no-switch path. Safe re BUG-006: NO context
+            // switch happens here, so `current` and locals are still valid.
+            process_unref(current);
 #ifndef SCHEDULER_QUIET
             kprintf("[SCHEDULER] Only process in system, continuing '%s' (PID %d) with fresh time slice\n",
                     current->name, current->pid);

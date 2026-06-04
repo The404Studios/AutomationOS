@@ -896,6 +896,16 @@ int64_t sys_yield(uint64_t arg1, uint64_t arg2, uint64_t arg3,
         // (e.g. the never-yielding CPU burners) instead of starving them.
         current->resume_mode = RESUME_CRETURN;
         cooperative_switch_to(current, next);
+    } else if (next == current) {
+        // pick_next handed back current itself (sole runnable task), carrying the
+        // EXTRA reference scheduler_yield_requeue() took (pick_next "transfers" it
+        // to the caller). We are NOT switching away, so that ref is surplus --
+        // release it. Without this, every self-yield leaks: ref_count never
+        // returns to its running baseline, so the PCB / 8KB kernel stack / address
+        // space are never freed and the PID is never reclaimed. Mirrors the
+        // process_unref on schedule_from_irq's no-switch path. Safe re BUG-006:
+        // no context switch occurred here, so `current` is still valid.
+        process_unref(current);
     }
 
     return ESUCCESS;

@@ -1428,20 +1428,22 @@ static int ramfs_close(vfs_file_t* file) {
  * RAMFS: Seek in file
  */
 static off_t ramfs_lseek(vfs_file_t* file, off_t offset, int whence) {
+    /* Validate before assigning: this op-specific lseek bypasses vfs_lseek's own
+     * guards, so without these checks a negative/underflowing seek would store a
+     * near-UINT64_MAX value into the uint64 file->offset and corrupt later
+     * read/write/page-cache offset math. Mirrors the vfs_lseek default path. */
+    uint64_t base;
     switch (whence) {
-        case SEEK_SET:
-            file->offset = offset;
-            break;
-        case SEEK_CUR:
-            file->offset += offset;
-            break;
-        case SEEK_END:
-            file->offset = file->inode->size + offset;
-            break;
-        default:
-            return -1;
+        case SEEK_SET: base = 0; break;
+        case SEEK_CUR: base = file->offset; break;
+        case SEEK_END: base = file->inode->size; break;
+        default:       return -1;
     }
-    return file->offset;
+    if (offset < 0 && (uint64_t)(-offset) > base) {
+        return -1;   /* would seek before byte 0 */
+    }
+    file->offset = base + (uint64_t)offset;
+    return (off_t)file->offset;
 }
 
 /**

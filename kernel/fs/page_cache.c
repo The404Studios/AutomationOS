@@ -42,14 +42,16 @@ static page_cache_entry_t* cache_entry_alloc(void) {
         return NULL;
     }
 
+    /* Zero the struct FIRST, then allocate page_data. The previous order
+     * (alloc page_data, then memset the whole struct) clobbered page_data back
+     * to NULL and leaked the 4KB buffer, so every entry came back with
+     * page_data == NULL -> NULL kernel write in cache_read_page/page_cache_write. */
+    memset(entry, 0, sizeof(page_cache_entry_t));
     entry->page_data = kmalloc(PAGE_CACHE_SIZE);
     if (!entry->page_data) {
         kfree(entry);
         return NULL;
     }
-
-    memset(entry, 0, sizeof(page_cache_entry_t));
-    entry->page_data = entry->page_data; /* Already allocated above */
     entry->ref_count = 1;
     return entry;
 }

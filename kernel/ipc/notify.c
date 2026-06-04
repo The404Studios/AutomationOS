@@ -117,7 +117,16 @@ int notify_poll(void *user_buf, uint32_t max)
     }
 
     notify_entry_t *slot = &g_queue[g_head];
-    uint32_t copy_len = (slot->len < max) ? slot->len : max;
+    /* Don't truncate-and-destroy: the NUL-delimited "title\0body\0" payload
+     * can't survive a mid-string chop, and dequeuing a truncated entry would
+     * lose data AND hand back a non-NUL-terminated buffer (consumer over-read).
+     * If the caller's buffer is too small, reject WITHOUT dequeuing so it can
+     * retry larger. In-tree consumers pass a full NOTIFY_PAYLOAD_MAX buffer. */
+    if (max < slot->len) {
+        spin_unlock(&g_lock);
+        return EINVAL;
+    }
+    uint32_t copy_len = slot->len;
 
     /* Snapshot into a local buffer so we can release the lock before the
      * potentially-faulting copy_to_user call. */

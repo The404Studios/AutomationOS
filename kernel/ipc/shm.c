@@ -710,8 +710,7 @@ int64_t sys_shmctl(uint64_t shmid, uint64_t cmd, uint64_t buf,
     (void)arg4; (void)arg5; (void)arg6;
     int id = (int)shmid;
     int command = (int)cmd;
-    void* buffer = (void*)buf;
-    (void)buffer;
+    void* buffer = (void*)buf;   /* IPC_STAT out-buffer (struct shmid_ds*) */
     process_t* current = process_get_current();
     if (!current) {
         return IPC_EINVAL;
@@ -785,9 +784,46 @@ int64_t sys_shmctl(uint64_t shmid, uint64_t cmd, uint64_t buf,
             }
             return IPC_SUCCESS;
 
-        case IPC_STAT:
+        case IPC_STAT: {
+            /* Fill the caller's struct shmid_ds. Snapshot every field UNDER the
+             * lock, drop the lock, THEN copy_to_user (which walks the page table
+             * and can fault -- must not run under shm_lock, per this file's
+             * lock-ordering discipline). Layout mirrors userspace struct
+             * shmid_ds (userspace/libc/ipc.h) field-for-field. This was a no-op
+             * stub before, so the segment size never reached userspace -- the
+             * compositor needs it to reject a client buffer extent that exceeds
+             * the actual segment (else it blits past the mapped shm). */
+            struct {
+                unsigned int  shm_perm_uid;
+                unsigned int  shm_perm_gid;
+                unsigned int  shm_perm_mode;
+                unsigned long shm_segsz;
+                unsigned long shm_atime;
+                unsigned long shm_dtime;
+                unsigned long shm_ctime;
+                unsigned int  shm_cpid;
+                unsigned int  shm_lpid;
+                unsigned int  shm_nattch;
+            } st;
+            st.shm_perm_uid  = seg->creator_uid;
+            st.shm_perm_gid  = seg->creator_gid;
+            st.shm_perm_mode = seg->mode;
+            st.shm_segsz     = (unsigned long)seg->size;
+            st.shm_atime     = (unsigned long)seg->attach_time;
+            st.shm_dtime     = (unsigned long)seg->detach_time;
+            st.shm_ctime     = (unsigned long)seg->create_time;
+            st.shm_cpid      = seg->owner_pid;
+            st.shm_lpid      = seg->owner_pid;
+            st.shm_nattch    = seg->attach_count;
             spin_unlock(&shm_lock);
+            if (!buffer) {
+                return IPC_EINVAL;
+            }
+            if (copy_to_user(buffer, &st, sizeof(st)) != COPY_SUCCESS) {
+                return IPC_EFAULT;
+            }
             return IPC_SUCCESS;
+        }
 
         case IPC_SET:
             spin_unlock(&shm_lock);

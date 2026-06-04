@@ -112,6 +112,8 @@ typedef long                int64_t;    /* match <stdint.h> __INT64_TYPE__  (LP6
 #define SYS_SPAWN         16
 #define SYS_SHMAT         19
 #define SYS_SHMDT         20
+#define SYS_SHMCTL        21
+#define IPC_STAT      0x2000     /* shmctl: get segment status (size) */
 #define SYS_MSGGET        22
 #define SYS_MSGSND        23
 #define SYS_MSGRCV        24
@@ -2967,6 +2969,21 @@ static void clamp_window(window_t *win) {
     if (max_x >= 4 && win->x > max_x) win->x = max_x;
 }
 
+/* Query an shm segment's byte size via SHMCTL IPC_STAT. Returns the size, or 0
+ * if it can't be determined (caller treats 0 as "reject the buffer"). The struct
+ * layout mirrors the kernel's IPC_STAT fill (= userspace struct shmid_ds). */
+static uint64_t shm_segment_size(int shm_id) {
+    struct {
+        unsigned int  shm_perm_uid, shm_perm_gid, shm_perm_mode;
+        unsigned long shm_segsz, shm_atime, shm_dtime, shm_ctime;
+        unsigned int  shm_cpid, shm_lpid, shm_nattch;
+    } ds;
+    ds.shm_segsz = 0;
+    long r = sc6(SYS_SHMCTL, (long)shm_id, IPC_STAT, (long)&ds, 0, 0, 0);
+    if (r != 0) return 0;
+    return (uint64_t)ds.shm_segsz;
+}
+
 static void handle_create(const wl_req_create_t *req) {
     int slot = find_free_slot();
     if (slot < 0) {
@@ -3027,8 +3044,24 @@ static void handle_create(const wl_req_create_t *req) {
     /* zero-copy attach: map the client's shm segment into THIS process. */
     long addr = sc6(SYS_SHMAT, (long)req->shm_id, 0, 0, 0, 0, 0);
     if (addr > 0) {
-        win->shm_vaddr = (uint64_t)addr;
-        win->pixels    = (uint32_t *)addr;
+        /* Validate the client's claimed buffer extent (w*h*4, stride pinned to
+         * w) fits the ACTUAL shm segment. A malicious client can shmget a tiny
+         * segment yet claim a huge w*h, making the compositor blit read past the
+         * mapping (fault = desktop-wide DoS, or neighbour-memory info leak). */
+        uint64_t need = (uint64_t)req->w * (uint64_t)req->h * 4u;
+        uint64_t have = shm_segment_size(req->shm_id);
+        if (have == 0 || need > have) {
+            print("[COMP] rejecting create: buf "); print_num((long)need);
+            print(" > shm "); print_num((long)have);
+            print(" shm_id="); print_num(req->shm_id); print("\n");
+            sc6(SYS_SHMDT, addr, 0, 0, 0, 0, 0);
+            win->shm_vaddr = 0;
+            win->pixels    = 0;
+            win->shm_id    = 0;   /* don't let handle_commit re-attach the rejected segment */
+        } else {
+            win->shm_vaddr = (uint64_t)addr;
+            win->pixels    = (uint32_t *)addr;
+        }
     } else {
         win->shm_vaddr = 0;
         win->pixels    = 0;
@@ -3072,7 +3105,20 @@ static void handle_commit(const wl_req_commit_t *req) {
     win->dirty = 1;
     if (!win->pixels && win->shm_id > 0) {
         long addr = sc6(SYS_SHMAT, (long)win->shm_id, 0, 0, 0, 0, 0);
-        if (addr > 0) { win->shm_vaddr = (uint64_t)addr; win->pixels = (uint32_t *)addr; }
+        if (addr > 0) {
+            /* Re-validate the buffer extent against the segment on this
+             * (re)attach too -- a rejected/oversized create must not sneak its
+             * too-small segment in via a later commit (defense-in-depth on top
+             * of clearing shm_id at reject time). buf_w/buf_h = claimed extent. */
+            uint64_t need = (uint64_t)win->buf_w * (uint64_t)win->buf_h * 4u;
+            uint64_t have = shm_segment_size(win->shm_id);
+            if (have == 0 || need > have) {
+                sc6(SYS_SHMDT, addr, 0, 0, 0, 0, 0);
+            } else {
+                win->shm_vaddr = (uint64_t)addr;
+                win->pixels    = (uint32_t *)addr;
+            }
+        }
     }
     (void)req;
 }
@@ -3133,6 +3179,19 @@ static void handle_resize(const wl_req_resize_t *req) {
         print("[COMP] resize shmat FAILED shm_id="); print_num(req->shm_id);
         print(" r="); print_num(addr); print("\n");
         return;                                  /* keep the old buffer */
+    }
+    /* Validate the new buffer extent fits the new segment before adopting it
+     * (same OOB-blit protection as handle_create). On failure, detach the new
+     * mapping and keep the old buffer. */
+    {
+        uint64_t need = (uint64_t)req->w * (uint64_t)req->h * 4u;
+        uint64_t have = shm_segment_size(req->shm_id);
+        if (have == 0 || need > have) {
+            print("[COMP] rejecting resize: buf "); print_num((long)need);
+            print(" > shm "); print_num((long)have); print("\n");
+            sc6(SYS_SHMDT, addr, 0, 0, 0, 0, 0);
+            return;                              /* keep the old buffer */
+        }
     }
     uint64_t old_vaddr = win->shm_vaddr;
     win->shm_id    = req->shm_id;

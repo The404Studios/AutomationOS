@@ -495,9 +495,29 @@ static vfs_inode_t* vfs_lookup_component(vfs_inode_t* dir, const char* name, siz
  */
 #define MAX_SYMLINK_DEPTH 8
 
+/* cleanup helper: auto-kfree a heap path buffer on scope exit. The syscall->VFS
+ * path-lookup/mkdir/rmdir chain stacks several 4096-byte path buffers; on the
+ * 8KB kernel stack (no guard page) that overflows, so these buffers are
+ * heap-allocated and freed via __attribute__((cleanup)) on every return path. */
+static inline void free_path_buf(char** p) { if (*p) kfree(*p); }
+
+static vfs_inode_t* vfs_path_lookup_rec(const char* path, int rec_depth);
+
 vfs_inode_t* vfs_path_lookup(const char* path) {
+    return vfs_path_lookup_rec(path, 0);
+}
+
+/* Internal recursive worker. rec_depth bounds symlink-chain recursion ACROSS
+ * calls: the public wrapper passes 0 and the absolute-symlink case recurses with
+ * rec_depth+1. (The old code recursed via vfs_path_lookup() and reset the
+ * per-walk symlink_depth to 0 each call, so an absolute-symlink cycle
+ * /a->/b->/a recursed without bound and blew the kernel stack -- now capped.) */
+static vfs_inode_t* vfs_path_lookup_rec(const char* path, int rec_depth) {
     if (!path || path[0] != '/') {
         return NULL;
+    }
+    if (rec_depth > MAX_SYMLINK_DEPTH) {
+        return NULL;  // symlink chain too deep (global recursion bound)
     }
 
     // Find mount point
@@ -591,8 +611,17 @@ vfs_inode_t* vfs_path_lookup(const char* path) {
                 return NULL;
             }
 
-            // Copy symlink target (ensure null-termination)
-            char target[VFS_MAX_PATH];
+            // Copy symlink target (heap-allocated, auto-freed on block/return
+            // exit -- keeps this recursive frame's 4096B off the 8KB stack).
+            char* target __attribute__((cleanup(free_path_buf))) = (char*)kmalloc(VFS_MAX_PATH);
+            if (!target) {
+                vfs_inode_put(next);
+                vfs_inode_put(current);
+                if (parent) {
+                    vfs_inode_put(parent);
+                }
+                return NULL;
+            }
             size_t target_len = next->size;
             if (target_len >= VFS_MAX_PATH) {
                 target_len = VFS_MAX_PATH - 1;
@@ -606,8 +635,8 @@ vfs_inode_t* vfs_path_lookup(const char* path) {
             // Resolve the symlink target
             vfs_inode_t* symlink_target = NULL;
             if (target[0] == '/') {
-                // Absolute symlink: resolve from root
-                symlink_target = vfs_path_lookup(target);
+                // Absolute symlink: resolve from root (depth-bounded recursion)
+                symlink_target = vfs_path_lookup_rec(target, rec_depth + 1);
             } else {
                 // Relative symlink: resolve from current directory
                 // Build full path: current directory + '/' + target
@@ -1193,8 +1222,11 @@ int vfs_mount(const char* source, const char* target, const char* fstype) {
  * Create directory (single level)
  */
 int vfs_mkdir(const char* path, uint32_t mode) {
-    // Find parent directory
-    char parent_path[VFS_MAX_PATH];
+    // Find parent directory (heap buffer, auto-freed; off the 8KB kernel stack)
+    char* parent_path __attribute__((cleanup(free_path_buf))) = (char*)kmalloc(VFS_MAX_PATH);
+    if (!parent_path) {
+        return -1;
+    }
     const char* name;
 
     // Find last slash
@@ -1250,7 +1282,12 @@ int vfs_mkdir(const char* path, uint32_t mode) {
  * Create directory recursively
  */
 int vfs_mkdir_recursive(const char* path, uint32_t mode) {
-    char tmp[VFS_MAX_PATH];
+    // Heap buffer, auto-freed on every return (incl. `return vfs_mkdir(tmp,...)`
+    // below: tmp is valid during the call, freed after on scope exit).
+    char* tmp __attribute__((cleanup(free_path_buf))) = (char*)kmalloc(VFS_MAX_PATH);
+    if (!tmp) {
+        return -1;
+    }
     char* p = NULL;
     size_t len;
 
@@ -1556,7 +1593,10 @@ static vfs_inode_t* vfs_create_file_inode(const char* path, uint32_t mode) {
         return NULL;  // trailing slash - not a file
     }
 
-    char parent_path[VFS_MAX_PATH];
+    char* parent_path __attribute__((cleanup(free_path_buf))) = (char*)kmalloc(VFS_MAX_PATH);
+    if (!parent_path) {
+        return NULL;
+    }
     size_t parent_len = (size_t)(last_slash - path);
     if (parent_len == 0) {
         parent_path[0] = '/';
@@ -1988,8 +2028,11 @@ int vfs_rmdir(const char* path) {
         return -1;
     }
 
-    // Find parent directory and directory name
-    char parent_path[VFS_MAX_PATH];
+    // Find parent directory and directory name (heap buffer, auto-freed)
+    char* parent_path __attribute__((cleanup(free_path_buf))) = (char*)kmalloc(VFS_MAX_PATH);
+    if (!parent_path) {
+        return -1;
+    }
     const char* dirname;
 
     // Find last slash

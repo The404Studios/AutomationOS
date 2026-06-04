@@ -10,6 +10,12 @@
 #include "../include/string.h"
 #include "../include/syscall.h"
 
+// cleanup helper: auto-kfree a heap path buffer on scope exit -- keeps the
+// 4096-byte path buffers in vfs_unlink/vfs_rename OFF the 8KB kernel stack
+// (vfs_rename had TWO = 8KB, overflowing on its own even after sys_rename was
+// heap-allocated). kfree(NULL) is safe.
+static inline void free_path_buf(char** p) { if (*p) kfree(*p); }
+
 // Directory handle structure
 typedef struct {
     vfs_inode_t* inode;
@@ -234,8 +240,11 @@ int vfs_unlink(const char* path) {
         return VFS_ERR_INVAL;
     }
 
-    // Find parent directory and filename
-    char parent_path[VFS_MAX_PATH];
+    // Find parent directory and filename (heap buffer, auto-freed)
+    char* parent_path __attribute__((cleanup(free_path_buf))) = (char*)kmalloc(VFS_MAX_PATH);
+    if (!parent_path) {
+        return VFS_ERR_INVAL;
+    }
     const char* filename;
 
     // Find last slash
@@ -326,8 +335,11 @@ int vfs_rename(const char* oldpath, const char* newpath) {
         return VFS_ERR_INVAL;
     }
 
-    // Parse old path
-    char old_parent_path[VFS_MAX_PATH];
+    // Parse old path (heap buffer, auto-freed)
+    char* old_parent_path __attribute__((cleanup(free_path_buf))) = (char*)kmalloc(VFS_MAX_PATH);
+    if (!old_parent_path) {
+        return VFS_ERR_INVAL;
+    }
     const char* old_filename;
     const char* old_last_slash = NULL;
 
@@ -356,8 +368,11 @@ int vfs_rename(const char* oldpath, const char* newpath) {
         return VFS_ERR_INVAL;
     }
 
-    // Parse new path
-    char new_parent_path[VFS_MAX_PATH];
+    // Parse new path (heap buffer, auto-freed)
+    char* new_parent_path __attribute__((cleanup(free_path_buf))) = (char*)kmalloc(VFS_MAX_PATH);
+    if (!new_parent_path) {
+        return VFS_ERR_INVAL;
+    }
     const char* new_filename;
     const char* new_last_slash = NULL;
 

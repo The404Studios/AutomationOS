@@ -19,6 +19,14 @@
 // External serial driver functions
 extern void serial_write(const char* str, size_t len);
 
+// cleanup helper for heap-allocated path buffers. A 4096-byte path buffer on
+// the kernel stack, combined with the VFS chain's own buffers (vfs_mkdir_recursive
+// -> vfs_mkdir -> vfs_path_lookup, each 4096B), overflows the 8KB kernel stack
+// (no guard page) -- a ring-3 mkdir of a nested path is enough. Path-taking
+// handlers therefore heap-allocate; __attribute__((cleanup)) auto-frees on EVERY
+// return path so we never leak. kfree(NULL) is safe.
+static inline void free_path_buf(char** p) { if (*p) kfree(*p); }
+
 // SYS_EXIT - Terminate calling process
 int64_t sys_exit(uint64_t status, uint64_t arg2, uint64_t arg3,
                  uint64_t arg4, uint64_t arg5, uint64_t arg6) {
@@ -642,7 +650,10 @@ int64_t sys_open(uint64_t path, uint64_t flags, uint64_t mode,
     }
 
     // Copy path from user space
-    char kernel_path[MAX_PATH_LEN];
+    char* kernel_path __attribute__((cleanup(free_path_buf))) = (char*)kmalloc(MAX_PATH_LEN);
+    if (!kernel_path) {
+        return ENOMEM;
+    }
     if (copy_user_string(kernel_path, (const void*)path, MAX_PATH_LEN) != COPY_SUCCESS) {
         return EFAULT;
     }
@@ -1123,7 +1134,10 @@ int64_t sys_opendir(uint64_t path, uint64_t arg2, uint64_t arg3,
     }
 
     // Copy path from userspace
-    char kernel_path[MAX_PATH_LEN];
+    char* kernel_path __attribute__((cleanup(free_path_buf))) = (char*)kmalloc(MAX_PATH_LEN);
+    if (!kernel_path) {
+        return ENOMEM;
+    }
     if (copy_user_string(kernel_path, (const void*)path, MAX_PATH_LEN) != COPY_SUCCESS) {
         return EFAULT;
     }
@@ -1193,7 +1207,10 @@ int64_t sys_stat(uint64_t path, uint64_t buf_ptr, uint64_t arg3,
     }
 
     // Copy path from userspace
-    char kernel_path[MAX_PATH_LEN];
+    char* kernel_path __attribute__((cleanup(free_path_buf))) = (char*)kmalloc(MAX_PATH_LEN);
+    if (!kernel_path) {
+        return ENOMEM;
+    }
     if (copy_user_string(kernel_path, (const void*)path, MAX_PATH_LEN) != COPY_SUCCESS) {
         return EFAULT;
     }
@@ -1228,7 +1245,10 @@ int64_t sys_unlink(uint64_t path, uint64_t arg2, uint64_t arg3,
     }
 
     // Copy path from userspace
-    char kernel_path[MAX_PATH_LEN];
+    char* kernel_path __attribute__((cleanup(free_path_buf))) = (char*)kmalloc(MAX_PATH_LEN);
+    if (!kernel_path) {
+        return ENOMEM;
+    }
     if (copy_user_string(kernel_path, (const void*)path, MAX_PATH_LEN) != COPY_SUCCESS) {
         return EFAULT;
     }
@@ -1299,7 +1319,10 @@ int64_t sys_mkdir(uint64_t path, uint64_t mode, uint64_t arg3,
         return EFAULT;
     }
 
-    char kernel_path[MAX_PATH_LEN];
+    char* kernel_path __attribute__((cleanup(free_path_buf))) = (char*)kmalloc(MAX_PATH_LEN);
+    if (!kernel_path) {
+        return ENOMEM;
+    }
     if (copy_user_string(kernel_path, (const void*)path, MAX_PATH_LEN) != COPY_SUCCESS) {
         return EFAULT;
     }
@@ -1327,7 +1350,10 @@ int64_t sys_truncate(uint64_t path, uint64_t length, uint64_t arg3,
     }
 
     // Copy path from userspace
-    char kernel_path[MAX_PATH_LEN];
+    char* kernel_path __attribute__((cleanup(free_path_buf))) = (char*)kmalloc(MAX_PATH_LEN);
+    if (!kernel_path) {
+        return ENOMEM;
+    }
     if (copy_user_string(kernel_path, (const void*)path, MAX_PATH_LEN) != COPY_SUCCESS) {
         return EFAULT;
     }

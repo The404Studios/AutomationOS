@@ -119,19 +119,24 @@ void panel_topbar(Ide* a, Canvas* cv, Rect r) {
         int chip_w  = label_w + n * GFX_FW + GFX_FW;   /* digits + '%' */
         /* sit just left of the [+ NEW] button (with a gap). */
         int chip_x  = chr_new_x(r) - GFX_FW - chip_w;
-        if (chip_x < r.x + PAD) chip_x = r.x + PAD;
 
-        int clip_x = r.x + PAD;
-        int clip_w = r.w - 2 * PAD;
-        if (clip_w < 0) clip_w = 0;
+        /* Only draw the chip if it FITS to the left of [+ NEW] without crossing
+         * the tabs region; when zoomed-in on a narrow bar it simply hides (the
+         * coherence score is also shown in the inspector) rather than painting
+         * over the [+ NEW] button. */
+        if (chip_x >= r.x + PAD) {
+            int clip_x = chip_x;
+            int clip_w = (chr_new_x(r) - GFX_FW) - chip_x;   /* bounded to the gap */
+            if (clip_w < 0) clip_w = 0;
 
-        uint32_t cc = chr_coh_color(coh);
-        int cx = chip_x;
-        gfx_text_clip(cv, cx, ty, "COH", TH_TEXT_DIM, clip_x, clip_w);
-        cx += gfx_textw("COH") + GFX_FW;
-        gfx_text_clip(cv, cx, ty, num, cc, clip_x, clip_w);
-        cx += n * GFX_FW;
-        gfx_text_clip(cv, cx, ty, "%", cc, clip_x, clip_w);
+            uint32_t cc = chr_coh_color(coh);
+            int cx = chip_x;
+            gfx_text_clip(cv, cx, ty, "COH", TH_TEXT_DIM, clip_x, clip_w);
+            cx += gfx_textw("COH") + GFX_FW;
+            gfx_text_clip(cv, cx, ty, num, cc, clip_x, clip_w);
+            cx += n * GFX_FW;
+            gfx_text_clip(cv, cx, ty, "%", cc, clip_x, clip_w);
+        }
     }
 }
 

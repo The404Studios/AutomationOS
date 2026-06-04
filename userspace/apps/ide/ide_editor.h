@@ -71,4 +71,21 @@ void ide_editor_duplicate_line(struct Ide* a);
 /* Delete the current line (Ctrl+Shift+K). */
 void ide_editor_delete_line(struct Ide* a);
 
+/* Clipboard / selection ops. These are driven by Ctrl+A/C/X/V routed through the
+ * IDE's central chord handler (handle_ctrl_chord in ide.c), since the editor's
+ * own key entry point is invoked with ctrl already stripped. Copy/cut with no
+ * active selection act on the whole current line (VS Code style). */
+void ide_editor_select_all(struct Ide* a);
+void ide_editor_copy(struct Ide* a);
+void ide_editor_cut(struct Ide* a);
+void ide_editor_paste(struct Ide* a);
+
+/* Find `needle` after the caret (wraps); selects+scrolls to the match. Driven by
+ * Ctrl+F's prompt in ide.c. Returns 1 if found. */
+int ide_editor_find(struct Ide* a, const char* needle, int dir);
+
+/* Replace ALL occurrences of `needle` with `repl`; returns the count replaced.
+ * Driven by Ctrl+H's replace prompt in ide.c. */
+int ide_editor_replace_all(struct Ide* a, const char* needle, const char* repl);
+
 #endif /* IDE_EDITOR_H */

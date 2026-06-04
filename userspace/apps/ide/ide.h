@@ -126,6 +126,13 @@ typedef struct Ide {
     int       goto_active;          /* 1 = go-to-line prompt active */
     char      goto_buf[8];          /* line number input buffer (max 7 digits + NUL) */
     int       goto_len;             /* current length of goto_buf */
+    int       find_active;          /* 1 = find (Ctrl+F) prompt active */
+    char      find_buf[96];         /* search query */
+    int       find_len;             /* current length of find_buf */
+    int       find_replace;         /* 1 = replace mode (Ctrl+H): two fields */
+    int       find_repl_focus;      /* 0 = editing query, 1 = editing replacement */
+    char      repl_buf[96];         /* replacement text */
+    int       repl_len;             /* current length of repl_buf */
     int       win_w, win_h;         /* last known window size (responsive)*/
 
     /* layout rects (recomputed each frame by ide.c) */

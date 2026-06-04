@@ -410,8 +410,10 @@ void panel_map(Ide* a, Canvas* cv, Rect r)
             buf[0] = '\0';
             map_cat(buf, f->reads[i][0] ? f->reads[i] : "g", sizeof(buf));
             map_cat(buf, " (read)", sizeof(buf));
-            /* wire reaches the satellite at its RIGHT edge */
-            map_sat_push(sc, MK_READ, TH_CYAN, card_left, ay, 0, buf, 0);
+            /* wire reaches the satellite at its RIGHT edge. Stash the BARE global
+             * name in fname so a click can navigate by dependency (jump to a
+             * function that WRITES this global -- the producer). */
+            map_sat_push(sc, MK_READ, TH_CYAN, card_left, ay, 0, buf, f->reads[i]);
             sy += sat_h + sat_vgap;
         }
     }
@@ -482,8 +484,10 @@ void panel_map(Ide* a, Canvas* cv, Rect r)
             buf[0] = '\0';
             map_cat(buf, f->writes[i][0] ? f->writes[i] : "g", sizeof(buf));
             map_cat(buf, " (write)", sizeof(buf));
+            /* Stash the BARE global name in fname so a click navigates by
+             * dependency (jump to a function that READS this global -- a consumer). */
             MapSat* s = map_sat_push(sc, MK_WRITE, TH_GREEN, card_right, wy,
-                                     0, buf, 0);
+                                     0, buf, f->writes[i]);
             if (s) s->warn = multi;
             sy += sat_h + sat_vgap;
         }
@@ -687,12 +691,32 @@ int panel_map_click(Ide* a, Rect r, int mx, int my)
 
         case MK_READ:
         case MK_WRITE:
-            /* Future: jump to global definition or show all readers/writers
-             * For now, we could search for the global declaration in the code.
-             * This is a placeholder for revolutionary "navigate by dependency" feature.
-             * The label format is "varname (read)" or "varname (write)"
-             * Extract varname and search for its definition. */
-            /* TODO: Implement global definition lookup */
+            /* Navigate by dependency. s->fname holds the BARE global name.
+             *   READ  port  -> jump to a function that WRITES it (the producer).
+             *   WRITE port  -> jump to a function that READS it (a consumer).
+             * Scan the model for the first matching counterpart and refocus. We
+             * skip the currently-focused function so the click always moves. */
+            if (s->fname[0]) {
+                for (j = 0; j < a->model.nfuncs && j < M_MAXFUNCS; j++) {
+                    Func* g = &a->model.funcs[j];
+                    int k, nref, hit = 0;
+                    if (j == a->focus_func) continue;
+                    if (s->kind == MK_READ) {
+                        nref = g->nwrites; if (nref > M_MAXREFS) nref = M_MAXREFS;
+                        for (k = 0; k < nref; k++)
+                            if (g->writes[k][0] && map_streq(g->writes[k], s->fname)) { hit = 1; break; }
+                    } else {
+                        nref = g->nreads;  if (nref > M_MAXREFS) nref = M_MAXREFS;
+                        for (k = 0; k < nref; k++)
+                            if (g->reads[k][0] && map_streq(g->reads[k], s->fname)) { hit = 1; break; }
+                    }
+                    if (hit) {
+                        a->prev_focus = a->focus_func;   /* Backspace = back */
+                        ide_set_focus(a, j);
+                        return 1;
+                    }
+                }
+            }
             break;
 
         case MK_ABSENT:

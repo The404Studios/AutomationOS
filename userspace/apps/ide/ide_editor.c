@@ -116,6 +116,166 @@ static void ed_delete_byte(struct Ide* a, int off) {
     a->editor.dirty = 1;
 }
 
+/* ===========================================================================
+ * Selection + clipboard.
+ *   - Shift + a caret move EXTENDS the selection; any unshifted move drops it.
+ *   - Ctrl+A select-all, Ctrl+C copy, Ctrl+X cut, Ctrl+V paste.
+ *   - Typing / Backspace / Delete / Enter / Tab over a selection REPLACES it.
+ * sel_anchor_off is the FIXED end (a byte offset); the caret is the moving end.
+ * A selection is active when sel_anchor_off >= 0 and differs from the caret.
+ * The clipboard is app-local (no system clipboard exists yet).
+ * ==========================================================================*/
+#define ED_CLIP_CAP  8192
+static char ed_clip[ED_CLIP_CAP];
+static int  ed_clip_len = 0;
+
+/* Set caret (line,col) from a byte offset. */
+static void ed_caret_from_off(struct Ide* a, int off) {
+    Editor* e = &a->editor;
+    if (off < 0) off = 0;
+    if (off > a->src_len) off = a->src_len;
+    int line = 0, col = 0;
+    for (int i = 0; i < off; i++) {
+        if (a->src[i] == '\n') { line++; col = 0; }
+        else col++;
+    }
+    e->caret_line = line; e->caret_col = col; e->want_col = col;
+}
+
+/* Ordered active-selection range [lo,hi) in byte offsets. Returns 1 if a
+ * non-empty selection exists, else clears the anchor and returns 0. */
+static int ed_sel_range(struct Ide* a, int* lo, int* hi) {
+    Editor* e = &a->editor;
+    if (e->sel_anchor_off < 0) return 0;
+    int anc = e->sel_anchor_off;
+    if (anc < 0) anc = 0; if (anc > a->src_len) anc = a->src_len;
+    int car = ed_caret_off(a);
+    int l = anc < car ? anc : car;
+    int h = anc < car ? car : anc;
+    if (l < 0) l = 0; if (h > a->src_len) h = a->src_len;
+    if (h <= l) return 0;
+    *lo = l; *hi = h;
+    return 1;
+}
+
+/* Before a caret MOVE: Shift anchors the selection (once) at the current caret;
+ * no Shift drops any selection. Call BEFORE performing the move. */
+static void ed_sel_track(struct Ide* a, int shift) {
+    Editor* e = &a->editor;
+    if (shift) { if (e->sel_anchor_off < 0) e->sel_anchor_off = ed_caret_off(a); }
+    else        e->sel_anchor_off = -1;
+}
+
+/* Delete the active selection (if any); caret ends at its start, anchor cleared.
+ * Returns 1 if something was deleted. */
+static int ed_delete_sel(struct Ide* a) {
+    int lo, hi;
+    if (!ed_sel_range(a, &lo, &hi)) { a->editor.sel_anchor_off = -1; return 0; }
+    int n = hi - lo;
+    for (int i = 0; i < n; i++) ed_delete_byte(a, lo);   /* remove at lo n times */
+    ed_caret_from_off(a, lo);
+    a->editor.sel_anchor_off = -1;
+    return 1;
+}
+
+/* Copy the active selection (or, with no selection, the whole current line incl.
+ * its trailing newline) into the app-local clipboard. */
+static void ed_copy(struct Ide* a) {
+    int lo, hi;
+    if (!ed_sel_range(a, &lo, &hi)) {
+        lo = ed_line_start(a->src, a->src_len, a->editor.caret_line);
+        hi = lo + ed_line_len(a->src, a->src_len, a->editor.caret_line);
+        if (hi < a->src_len && a->src[hi] == '\n') hi++;   /* whole-line copy */
+    }
+    int n = hi - lo;
+    if (n > ED_CLIP_CAP) n = ED_CLIP_CAP;
+    for (int i = 0; i < n; i++) ed_clip[i] = a->src[lo + i];
+    ed_clip_len = n;
+}
+
+/* Insert the clipboard at the caret, replacing any active selection. */
+static void ed_paste(struct Ide* a) {
+    ed_delete_sel(a);
+    int off = ed_caret_off(a);
+    int i;
+    for (i = 0; i < ed_clip_len; i++)
+        if (!ed_insert_byte(a, off + i, ed_clip[i])) break;
+    ed_caret_from_off(a, off + i);
+}
+
+/* case-sensitive substring search forward in a->src from byte offset `from`;
+ * returns the match start offset or -1. */
+static int ed_src_find(struct Ide* a, const char* needle, int from) {
+    int nl = 0; while (needle[nl]) nl++;
+    if (nl == 0) return -1;
+    if (from < 0) from = 0;
+    for (int i = from; i + nl <= a->src_len; i++) {
+        int k = 0;
+        while (k < nl && a->src[i + k] == needle[k]) k++;
+        if (k == nl) return i;
+    }
+    return -1;
+}
+
+/* Find `needle` and SELECT it (the selection highlight shows the match), scrolling
+ * it into view. The search base is the current match start (sel anchor) if a match
+ * is selected, else the caret. `advance`=0 refines IN PLACE (incremental typing);
+ * `advance`=1 skips the current match (Find Next). Wraps to the top. Returns 1/0. */
+int ide_editor_find(struct Ide* a, const char* needle, int advance) {
+    int nl = 0; while (needle[nl]) nl++;
+    if (nl == 0) return 0;
+    int base = (a->editor.sel_anchor_off >= 0) ? a->editor.sel_anchor_off : ed_caret_off(a);
+    int m = ed_src_find(a, needle, base + (advance ? 1 : 0));
+    if (m < 0) m = ed_src_find(a, needle, 0);   /* wrap to top */
+    if (m < 0) return 0;
+    a->editor.sel_anchor_off = m;       /* highlight the match via selection */
+    ed_caret_from_off(a, m + nl);
+    return 1;
+}
+
+/* Replace ALL occurrences of `needle` with `repl` in a->src. Returns the count
+ * replaced. Bounded; clears any selection and parks the caret at the top. */
+int ide_editor_replace_all(struct Ide* a, const char* needle, const char* repl) {
+    int nl = 0; while (needle[nl]) nl++;
+    if (nl == 0) return 0;
+    int rl = 0; while (repl[rl]) rl++;
+    int count = 0, from = 0;
+    while (count < 100000) {
+        int m = ed_src_find(a, needle, from);
+        if (m < 0) break;
+        /* Stop cleanly if this replacement would not FIT (buffer full): otherwise
+         * a partial insert leaves the needle in place and `from` never advances,
+         * spinning the loop to its 100000 cap (a multi-second freeze). Checking
+         * the net growth (rl-nl) up front guarantees every delete+insert below
+         * fully succeeds, so `from = m + rl` always makes forward progress. */
+        if (rl > nl && a->src_len + (rl - nl) > IDE_SRC_CAP) break;
+        for (int i = 0; i < nl; i++) ed_delete_byte(a, m);          /* remove needle */
+        for (int i = 0; i < rl; i++) ed_insert_byte(a, m + i, repl[i]);  /* room guaranteed */
+        from = m + rl;
+        count++;
+    }
+    a->editor.sel_anchor_off = -1;
+    ed_caret_from_off(a, 0);
+    ed_clamp_caret(a);
+    return count;
+}
+
+/* ---- public clipboard / selection ops (Ctrl+A/C/X/V via ide.c chord handler) ---- */
+void ide_editor_select_all(struct Ide* a) {
+    a->editor.sel_anchor_off = 0;
+    ed_caret_from_off(a, a->src_len);
+}
+void ide_editor_copy(struct Ide* a) { ed_copy(a); }
+void ide_editor_cut(struct Ide* a) {
+    ed_copy(a);
+    if (!ed_delete_sel(a)) ide_editor_delete_line(a);
+    ed_clamp_caret(a);
+}
+void ide_editor_paste(struct Ide* a) {
+    ed_paste(a);
+    ed_clamp_caret(a);
+}
+
 /* ---- public reset ---- */
 void ide_editor_reset(struct Ide* a) {
     Editor* e = &a->editor;
@@ -236,6 +396,10 @@ static void ed_scroll_to_caret(struct Ide* a, Rect body) {
 #define EDK_TAB       15
 #define EDK_ENTER     28
 #define EDK_S         31
+#define EDK_A         30      /* select-all */
+#define EDK_X         45      /* cut        */
+#define EDK_C         46      /* copy       */
+#define EDK_V         47      /* paste      */
 #define EDK_UP        103
 #define EDK_DOWN      108
 #define EDK_LEFT      105
@@ -270,15 +434,27 @@ int ide_editor_key(struct Ide* a, int keycode, char ch, int shift, int ctrl) {
      * unaffected. We only use kch on the printable path. */
     char kch = keymap_resolve((uint8_t)keycode, 1, &ed_km);
 
-    /* Ctrl+S: save (handled even if a printable 's' resolved). */
-    if (ctrl && keycode == EDK_S) {
-        ide_editor_save(a);
-        return 1;
-    }
-    /* Other Ctrl-chords are not editor edits -- let the caller route them. */
+    /* Ctrl chords are routed by the IDE's central handler (handle_ctrl_chord in
+     * ide.c) -- this entry point is called with ctrl already stripped (ctrl==0),
+     * so Ctrl+S / Ctrl+A/C/X/V are handled THERE (via the ide_editor_* ops), not
+     * here. We keep the guards defensively in case a caller ever forwards ctrl. */
+    if (ctrl && keycode == EDK_S) { ide_editor_save(a); return 1; }
     if (ctrl) return 0;
 
     ed_clamp_caret(a);
+
+    /* Selection: Shift + a caret move extends; any unshifted move clears. Runs
+     * BEFORE the move so the anchor captures the pre-move caret offset. */
+    switch (keycode) {
+    case EDK_LEFT: case EDK_RIGHT: case EDK_UP: case EDK_DOWN:
+    case EDK_HOME: case EDK_END: case EDK_PAGEUP: case EDK_PAGEDOWN:
+        ed_sel_track(a, shift);
+        break;
+    default:
+        /* a non-navigation key with no active selection edit: drop stale anchor
+         * only for keys that are neither edits nor moves is handled below. */
+        break;
+    }
 
     switch (keycode) {
     case EDK_LEFT: {
@@ -372,6 +548,7 @@ int ide_editor_key(struct Ide* a, int keycode, char ch, int shift, int ctrl) {
         return 1;
     }
     case EDK_BACKSPACE: {
+        if (ed_delete_sel(a)) { e->want_col = e->caret_col; return 1; }
         int off = ed_caret_off(a);
         if (off > 0) {
             int prev_is_nl = (a->src[off - 1] == '\n');
@@ -390,11 +567,13 @@ int ide_editor_key(struct Ide* a, int keycode, char ch, int shift, int ctrl) {
         return 1;
     }
     case EDK_DELETE: {
+        if (ed_delete_sel(a)) { e->want_col = e->caret_col; return 1; }
         int off = ed_caret_off(a);
         if (off < a->src_len) ed_delete_byte(a, off);
         return 1;
     }
     case EDK_ENTER: {
+        ed_delete_sel(a);                 /* Enter over a selection replaces it */
         int off = ed_caret_off(a);
         if (!ed_insert_byte(a, off, '\n')) return 1;
 
@@ -429,6 +608,7 @@ int ide_editor_key(struct Ide* a, int keycode, char ch, int shift, int ctrl) {
     }
     case EDK_TAB: {
         /* insert ED_TABW spaces (soft tabs) */
+        ed_delete_sel(a);                 /* Tab over a selection replaces it */
         int off = ed_caret_off(a);
         for (int i = 0; i < ED_TABW; i++) {
             if (!ed_insert_byte(a, off + i, ' ')) break;
@@ -442,6 +622,7 @@ int ide_editor_key(struct Ide* a, int keycode, char ch, int shift, int ctrl) {
 
     /* printable character (keymap-resolved: honours caps-lock + Shift+symbol) */
     if (kch >= 32 && kch < 127) {
+        ed_delete_sel(a);                 /* typing over a selection replaces it */
         int off = ed_caret_off(a);
         if (ed_insert_byte(a, off, kch)) {
             e->caret_col++;
@@ -478,6 +659,7 @@ int ide_editor_click(struct Ide* a, Rect r, int mx, int my) {
     if (col > ll) col = ll;
     e->caret_col = col;
     e->want_col = col;
+    e->sel_anchor_off = -1;   /* a plain click drops any active selection */
     return 1;
 }
 
@@ -600,6 +782,34 @@ void ide_editor_render(struct Ide* a, Canvas* cv, Rect r) {
                       is_caret_line ? TH_TEXT_DIM : TH_TEXT_FAINT,
                       body.x + PAD, ED_GUTTER_CH * GFX_FW);
 
+        /* selection highlight on this line (drawn under the code text). The
+         * selection [slo,shi) is in byte offsets; intersect with this line's
+         * [lstart, lend]. When the selection spills past this line's end, extend
+         * the highlight one cell past the last char to signal the newline is
+         * included. Columns honour the horizontal scroll (left_col). */
+        {
+            int slo, shi;
+            if (e->focused && ed_sel_range(a, &slo, &shi)) {
+                int line_end = lstart + llen;          /* exclusive, before '\n' */
+                if (shi > lstart && slo <= line_end) {
+                    int c0 = (slo > lstart ? slo : lstart) - lstart;
+                    int c1 = (shi > line_end) ? (llen + 1) : (shi - lstart);
+                    int v0 = c0 - e->left_col; if (v0 < 0) v0 = 0;
+                    int v1 = c1 - e->left_col; if (v1 < 0) v1 = 0;
+                    if (v1 > v0) {
+                        int hx = code_x + v0 * GFX_FW;
+                        int hw = (v1 - v0) * GFX_FW;
+                        int code_right = code_x + code_clip_w;
+                        if (hx < code_right) {
+                            if (hx + hw > code_right) hw = code_right - hx;
+                            gfx_blend(cv, hx, ry, hw, line_h,
+                                      (0x66u << 24) | (TH_BLUE & 0x00FFFFFFu));
+                        }
+                    }
+                }
+            }
+        }
+
         /* classify + draw, honoring horizontal scroll (left_col) */
         int n = llen; if (n > ED_LINECAP) n = ED_LINECAP;
         if (n > 0) {
@@ -617,8 +827,14 @@ void ide_editor_render(struct Ide* a, Canvas* cv, Rect r) {
             }
         }
 
-        /* caret on this line */
-        if (is_caret_line && e->focused && e->blink_ms < ED_BLINK_MS) {
+        /* caret on this line. ALWAYS rendered while the editor is focused -- a
+         * solid block caret, NOT gated on the blink phase. The old blink gate
+         * (blink_ms < ED_BLINK_MS) could hide the caret for up to 500ms at a
+         * time; combined with the dirty-gate only forcing a blink redraw every
+         * 400ms, a user who started typing in that window saw NO cursor and
+         * believed the editor was dead ("can't code anywhere"). A persistent
+         * caret makes the insertion point unmistakable. */
+        if (is_caret_line && e->focused) {
             int vis_col = e->caret_col - e->left_col;
             if (vis_col >= 0) {
                 int cx = code_x + vis_col * GFX_FW;

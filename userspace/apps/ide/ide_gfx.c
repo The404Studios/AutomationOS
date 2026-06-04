@@ -5,8 +5,11 @@
 #include "../../lib/font/bitfont.h"
 #include "../../lib/font2/font2.h"
 
-/* Runtime UI scale (see ide_gfx.h). Default 138% -> 11x22 cell. */
-int g_ui_pct = 138, g_gfx_fw = 11, g_gfx_fh = 22;
+/* Runtime UI scale (see ide_gfx.h). Default 120% -> 9x19 cell: readable but
+ * compact so the tab strips and side panels all fit without crowding (138% felt
+ * "very big" and scrunched the chrome). The user can Ctrl+wheel / Ctrl+=/- to
+ * rescale live; the whole layout reflows from this cell. */
+int g_ui_pct = 120, g_gfx_fw = 9, g_gfx_fh = 19;
 
 void gfx_set_scale(int pct) {
     if (pct < 100) pct = 100;

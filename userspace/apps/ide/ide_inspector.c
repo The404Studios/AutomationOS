@@ -26,8 +26,12 @@
 #define INSP_APPLY_W    56            /* [APPLY] button width             */
 #define INSP_APPLY_H    (ROW_H - 2)   /* [APPLY] button height            */
 
+/* SHORT labels: 5 equal-width cells in RIGHT_W (=27*GFX_FW) give ~48px each at
+ * the default scale, so the old full words ("CATEGORY"=8 chars) overflowed and
+ * truncated to unreadable fragments. Compact 3-4 char labels fit cleanly at
+ * every zoom level. (Hover/active state + the body content disambiguate them.) */
 static const char* const INSP_TAB_LBL[INSP_NTABS] = {
-    "SYNTAX", "CATEGORY", "PORTS", "CONN", "DETAILS"
+    "SYN", "CAT", "PORT", "CONN", "INFO"
 };
 
 /* ---- tiny shared scratch (no libc) ---- */

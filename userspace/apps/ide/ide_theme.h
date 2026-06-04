@@ -40,8 +40,12 @@
  * work area). The text-sensitive constants below DERIVE from the runtime cell
  * (GFX_FW/GFX_FH), so when the user zooms (Ctrl+wheel) the WHOLE layout reflows
  * coherently -- rows, bars and side columns all track the glyph size. */
-#define IDE_W          1024
-#define IDE_H          700
+/* Open WIDE so the IDE fills a typical 1280-wide screen on launch (the old 1024
+ * left the IDE narrow + scrunched on a 1280 desktop; the compositor clamps an
+ * over-large request to the display, and the IDE reflows to win->w/h every frame
+ * via the resize protocol). Height fits a 720p work area with the dock visible. */
+#define IDE_W          1180
+#define IDE_H          688
 #define TOPBAR_H       (GFX_FH + 12)   /* VIZ tab bar (fits one glyph + pad)  */
 #define STATUS_H       (GFX_FH + 6)    /* bottom shortcuts bar                */
 #define LEFT_W         (24 * GFX_FW)   /* explorer + funcs column (~24 chars) */

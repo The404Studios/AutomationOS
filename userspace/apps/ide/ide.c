@@ -48,6 +48,12 @@ static int g_build_view = 0;
 #define KEY_R        19          /* Run the last build (SYS_SPAWN the ELF)        */
 #define KEY_N        49          /* Ctrl+N new project (templates picker)         */
 #define KEY_S        31          /* Ctrl+S save (editor)                          */
+#define KEY_A        30          /* Ctrl+A select all (editor)                    */
+#define KEY_X        45          /* Ctrl+X cut (editor)                           */
+#define KEY_C        46          /* Ctrl+C copy (editor)                          */
+#define KEY_V        47          /* Ctrl+V paste (editor)                         */
+#define KEY_F        33          /* Ctrl+F find (editor)                          */
+#define KEY_H        35          /* Ctrl+H find & replace (editor)                */
 #define KEY_D        32          /* Ctrl+D duplicate line (editor)                */
 #define KEY_K        37          /* Ctrl+Shift+K delete line (editor)             */
 #define KEY_ENTER    28          /* confirm in the New Project modal              */
@@ -1077,27 +1083,30 @@ static void editor_topbar(Ide* a, Canvas* cv, Rect r) {
 
     /* [+ NEW] button: a small framed, green-accented pill that opens the New
      * Project modal. Hovering tints it. */
-    {
-        int bx = np_btn_x(r);
-        int bw = np_btn_w();
-        if (bx + bw < r.x + r.w) {
-            int hov = (a->mouse_y >= r.y && a->mouse_y < r.y + r.h &&
-                       a->mouse_x >= bx && a->mouse_x < bx + bw);
-            gfx_fill  (cv, bx, r.y + 3, bw, r.h - 6, hov ? TH_SELECT : TH_PANEL);
-            gfx_stroke(cv, bx, r.y + 3, bw, r.h - 6, TH_GREEN);
-            gfx_text_clip(cv, bx + GFX_FW, ty, NP_BTN_LABEL, TH_GREEN, bx, bw);
-        }
+    int btn_x = np_btn_x(r);
+    int btn_w = np_btn_w();
+    int btn_vis = (btn_x + btn_w < r.x + r.w);
+    if (btn_vis) {
+        int hov = (a->mouse_y >= r.y && a->mouse_y < r.y + r.h &&
+                   a->mouse_x >= btn_x && a->mouse_x < btn_x + btn_w);
+        gfx_fill  (cv, btn_x, r.y + 3, btn_w, r.h - 6, hov ? TH_SELECT : TH_PANEL);
+        gfx_stroke(cv, btn_x, r.y + 3, btn_w, r.h - 6, TH_GREEN);
+        gfx_text_clip(cv, btn_x + GFX_FW, ty, NP_BTN_LABEL, TH_GREEN, btn_x, btn_w);
     }
 
-    /* right-aligned filename + dirty marker */
+    /* right-aligned filename + dirty marker. Its left edge must clear the [+NEW]
+     * button's RIGHT edge (or the tabs, if +NEW is hidden at narrow widths) so
+     * the filename never paints over them when the UI is zoomed in. */
+    int left_bound = btn_vis ? (btn_x + btn_w + GFX_FW) : x;
     const char* f = a->cur_file[0] ? a->cur_file : "(no file)";
     int fw = gfx_textw(f);
     int dirtyw = ide_editor_dirty(a) ? (gfx_textw(" *")) : 0;
     int fx = r.x + r.w - PAD - fw - dirtyw;
-    if (fx > x) {
-        gfx_text_clip(cv, fx, ty, f, TH_TEXT_DIM, x, r.w);
+    if (fx > left_bound) {
+        int clipw = r.x + r.w - left_bound;
+        gfx_text_clip(cv, fx, ty, f, TH_TEXT_DIM, left_bound, clipw);
         if (ide_editor_dirty(a))
-            gfx_text_clip(cv, fx + fw, ty, " *", TH_ORANGE, x, r.w);
+            gfx_text_clip(cv, fx + fw, ty, " *", TH_ORANGE, left_bound, clipw);
     }
 }
 
@@ -1175,7 +1184,7 @@ static void editor_status(Ide* a, Canvas* cv, Rect r) {
     }
 
     /* right-aligned shortcut legend */
-    const char* leg = "Ctrl+N new  Ctrl+B build  Ctrl+R run  Ctrl+S save  Ctrl+E map";
+    const char* leg = "Ctrl+N new  B build  R run  S save  F find  H replace  E map";
     int lw = gfx_textw(leg);
     int lx = r.x + r.w - PAD - lw;
     if (lx > x) gfx_text_clip(cv, lx, ty, leg, TH_TEXT_FAINT, x, clip_w);
@@ -1219,6 +1228,42 @@ static void render_editor(Ide* a, Canvas* cv) {
         if ((blink_counter / 30) % 2 == 0) {  /* blink every ~0.5s at 60fps */
             int cursor_x = input_x + a->goto_len * GFX_FW;
             gfx_vline(cv, cursor_x, ty, GFX_FH, TH_GREEN);
+        }
+    }
+
+    /* Find (Ctrl+F) / Find&Replace (Ctrl+H) overlay. One row for find (+ ok/no);
+     * a second row for the replacement in replace mode. The focused field's label
+     * is accent-coloured. The match is highlighted in the editor body. */
+    if (a->find_active) {
+        int rows = a->find_replace ? 2 : 1;
+        int prompt_w = 420;
+        int row_h = 26;
+        int prompt_h = rows * row_h + 8;
+        int px = (cv->w - prompt_w) / 2;
+        int py = cv->h - 40 - prompt_h;
+        gfx_fill  (cv, px, py, prompt_w, prompt_h, TH_PANEL2);
+        gfx_stroke(cv, px, py, prompt_w, prompt_h, TH_BLUE);
+        int tx = px + 8;
+        int input_x = tx + 8 * GFX_FW;
+        int hint_w  = 4 * GFX_FW;
+        int avail   = (px + prompt_w - 8 - hint_w) - input_x;
+        /* row 0: Find */
+        int ty0 = py + 4 + (row_h - GFX_FH) / 2;
+        int find_foc = !(a->find_replace && a->find_repl_focus);
+        gfx_text(cv, tx, ty0, "Find:", find_foc ? TH_BLUE : TH_TEXT_DIM);
+        if (avail > 0) gfx_text_clip(cv, input_x, ty0, a->find_buf, TH_GREEN, input_x, avail);
+        if (a->find_len > 0) {
+            int has = (a->editor.sel_anchor_off >= 0);
+            gfx_text(cv, px + prompt_w - 8 - hint_w, ty0, has ? "ok" : "no",
+                     has ? TH_GREEN : TH_ORANGE);
+        }
+        /* row 1: Replace (replace mode only) */
+        if (a->find_replace) {
+            int ty1 = py + 4 + row_h + (row_h - GFX_FH) / 2;
+            int repl_foc = a->find_repl_focus;
+            gfx_text(cv, tx, ty1, "Repl:", repl_foc ? TH_BLUE : TH_TEXT_DIM);
+            if (avail > 0) gfx_text_clip(cv, input_x, ty1, a->repl_buf, TH_CYAN, input_x, avail);
+            gfx_text(cv, px + prompt_w - 8 - 8 * GFX_FW, ty1, "Tab/Ent", TH_TEXT_FAINT);
         }
     }
 }
@@ -1411,7 +1456,7 @@ static int handle_ctrl_chord(Ide* a, int keycode) {
         gfx_set_scale(g_ui_pct - 25);
         return 1;
     case KEY_0:               /* Ctrl+0 : reset the IDE text zoom to the default */
-        gfx_set_scale(138);
+        gfx_set_scale(120);
         return 1;
     case KEY_B:               /* Ctrl+B: build the open file */
         /* Build what's on screen: flush unsaved editor edits to disk first so
@@ -1430,6 +1475,37 @@ static int handle_ctrl_chord(Ide* a, int keycode) {
         return 1;
     case KEY_S:               /* Ctrl+S: save (editor) */
         ide_editor_save(a);
+        return 1;
+    case KEY_A:               /* Ctrl+A: select all (editor) */
+        if (a->ws == WS_EDITOR && a->editor.focused) ide_editor_select_all(a);
+        return 1;
+    case KEY_C:               /* Ctrl+C: copy selection / current line (editor) */
+        if (a->ws == WS_EDITOR && a->editor.focused) ide_editor_copy(a);
+        return 1;
+    case KEY_X:               /* Ctrl+X: cut selection / current line (editor) */
+        if (a->ws == WS_EDITOR && a->editor.focused) ide_editor_cut(a);
+        return 1;
+    case KEY_V:               /* Ctrl+V: paste (editor) */
+        if (a->ws == WS_EDITOR && a->editor.focused) ide_editor_paste(a);
+        return 1;
+    case KEY_F:               /* Ctrl+F: open the find prompt (editor) */
+        if (a->ws == WS_EDITOR) {
+            a->find_active = 1;
+            a->find_replace = 0;
+            a->find_len = 0;
+            a->find_buf[0] = '\0';
+            a->goto_active = 0;       /* find + goto are mutually exclusive */
+        }
+        return 1;
+    case KEY_H:               /* Ctrl+H: open find & replace (editor) */
+        if (a->ws == WS_EDITOR) {
+            a->find_active = 1;
+            a->find_replace = 1;
+            a->find_repl_focus = 0;   /* start in the Find field */
+            a->find_len = 0; a->find_buf[0] = '\0';
+            a->repl_len = 0; a->repl_buf[0] = '\0';
+            a->goto_active = 0;
+        }
         return 1;
     case KEY_G:               /* Ctrl+G: go to line (editor only) */
         if (a->ws == WS_EDITOR && a->editor.focused) {
@@ -1529,6 +1605,50 @@ static void handle_key(Ide* a, int keycode, int pressed) {
         if (ch >= '0' && ch <= '9' && a->goto_len < 7) {
             a->goto_buf[a->goto_len++] = ch;
             a->goto_buf[a->goto_len] = '\0';
+        }
+        return;
+    }
+
+    /* Find prompt (Ctrl+F) / Find&Replace (Ctrl+H). In plain find: incremental
+     * search, Enter = next match. In replace mode: Tab toggles the Find/Replace
+     * field, Enter = replace ALL. Esc closes either. */
+    if (a->find_active && !g_ctrl_down) {
+        int rep = a->find_replace;
+        int on_repl = rep && a->find_repl_focus;
+        if (keycode == KEY_ESC) { a->find_active = 0; return; }
+        if (keycode == KEY_TAB && rep) { a->find_repl_focus = !a->find_repl_focus; return; }
+        if (keycode == KEY_ENTER) {
+            if (rep) {                              /* replace ALL find -> repl */
+                a->find_buf[a->find_len] = '\0';
+                a->repl_buf[a->repl_len] = '\0';
+                if (a->find_len > 0) ide_editor_replace_all(a, a->find_buf, a->repl_buf);
+                a->find_active = 0;
+            } else {
+                ide_editor_find(a, a->find_buf, 1); /* find next */
+            }
+            return;
+        }
+        if (keycode == KEY_BACKSPC) {
+            if (on_repl) { if (a->repl_len > 0) a->repl_buf[--a->repl_len] = '\0'; }
+            else {
+                if (a->find_len > 0) a->find_buf[--a->find_len] = '\0';
+                if (a->find_len > 0) ide_editor_find(a, a->find_buf, 0);
+                else a->editor.sel_anchor_off = -1;
+            }
+            return;
+        }
+        char fch = ide_keycode_ascii(keycode, g_shift_down);
+        if (fch >= 32 && fch < 127) {
+            if (on_repl) {
+                if (a->repl_len < (int)sizeof(a->repl_buf) - 1) {
+                    a->repl_buf[a->repl_len++] = fch;
+                    a->repl_buf[a->repl_len] = '\0';
+                }
+            } else if (a->find_len < (int)sizeof(a->find_buf) - 1) {
+                a->find_buf[a->find_len++] = fch;
+                a->find_buf[a->find_len] = '\0';
+                ide_editor_find(a, a->find_buf, 0);  /* live-preview the match */
+            }
         }
         return;
     }

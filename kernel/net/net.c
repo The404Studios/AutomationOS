@@ -404,6 +404,15 @@ static int ip_reassemble(const ipv4_hdr_t* ip, uint16_t ip_avail,
         if (fr->holes[i]) return 0; /* still have holes */
     }
 
+    /* The reassembled IP packet is ihl + total_len bytes. DROP anything that would
+     * not fit the FRAG_BUF_SIZE output buffer: the payload memcpy below writes at
+     * out_buf + ihl for total_len bytes, so ihl + total_len (up to ~65555) would
+     * overrun the 65535-byte buffer. This also keeps the IP total-length field valid. */
+    if ((uint32_t)ihl + (uint32_t)fr->total_len > FRAG_BUF_SIZE) {
+        fr->valid = false;
+        return -1;
+    }
+
     /* Reassembly complete! Build the reassembled packet. */
     /* Copy IP header from first fragment (reconstruct). */
     memcpy(out_buf, ip, ihl);

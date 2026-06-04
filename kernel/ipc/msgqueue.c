@@ -175,7 +175,9 @@ static bool msg_check_permission(msg_queue_t* q, uint32_t uid, uint32_t gid, boo
         return true;
     }
     if (gid == q->creator_gid) {
-        return write ? (q->mode & IPC_W) != 0 : (q->mode & IPC_R) != 0;
+        /* GROUP bits are mode>>3; the owner bits IPC_W/R would grant a group
+         * member the owner's rights (mode 0640 => group can WRITE). 'other' >>6. */
+        return write ? (q->mode & (IPC_W >> 3)) != 0 : (q->mode & (IPC_R >> 3)) != 0;
     }
     return write ? (q->mode & (IPC_W >> 6)) != 0 : (q->mode & (IPC_R >> 6)) != 0;
 }

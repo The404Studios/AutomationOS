@@ -793,6 +793,10 @@ int e1000_rx_poll(void* buf, uint16_t buf_len) {
     }
 
     uint16_t len = d->length;
+    if (len > RX_BUF_SIZE) len = RX_BUF_SIZE;   /* clamp to the HW rx buffer: a NIC
+                                                 * reporting length > the 2KB buffer
+                                                 * would otherwise over-read kernel
+                                                 * memory past rx_bufs[i] into `buf`. */
     if (len > buf_len) len = buf_len;
 
     /* Copy before recycling: once we advance RDT the HW may overwrite the buffer. */

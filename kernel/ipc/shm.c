@@ -213,7 +213,10 @@ static bool shm_check_permission(shm_segment_t* seg, uint32_t uid, uint32_t gid,
         return true;
     }
     if (gid == seg->creator_gid) {
-        return write ? (seg->mode & IPC_W) != 0 : (seg->mode & IPC_R) != 0;
+        /* GROUP bits are mode>>3 (0020/0040); using the owner bits IPC_W/R here
+         * would grant a group member the OWNER's rights (mode 0640 => group can
+         * WRITE). The 'other' branch below correctly uses >>6. */
+        return write ? (seg->mode & (IPC_W >> 3)) != 0 : (seg->mode & (IPC_R >> 3)) != 0;
     }
     return write ? (seg->mode & (IPC_W >> 6)) != 0 : (seg->mode & (IPC_R >> 6)) != 0;
 }

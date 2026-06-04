@@ -270,7 +270,7 @@ static int execute_for_loop(script_context_t *ctx, flow_control_t *flow) {
     char var[256] = "";
     char list[4096] = "";
 
-    sscanf(line, "for %s in %[^\n]", var, list);
+    sscanf(line, "for %255s in %4095[^\n]", var, list);
 
     /* Remove trailing "; do" if present */
     char *do_pos = strstr(list, "; do");
@@ -460,7 +460,7 @@ static int execute_case_statement(script_context_t *ctx, flow_control_t *flow) {
 
     /* Extract variable */
     char var_expr[256];
-    sscanf(line, "case %s in", var_expr);
+    sscanf(line, "case %255s in", var_expr);
 
     char *var_value = expand_variables(var_expr);
 
@@ -489,6 +489,7 @@ static int execute_case_statement(script_context_t *ctx, flow_control_t *flow) {
         if (strchr(l, ')')) {
             char pattern[256];
             strncpy(pattern, l, sizeof(pattern) - 1);
+            pattern[sizeof(pattern) - 1] = '\0';  /* strncpy doesn't NUL-terminate on truncation */
             char *rparen = strchr(pattern, ')');
             if (rparen) {
                 *rparen = '\0';
@@ -523,12 +524,12 @@ static int execute_function_def(script_context_t *ctx) {
 
     char func_name[256];
     if (strncmp(line, "function ", 9) == 0) {
-        sscanf(line, "function %s", func_name);
+        sscanf(line, "function %255s", func_name);
         /* Remove trailing () if present */
         char *paren = strchr(func_name, '(');
         if (paren) *paren = '\0';
     } else {
-        sscanf(line, "%[^(]", func_name);
+        sscanf(line, "%255[^(]", func_name);
     }
 
     /* Find closing brace */

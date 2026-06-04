@@ -785,6 +785,18 @@ size_t heap_shrink(void) {
             break;
         }
 
+        /* The entire-block case (freeable_start == block_start) unmaps the page
+         * that holds THIS block's header, so last->prev_phys and bin_remove(last)
+         * must be done BEFORE the unmap -- the old code did both AFTER, reading a
+         * freed header (use-after-unmap, triggered when the header is page-
+         * aligned). Snapshot prev unconditionally (header still mapped here) and
+         * pre-detach from the bin only in the entire-block case. */
+        block_t* last_prev = last->prev_phys;
+        int header_unmapped = (freeable_start == block_start);
+        if (header_unmapped) {
+            bin_remove(last);
+        }
+
         /* Unmap the pages from [freeable_start, freeable_end) and return them to PMM */
         uint64_t num_pages = (freeable_end - freeable_start) / PAGE_SIZE;
         for (uint64_t i = 0; i < num_pages; i++) {
@@ -799,13 +811,12 @@ size_t heap_shrink(void) {
         /* Update shrink boundary */
         shrink_to = freeable_start;
 
-        /* If the block is entirely freed, remove it from its bin and update
-         * the heap_mapped_end. If it's only partially freed, split it. */
-        if (freeable_start == block_start) {
-            /* Entire block freed; remove from bin */
-            bin_remove(last);
-            /* Move to previous block */
-            last = last->prev_phys;
+        /* If the block is entirely freed, move to the previous block (already
+         * bin_remove'd above; its header is now unmapped, so use the snapshotted
+         * prev link). Otherwise the header is below freeable_start, still mapped,
+         * so it is safe to trim and re-bin. */
+        if (header_unmapped) {
+            last = last_prev;
         } else {
             /* Partial shrink: trim the block */
             bin_remove(last);

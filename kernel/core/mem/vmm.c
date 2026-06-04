@@ -596,6 +596,18 @@ int vmm_protect(void* vmm_ctx, void* addr, size_t size, int prot) {
         return -1;
     }
 
+    // Overflow-safe range bound BEFORE the rounding math below. vaddr is already
+    // < USER_SPACE_END; reject if `size` would push the range to/past it. This
+    // also prevents `vaddr + size + PAGE_SIZE - 1` from wrapping uint64 (which
+    // would make end_addr small, aligned_size huge, and let the post-check at
+    // `aligned_addr + aligned_size > USER_SPACE_END` wrap back under the bound --
+    // walking the loop into the shared kernel half and re-flagging kernel PTEs).
+    if (size > USER_SPACE_END - vaddr) {
+        kprintf("[VMM] vmm_protect: range size %lu from %p overflows user space\n",
+                (unsigned long)size, addr);
+        return -1;
+    }
+
     // Align address down to page boundary and size up
     uint64_t aligned_addr = vaddr & ~(PAGE_SIZE - 1);
     uint64_t end_addr = (vaddr + size + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);

@@ -3152,6 +3152,13 @@ static void handle_resize(const wl_req_resize_t *req) {
 static void drain_inbox(int32_t inbox_qid) {
     wl_inbox_msg_t msg;
     for (;;) {
+        /* Zero before each receive: the kernel msgrcv copies only the bytes the
+         * client actually sent, so a deliberately short message would otherwise
+         * leave stale fields from a PRIOR message (or initial stack garbage) for
+         * the handler to trust -- a lever for a malicious client to place chosen
+         * values into fields it "didn't send". Zeroing makes un-sent fields read
+         * as 0, which the handlers' w==0/h==0 + shm_id validation then rejects. */
+        __builtin_memset(&msg, 0, sizeof(msg));
         long r = sc6(SYS_MSGRCV, inbox_qid, (long)&msg,
                      (long)(sizeof(msg) - sizeof(int64_t)), 0, (long)IPC_NOWAIT, 0);
         if (r < 0) break;

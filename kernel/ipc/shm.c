@@ -500,6 +500,27 @@ int64_t sys_shmat(uint64_t shmid, uint64_t shmaddr, uint64_t shmflg,
         }
     }
 
+    // Confine EVERY shm mapping to the shared SHM VA window. Pages mapped
+    // outside [SHARED_SHM_VA_START, SHARED_SHM_VA_END) get PTE_OWNED (see
+    // paging_map_page), so paging_destroy_address_space() would free the
+    // segment's SHARED frames at process teardown -- double-freeing them (PMM
+    // free-list corruption / cross-process use-after-free). This rejects:
+    //  - a malicious user-supplied shmaddr outside the window;
+    //  - the NULL-attach formula (SHM_VA_BASE + id*SHM_VA_STRIDE) once id>=160
+    //    runs the base past SHARED_SHM_VA_END;
+    //  - a NULL-attach segment larger than one 16MB slot, which would otherwise
+    //    overlap the next segment's slot (size > stride).
+    {
+        uint64_t shm_end = virt_addr + (uint64_t)seg->size;
+        if (virt_addr < SHARED_SHM_VA_START || shm_end > SHARED_SHM_VA_END ||
+            shm_end < virt_addr || (uint64_t)seg->size > SHM_VA_STRIDE) {
+            spin_unlock(&shm_lock);
+            kprintf("[SHMAT] mapping outside shared SHM window: %p +%lu\n",
+                    (void*)virt_addr, (unsigned long)seg->size);
+            return IPC_EINVAL;
+        }
+    }
+
     // Map into CALLING process's address space (current->context.cr3).
     uint32_t page_flags = PAGE_PRESENT | PAGE_USER;
     if (write) {

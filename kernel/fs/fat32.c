@@ -332,6 +332,13 @@ static int fat32_read_lfn(fat32_dir_entry_t* entries, uint32_t max_entries,
     memcpy(lfn_buffer, temp_buffer, pos);
     lfn_buffer[pos] = '\0';
 
+    // Never report more entries than we were allowed to scan this cluster. The
+    // caller does `i += count - 1` to skip the LFN group; an on-disk seq that
+    // exceeds the entries remaining in the cluster would otherwise skip past the
+    // cluster boundary and misparse the next cluster's entries mid-group.
+    if (total_lfn_entries > (int)max_entries) {
+        total_lfn_entries = (int)max_entries;
+    }
     return total_lfn_entries;
 }
 
@@ -356,7 +363,15 @@ static vfs_dentry_t* fat32_vfs_lookup(vfs_inode_t* dir, const char* name) {
 
     // Read directory entries
     uint32_t cluster = dir_cluster;
+    uint32_t walk_guard = 0;
     while (cluster < FAT32_EOC) {
+        // Cycle guard: a valid chain visits each cluster at most once, so cap
+        // the walk at total_clusters. A crafted/corrupt FAT can encode an
+        // in-range cluster cycle (fat[N]=N, A->B->A) that never reaches EOC and
+        // would otherwise hang the kernel re-reading the same directory cluster.
+        if (++walk_guard > fs_data->total_clusters) {
+            break;
+        }
         uint64_t lba = fat32_cluster_to_lba(fs_data, cluster);
         if (lba == 0) {
             break;

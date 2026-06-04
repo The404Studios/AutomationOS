@@ -618,6 +618,26 @@ vfs_superblock_t* ext2_mount(const char* source, uint32_t flags) {
 
     kprintf("[EXT2] Block groups: %u\n", fs_data->groups_count);
 
+    // Bound the derived group count BEFORE allocating. groups_count comes from
+    // fully-untrusted superblock fields (s_blocks_count / s_blocks_per_group);
+    // an out-of-range value would otherwise (a) overflow the 32-bit gdt_size
+    // below -> a truncated allocation that ext2_read_inode's "group >=
+    // groups_count" check then indexes far past (heap OOB read), and (b) demand
+    // a multi-MB kmalloc that trips the heap's size assert (panic). Validate in
+    // 64-bit and reject implausible images. 4 MiB of GDT = 131072 groups, far
+    // more than any real device needs.
+    {
+        uint64_t gdt_size64 = (uint64_t)fs_data->groups_count *
+                              sizeof(ext2_block_group_desc_t);
+        if (fs_data->groups_count == 0 || gdt_size64 > (4u * 1024 * 1024)) {
+            kprintf("[EXT2] Rejecting image: implausible group count %u\n",
+                    fs_data->groups_count);
+            kfree(fs_data->superblock);
+            kfree(fs_data);
+            return NULL;
+        }
+    }
+
     // Read block group descriptor table
     uint32_t gdt_size = fs_data->groups_count * sizeof(ext2_block_group_desc_t);
     fs_data->group_desc = kmalloc(gdt_size);

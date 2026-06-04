@@ -290,8 +290,13 @@ void* slab_alloc(slab_cache_t* c) {
      * the poisoned partial list (leak it — its next/prev are garbage so we cannot
      * safely traverse it) and grow a fresh slab so kmalloc keeps working. */
     void* obj = s->free_list;
-    if (s->magic != SLAB_MAGIC || s->total_slots == 0 ||
-        (obj && ((uintptr_t)obj & SLAB_PAGE_MASK) != (uintptr_t)s)) {
+    /* A partial slab ALWAYS has free_count>0 and thus a non-NULL free_list, so
+     * obj==NULL here is itself corruption (an external writer zeroed the free_list
+     * field while leaving magic/total_slots intact -- exactly the partial-clobber
+     * this recovery exists to survive). The old guard's `obj &&` short-circuit
+     * tolerated obj==NULL and then dereferenced it at *(void**)obj below. */
+    if (s->magic != SLAB_MAGIC || s->total_slots == 0 || obj == NULL ||
+        ((uintptr_t)obj & SLAB_PAGE_MASK) != (uintptr_t)s) {
         kprintf("[SLAB] partial slab %p of cache '%s' has a corrupt header "
                 "(magic=%lx total=%u) — orphaning it and growing a fresh slab\n",
                 s, c->name ? c->name : "?", (unsigned long)s->magic, s->total_slots);
@@ -300,6 +305,7 @@ void* slab_alloc(slab_cache_t* c) {
         if (!s) { spin_unlock(&c->lock); return NULL; }
         obj = s->free_list;
     }
+    if (!obj) { spin_unlock(&c->lock); return NULL; }  /* defensive: never deref NULL */
     s->free_list = *(void**)obj;
     s->free_count--;
 

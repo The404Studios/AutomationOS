@@ -557,12 +557,11 @@ void* krealloc(void* ptr, size_t new_size) {
         return NULL;
     }
 
-    if (!heap_owns(ptr)) {
-        kprintf("[KREALLOC] REJECTED non-heap pointer: %p\n", ptr);
-        return NULL;
-    }
-
-    /* Check if this is a slab allocation */
+    /* Slab allocations live in the DIRECT MAP, not the heap window, so they are
+     * NOT heap_owns(). Detect the slab magic BEFORE the heap_owns() gate below
+     * (mirroring kfree's order) -- otherwise every slab-backed pointer (all
+     * kmalloc of size <= 4096, the common case) is wrongly rejected and krealloc
+     * returns NULL, leaving the old block un-freed. */
     if (slab_enabled) {
         uintptr_t page_base = (uintptr_t)ptr & ~(PAGE_SIZE - 1);
         uint64_t* magic_ptr = (uint64_t*)page_base;
@@ -578,6 +577,11 @@ void* krealloc(void* ptr, size_t new_size) {
             slab_free(NULL, ptr);
             return new_ptr;
         }
+    }
+
+    if (!heap_owns(ptr)) {
+        kprintf("[KREALLOC] REJECTED non-heap pointer: %p\n", ptr);
+        return NULL;
     }
 
     /* Heap allocation: extract block header to get exact old size */

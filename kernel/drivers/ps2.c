@@ -240,12 +240,152 @@ static const uint16_t scancode_to_keycode[128] = {
     0, 0, 0, 0, 0, 0, 0, 0
 };
 
+// ---------------------------------------------------------------------------
+// Extended (0xE0-prefixed) scancode -> evdev keycode mapping.
+//
+// In scancode set 1, the gray navigation cluster (arrows, Home/End/PgUp/PgDn,
+// Ins/Del), the right-hand modifiers (R-Ctrl, R-Alt), keypad-Enter and
+// keypad-'/' all share their low 7 bits with OTHER keys (e.g. extended 0x48 ==
+// keypad-8, extended 0x4B == keypad-4). The controller distinguishes them by
+// sending a 0xE0 lead byte FIRST. Without tracking that prefix the navigation
+// keys were looked up in scancode_to_keycode[] as their non-extended twins:
+// the up arrow (E0 48) collapsed onto plain 0x48, etc. -- the root cause of
+// "dead arrow keys" (and R-Ctrl/R-Alt aliasing the left modifiers).
+//
+// The numeric values here are the standard Linux input-event-codes the rest of
+// the system already speaks: the compositor forwards e->code verbatim and the
+// IDE / editor / terminal switch on KEY_UP==103, KEY_DOWN==108, KEY_LEFT==105,
+// KEY_RIGHT==106 (see userspace/apps/ide/ide.c, editor.c, terminal_m3.c). The
+// kernel input.h only defines keycodes up to KEY_SCROLLLOCK(70), so the >70
+// codes are spelled as literals with their evdev names in comments. 0 == "no
+// keycode" (entry not an extended key we forward).
+#define KC_KPENTER   96   // keypad Enter
+#define KC_RIGHTCTRL 97
+#define KC_KPSLASH   98   // keypad '/'
+#define KC_RIGHTALT  100
+#define KC_HOME      102
+#define KC_UP        103
+#define KC_PAGEUP    104
+#define KC_LEFT      105
+#define KC_RIGHT     106
+#define KC_END       107
+#define KC_DOWN      108
+#define KC_PAGEDOWN  109
+#define KC_INSERT    110
+#define KC_DELETE    111
+#define KC_LEFTMETA  125  // left Super/Windows
+#define KC_RIGHTMETA 126  // right Super/Windows
+#define KC_MENU      127  // application/menu key
+
+static const uint16_t scancode_to_keycode_ext[128] = {
+    [0x1C] = KC_KPENTER,   // keypad Enter
+    [0x1D] = KC_RIGHTCTRL, // right Ctrl
+    [0x35] = KC_KPSLASH,   // keypad '/'
+    [0x38] = KC_RIGHTALT,  // right Alt (AltGr)
+    [0x47] = KC_HOME,
+    [0x48] = KC_UP,
+    [0x49] = KC_PAGEUP,
+    [0x4B] = KC_LEFT,
+    [0x4D] = KC_RIGHT,
+    [0x4F] = KC_END,
+    [0x50] = KC_DOWN,
+    [0x51] = KC_PAGEDOWN,
+    [0x52] = KC_INSERT,
+    [0x53] = KC_DELETE,
+    [0x5B] = KC_LEFTMETA,
+    [0x5C] = KC_RIGHTMETA,
+    [0x5D] = KC_MENU,
+    // everything else 0 (e.g. 0x2A / 0x36 fake-shift, already filtered below)
+};
+
+// ASCII for the handful of extended keys that genuinely produce a character on
+// the legacy stdin path (ps2_getchar): keypad-Enter -> '\n', keypad-'/' -> '/'.
+// The navigation keys (arrows, Home/End/PgUp/PgDn, Ins/Del) deliberately yield
+// 0 here -- they have no ASCII and previously LEAKED keypad digits ('8','4',...)
+// into stdin because the non-extended table was consulted. Returning 0 means
+// "no character", which is exactly how a bare terminal behaves for a naked
+// cursor key (the real char comes from an escape sequence the simple stdin
+// consumers don't parse). This keeps the bug (digit injection) fixed without
+// inventing bytes.
+static char ext_scancode_to_ascii(uint8_t sc) {
+    switch (sc) {
+        case 0x1C: return '\n';  // keypad Enter
+        case 0x35: return '/';   // keypad '/'
+        default:   return 0;     // navigation / right-modifiers: no ASCII
+    }
+}
+
 // Handle keyboard scancode
 static void ps2_handle_scancode(uint8_t scancode) {
+    // --- 0xE1 (Pause/Break) prefix: a fixed 6-byte (E1 1D 45 E1 9D C5) burst.
+    // It has no useful keycode and, left untracked, its body bytes (0x1D ==
+    // Ctrl, 0x45 == NumLock, ...) would be misread as real key events. Swallow
+    // the whole sequence. e1_remaining counts the bytes still to discard. ---
+    static int  e1_remaining = 0;
+    if (e1_remaining > 0) {
+        e1_remaining--;
+        return;
+    }
+    if (scancode == 0xE1) {
+        e1_remaining = 5;  // discard the 5 bytes that follow the 0xE1 lead
+        return;
+    }
+
+    // --- 0xE0 extended prefix: the NEXT byte is an extended scancode. Latch the
+    // flag and wait for that byte; do not treat 0xE0 itself as a key. ---
+    static bool saw_e0 = false;
+    if (scancode == 0xE0) {
+        saw_e0 = true;
+        return;
+    }
+
+    bool extended = saw_e0;
+    saw_e0 = false;  // consume the latch exactly once, for THIS byte only
+
     // Check for key release (high bit set)
     bool key_released = (scancode & 0x80) != 0;
     scancode &= 0x7F;  // Clear release bit
 
+    if (extended) {
+        // Fake-shift: with NumLock on, the BIOS brackets gray navigation keys
+        // with a synthetic shift (E0 2A press / E0 AA release, also E0 36/B6).
+        // These are not real shift presses -- ignore them entirely so they
+        // neither toggle shift_pressed nor latch a stuck modifier.
+        if (scancode == 0x2A || scancode == 0x36) {
+            return;
+        }
+
+        // Right-hand modifiers (distinct from their left twins thanks to 0xE0).
+        if (scancode == 0x1D) {  // Right Ctrl
+            ctrl_pressed = !key_released;
+        } else if (scancode == 0x38) {  // Right Alt (AltGr)
+            alt_pressed = !key_released;
+        }
+
+        // Forward the extended keycode (arrows, Home/End/PgUp/PgDn, Ins/Del,
+        // keypad-Enter, keypad-'/', R-Ctrl, R-Alt, Super, Menu).
+        if (keyboard_device) {
+            uint16_t keycode = scancode_to_keycode_ext[scancode];
+            if (keycode != 0) {
+                int32_t value = key_released ? KEY_STATE_RELEASED
+                                             : KEY_STATE_PRESSED;
+                input_report_key(keyboard_device, keycode, value);
+                input_sync(keyboard_device);
+            }
+        }
+
+        // Legacy stdin path: only on press, only for keys with real ASCII
+        // (keypad-Enter / keypad-'/'); navigation keys yield 0 and are dropped.
+        if (!key_released) {
+            char ec = ext_scancode_to_ascii(scancode);
+            if (ec != 0) {
+                kb_buffer_put(ec);
+            }
+        }
+        return;  // extended bytes never fall through to the non-extended path
+    }
+
+    // ===================== non-extended (common) path =====================
     // Update modifier state
     if (scancode == 0x2A || scancode == 0x36) {  // Left/Right Shift
         shift_pressed = !key_released;

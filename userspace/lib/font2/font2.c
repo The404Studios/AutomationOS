@@ -431,6 +431,56 @@ void font2_draw_scaled_clip(unsigned int *px, int stride, int maxw, int maxh,
 }
 
 /* =========================================================================
+ * font2_draw_cell_clip — fractional (nearest-neighbor) scaled + clipped draw.
+ * Maps each output pixel (dx,dy) in the cell_w x cell_h cell back to the 8x16
+ * source glyph by nearest-neighbor, so non-integer sizes (e.g. 12x24) work.
+ * ========================================================================= */
+void font2_draw_cell_clip(unsigned int *px, int stride, int maxw, int maxh,
+                          int clip_x0, int clip_x1,
+                          int x, int y,
+                          const char *str, int cell_w, int cell_h,
+                          unsigned int argb)
+{
+    int cx = x;
+    if (!str || !px) return;
+    if (cell_w < 1) cell_w = 1;
+    if (cell_h < 1) cell_h = 1;
+    if (clip_x0 < 0) clip_x0 = 0;
+    if (clip_x1 > maxw) clip_x1 = maxw;
+
+    while (*str) {
+        char c = *str++;
+        if ((unsigned char)c < 0x20u) { cx += cell_w; continue; }
+        if (cx >= clip_x1) break;
+        if (cx + cell_w <= clip_x0) { cx += cell_w; continue; }
+
+        {
+            const unsigned char *glyph = f2_glyph(c);
+            int dy;
+            for (dy = 0; dy < cell_h; dy++) {
+                int by = y + dy;
+                int srow, dx;
+                unsigned char bits;
+                if (by < 0 || by >= maxh) continue;
+                srow = dy * FONT_H / cell_h;          /* nearest source row */
+                bits = glyph[srow];
+                if (bits == 0) continue;
+                for (dx = 0; dx < cell_w; dx++) {
+                    int bx = cx + dx;
+                    int scol;
+                    if (bx < clip_x0 || bx >= clip_x1) continue;
+                    if (bx < 0 || bx >= maxw) continue;
+                    scol = dx * FONT_W / cell_w;       /* nearest source col */
+                    if (f2_bit(bits, scol))
+                        px[by * stride + bx] = argb;
+                }
+            }
+        }
+        cx += cell_w;
+    }
+}
+
+/* =========================================================================
  * font2_draw_aa
  *
  * Anti-aliasing via 2× supersampling + 2×2 box downsample.

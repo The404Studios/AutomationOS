@@ -50,7 +50,7 @@ cc userspace/lib/icon/icon.c    /tmp/icon.o
 
 echo "[all] compositor (m8: right-side dock w/ hover-magnify, folders, bounce) + init..."
 cc userspace/compositor/compositor_m8.c /tmp/cm6.o
-$LD /tmp/cm6.o /tmp/bf.o /tmp/icon.o -o /tmp/comp.elf
+$LD /tmp/cm6.o /tmp/bf.o /tmp/font2.o /tmp/icon.o -o /tmp/comp.elf
 gcc $CF $INIT_EXTRA -c userspace/init/main.c -o /tmp/init.o
 $LD /tmp/init.o -o /tmp/init.elf
 # forktest: standalone fork/CoW correctness probe (no libs), spawned by init.

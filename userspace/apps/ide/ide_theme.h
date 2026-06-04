@@ -35,22 +35,20 @@
 #define TH_PENDING     TH_TEXT_FAINT
 
 /* ---- layout (pixels) ---- */
-/* Larger default window (the 950x680 felt cramped/"too small"). The IDE relays
- * out every frame from the live window size, so this also gives Alt+Enter /
- * titlebar Maximize real room to grow toward the 1280x800 desktop. */
-/* Constants grown to match the 2x text (IDE_UI_SCALE): bars that hold a 32px
- * glyph need >= ~40px, list rows >= ~36px, and the side columns need ~2x width
- * to fit the same character counts. The IDE re-layouts from the live window
- * size, so on a maximized 1280-wide desktop the editor still gets ~550px. */
-#define IDE_W          1200
-#define IDE_H          740
-#define TOPBAR_H       44    /* VIZ tab bar              */
-#define STATUS_H       38    /* bottom shortcuts bar     */
-#define LEFT_W         340   /* explorer + funcs column  */
-#define RIGHT_W        380   /* inspector column         */
-#define RUNTIME_H      150    /* bottom runtime-flow strip*/
-#define ROW_H          36    /* list row height          */
-#define PAD            8
+/* IDE_W/IDE_H are the default window size, kept <= a 1024x768 panel so the IDE
+ * never opens larger than the physical screen (the app also clamps to the live
+ * work area). The text-sensitive constants below DERIVE from the runtime cell
+ * (GFX_FW/GFX_FH), so when the user zooms (Ctrl+wheel) the WHOLE layout reflows
+ * coherently -- rows, bars and side columns all track the glyph size. */
+#define IDE_W          1024
+#define IDE_H          700
+#define TOPBAR_H       (GFX_FH + 12)   /* VIZ tab bar (fits one glyph + pad)  */
+#define STATUS_H       (GFX_FH + 6)    /* bottom shortcuts bar                */
+#define LEFT_W         (24 * GFX_FW)   /* explorer + funcs column (~24 chars) */
+#define RIGHT_W        (27 * GFX_FW)   /* inspector column (~27 chars)        */
+#define RUNTIME_H      (5  * GFX_FH)   /* bottom runtime-flow strip (~5 rows) */
+#define ROW_H          (GFX_FH + 4)    /* list row height                    */
+#define PAD            6
 
 /* port-type -> accent colour mapping helper (inline) */
 static inline unsigned int th_port_color(int port_type) {

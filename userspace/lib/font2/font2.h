@@ -71,6 +71,23 @@ void font2_draw_scaled_clip(unsigned int *px, int stride, int maxw, int maxh,
                             unsigned int argb);
 
 /* --------------------------------------------------------------------------
+ * font2_draw_cell_clip — FRACTIONAL scaled text (nearest-neighbor) into an
+ * arbitrary glyph cell (cell_w x cell_h), bounds-safe + horizontally clipped.
+ *
+ * Unlike font2_draw_scaled (integer replication only), this maps each output
+ * pixel back to the 8x16 source by nearest-neighbor, so it can render any
+ * intermediate size — e.g. 12x24 (1.5x) or 10x20 (1.25x) — to land between the
+ * "too small" 8x16 and the "too big" 16x32. Same bounds/clip guarantees as
+ * font2_draw_scaled_clip. cell advance == cell_w (matches font2_text_width when
+ * width is computed as nchars*cell_w).
+ * -------------------------------------------------------------------------- */
+void font2_draw_cell_clip(unsigned int *px, int stride, int maxw, int maxh,
+                          int clip_x0, int clip_x1,
+                          int x, int y,
+                          const char *str, int cell_w, int cell_h,
+                          unsigned int argb);
+
+/* --------------------------------------------------------------------------
  * font2_draw_aa
  *
  * Lightly anti-aliased 1× render via 2×2 supersampling.

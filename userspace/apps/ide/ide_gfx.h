@@ -7,14 +7,19 @@
 
 #include <stdint.h>
 
-/* UI text scale: the base bitmap font is 8x16; at IDE_UI_SCALE=2 the whole IDE
- * renders crisp 16x32 text (the desktop felt "too small"). GFX_FW/GFX_FH are the
- * single source of truth the layout math is built on, so bumping them here scales
- * the entire IDE coherently; the fixed pixel constants in ide_theme.h are grown
- * proportionally to match. Text is drawn via font2_draw_scaled_clip (bounds-safe). */
-#define IDE_UI_SCALE 2
-#define GFX_FW (8  * IDE_UI_SCALE)   /* font cell width                 */
-#define GFX_FH (16 * IDE_UI_SCALE)   /* font cell height                */
+/* RUNTIME UI text scale. The base bitmap font is 8x16; the glyph cell is
+ * (8,16) * g_ui_pct/100, rendered via font2_draw_cell_clip (fractional, bounds-
+ * safe). Making these RUNTIME vars (not #defines) lets the user zoom the whole
+ * IDE live with Ctrl+mouse-wheel / Ctrl +/-/0 -- the layout reflows because every
+ * panel derives its geometry from GFX_FW/GFX_FH each frame. The macro aliases keep
+ * all ~150 existing call sites unchanged. Default 138% => an 11x22 cell (readable
+ * on a 1024x768 panel, between the too-small 8x16 and the too-big 16x32). */
+extern int g_ui_pct;     /* zoom percent of the 8x16 base, 100..250          */
+extern int g_gfx_fw;     /* current cell width  (8..20)                      */
+extern int g_gfx_fh;     /* current cell height (16..40)                     */
+void gfx_set_scale(int pct);   /* clamp pct to [100,250], recompute the cell  */
+#define GFX_FW g_gfx_fw
+#define GFX_FH g_gfx_fh
 
 typedef struct {
     uint32_t* px;    /* ARGB32 pixels        */

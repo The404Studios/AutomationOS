@@ -74,6 +74,13 @@ static int g_build_view = 0;
 static int g_ctrl_down  = 0;
 static int g_shift_down = 0;
 
+/* Dirty flag: the IDE only re-renders + wl_commits when something actually
+ * changed (input, zoom, resize, or a periodic caret-blink tick). Previously the
+ * main loop redrew + committed full-surface EVERY iteration, forcing the
+ * compositor to recomposite the whole screen continuously -- the "super laggy"
+ * report, 4x worse at 2x text. Seeded 1 so the first frame always draws. */
+static int g_ide_redraw = 1;
+
 /*
  * US-layout raw-keycode -> ASCII. `shift` selects the shifted glyph. Keys with
  * no printable mapping (Enter/Backspace/arrows/etc.) return 0; the editor and
@@ -663,23 +670,44 @@ static void layout(Ide* a, wl_window* win) {
     a->r_topbar.x = 0;  a->r_topbar.y = 0;
     a->r_topbar.w = W;  a->r_topbar.h = TOPBAR_H;
 
-    /* Status bar -- full width at the very bottom. */
-    a->r_status.x = 0;  a->r_status.y = H - STATUS_H;
-    a->r_status.w = W;  a->r_status.h = STATUS_H;
+    /* VERTICAL fit: reserve the topbar first, then squeeze the runtime + status
+     * bands into whatever height remains, so they can NEVER paint over the topbar
+     * / explorer on a small window (the cause of the runtime-overlaps-everything
+     * artifact). Below a point the runtime band collapses to 0 (hidden). */
+    int avail = H - TOPBAR_H; if (avail < 0) avail = 0;
+    int status_h  = STATUS_H;  if (status_h  > avail)            status_h  = avail;
+    int runtime_h = RUNTIME_H; if (runtime_h > avail - status_h) runtime_h = avail - status_h;
+    if (runtime_h < 0) runtime_h = 0;
 
-    /* Runtime band -- the RUNTIME_H strip just above the status bar. */
-    a->r_runtime.x = 0;             a->r_runtime.y = H - STATUS_H - RUNTIME_H;
-    a->r_runtime.w = W;             a->r_runtime.h = RUNTIME_H;
+    a->r_status.x = 0;  a->r_status.y = H - status_h;
+    a->r_status.w = W;  a->r_status.h = status_h;
+
+    a->r_runtime.x = 0;  a->r_runtime.y = H - status_h - runtime_h;
+    a->r_runtime.w = W;  a->r_runtime.h = runtime_h;
 
     /* The working region between the top bar and the runtime band. */
     int work_top    = TOPBAR_H;
-    int work_bottom = H - STATUS_H - RUNTIME_H;     /* exclusive            */
+    int work_bottom = H - status_h - runtime_h;     /* exclusive, never < TOPBAR_H */
     int work_h      = work_bottom - work_top;
     if (work_h < 0) work_h = 0;
 
-    /* Left column (explorer over funcs). */
-    int left_w = LEFT_W;
-    if (left_w > W) left_w = W;
+    /* HORIZONTAL fit: clamp the left + right columns TOGETHER (each to a fraction)
+     * and reserve a minimum center, so explorer and inspector can never touch /
+     * overlap and the map/code center never collapses unless the window is tiny --
+     * in which case a column is HIDDEN (width 0) rather than overlapped. */
+    int min_center = GFX_FW * 12;
+    int left_w  = LEFT_W;  if (left_w  > (W * 30) / 100) left_w  = (W * 30) / 100;
+    int right_w = RIGHT_W; if (right_w > (W * 32) / 100) right_w = (W * 32) / 100;
+    if (left_w + right_w > W - min_center) {
+        int over = (left_w + right_w) - (W - min_center);
+        left_w  -= over / 2;
+        right_w -= (over - over / 2);
+    }
+    if (W < min_center + 80) right_w = 0;            /* drop inspector first */
+    if (W < 80)            { left_w = 0; right_w = 0; }
+    if (left_w  < 0) left_w  = 0;
+    if (right_w < 0) right_w = 0;
+
     int expl_h = (work_h * 58) / 100;               /* explorer ~58%        */
     if (expl_h < 0) expl_h = 0;
 
@@ -688,11 +716,6 @@ static void layout(Ide* a, wl_window* win) {
 
     a->r_funcs.x = 0;               a->r_funcs.y = work_top + expl_h;
     a->r_funcs.w = left_w;          a->r_funcs.h = work_h - expl_h;
-
-    /* Right column (inspector, full working height). */
-    int right_w = RIGHT_W;
-    if (right_w > W - left_w) right_w = W - left_w;
-    if (right_w < 0) right_w = 0;
 
     a->r_inspector.x = W - right_w; a->r_inspector.y = work_top;
     a->r_inspector.w = right_w;     a->r_inspector.h = work_h;
@@ -1354,16 +1377,24 @@ static void scroll_under_mouse(Ide* a, int delta, int horizontal) {
         return;
     }
 
-    if (horizontal) return;   /* the row lists only scroll vertically */
+    if (!horizontal) {
+        if (rect_hit(a->r_explorer, mx, my))       target = &a->explorer_scroll;
+        else if (rect_hit(a->r_funcs, mx, my))     target = &a->funcs_scroll;
+        else if (rect_hit(a->r_code, mx, my))      target = &a->code_scroll;
+        else if (rect_hit(a->r_inspector, mx, my)) target = &a->inspector_scroll;
+    }
 
-    if (rect_hit(a->r_explorer, mx, my))       target = &a->explorer_scroll;
-    else if (rect_hit(a->r_funcs, mx, my))     target = &a->funcs_scroll;
-    else if (rect_hit(a->r_code, mx, my))      target = &a->code_scroll;
-    else if (rect_hit(a->r_inspector, mx, my)) target = &a->inspector_scroll;
+    if (target) {
+        *target += delta;
+        if (*target < 0) *target = 0;
+        return;
+    }
 
-    if (!target) return;
-    *target += delta;
-    if (*target < 0) *target = 0;
+    /* Nothing scrollable under the cursor: pan the map so arrow keys ALWAYS do
+     * something visible on the LEGO face (previously they were silently dropped
+     * unless the mouse happened to hover a panel -- "arrow keys don't work"). */
+    if (horizontal) a->map_ox += delta * MAP_PAN_STEP;
+    else            a->map_oy += delta * MAP_PAN_STEP;
 }
 
 /* Shared Ctrl-chord actions available in BOTH workspaces. Returns 1 if the
@@ -1373,18 +1404,14 @@ static int handle_ctrl_chord(Ide* a, int keycode) {
     case KEY_N:               /* Ctrl+N: open the New Project templates picker */
         np_open(a);
         return 1;
-    case KEY_EQUAL:           /* Ctrl+= zoom in (LEGO map): scale max 1.00 (100%) */
-        a->map_zoom += 10;
-        if (a->map_zoom > 100) a->map_zoom = 100;   /* clamp to 1.00 (max scale) */
+    case KEY_EQUAL:           /* Ctrl+= : zoom the whole IDE text IN (the layout reflows) */
+        gfx_set_scale(g_ui_pct + 25);
         return 1;
-    case KEY_MINUS:           /* Ctrl+- zoom out (LEGO map): scale min 0.01 (1%) */
-        a->map_zoom -= 10;
-        if (a->map_zoom < 1) a->map_zoom = 1;       /* clamp to 0.01 (min scale) */
+    case KEY_MINUS:           /* Ctrl+- : zoom the whole IDE text OUT */
+        gfx_set_scale(g_ui_pct - 25);
         return 1;
-    case KEY_0:               /* Ctrl+0 reset zoom to 100% */
-        a->map_zoom = 100;
-        a->map_ox = 0;        /* also recenter on zoom reset */
-        a->map_oy = 0;
+    case KEY_0:               /* Ctrl+0 : reset the IDE text zoom to the default */
+        gfx_set_scale(138);
         return 1;
     case KEY_B:               /* Ctrl+B: build the open file */
         /* Build what's on screen: flush unsaved editor edits to disk first so
@@ -1674,6 +1701,7 @@ void _start(void) {
     const int DRAG_THRESH = 4;            /* px of travel before it's a drag */
 
     long last_ms = ide_ticks_ms();
+    long last_blink_ms = last_ms;
 
     for (;;) {
         /* Recompute layout (window size may change) and render a fresh frame
@@ -1695,18 +1723,35 @@ void _start(void) {
         ide_editor_tick(a, dt);
         ide_term_tick(&a->term, dt);
 
-        if (a->ws == WS_EDITOR) {
-            layout_editor(a, win);
-            render_editor(a, &cv);
-        } else {
-            layout(a, win);
-            render(a, &cv);
+        /* Caret blink: force a redraw at a throttled ~400ms cadence only when a
+         * text caret is visible+focused, so the cursor blinks without busy-
+         * redrawing. Idle + unfocused => ZERO redraws/commits (the lag fix). */
+        int blink_active = (a->ws == WS_EDITOR && a->editor.focused) || a->term_focus;
+        if (blink_active && (now_ms - last_blink_ms) >= 400) {
+            g_ide_redraw = 1;
+            last_blink_ms = now_ms;
         }
-        wl_commit(win);
 
-        /* Drain all pending input events for this frame. */
+        /* Only re-render + commit when something actually changed (input, zoom,
+         * resize, or the blink tick above). No more full-surface recomposite of
+         * the whole screen every single frame. */
+        if (g_ide_redraw) {
+            if (a->ws == WS_EDITOR) {
+                layout_editor(a, win);
+                render_editor(a, &cv);
+            } else {
+                layout(a, win);
+                render(a, &cv);
+            }
+            wl_commit(win);
+            g_ide_redraw = 0;
+        }
+
+        /* Drain all pending input events for this frame. Each event is a state
+         * change -> mark the frame dirty so the next render reflects it. */
         int kind, ea, eb, ec;
         while (wl_poll_event(win, &kind, &ea, &eb, &ec)) {
+            g_ide_redraw = 1;                 /* any event changes state -> redraw */
             if (kind == WL_EVENT_POINTER) {
                 a->mouse_x = ea;
                 a->mouse_y = eb;
@@ -1717,6 +1762,14 @@ void _start(void) {
 
                 int left_now  = (a->buttons & 1);
                 int left_prev = (a->prev_buttons & 1);
+
+                /* Ctrl + mouse-wheel: ZOOM the whole IDE text in/out (the layout
+                 * reflows from the runtime cell size). Takes priority over scroll. */
+                if (wheel != 0 && g_ctrl_down) {
+                    gfx_set_scale(g_ui_pct + (wheel > 0 ? 25 : -25));
+                    a->prev_buttons = a->buttons;
+                    continue;                 /* don't also scroll */
+                }
 
                 /* Handle mouse wheel scrolling (negative=scroll down, positive=scroll up) */
                 if (wheel != 0) {

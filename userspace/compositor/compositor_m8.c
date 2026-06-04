@@ -546,20 +546,22 @@ static void blit_surface_scaled_alpha(uint32_t *buf, uint32_t bw, uint32_t bh, u
 #define BTN_MIN         0xFFFFBD47u   /* minimize box (amber)                */
 #define WIN_PLACEHOLDER 0xFF1C1C1Eu   /* shown if a client has no shm yet    */
 
-/* GUI SCALE: restored to ~1.0x chrome (user: the 0.75x shrink made the GUI "too
- * small"). These are the pre-shrink values; text-bearing bars stay >= 16px font + pad. */
-#define TITLEBAR_H  28
+/* GUI SCALE: text-bearing chrome bars DERIVE from the runtime font cell (FONT_H,
+ * defined below) so the WHOLE desktop -- not just the IDE -- grows/shrinks when the
+ * user zooms (Alt+wheel). These expand at use (after FONT_H is defined), and are
+ * used only in functions further down, so the macro-order is fine. */
+#define TITLEBAR_H  (FONT_H + 12)
 #define BORDER_W    1
 #define WIN_RADIUS  6                 /* rounded window outer-corner radius   */
 
-/* chrome geometry */
-#define PANEL_H     28
-#define DOCK_H      34
-#define LAUNCH_SZ   36                 /* launcher button                     */
-#define TASK_W      120                /* taskbar button width                */
-#define TASK_H      32                 /* taskbar button height               */
-#define CLOSE_SZ    12                 /* titlebar close box hit/visual size  */
-#define MIN_SZ      12                 /* titlebar minimize box hit/visual    */
+/* chrome geometry (font-cell-derived; track the global UI zoom) */
+#define PANEL_H     (FONT_H + 12)
+#define DOCK_H      (FONT_H + 18)
+#define LAUNCH_SZ   (FONT_H + 16)      /* launcher button                     */
+#define TASK_W      (FONT_W * 12)      /* taskbar button width (~12 chars)    */
+#define TASK_H      (FONT_H + 12)      /* taskbar button height               */
+#define CLOSE_SZ    (FONT_H - 4)       /* titlebar close box hit/visual size  */
+#define MIN_SZ      (FONT_H - 4)       /* titlebar minimize box hit/visual    */
 
 /* animation tunables (ms) */
 #define ANIM_OPEN_MS    180
@@ -866,8 +868,34 @@ static int32_t cos_q(int32_t deg) { return sin_q(deg + 90); }
 /* font (linked from userspace/lib/font/bitfont.c) */
 extern int font_draw_string(unsigned int *fbuf, int fstride, int fbw, int fbh,
                             int tx, int ty, const char *s, unsigned int color);
-#define FONT_W 8
-#define FONT_H 16
+/* Scalable text renderer (userspace/lib/font2) -- bounds-safe fractional cell. */
+extern void font2_draw_cell_clip(unsigned int *px, int stride, int maxw, int maxh,
+                                 int clip_x0, int clip_x1, int x, int y,
+                                 const char *str, int cell_w, int cell_h,
+                                 unsigned int argb);
+
+/* RUNTIME GLOBAL UI SCALE. The whole desktop -- chrome AND every text draw routed
+ * through cz_text() -- renders at a glyph cell of (8,16) * g_ui_pct/100. Alt+wheel
+ * zooms it live. FONT_W/FONT_H alias the runtime cell so all centering/truncation
+ * math tracks it; the chrome bar heights derive from FONT_H so they grow with it. */
+static int g_ui_pct = 130;     /* 100..200; default 130% => 10x20 cell           */
+static int g_cell_w = 10;
+static int g_cell_h = 20;
+#define FONT_W g_cell_w
+#define FONT_H g_cell_h
+static void cz_set_scale(int pct) {
+    if (pct < 100) pct = 100;
+    if (pct > 200) pct = 200;
+    g_ui_pct = pct;
+    g_cell_w = 8  * pct / 100;
+    g_cell_h = 16 * pct / 100;
+}
+/* Drop-in scaled replacement for font_draw_string() (identical signature), so
+ * every chrome text draw routes through the scalable renderer. */
+static void cz_text(unsigned int *buf, int stride, int bw, int bh,
+                    int x, int y, const char *s, unsigned int color) {
+    font2_draw_cell_clip(buf, stride, bw, bh, 0, bw, x, y, s, g_cell_w, g_cell_h, color);
+}
 
 /* ---- cursor arrow bitmap (from compositor_m2/m3.c) ---- */
 #define CUR_W 12
@@ -1407,7 +1435,7 @@ static void render_desktop_icons(uint32_t *buf, uint32_t w, uint32_t h, uint32_t
         int32_t lbl_x = tx + DESK_TILE / 2 - lbl_w / 2;
         int32_t lbl_y = ty + DESK_TILE + DESK_LABEL_GAP;
         if (lbl_x < 2) lbl_x = 2;
-        font_draw_string(buf, (int)stride, (int)w, (int)h, lbl_x, lbl_y, lbl, COL_TEXT);
+        cz_text(buf, (int)stride, (int)w, (int)h, lbl_x, lbl_y, lbl, COL_TEXT);
     }
 }
 
@@ -1518,10 +1546,10 @@ static void render_window_static(uint32_t *buf, uint32_t w, uint32_t h, uint32_t
         int32_t min_y   = fy + (TITLEBAR_H - MIN_SZ) / 2;
         fill_round_rect(buf, w, h, stride, close_x, close_y, CLOSE_SZ, CLOSE_SZ, 3, BTN_CLOSE);
         fill_round_rect(buf, w, h, stride, min_x,   min_y,   MIN_SZ,   MIN_SZ,   3, BTN_MIN);
-        font_draw_string(buf, (int)stride, (int)w, (int)h,
+        cz_text(buf, (int)stride, (int)w, (int)h,
                          close_x + (CLOSE_SZ - FONT_W) / 2,
                          close_y + (CLOSE_SZ - FONT_H) / 2, "x", COL_TEXT);
-        font_draw_string(buf, (int)stride, (int)w, (int)h,
+        cz_text(buf, (int)stride, (int)w, (int)h,
                          min_x + (MIN_SZ - FONT_W) / 2,
                          min_y + (MIN_SZ - FONT_H) / 2, "-", 0xFF000000u);
 
@@ -1539,7 +1567,7 @@ static void render_window_static(uint32_t *buf, uint32_t w, uint32_t h, uint32_t
         }
 
         /* window title text */
-        font_draw_string(buf, (int)stride, (int)w, (int)h,
+        cz_text(buf, (int)stride, (int)w, (int)h,
                          fx + 8, fy + (TITLEBAR_H - FONT_H) / 2, win->title,
                          focused ? COL_TEXT : COL_TEXT_DIM);
 
@@ -1829,7 +1857,7 @@ static void render_panel(uint32_t *buf, uint32_t w, uint32_t h, uint32_t stride)
     int slot = focused_slot();
     if (slot >= 0 && g_windows[slot].used && g_windows[slot].title[0])
         title = g_windows[slot].title;
-    font_draw_string(buf, (int)stride, (int)w, (int)h,
+    cz_text(buf, (int)stride, (int)w, (int)h,
                      12, (PANEL_H - FONT_H) / 2, title, COL_TEXT);
 
     /* right: clock HH:MM:SS */
@@ -1837,7 +1865,7 @@ static void render_panel(uint32_t *buf, uint32_t w, uint32_t h, uint32_t stride)
     long ms = syscall(SYS_GET_TICKS_MS, 0, 0, 0);
     format_clock(ms, clk);
     int clk_w = (int)k_strlen(clk) * FONT_W;
-    font_draw_string(buf, (int)stride, (int)w, (int)h,
+    cz_text(buf, (int)stride, (int)w, (int)h,
                      (int)w - clk_w - 12, (PANEL_H - FONT_H) / 2, clk, COL_TEXT);
 
     /* right: an ethernet/network indicator (4 signal bars) just left of the
@@ -1868,7 +1896,7 @@ static void render_dock(uint32_t *buf, uint32_t w, uint32_t h, uint32_t stride,
     if (launch_hover)
         fill_round_rect(buf, w, h, stride, lx - 1, ly - 1, LAUNCH_SZ + 2, LAUNCH_SZ + 2, 9, COL_HOVER);
     fill_round_rect(buf, w, h, stride, lx, ly, LAUNCH_SZ, LAUNCH_SZ, 8, COL_ACCENT);
-    font_draw_string(buf, (int)stride, (int)w, (int)h,
+    cz_text(buf, (int)stride, (int)w, (int)h,
                      lx + (LAUNCH_SZ - FONT_W) / 2, ly + (LAUNCH_SZ - FONT_H) / 2,
                      "T", COL_TEXT);
 
@@ -1891,7 +1919,7 @@ static void render_dock(uint32_t *buf, uint32_t w, uint32_t h, uint32_t stride,
         char t[20];
         truncate_title(g_windows[s].title[0] ? g_windows[s].title : "window",
                        t, (TASK_W - 12) / FONT_W);
-        font_draw_string(buf, (int)stride, (int)w, (int)h,
+        cz_text(buf, (int)stride, (int)w, (int)h,
                          bx + (g_windows[s].minimized ? 12 : 6),
                          by + (TASK_H - FONT_H) / 2, t,
                          (s == focused) ? COL_TEXT : COL_TEXT_DIM);
@@ -2006,7 +2034,7 @@ static void render_toast(uint32_t *buf, uint32_t w, uint32_t h, uint32_t stride,
      * the font has no alpha param, so for partial fades we draw only when the
      * toast is mostly visible to avoid harsh popping. */
     if (alpha >= 64) {
-        font_draw_string(buf, (int)stride, (int)w, (int)h,
+        cz_text(buf, (int)stride, (int)w, (int)h,
                          tx + TOAST_PAD_X, ty + TOAST_PAD_Y, g_toast_text, COL_TEXT);
     }
 }
@@ -2392,7 +2420,7 @@ static void render_right_dock(uint32_t *buf, uint32_t w, uint32_t h, uint32_t st
             if (tip_x < 4) tip_x = 4;
             fill_round_rect(buf, w, h, stride, tip_x, tip_y, tip_w, tip_h, 5, 0xF0111111u);
             stroke_rect(buf, w, h, stride, tip_x, tip_y, tip_w, tip_h, COL_BORDER);
-            font_draw_string(buf, (int)stride, (int)w, (int)h,
+            cz_text(buf, (int)stride, (int)w, (int)h,
                              tip_x + 8, tip_y + 4, tip, COL_TEXT);
         }
     }
@@ -2530,7 +2558,7 @@ static void draw_menu(uint32_t *buf, uint32_t w, uint32_t h, uint32_t stride) {
     blend_rect(buf, w, h, stride, g_menu_x + 5, g_menu_y + 6, MENU_W, mh, 0x60000000u); /* shadow */
     fill_round_rect(buf, w, h, stride, g_menu_x, g_menu_y, MENU_W, mh, 8, 0xFF1C2230u); /* panel */
     const char *title = g_menu_is_ctx ? "Actions" : "AutomationOS";
-    font_draw_string(buf, (int)stride, (int)w, (int)h,
+    cz_text(buf, (int)stride, (int)w, (int)h,
                      g_menu_x + 12, g_menu_y + (MENU_HDR_H - FONT_H) / 2, title, COL_ACCENT);
     blend_rect(buf, w, h, stride, g_menu_x + 8, g_menu_y + MENU_HDR_H - 1,
                MENU_W - 16, 1, 0x40FFFFFFu); /* divider */
@@ -2539,7 +2567,7 @@ static void draw_menu(uint32_t *buf, uint32_t w, uint32_t h, uint32_t stride) {
         if (i == g_menu_hover)
             fill_round_rect(buf, w, h, stride, g_menu_x + 4, ry + 1,
                             MENU_W - 8, MENU_ROW_H - 2, 4, COL_ACCENT);
-        font_draw_string(buf, (int)stride, (int)w, (int)h,
+        cz_text(buf, (int)stride, (int)w, (int)h,
                          g_menu_x + 14, ry + (MENU_ROW_H - FONT_H) / 2,
                          g_menu_label[i], COL_TEXT);
     }
@@ -2572,10 +2600,10 @@ static void draw_about(uint32_t *buf, uint32_t w, uint32_t h, uint32_t stride) {
     int32_t tx_cred  = px + (pw - about_slen(l_cred)  * FONT_W) / 2;
     int32_t tx_hint  = px + (pw - about_slen(l_hint)  * FONT_W) / 2;
 
-    font_draw_string(buf, (int)stride, (int)w, (int)h, tx_title, py + (44 - FONT_H) / 2, l_title, COL_ACCENT);
-    font_draw_string(buf, (int)stride, (int)w, (int)h, tx_ver,   py + 78,  l_ver,  COL_TEXT_DIM);
-    font_draw_string(buf, (int)stride, (int)w, (int)h, tx_cred,  py + 118, l_cred, COL_TEXT);
-    font_draw_string(buf, (int)stride, (int)w, (int)h, tx_hint,  py + 168, l_hint, COL_TEXT_DIM);
+    cz_text(buf, (int)stride, (int)w, (int)h, tx_title, py + (44 - FONT_H) / 2, l_title, COL_ACCENT);
+    cz_text(buf, (int)stride, (int)w, (int)h, tx_ver,   py + 78,  l_ver,  COL_TEXT_DIM);
+    cz_text(buf, (int)stride, (int)w, (int)h, tx_cred,  py + 118, l_cred, COL_TEXT);
+    cz_text(buf, (int)stride, (int)w, (int)h, tx_hint,  py + 168, l_hint, COL_TEXT_DIM);
 }
 
 /* ====================================================================== *
@@ -2664,11 +2692,11 @@ static void render_stats_overlay(uint32_t *buf, uint32_t w, uint32_t h, uint32_t
     blend_rect(buf, w, h, stride, bx, by, bw, bh, 0xC0101418u);
     stroke_rect(buf, w, h, stride, bx, by, bw, bh, 0x800A84FFu);
 
-    font_draw_string(buf, (int)stride, (int)w, (int)h,
+    cz_text(buf, (int)stride, (int)w, (int)h,
                      bx + 6, by + 5, l1, 0xFF6FE26Fu);            /* green-ish */
-    font_draw_string(buf, (int)stride, (int)w, (int)h,
+    cz_text(buf, (int)stride, (int)w, (int)h,
                      bx + 6, by + 5 + FONT_H, l2, 0xFFE2E27Au);   /* amber-ish */
-    font_draw_string(buf, (int)stride, (int)w, (int)h,
+    cz_text(buf, (int)stride, (int)w, (int)h,
                      bx + 6, by + 5 + 2 * FONT_H, l3, 0xFF7AC8FFu); /* blue-ish */
 }
 
@@ -3076,6 +3104,7 @@ static void handle_resize(const wl_req_resize_t *req) {
     win->buf_h     = req->h;
     win->stride    = req->w;                      /* tightly packed, pinned to w */
     win->dirty     = 1;
+    mark_dirty();                                 /* force a recomposite so the new buffer shows */
     if (old_vaddr) sc6(SYS_SHMDT, (long)old_vaddr, 0, 0, 0, 0, 0);
     print("[COMP] resize win="); print_num(req->win_id);
     print(" to "); print_num((long)req->w); print("x"); print_num((long)req->h);
@@ -3138,7 +3167,17 @@ static int32_t g_wheel_delta = 0; /* accumulated wheel scroll (reset per frame) 
 static int32_t g_click_latch  = 0, g_click_cx  = 0, g_click_cy  = 0;  /* left  */
 static int32_t g_rclick_latch = 0, g_rclick_cx = 0, g_rclick_cy = 0;  /* right */
 
+static int g_alt_held;   /* fwd decl (defined below); used by the Alt+wheel zoom */
 static void send_pointer_to_focus(void) {
+    /* Alt + mouse-wheel = GLOBAL DESKTOP ZOOM. Consume the wheel here (don't
+     * forward it to the app) and step the whole-desktop UI scale by 10% per
+     * notch; the next composite re-renders all chrome at the new cell. Works even
+     * with no focused window (zoom from the bare desktop). */
+    if (g_alt_held && g_wheel_delta != 0) {
+        cz_set_scale(g_ui_pct + (g_wheel_delta > 0 ? 10 : -10));
+        g_wheel_delta = 0;
+        mark_dirty();
+    }
     int slot = focused_slot();
     if (slot < 0) return;
     window_t *win = &g_windows[slot];

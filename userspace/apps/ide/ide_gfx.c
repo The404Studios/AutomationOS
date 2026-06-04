@@ -5,6 +5,17 @@
 #include "../../lib/font/bitfont.h"
 #include "../../lib/font2/font2.h"
 
+/* Runtime UI scale (see ide_gfx.h). Default 138% -> 11x22 cell. */
+int g_ui_pct = 138, g_gfx_fw = 11, g_gfx_fh = 22;
+
+void gfx_set_scale(int pct) {
+    if (pct < 100) pct = 100;
+    if (pct > 250) pct = 250;
+    g_ui_pct = pct;
+    g_gfx_fw = 8  * pct / 100; if (g_gfx_fw < 8)  g_gfx_fw = 8;  if (g_gfx_fw > 20) g_gfx_fw = 20;
+    g_gfx_fh = 16 * pct / 100; if (g_gfx_fh < 16) g_gfx_fh = 16; if (g_gfx_fh > 40) g_gfx_fh = 40;
+}
+
 #define A(c) (((c) >> 24) & 0xFFu)
 #define R(c) (((c) >> 16) & 0xFFu)
 #define G(c) (((c) >>  8) & 0xFFu)
@@ -135,9 +146,9 @@ void gfx_dashed(Canvas* c, int x0, int y0, int x1, int y1, uint32_t col, int das
 }
 
 void gfx_text(Canvas* c, int x, int y, const char* s, uint32_t col) {
-    /* Crisp scaled text (IDE_UI_SCALE), bounds-clipped to the canvas. */
-    font2_draw_scaled_clip((unsigned int*)c->px, c->stride, c->w, c->h,
-                           0, c->w, x, y, s, IDE_UI_SCALE, col | 0xFF000000u);
+    /* Fractional scaled text at the runtime cell size, bounds-clipped to canvas. */
+    font2_draw_cell_clip((unsigned int*)c->px, c->stride, c->w, c->h,
+                         0, c->w, x, y, s, g_gfx_fw, g_gfx_fh, col | 0xFF000000u);
 }
 
 void gfx_text_n(Canvas* c, int x, int y, const char* s, int n, uint32_t col) {
@@ -152,10 +163,10 @@ void gfx_text_n(Canvas* c, int x, int y, const char* s, int n, uint32_t col) {
 void gfx_text_clip(Canvas* c, int x, int y, const char* s, uint32_t col,
                    int clip_x, int clip_w) {
     /* Scaled text horizontally clipped to [clip_x, clip_x+clip_w) and bounded to
-     * the canvas. font2_draw_scaled_clip handles per-pixel clipping internally. */
-    font2_draw_scaled_clip((unsigned int*)c->px, c->stride, c->w, c->h,
-                           clip_x, clip_x + clip_w, x, y, s,
-                           IDE_UI_SCALE, col | 0xFF000000u);
+     * the canvas. font2_draw_cell_clip handles per-pixel clipping internally. */
+    font2_draw_cell_clip((unsigned int*)c->px, c->stride, c->w, c->h,
+                         clip_x, clip_x + clip_w, x, y, s,
+                         g_gfx_fw, g_gfx_fh, col | 0xFF000000u);
 }
 
 int gfx_textw(const char* s) { int n = 0; if (s) while (s[n]) n++; return n * GFX_FW; }

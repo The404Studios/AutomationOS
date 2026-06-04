@@ -204,6 +204,14 @@ int tc_build(const char* path, TcResult* res)
         AstNode* tu;
         parser_init(&g_P, g_src, srclen, g_toks, PARSE_MAX_TOKS);
         tu = parse_translation_unit(&g_P);
+        /* If the AST node pool overflowed, the tree is SILENTLY truncated (further
+         * ast_new() return a shared sentinel) -- feeding that to codegen yields
+         * wrong asm or a null-deref crash. Fail cleanly instead. */
+        if (ast_arena_full()) {
+            res->ok = 0;
+            set_msg(res, "source too large: AST node pool exhausted -- split the file");
+            return 0;
+        }
         if (!cc_compile(tu, g_asm, TC_ASM_CAP, res->diags, &res->ndiags)) {
             res->ok = 0;
             set_msg(res, "C compile failed");

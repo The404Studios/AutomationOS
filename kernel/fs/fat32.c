@@ -276,6 +276,10 @@ static int fat32_read_lfn(fat32_dir_entry_t* entries, uint32_t max_entries,
 
     int total_lfn_entries = seq;
     char temp_buffer[260];  // Max LFN length
+    // Zero first: the extraction loops below write ONLY the character positions
+    // that pass their guards, so any skipped slot would otherwise be read back as
+    // uninitialized stack garbage when the name is assembled -> corrupt filenames.
+    memset(temp_buffer, 0, sizeof(temp_buffer));
     int pos = 0;
 
     // Read LFN entries in reverse order

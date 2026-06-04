@@ -136,7 +136,12 @@ static void as_diag2(AsState* S, int line, const char* msg, const char* extra) {
  * ----------------------------------------------------------------------- */
 
 static int as_sym_add(AsState* S, const char* name, uint64_t addr) {
-    if (S->nsyms >= AS_MAXLABEL) return 0;
+    if (S->nsyms >= AS_MAXLABEL) {
+        /* Table full: callers don't check this return, so without a diagnostic an
+         * over-the-cap label would silently resolve to 0 -> wrong jumps. Surface it. */
+        as_diag(S, S->line, "too many labels (assembler symbol table full)");
+        return 0;
+    }
     /* dedup: redefinition just updates (codegen labels are unique anyway) */
     for (int i = 0; i < S->nsyms; i++) {
         if (as_streq(S->syms[i].name, name)) { S->syms[i].addr = addr; return 1; }
@@ -780,6 +785,12 @@ static void enc_dq(AsState* S, AsLex* L) {
  *  label (possibly with trailing instruction), or instruction.
  * ----------------------------------------------------------------------- */
 
+/* Depth guard for the "label: instruction" same-line recursion below. A
+ * pathological input ("a: b: c: ... nop") would otherwise recurse once per label
+ * and blow the C stack, crashing the assembler (and the IDE on Ctrl+B). */
+static int g_enc_label_depth = 0;
+#define ENC_LABEL_MAX_DEPTH 64
+
 static void enc_line(AsState* S, const char* line, int in_data) {
     AsLex Lx; Lx.p = line;
     AsLex* L = &Lx;
@@ -802,8 +813,14 @@ static void enc_line(AsState* S, const char* line, int in_data) {
         /* the rest of the line (if any) may be another instruction */
         lx_skipws(L);
         if (!*L->p || *L->p == ';' || *L->p == '#') return;
-        /* recurse on remainder */
+        /* recurse on remainder, capped so a long "a: b: c: ..." can't blow the stack */
+        if (g_enc_label_depth >= ENC_LABEL_MAX_DEPTH) {
+            as_diag(S, S->line, "too many labels on one line");
+            return;
+        }
+        g_enc_label_depth++;
         enc_line(S, L->p, in_data);
+        g_enc_label_depth--;
         return;
     }
     L->p = tokstart;  /* rewind; re-lex below as mnemonic/directive */

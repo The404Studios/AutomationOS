@@ -1049,9 +1049,14 @@ int64_t sys_map_file(uint64_t path, uint64_t out_addr, uint64_t out_size,
     kprintf("[MAP_FILE] Mapped %s at 0x%lx (%lu bytes, %lu pages)\n",
             kpath, base_va, file_size, pages);
 
-    // Write results to userspace
-    copy_to_user((void*)out_addr, &base_va, sizeof(base_va));
-    copy_to_user((void*)out_size, &file_size, sizeof(file_size));
+    // Write results to userspace. Check BOTH copies: a failure (bad out_addr/
+    // out_size pointer) must surface as EFAULT, not a false ESUCCESS that leaves
+    // the caller reading stale stack for the mapped address/size.
+    if (copy_to_user((void*)out_addr, &base_va, sizeof(base_va)) != COPY_SUCCESS ||
+        copy_to_user((void*)out_size, &file_size, sizeof(file_size)) != COPY_SUCCESS) {
+        vfs_inode_put(inode);
+        return EFAULT;
+    }
 
     vfs_inode_put(inode);
     return ESUCCESS;

@@ -101,6 +101,13 @@ void draw_rect(uint32_t *fb, uint32_t fb_width, uint32_t fb_height,
                uint32_t color, uint32_t thickness) {
     if (!fb || thickness == 0) return;
 
+    // If the border is as thick as (or thicker than) the rect, the side-edge
+    // height/width math (height - 2*thickness) would underflow these uint32s to
+    // a huge value -> a massive out-of-bounds fill. Just fill it solid instead.
+    if (2 * thickness >= width || 2 * thickness >= height) {
+        draw_fill_rect(fb, fb_width, fb_height, x, y, width, height, color);
+        return;
+    }
     // Top edge
     draw_fill_rect(fb, fb_width, fb_height, x, y, width, thickness, color);
     // Bottom edge

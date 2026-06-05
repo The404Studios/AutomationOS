@@ -21,7 +21,14 @@ extern void syscall_entry_cpu1(void);
  * (Brick F). Harmless now: CPU1 issues no SYSCALL until it dispatches a process. */
 void syscall_msr_init_ap(void) {
     uint64_t efer = rdmsr(0xC0000080);          // IA32_EFER
-    efer |= 1;                                  // SCE
+    efer |= 1;                                  // SCE (System Call Enable)
+    // NXE (No-Execute Enable, bit 11) is PER-CPU. The BSP enables it in paging_init,
+    // but the AP trampoline does NOT -- so without this, the NX bit (63) that the
+    // kernel sets on data mappings (incl. the higher-half DIRECT MAP) is a RESERVED
+    // bit on CPU1. CPU1 then takes a reserved-bit #PF the instant it reads a kmalloc'd
+    // offload operand via PHYS_TO_DIRECT in matmul_band_n (err=0x8 RESERVED-BIT) -- the
+    // smpstress crash long misattributed to a direct-map "alias" coherence problem.
+    efer |= (1ULL << 11);                       // NXE -- match the BSP
     wrmsr(0xC0000080, efer);
 
     uint64_t star = ((uint64_t)0x10 << 48) | ((uint64_t)0x08 << 32);

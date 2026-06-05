@@ -492,10 +492,15 @@ static int snapshot_file(const char *path)
         if (write_file(snap, g_filebuf, n) != 0) return -1;
     }
 
-    /* remember most-recent snapshot for this basename */
+    /* Remember the most-recent snapshot for this EXACT path. Keying on basename alone
+     * (the old behaviour) collides two files with the same name in different
+     * directories (e.g. /home/config.txt and /usr/src/config.txt -- both writable per
+     * path_write_allowed) into one slot, so the second write overwrites the first's
+     * tracked orig and a later rollback restores the WRONG file. orig is full-path
+     * (KPATH_MAX); the base[] field stays only for the on-disk snapshot filename. */
     int slot = -1;
     for (int i = 0; i < g_snap_count; i++) {
-        if (k_streq(g_snaps[i].base, base)) { slot = i; break; }
+        if (k_streq(g_snaps[i].orig, path)) { slot = i; break; }
     }
     if (slot < 0 && g_snap_count < SNAP_SLOTS) slot = g_snap_count++;
     if (slot >= 0) {
@@ -506,12 +511,13 @@ static int snapshot_file(const char *path)
     return 0;
 }
 
-/* Restore the latest snapshot for path's basename.  0 ok, -1 no snapshot. */
+/* Restore the latest snapshot for this EXACT path.  0 ok, -1 no snapshot.
+ * Matches on the full original path (not basename) so a rollback restores the file
+ * the caller named, not a same-named file from a different directory. */
 static int rollback_file(const char *path)
 {
-    const char *base = basename_of(path);
     for (int i = 0; i < g_snap_count; i++) {
-        if (k_streq(g_snaps[i].base, base)) {
+        if (k_streq(g_snaps[i].orig, path)) {
             long n = slurp_file(g_snaps[i].snap);
             if (n < 0) return -1;
             return write_file(g_snaps[i].orig, g_filebuf, n);

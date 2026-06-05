@@ -191,6 +191,12 @@ void panel_build(Ide* a, Canvas* cv, Rect r) {
     if (g_runmsg[0])
         y = bp_line(cv, x, y, w, bot, g_runmsg, TH_CYAN);
 
+    /* run hint: after a successful build, tell the user how to run the artifact --
+     * previously nothing surfaced the R key, so the user never knew the build could
+     * be run (and the artifact also lands on the Desktop as a double-click icon). */
+    if (g_res.ok && !g_runmsg[0])
+        y = bp_line(cv, x, y, w, bot, "Press R to run  (also a Desktop icon)", TH_CYAN);
+
     /* diagnostics */
     {
         int nd = g_res.ndiags;

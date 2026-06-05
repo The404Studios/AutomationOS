@@ -305,6 +305,29 @@ int tc_build(const char* path, TcResult* res)
         }
     }
 
+    /* 7b. Also drop a runnable copy on the DESKTOP so the built program appears as a
+     * clickable icon: the compositor enumerates /Desktop and SYS_SPAWNs a file icon
+     * on double-click ("the IDE compiles programs to /Desktop"). Named after the
+     * PROJECT (basename of the source's directory) so a multi-file project yields one
+     * obvious artifact, e.g. /usr/src/towerdefense/tower.c -> /Desktop/towerdefense.elf.
+     * Best-effort: a failure here never fails the build. */
+    {
+        char dir[160], proj[80];
+        dirname_of(path, dir, (int)sizeof(dir));
+        const char* b = dir;                        /* basename of the project dir */
+        for (int i = 0; dir[i]; i++)
+            if (dir[i] == '/' || dir[i] == '\\') b = &dir[i + 1];
+        sk_copy(proj, b, (int)sizeof(proj));
+        if (proj[0] == '\0') sk_copy(proj, base, (int)sizeof(proj));  /* lone file */
+
+        ide_sc(67 /* SYS_MKDIR */, (long)"/Desktop", 0755, 0, 0, 0, 0);
+        char dpath[160];
+        int dn = sk_copy(dpath, "/Desktop/", (int)sizeof(dpath));
+        dn += sk_copy(dpath + dn, proj, (int)sizeof(dpath) - dn);
+        sk_copy(dpath + dn, ".elf", (int)sizeof(dpath) - dn);
+        ide_write_file(dpath, (char*)g_elf, elen);   /* best-effort; ignore failure */
+    }
+
     res->ok = 1;
     if (res->message[0] == '\0' || res->lang == LANG_CPP) {
         /* keep any C++ prefix, then append the success summary. */

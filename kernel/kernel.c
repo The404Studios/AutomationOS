@@ -949,6 +949,10 @@ void kernel_main(void* raw_info) {
     vfs_mkdir("/mnt/ext2", 0755);
     vfs_mkdir("/mnt/usb", 0755);
     vfs_mkdir("/home", 0755);
+    // /Desktop: the compositor enumerates this as clickable wallpaper icons and the
+    // IDE compiles programs here (double-click a .elf icon spawns it). Create it at
+    // boot so the desktop scan + the IDE's build-output write always have a target.
+    vfs_mkdir("/Desktop", 0777);
     kprintf("[KERNEL] Mount points created\n");
 
     kprintf("[KERNEL] Creating /dev directory...\n");

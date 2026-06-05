@@ -365,9 +365,18 @@ int elf_load_and_exec(void* elf_data, size_t elf_size, const char* name) {
             //     plus PAGE_WRITE iff PF_W. Data is writable but never executes.
             // PAGE_NX is inert until EFER.NXE is enabled in paging_init().
             uint64_t page_flags = PAGE_PRESENT | PAGE_USER;
-            if (phdr[i].p_flags & PF_X) {
-                // Executable segment: RX. Never writable (W^X), no NX bit.
-                // (If a toolchain ever emits W+X we still strip W here.)
+            if ((phdr[i].p_flags & PF_X) && (phdr[i].p_flags & PF_W)) {
+                // SINGLE R|W|X PT_LOAD: the on-device toolchain (the IDE's native
+                // compiler) emits ONE segment holding code AND mutable .data + string
+                // literals, so we must honor BOTH X and W -- otherwise every global /
+                // string write faults and the freshly-built program "won't run". Map
+                // it RWX. Gated on the W&&X signature so it does NOT relax W^X for the
+                // normal two-PT_LOAD apps below (whose .text is X-not-W and .data is
+                // W-not-X). Acceptable here: these are the user's own locally-built
+                // programs, and the alternative is they cannot run at all.
+                page_flags |= PAGE_WRITE;   // executable AND writable
+            } else if (phdr[i].p_flags & PF_X) {
+                // Pure code segment: RX. Never writable (W^X), no NX bit.
             } else {
                 // Non-executable segment: mark NX, add write only if PF_W.
                 page_flags |= PAGE_NX;

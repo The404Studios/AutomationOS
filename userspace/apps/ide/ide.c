@@ -181,6 +181,13 @@ static int ends_with_dot_c(const char* name) {
     return (n >= 2 && name[n - 2] == '.' && name[n - 1] == 'c');
 }
 
+/* True if name ends with ".elf" (a built, runnable artifact). */
+static int ends_with_dot_elf(const char* name) {
+    int n = ide_strlen(name);
+    return (n >= 4 && name[n - 4] == '.' && name[n - 3] == 'e' &&
+            name[n - 2] == 'l' && name[n - 1] == 'f');
+}
+
 /* Skip "." and "..". */
 static int is_dot_entry(const char* name) {
     return (name[0] == '.' &&
@@ -193,6 +200,15 @@ static int is_dot_entry(const char* name) {
 
 void ide_open_file(Ide* a, const char* path) {
     if (!a || !path) return;
+
+    /* A built artifact is a PROGRAM, not source: RUN it (SYS_SPAWN) rather than load
+     * its binary bytes into the text editor (which showed garbage -- the user's "the
+     * elfs don't open" complaint). Both the explorer click/Enter and the post-build
+     * reveal route through here, so double-clicking a .elf now launches it. */
+    if (ends_with_dot_elf(path)) {
+        ide_sc(16 /* SYS_SPAWN */, (long)path, 0, 0, 0, 0, 0);
+        return;
+    }
 
     int n = ide_read_file(path, a->src, IDE_SRC_CAP);
     if (n < 0) n = 0;                 /* clamp errors to an empty buffer   */
@@ -1306,6 +1322,9 @@ static void route_center_top_click(Ide* a, int mx, int my) {
 /* Route a left-button press at (mx,my). Priority: topbar first (VIZ tabs),
  * then whichever interactive panel rect contains the point. */
 static void route_click(Ide* a, int mx, int my) {
+    /* (g_build_view is cleared in the LEGO pointer-press branch before this is
+     * reached, so any click dismisses the transient BUILD overlay -- see the
+     * TAB-TRAP FIX comment in the event loop.) */
     if (panel_topbar_click(a, a->r_topbar, mx, my)) return;
 
     if (rect_hit(a->r_explorer, mx, my)) {
@@ -1929,6 +1948,17 @@ void _start(void) {
                 } else {
                     /* LEGO: map drag vs click handling. */
                     if (left_now && !left_prev) {
+                        /* TAB-TRAP FIX: any left-press in the LEGO workspace dismisses
+                         * the transient BUILD overlay. Ctrl+B/Ctrl+R set g_build_view and
+                         * render_center_top() draws panel_build over the WHOLE center
+                         * region while it is set; previously ONLY the '1'..'5' keys cleared
+                         * it, so clicking the visible build report (which fills r_map) did
+                         * nothing and the user was trapped ("can't view the other tabs").
+                         * Clearing it HERE -- before the r_map drag test -- covers BOTH the
+                         * map-drag path (route_center_top_click on release) and the side-
+                         * panel path (route_click). The result is kept (ide_build_active)
+                         * so Ctrl+B re-shows it on demand. */
+                        g_build_view = 0;
                         if (rect_hit(a->r_map, ea, eb)) {
                             drag_active = 1; drag_panning = 0;
                             drag_px = ea; drag_py = eb; drag_dx = 0; drag_dy = 0;

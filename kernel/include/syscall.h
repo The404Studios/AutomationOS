@@ -96,6 +96,7 @@
 #define SYS_FTRUNCATE   85  // truncate file via file descriptor
 #define SYS_FSYNC       86  // flush file data to storage
 #define SYS_SYNC        87  // flush all dirty data to storage
+#define SYS_RECOVERY_OVERLAY 88 // draw the self-heal fluid-circle recovery animation
 #define SYS_VMA_TEST    200 // VMA red-black tree testing and benchmarking
 
 // ---- SMP coprocessor offload (GATED: only registered under SMP_FOUNDATION) ----
@@ -245,6 +246,8 @@ int64_t sys_fb_acquire(uint64_t out_info, uint64_t arg2, uint64_t arg3,
                        uint64_t arg4, uint64_t arg5, uint64_t arg6);
 int64_t sys_get_ticks_ms(uint64_t arg1, uint64_t arg2, uint64_t arg3,
                          uint64_t arg4, uint64_t arg5, uint64_t arg6);
+int64_t sys_recovery_overlay(uint64_t mode, uint64_t dur_ms, uint64_t arg3,
+                             uint64_t arg4, uint64_t arg5, uint64_t arg6);
 
 // RTC / wall-clock syscalls
 int64_t sys_time(uint64_t arg1, uint64_t arg2, uint64_t arg3,

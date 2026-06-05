@@ -97,6 +97,7 @@ void syscall_init(void) {
     syscall_table[SYS_FTRUNCATE] = sys_ftruncate;
     syscall_table[SYS_FSYNC] = sys_fsync;
     syscall_table[SYS_SYNC] = sys_sync;
+    syscall_table[SYS_RECOVERY_OVERLAY] = sys_recovery_overlay;
 
     // Block device syscalls (AHCI/SATA persistence)
     syscall_table[SYS_BLK_READ] = sys_blk_read;

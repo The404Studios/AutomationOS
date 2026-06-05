@@ -1587,6 +1587,51 @@ int64_t sys_get_ticks_ms(uint64_t arg1, uint64_t arg2, uint64_t arg3,
     return (int64_t)timer_get_ticks_ms();
 }
 
+// SYS_RECOVERY_OVERLAY - the desktop self-heal recovery screen. Clears to the splash
+// background, prints "Recovering desktop...", and spins the kernel fluid-circle for
+// dur_ms (bounded <=4000), then returns. The desktop watchdog calls this when it
+// detects a frozen compositor, BEFORE it kills+respawns it, so the user sees a cool
+// recovery animation instead of a frozen screen. Works because the kernel keeps its OWN
+// valid framebuffer mapping (fb_state.buffer) even after the compositor SYS_FB_ACQUIRE's
+// the FB into a separate userspace VA -- so framebuffer_* still draws from kernel ctx.
+// On a uniprocessor this BLOCKS the caller for the duration; acceptable, the desktop is
+// already frozen. PIT is up by now, so timer_get_ticks_ms() bounds it precisely.
+int64_t sys_recovery_overlay(uint64_t mode, uint64_t dur_ms, uint64_t arg3,
+                             uint64_t arg4, uint64_t arg5, uint64_t arg6) {
+    (void)mode; (void)arg3; (void)arg4; (void)arg5; (void)arg6;
+    fb_info_t info;
+    if (framebuffer_get_info(&info) != 0) return EINVAL;   // no framebuffer
+    if (dur_ms == 0)   dur_ms = 1800;
+    if (dur_ms > 4000) dur_ms = 4000;
+
+    framebuffer_clear(0x00101826u);
+    {
+        const char* msg = "Recovering desktop...";
+        uint32_t n = 0; while (msg[n]) n++;
+        uint32_t s = 2u, w = n * 8u * s;
+        uint32_t x = (info.width > w) ? (info.width - w) / 2u : 0u;
+        uint32_t y = (info.height > 120u) ? (info.height / 2u - 60u) : 0u;
+        framebuffer_puts_scaled(msg, x, y, 0x00FFFFFFu, s);
+    }
+    int cx = (int)info.width / 2;
+    int cy = (int)info.height / 2 + 10;
+    int R = 32, dot_r = 7, box = R + dot_r + 4;
+    uint64_t start = timer_get_ticks_ms();
+    uint64_t end   = start + dur_ms;
+    uint64_t now;
+    while ((now = timer_get_ticks_ms()) < end) {
+        int phase = (int)(((now - start) * 3u / 5u) % 360u);   /* ~1.7 rot/s */
+        framebuffer_draw_rect((uint32_t)(cx - box), (uint32_t)(cy - box),
+                              (uint32_t)(2 * box), (uint32_t)(2 * box), 0x00101826u);
+        framebuffer_draw_fluid_circle(cx, cy, R, dot_r, phase, 0x009FC8FFu);
+        /* ~16ms frame pause (no sleep syscall in kernel ctx) */
+        uint64_t f = timer_get_ticks_ms();
+        while (timer_get_ticks_ms() - f < 16 && timer_get_ticks_ms() < end)
+            __asm__ volatile("pause");
+    }
+    return 0;
+}
+
 // SYS_TIME - seconds since the Unix epoch, read from the CMOS RTC
 int64_t sys_time(uint64_t arg1, uint64_t arg2, uint64_t arg3,
                  uint64_t arg4, uint64_t arg5, uint64_t arg6) {

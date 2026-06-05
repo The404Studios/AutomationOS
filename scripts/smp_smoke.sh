@@ -51,11 +51,17 @@ grep -F '[SMP] dispatch=' "$SER" | tail -4
 echo "=== SMPSTRESS result ==="
 grep -F 'SMPSTRESS:' "$SER" | tail -3
 
-if grep -qF 'SMPSTRESS: PASS' "$SER"; then
-    echo "[smp-smoke] RESULT: PASS -- CPU1 ran the dispatch stress correctly under -smp 2"
+echo "=== PAGINGALIAS coherence gate (#20) ==="
+grep -F 'PAGINGALIAS' "$SER" | tail -2
+PA_OK=0; grep -qF 'PAGINGALIAS PASS' "$SER" && PA_OK=1
+# A matmul_band_n / direct-map fault is the #20 crash signature -- must be ZERO.
+NMATMUL=$(grep -cF 'matmul_band_n' "$SER" || true)
+
+if grep -qF 'SMPSTRESS: PASS' "$SER" && [ "$PA_OK" = "1" ] && [ "$NMATMUL" = "0" ]; then
+    echo "[smp-smoke] RESULT: PASS -- CPU1 dispatch stress PASS + PAGINGALIAS PASS + no matmul_band_n fault"
     exit 0
 else
-    echo "[smp-smoke] RESULT: FAIL -- no 'SMPSTRESS: PASS' in the serial log"
+    echo "[smp-smoke] RESULT: FAIL -- SMPSTRESS=$(grep -cF 'SMPSTRESS: PASS' "$SER") PAGINGALIAS_PASS=$PA_OK matmul_faults=$NMATMUL"
     echo "--- last 30 serial lines ---"; tail -30 "$SER"
     exit 1
 fi

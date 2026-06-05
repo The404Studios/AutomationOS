@@ -814,6 +814,19 @@ check_no_pid_exhaustion() {
     return 1
 }
 
+check_pagingalias() {
+    # #20 direct-map coherence gate. paging_init proves the higher-half direct map
+    # (PML4[256]) is STRUCTURALLY INDEPENDENT of the splittable low identity (its
+    # PDPT is a different physical page), so no identity split can perturb it.
+    # Emits "PAGINGALIAS PASS" on every boot (default + SMP).
+    if grep -qF 'PAGINGALIAS PASS' "$LOG"; then
+        pass "Direct-map coherence (PAGINGALIAS): direct map independent of the identity"
+        return 0
+    fi
+    fail "PAGINGALIAS PASS missing — direct-map coherence self-test failed/absent"
+    return 1
+}
+
 # ── Run all checks, tally results ──────────────────────────────────────────
 run_checks() {
     header "Boot invariant checks"
@@ -830,6 +843,7 @@ run_checks() {
         check_no_segment_too_large
         check_no_crash_loop
         check_no_pid_exhaustion
+        check_pagingalias
         check_fork_cow
         check_thread
         check_matmuljobs

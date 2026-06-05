@@ -332,10 +332,18 @@ int elf_load_and_exec(void* elf_data, size_t elf_size, const char* name) {
                     (phdr[i].p_flags & PF_W) ? "W" : "-",
                     (phdr[i].p_flags & PF_X) ? "X" : "-");
 
-            // Validate segment is in user space
-            if (vaddr_start >= 0x0000800000000000ULL) {
-                EXEC_LOG("[EXEC]   ERROR: Segment vaddr 0x%016lx is outside user space\n",
-                        vaddr_start);
+            // Validate segment is in user space. BOTH the start AND the page-aligned
+            // END must be below the user/kernel split (0x0000800000000000): a crafted
+            // PT_LOAD that STARTS in user space but EXTENDS past it (large p_memsz)
+            // would otherwise pass a start-only check, and the mapping loop below would
+            // install PTEs for KERNEL virtual addresses, corrupting the process's
+            // kernel-half page tables. The overflow guard above already prevents
+            // vaddr_end from wrapping, so this strict comparison is sound. Mirrors the
+            // companion loader elf_loader.c, which already checks both ends.
+            if (vaddr_start >= 0x0000800000000000ULL ||
+                vaddr_end   >  0x0000800000000000ULL) {
+                EXEC_LOG("[EXEC]   ERROR: Segment [0x%016lx,0x%016lx) leaves user space\n",
+                        vaddr_start, vaddr_end);
                 elf_cleanup_failed_load(proc);
                 return ELF_ERR_PERM;
             }

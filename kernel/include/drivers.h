@@ -33,6 +33,13 @@ void framebuffer_draw_hline(uint32_t x, uint32_t y, uint32_t length, uint32_t co
 void framebuffer_draw_vline(uint32_t x, uint32_t y, uint32_t length, uint32_t color);
 int  framebuffer_get_info(fb_info_t* out);
 
+/* Boot / recovery loading animation (the "fluid circle" comet spinner). Pure
+ * integer; used by the kernel boot splash and the recovery-overlay syscall. */
+void framebuffer_fill_circle(int cx, int cy, int r, uint32_t color);
+void framebuffer_draw_fluid_circle(int cx, int cy, int R, int dot_r,
+                                   int phase_deg, uint32_t base_color);
+void framebuffer_boot_spinner(uint32_t duration_ms);
+
 #ifdef FB_WC
 /* GATED (only declared under -DFB_WC): program a variable-range MTRR to mark
  * the framebuffer physical region [base, base+size) Write-Combining, batching

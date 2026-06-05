@@ -698,3 +698,121 @@ int framebuffer_get_info(fb_info_t* out) {
     out->bpp       = fb_state.bpp;
     return 0;
 }
+
+/* =========================================================================
+ * Boot / recovery loading animation -- a "fluid circle": a comet of orbiting
+ * filled discs. Pure 32-bit integer math (no float, no 64-bit division in the
+ * hot path -> no libgcc soft-float; verified by the no-float link gate). The
+ * sin LUT + isqrt are copies of the compositor's (compositor_m8.c) so the
+ * kernel boot spinner and the userspace recovery overlay animate identically.
+ * The kernel cannot read back the framebuffer (no alpha blend), so the comet
+ * trail DARKENS toward the known splash background instead of true alpha.
+ * ========================================================================= */
+
+/* sin(deg)*256, Q8 fixed point. Mirrors compositor_m8.c sin_q/cos_q. */
+static const int32_t FB_SINQ_TBL[19] = {  /* sin(0..90 by 5 deg) * 256 */
+      0,  22,  44,  66,  88, 109, 128, 147, 165, 181,
+    196, 209, 221, 231, 240, 247, 252, 255, 256
+};
+static int32_t fb_sin_q(int32_t deg) {
+    deg %= 360; if (deg < 0) deg += 360;
+    int32_t sign = 1;
+    if (deg >= 180) { deg -= 180; sign = -1; }
+    if (deg > 90) deg = 180 - deg;
+    int32_t i = deg / 5;
+    int32_t frac = deg - i * 5;
+    int32_t a = FB_SINQ_TBL[i];
+    int32_t b = FB_SINQ_TBL[i + 1];
+    return sign * (a + (b - a) * frac / 5);
+}
+static int32_t fb_cos_q(int32_t deg) { return fb_sin_q(deg + 90); }
+
+/* Integer sqrt (Newton). 32-bit divides only -> hardware idiv, no libgcc. */
+static uint32_t fb_isqrt32(uint32_t n) {
+    if (n == 0) return 0;
+    uint32_t x = n, y = (x + 1u) / 2u;
+    while (y < x) { x = y; y = (x + n / x) / 2u; }
+    return x;
+}
+
+/* TSC read (rdtsc in perf.h is a static inline with no linkable symbol; carry a
+ * private copy, same as page_cache_test.c, so the spinner has a clock pre-PIT). */
+static inline uint64_t fb_rdtsc(void) {
+    uint32_t lo, hi;
+    __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi));
+    return ((uint64_t)hi << 32) | lo;
+}
+
+/* Linear blend of two 0x00RRGGBB colors: t in [0,256], 0 -> a, 256 -> b. */
+static uint32_t fb_blend_rgb(uint32_t a, uint32_t b, int32_t t) {
+    if (t <= 0)   return a;
+    if (t >= 256) return b;
+    uint32_t inv = (uint32_t)(256 - t);
+    uint32_t r = (((a >> 16) & 0xFF) * inv + ((b >> 16) & 0xFF) * (uint32_t)t) >> 8;
+    uint32_t g = (((a >>  8) & 0xFF) * inv + ((b >>  8) & 0xFF) * (uint32_t)t) >> 8;
+    uint32_t bl= ((( a       & 0xFF) * inv + ( b        & 0xFF) * (uint32_t)t)) >> 8;
+    return (r << 16) | (g << 8) | bl;
+}
+
+/* Filled disc centered at (cx,cy), radius r, via per-row hlines (clipped). */
+void framebuffer_fill_circle(int cx, int cy, int r, uint32_t color) {
+    if (!fb_state.initialized || r <= 0) return;
+    int32_t r2 = r * r;
+    for (int32_t dy = -r; dy <= r; dy++) {
+        int32_t y = cy + dy;
+        if (y < 0) continue;
+        if (y >= (int32_t)fb_state.height) break;
+        int32_t half = (int32_t)fb_isqrt32((uint32_t)(r2 - dy * dy));
+        int32_t x0 = cx - half;
+        int32_t len = 2 * half + 1;
+        if (x0 < 0) { len += x0; x0 = 0; }
+        if (len <= 0) continue;
+        framebuffer_draw_hline((uint32_t)x0, (uint32_t)y, (uint32_t)len, color);
+    }
+}
+
+/* The "fluid circle": NDOTS filled discs orbiting (cx,cy) at radius R, driven by
+ * one phase angle. The head (i=0) is full base_color + full size; trailing dots
+ * fade toward the splash bg and taper, reading as a comet/spinner. */
+#define FB_SPIN_BG    0x00101826u   /* must match the boot splash background */
+#define FB_SPIN_DOTS  8
+void framebuffer_draw_fluid_circle(int cx, int cy, int R, int dot_r,
+                                   int phase_deg, uint32_t base_color) {
+    for (int i = 0; i < FB_SPIN_DOTS; i++) {
+        int32_t a  = phase_deg - i * (360 / FB_SPIN_DOTS);
+        int32_t x  = cx + R * fb_cos_q(a) / 256;
+        int32_t y  = cy + R * fb_sin_q(a) / 256;
+        uint32_t col = fb_blend_rgb(base_color, FB_SPIN_BG, i * 256 / FB_SPIN_DOTS);
+        int rr = dot_r - (i * dot_r) / (2 * FB_SPIN_DOTS);
+        if (rr < 1) rr = 1;
+        framebuffer_fill_circle(x, y, rr, col);
+    }
+}
+
+/* Bounded boot loading spinner: an rdtsc-timed ~60fps loop drawing the fluid
+ * circle BELOW the splash title for `duration_ms`. Boot is single-threaded with
+ * IRQs off here (pre-scheduler, pre-PIT), so rdtsc is the only clock -- same
+ * ~3GHz convention as the kernel's SMP heartbeat window. Erases only a small box
+ * around the spinner each frame (NOT a full clear -- full clears are slow on
+ * UC-mapped framebuffers) and never touches the splash text above it. */
+void framebuffer_boot_spinner(uint32_t duration_ms) {
+    if (!fb_state.initialized) return;
+    const uint64_t TSC_PER_US = 3000ULL;            /* ~3 GHz, matches kernel.c */
+    const uint64_t FRAME_TSC  = 16ULL * 1000ULL * TSC_PER_US;   /* ~16 ms */
+    int cx  = (int)fb_state.width / 2;
+    int cy  = (int)fb_state.height / 2 + 90;        /* below the splash title */
+    int R   = 26, dot_r = 6;
+    int box = R + dot_r + 4;
+    uint64_t start = fb_rdtsc();
+    uint64_t total = (uint64_t)duration_ms * 1000ULL * TSC_PER_US;
+    uint64_t next_frame = 0;
+    while ((fb_rdtsc() - start) < total) {
+        uint64_t now = fb_rdtsc() - start;
+        if (now < next_frame) continue;
+        next_frame = now + FRAME_TSC;
+        int phase = (int)((now / TSC_PER_US / 1500ULL) % 360ULL);  /* ~1.8 rot/s */
+        framebuffer_draw_rect((uint32_t)(cx - box), (uint32_t)(cy - box),
+                              (uint32_t)(2 * box), (uint32_t)(2 * box), FB_SPIN_BG);
+        framebuffer_draw_fluid_circle(cx, cy, R, dot_r, phase, 0x009FC8FFu);
+    }
+}

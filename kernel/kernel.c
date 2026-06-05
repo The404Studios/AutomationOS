@@ -659,6 +659,13 @@ void kernel_main(void* raw_info) {
         }
         kprintf("[KERNEL] Boot splash drawn!\n");
 
+        /* Cool loading animation: a fluid orbiting-dot spinner below the splash
+         * title while the rest of boot proceeds. Bounded, rdtsc-timed (pre-PIT,
+         * pre-scheduler -- single-threaded here), draws only to the framebuffer
+         * (all serial/kprintf output is untouched, so headless smoke is unchanged).
+         * OUTSIDE the SMP #ifdef so it runs on the shipping default kernel. */
+        framebuffer_boot_spinner(1200);
+
 #ifdef SMP_FOUNDATION
         /* Paint the SMP/AP result + the REAL framebuffer geometry at a FIXED spot
          * at the TOP-LEFT of the panel (bright cyan, scale 3, ABOVE the splash and

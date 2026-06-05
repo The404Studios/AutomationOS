@@ -129,28 +129,35 @@ static uint64_t futex_get_phys_addr(void* uaddr) {
     uint64_t virt = (uint64_t)uaddr;
     uint64_t cr3 = read_cr3() & ~0xFFFULL;
 
+    // Require PAGE_USER as well as PAGE_PRESENT at every level: a futex word must be in
+    // a USER-accessible page. Without this, a present-but-kernel-only or PROT_NONE page
+    // in the user VA range would resolve to a physical address the process must not be
+    // able to wait/wake on (it could then park on, or be woken via, a frame outside its
+    // rights). Returning 0 here makes futex_wait/wake fail with EFAULT.
+    const uint64_t PUSER = PAGE_PRESENT | PAGE_USER;
+
     // PML4 index
     uint64_t pml4_idx = (virt >> 39) & 0x1FF;
     uint64_t* pml4 = (uint64_t*)cr3;
-    if (!(pml4[pml4_idx] & PAGE_PRESENT)) {
+    if ((pml4[pml4_idx] & PUSER) != PUSER) {
         return 0;
     }
 
     // PDPT index
     uint64_t pdpt_idx = (virt >> 30) & 0x1FF;
     uint64_t* pdpt = (uint64_t*)(pml4[pml4_idx] & ~0xFFFULL);
-    if (!(pdpt[pdpt_idx] & PAGE_PRESENT)) {
+    if ((pdpt[pdpt_idx] & PUSER) != PUSER) {
         return 0;
     }
 
     // PD index
     uint64_t pd_idx = (virt >> 21) & 0x1FF;
     uint64_t* pd = (uint64_t*)(pdpt[pdpt_idx] & ~0xFFFULL);
-    if (!(pd[pd_idx] & PAGE_PRESENT)) {
+    if ((pd[pd_idx] & PUSER) != PUSER) {
         return 0;
     }
 
-    // Check for 2MB huge page
+    // Check for 2MB huge page (PAGE_USER already verified at the PD level above)
     if (pd[pd_idx] & (1ULL << 7)) {
         uint64_t phys_base = pd[pd_idx] & ~0x1FFFFFULL;
         uint64_t offset = virt & 0x1FFFFF;
@@ -160,7 +167,7 @@ static uint64_t futex_get_phys_addr(void* uaddr) {
     // PT index (4KB page)
     uint64_t pt_idx = (virt >> 12) & 0x1FF;
     uint64_t* pt = (uint64_t*)(pd[pd_idx] & ~0xFFFULL);
-    if (!(pt[pt_idx] & PAGE_PRESENT)) {
+    if ((pt[pt_idx] & PUSER) != PUSER) {
         return 0;
     }
 

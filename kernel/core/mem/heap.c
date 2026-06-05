@@ -789,6 +789,22 @@ size_t heap_shrink(void) {
             break;
         }
 
+        /* Partial-shrink viability (must be checked BEFORE the unmap loop below).
+         * When freeable_start > block_start we will trim this block rather than free
+         * it whole, leaving its 64-byte header at block_start. That header must remain
+         * a VALID, fully-mapped free block afterwards: it needs sizeof(block_t) for the
+         * header plus a minimum payload, and it must NOT straddle freeable_start (the
+         * page boundary we are about to unmap). If the gap is too small,
+         * (freeable_start - block_start - sizeof(block_t)) underflows to a giant bogus
+         * size and bin_push(last) would also write into the just-unmapped page. Refuse
+         * to trim in that case and stop -- the few sub-page tail bytes stay mapped
+         * (benign) rather than corrupting the heap. The entire-block case
+         * (freeable_start == block_start) is exempt: its header is freed with the block. */
+        if (freeable_start != block_start &&
+            freeable_start - block_start < sizeof(block_t) + 16) {
+            break;
+        }
+
         /* The entire-block case (freeable_start == block_start) unmaps the page
          * that holds THIS block's header, so last->prev_phys and bin_remove(last)
          * must be done BEFORE the unmap -- the old code did both AFTER, reading a

@@ -33,6 +33,30 @@ if [ "${GAMETEST:-0}" = "1" ]; then
     INIT_EXTRA="$INIT_EXTRA -DGAMETEST_RUN"
     echo "*** GAMETEST build: init compiled with -DGAMETEST_RUN (spawns sbin/gametest) ***"
 fi
+# SELFHEAL=1 wires the userspace desktop self-heal: the compositor publishes a
+# per-frame heartbeat into a SysV SHM page, init creates+owns that page and spawns
+# sbin/cwatchdog (the recovery supervisor). Threads -DSELFHEAL into the compositor
+# AND init compiles and builds+ships sbin/cwatchdog. Unset => none of it is
+# compiled or shipped, and the default initrd is byte-for-byte unchanged.
+SELFHEAL_EXTRA=""
+if [ "${SELFHEAL:-0}" = "1" ]; then
+    SELFHEAL_EXTRA="-DSELFHEAL"
+    INIT_EXTRA="$INIT_EXTRA -DSELFHEAL"
+    echo "*** SELFHEAL build: compositor heartbeat + init + sbin/cwatchdog (-DSELFHEAL) ***"
+fi
+# FREEZE_TEST=1 (+ FREEZE_MODE=0 blocking | 1 tight-loop) adds a ONE-SHOT forced
+# freeze to the compositor for the recovery PROOF (scripts/selfheal_smoke.sh).
+# The freeze hook lives inside the SELFHEAL machinery, so FREEZE_TEST implies
+# SELFHEAL. Never set in a shipping build.
+FREEZE_EXTRA=""
+if [ "${FREEZE_TEST:-0}" = "1" ]; then
+    FREEZE_EXTRA="-DSELFHEAL_FREEZE -DFREEZE_MODE=${FREEZE_MODE:-0}"
+    case "$SELFHEAL_EXTRA" in
+        *-DSELFHEAL*) ;;
+        *) SELFHEAL_EXTRA="-DSELFHEAL"; INIT_EXTRA="$INIT_EXTRA -DSELFHEAL";;
+    esac
+    echo "*** FREEZE_TEST build: compositor self-freeze mode=${FREEZE_MODE:-0} (implies SELFHEAL) ***"
+fi
 
 echo "[all] shared libs..."
 cc userspace/lib/font/bitfont.c /tmp/bf.o
@@ -49,7 +73,7 @@ cc userspace/lib/audio/audio.c  /tmp/audio.o
 cc userspace/lib/icon/icon.c    /tmp/icon.o
 
 echo "[all] compositor (m8: right-side dock w/ hover-magnify, folders, bounce) + init..."
-cc userspace/compositor/compositor_m8.c /tmp/cm6.o
+gcc $CF $SELFHEAL_EXTRA $FREEZE_EXTRA -c userspace/compositor/compositor_m8.c -o /tmp/cm6.o
 $LD /tmp/cm6.o /tmp/bf.o /tmp/font2.o /tmp/icon.o -o /tmp/comp.elf
 gcc $CF $INIT_EXTRA -c userspace/init/main.c -o /tmp/init.o
 $LD /tmp/init.o -o /tmp/init.elf

@@ -230,6 +230,62 @@ static void print_num(long n) {
     while (i > 0) { char c = b[--i]; syscall(SYS_WRITE, 1, (long)&c, 1); }
 }
 
+#ifdef SELFHEAL
+/* ====================================================================== *
+ *  SELFHEAL — per-frame liveness heartbeat (gated; compiled out by default) *
+ * ---------------------------------------------------------------------- *
+ *  Publish a monotonic frame counter + timestamp into a SysV SHM page that
+ *  init (PID 1) creates+owns, so sbin/cwatchdog can tell a LIVE desktop from
+ *  a frozen one and trigger recovery.  See userspace/include/selfheal.h for
+ *  the ownership + one-shot-latch reasoning.  selfheal.h uses only primitive
+ *  types, so this -ffreestanding TU (with its own int typedefs) includes it
+ *  directly with no collision and zero field drift.                         *
+ * ---------------------------------------------------------------------- */
+#include "../include/selfheal.h"
+#define SYS_GETPID   8
+#define SYS_SHMGET  18
+/* SYS_SHMAT(19) + SYS_GET_TICKS_MS(40) are already #defined above. */
+
+static volatile sh_heartbeat_t* g_hb = (volatile sh_heartbeat_t*)0;
+#ifdef SELFHEAL_FREEZE
+#ifndef FREEZE_AT_FRAME
+#define FREEZE_AT_FRAME 240        /* ~4s into the loop @ ~60fps */
+#endif
+#ifndef FREEZE_MODE
+#define FREEZE_MODE 0              /* 0=blocking (recoverable on default), 1=tight-loop (needs PREEMPT) */
+#endif
+static uint64_t g_freeze_at = 0;   /* 0 = never freeze; set only for the FIRST instance */
+#endif
+
+/* Attach the heartbeat page LOOKUP-ONLY (init owns it; never IPC_CREAT here, so
+ * the compositor can never become the owner — see selfheal.h).  `magic` doubles
+ * as a "a prior instance already ran" latch: a fresh page (init zeroed it) reads
+ * magic==0 -> first instance; a value that survived a kill reads magic==MAGIC ->
+ * this is a respawn. */
+static void selfheal_init(void) {
+    /* Lookup-only: pass the real size + NO IPC_CREAT. This kernel's sys_shmget
+     * rejects size==0 (shm.c:275), but with a valid size and the key already
+     * present it returns the existing segment (shm.c:289-299) WITHOUT creating —
+     * so we attach init's page and never become the owner. */
+    long id = sc6(SYS_SHMGET, (long)SELFHEAL_SHM_KEY, (long)SELFHEAL_SHM_SIZE, 0, 0, 0, 0);
+    if (id < 0) { print("[SHELL] SELFHEAL: heartbeat segment missing\n"); return; }
+    long p = sc6(SYS_SHMAT, id, 0, 0, 0, 0, 0);                        /* RW attach */
+    if (p <= 0) { print("[SHELL] SELFHEAL: heartbeat shmat FAILED\n"); return; }
+    g_hb = (volatile sh_heartbeat_t*)p;
+    unsigned int was_init = (g_hb->magic == SELFHEAL_MAGIC);           /* respawn? */
+    g_hb->version        = SELFHEAL_VERSION;
+    g_hb->compositor_pid = (unsigned int)syscall(SYS_GETPID, 0, 0, 0);
+    if (!was_init) g_hb->frame_counter = 0;
+    g_hb->last_frame_ms  = (unsigned long long)syscall(SYS_GET_TICKS_MS, 0, 0, 0);
+    g_hb->state          = SH_STATE_RUNNING;
+    g_hb->magic          = SELFHEAL_MAGIC;                             /* publish LAST */
+#ifdef SELFHEAL_FREEZE
+    g_freeze_at = was_init ? 0 : FREEZE_AT_FRAME;   /* only the first instance freezes */
+#endif
+    print("[SHELL] SELFHEAL: heartbeat published\n");
+}
+#endif /* SELFHEAL */
+
 /* ---- framebuffer geometry returned by SYS_FB_ACQUIRE ---- */
 typedef struct { uint64_t vaddr; uint32_t width, height, pitch, bpp; } fb_acquire_t;
 
@@ -4291,6 +4347,11 @@ void _start(void) {
     /* M8: welcome notification toast */
     toast_show("AutomationOS M8 — right dock ready", 3500);
 
+#ifdef SELFHEAL
+    /* Attach + publish the liveness heartbeat before the loop starts beating it. */
+    selfheal_init();
+#endif
+
     /* 5. Frame loop. */
     long t0 = syscall(SYS_GET_TICKS_MS, 0, 0, 0);
     long next = t0;
@@ -4432,5 +4493,30 @@ void _start(void) {
         else               syscall(SYS_YIELD, 0, 0, 0);
         now = syscall(SYS_GET_TICKS_MS, 0, 0, 0);
         if (next < now - 64) next = now;     /* resync after a clock jump */
+
+#ifdef SELFHEAL
+        /* Heartbeat: stamp the loop's liveness ONCE PER ITERATION (incl. idle,
+         * present-skipped frames) so a freeze of EITHER kind stalls the counter.
+         * Two volatile stores; zero syscalls on this hot path. */
+        if (g_hb) { g_hb->frame_counter = frame; g_hb->last_frame_ms = (unsigned long long)now; }
+#endif
+#ifdef SELFHEAL_FREEZE
+        /* Forced-freeze PROOF (one-shot via the magic latch set in selfheal_init):
+         * only the FIRST compositor instance freezes; the respawn runs normally,
+         * so cwatchdog proves recovery with exactly ONE freeze (no breaker storm). */
+        if (g_freeze_at && frame >= g_freeze_at) {
+            print("[SHELL] FREEZE_TEST: entering freeze mode ");
+            print_num(FREEZE_MODE); print("\n");
+#if FREEZE_MODE == 0
+            /* blocking freeze: stuck off the frame loop but YIELDING the CPU, so
+             * the watchdog runs on the cooperative kernel. Short repeating sleep
+             * (not one 1000s sleep) so a pending SIGKILL is delivered within a
+             * poll and no long-lived timer entry is stranded after teardown. */
+            for (;;) syscall(SYS_SLEEP, 250, 0, 0);
+#else
+            for (;;) { __asm__ volatile("" ::: "memory"); } /* tight loop: never yields -> needs PREEMPT */
+#endif
+        }
+#endif
     }
 }

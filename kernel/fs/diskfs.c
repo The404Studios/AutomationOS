@@ -311,7 +311,12 @@ static int dfs_block_write(uint32_t blk, const void* buf)
  * Returns the stored data-block index, or 0 on hole/error. */
 static uint32_t dfs_iptr_get(uint32_t iblk, uint32_t idx)
 {
-    if (iblk == 0 || idx >= DFS_PTRS_PER_BLOCK) return 0;
+    // Bound `iblk` (an on-disk inode's `indirect` field, copied verbatim from an
+    // untrusted image) against the volume size, exactly as dfs_block_read/write do.
+    // Without it, iblk * DFS_SECS_PER_BLOCK overflows uint32 and the wrapped value
+    // becomes an arbitrary in-bounds device LBA -> read of an arbitrary sector
+    // (superblock/inode table/bitmap/other files) interpreted as a block pointer.
+    if (iblk == 0 || iblk >= g_fs.block_count || idx >= DFS_PTRS_PER_BLOCK) return 0;
     uint32_t sec  = g_fs.data_lba + iblk * DFS_SECS_PER_BLOCK + (idx / DFS_PTRS_PER_SEC);
     uint32_t slot = idx % DFS_PTRS_PER_SEC;
     uint32_t buf[DFS_PTRS_PER_SEC];
@@ -323,7 +328,13 @@ static uint32_t dfs_iptr_get(uint32_t iblk, uint32_t idx)
  * of the single 512-byte sector). Returns 0 on success, <0 on I/O error. */
 static int dfs_iptr_set(uint32_t iblk, uint32_t idx, uint32_t val)
 {
-    if (iblk == 0 || idx >= DFS_PTRS_PER_BLOCK) return -1;
+    // Same untrusted-iblk bound as dfs_iptr_get, but return -1 (error) here, NOT 0:
+    // dfs_iptr_set's contract is 0==success, so returning 0 on a bad iblk would
+    // falsely report a successful pointer write to dfs_map_block. Without the bound,
+    // iblk * DFS_SECS_PER_BLOCK overflows to an arbitrary in-bounds LBA -> a
+    // read-modify-WRITE of an arbitrary device sector (superblock/inode/bitmap/other
+    // files), defeating the per-block bounds checks the rest of the FS enforces.
+    if (iblk == 0 || iblk >= g_fs.block_count || idx >= DFS_PTRS_PER_BLOCK) return -1;
     uint32_t sec  = g_fs.data_lba + iblk * DFS_SECS_PER_BLOCK + (idx / DFS_PTRS_PER_SEC);
     uint32_t slot = idx % DFS_PTRS_PER_SEC;
     uint32_t buf[DFS_PTRS_PER_SEC];

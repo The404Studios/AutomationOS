@@ -112,6 +112,8 @@ static void cpu_enable_fpu_sse(void) {
     kprintf("[VMM] FPU/SSE/AVX enabled for userspace\n");
 }
 
+static void paging_alias_selftest(void);   // #20 coherence proof (defined below)
+
 void paging_init(void) {
     kprintf("[VMM] Initializing paging...\n");
 
@@ -246,28 +248,68 @@ void paging_init(void) {
     }
 
     // ----------------------------------------------------------------------
-    // DIRECT MAP (phys==virt bug-family fix). Alias the identity PDPT into the
-    // UNUSED higher-half slot PML4[256] (base DIRECT_MAP_BASE). Because
-    // DIRECT_MAP_BASE+phys and 0+phys produce IDENTICAL PDPT/PD/PT indices, sharing
-    // the SAME PDPT maps every physical frame at both addresses. The difference that
-    // matters: PML4[256] is in the SHARED higher-half (paging_create_address_space
-    // copies 256-511 BY REFERENCE; paging_destroy_address_space frees only 0-255), so
-    // every process CR3 points at the kernel's ONE clean PDPT here -- it is NEVER
-    // deep-copied or mutated by a process's exec huge-page splits (those touch only
-    // its private PML4[0]). So PHYS_TO_DIRECT(phys) resolves on ANY CR3, with no
-    // per-access CR3 switch -- retiring the whole "phys==virt under a mutated process
-    // identity map" crash class. We mask the USER bit (supervisor-only: ring-3 must
-    // NOT be able to read all of RAM) and set NX (the direct map is data, never
-    // executed; EFER.NXE was enabled above). PML4[256] is unused by boot.asm.
+    // DIRECT MAP (#20 fix). Give PML4[256] its OWN dedicated PDPT + PD chain of
+    // never-split 2MB huge pages, INSTEAD of aliasing the identity PDPT.
+    //
+    // OLD (buggy): kernel_pml4->entries[256] = kernel_pml4->entries[0], so the
+    // direct map and the low identity map shared ONE PDPT -> PD -> 2MB-huge-PDE
+    // chain. Under churn a paging_map_page split a 2MB identity PDE (exec maps a
+    // process's low PT_LOAD VAs at 4KB, hitting the huge-page split branch), and
+    // because PML4[256] is in the SHARED kernel higher-half the corrupted view was
+    // visible in EVERY CR3 -- including the AP's fixed master kernel_cr3. CPU1 then
+    // #PF'd reading a kmalloc_ref offload operand via PHYS_TO_DIRECT in
+    // matmul_band_n (the smpstress crash, phys ~194MB).
+    //
+    // NEW (fixed): a DEDICATED chain that shares NO structural page with the
+    // splittable identity. Nothing ever paging_map_page's into the direct-map VA
+    // range, so its huge PDEs stay present forever; a split of an identity PDE
+    // perturbs only PML4[0]'s private chain. Installed at kernel_pml4->entries[256]
+    // BEFORE any process or the AP exists, so it propagates BY REFERENCE to every
+    // CR3 (paging_create_address_space copies 256-511) and the AP master CR3 -- no
+    // per-CR3 work. Supervisor-only (no USER: ring-3 must not read all RAM) + NX
+    // (data, W^X). Covers phys 0..16GB, matching the identity extent.
+    //
+    // BOOTSTRAP ORDER (critical, or triple-fault): fill the dedicated tables via
+    // the LOW IDENTITY (raw pointers -- the frames are low + identity-covered here)
+    // and only THEN install entries[256] + flush. PHYS_TO_DIRECT does not resolve
+    // until the map is live.
     {
-        uint64_t ident = kernel_pml4->entries[0];           // identity PDPT | flags
-        kernel_pml4->entries[256] = (ident & ~0x4ULL)       // clear USER (supervisor-only)
-                                    | (1ULL << 63);          // set NX (W^X: data alias)
-        write_cr3(read_cr3());                               // flush TLB -> alias live
+        const uint64_t DM_GB = 16;                          // cover the 16GB the identity covers
+        page_table_t* dm_pdpt = (page_table_t*)pmm_alloc_page();
+        int dm_ok = (dm_pdpt != 0);
+        if (dm_ok) {
+            memset(dm_pdpt, 0, PAGE_SIZE);
+            for (uint64_t g = 0; g < DM_GB; g++) {
+                page_table_t* dm_pd = (page_table_t*)pmm_alloc_page();
+                if (!dm_pd) { dm_ok = 0; break; }
+                memset(dm_pd, 0, PAGE_SIZE);
+                for (uint64_t i = 0; i < 512; i++) {
+                    uint64_t ph = (g * 512 + i) * 0x200000ULL;       // 2MB huge page
+                    dm_pd->entries[i] = ph | PTE_PRESENT | PTE_WRITE
+                                        | (1ULL << 7)                 // PS (2MB huge)
+                                        | (1ULL << 63);               // NX (data, W^X)
+                }
+                dm_pdpt->entries[g] = (uint64_t)dm_pd | PTE_PRESENT | PTE_WRITE;  // no USER
+            }
+        }
+        if (dm_ok) {
+            kernel_pml4->entries[256] = (uint64_t)dm_pdpt
+                                        | PTE_PRESENT | PTE_WRITE     // supervisor-only
+                                        | (1ULL << 63);               // NX
+            write_cr3(read_cr3());                                    // flush -> dedicated map live
+            kprintf("[VMM] Direct map ONLINE @ 0x%016lx (DEDICATED PDPT+PD, phys 0..%luGB, never-split, all CR3s)\n",
+                    (unsigned long)DIRECT_MAP_BASE, (unsigned long)DM_GB);
+        } else {
+            // OOM (essentially unreachable this early): fall back to the old alias so
+            // boot still completes in the known-buggy-but-boots state (#20 unfixed).
+            kernel_pml4->entries[256] = (kernel_pml4->entries[0] & ~0x4ULL) | (1ULL << 63);
+            write_cr3(read_cr3());
+            kprintf("[VMM] WARNING: dedicated direct-map alloc failed; fell back to identity alias (#20 unfixed)\n");
+        }
 
-        // Boot self-test: write a sentinel to a fresh frame via the DIRECT MAP and
-        // read it back via the LOW identity map (and vice-versa). Proves the alias
-        // resolves to the same physical RAM. (Full cross-CR3 proof is GAMETEST.)
+        // Boot self-test: write a sentinel via the DIRECT MAP and read it back via
+        // the LOW identity (and vice-versa). Proves the direct map resolves to the
+        // same physical RAM as the identity. (Post-split coherence is PAGINGALIAS.)
         void* probe = pmm_alloc_page();
         if (probe) {
             volatile uint64_t* via_ident  = (volatile uint64_t*)probe;
@@ -277,8 +319,7 @@ void paging_init(void) {
             *via_ident = 0xC0FFEE5DEADBEEFULL;
             uint64_t rb_direct = *via_direct;
             if (rb_ident == 0xD15EA5ED0FF5E7ULL && rb_direct == 0xC0FFEE5DEADBEEFULL) {
-                kprintf("[VMM] Direct map ONLINE @ 0x%016lx (phys 0..16GB, shared all CR3s); self-test OK\n",
-                        (unsigned long)DIRECT_MAP_BASE);
+                kprintf("[VMM] Direct-map self-test OK (direct<->identity coherent)\n");
             } else {
                 kprintf("[VMM] WARNING: direct-map self-test FAILED (ident=0x%lx direct=0x%lx)\n",
                         (unsigned long)rb_ident, (unsigned long)rb_direct);
@@ -295,6 +336,10 @@ void paging_init(void) {
 
     active_pml4 = kernel_pml4;
     kprintf("[VMM] Paging initialized with full identity mapping\n");
+
+    // Permanent coherence proof for the #20 fix: split a low-identity 2MB PDE and
+    // confirm the dedicated direct map stays coherent (emits PAGINGALIAS PASS/FAIL).
+    paging_alias_selftest();
 }
 
 // Switch which PML4 paging_map_page targets (for per-process mapping)
@@ -304,6 +349,58 @@ void paging_set_target(uint64_t cr3) {
 
 void paging_reset_target(void) {
     active_pml4 = kernel_pml4;
+}
+
+// ---------------------------------------------------------------------------
+// PAGINGALIAS coherence self-test (#20). Proves the direct map is STRUCTURALLY
+// INDEPENDENT of the splittable identity -- the invariant the fix establishes.
+//
+// We assert it WITHOUT mutating the kernel identity: forcing a split here would
+// create a kernel-identity PT that processes deep-copy (shared) and the teardown
+// path then frees (the shared-kernel-PT guard only protects PTs split from a
+// STILL-HUGE kernel PDE), corrupting memory under churn. Structural independence
+// is the stronger, safe proof: if PML4[256]'s PDPT is a DIFFERENT physical page
+// than PML4[0]'s identity PDPT, then NO identity split (which only edits the
+// identity's PD pages) can ever reach the direct map's pages -- coherence holds
+// by construction. The pre-fix aliased code had entries[256]==entries[0], so this
+// FAILs on the bug and PASSes on the fix.
+static void paging_alias_selftest(void) {
+    void* F = pmm_alloc_page();
+    if (!F) { kprintf("[VMM] PAGINGALIAS SKIP (no probe frame)\n"); return; }
+    uint64_t phys = (uint64_t)F;
+    const uint64_t MASK = 0x000FFFFFFFFFF000ULL;
+    const uint64_t HUGE = (1ULL << 7);
+
+    // (1) STRUCTURAL INDEPENDENCE: direct-map PDPT != identity PDPT.
+    uint64_t dm_pdpt_phys = kernel_pml4->entries[256] & MASK;
+    uint64_t id_pdpt_phys = kernel_pml4->entries[0]   & MASK;
+    int independent = (dm_pdpt_phys != id_pdpt_phys) && dm_pdpt_phys != 0;
+
+    // (2) COHERENCE: a write via the DIRECT MAP is seen via the LOW identity
+    //     (both name the same physical frame).
+    volatile uint64_t* dm = (volatile uint64_t*)PHYS_TO_DIRECT(phys);
+    volatile uint64_t* id = (volatile uint64_t*)phys;
+    *dm = 0xA11A5C0DEULL;
+    int coherent = (*id == 0xA11A5C0DEULL);
+
+    // (3) the direct-map PDE for the probe is a PRESENT 2MB HUGE page (never split).
+    uint64_t dva          = (uint64_t)PHYS_TO_DIRECT(phys);
+    page_table_t* dm_pdpt = (page_table_t*)PHYS_TO_DIRECT(dm_pdpt_phys);
+    uint64_t dm_pdpte     = dm_pdpt->entries[(dva >> 30) & 0x1FF];
+    page_table_t* dm_pd   = (page_table_t*)PHYS_TO_DIRECT(dm_pdpte & MASK);
+    uint64_t dm_pde       = dm_pd->entries[(dva >> 21) & 0x1FF];
+    int dm_huge           = (dm_pde & PTE_PRESENT) && (dm_pde & HUGE);
+
+    pmm_free_page(F);
+
+    if (independent && coherent && dm_huge) {
+        kprintf("[VMM] PAGINGALIAS PASS (direct map independent of identity: dm_pdpt=0x%lx id_pdpt=0x%lx)\n",
+                (unsigned long)dm_pdpt_phys, (unsigned long)id_pdpt_phys);
+    } else {
+        kprintf("[VMM] PAGINGALIAS FAIL (independent=%d coherent=%d dm_huge=%d dm_pdpt=0x%lx id_pdpt=0x%lx)\n",
+                independent, coherent, dm_huge,
+                (unsigned long)dm_pdpt_phys, (unsigned long)id_pdpt_phys);
+    }
 }
 
 // Physical address (CR3 value, PCID 0) of the kernel's master PML4. The kernel

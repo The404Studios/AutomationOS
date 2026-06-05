@@ -550,6 +550,17 @@ void wait_object_init(wait_object_t* wo);
 // (not a hard IRQ; interrupts enabled).
 int wait_object_block(wait_object_t* wo, uint64_t deadline_or_0);
 
+// FUTEX-A lost-wakeup fix: enqueue-and-recheck under wo->lock (the SAME lock the wake
+// path takes), as a two-step prepare/commit so the value test, the link, and the
+// BLOCKED store are atomic w.r.t. a concurrent futex_wake. wait_object_prepare_futex
+// returns 1 (current is now linked on wo, tagged with `key`, and BLOCKED -- caller MUST
+// then call wait_object_park_committed) or 0 (*uaddr != val: nothing linked, caller
+// returns EAGAIN). wait_object_park_committed deschedules an already-linked,
+// already-BLOCKED waiter and returns 1 if signal-woken. Futex-only; generic blockers
+// keep using wait_object_block.
+int wait_object_prepare_futex(wait_object_t* wo, int* uaddr, int val, uint64_t key);
+int wait_object_park_committed(wait_object_t* wo);
+
 // Wake the wait_object's waiters: wake_all==0 wakes exactly one (FIFO), nonzero
 // wakes all. Each woken waiter is unlinked, marked PROCESS_READY and handed to
 // scheduler_add_process(). Returns the number of processes woken.

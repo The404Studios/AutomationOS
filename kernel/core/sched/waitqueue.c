@@ -195,34 +195,14 @@ static process_t* wo_pop_head_matching(wait_object_t* wo, uint64_t key) {
     return NULL;
 }
 
-int wait_object_block(wait_object_t* wo, uint64_t deadline_or_0) {
-    if (!wo) return 0;
-    wo_ensure_init(wo);
-
-    process_t* current = process_get_current();
-    if (!current) {
-        kprintf("[WAIT] wait_object_block: no current process\n");
-        return 0;
-    }
-
-    // Record the waiter BEFORE marking blocked / switching away, so a wakeup
-    // (signal or timer) racing in right after we set state cannot miss us.
-    // (Wakeups also take the object/sleep locks, and re-readying a not-yet-
-    // switched-out process is safe: it goes back on the ready queue and we never
-    // actually sleep.)
-    wo_link_tail(wo, current);
-
-    // Timer-armed wait: also park on the global sleep list with the deadline, so
-    // the per-tick scan (sleep_list_wake_due) can wake us if the timeout fires
-    // before any signal. sleep_list_push brackets the list mutation with
-    // cli/restore so the timer IRQ can't observe a half-linked node.
-    if (deadline_or_0 != 0) {
-        current->wake_deadline = deadline_or_0;
-        sleep_list_push(current);
-    }
-
-    current->state = PROCESS_BLOCKED;
-
+// Deschedule a waiter that is ALREADY linked onto `wo` and ALREADY marked
+// PROCESS_BLOCKED: pick a successor, idle if none is runnable, switch, and on resume
+// tear down any residual linkage. This is the common "park core" shared by
+// wait_object_block (which links + sets BLOCKED itself) and the futex prepare/commit
+// path (which links + sets BLOCKED under wo->lock to close the FUTEX-A lost-wakeup
+// window). Returns 1 if woken by a signal (wait_object_signal already popped us), 0 if
+// by the timer/other. Runs in `current`'s own context; touches no stale locals.
+static int wo_park_and_cleanup(wait_object_t* wo, process_t* current) {
     // Switch to another runnable process. Mirror sys_yield()/cooperative
     // context_switch exactly: pick a successor, hand it the CPU. The current
     // (blocked) process is NOT re-added to the ready queue, so it will not run
@@ -294,6 +274,86 @@ int wait_object_block(wait_object_t* wo, uint64_t deadline_or_0) {
     current->wake_deadline = 0;
 
     return woke_by_signal;
+}
+
+int wait_object_block(wait_object_t* wo, uint64_t deadline_or_0) {
+    if (!wo) return 0;
+    wo_ensure_init(wo);
+
+    process_t* current = process_get_current();
+    if (!current) {
+        kprintf("[WAIT] wait_object_block: no current process\n");
+        return 0;
+    }
+
+    // Record the waiter BEFORE marking blocked / switching away, so a wakeup
+    // (signal or timer) racing in right after we set state cannot miss us.
+    // (Wakeups also take the object/sleep locks, and re-readying a not-yet-
+    // switched-out process is safe: it goes back on the ready queue and we never
+    // actually sleep.)
+    wo_link_tail(wo, current);
+
+    // Timer-armed wait: also park on the global sleep list with the deadline, so
+    // the per-tick scan (sleep_list_wake_due) can wake us if the timeout fires
+    // before any signal. sleep_list_push brackets the list mutation with
+    // cli/restore so the timer IRQ can't observe a half-linked node.
+    if (deadline_or_0 != 0) {
+        current->wake_deadline = deadline_or_0;
+        sleep_list_push(current);
+    }
+
+    current->state = PROCESS_BLOCKED;
+
+    return wo_park_and_cleanup(wo, current);
+}
+
+// FUTEX-A: close the futex check-then-block lost-wakeup. Atomically, under wo->lock
+// (the SAME lock futex_wake's wo_pop_head_matching takes), re-read the futex word and:
+//   - if *uaddr still == val: link `current` at the tail of `wo`, tag it with `key`,
+//     mark it PROCESS_BLOCKED, and return 1 -- the caller then parks via
+//     wait_object_park_committed();
+//   - if *uaddr already changed: link nothing and return 0 -- the caller returns EAGAIN.
+// Because the value test, the link, and the BLOCKED store all happen under one lock, a
+// concurrent futex_wake can neither be lost in a gap between the test and the link, nor
+// observe a half-committed (linked-but-not-BLOCKED) waiter. This is futex-specific but
+// lives here because it must mutate the intrusive waiter list under wo->lock. The
+// inline link mirrors wo_link_tail's body (process_ref + tail append) exactly.
+int wait_object_prepare_futex(wait_object_t* wo, int* uaddr, int val, uint64_t key) {
+    if (!wo || !uaddr) return 0;
+    wo_ensure_init(wo);
+
+    process_t* current = process_get_current();
+    if (!current) return 0;
+
+    uint64_t flags;
+    spin_lock_irqsave(&wo->lock, &flags);
+    if (__atomic_load_n(uaddr, __ATOMIC_SEQ_CST) != val) {
+        spin_unlock_irqrestore(&wo->lock, flags);
+        return 0;   // value changed under the lock -> EAGAIN, nothing linked
+    }
+    // Link current at the tail (wo_link_tail body, inlined: we already hold wo->lock).
+    process_ref(current);            // the object owns one reference on the parked waiter
+    current->futex_key = key;
+    current->wait_on   = wo;
+    current->wait_next = NULL;
+    if (wo->tail) {
+        wo->tail->wait_next = current;
+        wo->tail = current;
+    } else {
+        wo->waiters = current;
+        wo->tail = current;
+    }
+    current->state = PROCESS_BLOCKED;
+    spin_unlock_irqrestore(&wo->lock, flags);
+    return 1;
+}
+
+int wait_object_park_committed(wait_object_t* wo) {
+    if (!wo) return 0;
+    process_t* current = process_get_current();
+    if (!current) return 0;
+    // The caller already linked us and set BLOCKED (under wo->lock); just deschedule.
+    return wo_park_and_cleanup(wo, current);
 }
 
 // Wake exactly one waiter (FIFO), skipping any that already moved on (killed).

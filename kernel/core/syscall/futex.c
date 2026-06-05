@@ -70,13 +70,13 @@
 #define FUTEX_HASHSIZE  (1 << FUTEX_HASHBITS)
 #define FUTEX_HASHMASK  (FUTEX_HASHSIZE - 1)
 
-// Per-bucket futex wait queue. Address disambiguation is now per-WAITER
-// (process_t.futex_key), not per-bucket: a single bucket scalar could never tell apart
-// multiple distinct futex addresses that hash-collide into it, so the old `addr` field
-// was vestigial (written, never read) and has been removed (FUTEX-B).
+// Per-bucket futex wait queue. The bucket holds ONLY the wait_object queue: all
+// serialization (value test + enqueue + wake) is on the wait_object's own lock
+// (wq.wobj.lock), so wait and wake share a single lock domain (FUTEX-A). The old
+// per-bucket spinlock (only ever guarded the value test, on a DIFFERENT lock than the
+// enqueue) and the `addr` scalar (written, never read) were both vestigial and removed.
 typedef struct futex_bucket {
     wait_queue_t wq;
-    spinlock_t lock;
 } futex_bucket_t;
 
 // Global futex hash table
@@ -87,7 +87,6 @@ static int futex_initialized = 0;
 void futex_init(void) {
     for (int i = 0; i < FUTEX_HASHSIZE; i++) {
         wq_init(&futex_table[i].wq);
-        spin_lock_init(&futex_table[i].lock);
     }
     futex_initialized = 1;
     kprintf("[FUTEX] Initialized futex subsystem (%d hash buckets)\n", FUTEX_HASHSIZE);
@@ -190,48 +189,26 @@ static int64_t futex_wait(int* uaddr, int val) {
     uint32_t bucket_idx = futex_hash(phys_addr);
     futex_bucket_t* bucket = &futex_table[bucket_idx];
 
-    // Acquire bucket lock
-    uint64_t flags;
-    spin_lock_irqsave(&bucket->lock, &flags);
-
-    // CRITICAL: Check value AFTER enqueuing to prevent lost wakeups
-    // If we checked before enqueuing, a wakeup could occur between the check
-    // and enqueue, causing us to sleep forever
-    //
-    // Correct ordering (Linux futex algorithm):
-    //   1. Enqueue on wait queue
-    //   2. Atomic load of *uaddr
-    //   3. If *uaddr != val: dequeue and return EAGAIN
-    //   4. Otherwise: release lock and sleep
-    //
-    // This ensures that any wakeup after we read the value will wake us.
-
-    // Read current value atomically
-    int current_val = __atomic_load_n(uaddr, __ATOMIC_SEQ_CST);
-
-    if (current_val != val) {
-        // Value changed, don't sleep
-        spin_unlock_irqrestore(&bucket->lock, flags);
-        return EAGAIN;  // Spurious wakeup / value mismatch
+    // CRITICAL ordering (FUTEX-A lost-wakeup fix): the value test, the enqueue, and the
+    // BLOCKED store must all happen under the SAME lock that futex_wake takes -- here the
+    // wait_object's own lock (bucket->wq.wobj.lock), which wo_pop_head_matching acquires.
+    // The old code tested *uaddr under a SEPARATE bucket->lock and then released it BEFORE
+    // wq_block_current linked the waiter (under wo->lock), so a wake landing in that gap
+    // found an empty queue and was lost (latent on cooperative-uniprocessor, live on
+    // SMP/PREEMPT). wait_object_prepare_futex does the test+link+BLOCKED atomically:
+    //   - returns 1: current is linked, tagged with phys_addr (FUTEX-B key), and BLOCKED
+    //     -> deschedule via wait_object_park_committed (no relink);
+    //   - returns 0: *uaddr already changed -> nothing linked, return EAGAIN.
+    // bucket->lock is no longer needed and has been removed.
+    if (!wait_object_prepare_futex(&bucket->wq.wobj, uaddr, val, phys_addr)) {
+        return EAGAIN;  // value mismatch -> do not sleep
     }
 
-    // Value matches, prepare to sleep. Tag this waiter with its futex KEY (the physical
-    // address) so futex_wake re-readies only waiters parked on THIS address, never an
-    // unrelated waiter that hash-collided into the same bucket (FUTEX-B). The key is set
-    // BEFORE the waiter is linked (inside wq_block_current) so any wake that finds it in
-    // the list already sees a correct key; it is cleared on resume so a later non-futex
-    // block (waitpid/sleep) is never mistaken for a futex waiter.
+    wait_object_park_committed(&bucket->wq.wobj);
+
+    // Resumed here after wakeup. Clear the futex key so a later non-futex block
+    // (waitpid/sleep) is never mistaken for a futex waiter.
     process_t* self = process_get_current();
-    if (self) self->futex_key = phys_addr;
-
-    // Release bucket lock before blocking
-    spin_unlock_irqrestore(&bucket->lock, flags);
-
-    // Block on wait queue
-    // This marks the process PROCESS_BLOCKED and switches to another process
-    wq_block_current(&bucket->wq);
-
-    // Resumed here after wakeup
     if (self) self->futex_key = 0;
     return 0;
 }

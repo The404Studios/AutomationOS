@@ -1347,19 +1347,34 @@ void schedule(void) {
         // cooperative_switch_to routes RESUME_IRETQ successors through iretq
         // (a dead process can hand off to a timer-preempted one safely).
         dead->resume_mode = RESUME_CRETURN;
-        cooperative_switch_to(dead, next);
 
         // -------------------------------------------------------------------
-        // KILL-FIX-002 (continued): Release the dead process's "current"
-        // reference NOW.  context_switch() returns here when the *next*
-        // process is eventually switched away from and this kernel stack
-        // frame is resumed.  At that point `dead` holds the process that
-        // was terminated; we release its scheduler reference exactly once.
-        // scheduler_add_process() ensures TERMINATED processes are never
-        // re-queued, so `dead` can never become current again — making this
-        // unref safe and non-repeating.
+        // KILL-FIX-002 (CORRECTED): release the dead process's scheduler
+        // ("current"/running) reference HERE, BEFORE the switch.
+        //
+        // The original code placed this process_unref(dead) AFTER
+        // cooperative_switch_to(dead,next), on the theory it would run "when
+        // this kernel-stack frame is resumed." But a TERMINATED process is
+        // NEVER re-queued (scheduler_add_process rejects it), so dead's stack
+        // frame is never resumed -- the post-switch unref NEVER executed and
+        // the scheduler ref leaked, pinning ref_count at 1 forever. That hid
+        // under the (separate) #9 creation-ref leak; once the reaper releases
+        // the creation ref, this orphaned scheduler ref is exactly what stops
+        // the PCB / 8KB stack / CR3 / PID from EVER being freed -> PIDs never
+        // recycle and the 256-PID pool exhausts. (Verified live: a reaped
+        // zombie stuck at ref_count==1 with no unref ever dropping it.)
+        //
+        // Dropping it here does NOT free the stack we are still executing on:
+        // the process is a zombie awaiting reap, so its CREATION ref keeps
+        // ref_count >= 1 (reaped==0 until a reaper claims it, and on the
+        // cooperative uniprocessor no reaper can run while this process is
+        // `current`). This unref therefore takes 2 -> 1 (never to 0); the
+        // reaper later drops the creation ref to reach 0 and frees the PCB OFF
+        // this stack. (SMP note: when AP scheduling lands, revisit to a
+        // schedule_tail-style drop in the successor's context.)
         // -------------------------------------------------------------------
         process_unref(dead);
+        cooperative_switch_to(dead, next);
         return;
     }
 

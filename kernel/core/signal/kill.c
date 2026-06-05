@@ -123,6 +123,20 @@ int64_t sys_kill(uint64_t pid, uint64_t sig, uint64_t arg3,
             // KILL-FIX-002.  No double-remove, no double-unref.
             kprintf("[KILL] Sending SIGKILL to process %u (%s)\n",
                     target->pid, target->name);
+            // #9 kill-while-blocked: if the victim is BLOCKED on a wait_object,
+            // force-unlink it so the object-ref it holds is dropped. Snapshot
+            // wait_on BEFORE marking TERMINATED. Without this, an event-only waiter
+            // (futex/waitpid/epoll, not on the timer sleep list) stays linked
+            // forever, the object-ref leaks, ref_count never reaches 0, and the PCB
+            // is never reaped. wait_object_abort is idempotent vs a racing signal.
+            // target is kept alive by our get_by_pid ref, so the unref can't free it
+            // mid-handler.
+            {
+                struct wait_object* wo = target->wait_on;
+                if (target->state == PROCESS_BLOCKED && wo) {
+                    wait_object_abort(wo, target);
+                }
+            }
             target->state = PROCESS_TERMINATED;
             target->exit_status = 128 + SIGKILL;   // conventional "killed by sig"
             process_on_terminate(target);          // wake a waitpid'ing parent
@@ -134,6 +148,14 @@ int64_t sys_kill(uint64_t pid, uint64_t sig, uint64_t arg3,
             // Same ref/removal semantics as SIGKILL above.
             kprintf("[KILL] Sending SIGTERM to process %u (%s)\n",
                     target->pid, target->name);
+            // Same blocked-waiter reclamation as SIGKILL above (#9): drop the
+            // stranded wait_object ref so a BLOCKED victim becomes a reapable zombie.
+            {
+                struct wait_object* wo = target->wait_on;
+                if (target->state == PROCESS_BLOCKED && wo) {
+                    wait_object_abort(wo, target);
+                }
+            }
             target->state = PROCESS_TERMINATED;
             target->exit_status = 128 + SIGTERM;
             process_on_terminate(target);

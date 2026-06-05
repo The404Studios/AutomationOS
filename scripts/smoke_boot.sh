@@ -40,6 +40,9 @@ MIN_PIDS=4
 # +5 for the new short-lived webapitest probe.
 # +5 for threadtest (4 threads + the main process all exit -> legitimate frees).
 # +5 for matmuljobs (2 worker threads + the main process all exit -> legitimate frees).
+# NOTE: the kernel is built -DPROCESS_QUIET (scripts/quick_build.sh), which SUPPRESSES
+# the "[PROCESS] Freeing process" line, so this count is effectively always 0 and the
+# threshold is moot today; kept as a guard in case PROCESS_QUIET is ever lifted.
 MAX_FREEING=190
 
 # ── Colour helpers ─────────────────────────────────────────────────────────
@@ -770,6 +773,24 @@ check_no_crash_loop() {
     fi
 }
 
+check_no_pid_exhaustion() {
+    # #9 PID/zombie-leak gate. reaploop (spawned by init) fork+reaps a trivial child
+    # 300x (> MAX_PROCESSES == 256). If reaping leaks the creation ref, the PID pool
+    # exhausts: the kernel logs "No free PID" and reaploop prints REAPLOOP: FAIL. The
+    # claim-based reap + reparent-to-init fix recycles slots, so we require
+    # REAPLOOP: PASS and ZERO "No free PID".
+    if grep -qF 'No free PID' "$LOG"; then
+        fail "PID pool exhausted: kernel logged \"No free PID\" (zombie/PID leak -- reap not recycling slots)"
+        return 1
+    fi
+    if grep -qF 'REAPLOOP: PASS' "$LOG"; then
+        pass "PID recycling verified (reaploop: 300 fork+reap cycles > 256-slot table, no exhaustion)"
+        return 0
+    fi
+    fail "reaploop did not report PASS (REAPLOOP: PASS missing)"
+    return 1
+}
+
 # ── Run all checks, tally results ──────────────────────────────────────────
 run_checks() {
     header "Boot invariant checks"
@@ -785,6 +806,7 @@ run_checks() {
         check_no_page_fault
         check_no_segment_too_large
         check_no_crash_loop
+        check_no_pid_exhaustion
         check_fork_cow
         check_thread
         check_matmuljobs

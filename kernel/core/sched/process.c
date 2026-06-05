@@ -161,6 +161,13 @@ void process_cleanup(void) {
         extern void scheduler_remove_process(process_t* proc);
         scheduler_remove_process(proc);
 
+        // #9 fix: release the CREATION ref too. A never-reaped process at shutdown
+        // still holds it, so without this the final leak scan below reports it as
+        // "still in table". CAS-guarded so a concurrent parent reaper can't double-
+        // release, and it MUST run BEFORE the extra-ref unref below so the PCB
+        // survives to be freed by that final unref.
+        reap_claim_release(proc);
+
         // Drop the table's reference (our +ref above will be the last one after
         // scheduler_remove_process released its ref, so this should trigger the
         // final teardown)
@@ -487,6 +494,52 @@ void process_ref(process_t* proc) {
 //      the entry, sees the process is no longer BLOCKED, and releases that ref.
 void process_on_terminate(process_t* child) {
     if (!child) return;
+
+    // ---- Phase A: reparent this dying process's own children to init (PID 1).
+    //
+    // LOCKED DESIGN (#9): orphans are reparented-to-init; NO process self-reaps.
+    // When a process dies, every child that still names it as parent must be handed
+    // to init so init's waitpid(-1) loop (userspace/init/main.c) eventually harvests
+    // the child's zombie and releases its creation ref via reap_claim_release.
+    // Without this, a child that outlives its parent -- or is already a zombie when
+    // the parent dies -- is NEVER reaped (init's scan matches only parent_pid==1, so
+    // a grandchild keeps leaking). This is the load-bearing half of the leak fix.
+    //
+    // RECURSIVE-DEADLOCK AVOIDANCE: process_table_lock is a PLAIN, NON-RECURSIVE
+    // spinlock. We must walk process_table[] under it to find our children, so we
+    // MUST NOT call process_get_by_pid() (or anything that takes the same lock)
+    // while holding it. We therefore touch process_table[i] DIRECTLY here, exactly
+    // like process_cleanup() does, and defer every lock-taking call (the parent wake
+    // and the init wake, both of which use process_get_by_pid) to AFTER we drop the
+    // lock. We only read/set scalar PCB fields (parent_pid, state) under the lock --
+    // no allocation, no wq calls, no unref -- so the section is tiny and IRQ-safe
+    // (acquired irqsave, matching every other holder).
+    //
+    // dying==init guard: if the dying process IS init (pid 1) we are on the shutdown
+    // path; reparenting children to "1" would point them at the corpse and no
+    // surviving reaper exists, so skip Phase A and the init-wake entirely.
+    int reparented_zombie = 0;   // did we hand init an already-TERMINATED child?
+    if (child->pid != 1) {
+        uint64_t flags;
+        spin_lock_irqsave(&process_table_lock, &flags);
+        for (int i = 0; i < MAX_PROCESSES; i++) {
+            process_t* p = process_table[i];
+            // Skip empty slots and the dying process itself. Touch fields directly
+            // -- NO process_get_by_pid here (it would re-take this same lock).
+            if (!p || p == child) continue;
+            if (p->parent_pid == child->pid) {
+                p->parent_pid = 1;                       // reparent to init
+                if (p->state == PROCESS_TERMINATED) {     // already a zombie
+                    reparented_zombie = 1;                // init must be woken
+                }
+            }
+        }
+        spin_unlock_irqrestore(&process_table_lock, flags);
+    }
+
+    // ---- Phase B: wake this dying process's OWN parent (unchanged behavior), now
+    // safely outside process_table_lock. process_get_by_pid()/process_unref() take
+    // the lock internally -- fine, we hold nothing here.
     if (child->parent_pid) {
         process_t* parent = process_get_by_pid(child->parent_pid);
         if (parent) {
@@ -496,6 +549,25 @@ void process_on_terminate(process_t* child) {
             process_unref(parent);
         }
     }
+
+    // ---- Phase C: if we handed init an already-TERMINATED orphan, wake init's
+    // child_wait so its waitpid(-1) loop re-scans and harvests the zombie. Done
+    // outside the lock (process_get_by_pid takes it). Tolerate a missing init (NULL
+    // pre-init / at shutdown) and a not-yet-allocated init->child_wait (init has
+    // never blocked in waitpid yet -- its next scan finds the zombie anyway).
+    if (reparented_zombie) {
+        process_t* init_proc = process_get_by_pid(1);
+        if (init_proc) {
+            if (init_proc->child_wait) {
+                wq_wake_one((wait_queue_t*)init_proc->child_wait);
+            }
+            process_unref(init_proc);
+        }
+    }
+
+    // ---- Self-drain (unchanged): if this dying process was itself blocked in
+    // waitpid(), its self-referencing wait entry holds a ref; wq_wake_all releases
+    // it so the PCB can actually be freed.
     if (child->child_wait) {
         wq_wake_all((wait_queue_t*)child->child_wait);
     }
@@ -652,6 +724,20 @@ void process_unref(process_t* proc) {
 
         // Free process structure
         kfree(proc);
+    }
+}
+
+// See sched.h. CAS-guarded single release of the CREATION ref: only the reaper
+// that wins reaped:0->1 drops the creation ref; losers no-op. Never touches the
+// caller's get_by_pid ref (the caller drops that itself, via process_destroy or
+// process_unref). SEQ_CST matches the rest of the refcount atomics in this file.
+// This is the headline #9 fix: today the creation ref (process_create sets
+// ref_count=1) is NEVER released for a reaped zombie, so the PCB/8KB stack/CR3/PID
+// leak and the 256-PID pool exhausts under spawn/exit churn.
+void reap_claim_release(process_t* proc) {
+    if (!proc) return;
+    if (__atomic_exchange_n(&proc->reaped, 1, __ATOMIC_SEQ_CST) == 0) {
+        process_unref(proc);   // release the creation ref, exactly once
     }
 }
 

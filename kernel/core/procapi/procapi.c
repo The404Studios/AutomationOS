@@ -178,6 +178,17 @@ int procapi_ctl(uint32_t pid, uint32_t verb, uint64_t arg)
          * Identical logic to kill.c case SIGKILL.
          */
         kprintf("[PROCAPI] Killing PID %u (%s)\n", proc->pid, proc->name);
+        // Mirror the kill.c SIGKILL fix (#9): if the victim is BLOCKED on a
+        // wait_object, force-unlink it so its object-ref is dropped and it becomes a
+        // reapable zombie (otherwise an event-only waiter leaks). Snapshot wait_on
+        // BEFORE marking TERMINATED; abort is idempotent. proc is held by our
+        // get_by_pid ref for the duration, so the unref can't free it mid-handler.
+        {
+            struct wait_object* wo = proc->wait_on;
+            if (proc->state == PROCESS_BLOCKED && wo) {
+                wait_object_abort(wo, proc);
+            }
+        }
         proc->state = PROCESS_TERMINATED;
         proc->exit_status = 128 + 9;   // SIGKILL-equivalent
         process_on_terminate(proc);    // wake a waitpid'ing parent

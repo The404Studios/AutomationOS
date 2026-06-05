@@ -274,6 +274,15 @@ typedef struct process {
     // number of attachments THIS process holds (typically 1-5) instead of O(128).
     // Appended at the END to keep the assembler's hardcoded context offset valid.
     struct shm_attachment* shm_attachments;
+
+    // Reap-claim flag (#9 zombie-leak fix). 0 = the zombie's CREATION ref has not
+    // yet been claimed; a single reaper transitions it 0->1 via __atomic_exchange_n
+    // and ONLY that winner releases the creation ref (reap_claim_release). Lets the
+    // waitpid table-scan, a targeted thread_join, and init all observe the same
+    // zombie while exactly one releases the creation ref (no double-free). memset-
+    // zeroed by process_create()/thread_create(). Appended at the END to keep the
+    // assembler's hardcoded PROCESS_CONTEXT_OFFSET (16) valid.
+    volatile int reaped;
 } process_t;
 
 // Global pointer to current process (for PE loader and other subsystems)
@@ -285,6 +294,16 @@ void process_cleanup(void);  // Teardown counterpart: terminate all live process
 process_t* process_create(const char* name, void* entry_point);
 void process_adopt_pid0(process_t* proc);   // re-home a process onto reserved PID 0 (idle thread)
 void process_destroy(process_t* proc);
+
+// Release the CREATION reference of a terminated process EXACTLY ONCE, even when
+// several reapers (a waitpid table-scan, a targeted thread_join, init) race on the
+// same zombie. Uses a CAS (__atomic_exchange_n) on proc->reaped: only the reaper
+// that transitions reaped 0->1 drops the creation ref; losers no-op. Does NOT
+// touch any get_by_pid reference -- the caller still drops its own ref afterwards
+// (via process_destroy() or process_unref()). Call this IMMEDIATELY BEFORE
+// process_destroy(zombie) at a reaper site, or before the final process_unref() in
+// process_cleanup(). [#9 zombie/PID leak]
+void reap_claim_release(process_t* proc);
 
 // ----------------------------------------------------------------------------
 // Threads (kernel/core/sched/process.c)
@@ -513,6 +532,14 @@ int wait_object_signal(wait_object_t* wo, int wake_all);
 
 // Number of processes currently parked on wo.
 int wait_object_count(wait_object_t* wo);
+
+// Force-unlink `proc` from `wo` if it is currently linked there, dropping the
+// object's reference on it. Idempotent: a no-op (and NO unref) if proc was already
+// removed by a concurrent signal/timer. Used by the kill paths to reclaim the
+// object-ref of a process killed while BLOCKED on this wait_object, so the PCB
+// collapses to a reapable zombie instead of leaking. Returns 1 if it unlinked-and-
+// unref'd, else 0. [#9 kill-while-blocked leak]
+int wait_object_abort(wait_object_t* wo, process_t* proc);
 
 // ===========================================================================
 // Wait queues — thin compatibility wrapper over wait_object_t

@@ -286,7 +286,12 @@ void _start(void) {
     // boot-time spawn storm has drained) so the two burners get a clean window
     // rather than fighting dozens of still-spawning boot apps for the CPU.
     print("[INIT] Spawning prioritytest...\n");
-    spawn("sbin/prioritytest");
+    // Capture prioritytest's pid: the PID-recycling proof (reaploop) is launched
+    // only AFTER prioritytest is reaped (in the loop below), so reaploop's fork load
+    // never perturbs the timing-sensitive sleeptest/prioritytest measurements. By
+    // the time prioritytest (the last + slowest timing probe) exits, sleeptest has
+    // long since finished and the boot storm has drained -- a clean, settled system.
+    int prioritytest_pid = spawn("sbin/prioritytest");
 
 #ifdef PREEMPT_STRESS
     // ========================================================================
@@ -336,6 +341,12 @@ void _start(void) {
     spawn("sbin/ide");
 #endif
 
+    // PID-recycling proof (#9) is launched from the reaper loop below, exactly once,
+    // when prioritytest is reaped -- by then the boot self-test storm has drained
+    // and the timing-sensitive probes have finished, so reaploop runs on a settled
+    // system (clean PID reuse) without perturbing any measurement.
+    int reaploop_spawned = 0;
+
     while (1) {
         int status;
         int pid = (int)syscall(SYS_WAITPID, -1, (long)&status, 0);
@@ -346,10 +357,31 @@ void _start(void) {
             print_num(status);
             print("\n");
 
+            // Launch the PID-recycling proof exactly once, when prioritytest (the
+            // last + slowest timing-sensitive boot probe) is reaped. By now the boot
+            // storm has drained and the timing probes have finished, so reaploop
+            // gets a free pool + clean PID reuse and cannot perturb sleeptest/
+            // prioritytest (already done). (#9 zombie/PID-leak proof.)
+            if (pid == prioritytest_pid && !reaploop_spawned) {
+                reaploop_spawned = 1;
+                print("[INIT] Spawning reaploop (PID-recycling proof)...\n");
+                spawn("sbin/reaploop");
+            }
+
             if (pid == compositor_pid) {
                 print("[INIT] Restarting compositor...\n");
                 compositor_pid = spawn("sbin/compositor");
             }
+
+            // Yield after each reap so a process woken DURING init's reap burst
+            // (e.g. a sleeper hitting its deadline) is dispatched promptly. The #9
+            // fix makes each reap do REAL teardown (CR3 destroy, free stack/pages) --
+            // previously a no-op (the total leak), so reaps were ~instant. Without
+            // this yield the cooperative reaper monopolizes the CPU through the
+            // ~80-zombie boot drain and inflates other processes' wakeup-dispatch
+            // latency (observed: a 50 ms sleep measured ~480 ms). Spreading the
+            // teardown keeps the desktop + timing-sensitive probes responsive.
+            yield();
         } else {
             yield();
         }

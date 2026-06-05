@@ -479,6 +479,11 @@ int64_t sys_thread_join(uint64_t tid, uint64_t retval_out, uint64_t arg3,
     // process_unref inside the teardown runs the AS-refcount-gated CR3 teardown,
     // tearing the SHARED address space down only if this thread was its last user.
     target->parent_pid = 0;
+    // #9: release the thread's CREATION ref exactly once (CAS-guarded vs a racing
+    // parent-waitpid reaper), THEN process_destroy drops our get_by_pid ref. The
+    // final process_unref inside teardown runs the as_refcount-gated CR3 teardown,
+    // freeing the SHARED address space only if this thread was its last user.
+    reap_claim_release(target);
     process_destroy(target);
 
     kprintf("[SYSCALL] sys_thread_join: tid=%d joined by pid=%d\n",
@@ -839,6 +844,10 @@ int64_t sys_waitpid(uint64_t pid, uint64_t status_ptr, uint64_t options,
             int child_pid = found->pid;
             // Orphan before teardown so a later scan can't re-match this PID.
             found->parent_pid = 0;
+            // #9: release the zombie's CREATION ref exactly once (CAS-guarded so a
+            // racing thread_join/init reaper can't double-release), THEN
+            // process_destroy drops our get_by_pid ref -> ref hits 0 -> teardown.
+            reap_claim_release(found);
             process_destroy(found);
             return child_pid;
         }

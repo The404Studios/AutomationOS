@@ -122,6 +122,25 @@ static int wo_unlink(wait_object_t* wo, process_t* proc) {
     return 0;
 }
 
+// Force-unlink `proc` from `wo` if (and only if) it is currently linked there,
+// dropping the object-ref it holds. Idempotent: a no-op (and NO unref) if proc was
+// already removed by a concurrent signal/timer. Used by the kill paths to reclaim
+// the object-ref of a process killed while BLOCKED on this wait_object, so the PCB
+// collapses to a reapable zombie instead of leaking. wo_unlink takes wo->lock
+// IRQ-safe internally; callers hold no locks. IRQ-safety: a hard-IRQ
+// wait_object_signal racing us either pops proc first (then we find nothing and do
+// nothing) or runs after our unlink (then it finds nothing) -- wo->lock serializes
+// the two, and exactly one of them drops the single object-ref. [#9]
+int wait_object_abort(wait_object_t* wo, process_t* proc) {
+    if (!wo || !proc) return 0;
+    wo_ensure_init(wo);
+    if (wo_unlink(wo, proc)) {
+        process_unref(proc);   // release the stranded object-ref exactly once
+        return 1;
+    }
+    return 0;
+}
+
 // Pop the head waiter (FIFO). Returns the parked process still holding the
 // object's reference (caller must unref), or NULL if empty.
 static process_t* wo_pop_head(wait_object_t* wo) {

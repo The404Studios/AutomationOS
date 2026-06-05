@@ -1122,5 +1122,16 @@ int as_assemble(const char* text, uint64_t base, uint8_t* code_out, int code_cap
     if (total > code_cap) total = code_cap;
 
     if (code_len) *code_len = total;
+    /* Honesty gate: a "successful" assemble must have emitted bytes AND logged no
+     * errors. resolve_label (undefined label), enc_jmp/enc_jcc/enc_call (bad branch
+     * target) and as_sym_add (symbol table full) all log a diagnostic but otherwise
+     * SILENTLY encode 0 / self-relative garbage; S.fatal flags a code-buffer overflow.
+     * Without this gate as_assemble returned 1 on any nonzero output and tc_driver
+     * wrote a corrupt ELF to disk (it crashes when run). *ndiags is zeroed on entry
+     * (above) and the two pass-1 sizing sweeps suppress their own diagnostics, so a
+     * nonzero count here reflects only genuine pass-2 assembler errors -- there are no
+     * benign warnings, so failing on any diagnostic never over-rejects a valid program. */
+    if (S.fatal) return 0;
+    if (ndiags && *ndiags > 0) return 0;
     return (total > 0) ? 1 : 0;
 }

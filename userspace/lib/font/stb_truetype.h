@@ -1775,9 +1775,13 @@ static int stbtt__GetGlyphShapeTT(const stbtt_fontinfo *info, int glyph_index, s
 
             // now start the new one
             start_off = !(flags & 1);
-            if (start_off) {
+            if (start_off && i+1 < n) {
                // if we start off with an off-curve point, then when we need to find a point on the curve
                // where we can start, and we need to save some state for when we wraparound.
+               // (i+1 < n guard: a crafted font whose final contour is a single off-curve
+               // point at i==n-1 would otherwise read vertices[off+n], one past the buffer
+               // (m = n + 2*numberOfContours; valid point indices are off..off+n-1). With
+               // the guard that degenerate case falls through to the bounded sx=x/sy=y move.)
                scx = x;
                scy = y;
                if (!(vertices[off+i+1].type & 1)) {
@@ -3744,6 +3748,17 @@ STBTT_DEF unsigned char *stbtt_GetGlyphBitmapSubpixel(const stbtt_fontinfo *info
    gbm.w = (ix1 - ix0);
    gbm.h = (iy1 - iy0);
    gbm.pixels = NULL; // in case we error
+
+   // Clamp the glyph bitmap dimensions against a hostile font (mirrors the hardening
+   // already applied on the ttf_parser.c path). A crafted font with a tiny hhea
+   // fheight and a full-range glyph bbox makes scale huge and gbm.w/gbm.h enormous, so
+   // gbm.w * gbm.h below overflows int -> a tiny STBTT_malloc that stbtt_Rasterize then
+   // overruns to the full (un-overflowed) extent = heap corruption. Clamp BEFORE the
+   // multiply and report the clamped size so the caller's stride matches what we raster.
+   if (gbm.w < 0) gbm.w = 0;
+   if (gbm.h < 0) gbm.h = 0;
+   if (gbm.w > 4096) gbm.w = 4096;
+   if (gbm.h > 4096) gbm.h = 4096;
 
    if (width ) *width  = gbm.w;
    if (height) *height = gbm.h;

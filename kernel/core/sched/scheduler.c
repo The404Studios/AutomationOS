@@ -960,20 +960,24 @@ void scheduler_add_process(process_t* proc) {
     // ready queue at most once. Re-adding an already-queued process would
     // overwrite its `next` (truncating the list / forming a cycle) and leak the
     // extra reference. Bail out if it is already enqueued.
+    // SINGLE critical section (RACE-001): the on_queue test, the ref, the enqueue, and
+    // the ready_count bump must all be ATOMIC under scheduler_lock. The old code dropped
+    // the lock between the on_queue test and the ref/enqueue, so two CPUs (on SMP_SCHED,
+    // once Brick-F dispatch makes a second CPU call this) could BOTH observe on_queue==0,
+    // both process_ref, and both runqueue_enqueue the same PCB -- overwriting its single
+    // `next` link (list truncation / cycle) and leaking the extra ref. Latent on the
+    // uniprocessor-cooperative default; this mirrors the already-correct single-critical-
+    // section pattern in scheduler_add_process_to_cpu. process_ref is a lock-free atomic
+    // add, and process_set_ready / process_get_priority take no locks, so all are safe
+    // to call while holding scheduler_lock.
     spin_lock(&scheduler_lock);
     if (proc->on_queue) {
         spin_unlock(&scheduler_lock);
         PERF_END(PERF_OP_SCHEDULER_ADD);
         return;
     }
-    spin_unlock(&scheduler_lock);
 
-    // Take reference when adding to queue (prevents use-after-free)
-    process_ref(proc);
-
-    // RACE-001 fix: Acquire scheduler lock before queue manipulation
-    spin_lock(&scheduler_lock);
-
+    process_ref(proc);          // the queue's reference (prevents use-after-free)
     process_set_ready(proc);
     proc->on_queue = 1;
 

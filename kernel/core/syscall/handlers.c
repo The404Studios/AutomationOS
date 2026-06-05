@@ -1604,6 +1604,19 @@ int64_t sys_recovery_overlay(uint64_t mode, uint64_t dur_ms, uint64_t arg3,
     if (dur_ms == 0)   dur_ms = 1800;
     if (dur_ms > 4000) dur_ms = 4000;
 
+    // Syscalls enter with interrupts DISABLED (IA32_FMASK = 0x200 clears IF on
+    // SYSCALL — see syscall_init.c). This handler's animation loop below busy-waits
+    // on timer_get_ticks_ms() ADVANCING, which only happens when the PIT can fire.
+    // With IF=0 the tick counter is frozen and the loop spins forever (hanging the
+    // caller — exactly what stalled the desktop self-heal watchdog the first time it
+    // invoked this). So enable interrupts for the duration (this also keeps system
+    // timekeeping + scheduling alive during the ~2s animation), then restore the
+    // entry IF state. Safe in ring-0: the timer ISR only advances ticks here, and
+    // schedule_from_irq preempts ring-3 only, never this ring-0 handler.
+    unsigned long _ovl_rflags;
+    __asm__ volatile("pushfq; pop %0" : "=r"(_ovl_rflags));
+    __asm__ volatile("sti");
+
     framebuffer_clear(0x00101826u);
     {
         const char* msg = "Recovering desktop...";
@@ -1629,6 +1642,8 @@ int64_t sys_recovery_overlay(uint64_t mode, uint64_t dur_ms, uint64_t arg3,
         while (timer_get_ticks_ms() - f < 16 && timer_get_ticks_ms() < end)
             __asm__ volatile("pause");
     }
+    // Restore the entry interrupt state (syscalls return to the dispatcher with IF=0).
+    if (!(_ovl_rflags & 0x200UL)) __asm__ volatile("cli");
     return 0;
 }
 

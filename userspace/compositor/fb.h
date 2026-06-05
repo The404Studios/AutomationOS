@@ -9,6 +9,7 @@
 
 #include <stdint.h>
 #include <stdbool.h>
+#include <stddef.h>   /* size_t (used by the framebuffer size field below) */
 
 /**
  * Framebuffer structure

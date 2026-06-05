@@ -88,6 +88,13 @@ $LD /tmp/threadtest.o -o /tmp/threadtest.elf
 # == 256). Prints REAPLOOP: PASS iff the PID pool never exhausts (the #9 reap fix).
 cc userspace/apps/reaploop/reaploop.c /tmp/reaploop.o
 $LD /tmp/reaploop.o -o /tmp/reaploop.elf
+# cwatchdog: SELFHEAL desktop recovery supervisor (sbin/cwatchdog). Bare _start,
+# no libs/crt0. Built + shipped ONLY under SELFHEAL=1 (init spawns it only under
+# -DSELFHEAL), so the default initrd is byte-for-byte unchanged.
+if [ "${SELFHEAL:-0}" = "1" ]; then
+    cc userspace/apps/cwatchdog/cwatchdog.c /tmp/cwatchdog.o
+    $LD /tmp/cwatchdog.o -o /tmp/cwatchdog.elf
+fi
 
 # AI-native layer + standard tools (self-contained freestanding apps, no libs).
 # aibroker = the capability-gated AI command broker (/sbin); the rest are /bin
@@ -473,6 +480,10 @@ rm -rf /tmp/ird && mkdir -p /tmp/ird/sbin /tmp/ird/bin
 # (fresh checkout / cleaned tree) — otherwise the first `cp ... /tmp/ird/sbin/`
 # below fails with "No such file or directory" and the whole initrd is empty.
 ( cd /tmp/ird && tar xf /mnt/c/Users/wilde/Desktop/Kernel/iso/boot/initrd.img 2>/dev/null || true )
+# SELFHEAL gating: the seed above can carry an sbin/cwatchdog left by a PRIOR
+# SELFHEAL build. On a non-SELFHEAL build, drop it so the default initrd never
+# ships the watchdog (preserves the byte-for-byte-unchanged default image).
+if [ "${SELFHEAL:-0}" != "1" ]; then rm -f /tmp/ird/sbin/cwatchdog; fi
 cp /tmp/comp.elf /tmp/ird/sbin/compositor
 cp /tmp/init.elf /tmp/ird/sbin/init
 for e in filemanager calculator clock sysinfo settings sysmon uidemo dateapp applauncher taskman terminal editor snake paint synth tetris game2048 sheet notes calendar stopwatch mines piano dashboard welcome bench breakout pong invaders procmon soundtest solitaire aiconsole screenshot stress musicplayer ide bubbletd startmenu controlcenter chess asteroids sudoku photos pacman clockapp zombietd forktest threadtest reaploop matmuljobs cube3d ray; do
@@ -515,6 +526,8 @@ cp /tmp/sockettest.elf /tmp/ird/sbin/sockettest
 cp /tmp/cpu1offload.elf /tmp/ird/sbin/cpu1offload
 # smpstress -> /sbin (init spawns it; PASS on SMP after thousands of CPU1 jobs, SKIP on default).
 cp /tmp/smpstress.elf /tmp/ird/sbin/smpstress
+# cwatchdog only exists under SELFHEAL=1; if-guard keeps `set -e` happy on default.
+if [ "${SELFHEAL:-0}" = "1" ]; then cp /tmp/cwatchdog.elf /tmp/ird/sbin/cwatchdog; fi
 # overhaul-syscall verification probes -> /sbin (init spawns them at boot)
 for t in futextest epolltest sendfiletest perftest batchtest; do
     cp /tmp/$t.elf /tmp/ird/sbin/$t

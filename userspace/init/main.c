@@ -12,6 +12,14 @@ typedef unsigned long size_t;
 #define SYS_SPAWN   16
 #define SYS_WAITPID 6
 #define SYS_YIELD   15
+#define SYS_SHMGET  18
+#define SYS_SHMAT   19
+
+#ifdef SELFHEAL
+/* SELFHEAL: init creates+owns the compositor heartbeat SHM page. selfheal.h is
+ * self-contained (primitive types only), so including it here is collision-free. */
+#include "../include/selfheal.h"
+#endif
 
 static inline long syscall(long n, long a1, long a2, long a3) {
     long ret;
@@ -79,6 +87,33 @@ void _start(void) {
         syscall(SYS_EXIT, 1, 0, 0);
     }
 
+#ifdef SELFHEAL
+    /* SELFHEAL: init (PID 1, immortal) CREATES + OWNS the compositor heartbeat
+     * segment, then zeroes the page (sys_shmget does NOT zero page contents), so
+     * the first compositor instance reads magic==0 and detects a fresh segment.
+     * init owning it is load-bearing: an owner's death implicitly IPC_RMIDs the
+     * segment (kernel/ipc/shm.c:955-988), tombstoning the key and breaking
+     * respawn-resume — see userspace/include/selfheal.h. init keeps it attached
+     * forever so the page can never be freed while the desktop is up. */
+    print("[INIT] SELFHEAL: creating compositor heartbeat segment...\n");
+    {
+        long hb_id = syscall(SYS_SHMGET, (long)SELFHEAL_SHM_KEY,
+                             (long)SELFHEAL_SHM_SIZE, 0x200 /*IPC_CREAT*/ | 0666);
+        if (hb_id < 0) {
+            print("[INIT] SELFHEAL: heartbeat shmget FAILED\n");
+        } else {
+            long hb_addr = syscall(SYS_SHMAT, hb_id, 0, 0);
+            if (hb_addr > 0) {
+                volatile unsigned char* p = (volatile unsigned char*)hb_addr;
+                for (unsigned i = 0; i < SELFHEAL_SHM_SIZE; i++) p[i] = 0;
+                print("[INIT] SELFHEAL: heartbeat segment ready\n");
+            } else {
+                print("[INIT] SELFHEAL: heartbeat shmat FAILED\n");
+            }
+        }
+    }
+#endif
+
     print("[INIT] Spawning compositor...\n");
     int compositor_pid = spawn("sbin/compositor");
     if (compositor_pid > 0) {
@@ -88,6 +123,19 @@ void _start(void) {
     } else {
         print("[INIT] ERROR: Failed to spawn compositor!\n");
     }
+
+#ifdef SELFHEAL
+    /* SELFHEAL: the recovery supervisor. It polls the heartbeat and, on a freeze,
+     * fires the recovery overlay + kills the compositor (init respawns it below). */
+    print("[INIT] SELFHEAL: spawning cwatchdog...\n");
+    int cwatchdog_pid = spawn("sbin/cwatchdog");
+    if (cwatchdog_pid > 0) {
+        print("[INIT] cwatchdog started (PID "); print_num(cwatchdog_pid); print(")\n");
+    } else {
+        print("[INIT] ERROR: Failed to spawn cwatchdog!\n");
+    }
+#endif
+
     // M3: spawn a test client that creates a window over the SHM protocol.
     // (No settle delay: both processes are queued and the SysV inbox queue is
     // created with IPC_CREAT by whichever side calls msgget first.)
@@ -380,6 +428,13 @@ void _start(void) {
                 print("[INIT] Restarting compositor...\n");
                 compositor_pid = spawn("sbin/compositor");
             }
+
+#ifdef SELFHEAL
+            if (pid == cwatchdog_pid) {
+                print("[INIT] Restarting cwatchdog...\n");
+                cwatchdog_pid = spawn("sbin/cwatchdog");
+            }
+#endif
 
             // Yield after each reap so a process woken DURING init's reap burst
             // (e.g. a sleeper hitting its deadline) is dispatched promptly. The #9

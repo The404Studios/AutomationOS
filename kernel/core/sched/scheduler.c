@@ -30,10 +30,15 @@
  *            This is critical for maintaining scheduling fairness.
  *            See bug fix documentation: docs/BUG_FIX_SCHEDULER_TIME_SLICE.md
  *
- * Locking Protocol (RACE-001 fix):
- *  - scheduler_lock protects runqueues, bitmaps, and ready_count
- *  - Must be held during all queue manipulations
- *  - Lock ordering: scheduler_lock is Level 1 (highest)
+ * Locking Protocol (RACE-001 fix; F3-1 per-CPU split):
+ *  - cpus[c].rq_lock protects cpu c's runqueues, bitmaps, ready_count and the
+ *    on_queue/queued_cpu membership of its tasks. Held during all per-cpu queue
+ *    manipulations (add/remove/pick/yield/reset). At N=1 only cpus[0].rq_lock exists.
+ *  - scheduler_lock is RETAINED as the global OUTER lock for scheduler_shutdown
+ *    (drain serializer) only.
+ *  - Lock ordering: scheduler_lock (outer) -> per-cpu rq_locks (inner, STRICT
+ *    ASCENDING cpu-id order). No site holds two rq_locks; the cross-cpu enqueue
+ *    (scheduler_add_process_to_cpu) takes exactly one foreign rq_lock, never nests.
  */
 
 #ifndef CONFIG_SMP
@@ -129,6 +134,15 @@ typedef struct cpu {
     runqueue_t  rq_expired;     // was the global expired_rq
     uint32_t    ready_count;    // was the global ready_count
     cpu_stats_t stats;          // per-CPU scheduler stats (unused at N=1)
+    // F3-1: per-CPU runqueue mutation lock. Guards rq_active/rq_expired/ready_count
+    // and the on_queue/queued_cpu membership of THIS cpu's tasks ONLY. Replaces the
+    // global scheduler_lock at every per-cpu runqueue site (add/remove/pick/yield/
+    // reset). scheduler_lock is RETAINED as the OUTER lock for scheduler_shutdown
+    // (global drain serializer) and as the home for any future global-only state.
+    // At N=1 cpu_id()==0 so this_cpu()->rq_lock is ALWAYS cpus[0].rq_lock -- a pure
+    // rename of which spinlock instance is taken (same granularity, same critical
+    // sections, same enqueue targets) => byte-for-byte the old single-lock behavior.
+    spinlock_t  rq_lock;
 } cpu_t;
 
 static cpu_t cpus[MAX_CPUS];
@@ -556,11 +570,22 @@ static process_t* create_idle_thread(uint32_t cpu_id_val, int adopt_pid0) {
     return idle;
 }
 
+// F3-1: at-rest per-CPU runqueue topology self-test (defined with the F3-0
+// validators below; emits a single greppable "RQLOCK: PASS"/"FAIL" line). Forward
+// declared because scheduler_init() calls it BEFORE the validators block. A no-op
+// stub in a non-SCHED_DEBUG (perf) build.
+static void scheduler_rqlock_selftest(void);
+
 void scheduler_init(void) {
     kprintf("[SCHEDULER] Initializing O(1) multi-level feedback queue scheduler...\n");
 
-    // RACE-001 fix: Initialize scheduler lock
+    // RACE-001 fix: Initialize scheduler lock (retained as the OUTER/global lock for
+    // scheduler_shutdown; per-CPU runqueue mutation now uses cpus[].rq_lock, F3-1).
     spin_lock_init(&scheduler_lock);
+
+    // F3-1: initialize the BSP's per-CPU runqueue lock. At N=1 this is the ONLY
+    // rq_lock ever taken (cpu_id()==0 => this_cpu()->rq_lock == cpus[0].rq_lock).
+    spin_lock_init(&cpus[0].rq_lock);
 
 #if defined(SMP_SCHED) && defined(SMP_SCHED_DISPATCH)
     // Audit fix: eagerly build the FPU template HERE (BSP, before CPU1 is brought
@@ -606,6 +631,11 @@ void scheduler_init(void) {
     kprintf("[SCHEDULER]   - Complexity: O(1) enqueue, O(1) dequeue, O(1) pick_next\n");
     kprintf("[SCHEDULER]   - SMP-safe: Yes\n");
     kprintf("[SCHEDULER]   - Idle thread: PID %d\n", this_cpu()->idle_thread->pid);
+
+    // F3-1: prove the per-CPU runqueue lock topology is sound AT REST (rq_lock
+    // init'd, ready_count==walk, no cross-cpu duplicate, secondary cpus empty)
+    // before init spawns any service. Emits "RQLOCK: PASS" on every boot.
+    scheduler_rqlock_selftest();
 }
 
 #ifdef SMP_SCHED
@@ -633,6 +663,10 @@ int scheduler_init_secondary_cpu(uint32_t cpu, uint32_t apic_id) {
     runqueue_init(&cpus[cpu].rq_active);
     runqueue_init(&cpus[cpu].rq_expired);
     cpus[cpu].ready_count = 0;
+    // F3-1 (F-2 hazard): init this AP's rq_lock BEFORE any code acquires it. The BSP
+    // takes cpus[cpu].rq_lock cross-CPU in scheduler_add_process_to_cpu (called by
+    // ap_spawn_test_kthread), so an uninitialized lock word here would spin forever.
+    spin_lock_init(&cpus[cpu].rq_lock);
 
     process_t* idle = create_idle_thread(cpu, 0 /* do NOT adopt PID 0 */);
     if (!idle) {
@@ -661,8 +695,9 @@ int scheduler_init_secondary_cpu(uint32_t cpu, uint32_t apic_id) {
 // affinity primitive for Brick F. Mirrors scheduler_add_process()'s exact ref /
 // lock / idempotency discipline, but targets cpus[cpu].rq instead of this_cpu()'s
 // (scheduler_add_process always uses this_cpu(), so the BSP can't use it to pin to
-// CPU1). The global scheduler_lock covers ALL CPUs' runqueues, so this is safe to
-// call from the BSP for a CPU1 queue. Takes a ref that pick_next() later transfers.
+// CPU1). F3-1: it takes the TARGET cpu's own rq_lock (cpus[cpu].rq_lock, a FOREIGN
+// lock when called from the BSP for CPU1) -- exactly one lock, never nested, so it
+// can't ABBA with shutdown. Takes a ref that pick_next() later transfers.
 void scheduler_add_process_to_cpu(process_t* proc, uint32_t cpu) {
     if (!proc || cpu >= MAX_CPUS) return;
     if (proc->state == PROCESS_TERMINATED) return;
@@ -670,21 +705,25 @@ void scheduler_add_process_to_cpu(process_t* proc, uint32_t cpu) {
     // breaks the active/expired invariant and leaks a ref). Guard explicitly.
     if (proc == cpus[cpu].idle_thread) return;
 
-    // Single critical section: (check on_queue, take the queue's ref, set the flag,
-    // enqueue) are done atomically under scheduler_lock so a concurrent
-    // scheduler_remove_process can't orphan the ref (process_ref is a lock-free
-    // atomic add, safe to call here). Tighter than the legacy scheduler_add_process
-    // (which refs outside the lock) -- the AP path must be race-clean.
-    spin_lock(&scheduler_lock);
+    // Single critical section: (check on_queue, take the queue's ref, set the flag
+    // + queued_cpu, enqueue) are done atomically under the TARGET cpu's rq_lock so a
+    // concurrent scheduler_remove_process can't orphan the ref (process_ref is a
+    // lock-free atomic add, safe to call here). Tighter than the legacy
+    // scheduler_add_process (which refs outside the lock) -- the AP path must be
+    // race-clean. F3-1: this is a cross-CPU enqueue (BSP -> cpus[cpu]); it acquires
+    // the FOREIGN target cpu's rq_lock (NOT this_cpu()'s). Exactly ONE lock is held
+    // and it never nests, so it cannot form an ABBA cycle with scheduler_shutdown.
+    spin_lock(&cpus[cpu].rq_lock);
     if (!proc->on_queue) {
         process_ref(proc);                   // queue holds a ref (UAF guard)
         process_set_ready(proc);
         proc->on_queue = 1;
+        proc->queued_cpu = cpu;              // membership lands on the TARGET cpu
         int priority = process_get_priority(proc);
         runqueue_enqueue(&cpus[cpu].rq_expired, proc, priority);
         cpus[cpu].ready_count++;
     }
-    spin_unlock(&scheduler_lock);
+    spin_unlock(&cpus[cpu].rq_lock);
 }
 #endif /* SMP_SCHED */
 
@@ -713,9 +752,11 @@ void scheduler_add_process_to_cpu(process_t* proc, uint32_t cpu) {
 // lapic_tick() AFTER the LAPIC EOI. The HARD ring-3 guard comes FIRST: only ever
 // preempt code the timer caught running in ring 3 (CPL==3). CPU1's scheduler loop
 // runs in ring 0, so in F1 this returns immediately every tick (the skeleton
-// proof). Doing the guard before ANY scheduler_lock acquisition ALSO prevents a
-// same-CPU self-deadlock: CPU1 must never try to take scheduler_lock from this ISR
-// while the ring-0 code it interrupted already holds it.
+// proof). Doing the guard before ANY rq_lock acquisition ALSO prevents a same-CPU
+// self-deadlock: CPU1 must never try to take this_cpu()->rq_lock (cpus[1].rq_lock)
+// from this ISR while the ring-0 code it interrupted already holds it. F3-1 makes
+// this MORE important, not less: the per-cpu lock is now the cpu's OWN lock, so a
+// pre-guard acquire would self-wedge that cpu. Keep the ring-3 guard OUTERMOST.
 void ap_schedule_from_irq(interrupt_frame_t* frame) {
     if ((frame->cs & 3) != 3) {
         return;  // kernel/idle interrupted: never preempt. (F1: ALWAYS taken.)
@@ -872,12 +913,20 @@ void ap_scheduler_loop(void) {
 void scheduler_shutdown(void) {
     kprintf("[SCHEDULER] Shutting down scheduler (draining runqueues and sleep list)...\n");
 
-    // 1) Acquire the scheduler lock to prevent concurrent add/remove operations
-    //    while we drain. This blocks any timer IRQ that tries to re-queue a
-    //    process mid-shutdown.
+    // 1) Acquire the GLOBAL scheduler lock (F3-1: retained as the OUTER lock) to
+    //    serialize shutdown vs any concurrent add/remove globally and to guard the
+    //    global g_sleep_list clear below. This blocks any timer IRQ that tries to
+    //    re-queue a process mid-shutdown.
     spin_lock(&scheduler_lock);
 
     uint32_t drained_count = 0;
+
+    // F3-1: drain THIS cpu's runqueues under its per-cpu rq_lock (the INNER lock).
+    // Lock order is scheduler_lock (outer) -> per-cpu rq_lock (inner); the inner
+    // per-cpu locks must be taken in STRICT ASCENDING cpu-id order when a future
+    // shutdown drains all online CPUs. At F3-1 shutdown only drains this_cpu()
+    // (cpu0), so it takes exactly cpus[0].rq_lock here.
+    spin_lock(&this_cpu()->rq_lock);
 
     // 2) Drain the ACTIVE runqueue: dequeue every priority level, releasing
     //    the scheduler's reference for each process.
@@ -910,6 +959,11 @@ void scheduler_shutdown(void) {
             process_unref(proc);
         }
     }
+
+    // Done mutating this cpu's runqueues -- release the inner per-cpu rq_lock. The
+    // sleep-list clear and online=0 below are GLOBAL/non-runqueue state and stay
+    // under scheduler_lock (outer) only.
+    spin_unlock(&this_cpu()->rq_lock);
 
     // 4) Clear the global sleep list. We do NOT unref the sleepers here (their
     //    refs are on the wait_objects they are parked on; the wait-object teardown
@@ -947,15 +1001,24 @@ void scheduler_shutdown(void) {
 // so a false positive cannot brick boot; each violation prints a greppable
 // "[SCHED_INVARIANT] VIOLATION ..." line and bumps g_sched_invariant_violations.
 //
-// LOCK CONTRACT: every call site already holds scheduler_lock (a NON-recursive
-// spinlock) or runs IF=0 in the IRQ path. These functions therefore MUST NOT
-// acquire scheduler_lock -- they only READ runqueue/list state + kprintf. All
+// LOCK CONTRACT (F3-1 per-CPU rq_lock): every per-task call site already holds the
+// RELEVANT lock -- the caller's this_cpu()->rq_lock (add_process/remove_process/
+// pick_next all hold it) -- or runs IF=0 in the IRQ path. These functions therefore
+// MUST NOT acquire any lock -- they only READ runqueue/list state + kprintf. All
 // list walks are BOUNDED so a corrupt (cyclic) list cannot hang the validator --
 // which is exactly the corruption class the SMP harness hunts.
 //
+// CROSS-CPU READ DEFERRAL (F3-1 -> F3-3): the validators read EVERY online cpu's
+// runqueue (validate_runqueues' MAX_CPUS loop + sched_dbg_cross_cpu_duplicates).
+// At F3-1 this is SAFE: only cpu0 ever mutates a runqueue (CPU1 is offload-only and
+// never enqueues), so reading another cpu's queue is single-writer-safe. The MOMENT
+// Brick F3-3 makes CPU1 mutate its own runqueue, these lock-free cross-cpu reads
+// become RACY and MUST be gated under the target cpu's rq_lock (or run only on the
+// owning cpu). Documented here; NOT yet enforced (no concurrent CPU1 writer exists).
+//
 // Gated behind -DSCHED_DEBUG (default ON during SMP bring-up; see quick_build.sh);
 // compiles to no-ops in a perf build. Mirrors the existing
-// scheduler_validate_ready_count() "must hold scheduler_lock" contract.
+// scheduler_validate_ready_count() "must hold the relevant lock" contract.
 // ===========================================================================
 #ifdef SCHED_DEBUG
 static volatile uint64_t g_sched_invariant_violations = 0;
@@ -991,14 +1054,43 @@ static int sched_dbg_on_sleep_list(const process_t* p) {
     return 0;
 }
 
+// F3-1: count how many online CPUs have `p` linked in their runqueues. >1 is the
+// cross-cpu DOUBLE-ENQUEUE race signature -- the exact corruption the RACE-001
+// single-critical-section enqueue prevents, and the failure mode per-CPU rq_locks
+// must never produce. Bounded, lock-free reads. SAFE at F3-1 (single runqueue
+// writer == cpu0); becomes racy once F3-3 makes CPU1 mutate a runqueue (see the
+// cross-cpu deferral note above). Returns the membership count.
+static int sched_dbg_cross_cpu_duplicates(const process_t* p, const char* where) {
+    if (!p) return 0;
+    int seen = 0;
+    for (uint32_t cid = 0; cid < MAX_CPUS; cid++) {
+        if (!cpus[cid].online) continue;
+        if (sched_dbg_in_rq(&cpus[cid].rq_active,  p) ||
+            sched_dbg_in_rq(&cpus[cid].rq_expired, p)) {
+            seen++;
+        }
+    }
+    if (seen > 1)
+        SCHED_VIOLATION(where, p->pid, "task on %d CPU runqueues (cross-cpu duplicate)", seen);
+    return seen;
+}
+
 // Per-task invariant guard. `where` names the call site. Returns violations seen.
 static int sched_validate_task(process_t* p, const char* where) {
     if (!p) return 0;
     cpu_t* c = this_cpu();
     uint64_t before = g_sched_invariant_violations;
 
-    int in_active  = sched_dbg_in_rq(&c->rq_active,  p);
-    int in_expired = sched_dbg_in_rq(&c->rq_expired, p);
+    // F3-1: a queued task is linked on the runqueue of the cpu it CLAIMS
+    // (queued_cpu, VALID iff on_queue==1). Evaluate membership against the CLAIMED
+    // cpu so a mis-routed enqueue is detectable as a hard invariant violation. For
+    // a non-queued task queued_cpu is stale, so fall back to this_cpu() (at N=1 both
+    // resolve to cpus[0], making this byte-identical to the F3-0 behavior today).
+    uint32_t qcpu = (p->on_queue && p->queued_cpu < MAX_CPUS) ? p->queued_cpu : cpu_id();
+    cpu_t* qc = &cpus[qcpu];
+
+    int in_active  = sched_dbg_in_rq(&qc->rq_active,  p);
+    int in_expired = sched_dbg_in_rq(&qc->rq_expired, p);
     int on_sleep   = sched_dbg_on_sleep_list(p);
     int on_wait    = (p->wait_on != NULL);
 
@@ -1014,9 +1106,13 @@ static int sched_validate_task(process_t* p, const char* where) {
     if (!p->on_queue && p->next != NULL)
         SCHED_VIOLATION(where, p->pid, "on_queue=0 but next!=NULL (stale link)");
     if (p->on_queue && !(in_active || in_expired))
-        SCHED_VIOLATION(where, p->pid, "on_queue=1 but not linked on any runqueue");
+        SCHED_VIOLATION(where, p->pid, "on_queue=1 but not linked on cpus[%u] (queued_cpu) runqueue", qcpu);
     if (!p->on_queue && (in_active || in_expired))
         SCHED_VIOLATION(where, p->pid, "on_queue=0 but linked on a runqueue");
+    // F3-1: a queued task must be on EXACTLY ONE cpu's runqueue. Cross-cpu
+    // duplication is the double-enqueue race signature (no-op/benign at N=1).
+    if (p->on_queue)
+        sched_dbg_cross_cpu_duplicates(p, where);
     // A task is NEVER on a runqueue AND the SLEEP list at once. NOTE: wait_on is
     // deliberately NOT used as a membership signal here -- it is set on block and
     // left STALE after wake (harmless: every reader guards it with state==BLOCKED),
@@ -1129,11 +1225,113 @@ static int sched_validate_runqueues(const char* where) {
             g_sched_invariant_violations++;
         }
     }
+
+    // F3-1: cross-cpu duplicate sweep -- a task linked on >1 cpu's runqueue is the
+    // double-enqueue race signature. Only MEANINGFUL once >=2 cpus own runqueues;
+    // at F3-1 only cpu0 ever mutates a runqueue (CPU1 is offload-only), so counting
+    // online cpus first keeps the common single-runqueue path free (zero work) and
+    // this becomes active hardening at F3-3. Bounded by each cpu's ready_count.
+    uint32_t online_cpus = 0;
+    for (uint32_t cid = 0; cid < MAX_CPUS; cid++) if (cpus[cid].online) online_cpus++;
+    if (online_cpus > 1) {
+        for (uint32_t cid = 0; cid < MAX_CPUS; cid++) {
+            if (!cpus[cid].online) continue;
+            uint32_t bound = cpus[cid].ready_count + 16, visited = 0;
+            runqueue_t* rqs[2] = { &cpus[cid].rq_active, &cpus[cid].rq_expired };
+            for (int q = 0; q < 2; q++) {
+                for (int prio = 0; prio < SCHED_PRIORITY_LEVELS; prio++) {
+                    process_t* it = rqs[q]->queues[prio];
+                    while (it && visited < bound) {
+                        visited++;
+                        sched_dbg_cross_cpu_duplicates(it, where);
+                        it = it->next;
+                    }
+                }
+            }
+        }
+    }
     return (int)(g_sched_invariant_violations - before);
+}
+
+// F3-1: at-rest per-CPU runqueue TOPOLOGY proof (modeled on paging_alias_selftest).
+// Runs at the END of scheduler_init -- AFTER rq init + idle creation, BEFORE init
+// spawns any service, so the queues are provably empty. Holds cpus[0].rq_lock for
+// the structural walks (honors the "walk under the relevant rq_lock" contract; at
+// this boot point no AP is online yet, so it is single-threaded). Checks 4 things
+// and emits exactly one greppable line: "RQLOCK: PASS" (all-pass) or "RQLOCK: FAIL".
+static void scheduler_rqlock_selftest(void) {
+    int fails = 0;
+
+    // Inv 1: every online cpu's rq_lock is INITIALIZED (unlocked). Checked BEFORE we
+    // acquire any rq_lock, so cpu0's own lock still reads the init signature.
+    for (uint32_t cid = 0; cid < MAX_CPUS; cid++) {
+        if (!cpus[cid].online) continue;
+        if (cpus[cid].rq_lock.lock != 0 || cpus[cid].rq_lock.owner_cpu != 0xFFFFFFFF) {
+            kprintf("[SCHEDULER] RQLOCK: inv1 cpu=%u rq_lock not initialized (lock=%u owner=%x)\n",
+                    cid, cpus[cid].rq_lock.lock, cpus[cid].rq_lock.owner_cpu);
+            fails++;
+        }
+    }
+
+    // Hold cpu0's rq_lock for the structural walks (contract + future-safe).
+    spin_lock(&cpus[0].rq_lock);
+    for (uint32_t cid = 0; cid < MAX_CPUS; cid++) {
+        if (!cpus[cid].online) continue;
+        // Inv 2: ready_count == bounded node walk of active+expired.
+        uint32_t counted = 0, bound = cpus[cid].ready_count + 16;
+        runqueue_t* rqs[2] = { &cpus[cid].rq_active, &cpus[cid].rq_expired };
+        for (int q = 0; q < 2; q++)
+            for (int prio = 0; prio < SCHED_PRIORITY_LEVELS; prio++) {
+                process_t* it = rqs[q]->queues[prio];
+                while (it && counted <= bound) { counted++; it = it->next; }
+            }
+        if (counted != cpus[cid].ready_count) {
+            kprintf("[SCHEDULER] RQLOCK: inv2 cpu=%u counted=%u != ready_count=%u\n",
+                    cid, counted, cpus[cid].ready_count);
+            fails++;
+        }
+        // Inv 4: a SECONDARY cpu (cid>0) holds NO scheduled process (the F3-1
+        // offload-only policy: CPU1 never owns a runqueue task). Vacuous at
+        // scheduler_init in the default/SMP_FOUNDATION build (no AP slot online
+        // yet); ACTIVE once a secondary cpu registers a scheduler slot (SMP_SCHED).
+        if (cid != 0 && (counted != 0 || cpus[cid].ready_count != 0)) {
+            kprintf("[SCHEDULER] RQLOCK: inv4 cpu=%u secondary runqueue NOT empty (counted=%u ready=%u)\n",
+                    cid, counted, cpus[cid].ready_count);
+            fails++;
+        }
+    }
+
+    // Inv 3: no task on >1 cpu's runqueue. Meaningful only with >=2 runqueue-owning
+    // cpus (else trivially true); reuses the cross-cpu duplicate scan.
+    uint32_t online_cpus = 0;
+    for (uint32_t cid = 0; cid < MAX_CPUS; cid++) if (cpus[cid].online) online_cpus++;
+    if (online_cpus > 1) {
+        for (uint32_t cid = 0; cid < MAX_CPUS; cid++) {
+            if (!cpus[cid].online) continue;
+            uint32_t bound = cpus[cid].ready_count + 16, visited = 0;
+            runqueue_t* rqs[2] = { &cpus[cid].rq_active, &cpus[cid].rq_expired };
+            for (int q = 0; q < 2; q++)
+                for (int prio = 0; prio < SCHED_PRIORITY_LEVELS; prio++) {
+                    process_t* it = rqs[q]->queues[prio];
+                    while (it && visited < bound) {
+                        visited++;
+                        if (sched_dbg_cross_cpu_duplicates(it, "rqlock_selftest") > 1) fails++;
+                        it = it->next;
+                    }
+                }
+        }
+    }
+    spin_unlock(&cpus[0].rq_lock);
+
+    if (fails == 0)
+        kprintf("[SCHEDULER] RQLOCK: PASS (per-cpu rq_lock init + ready_count==walk + no cross-cpu dup + secondary rq empty)\n");
+    else
+        kprintf("[SCHEDULER] RQLOCK: FAIL (%d invariant(s) violated)\n", fails);
 }
 #else  /* !SCHED_DEBUG: compile to nothing for a perf build */
 static inline int sched_validate_task(process_t* p, const char* where) { (void)p; (void)where; return 0; }
 static inline int sched_validate_runqueues(const char* where) { (void)where; return 0; }
+static void scheduler_rqlock_selftest(void) { }  /* perf build: no topology proof */
 #endif /* SCHED_DEBUG */
 
 void scheduler_add_process(process_t* proc) {
@@ -1156,18 +1354,20 @@ void scheduler_add_process(process_t* proc) {
     // overwrite its `next` (truncating the list / forming a cycle) and leak the
     // extra reference. Bail out if it is already enqueued.
     // SINGLE critical section (RACE-001): the on_queue test, the ref, the enqueue, and
-    // the ready_count bump must all be ATOMIC under scheduler_lock. The old code dropped
-    // the lock between the on_queue test and the ref/enqueue, so two CPUs (on SMP_SCHED,
-    // once Brick-F dispatch makes a second CPU call this) could BOTH observe on_queue==0,
-    // both process_ref, and both runqueue_enqueue the same PCB -- overwriting its single
-    // `next` link (list truncation / cycle) and leaking the extra ref. Latent on the
-    // uniprocessor-cooperative default; this mirrors the already-correct single-critical-
-    // section pattern in scheduler_add_process_to_cpu. process_ref is a lock-free atomic
-    // add, and process_set_ready / process_get_priority take no locks, so all are safe
-    // to call while holding scheduler_lock.
-    spin_lock(&scheduler_lock);
+    // the ready_count bump must all be ATOMIC under this_cpu()->rq_lock (F3-1: was the
+    // global scheduler_lock). The old code dropped the lock between the on_queue test
+    // and the ref/enqueue, so two CPUs (on SMP_SCHED, once Brick-F dispatch makes a
+    // second CPU call this) could BOTH observe on_queue==0, both process_ref, and both
+    // runqueue_enqueue the same PCB -- overwriting its single `next` link (list
+    // truncation / cycle) and leaking the extra ref. Latent on the uniprocessor-
+    // cooperative default; this mirrors the already-correct single-critical-section
+    // pattern in scheduler_add_process_to_cpu. process_ref is a lock-free atomic add,
+    // and process_set_ready / process_get_priority take no locks, so all are safe to
+    // call while holding the per-cpu rq_lock. The enqueue targets this_cpu() (cpu_id()
+    // == 0 on the BSP), so queued_cpu is set to cpu_id() inside this same section.
+    spin_lock(&this_cpu()->rq_lock);
     if (proc->on_queue) {
-        spin_unlock(&scheduler_lock);
+        spin_unlock(&this_cpu()->rq_lock);
         PERF_END(PERF_OP_SCHEDULER_ADD);
         return;
     }
@@ -1175,6 +1375,7 @@ void scheduler_add_process(process_t* proc) {
     process_ref(proc);          // the queue's reference (prevents use-after-free)
     process_set_ready(proc);
     proc->on_queue = 1;
+    proc->queued_cpu = cpu_id();  // F3-1: membership lands on this_cpu()
 
     // CRITICAL: Do NOT reset time_slice here!
     // This function is called when:
@@ -1198,7 +1399,7 @@ void scheduler_add_process(process_t* proc) {
     sched_validate_task(proc, "add_process:exit");
     sched_validate_runqueues("add_process:exit");
 
-    spin_unlock(&scheduler_lock);
+    spin_unlock(&this_cpu()->rq_lock);
 
 #ifndef SCHEDULER_QUIET
     kprintf("[SCHEDULER] Added process '%s' (PID %d) to expired queue (priority: %d, time_slice: %d, ref_count: %d)\n",
@@ -1238,15 +1439,20 @@ void scheduler_yield_requeue(process_t* proc) {
     if (!proc) return;
     if (proc->state == PROCESS_TERMINATED) return;
 
-    spin_lock(&scheduler_lock);
-    if (proc->on_queue) { spin_unlock(&scheduler_lock); return; }
-    spin_unlock(&scheduler_lock);
+    // F3-1: per-cpu rq_lock (was scheduler_lock). 4a (early on_queue check) and 4b
+    // (the main re-queue) take the SAME this_cpu() lock; the unlock-relock gap is
+    // preserved EXACTLY as before -- a pre-existing, behavior-identical window, not
+    // changed in F3-1.
+    spin_lock(&this_cpu()->rq_lock);
+    if (proc->on_queue) { spin_unlock(&this_cpu()->rq_lock); return; }
+    spin_unlock(&this_cpu()->rq_lock);
 
     process_ref(proc);
 
-    spin_lock(&scheduler_lock);
+    spin_lock(&this_cpu()->rq_lock);
     process_set_ready(proc);
     proc->on_queue = 1;
+    proc->queued_cpu = cpu_id();  // F3-1: membership lands on this_cpu() (both branches)
     int priority = process_get_priority(proc);
 
     if (proc->yield_boost > 0) {
@@ -1262,7 +1468,7 @@ void scheduler_yield_requeue(process_t* proc) {
         runqueue_enqueue(&this_cpu()->rq_expired, proc, priority);
     }
     this_cpu()->ready_count++;
-    spin_unlock(&scheduler_lock);
+    spin_unlock(&this_cpu()->rq_lock);
 }
 
 void scheduler_remove_process(process_t* proc) {
@@ -1278,11 +1484,12 @@ void scheduler_remove_process(process_t* proc) {
     // no double-unref, no double-print. This makes calling
     // scheduler_remove_process() twice on the same process completely safe.
 
-    // RACE-001 fix: Acquire scheduler lock before queue manipulation
-    spin_lock(&scheduler_lock);
+    // RACE-001 fix: Acquire this cpu's runqueue lock before queue manipulation
+    // (F3-1: was the global scheduler_lock).
+    spin_lock(&this_cpu()->rq_lock);
 
     if (!proc->on_queue) {
-        spin_unlock(&scheduler_lock);
+        spin_unlock(&this_cpu()->rq_lock);
         PERF_END(PERF_OP_SCHEDULER_REMOVE);
         return;
     }
@@ -1307,7 +1514,7 @@ void scheduler_remove_process(process_t* proc) {
         // queue STRUCTURE only, not the removed task's per-state membership.)
         sched_validate_runqueues("remove_process:exit");
 
-        spin_unlock(&scheduler_lock);
+        spin_unlock(&this_cpu()->rq_lock);
 
 #ifndef SCHEDULER_QUIET
         kprintf("[SCHEDULER] Removed process '%s' (PID %d) from ready queue (priority: %d)\n",
@@ -1318,15 +1525,19 @@ void scheduler_remove_process(process_t* proc) {
         process_unref(proc);
     } else {
         // Not found in either queue - already removed
-        spin_unlock(&scheduler_lock);
+        spin_unlock(&this_cpu()->rq_lock);
     }
 
     PERF_END(PERF_OP_SCHEDULER_REMOVE);
 }
 
 process_t* scheduler_pick_next(void) {
-    // RACE-001 fix: Acquire scheduler lock before queue access
-    spin_lock(&scheduler_lock);
+    // RACE-001 fix: Acquire this cpu's runqueue lock before queue access (F3-1: was
+    // the global scheduler_lock). ALL six lock sites in this function -- the initial
+    // acquire, the two idle-fallback releases, the terminated-drain release + its
+    // re-lock in the pick_again loop, and the final release -- use this_cpu()->rq_lock
+    // so the acquire/release are matched on the SAME lock (a mismatch would wedge).
+    spin_lock(&this_cpu()->rq_lock);
 
     process_t* next = NULL;
 
@@ -1348,7 +1559,7 @@ pick_again:
             // Both runqueues are empty: nothing runnable. Return the idle thread,
             // which is NOT enqueued (see scheduler_init) — it is the dedicated
             // fallback that runs only in this all-empty state.
-            spin_unlock(&scheduler_lock);
+            spin_unlock(&this_cpu()->rq_lock);
             return this_cpu()->idle_thread;
         }
 
@@ -1361,7 +1572,7 @@ pick_again:
         if (next == NULL) {
             // Expired was non-empty but yielded nothing pickable (all entries
             // drained as terminated): fall back to the idle thread.
-            spin_unlock(&scheduler_lock);
+            spin_unlock(&this_cpu()->rq_lock);
             return this_cpu()->idle_thread;
         }
     }
@@ -1376,14 +1587,14 @@ pick_again:
     if (next->state == PROCESS_TERMINATED) {
         this_cpu()->ready_count--;
         next->on_queue = 0;
-        spin_unlock(&scheduler_lock);
+        spin_unlock(&this_cpu()->rq_lock);
 #ifndef SCHEDULER_QUIET
         kprintf("[SCHEDULER] pick_next: discarding terminated '%s' (PID %d), "
                 "picking again\n", next->name, next->pid);
 #endif
         // Release the reference that scheduler_add_process took
         process_unref(next);
-        spin_lock(&scheduler_lock);
+        spin_lock(&this_cpu()->rq_lock);
         goto pick_again;  // Try to pick another process
     }
 
@@ -1395,7 +1606,7 @@ pick_again:
     // later in process_set_current), so a per-task check would false-positive.
     sched_validate_runqueues("pick_next:exit");
 
-    spin_unlock(&scheduler_lock);
+    spin_unlock(&this_cpu()->rq_lock);
 
     // ============================================================================
     // TIME SLICE FAIRNESS FIX (Bug fix from Agent 29 investigation)
@@ -2094,9 +2305,11 @@ void scheduler_reset_ready_count(uint32_t cpu_id) {
     if (cpu_id >= MAX_CPUS) {
         return;
     }
-    spin_lock(&scheduler_lock);
+    // F3-1: guard the SPECIFIC cpu's ready_count under ITS own rq_lock (was the
+    // global scheduler_lock). Caller passes the target cpu id explicitly.
+    spin_lock(&cpus[cpu_id].rq_lock);
     cpus[cpu_id].ready_count = 0;
-    spin_unlock(&scheduler_lock);
+    spin_unlock(&cpus[cpu_id].rq_lock);
 }
 
 // Get per-CPU statistics for a specific CPU
@@ -2134,7 +2347,8 @@ void scheduler_reset_all_cpu_stats(void) {
 // Validate ready_count against actual runqueue contents
 // Debugging function that counts processes in both runqueues and compares
 // against ready_count. Returns 0 if counts match, -1 otherwise.
-// WARNING: Must be called with scheduler_lock held or with interrupts disabled.
+// WARNING: Must be called with the target cpu's rq_lock (cpus[cpu_id].rq_lock) held
+// or with interrupts disabled (F3-1: was the global scheduler_lock).
 int scheduler_validate_ready_count(uint32_t cpu_id) {
     if (cpu_id >= MAX_CPUS) {
         return -1;

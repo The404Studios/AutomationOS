@@ -320,6 +320,19 @@ typedef struct process {
     // thread_create(); appended at the END to preserve the assembler's hardcoded
     // PROCESS_CONTEXT_OFFSET (16).
     struct process* join_target;
+
+    // Per-CPU runqueue membership (F3-1 per-CPU rq_lock). Records WHICH cpu's
+    // runqueue this task is currently linked on. VALID iff on_queue==1; left STALE
+    // when on_queue==0 (exactly like wait_on/futex_key -- readers MUST gate on
+    // on_queue first). Set inside the SAME rq_lock critical section that sets
+    // on_queue=1 and calls runqueue_enqueue, so (on_queue, queued_cpu, physical
+    // link) are always mutually consistent under that cpu's rq_lock. Lets the
+    // F3-0 validators turn "task X is on cpu C's runqueue" into a checkable
+    // invariant (membership must land on cpus[queued_cpu] and on NO OTHER cpu --
+    // the cross-cpu double-enqueue race signature). At N=1 it is always 0 (cpu0).
+    // memset-zeroed by process_create()/thread_create(); appended at the END to
+    // preserve the assembler's hardcoded PROCESS_CONTEXT_OFFSET (16).
+    uint32_t queued_cpu;
 } process_t;
 
 // Global pointer to current process (for PE loader and other subsystems)

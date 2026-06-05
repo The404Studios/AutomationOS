@@ -827,6 +827,25 @@ check_pagingalias() {
     return 1
 }
 
+check_rqlock() {
+    # F3-1 per-CPU rq_lock topology gate. scheduler_init proves AT REST that every
+    # online cpu's rq_lock is initialized, ready_count == the bounded runqueue walk,
+    # no task is on >1 cpu's runqueue, and every SECONDARY cpu's runqueue is empty
+    # (the offload-only policy). Emits "RQLOCK: PASS" on every boot (default + SMP).
+    # Also require ZERO [SCHED_INVARIANT] lines (the F3-0 guard must not trip under
+    # the per-cpu locks).
+    if grep -qF '[SCHED_INVARIANT]' "$LOG"; then
+        fail "Scheduler invariant violated ([SCHED_INVARIANT] present) — per-cpu rq_lock split tripped a guard"
+        return 1
+    fi
+    if grep -qF 'RQLOCK: PASS' "$LOG"; then
+        pass "Per-CPU rq_lock topology (RQLOCK): init + ready_count==walk + no cross-cpu dup + secondary rq empty"
+        return 0
+    fi
+    fail "RQLOCK: PASS missing — per-cpu rq_lock topology self-test failed/absent"
+    return 1
+}
+
 # ── Run all checks, tally results ──────────────────────────────────────────
 run_checks() {
     header "Boot invariant checks"
@@ -844,6 +863,7 @@ run_checks() {
         check_no_crash_loop
         check_no_pid_exhaustion
         check_pagingalias
+        check_rqlock
         check_fork_cow
         check_thread
         check_matmuljobs

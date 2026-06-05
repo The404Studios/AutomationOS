@@ -70,6 +70,24 @@ int64_t sys_exit(uint64_t status, uint64_t arg2, uint64_t arg3,
 #define FORK_PDI(va)    (((uint64_t)(va) >> 21) & 0x1FF)
 #define FORK_PTI(va)    (((uint64_t)(va) >> 12) & 0x1FF)
 
+// Read back whether `va` is now mapped PRESENT in the child address space rooted at
+// child_pml4_phys, by walking the child's tables via the direct map. paging_map_page()
+// returns void and SILENTLY bails on a page-table-allocation OOM (paging.c), so
+// vmm_map_page() can "succeed" without actually installing the leaf PTE. fork uses this
+// to detect that silent failure and undo the cow_incref / parent demotion / copy frame
+// instead of leaking a refcount or page (FORK#4).
+static int fork_child_mapped(uint64_t child_pml4_phys, uint64_t va) {
+    uint64_t* pml4 = (uint64_t*)PHYS_TO_DIRECT(child_pml4_phys & 0x000FFFFFFFFFF000ULL);
+    if (!(pml4[FORK_PML4I(va)] & PAGE_PRESENT)) return 0;
+    uint64_t* pdpt = (uint64_t*)PHYS_TO_DIRECT(pml4[FORK_PML4I(va)] & 0x000FFFFFFFFFF000ULL);
+    if (!(pdpt[FORK_PDPTI(va)] & PAGE_PRESENT)) return 0;
+    uint64_t* pd = (uint64_t*)PHYS_TO_DIRECT(pdpt[FORK_PDPTI(va)] & 0x000FFFFFFFFFF000ULL);
+    if (!(pd[FORK_PDI(va)] & PAGE_PRESENT)) return 0;
+    if (pd[FORK_PDI(va)] & (1ULL << 7)) return 1;   // 2MB huge page present
+    uint64_t* pt = (uint64_t*)PHYS_TO_DIRECT(pd[FORK_PDI(va)] & 0x000FFFFFFFFFF000ULL);
+    return (pt[FORK_PTI(va)] & PAGE_PRESENT) ? 1 : 0;
+}
+
 // Copy every user-mapped 4KiB page from the parent (current CR3) into the
 // child's address space.  Returns 0 on success, -1 if any allocation fails.
 static int fork_copy_user_pages(process_t* child) {
@@ -108,9 +126,15 @@ static int fork_copy_user_pages(process_t* child) {
 
                 // 2 MiB huge page – split into 4 KiB pages.
                 if (pd[pdi] & (1ULL << 7)) {
-                    uint64_t base_phys = pd[pdi] & ~0x1FFFFFULL;
-                    uint32_t base_flags = (uint32_t)(pd[pdi] & 0xFFF);
-                    base_flags &= ~(1ULL << 7);
+                    // Preserve the FULL 64-bit flags (incl PAGE_NX, bit 63) and use the
+                    // proper 2MB phys mask (bits 21-51), mirroring the kernel's own
+                    // huge-page split (paging.c). The old `(uint32_t)(pd[pdi] & 0xFFF)`
+                    // truncated bit 63, so a NX (data) user huge page became EXECUTABLE
+                    // in the child -> W^X bypass; and `& ~0x1FFFFFULL` left bit 63 in the
+                    // phys base, making it non-canonical (the memcpy below would #GP).
+                    uint64_t base_phys  = pd[pdi] & 0x000FFFFFFFE00000ULL;   // 2MB phys base
+                    uint64_t base_flags = (pd[pdi] & ~(1ULL << 7))          // all flags incl NX
+                                        & ~0x000FFFFFFFE00000ULL;            // minus phys base
 
                     // Only copy user-accessible huge pages.
                     if (!(base_flags & PAGE_USER)) continue;
@@ -125,6 +149,13 @@ static int fork_copy_user_pages(process_t* child) {
                         memcpy(PHYS_TO_DIRECT(new_page),
                                PHYS_TO_DIRECT(base_phys + pti * PAGE_SIZE), PAGE_SIZE);
                         vmm_map_page((void*)va, new_page, base_flags);
+                        // FORK#4: vmm_map_page can silently fail on PT-alloc OOM. If the
+                        // child PTE was not installed, free the just-copied frame instead
+                        // of leaking it, and abort.
+                        if (!fork_child_mapped(child->context.cr3, va)) {
+                            pmm_free_page(new_page);
+                            goto fail;
+                        }
                     }
                     continue;
                 }
@@ -165,16 +196,27 @@ static int fork_copy_user_pages(process_t* child) {
                     // refcount saturation -> eager fallback below).
                     if (use_cow && cow_incref(phys)) {
                         uint64_t child_flags = flags;
+                        int demoted_here = 0;
                         if (flags & PAGE_WRITE) {
                             // Writable: demote BOTH copies to RO+COW so the first
                             // write on either side triggers copy-on-write.
                             child_flags = (flags & ~(uint64_t)PAGE_WRITE) | PTE_COW;
                             pt[pti] = phys | child_flags;   // parent, in place
                             parent_pte_changed = 1;
+                            demoted_here = 1;
                         }
                         // Read-only owned pages (code/rodata) are shared as-is;
                         // a write to them is a genuine W^X fault (no PTE_COW).
                         vmm_map_page((void*)va, (void*)phys, child_flags);
+                        // FORK#4: if vmm_map_page silently failed (PT-alloc OOM), the
+                        // child PTE is absent but we already cow_incref'd and possibly
+                        // demoted the parent. Undo BOTH so the frame's refcount and the
+                        // parent's writable PTE don't leak, then abort.
+                        if (!fork_child_mapped(child->context.cr3, va)) {
+                            cow_unref(phys);
+                            if (demoted_here) pt[pti] = phys | flags;   // restore parent RW
+                            goto fail;
+                        }
                         n_cow++;
                         continue;
                     }
@@ -185,6 +227,12 @@ static int fork_copy_user_pages(process_t* child) {
                     if (!new_page) goto fail;
                     memcpy(PHYS_TO_DIRECT(new_page), PHYS_TO_DIRECT(phys), PAGE_SIZE);
                     vmm_map_page((void*)va, new_page, flags);
+                    // FORK#4: free the copy instead of leaking it if the child PTE was
+                    // not installed (silent PT-alloc OOM).
+                    if (!fork_child_mapped(child->context.cr3, va)) {
+                        pmm_free_page(new_page);
+                        goto fail;
+                    }
                     n_eager++;
                 }
             }
@@ -205,6 +253,16 @@ static int fork_copy_user_pages(process_t* child) {
 
 fail:
     kprintf("[FORK] Out of memory while copying address space\n");
+    // FORK#5: if we demoted any parent PTEs to RO+COW before failing, the parent may
+    // still hold stale WRITABLE TLB entries for them -- a write would then bypass the
+    // RO+COW trap. The success path flushes CR3 at the end; the fail path skipped it and
+    // returned with stale TLB. Flush here too. The caller destroys the child, whose
+    // teardown cow_unref's the partially-installed shared frames and restores the parent
+    // to sole owner, so after this flush the demoted pages self-heal via cow_handle_write
+    // on the parent's first write.
+    if (parent_pte_changed) {
+        __asm__ volatile("mov %%cr3, %%rax; mov %%rax, %%cr3" ::: "rax", "memory");
+    }
     paging_reset_target();
     return -1;
 }

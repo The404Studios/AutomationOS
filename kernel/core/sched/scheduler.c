@@ -941,6 +941,201 @@ void scheduler_shutdown(void) {
 }
 
 
+// ===========================================================================
+// Brick F3-0: ADDITIVE scheduler/runqueue invariant guards (proof-first).
+// Assertions/counters ONLY -- no behavior change. They LOG + COUNT, never panic,
+// so a false positive cannot brick boot; each violation prints a greppable
+// "[SCHED_INVARIANT] VIOLATION ..." line and bumps g_sched_invariant_violations.
+//
+// LOCK CONTRACT: every call site already holds scheduler_lock (a NON-recursive
+// spinlock) or runs IF=0 in the IRQ path. These functions therefore MUST NOT
+// acquire scheduler_lock -- they only READ runqueue/list state + kprintf. All
+// list walks are BOUNDED so a corrupt (cyclic) list cannot hang the validator --
+// which is exactly the corruption class the SMP harness hunts.
+//
+// Gated behind -DSCHED_DEBUG (default ON during SMP bring-up; see quick_build.sh);
+// compiles to no-ops in a perf build. Mirrors the existing
+// scheduler_validate_ready_count() "must hold scheduler_lock" contract.
+// ===========================================================================
+#ifdef SCHED_DEBUG
+static volatile uint64_t g_sched_invariant_violations = 0;
+
+#define SCHED_VIOLATION(where, pid, fmt, ...)                                   \
+    do {                                                                        \
+        g_sched_invariant_violations++;                                         \
+        kprintf("[SCHED_INVARIANT] VIOLATION at %s pid=%d : " fmt "\n",         \
+                (where), (int)(pid), ##__VA_ARGS__);                            \
+    } while (0)
+
+// Is `p` linked anywhere in runqueue `rq`? Bounded scan of all priorities.
+static int sched_dbg_in_rq(const runqueue_t* rq, const process_t* p) {
+    for (int prio = 0; prio < SCHED_PRIORITY_LEVELS; prio++) {
+        const process_t* it = rq->queues[prio];
+        uint32_t guard = 1024;                 // > MAX_PROCESSES; defends vs a cycle
+        while (it && guard--) {
+            if (it == p) return 1;
+            it = it->next;
+        }
+    }
+    return 0;
+}
+
+// Is `p` currently linked on the global timer sleep list? Bounded walk.
+static int sched_dbg_on_sleep_list(const process_t* p) {
+    const process_t* it = g_sleep_list;
+    uint32_t guard = 1024;
+    while (it && guard--) {
+        if (it == p) return 1;
+        it = it->sleep_next;
+    }
+    return 0;
+}
+
+// Per-task invariant guard. `where` names the call site. Returns violations seen.
+static int sched_validate_task(process_t* p, const char* where) {
+    if (!p) return 0;
+    cpu_t* c = this_cpu();
+    uint64_t before = g_sched_invariant_violations;
+
+    int in_active  = sched_dbg_in_rq(&c->rq_active,  p);
+    int in_expired = sched_dbg_in_rq(&c->rq_expired, p);
+    int on_sleep   = sched_dbg_on_sleep_list(p);
+    int on_wait    = (p->wait_on != NULL);
+
+    if (p == c->idle_thread) {
+        // Idle is the fallback -- never enqueued; exempt from state<->queue.
+        if (p->on_queue || in_active || in_expired)
+            SCHED_VIOLATION(where, p->pid, "idle thread is enqueued");
+        return (int)(g_sched_invariant_violations - before);
+    }
+
+    if (in_active && in_expired)
+        SCHED_VIOLATION(where, p->pid, "on BOTH active and expired runqueues");
+    if (!p->on_queue && p->next != NULL)
+        SCHED_VIOLATION(where, p->pid, "on_queue=0 but next!=NULL (stale link)");
+    if (p->on_queue && !(in_active || in_expired))
+        SCHED_VIOLATION(where, p->pid, "on_queue=1 but not linked on any runqueue");
+    if (!p->on_queue && (in_active || in_expired))
+        SCHED_VIOLATION(where, p->pid, "on_queue=0 but linked on a runqueue");
+    // A task is NEVER on a runqueue AND the SLEEP list at once. NOTE: wait_on is
+    // deliberately NOT used as a membership signal here -- it is set on block and
+    // left STALE after wake (harmless: every reader guards it with state==BLOCKED),
+    // so a just-woken READY task being enqueued legitimately still has a non-NULL
+    // wait_on. Only the runqueue walk and the g_sleep_list walk are reliable here;
+    // wait_on is consulted ONLY in the BLOCKED case below where it is current.
+    if ((in_active || in_expired) && on_sleep)
+        SCHED_VIOLATION(where, p->pid, "linked on a runqueue AND the sleep list");
+
+    switch (p->state) {
+    case PROCESS_READY:
+        if (!p->on_queue)
+            SCHED_VIOLATION(where, p->pid, "state=READY but on_queue=0");
+        if (!(in_active || in_expired))
+            SCHED_VIOLATION(where, p->pid, "state=READY but not on any runqueue");
+        if (on_sleep)   // reliable; wait_on is stale-after-wake (see note above)
+            SCHED_VIOLATION(where, p->pid, "state=READY but on the sleep list");
+        break;
+    case PROCESS_RUNNING:
+        if (p->on_queue || in_active || in_expired)
+            SCHED_VIOLATION(where, p->pid, "state=RUNNING but still on a runqueue");
+        break;
+    case PROCESS_BLOCKED:
+        if (p->on_queue || in_active || in_expired)
+            SCHED_VIOLATION(where, p->pid, "state=BLOCKED but still on a runqueue");
+        if (!on_wait && !on_sleep)
+            SCHED_VIOLATION(where, p->pid, "state=BLOCKED but on neither wait nor sleep list");
+        break;
+    case PROCESS_TERMINATED:
+        if (p->on_queue || in_active || in_expired)
+            SCHED_VIOLATION(where, p->pid, "state=TERMINATED but still on a runqueue");
+        if (on_sleep)   // reliable list walk; wait_on/wait_next/sleep_next can be stale
+            SCHED_VIOLATION(where, p->pid, "state=TERMINATED but still on the sleep list");
+        break;
+    default:
+        SCHED_VIOLATION(where, p->pid, "invalid state value %d", (int)p->state);
+        break;
+    }
+    return (int)(g_sched_invariant_violations - before);
+}
+
+// Walk ONE runqueue: per-node + structural checks, accumulate the live node count.
+static void sched_dbg_walk_rq(runqueue_t* rq, uint32_t cid, const char* tag,
+                              const char* where, uint32_t* out_count) {
+    uint32_t bound = cpus[cid].ready_count + 16;          // termination bound
+    for (int prio = 0; prio < SCHED_PRIORITY_LEVELS; prio++) {
+        process_t* it = rq->queues[prio];
+        int bit = bitmap_test(rq->bitmap, prio);
+        if (bit && it == NULL) {
+            kprintf("[SCHED_INVARIANT] VIOLATION at %s cpu=%u %s prio=%d : bitmap set but queue empty\n", where, cid, tag, prio);
+            g_sched_invariant_violations++;
+        }
+        if (!bit && it != NULL) {
+            kprintf("[SCHED_INVARIANT] VIOLATION at %s cpu=%u %s prio=%d : queue non-empty but bitmap clear\n", where, cid, tag, prio);
+            g_sched_invariant_violations++;
+        }
+        process_t* last = NULL;
+        while (it) {
+            (*out_count)++;
+            if (*out_count > bound) {            // cycle defense
+                kprintf("[SCHED_INVARIANT] VIOLATION at %s cpu=%u %s : walk exceeded bound %u (CYCLE?) pid=%d\n", where, cid, tag, bound, (int)it->pid);
+                g_sched_invariant_violations++;
+                return;
+            }
+            // A queued node must be READY, OR a TERMINATED task awaiting the
+            // KILL-FIX-001 drain in pick_next (a legitimate, self-healing transient:
+            // sys_kill sets TERMINATED on an already-enqueued task; pick_next discards
+            // it on the next pick). Any OTHER state (RUNNING/BLOCKED/garbage) in a
+            // runqueue is a real violation.
+            if (it->state != PROCESS_READY && it->state != PROCESS_TERMINATED) {
+                kprintf("[SCHED_INVARIANT] VIOLATION at %s cpu=%u %s : queued pid=%d state=%d (not READY/TERMINATED)\n", where, cid, tag, (int)it->pid, (int)it->state);
+                g_sched_invariant_violations++;
+            }
+            if (!it->on_queue) {
+                kprintf("[SCHED_INVARIANT] VIOLATION at %s cpu=%u %s : queued pid=%d on_queue=0\n", where, cid, tag, (int)it->pid);
+                g_sched_invariant_violations++;
+            }
+            last = it;
+            it = it->next;
+        }
+        if (rq->queues[prio] != NULL) {
+            if (rq->tails[prio] != last) {
+                kprintf("[SCHED_INVARIANT] VIOLATION at %s cpu=%u %s prio=%d : tails[] != actual last node\n", where, cid, tag, prio);
+                g_sched_invariant_violations++;
+            }
+            if (last && last->next != NULL) {
+                kprintf("[SCHED_INVARIANT] VIOLATION at %s cpu=%u %s prio=%d : last node next!=NULL\n", where, cid, tag, prio);
+                g_sched_invariant_violations++;
+            }
+        }
+    }
+}
+
+// Whole-runqueue structural sweep across all online CPUs. Bounded, lock-free reads.
+static int sched_validate_runqueues(const char* where) {
+    uint64_t before = g_sched_invariant_violations;
+    for (uint32_t cid = 0; cid < MAX_CPUS; cid++) {
+        if (!cpus[cid].online) continue;
+        uint32_t counted = 0;
+        sched_dbg_walk_rq(&cpus[cid].rq_active,  cid, "active",  where, &counted);
+        sched_dbg_walk_rq(&cpus[cid].rq_expired, cid, "expired", where, &counted);
+        if (counted != cpus[cid].ready_count) {
+            kprintf("[SCHED_INVARIANT] VIOLATION at %s cpu=%u : ready_count=%u but counted %u nodes\n", where, cid, cpus[cid].ready_count, counted);
+            g_sched_invariant_violations++;
+        }
+        if (cpus[cid].idle_thread &&
+            (sched_dbg_in_rq(&cpus[cid].rq_active,  cpus[cid].idle_thread) ||
+             sched_dbg_in_rq(&cpus[cid].rq_expired, cpus[cid].idle_thread))) {
+            kprintf("[SCHED_INVARIANT] VIOLATION at %s cpu=%u : idle_thread is enqueued\n", where, cid);
+            g_sched_invariant_violations++;
+        }
+    }
+    return (int)(g_sched_invariant_violations - before);
+}
+#else  /* !SCHED_DEBUG: compile to nothing for a perf build */
+static inline int sched_validate_task(process_t* p, const char* where) { (void)p; (void)where; return 0; }
+static inline int sched_validate_runqueues(const char* where) { (void)where; return 0; }
+#endif /* SCHED_DEBUG */
+
 void scheduler_add_process(process_t* proc) {
     PERF_START(PERF_OP_SCHEDULER_ADD);
 
@@ -998,6 +1193,10 @@ void scheduler_add_process(process_t* proc) {
     runqueue_enqueue(&this_cpu()->rq_expired, proc, priority);
 
     this_cpu()->ready_count++;
+
+    // F3-0 proof guard: settled state here (on_queue=1, state=READY, linked, counted).
+    sched_validate_task(proc, "add_process:exit");
+    sched_validate_runqueues("add_process:exit");
 
     spin_unlock(&scheduler_lock);
 
@@ -1103,6 +1302,11 @@ void scheduler_remove_process(process_t* proc) {
         proc->on_queue = 0;
         this_cpu()->ready_count--;
 
+        // F3-0 proof guard: the runqueue must be consistent after removal. (The
+        // removed task's state may be mid-transition at this site, so validate the
+        // queue STRUCTURE only, not the removed task's per-state membership.)
+        sched_validate_runqueues("remove_process:exit");
+
         spin_unlock(&scheduler_lock);
 
 #ifndef SCHEDULER_QUIET
@@ -1185,6 +1389,11 @@ pick_again:
 
     this_cpu()->ready_count--;
     next->on_queue = 0;
+
+    // F3-0 proof guard: validate the runqueue STRUCTURE only here. The just-picked
+    // task is dequeued (on_queue=0) but still PROCESS_READY (READY->RUNNING happens
+    // later in process_set_current), so a per-task check would false-positive.
+    sched_validate_runqueues("pick_next:exit");
 
     spin_unlock(&scheduler_lock);
 

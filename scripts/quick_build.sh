@@ -3,7 +3,7 @@ cd "$(dirname "$0")/.."
 mkdir -p build
 
 CC=gcc
-CFLAGS="-std=gnu11 -ffreestanding -nostdlib -nostdinc -fno-pic -fno-pie -fno-stack-protector -mno-red-zone -mcmodel=kernel -DSYSCALL_QUIET -DSCHEDULER_QUIET -DCONTEXT_SWITCH_QUIET -DEXEC_QUIET -DPROCESS_QUIET -Wno-unused-variable -Wno-unused-function -Wno-builtin-declaration-mismatch -Wno-implicit-function-declaration -Wno-int-conversion -Wno-incompatible-pointer-types -Ikernel/include -Ikernel/include/compat"
+CFLAGS="-std=gnu11 -ffreestanding -nostdlib -nostdinc -fno-pic -fno-pie -fno-stack-protector -mno-red-zone -mcmodel=kernel -DSYSCALL_QUIET -DSCHEDULER_QUIET -DCONTEXT_SWITCH_QUIET -DEXEC_QUIET -DPROCESS_QUIET -DSCHED_DEBUG -Wno-unused-variable -Wno-unused-function -Wno-builtin-declaration-mismatch -Wno-implicit-function-declaration -Wno-int-conversion -Wno-incompatible-pointer-types -Ikernel/include -Ikernel/include/compat"
 
 # Assembler flags. Empty by default so the cooperative build is byte-for-byte
 # unchanged.

@@ -158,6 +158,13 @@ int procapi_ctl(uint32_t pid, uint32_t verb, uint64_t arg)
         kprintf("[PROCAPI] Suspending PID %u (%s)\n", proc->pid, proc->name);
         if (proc->state == PROCESS_RUNNING || proc->state == PROCESS_READY) {
             proc->state = PROCESS_BLOCKED;
+            // Mirror kill.c SIGSTOP (FIX H4): also take the process OFF the ready
+            // queue. scheduler_pick_next only drains TERMINATED, not BLOCKED, so a
+            // suspended-but-still-queued process would otherwise be picked and
+            // resurrected to RUNNING (suspend wouldn't actually suspend). Removing the
+            // queue ref here also pairs with RESUME's scheduler_add_process below to
+            // keep refcount accounting balanced.
+            scheduler_remove_process(proc);
         }
         break;
 
@@ -169,6 +176,12 @@ int procapi_ctl(uint32_t pid, uint32_t verb, uint64_t arg)
         kprintf("[PROCAPI] Resuming PID %u (%s)\n", proc->pid, proc->name);
         if (proc->state == PROCESS_BLOCKED) {
             process_set_ready(proc);
+            // Mirror kill.c SIGCONT (FIX H4): process_set_ready only flips the state
+            // BLOCKED->READY; without scheduler_add_process the process is READY but
+            // linked in NO run queue -- invisible to the scheduler (it never runs
+            // again). scheduler_add_process re-takes exactly one queue ref, balancing
+            // the ref dropped by SUSPEND's scheduler_remove_process above.
+            scheduler_add_process(proc);
         }
         break;
 

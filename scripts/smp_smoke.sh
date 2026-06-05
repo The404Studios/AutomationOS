@@ -68,11 +68,18 @@ echo "=== RQLOCK per-cpu lock topology gate (#F3-1) ==="
 grep -F 'RQLOCK:' "$SER" | tail -2
 RQ_OK=0; grep -qF 'RQLOCK: PASS' "$SER" && RQ_OK=1
 
-if grep -qF 'SMPSTRESS: PASS' "$SER" && [ "$PA_OK" = "1" ] && [ "$NMATMUL" = "0" ] && [ "$NSCHED" = "0" ] && [ "$RQ_OK" = "1" ]; then
-    echo "[smp-smoke] RESULT: PASS -- SMPSTRESS PASS + PAGINGALIAS PASS + RQLOCK PASS + no matmul_band_n fault + 0 sched-invariant violations"
+# F3-2 CPU affinity selftest gate. On -smp 2 cpu1 is online but offload-only (empty
+# runqueue), so no task is queued on a forbidden cpu; the selftest proves the affinity
+# predicate + ctor-default (non-zero mask) invariants hold at rest.
+echo "=== AFFINITY cpu-mask selftest gate (#F3-2) ==="
+grep -F 'AFFINITY:' "$SER" | tail -2
+AFF_OK=0; grep -qF 'AFFINITY: PASS' "$SER" && AFF_OK=1
+
+if grep -qF 'SMPSTRESS: PASS' "$SER" && [ "$PA_OK" = "1" ] && [ "$NMATMUL" = "0" ] && [ "$NSCHED" = "0" ] && [ "$RQ_OK" = "1" ] && [ "$AFF_OK" = "1" ]; then
+    echo "[smp-smoke] RESULT: PASS -- SMPSTRESS PASS + PAGINGALIAS PASS + RQLOCK PASS + AFFINITY PASS + no matmul_band_n fault + 0 sched-invariant violations"
     exit 0
 else
-    echo "[smp-smoke] RESULT: FAIL -- SMPSTRESS=$(grep -cF 'SMPSTRESS: PASS' "$SER") PAGINGALIAS_PASS=$PA_OK RQLOCK_PASS=$RQ_OK matmul_faults=$NMATMUL sched_violations=$NSCHED"
+    echo "[smp-smoke] RESULT: FAIL -- SMPSTRESS=$(grep -cF 'SMPSTRESS: PASS' "$SER") PAGINGALIAS_PASS=$PA_OK RQLOCK_PASS=$RQ_OK AFFINITY_PASS=$AFF_OK matmul_faults=$NMATMUL sched_violations=$NSCHED"
     echo "--- last 30 serial lines ---"; tail -30 "$SER"
     exit 1
 fi

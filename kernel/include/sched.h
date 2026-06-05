@@ -27,6 +27,15 @@ typedef enum {
     PROCESS_TERMINATED
 } process_state_t;
 
+// F3-2: sentinel for process_t.pinned_cpu meaning "not pinned to any CPU". Defined
+// here (NOT smp.h) because sched.h declares pinned_cpu and is included by every PCB
+// construction site, whereas scheduler.c/process.c do NOT include smp.h. UINT32_MAX
+// comes from types.h. Distinct NAME from ownership.h's OWN_CPU_NONE (no collision;
+// the numeric coincidence at 0xFFFFFFFF is harmless). #ifndef-guarded defensively.
+#ifndef CPU_NONE
+#define CPU_NONE  UINT32_MAX   /* pinned_cpu sentinel: task is NOT pinned */
+#endif
+
 // ---------------------------------------------------------------------------
 // wait_object_t — the single blocking primitive (engine in waitqueue.c).
 // The full STRUCT layout is defined HERE (early) so process_t can embed a
@@ -333,6 +342,23 @@ typedef struct process {
     // memset-zeroed by process_create()/thread_create(); appended at the END to
     // preserve the assembler's hardcoded PROCESS_CONTEXT_OFFSET (16).
     uint32_t queued_cpu;
+
+    // CPU affinity model (F3-2). allowed_cpus is a bitmask: bit N set => this task MAY
+    // be enqueued on CPU N. pinned_cpu, when != CPU_NONE, REQUIRES the task run only on
+    // that CPU (the invariant allowed_cpus == (1ULL<<pinned_cpu) is expected). F3-2
+    // policy: normal tasks get allowed_cpus = (1ULL<<0) (CPU0-only) + pinned_cpu =
+    // CPU_NONE; the lone CPU1 test kthread gets allowed_cpus = (1ULL<<1), pinned_cpu = 1.
+    // Stored as a plain uint64_t (NOT cpumask_t) so sched.h need not include smp.h, and
+    // scheduler.c tests it with raw bit ops (it deliberately avoids including smp.h).
+    // THE TRAP: memset(proc,0) leaves allowed_cpus=0 (== allowed on NO cpu -> the
+    // validator trips for EVERY task) and pinned_cpu=0 (== pinned to CPU0, NOT the
+    // unpinned sentinel). So EVERY PCB construction site MUST set BOTH explicitly after
+    // its memset (process_create covers every ctor that funnels through it; thread_create
+    // sets its own). Appended at the END to preserve PROCESS_CONTEXT_OFFSET (16). NOTE:
+    // a uint64 mask addresses cpu0..63 while MAX_CPUS=256 -- irrelevant for F3-2 (cpu0/1),
+    // documented for a future >cpu63 brick.
+    uint64_t allowed_cpus;
+    uint32_t pinned_cpu;   // CPU_NONE if not pinned
 } process_t;
 
 // Global pointer to current process (for PE loader and other subsystems)

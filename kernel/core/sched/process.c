@@ -223,6 +223,16 @@ process_t* process_create(const char* name, void* entry_point) {
     // root-cause fix for that whole class of uninitialized-field bugs.
     memset(proc, 0, sizeof(process_t));
 
+    // F3-2 affinity defaults — MUST follow the memset, which zeroed BOTH fields into
+    // their trap states: allowed_cpus=0 means "allowed on NO cpu" (the validator would
+    // trip for every task) and pinned_cpu=0 means "pinned to CPU0", NOT the unpinned
+    // sentinel. Normal tasks are CPU0-only and unpinned. process_create is the funnel
+    // for almost every PCB ctor (idle, exec, fork, health_monitor, ...), so this one
+    // assignment closes the trap for all of them. The lone CPU1 test kthread OVERRIDES
+    // these after process_create returns (see ap_spawn_test_kthread in scheduler.c).
+    proc->allowed_cpus = (uint64_t)1 << 0;   // CPU0 only
+    proc->pinned_cpu   = CPU_NONE;           // not pinned
+
     // Initialize process structure
     proc->pid = pid;
     proc->parent_pid = current_process ? current_process->pid : 0;
@@ -397,6 +407,13 @@ process_t* thread_create(process_t* parent, uint64_t entry, uint64_t arg,
         return NULL;
     }
     memset(t, 0, sizeof(process_t));
+
+    // F3-2 affinity defaults (post-memset, same trap as process_create). thread_create
+    // has its OWN kmalloc+memset (does NOT funnel through process_create), so it must
+    // set both here. A child thread takes the CPU0-only default (NOT the parent's mask)
+    // -- conservative: no cross-cpu spread at F3-2.
+    t->allowed_cpus = (uint64_t)1 << 0;   // CPU0 only
+    t->pinned_cpu   = CPU_NONE;           // not pinned
 
     t->pid = pid;
     t->parent_pid = parent->pid;

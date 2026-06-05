@@ -846,6 +846,20 @@ check_rqlock() {
     return 1
 }
 
+check_affinity() {
+    # F3-2 CPU affinity model gate. scheduler_affinity_selftest() proves at boot that
+    # the affinity predicate is correct and every ctor default fired (no task carries a
+    # zero allowed_cpus mask -- the memset-trap closure), and the runtime validators
+    # (covered by check_rqlock's [SCHED_INVARIANT] gate) catch any queued task whose
+    # cpu is outside its mask or that is pinned to the wrong cpu. Emits "AFFINITY: PASS".
+    if grep -qF 'AFFINITY: PASS' "$LOG"; then
+        pass "CPU affinity model (AFFINITY): predicate sound + ctor defaults fired + no off-affinity task"
+        return 0
+    fi
+    fail "AFFINITY: PASS missing — affinity self-test failed/absent"
+    return 1
+}
+
 # ── Run all checks, tally results ──────────────────────────────────────────
 run_checks() {
     header "Boot invariant checks"
@@ -864,6 +878,7 @@ run_checks() {
         check_no_pid_exhaustion
         check_pagingalias
         check_rqlock
+        check_affinity
         check_fork_cow
         check_thread
         check_matmuljobs

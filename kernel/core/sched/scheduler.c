@@ -575,6 +575,7 @@ static process_t* create_idle_thread(uint32_t cpu_id_val, int adopt_pid0) {
 // declared because scheduler_init() calls it BEFORE the validators block. A no-op
 // stub in a non-SCHED_DEBUG (perf) build.
 static void scheduler_rqlock_selftest(void);
+static void scheduler_affinity_selftest(void);   // F3-2 (defined with the validators; perf-build stub)
 
 void scheduler_init(void) {
     kprintf("[SCHEDULER] Initializing O(1) multi-level feedback queue scheduler...\n");
@@ -636,6 +637,10 @@ void scheduler_init(void) {
     // init'd, ready_count==walk, no cross-cpu duplicate, secondary cpus empty)
     // before init spawns any service. Emits "RQLOCK: PASS" on every boot.
     scheduler_rqlock_selftest();
+
+    // F3-2: prove the CPU-affinity model is sound at rest (predicate correct + ctor
+    // defaults fired so no task carries a zero mask). Emits "AFFINITY: PASS".
+    scheduler_affinity_selftest();
 }
 
 #ifdef SMP_SCHED
@@ -675,6 +680,12 @@ int scheduler_init_secondary_cpu(uint32_t cpu, uint32_t apic_id) {
     }
     cpus[cpu].current_thread = idle;   // start CPU as "running idle" until it dispatches
     cpus[cpu].idle_thread    = idle;
+    // F3-2: the secondary cpu's idle conceptually belongs to THAT cpu. Idle is NEVER
+    // enqueued (empty-runqueue fallback only), so this does not affect the affinity
+    // gate today; it keeps the at-rest affinity model coherent for F3-3. Overrides the
+    // CPU0-only default process_create installed.
+    idle->allowed_cpus = (uint64_t)1 << cpu;
+    idle->pinned_cpu   = cpu;
 
     /* NOTE: CPU1's idle thread runs the AP scheduler loop on the AP BOOT stack (see
      * ap_main). Its pre-seeded context (idle_thread_func / idle->kernel_stack from
@@ -704,6 +715,20 @@ void scheduler_add_process_to_cpu(process_t* proc, uint32_t cpu) {
     // Idle is the empty-runqueue FALLBACK and must NEVER be enqueued (enqueuing it
     // breaks the active/expired invariant and leaks a ref). Guard explicitly.
     if (proc == cpus[cpu].idle_thread) return;
+
+    // F3-2 ENQUEUE LAW: refuse to enqueue a task on a CPU outside its affinity mask.
+    // This is the ONLY cross-cpu enqueue primitive, so it is the sole gatekeeper for
+    // CPU1 enqueues -- and it runs BEFORE the lock/ref/link, so a refusal takes no ref
+    // and links nothing: it CANNOT freeze a live task (the task was never on this
+    // queue). The this_cpu() paths (scheduler_add_process/yield_requeue) are
+    // deliberately NOT gated -- they target the running cpu and gating a requeue there
+    // would freeze a live task. Raw bit test (smp.h/cpumask_test is not included here);
+    // cpu < MAX_CPUS is already guaranteed above, the cpu>=64 guard is future-defense.
+    if (cpu >= 64 || ((proc->allowed_cpus >> cpu) & 1ULL) == 0) {
+        kprintf("[SCHEDULER] AFFINITY: refuse enqueue pid=%d on cpu=%u (allowed_cpus=0x%016llx)\n",
+                proc->pid, cpu, (unsigned long long)proc->allowed_cpus);
+        return;
+    }
 
     // Single critical section: (check on_queue, take the queue's ref, set the flag
     // + queued_cpu, enqueue) are done atomically under the TARGET cpu's rq_lock so a
@@ -857,6 +882,12 @@ void ap_spawn_test_kthread(void) {
     t->priority       = 0;
     t->time_slice     = 1;
     t->resume_mode    = RESUME_CRETURN;        // kernel thread: resumes via ctx_switch ret
+    // F3-2: this kthread runs ONLY on CPU1. Override the CPU0-only default that
+    // process_create installed, so the affinity gate in scheduler_add_process_to_cpu
+    // PERMITS the CPU1 enqueue (a CPU0-only mask would be REFUSED). Must precede the
+    // enqueue. Raw bit op -- smp.h/cpumask_test is intentionally not included here.
+    t->allowed_cpus   = (uint64_t)1 << 1;      // CPU1 only
+    t->pinned_cpu     = 1;                      // pinned to CPU1
     scheduler_add_process_to_cpu(t, 1);        // pin to CPU1
     kprintf("[SMP] Brick F2: pinned AP test kthread PID %d to CPU1 (kernel stack=%p)\n",
             t->pid, (void*)t->kernel_stack);
@@ -1030,6 +1061,14 @@ static volatile uint64_t g_sched_invariant_violations = 0;
                 (where), (int)(pid), ##__VA_ARGS__);                            \
     } while (0)
 
+// F3-2: raw CPU-affinity bit test. smp.h/cpumask_test is intentionally NOT included
+// in this file (it re-defines MAX_CPUS; see the local-MAX_CPUS note above), so the
+// affinity mask is a plain uint64_t tested by hand. bit N set => cpu N is allowed.
+// Guards cpu<64 (the mask is 64-wide) so a corrupt/out-of-range cpu can't shift UB.
+static inline int sched_dbg_cpu_allowed(uint64_t mask, uint32_t cpu) {
+    return cpu < 64 ? (int)((mask >> cpu) & 1ULL) : 0;
+}
+
 // Is `p` linked anywhere in runqueue `rq`? Bounded scan of all priorities.
 static int sched_dbg_in_rq(const runqueue_t* rq, const process_t* p) {
     for (int prio = 0; prio < SCHED_PRIORITY_LEVELS; prio++) {
@@ -1113,6 +1152,18 @@ static int sched_validate_task(process_t* p, const char* where) {
     // duplication is the double-enqueue race signature (no-op/benign at N=1).
     if (p->on_queue)
         sched_dbg_cross_cpu_duplicates(p, where);
+    // F3-2 affinity invariants (gated on on_queue, so idle -- never queued -- is
+    // auto-exempt; qcpu is the bounds-safe queued_cpu computed above). LOG-only.
+    if (p->on_queue) {
+        if (p->allowed_cpus == 0)
+            SCHED_VIOLATION(where, p->pid, "allowed_cpus=0 (allowed on NO cpu) -- missed ctor default?");
+        else if (!sched_dbg_cpu_allowed(p->allowed_cpus, qcpu))
+            SCHED_VIOLATION(where, p->pid, "queued_cpu=%u not in allowed_cpus=0x%016llx",
+                            qcpu, (unsigned long long)p->allowed_cpus);
+        if (p->pinned_cpu != CPU_NONE && qcpu != p->pinned_cpu)
+            SCHED_VIOLATION(where, p->pid, "queued_cpu=%u but pinned_cpu=%u (pinned task on wrong cpu)",
+                            qcpu, p->pinned_cpu);
+    }
     // A task is NEVER on a runqueue AND the SLEEP list at once. NOTE: wait_on is
     // deliberately NOT used as a membership signal here -- it is set on block and
     // left STALE after wake (harmless: every reader guards it with state==BLOCKED),
@@ -1250,6 +1301,32 @@ static int sched_validate_runqueues(const char* where) {
             }
         }
     }
+
+    // F3-2 affinity sweep: every queued task must have a non-zero mask, must be
+    // allowed on the cpu it is ACTUALLY linked on (cid, the definitely-valid walk
+    // index -- more robust than a possibly-stale queued_cpu), and if pinned must be
+    // pinned to that cpu. Bounded by each cpu's ready_count. At N=1 every task is on
+    // cpu0 with bit0 set -> zero violations. LOG-only.
+    for (uint32_t cid = 0; cid < MAX_CPUS; cid++) {
+        if (!cpus[cid].online) continue;
+        uint32_t bound = cpus[cid].ready_count + 16, visited = 0;
+        runqueue_t* rqs[2] = { &cpus[cid].rq_active, &cpus[cid].rq_expired };
+        for (int q = 0; q < 2; q++)
+            for (int prio = 0; prio < SCHED_PRIORITY_LEVELS; prio++) {
+                process_t* it = rqs[q]->queues[prio];
+                while (it && visited < bound) {
+                    visited++;
+                    if (it->allowed_cpus == 0)
+                        SCHED_VIOLATION(where, it->pid, "queued on cpu=%u but allowed_cpus=0", cid);
+                    else if (!sched_dbg_cpu_allowed(it->allowed_cpus, cid))
+                        SCHED_VIOLATION(where, it->pid, "on cpu=%u not in allowed_cpus=0x%016llx",
+                                        cid, (unsigned long long)it->allowed_cpus);
+                    if (it->pinned_cpu != CPU_NONE && it->pinned_cpu != cid)
+                        SCHED_VIOLATION(where, it->pid, "on cpu=%u but pinned_cpu=%u", cid, it->pinned_cpu);
+                    it = it->next;
+                }
+            }
+    }
     return (int)(g_sched_invariant_violations - before);
 }
 
@@ -1328,10 +1405,71 @@ static void scheduler_rqlock_selftest(void) {
     else
         kprintf("[SCHEDULER] RQLOCK: FAIL (%d invariant(s) violated)\n", fails);
 }
+
+// F3-2: at-rest CPU-affinity proof. Runs at END of scheduler_init (after the rqlock
+// selftest). NON-VACUOUS by design: the runqueues are EMPTY at this boot point, so a
+// pure queue walk would prove nothing -- instead it (1) self-tests the affinity
+// PREDICATE on synthetic masks, and (2) asserts every online cpu's idle thread carries
+// a NON-ZERO mask, which directly proves the ctor default fired (idle funnels through
+// process_create; a zero mask here == the memset-trap default was dropped). It also
+// (3) walks any queued task (none at boot; real if ever re-invoked later) for the full
+// invariant. Holds cpus[0].rq_lock (single-threaded here; no AP online yet in default).
+// Emits exactly one greppable line: "AFFINITY: PASS"/"FAIL".
+static void scheduler_affinity_selftest(void) {
+    int fails = 0;
+
+    // (1) Predicate self-test -- the affinity machinery must be correct independent of
+    // any enqueued task (boot queues are empty). A CPU0-only mask allows cpu0, forbids
+    // cpu1; the CPU_NONE sentinel must not collide with a real cpu id.
+    if (!sched_dbg_cpu_allowed((uint64_t)1 << 0, 0)) { kprintf("[SCHEDULER] AFFINITY: predicate FAIL (cpu0 not in {cpu0})\n"); fails++; }
+    if ( sched_dbg_cpu_allowed((uint64_t)1 << 0, 1)) { kprintf("[SCHEDULER] AFFINITY: predicate FAIL (cpu1 in {cpu0})\n"); fails++; }
+    if (CPU_NONE == 0 || CPU_NONE == 1)              { kprintf("[SCHEDULER] AFFINITY: predicate FAIL (CPU_NONE collides with a real cpu)\n"); fails++; }
+
+    spin_lock(&cpus[0].rq_lock);
+    for (uint32_t cid = 0; cid < MAX_CPUS; cid++) {
+        if (!cpus[cid].online) continue;
+        // (2) The ctor-default-fired proof: idle funnels through process_create, so a
+        // zero idle mask means the F3-2 default was dropped. Idle is never enqueued,
+        // so this is its only check.
+        process_t* idle = cpus[cid].idle_thread;
+        if (idle && idle->allowed_cpus == 0) {
+            kprintf("[SCHEDULER] AFFINITY: idle pid=%u cpu=%u allowed_cpus=0 (ctor default missed)\n", idle->pid, cid);
+            fails++;
+        }
+        // (3) Any queued task must have a non-zero mask, be allowed on the cpu it is
+        // actually on, and (if pinned) be pinned to that cpu. Empty at boot; bounded.
+        uint32_t bound = cpus[cid].ready_count + 16, visited = 0;
+        runqueue_t* rqs[2] = { &cpus[cid].rq_active, &cpus[cid].rq_expired };
+        for (int q = 0; q < 2; q++)
+            for (int prio = 0; prio < SCHED_PRIORITY_LEVELS; prio++) {
+                process_t* it = rqs[q]->queues[prio];
+                while (it && visited < bound) {
+                    visited++;
+                    if (it->allowed_cpus == 0) {
+                        kprintf("[SCHEDULER] AFFINITY: pid=%u queued on cpu=%u allowed_cpus=0\n", it->pid, cid); fails++;
+                    } else if (!sched_dbg_cpu_allowed(it->allowed_cpus, cid)) {
+                        kprintf("[SCHEDULER] AFFINITY: pid=%u on cpu=%u not in allowed_cpus=0x%016llx\n",
+                                it->pid, cid, (unsigned long long)it->allowed_cpus); fails++;
+                    }
+                    if (it->pinned_cpu != CPU_NONE && it->pinned_cpu != cid) {
+                        kprintf("[SCHEDULER] AFFINITY: pid=%u on cpu=%u but pinned_cpu=%u\n", it->pid, cid, it->pinned_cpu); fails++;
+                    }
+                    it = it->next;
+                }
+            }
+    }
+    spin_unlock(&cpus[0].rq_lock);
+
+    if (fails == 0)
+        kprintf("[SCHEDULER] AFFINITY: PASS (predicate sound + ctor defaults fired + no queued task off-affinity)\n");
+    else
+        kprintf("[SCHEDULER] AFFINITY: FAIL (%d invariant(s) violated)\n", fails);
+}
 #else  /* !SCHED_DEBUG: compile to nothing for a perf build */
 static inline int sched_validate_task(process_t* p, const char* where) { (void)p; (void)where; return 0; }
 static inline int sched_validate_runqueues(const char* where) { (void)where; return 0; }
 static void scheduler_rqlock_selftest(void) { }  /* perf build: no topology proof */
+static void scheduler_affinity_selftest(void) { }  /* perf build: no affinity proof */
 #endif /* SCHED_DEBUG */
 
 void scheduler_add_process(process_t* proc) {

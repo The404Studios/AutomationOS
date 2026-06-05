@@ -30,6 +30,11 @@ process_t* current_process = NULL;
 // RACE-002 fix: Global process table lock protects process_table[] and pid_used[]
 static spinlock_t process_table_lock;
 
+// Monotonic creation stamp for stable process identity (#10). Incremented under
+// process_table_lock each time a PCB is published, so (pid, create_seq) uniquely
+// identifies an incarnation even after the PID is recycled. Never reused/reset.
+static uint64_t g_create_seq = 0;
+
 // Allocate a free PID by scanning the bitmap under the table lock. Returns a PID
 // in [1, MAX_PROCESSES) on success, or 0 if the table is full (caller returns
 // NULL rather than panicking).
@@ -221,6 +226,9 @@ process_t* process_create(const char* name, void* entry_point) {
     // Initialize process structure
     proc->pid = pid;
     proc->parent_pid = current_process ? current_process->pid : 0;
+    // #10: snapshot the creator's stable identity so this child can later validate
+    // its parent is the SAME incarnation (guards against a recycled parent PID).
+    proc->parent_seq = current_process ? current_process->create_seq : 0;
     proc->state = PROCESS_CREATED;
     proc->resume_mode = RESUME_CRETURN;  // new processes resume via the C-return path
     // Inherit credentials from the creating process (root/0 for early procs).
@@ -336,6 +344,7 @@ process_t* process_create(const char* name, void* entry_point) {
     {
         uint64_t flags;
         spin_lock_irqsave(&process_table_lock, &flags);
+        proc->create_seq = ++g_create_seq;   // stable-identity stamp (#10), under lock
         process_table[pid] = proc;
         spin_unlock_irqrestore(&process_table_lock, flags);
     }
@@ -391,6 +400,7 @@ process_t* thread_create(process_t* parent, uint64_t entry, uint64_t arg,
 
     t->pid = pid;
     t->parent_pid = parent->pid;
+    t->parent_seq = parent->create_seq;   // stable parent identity (#10)
     t->state = PROCESS_CREATED;
     t->resume_mode = RESUME_CRETURN;     // first run via the trampoline `ret` path
     t->uid = parent->uid;
@@ -460,6 +470,7 @@ process_t* thread_create(process_t* parent, uint64_t entry, uint64_t arg,
     {
         uint64_t flags;
         spin_lock_irqsave(&process_table_lock, &flags);
+        t->create_seq = ++g_create_seq;   // stable-identity stamp (#10), under lock
         process_table[pid] = t;
         spin_unlock_irqrestore(&process_table_lock, flags);
     }
@@ -520,6 +531,14 @@ void process_on_terminate(process_t* child) {
     // surviving reaper exists, so skip Phase A and the init-wake entirely.
     int reparented_zombie = 0;   // did we hand init an already-TERMINATED child?
     if (child->pid != 1) {
+        // Fetch init's stable identity ONCE (outside the table lock) so reparented
+        // orphans adopt BOTH parent_pid=1 AND parent_seq=<init's create_seq> -- then
+        // the (pid, create_seq) identity check in Phase B and sys_waitpid holds for
+        // them uniformly (no init special-case needed). (#10)
+        uint64_t init_seq = 0;
+        process_t* init_p = process_get_by_pid(1);
+        if (init_p) { init_seq = init_p->create_seq; process_unref(init_p); }
+
         uint64_t flags;
         spin_lock_irqsave(&process_table_lock, &flags);
         for (int i = 0; i < MAX_PROCESSES; i++) {
@@ -529,6 +548,7 @@ void process_on_terminate(process_t* child) {
             if (!p || p == child) continue;
             if (p->parent_pid == child->pid) {
                 p->parent_pid = 1;                       // reparent to init
+                p->parent_seq = init_seq;                // adopt init's identity (#10)
                 if (p->state == PROCESS_TERMINATED) {     // already a zombie
                     reparented_zombie = 1;                // init must be woken
                 }
@@ -543,7 +563,17 @@ void process_on_terminate(process_t* child) {
     if (child->parent_pid) {
         process_t* parent = process_get_by_pid(child->parent_pid);
         if (parent) {
-            if (parent->child_wait) {
+            // #10: only wake the parent if it is the SAME incarnation the child was
+            // created under (pid + create_seq). A recycled PID now belonging to an
+            // unrelated process has a different create_seq -- we must NOT poke its
+            // child_wait (spurious wake / wrong-child reap). Reparented orphans carry
+            // init's create_seq (set in Phase A), so init is matched correctly.
+            // init (PID 1) is never recycled and is the universal reaper, so always
+            // match it; otherwise require the stable-identity match. The pid-1
+            // wildcard also covers the (unreachable in normal boot) init-absent
+            // reparent edge where an orphan's parent_seq stayed 0.
+            if ((child->parent_pid == 1 || parent->create_seq == child->parent_seq)
+                && parent->child_wait) {
                 wq_wake_one((wait_queue_t*)parent->child_wait);
             }
             process_unref(parent);

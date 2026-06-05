@@ -283,6 +283,20 @@ typedef struct process {
     // zeroed by process_create()/thread_create(). Appended at the END to keep the
     // assembler's hardcoded PROCESS_CONTEXT_OFFSET (16) valid.
     volatile int reaped;
+
+    // Stable process identity (#10 wrong-wake-on-PID-reuse fix). PIDs are recycled
+    // from the bitmap on death, so pid ALONE is not a stable identity: a recycled
+    // PID can make an unrelated new process impersonate a dead parent/child. INVARIANT:
+    // identity == (pid, create_seq). create_seq is a monotonic stamp assigned under
+    // process_table_lock at create; parent_seq snapshots the CREATOR's create_seq so a
+    // child carries its real parent's identity. A reaper/wake validates
+    // parent->create_seq == child->parent_seq before acting, so a recycled PID can
+    // never be mistaken for the original. Reparent-to-init rewrites BOTH parent_pid=1
+    // and parent_seq=<init's create_seq> so the check holds uniformly for orphans.
+    // memset-zeroed by process_create()/thread_create(); appended at the END to keep
+    // the assembler's hardcoded PROCESS_CONTEXT_OFFSET (16) valid.
+    uint64_t create_seq;
+    uint64_t parent_seq;
 } process_t;
 
 // Global pointer to current process (for PE loader and other subsystems)

@@ -316,8 +316,11 @@ int64_t sys_fork(uint64_t arg1, uint64_t arg2, uint64_t arg3,
     child->user_entry = user_rip;
     child->user_rsp   = user_rsp;
 
-    // The parent may have been forked already – override the pid chain.
+    // The parent may have been forked already – override the pid chain. Keep the
+    // stable-identity stamp (#10) in sync with the pid override so the child can
+    // validate its parent is this exact incarnation, not a recycled PID.
     child->parent_pid = parent->pid;
+    child->parent_seq = parent->create_seq;
 
     // ── Make the child schedulable ─────────────────────────────────
     scheduler_add_process(child);
@@ -819,7 +822,14 @@ int64_t sys_waitpid(uint64_t pid, uint64_t status_ptr, uint64_t options,
         for (uint32_t i = 0; i < 256; i++) {
             process_t* p = process_get_by_pid(i);
             if (!p) continue;
+            // #10: match on the stable identity (pid + create_seq), not pid alone --
+            // a child whose parent_pid happens to equal our pid but was created under
+            // a DIFFERENT (now-recycled) incarnation is not ours. Real children carry
+            // our create_seq; reparented orphans carry init's. init (PID 1) is never
+            // recycled and is the universal reaper, so when WE are init match purely on
+            // parent_pid (the seq guard is only needed for recyclable non-init pids).
             int match = (p->parent_pid == current->pid) &&
+                        (current->pid == 1 || p->parent_seq == current->create_seq) &&
                         (pid == (uint64_t)-1 || p->pid == target_pid);
             if (match) {
                 if (p->state == PROCESS_TERMINATED) {

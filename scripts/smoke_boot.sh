@@ -720,6 +720,29 @@ check_matmuljobs() {
     fi
 }
 
+check_smpstress() {
+    # init spawns sbin/smpstress, the 2-CPU dispatch STRESS harness: it drives the CPU1
+    # coprocessor mailbox thousands of times via SYS_CPU1_OFFLOAD, verifying every
+    # result bit-for-bit. On THIS default (single-core) smoke kernel SYS_CPU1_OFFLOAD is
+    # unregistered, so the harness prints "SMPSTRESS: SKIP single CPU" and exits cleanly
+    # -- that is the expected, passing result here (the real PASS is proved separately on
+    # the SMP kernel under `qemu -smp 2`, see scripts/smp_smoke.sh). FAIL means a result
+    # mismatch / timeout / lost wakeup under stress.
+    if grep -qF 'SMPSTRESS: PASS' "$LOG"; then
+        pass "SMP dispatch stress verified ($(grep -F 'SMPSTRESS: PASS' "$LOG" | head -1 | sed 's/^.*SMPSTRESS: PASS //'))"
+        return 0
+    elif grep -qF 'SMPSTRESS: SKIP' "$LOG"; then
+        pass "SMP dispatch stress harness present (SKIP: single-core default kernel)"
+        return 0
+    elif grep -qF 'SMPSTRESS: FAIL' "$LOG"; then
+        fail "SMP dispatch stress broke: $(grep -F 'SMPSTRESS: FAIL' "$LOG" | head -1)"
+        return 1
+    else
+        fail "smpstress did not report (never ran / hung)"
+        return 1
+    fi
+}
+
 check_browser_wave() {
     # 22-agent browser wave: init spawns the per-layer selftests + browser2.
     # Each app prints "<NAME>: PASS" or "<NAME>: FAIL ..." and exits.
@@ -810,6 +833,7 @@ run_checks() {
         check_fork_cow
         check_thread
         check_matmuljobs
+        check_smpstress
         check_heap_extend
         check_aibroker
         check_tools

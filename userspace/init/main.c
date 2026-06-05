@@ -210,6 +210,14 @@ void _start(void) {
     print("[INIT] Spawning cpu1offload...\n");
     spawn("sbin/cpu1offload");
 
+    // smpstress: the 2-CPU dispatch STRESS harness. Drives the CPU1 coprocessor
+    // mailbox thousands of times and verifies every result -- the proving ground the
+    // SMP scaling work is validated against BEFORE any per-CPU scheduler change. On
+    // the SMP kernel: "SMPSTRESS: PASS jobs=...". On the DEFAULT kernel SYS_CPU1_OFFLOAD
+    // is unregistered, so it prints "SMPSTRESS: SKIP single CPU" and exits cleanly.
+    print("[INIT] Spawning smpstress...\n");
+    spawn("sbin/smpstress");
+
     // wget self-test (URL parse + dotted-quad DNS, no network -> exits).
     spawn("bin/wget");
 

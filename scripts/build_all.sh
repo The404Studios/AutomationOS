@@ -145,6 +145,10 @@ cc userspace/apps/sockettest/sockettest.c /tmp/sockettest.o; $LD /tmp/sockettest
 # is unregistered, so it prints "CPU1OFFLOAD: SKIP" and exits cleanly (harmless).
 # Bare _start (no crt0), like nettest/sockettest.
 cc userspace/apps/cpu1offload/cpu1offload.c /tmp/cpu1offload.o; $LD /tmp/cpu1offload.o -o /tmp/cpu1offload.elf
+# smpstress: 2-CPU dispatch STRESS harness (the SMP proving ground). Drives the CPU1
+# coprocessor mailbox thousands of times via SYS_CPU1_OFFLOAD, verifying every result.
+# "SMPSTRESS: PASS ..." on the SMP kernel; "SMPSTRESS: SKIP single CPU" on default.
+cc userspace/apps/smpstress/smpstress.c /tmp/smpstress.o; $LD /tmp/smpstress.o -o /tmp/smpstress.elf
 # Overhaul-syscall verification probes (bare _start; exercise futex/epoll/
 # sendfile/perf/batch against the kernel's real ABI). Each prints "<NAME>: PASS".
 for t in futextest epolltest sendfiletest perftest batchtest; do
@@ -432,7 +436,7 @@ $LD /tmp/crt0.o /tmp/cc.o \
     -o /tmp/cc.elf
 
 echo "[all] canary check (all must be 0):"
-for e in comp init filemanager calculator clock sysinfo settings sysmon uidemo dateapp applauncher taskman terminal editor snake paint synth tetris game2048 sheet notes calendar stopwatch mines piano dashboard welcome bench breakout pong invaders procmon soundtest solitaire aiconsole screenshot stress musicplayer ide bubbletd zombietd pacman clockapp forktest threadtest reaploop matmuljobs aibroker sed awk tar pkg make meminfo argvtest floattest sleeptest prioritytest matbench tensortest cpuburn blk ps kill free uptime find diff cmp tee wcx xargs gzip cc nettest sockettest cpu1offload wget netman browser cryptotest libtest ping nc netinfo netscan tcping dig httpget pktmon httpd traceroute arp grep head tail sort uniq cut tr nl du touch basename dirname uname hostname whoami date less hexdump tlsprobe certtool dhcpc apidemo js futextest epolltest sendfiletest perftest batchtest domtest htmltest csstest layouttest webtest browser2 webapitest cube3d ray chess asteroids sudoku photos startmenu controlcenter gametest; do
+for e in comp init filemanager calculator clock sysinfo settings sysmon uidemo dateapp applauncher taskman terminal editor snake paint synth tetris game2048 sheet notes calendar stopwatch mines piano dashboard welcome bench breakout pong invaders procmon soundtest solitaire aiconsole screenshot stress musicplayer ide bubbletd zombietd pacman clockapp forktest threadtest reaploop matmuljobs aibroker sed awk tar pkg make meminfo argvtest floattest sleeptest prioritytest matbench tensortest cpuburn blk ps kill free uptime find diff cmp tee wcx xargs gzip cc nettest sockettest cpu1offload smpstress wget netman browser cryptotest libtest ping nc netinfo netscan tcping dig httpget pktmon httpd traceroute arp grep head tail sort uniq cut tr nl du touch basename dirname uname hostname whoami date less hexdump tlsprobe certtool dhcpc apidemo js futextest epolltest sendfiletest perftest batchtest domtest htmltest csstest layouttest webtest browser2 webapitest cube3d ray chess asteroids sudoku photos startmenu controlcenter gametest; do
     n=$(objdump -d /tmp/$e.elf 2>/dev/null | grep -c "fs:0x28" || true)
     echo "  $e=$n"
 done
@@ -485,6 +489,8 @@ cp /tmp/nettest.elf /tmp/ird/sbin/nettest
 cp /tmp/sockettest.elf /tmp/ird/sbin/sockettest
 # cpu1offload -> /sbin (init spawns it at boot; prints PASS on SMP, SKIP on default).
 cp /tmp/cpu1offload.elf /tmp/ird/sbin/cpu1offload
+# smpstress -> /sbin (init spawns it; PASS on SMP after thousands of CPU1 jobs, SKIP on default).
+cp /tmp/smpstress.elf /tmp/ird/sbin/smpstress
 # overhaul-syscall verification probes -> /sbin (init spawns them at boot)
 for t in futextest epolltest sendfiletest perftest batchtest; do
     cp /tmp/$t.elf /tmp/ird/sbin/$t

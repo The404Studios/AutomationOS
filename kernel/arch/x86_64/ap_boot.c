@@ -206,6 +206,19 @@ struct hb cpu_hb[2] = {{0, {0}}, {0, {0}}};   /* [0]=BSP, [1]=AP; 64-byte-separa
  */
 volatile uint64_t ap1_idle_ticks = 0;   /* CPU 1's managed-idle wakeup counter */
 
+/* SMP observability counters (Phase-1 proof scaffolding for the CPU1 coprocessor
+ * mailbox; the foundation the per-CPU scheduler work is validated against). These are
+ * PURE COUNTERS -- they change NO dispatch behavior, only record what happened:
+ *   cpu1_dispatch_total = jobs handed to CPU1 (a successful cpu1_submit),
+ *   cpu1_complete_total = jobs CPU1 finished within the deadline (cpu1_wait success),
+ *   cpu1_timeout_total  = jobs that did NOT signal done in the bounded deadline (a lost
+ *                         wakeup / stuck job from the BSP's view).
+ * Non-static so a future read-only stats path can extern them. For the polled mailbox
+ * "stuck_tasks" is always 0: every wait is bounded, so nothing stays pending forever. */
+volatile uint64_t cpu1_dispatch_total = 0;
+volatile uint64_t cpu1_complete_total = 0;
+volatile uint64_t cpu1_timeout_total  = 0;
+
 /* ---------------------------------------------------------------------------
  * SMP brick 6: the ONE job slot the BSP uses to dispatch a SINGLE trusted kernel
  * worker function to CPU 1. This is the first REAL work on the second core.
@@ -655,6 +668,7 @@ int cpu1_submit(cpu_job_fn fn, void *arg)
      * observe pending==1 and consume the job safely. */
     spin_unlock(&cpu1_job_lock);
 
+    __atomic_fetch_add(&cpu1_dispatch_total, 1, __ATOMIC_RELAXED);  /* observability only */
     return 1;                           /* submitted -- do NOT wait here */
 }
 
@@ -752,6 +766,11 @@ int cpu1_wait(uint64_t deadline_tsc)
             uint64_t timeout_ms  = elapsed_tsc / (AP_TSC_PER_US * 1000ULL);
             cpu1_diagnose_timeout(timeout_ms);
 
+            uint64_t to = __atomic_add_fetch(&cpu1_timeout_total, 1, __ATOMIC_RELAXED);
+            kprintf("[SMP] dispatch=%llu cpu1_jobs=%llu lost_wakeups=%llu stuck_tasks=0 (timeout)\n",
+                    (unsigned long long)__atomic_load_n(&cpu1_dispatch_total, __ATOMIC_RELAXED),
+                    (unsigned long long)__atomic_load_n(&cpu1_complete_total, __ATOMIC_RELAXED),
+                    (unsigned long long)to);
             return 0;                   /* timeout -> don't hang the BSP */
         }
         __asm__ volatile("pause" ::: "memory");
@@ -777,6 +796,18 @@ int cpu1_wait(uint64_t deadline_tsc)
      * process exits now. */
     cpu1_job.owner_pid = 0;
     spin_unlock(&cpu1_job_lock);
+
+    /* Observability only: count the completion and, every 256th job, emit a running
+     * counter line so a stress run leaves periodic [SMP] evidence in the boot log
+     * without spamming it. dispatch should track complete 1:1 under a healthy mailbox;
+     * a growing lost_wakeups (timeout) gap is the signal the proof harness watches. */
+    uint64_t done_n = __atomic_add_fetch(&cpu1_complete_total, 1, __ATOMIC_RELAXED);
+    if ((done_n & 0xFF) == 0) {
+        kprintf("[SMP] dispatch=%llu cpu1_jobs=%llu lost_wakeups=%llu stuck_tasks=0\n",
+                (unsigned long long)__atomic_load_n(&cpu1_dispatch_total, __ATOMIC_RELAXED),
+                (unsigned long long)done_n,
+                (unsigned long long)__atomic_load_n(&cpu1_timeout_total, __ATOMIC_RELAXED));
+    }
 
     return 1;                           /* CPU 1 ran the job and signalled done */
 }

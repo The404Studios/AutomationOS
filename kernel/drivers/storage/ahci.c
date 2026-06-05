@@ -535,7 +535,12 @@ static bool ahci_rw_one(ahci_port_t* port, uint64_t lba, void* dma_buf, bool wri
 
 bool ahci_read_sectors(ahci_port_t* port, uint64_t lba, uint32_t count, void* buffer) {
     if (!port || !port->device_present || count == 0) return false;
-    if (lba + count > port->sectors) return false;
+    // Overflow-safe range check: `lba + count` (uint64) wraps when lba is within
+    // `count` of UINT64_MAX, making a wrapped-small sum pass the old `> sectors` test
+    // and slip an out-of-range LBA past the guard. count>=1 here (count==0 rejected
+    // above) and the first clause short-circuits before the subtraction, so
+    // `sectors - count` never underflows.
+    if (count > port->sectors || lba > port->sectors - count) return false;
 
     uint8_t* dst = (uint8_t*)buffer;
     for (uint32_t s = 0; s < count; s++) {
@@ -551,7 +556,12 @@ bool ahci_read_sectors(ahci_port_t* port, uint64_t lba, uint32_t count, void* bu
 
 bool ahci_write_sectors(ahci_port_t* port, uint64_t lba, uint32_t count, const void* buffer) {
     if (!port || !port->device_present || count == 0) return false;
-    if (lba + count > port->sectors) return false;
+    // Overflow-safe range check: `lba + count` (uint64) wraps when lba is within
+    // `count` of UINT64_MAX, making a wrapped-small sum pass the old `> sectors` test
+    // and slip an out-of-range LBA past the guard. count>=1 here (count==0 rejected
+    // above) and the first clause short-circuits before the subtraction, so
+    // `sectors - count` never underflows.
+    if (count > port->sectors || lba > port->sectors - count) return false;
 
     const uint8_t* src = (const uint8_t*)buffer;
     for (uint32_t s = 0; s < count; s++) {

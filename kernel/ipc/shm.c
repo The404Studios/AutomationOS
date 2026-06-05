@@ -75,11 +75,15 @@ static spinlock_t shm_lock;        // Protects both tables
 // of attachments THIS process holds (typically 1-5) instead of O(128).
 
 // Add an attachment to the process's list. Caller must hold shm_lock.
-static void shm_attach_add(process_t* proc, ipc_id_t shm_id, void* virt_addr, size_t size, uint32_t flags) {
+// Returns true on success, false if the record could not be allocated -- the caller
+// MUST then NOT increment attach_count (and should roll back the mapping), otherwise
+// shm_cleanup_process (which decrements attach_count only by walking this list) never
+// balances the count and the segment is pinned forever.
+static bool shm_attach_add(process_t* proc, ipc_id_t shm_id, void* virt_addr, size_t size, uint32_t flags) {
     shm_attachment_t* att = (shm_attachment_t*)kmalloc(sizeof(shm_attachment_t));
     if (!att) {
         kprintf("[SHM] WARNING: failed to allocate attachment record for PID %u\n", proc->pid);
-        return;
+        return false;
     }
     att->shm_id = shm_id;
     att->virt_addr = virt_addr;
@@ -87,6 +91,7 @@ static void shm_attach_add(process_t* proc, ipc_id_t shm_id, void* virt_addr, si
     att->flags = flags;
     att->next = proc->shm_attachments;
     proc->shm_attachments = att;
+    return true;
 }
 
 // Remove an attachment from the process's list. Caller must hold shm_lock.
@@ -545,9 +550,20 @@ int64_t sys_shmat(uint64_t shmid, uint64_t shmaddr, uint64_t shmflg,
         }
     }
 
+    // Create the per-process attachment record BEFORE bumping attach_count so the two
+    // stay consistent. If the record can't be allocated, roll back the whole mapping
+    // (shared frames -> free_owned=false, same helper as the partial-map rollback
+    // above) and fail. The old code incremented attach_count then ignored a failed
+    // record alloc, so on process death shm_cleanup_process found no record, never
+    // decremented the count, and the segment (pages + struct) leaked permanently.
+    if (!shm_attach_add(current, seg->id, (void*)virt_addr, seg->size, flags)) {
+        vmm_unmap_range_into(cr3, virt_addr, (uint64_t)seg->pages * PAGE_SIZE, false);
+        spin_unlock(&shm_lock);
+        kprintf("[SHMAT] attachment record alloc failed; rolled back\n");
+        return IPC_ENOMEM;
+    }
     seg->attach_count++;
     seg->attach_time = timer_get_ticks();
-    shm_attach_add(current, seg->id, (void*)virt_addr, seg->size, flags);
 
     spin_unlock(&shm_lock);
 

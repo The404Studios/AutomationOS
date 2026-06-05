@@ -70,11 +70,13 @@
 #define FUTEX_HASHSIZE  (1 << FUTEX_HASHBITS)
 #define FUTEX_HASHMASK  (FUTEX_HASHSIZE - 1)
 
-// Per-bucket futex wait queue
+// Per-bucket futex wait queue. Address disambiguation is now per-WAITER
+// (process_t.futex_key), not per-bucket: a single bucket scalar could never tell apart
+// multiple distinct futex addresses that hash-collide into it, so the old `addr` field
+// was vestigial (written, never read) and has been removed (FUTEX-B).
 typedef struct futex_bucket {
     wait_queue_t wq;
     spinlock_t lock;
-    uint64_t addr;      // Physical address of futex word (for collision detection)
 } futex_bucket_t;
 
 // Global futex hash table
@@ -86,7 +88,6 @@ void futex_init(void) {
     for (int i = 0; i < FUTEX_HASHSIZE; i++) {
         wq_init(&futex_table[i].wq);
         spin_lock_init(&futex_table[i].lock);
-        futex_table[i].addr = 0;
     }
     futex_initialized = 1;
     kprintf("[FUTEX] Initialized futex subsystem (%d hash buckets)\n", FUTEX_HASHSIZE);
@@ -214,9 +215,14 @@ static int64_t futex_wait(int* uaddr, int val) {
         return EAGAIN;  // Spurious wakeup / value mismatch
     }
 
-    // Value matches, prepare to sleep
-    // Store physical address in bucket (for debugging / collision detection)
-    bucket->addr = phys_addr;
+    // Value matches, prepare to sleep. Tag this waiter with its futex KEY (the physical
+    // address) so futex_wake re-readies only waiters parked on THIS address, never an
+    // unrelated waiter that hash-collided into the same bucket (FUTEX-B). The key is set
+    // BEFORE the waiter is linked (inside wq_block_current) so any wake that finds it in
+    // the list already sees a correct key; it is cleared on resume so a later non-futex
+    // block (waitpid/sleep) is never mistaken for a futex waiter.
+    process_t* self = process_get_current();
+    if (self) self->futex_key = phys_addr;
 
     // Release bucket lock before blocking
     spin_unlock_irqrestore(&bucket->lock, flags);
@@ -226,6 +232,7 @@ static int64_t futex_wait(int* uaddr, int val) {
     wq_block_current(&bucket->wq);
 
     // Resumed here after wakeup
+    if (self) self->futex_key = 0;
     return 0;
 }
 
@@ -249,25 +256,24 @@ static int64_t futex_wake(int* uaddr, int nr_wake) {
     uint32_t bucket_idx = futex_hash(phys_addr);
     futex_bucket_t* bucket = &futex_table[bucket_idx];
 
-    // Wake up to nr_wake waiters
+    // Wake up to nr_wake waiters PARKED ON THIS ADDRESS. wq_wake_one_key filters by
+    // process_t.futex_key == phys_addr, so a waiter that hash-collided into this bucket
+    // on a different address is skipped (left blocked) rather than spuriously woken
+    // (FUTEX-B). INT32_MAX is the broadcast (wake-all-on-this-key) case.
     int woken = 0;
 
-    if (nr_wake == 1) {
-        // Common case: wake one waiter
-        if (wq_wake_one(&bucket->wq) != NULL) {
-            woken = 1;
+    if (nr_wake == INT32_MAX) {
+        // Wake all waiters on this key (not the whole bucket).
+        while (wq_wake_one_key(&bucket->wq, phys_addr) != NULL) {
+            woken++;
         }
-    } else if (nr_wake > 1) {
-        // Wake multiple waiters
+    } else if (nr_wake >= 1) {
         for (int i = 0; i < nr_wake; i++) {
-            if (wq_wake_one(&bucket->wq) == NULL) {
-                break;  // No more waiters
+            if (wq_wake_one_key(&bucket->wq, phys_addr) == NULL) {
+                break;  // No more matching waiters
             }
             woken++;
         }
-    } else if (nr_wake == INT32_MAX) {
-        // Wake all waiters (broadcast)
-        woken = wq_wake_all(&bucket->wq);
     }
 
     return woken;

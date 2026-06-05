@@ -161,6 +161,40 @@ static process_t* wo_pop_head(wait_object_t* wo) {
     return p;
 }
 
+// Pop the first waiter (FIFO order) whose process_t.futex_key matches `key`, skipping
+// (leaving linked) any non-matching waiters. Returns the parked process still holding
+// the object's reference (caller must unref), or NULL if no waiter matches. Same lock
+// discipline as wo_pop_head -- the whole list walk + unlink is under wo->lock so an
+// IRQ wakeup can never observe a half-linked node. Used by futex's key-filtered wake
+// (FUTEX-B): two distinct futex addresses colliding into one hash bucket share this
+// list, and only the waiter parked on the woken address must be re-readied.
+static process_t* wo_pop_head_matching(wait_object_t* wo, uint64_t key) {
+    uint64_t flags;
+    spin_lock_irqsave(&wo->lock, &flags);
+    process_t* prev = NULL;
+    process_t* it = wo->waiters;
+    while (it) {
+        if (it->futex_key == key) {
+            if (prev) {
+                prev->wait_next = it->wait_next;
+            } else {
+                wo->waiters = it->wait_next;
+            }
+            if (wo->tail == it) {
+                wo->tail = prev;
+            }
+            it->wait_next = NULL;
+            it->wait_on = NULL;
+            spin_unlock_irqrestore(&wo->lock, flags);
+            return it;
+        }
+        prev = it;
+        it = it->wait_next;
+    }
+    spin_unlock_irqrestore(&wo->lock, flags);
+    return NULL;
+}
+
 int wait_object_block(wait_object_t* wo, uint64_t deadline_or_0) {
     if (!wo) return 0;
     wo_ensure_init(wo);
@@ -290,6 +324,31 @@ static process_t* wo_wake_one_proc(wait_object_t* wo) {
     return NULL;
 }
 
+// Wake exactly one waiter whose futex_key == key (FIFO among matchers), skipping any
+// that already moved on (killed). Mirrors wo_wake_one_proc's re-ready + ref discipline
+// exactly, but pops by key via wo_pop_head_matching. Returns the re-readied process
+// (object-ref released; the scheduler holds one) or NULL if no live matching waiter.
+static process_t* wo_wake_one_matching(wait_object_t* wo, uint64_t key) {
+    process_t* proc;
+    while ((proc = wo_pop_head_matching(wo, key)) != NULL) {  // holds the object's ref
+        // Skip a waiter that already moved on (killed: TERMINATED but still linked).
+        if (proc->state != PROCESS_BLOCKED) {
+            process_unref(proc);
+            continue;
+        }
+        // A timer-armed waiter may also be on the sleep list; take it off so the timer
+        // can't also "wake" it after we've re-readied it.
+        sleep_list_remove(proc);
+        proc->wake_deadline = 0;
+
+        process_set_ready(proc);
+        scheduler_add_process(proc);  // takes its own reference
+        process_unref(proc);          // release the object-ref; scheduler holds one
+        return proc;
+    }
+    return NULL;
+}
+
 int wait_object_signal(wait_object_t* wo, int wake_all) {
     if (!wo) return 0;
     wo_ensure_init(wo);
@@ -347,6 +406,15 @@ process_t* wq_wake_one(wait_queue_t* wq) {
     // held only already-dead waiters. futex_wake tests non-NULL == "woke one";
     // child_wait/epoll ignore the return.
     return wo_wake_one_proc(&wq->wobj);
+}
+
+process_t* wq_wake_one_key(wait_queue_t* wq, uint64_t key) {
+    if (!wq) return NULL;
+    wo_ensure_init(&wq->wobj);
+    // Same "ref NOT taken" contract as wq_wake_one, but only a waiter whose
+    // futex_key == key is re-readied -- so a futex_wake on address X never wakes a
+    // waiter parked on a different address Y that hash-collided into the same bucket.
+    return wo_wake_one_matching(&wq->wobj, key);
 }
 
 int wq_wake_all(wait_queue_t* wq) {

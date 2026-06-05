@@ -297,6 +297,17 @@ typedef struct process {
     // the assembler's hardcoded PROCESS_CONTEXT_OFFSET (16) valid.
     uint64_t create_seq;
     uint64_t parent_seq;
+
+    // Futex wait key (FUTEX-B wrong-waiter-wake fix). When this process is parked in
+    // futex_wait, this holds the PHYSICAL address of the futex word it is waiting on;
+    // otherwise 0. futex_wake walks the hash bucket's waiter list and re-readies only
+    // waiters whose futex_key matches the woken address, so two distinct futex words
+    // that hash-collide into one bucket no longer wake each other. Set in futex_wait
+    // before the waiter is linked, cleared on resume. memset-zeroed by
+    // process_create()/thread_create(); appended at the END to keep the assembler's
+    // hardcoded PROCESS_CONTEXT_OFFSET (16) valid. Non-futex waiters keep it 0, so a
+    // (nonzero) futex key never matches them.
+    uint64_t futex_key;
 } process_t;
 
 // Global pointer to current process (for PE loader and other subsystems)
@@ -580,6 +591,13 @@ void wq_block_current(wait_queue_t* wq);
 // Wake exactly one waiter (FIFO). Returns the woken process (ref NOT taken) or
 // NULL if the queue was empty.
 process_t* wq_wake_one(wait_queue_t* wq);
+
+// Wake exactly one waiter whose process_t.futex_key == key (FIFO among matchers),
+// skipping (leaving linked) non-matching waiters. Returns the woken process (ref NOT
+// taken) or NULL if no live matching waiter. Used by futex_wake so a hash-bucket
+// collision between two distinct futex addresses cannot wake the wrong waiter; the
+// unfiltered wq_wake_one is unchanged for waitpid/epoll. [FUTEX-B]
+process_t* wq_wake_one_key(wait_queue_t* wq, uint64_t key);
 
 // Wake all waiters. Returns the number of processes woken.
 int wq_wake_all(wait_queue_t* wq);

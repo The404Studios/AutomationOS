@@ -511,6 +511,13 @@ int64_t sys_thread_join(uint64_t tid, uint64_t retval_out, uint64_t arg3,
         return EPERM;
     }
 
+    // #48: record the join target on our PCB BEFORE we block, so that if WE are killed
+    // while blocked below (kill.c aborts our wait + marks us TERMINATED, but our stack
+    // never resumes to run the reap/unref at the end), process_destroy() releases this
+    // get_by_pid reference for us at reap instead of leaking the target. Cleared on
+    // every normal exit path below before we drop the ref ourselves.
+    caller->join_target = target;
+
     // Block until the target has terminated. The cooperative scheduler makes the
     // "check TERMINATED then block" sequence atomic from our perspective (the
     // target can't run between them), so there is no lost-wakeup race: if it is
@@ -525,6 +532,7 @@ int64_t sys_thread_join(uint64_t tid, uint64_t retval_out, uint64_t arg3,
     if (retval_out) {
         int rv = target->thread_retval;
         if (copy_to_user((void*)retval_out, &rv, sizeof(rv)) != COPY_SUCCESS) {
+            caller->join_target = NULL;   // #48: we release this ref ourselves below
             process_unref(target);
             return EFAULT;
         }
@@ -540,6 +548,10 @@ int64_t sys_thread_join(uint64_t tid, uint64_t retval_out, uint64_t arg3,
     // process_unref inside the teardown runs the AS-refcount-gated CR3 teardown,
     // tearing the SHARED address space down only if this thread was its last user.
     target->parent_pid = 0;
+    // #48: we reached the normal reap path, so we will drop the get_by_pid ref below
+    // ourselves -- clear join_target so process_destroy(caller) at OUR later reap does
+    // not double-release it.
+    caller->join_target = NULL;
     // #9: release the thread's CREATION ref exactly once (CAS-guarded vs a racing
     // parent-waitpid reaper), THEN process_destroy drops our get_by_pid ref. The
     // final process_unref inside teardown runs the as_refcount-gated CR3 teardown,

@@ -308,6 +308,18 @@ typedef struct process {
     // hardcoded PROCESS_CONTEXT_OFFSET (16) valid. Non-futex waiters keep it 0, so a
     // (nonzero) futex key never matches them.
     uint64_t futex_key;
+
+    // Join target (#48 killed-while-blocked join-ref leak fix). While this thread is
+    // blocked in sys_thread_join, it holds a process_get_by_pid(+1) reference on the
+    // thread it is joining; join_target points at that target (else NULL). If the
+    // joiner is KILLED while blocked, its sys_thread_join cleanup never runs (its stack
+    // never resumes), so that reference would leak and the target would become an
+    // unreapable zombie. process_destroy() releases join_target at reap to plug that.
+    // A normally-completed join clears join_target before reaping its target, so it is
+    // NULL for every non-joining process. memset-zeroed by process_create()/
+    // thread_create(); appended at the END to preserve the assembler's hardcoded
+    // PROCESS_CONTEXT_OFFSET (16).
+    struct process* join_target;
 } process_t;
 
 // Global pointer to current process (for PE loader and other subsystems)

@@ -774,6 +774,19 @@ void reap_claim_release(process_t* proc) {
 void process_destroy(process_t* proc) {
     if (!proc) return;
 
+    // #48: if this process died while blocked in sys_thread_join (killed mid-join), it
+    // still holds a get_by_pid reference on its join target that its own join cleanup
+    // never released (its stack never resumed). Drop it here at reap so the target does
+    // not leak as an unreapable zombie. A normally-completed joiner cleared join_target
+    // before reaping its target, so this is NULL for it and for every non-joining
+    // process. Released OUTSIDE process_table_lock (process_destroy holds none), so the
+    // nested process_unref cannot self-deadlock.
+    if (proc->join_target) {
+        process_t* jt = proc->join_target;
+        proc->join_target = NULL;
+        process_unref(jt);
+    }
+
     PROC_LOG("[PROCESS] Destroying process '%s' (PID %d)\n", proc->name, proc->pid);
 
     // Remove from scheduler first (releases its reference)

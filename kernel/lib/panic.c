@@ -216,6 +216,30 @@ static void print_registers(void) {
  * Dump memory around a fault address
  * Shows hex dump of memory for debugging pointer/access violations
  */
+// Return 1 if `va` is mapped PRESENT in the current address space (so a read of it
+// won't page-fault), 0 otherwise. Walks the page tables by reading each structure page
+// through its physical address (the kernel page tables are identity-mapped in low
+// memory, so those reads are always safe) and NEVER dereferences `va` itself -- so the
+// probe can't fault on the very address we're deciding about. This is what stops the
+// crash dump from DOUBLE-FAULTING on the unmapped/bad fault address (which obscures the
+// real panic): print_memory_dump used to read kernel addresses unconditionally.
+static int panic_addr_mapped(uint64_t va) {
+    uint64_t cr3;
+    asm volatile("mov %%cr3, %0" : "=r"(cr3));
+    uint64_t* pml4 = (uint64_t*)(cr3 & 0x000FFFFFFFFFF000ULL);
+    if (!(pml4[(va >> 39) & 0x1FF] & 1)) return 0;
+    uint64_t* pdpt = (uint64_t*)(pml4[(va >> 39) & 0x1FF] & 0x000FFFFFFFFFF000ULL);
+    uint64_t e3 = pdpt[(va >> 30) & 0x1FF];
+    if (!(e3 & 1)) return 0;
+    if (e3 & (1ULL << 7)) return 1;                 // 1GB huge page, present
+    uint64_t* pd = (uint64_t*)(e3 & 0x000FFFFFFFFFF000ULL);
+    uint64_t e2 = pd[(va >> 21) & 0x1FF];
+    if (!(e2 & 1)) return 0;
+    if (e2 & (1ULL << 7)) return 1;                 // 2MB huge page, present
+    uint64_t* pt = (uint64_t*)(e2 & 0x000FFFFFFFFFF000ULL);
+    return (pt[(va >> 12) & 0x1FF] & 1) ? 1 : 0;
+}
+
 static void print_memory_dump(uint64_t addr) {
     kprintf("Memory dump around 0x%016llx:\n", addr);
 
@@ -230,20 +254,21 @@ static void print_memory_dump(uint64_t addr) {
 
         // Check if address is in kernel space (simple check)
         if (line_addr >= 0xFFFF800000000000ULL) {
-            // Attempt to read (may still fault on unmapped pages)
+            // Probe EACH byte's page before reading it: an unmapped/bad page (often the
+            // very fault address) must print "??" rather than fault the panic handler
+            // itself (which would double-fault and hide the real crash). 16 bytes can
+            // straddle a page boundary, so probe per byte.
             for (int j = 0; j < 16; j++) {
-                uint8_t byte = *(uint8_t*)(line_addr + j);
-                kprintf("%02x ", byte);
+                if (panic_addr_mapped(line_addr + j))
+                    kprintf("%02x ", *(uint8_t*)(line_addr + j));
+                else
+                    kprintf("?? ");
             }
             kprintf(" |");
-            // Print ASCII if printable
             for (int j = 0; j < 16; j++) {
+                if (!panic_addr_mapped(line_addr + j)) { kprintf("."); continue; }
                 uint8_t byte = *(uint8_t*)(line_addr + j);
-                if (byte >= 32 && byte < 127) {
-                    kprintf("%c", byte);
-                } else {
-                    kprintf(".");
-                }
+                kprintf("%c", (byte >= 32 && byte < 127) ? (char)byte : '.');
             }
             kprintf("|");
         } else {

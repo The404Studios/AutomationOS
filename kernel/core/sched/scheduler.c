@@ -165,6 +165,20 @@ void cpu_set_current_thread(process_t* proc) {
     this_cpu()->current_thread = proc;
 }
 
+// F3-4: per-CPU "current" resolver -- the inverse of cpu_set_current_thread(). THE LAW:
+// "current" is CPU-LOCAL. process_get_current() (process.c) routes through THIS so a
+// syscall/exit on the AP resolves cpus[cpu_id()].current_thread, NOT the global
+// current_process (which still names CPU0's task). Defined HERE (not process.c) because
+// cpus[]/this_cpu() are file-local to the scheduler, and smp.h's this_cpu() is a
+// DIFFERENT struct (percpu_data_t) whose current_thread is NOT this lockstep slot.
+// BYTE-IDENTICAL on the BSP: cpu_id()==0 always in default/SMP_FOUNDATION builds, so
+// this returns cpus[0].current_thread, which process_set_current() holds in lockstep
+// with the global current_process at the single dispatch chokepoint. The per-cpu
+// divergence appears ONLY under SMP_SCHED_DISPATCH when CPU1 runs a task.
+process_t* cpu_get_current_thread(void) {
+    return this_cpu()->current_thread;
+}
+
 // RACE-001 fix: Global scheduler lock protects runqueues
 // This prevents race conditions when multiple CPUs add/remove processes.
 // Kept GLOBAL (shared) on purpose: a per-CPU runqueue lock is brick 6, when the
@@ -861,7 +875,26 @@ volatile uint64_t ap_dbg_stage = 0;
 // leaves it un-preempted (F3 exercises ring-3 preemption).
 volatile uint64_t ap_kthread_counter = 0;
 
+// F3-4 APCURRENT result, read+printed by the BSP (kernel.c) after the F2 verify:
+//   0 = pending (kthread hasn't run the one-shot yet), 1 = PASS, 2 = FAIL.
+volatile int ap_current_probe_result = 0;
+
 static void ap_test_kthread_fn(void) {
+    // F3-4 APCURRENT one-shot (runs ON CPU1): call the ACTUAL deliverable
+    // process_get_current() and prove it resolves to THIS (CPU1-local) task, not CPU0's.
+    // This is the meaningful boundary proof -- it exercises the per-cpu routing from a
+    // real CPU1 context (NOT a BSP slot compare), and embodies the strong invariant
+    // "cpu_id()!=0 => process_get_current() != cpus[0].current_thread". If the F3-4
+    // one-liner were absent, process_get_current() would return the global (== CPU0's
+    // current) and `me == c0` -> FAIL, catching the regression.
+    {
+        process_t* me = process_get_current();      // per-cpu after F3-4; here == cpus[1].current_thread
+        process_t* c0 = cpus[0].current_thread;     // CPU0's current (file-local access)
+        if (me && me != c0 && me->pinned_cpu == 1 && me->state == PROCESS_RUNNING)
+            ap_current_probe_result = 1;            // PASS: AP current is CPU1-local + distinct from CPU0
+        else
+            ap_current_probe_result = 2;            // FAIL
+    }
     for (;;) {
         ap_kthread_counter++;
         __asm__ volatile("pause");

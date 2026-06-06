@@ -438,6 +438,7 @@ extern volatile int scheduler_in_switch;
 // At CPU count == 1 (cpu_id()==0) this is a non-observable extra store into
 // cpus[0]; it exists so bricks 5+ can read this_cpu()->current_thread directly.
 void cpu_set_current_thread(process_t* proc);
+process_t* cpu_get_current_thread(void);   // F3-4: per-CPU current (this_cpu()->current_thread)
 
 // Scheduler
 void scheduler_init(void);

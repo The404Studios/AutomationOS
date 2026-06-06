@@ -842,7 +842,14 @@ process_t* process_get_by_pid(uint32_t pid) {
 }
 
 process_t* process_get_current(void) {
-    return current_process;
+    // F3-4: "current" is CPU-LOCAL. Resolve via the per-cpu slot
+    // (cpus[cpu_id()].current_thread) instead of the global current_process. On the
+    // BSP this is BYTE-IDENTICAL (cpu_id()==0 -> cpus[0].current_thread, kept in
+    // lockstep with the global by process_set_current's single chokepoint); on the AP
+    // it returns CPU1's actual running task, NOT CPU0's -- which is what makes a CPU1
+    // syscall/exit operate on the right process. The global current_process remains the
+    // authority for GLOBAL-BSP-ONLY readers (PE loader, etc.) reached only on CPU0.
+    return cpu_get_current_thread();
 }
 
 // ===========================================================================

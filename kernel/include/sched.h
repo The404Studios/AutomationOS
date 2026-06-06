@@ -455,7 +455,20 @@ process_t* process_get_by_name(const char* needle);  // Find first live process 
 // Inlined: process_get_current is on the syscall dispatch hot path (called for
 // every SYS_GETPID, SYS_YIELD, and the table-lookup fallback). A cross-TU
 // function call costs ~5 cycles; inlining a global-load is a single MOV.
+//
+// F3-4 (adapted to this inline): THE LAW -- "current" is CPU-LOCAL. Under
+// SMP_SCHED_DISPATCH (the only build where CPU1 can RUN a task) the resolver
+// routes via cpus[cpu_id()].current_thread so a syscall/exit on the AP
+// operates on CPU1's actual task, NOT the global current_process (which still
+// names CPU0's). Default/SMP_FOUNDATION builds keep the single-MOV global
+// load: cpu_id()==0 always there and process_set_current() holds the per-cpu
+// slot in lockstep -- same value, cheaper path, default build byte-identical.
+#ifdef SMP_SCHED_DISPATCH
+process_t* cpu_get_current_thread(void);   /* fwd (also declared below) */
+static inline process_t* process_get_current(void) { return cpu_get_current_thread(); }
+#else
 static inline process_t* process_get_current(void) { return current_process; }
+#endif
 void process_set_current(process_t* proc);
 int process_set_ready(process_t* proc); // Validated CREATED/BLOCKED->READY transition (ret 0=OK, -1=rejected)
 
@@ -490,6 +503,8 @@ extern volatile int scheduler_in_switch;
 // At CPU count == 1 (cpu_id()==0) this is a non-observable extra store into
 // cpus[0]; it exists so bricks 5+ can read this_cpu()->current_thread directly.
 void cpu_set_current_thread(process_t* proc);
+// F3-4: the inverse resolver -- this_cpu()->current_thread (per-CPU "current").
+process_t* cpu_get_current_thread(void);
 
 // Scheduler
 void scheduler_init(void);

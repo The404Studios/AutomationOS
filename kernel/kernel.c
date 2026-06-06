@@ -1292,10 +1292,30 @@ void kernel_main(void* raw_info) {
                                     __asm__ volatile("pause");
                                 }
                                 uint64_t c1 = ap_kthread_counter;
-                                BOOT_LOG("[SMP] Brick F2 VERIFY: AP kthread counter "
+                                /* kprintf (not BOOT_LOG): cpu1_smoke.sh greps this
+                                 * gate line, and BOOT_LOG is suppressed by the
+                                 * always-on -DBOOT_QUIET in quick_build CFLAGS. */
+                                kprintf("[SMP] Brick F2 VERIFY: AP kthread counter "
                                         "%lu -> %lu (delta=%lu; >0 proves the FIRST "
                                         "AP context switch into a scheduled thread)\n",
                                         c0, c1, c1 - c0);
+
+                                /* F3-4 APCURRENT: the kthread (on CPU1) called the
+                                 * real process_get_current() and proved it resolves
+                                 * CPU1-local (distinct from CPU0's current). The BSP
+                                 * reads the result the kthread set and emits the
+                                 * single greppable gate line. Proves the per-cpu
+                                 * "current" routing works from a real CPU1 context
+                                 * -- the prerequisite for a safe AP syscall. */
+                                extern volatile int ap_current_probe_result;
+                                if (ap_current_probe_result == 1) {
+                                    kprintf("[SMP] APCURRENT: PASS (cpu1 process_get_current() "
+                                            "is cpu1-local + distinct from cpu0)\n");
+                                } else {
+                                    kprintf("[SMP] APCURRENT: FAIL (result=%d -- per-cpu "
+                                            "current resolution broken)\n",
+                                            ap_current_probe_result);
+                                }
                             }
 #endif
                         } else {

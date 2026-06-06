@@ -197,7 +197,7 @@ static inline long sc6(long n, long a1, long a2, long a3, long a4, long a5, long
  *  -- which the WM already intercepts as a modifier chord -- is the hook).  *
  * ---------------------------------------------------------------------- */
 #ifndef COMPOSITOR_STATS
-#define COMPOSITOR_STATS 0        /* 0 = stats overlay HIDDEN by default; Alt+S toggles it on */
+#define COMPOSITOR_STATS 0        /* overlay OFF by default (on-by-default forced the heavy path every frame -> froze the mouse); Alt+S toggles it on to spot-check */
 #endif
 
 /* Frame-dirty flag. Seeded to 1 so the very first frame (boot fade + initial
@@ -1918,7 +1918,7 @@ static void truncate_title(const char *src, char *dst, int maxchars) {
     if (i >= maxchars) dst[maxchars] = '\0';
 }
 
-static void render_panel(uint32_t *buf, uint32_t w, uint32_t h, uint32_t stride) {
+static void render_panel(uint32_t *buf, uint32_t w, uint32_t h, uint32_t stride, long now) {
     /* panel background + 1px bottom border */
     fill_rect(buf, w, h, stride, 0, 0, (int32_t)w, PANEL_H, COL_PANEL);
     fill_rect(buf, w, h, stride, 0, PANEL_H - 1, (int32_t)w, 1, COL_BORDER);
@@ -1933,7 +1933,7 @@ static void render_panel(uint32_t *buf, uint32_t w, uint32_t h, uint32_t stride)
 
     /* right: clock HH:MM:SS */
     char clk[9];
-    long ms = syscall(SYS_GET_TICKS_MS, 0, 0, 0);
+    long ms = now;  /* GUI-PERF clock-sync: use the frame-start timestamp passed in, NOT a 2nd independent SYS_GET_TICKS_MS read -- kills the clock-vs-rollover divergence (the "out of sync" jump) and one syscall/frame. (Still uptime; wall-clock RTC is a separate fix.) */
     format_clock(ms, clk);
     int clk_w = (int)k_strlen(clk) * FONT_W;
     cz_text(buf, (int)stride, (int)w, (int)h,
@@ -2818,7 +2818,7 @@ static void composite(uint32_t *buf, uint32_t w, uint32_t h, uint32_t stride,
     render_alttab_overlay(buf, w, h, stride);
 
     /* always-on-top chrome (drawn AFTER windows) */
-    render_panel(buf, w, h, stride);
+    render_panel(buf, w, h, stride, now);
     render_dock(buf, w, h, stride, cursor_x, cursor_y);
 
     /* M8: right vertical dock (drawn after bottom dock so it paints over the
@@ -3630,7 +3630,7 @@ static void pump_input(int32_t fd, int keyboard, uint32_t W, uint32_t H) {
         g_cursor_moved = 1;
         int hover = (g_cursor_y < PANEL_H) ||
                     (g_cursor_y > (int32_t)H - DOCK_H) ||
-                    (g_cursor_x > (int32_t)W - RDOCK_W - RDOCK_MAG_INFLUENCE) ||
+                    (g_cursor_x > (int32_t)W - RDOCK_W - 8) ||  /* GUI-LAT-1: recomposite only over the 48px dock strip + 8px hysteresis, not the full 110px magnify field */
                     g_menu_open || g_about_open ||
                     g_snap_armed != SNAP_NONE || g_toast_dur_ms > 0 ||
                     (g_buttons != 0);                /* dragging / press-drag */
@@ -3643,7 +3643,7 @@ static void pump_input(int32_t fd, int keyboard, uint32_t W, uint32_t H) {
                     g_cursor_y >= wy && g_cursor_y < wy + TITLEBAR_H) { hover = 1; break; }
             }
         }
-        if (hover || (g_cursor_safety++ & 15) == 0) mark_dirty();
+        if (hover || (g_cursor_safety++ & 255) == 0) mark_dirty();  /* GUI-LAT-1: bare-canvas moves take present_cursor (2 sprite rects); full-recomposite safety net every 256th packet, not 16th */
         send_pointer_to_focus();
     }
 }
@@ -4466,6 +4466,24 @@ void _start(void) {
                 long inst_fps_x10 = 10000 / g_frame_dt_ms;   /* (1000/dt)*10 */
                 if (g_fps_x10 == 0) g_fps_x10 = inst_fps_x10;
                 else g_fps_x10 += (inst_fps_x10 - g_fps_x10) / 4;  /* IIR a=1/4 */
+            }
+        }
+
+        /* GUI-PERF mouse fix: a heavy composite (e.g. the IDE open -> ~50ms/frame)
+         * leaves the cursor FROZEN at its loop-top position for the whole frame,
+         * because input is pumped only once at the top (above). Re-pump the pointer
+         * and slide the sprite to its FRESH position at frame END so it tracks the
+         * mouse at frame rate instead of lagging a whole composite behind. Cheap:
+         * present_cursor is 2 sprite rects copied from back/prev (the cursor-less
+         * scene) so it can never source/leave stale pixels; and it never enters
+         * handle_mouse/drag (those run only at the loop top), so no re-entrancy. */
+        if (back != hw && prev) {
+            pump_input(g_mouse_fd, 0, W, H);
+            if (g_cursor_moved) {
+                present_cursor(hw, back, prev, g_cur_drawn_x, g_cur_drawn_y,
+                               g_cursor_x, g_cursor_y, W, H, stride);
+                g_cur_drawn_x = g_cursor_x; g_cur_drawn_y = g_cursor_y;
+                g_cursor_moved = 0;
             }
         }
 

@@ -1330,6 +1330,28 @@ static int sched_validate_runqueues(const char* where) {
     return (int)(g_sched_invariant_violations - before);
 }
 
+// F3-3a: acquire EVERY online cpu's rq_lock in ASCENDING cpu-id order -- the lock
+// order for any AUTHORITATIVE all-cpu runqueue scan. Pairs with the release helper
+// (REVERSE order). ONLY called from the at-rest selftests (scheduler_init), where the
+// caller holds NO rq_lock, so there is no self-deadlock and no re-acquire of a held
+// lock. Mirrors scheduler_shutdown's outer-then-ascending discipline -> no ABBA vs
+// shutdown; scheduler_add_process_to_cpu takes exactly ONE foreign lock and never
+// nests, so no ABBA there either. WHY THIS IS NEEDED NOW (F3-3 frontier): once CPU1
+// mutates cpus[1].rq (F3-3b dispatch), the previously-lock-free cross-cpu walks in the
+// selftests become TOCTOU-racy (torn next-pointers, false cross-cpu-duplicate,
+// ready_count skew). Arming the lock discipline BEFORE the second writer exists is the
+// prerequisite for a trustworthy validator (scheduler law 7: detect an untrustworthy
+// cpu race-free). At N=1 / SMP_FOUNDATION only cpus[0] is online, so this takes exactly
+// cpus[0].rq_lock -- byte-identical to the single-lock it replaces.
+static void sched_acquire_all_rq_locks(void) {
+    for (uint32_t cid = 0; cid < MAX_CPUS; cid++)
+        if (cpus[cid].online) spin_lock(&cpus[cid].rq_lock);
+}
+static void sched_release_all_rq_locks(void) {
+    for (int cid = (int)MAX_CPUS - 1; cid >= 0; cid--)
+        if (cpus[cid].online) spin_unlock(&cpus[cid].rq_lock);
+}
+
 // F3-1: at-rest per-CPU runqueue TOPOLOGY proof (modeled on paging_alias_selftest).
 // Runs at the END of scheduler_init -- AFTER rq init + idle creation, BEFORE init
 // spawns any service, so the queues are provably empty. Holds cpus[0].rq_lock for
@@ -1350,8 +1372,10 @@ static void scheduler_rqlock_selftest(void) {
         }
     }
 
-    // Hold cpu0's rq_lock for the structural walks (contract + future-safe).
-    spin_lock(&cpus[0].rq_lock);
+    // F3-3a: hold ALL online cpus' rq_locks (ascending) for the structural walks, so
+    // the cross-cpu reads below are AUTHORITATIVE once CPU1 becomes a live runqueue
+    // writer (F3-3b). At N=1 / SMP_FOUNDATION this is exactly cpus[0].rq_lock.
+    sched_acquire_all_rq_locks();
     for (uint32_t cid = 0; cid < MAX_CPUS; cid++) {
         if (!cpus[cid].online) continue;
         // Inv 2: ready_count == bounded node walk of active+expired.
@@ -1367,14 +1391,26 @@ static void scheduler_rqlock_selftest(void) {
                     cid, counted, cpus[cid].ready_count);
             fails++;
         }
-        // Inv 4: a SECONDARY cpu (cid>0) holds NO scheduled process (the F3-1
-        // offload-only policy: CPU1 never owns a runqueue task). Vacuous at
-        // scheduler_init in the default/SMP_FOUNDATION build (no AP slot online
-        // yet); ACTIVE once a secondary cpu registers a scheduler slot (SMP_SCHED).
-        if (cid != 0 && (counted != 0 || cpus[cid].ready_count != 0)) {
-            kprintf("[SCHEDULER] RQLOCK: inv4 cpu=%u secondary runqueue NOT empty (counted=%u ready=%u)\n",
-                    cid, counted, cpus[cid].ready_count);
-            fails++;
+        // Inv 4 (F3-3a RELAXED): a SECONDARY cpu (cid>0) may now LEGALLY host a pinned
+        // task (F3-3b puts cpu1hello on CPU1). The invariant is no longer "empty" but
+        // "every secondary-queued task is LEGALLY pinned here": pinned_cpu==cid AND
+        // allowed_cpus has bit cid. Vacuous at scheduler_init in default/SMP_FOUNDATION
+        // (no secondary online); ACTIVE in the SMP_SCHED_DISPATCH cpu1_smoke vehicle.
+        if (cid != 0) {
+            uint32_t v2 = 0, b2 = cpus[cid].ready_count + 16;
+            for (int q = 0; q < 2; q++)
+                for (int prio = 0; prio < SCHED_PRIORITY_LEVELS; prio++) {
+                    process_t* it = rqs[q]->queues[prio];
+                    while (it && v2 < b2) {
+                        v2++;
+                        if (it->pinned_cpu != cid || !((it->allowed_cpus >> cid) & 1ULL)) {
+                            kprintf("[SCHEDULER] RQLOCK: inv4 cpu=%u pid=%u queued but NOT legally pinned here (pinned_cpu=%u allowed=0x%016llx)\n",
+                                    cid, it->pid, it->pinned_cpu, (unsigned long long)it->allowed_cpus);
+                            fails++;
+                        }
+                        it = it->next;
+                    }
+                }
         }
     }
 
@@ -1398,10 +1434,10 @@ static void scheduler_rqlock_selftest(void) {
                 }
         }
     }
-    spin_unlock(&cpus[0].rq_lock);
+    sched_release_all_rq_locks();
 
     if (fails == 0)
-        kprintf("[SCHEDULER] RQLOCK: PASS (per-cpu rq_lock init + ready_count==walk + no cross-cpu dup + secondary rq empty)\n");
+        kprintf("[SCHEDULER] RQLOCK: PASS (all-rq_lock authoritative: init + ready_count==walk + no cross-cpu dup + secondary tasks legally pinned)\n");
     else
         kprintf("[SCHEDULER] RQLOCK: FAIL (%d invariant(s) violated)\n", fails);
 }
@@ -1425,7 +1461,9 @@ static void scheduler_affinity_selftest(void) {
     if ( sched_dbg_cpu_allowed((uint64_t)1 << 0, 1)) { kprintf("[SCHEDULER] AFFINITY: predicate FAIL (cpu1 in {cpu0})\n"); fails++; }
     if (CPU_NONE == 0 || CPU_NONE == 1)              { kprintf("[SCHEDULER] AFFINITY: predicate FAIL (CPU_NONE collides with a real cpu)\n"); fails++; }
 
-    spin_lock(&cpus[0].rq_lock);
+    // F3-3a: all online cpus' rq_locks (ascending) so the cross-cpu queue walk below is
+    // authoritative once CPU1 is a live writer. cpus[0]-only at N=1 / SMP_FOUNDATION.
+    sched_acquire_all_rq_locks();
     for (uint32_t cid = 0; cid < MAX_CPUS; cid++) {
         if (!cpus[cid].online) continue;
         // (2) The ctor-default-fired proof: idle funnels through process_create, so a
@@ -1458,7 +1496,7 @@ static void scheduler_affinity_selftest(void) {
                 }
             }
     }
-    spin_unlock(&cpus[0].rq_lock);
+    sched_release_all_rq_locks();
 
     if (fails == 0)
         kprintf("[SCHEDULER] AFFINITY: PASS (predicate sound + ctor defaults fired + no queued task off-affinity)\n");

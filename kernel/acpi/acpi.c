@@ -258,7 +258,7 @@ static int acpi_parse_s5(acpi_table_header_t* dsdt, uint8_t* s5a, uint8_t* s5b) 
     const uint8_t* aml = (const uint8_t*)dsdt + sizeof(acpi_table_header_t);
     const uint8_t* end = (const uint8_t*)dsdt + dsdt->length;
 
-    for (const uint8_t* p = aml; p + 5 < end; p++) {
+    for (const uint8_t* p = aml; p + 5 <= end; p++) {   /* <= so the final 5-byte window (a trailing _S5_) is examined; body guards every q access against end */
         if (p[0] == '_' && p[1] == 'S' && p[2] == '5' && p[3] == '_') {
             const uint8_t* q = p + 4;
 

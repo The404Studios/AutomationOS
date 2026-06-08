@@ -283,6 +283,8 @@ static ssize_t rng_dev_read(vfs_file_t *file, void *buf, size_t count)
     (void)file;
     if (!buf || count == 0)
         return -22; /* EINVAL */
+    if (count > 0x7FFFFFFFFFFFFFFFULL)  /* > SSIZE_MAX: (ssize_t)count below would wrap negative */
+        return -22;
     rng_bytes(buf, count);
     return (ssize_t)count;
 }

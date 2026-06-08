@@ -806,9 +806,10 @@ int64_t sys_pci_list(uint64_t out_ptr, uint64_t max_entries, uint64_t a3,
     uint32_t count = pci_get_device_count();
     if (count == 0) return 0;
 
-    /* Cap to the user buffer size and a sane stack limit. */
-    uint32_t cap = (uint32_t)max_entries;
-    if (cap > PCI_MAX_DEVICES) cap = PCI_MAX_DEVICES;
+    /* Cap to the user buffer size and a sane stack limit. Clamp in 64-bit BEFORE
+     * the uint32 cast: a value like 0x100000001 would otherwise truncate to 1 and
+     * silently copy fewer entries than the caller requested. */
+    uint32_t cap = (max_entries > PCI_MAX_DEVICES) ? PCI_MAX_DEVICES : (uint32_t)max_entries;
     if (cap > count)           cap = count;
 
     pci_info_t kbuf[PCI_MAX_DEVICES];

@@ -226,11 +226,36 @@ void ide_do_build(Ide* a) {
         return;
     }
 
+    /* Project build: flush the editor, compile the project ENTRY (src/main.c),
+     * and emit the artifact into <root>/build/<Name>.elf so Run launches the
+     * project's own binary. Loose-file builds compile the open file straight to
+     * /Desktop/<base>.elf (override OFF). */
+    char build_src[IDE_PATH];
+    const char* src_to_build = a->cur_file;
+    int proj = a->project.active;
+    if (proj) {
+        ide_editor_save(a);                          /* flush editor -> disk      */
+        int n = ide_strlen(a->project.root);
+        ide_strlcpy(build_src, a->project.root, IDE_PATH);
+        if (n < IDE_PATH - 1) build_src[n++] = '/';
+        ide_strlcpy(build_src + n, a->project.entry, IDE_PATH - n);
+        src_to_build = build_src;
+
+        char out_dir[IDE_PATH];
+        int m = ide_strlen(a->project.root);
+        ide_strlcpy(out_dir, a->project.root, IDE_PATH);
+        if (m < IDE_PATH - 1) out_dir[m++] = '/';
+        ide_strlcpy(out_dir + m, "build", IDE_PATH - m);
+        tc_set_output_override(out_dir, a->project.name);
+    }
+
     long t0 = ide_ticks_ms();
-    tc_build(a->cur_file, &g_res);
+    tc_build(src_to_build, &g_res);
     long t1 = ide_ticks_ms();
     g_build_ms = (int)(t1 - t0);
     if (g_build_ms < 0) g_build_ms = 0;
+
+    if (proj) tc_set_output_override(0, 0);          /* one-shot: clear override  */
 
     /* If the on-device single-file compile failed but this is a shipped app with
      * a prebuilt /sbin binary (e.g. derby), present it as runnable instead. */

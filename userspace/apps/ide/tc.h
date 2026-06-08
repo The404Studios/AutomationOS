@@ -84,6 +84,11 @@ TcLang tc_lang_of(const char* path);
  * fill *res, return res->ok. (tc_driver.c) */
 int tc_build(const char* path, TcResult* res);
 
+/* Optional one-shot output override for the next tc_build(): the ELF is written
+ * to <dir>/<base>.elf instead of the default /Desktop/<srcbase>.elf. Pass (0,0)
+ * to clear. Used by the IDE for project builds. (tc_driver.c) */
+void tc_set_output_override(const char* dir, const char* base);
+
 /* ---- individual stages (driver + host tests call these) ---- */
 /* C AST -> Intel-subset asm text. 1=ok. (cc_codegen.c) */
 int cc_compile(const AstNode* tu, char* asm_out, int asm_cap,

@@ -169,6 +169,22 @@ TcLang tc_lang_of(const char* path)
     return LANG_UNKNOWN;
 }
 
+/* Optional one-shot output override (set by the IDE for project builds). When
+ * g_out_override_dir[0] != 0, the next tc_build writes <dir>/<base>.elf instead
+ * of the default /Desktop/<srcbase>.elf. The IDE clears it after each project
+ * build so loose-file builds keep landing on the desktop. */
+static char g_out_override_dir[160];
+static char g_out_override_base[64];
+void tc_set_output_override(const char* dir, const char* base) {
+    if (dir && base && dir[0] && base[0]) {
+        sk_copy(g_out_override_dir,  dir,  (int)sizeof(g_out_override_dir));
+        sk_copy(g_out_override_base, base, (int)sizeof(g_out_override_base));
+    } else {
+        g_out_override_dir[0]  = 0;
+        g_out_override_base[0] = 0;
+    }
+}
+
 int tc_build(const char* path, TcResult* res)
 {
     int srclen;
@@ -286,18 +302,25 @@ int tc_build(const char* path, TcResult* res)
     /* preview is independent of where we write. */
     copy_preview(res, g_asm);
 
-    /* out_dir = "/Desktop", out_path = "/Desktop/<base>.elf" */
-    ide_sc(67 /* SYS_MKDIR */, (long)"/Desktop", 0755, 0, 0, 0, 0);
-    sk_copy(res->out_dir, "/Desktop", (int)sizeof(res->out_dir));
-    {
+    /* Output path. A project build (IDE override) writes <dir>/<base>.elf into
+     * the project's build/ folder; a loose-file build writes /Desktop/<srcbase>.elf. */
+    if (g_out_override_dir[0]) {
+        ide_sc(67 /* SYS_MKDIR */, (long)g_out_override_dir, 0755, 0, 0, 0, 0);
+        sk_copy(res->out_dir, g_out_override_dir, (int)sizeof(res->out_dir));
+        int n = sk_copy(res->out_path, g_out_override_dir, (int)sizeof(res->out_path));
+        n += sk_copy(res->out_path + n, "/", (int)sizeof(res->out_path) - n);
+        n += sk_copy(res->out_path + n, g_out_override_base, (int)sizeof(res->out_path) - n);
+        sk_copy(res->out_path + n, ".elf", (int)sizeof(res->out_path) - n);
+    } else {
+        ide_sc(67 /* SYS_MKDIR */, (long)"/Desktop", 0755, 0, 0, 0, 0);
+        sk_copy(res->out_dir, "/Desktop", (int)sizeof(res->out_dir));
         int n = sk_copy(res->out_path, "/Desktop/", (int)sizeof(res->out_path));
         n += sk_copy(res->out_path + n, base, (int)sizeof(res->out_path) - n);
         sk_copy(res->out_path + n, ".elf", (int)sizeof(res->out_path) - n);
     }
 
-    /* 7. write the ELF to the desktop, with a /tmp fallback. */
+    /* 7. write the ELF, with a /tmp fallback so a build never silently fails. */
     if (ide_write_file(res->out_path, (char*)g_elf, elen) < 0) {
-        /* /Desktop not writable -> fall back to /tmp/<base>.elf. */
         ide_sc(67 /* SYS_MKDIR */, (long)"/tmp", 0755, 0, 0, 0, 0);
         sk_copy(res->out_dir, "/tmp", (int)sizeof(res->out_dir));
         int n = sk_copy(res->out_path, "/tmp/", (int)sizeof(res->out_path));
@@ -305,16 +328,15 @@ int tc_build(const char* path, TcResult* res)
         sk_copy(res->out_path + n, ".elf", (int)sizeof(res->out_path) - n);
         if (ide_write_file(res->out_path, (char*)g_elf, elen) < 0) {
             res->ok = 0;
-            set_msg(res, "elf write failed (/Desktop and /tmp)");
+            set_msg(res, "elf write failed");
             return 0;
         }
     }
 
-    /* 7b. Best-effort: also drop a copy into "<srcdir>/build/<base>.elf" so the
-     * project explorer (rooted at the project tree) can enumerate and reveal it.
-     * A failure here NEVER fails the build -- the desktop artifact above is the
-     * real deliverable. */
-    {
+    /* 7b. Loose-file builds only: drop a best-effort copy into
+     * "<srcdir>/build/<base>.elf" so the project explorer can reveal it. Project
+     * builds already write into <root>/build, so this is skipped for them. */
+    if (!g_out_override_dir[0]) {
         char dir[160];
         dirname_of(path, dir, (int)sizeof(dir));
         if (dir[0]) {

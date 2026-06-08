@@ -34,6 +34,9 @@ hda_stream_t* hda_stream_alloc(hda_controller_t* ctrl, bool is_output) {
 
     for (uint8_t i = 0; i < max_streams; i++) {
         uint8_t stream_num = stream_base + i;
+        /* num_iss/num_oss are device-reported (GCAP); a buggy/hostile controller
+         * could make stream_base+i exceed the streams[HDA_MAX_STREAMS] array. */
+        if (stream_num >= HDA_MAX_STREAMS) break;
         if (ctrl->streams[stream_num] == NULL) {
             // Allocate stream structure
             hda_stream_t* stream = (hda_stream_t*)kmalloc(sizeof(hda_stream_t));
@@ -61,7 +64,7 @@ hda_stream_t* hda_stream_alloc(hda_controller_t* ctrl, bool is_output) {
         }
     }
 
-    serial_write("HDA: No available streams\n", 27);
+    serial_write("HDA: No available streams\n", 26);
     return NULL;
 }
 
@@ -178,7 +181,9 @@ int hda_stream_setup(hda_controller_t* ctrl, hda_stream_t* stream,
     void* bdl_page = pmm_alloc_page();
     if (!bdl_page) {
         serial_write("HDA: Failed to allocate BDL\n", 29);
-        pmm_free_page(buffer_phys);
+        /* buffer_phys came from pmm_alloc_pages(num_pages) (16 pages); free the
+         * whole run, not a single page, or the other 15 pages leak permanently. */
+        pmm_free_pages(buffer_phys, (size_t)num_pages);
         return -1;
     }
 
@@ -246,7 +251,7 @@ int hda_stream_setup(hda_controller_t* ctrl, hda_stream_t* stream,
     // Set stream tag and channel
     ctl = hda_sd_read32(ctrl, sd, HDA_SD_CTL);
     ctl &= 0x0000FFFF;  // Clear upper bits
-    ctl |= (stream->stream_tag << 20);  // Set stream tag
+    ctl |= ((stream->stream_tag & 0xF) << 20);  // Set stream tag (4-bit field [23:20])
     hda_sd_write32(ctrl, sd, HDA_SD_CTL, ctl);
 
     /*
@@ -456,6 +461,11 @@ int hda_stream_read(hda_stream_t* stream, void* data, uint32_t size) {
     uint8_t* dst = (uint8_t*)data;
 
     while (read < size) {
+        if (stream->buffer_size == 0) break;
+        // Mirror hda_stream_write's guard: if position reached/passed buffer_size
+        // (stale or DMA-advanced), buffer_size - position underflows to ~4GB and the
+        // copy below reads far past the ring buffer (and writes past the dst).
+        if (stream->position >= stream->buffer_size) stream->position = 0;
         uint32_t available = stream->buffer_size - stream->position;
         uint32_t to_read = (size - read < available) ? (size - read) : available;
 

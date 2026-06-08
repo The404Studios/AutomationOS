@@ -354,20 +354,29 @@ void timer_sleep(uint32_t ms) {
         }
     } else {
         /*
-         * Interrupts disabled -- we cannot rely on ticks advancing.  The
-         * caller is sleeping with IF=0, which is almost certainly a bug;
-         * log it once and spin.  We do NOT call sti() here because enabling
-         * interrupts inside a caller's critical section would be far worse.
+         * Interrupts disabled -- timer_ticks can NEVER advance (IRQ0 masked),
+         * so the old `while (timer_ticks < target) pause;` spun FOREVER for any
+         * ms>0: a guaranteed hard hang.  We must not sti() inside a caller's
+         * critical section, and we must NOT silently return either -- callers
+         * use timer_sleep() for hardware settle delays (write reg; sleep; read
+         * status), and a zero-delay return would break those sequences.
+         *
+         * Fall back to a bounded, tick-INDEPENDENT busy delay: a write to the
+         * POST port (0x80) is a full ISA bus cycle (~1 us on real hardware), so
+         * ~1000 writes approximate 1 ms (the canonical io_delay).  This always
+         * terminates regardless of IF and preserves the settle-delay contract;
+         * the spin is capped so a pathological large ms cannot freeze for minutes.
          */
         static int warned = 0;
         if (!warned) {
-            kprintf("[PIT] WARNING: timer_sleep() called with interrupts disabled"
-                    " -- ticks will not advance!\n");
+            kprintf("[PIT] WARNING: timer_sleep(%u ms) called with IF=0 -- ticks"
+                    " cannot advance; using bounded io-delay fallback\n", ms);
             warned = 1;
         }
-        /* Spin; the loop exits immediately if target already passed. */
-        while (timer_ticks < target) {
-            asm volatile("pause");   /* reduce power/bus contention */
+        uint64_t io_spins = (uint64_t)ms * 1000ULL;        /* ~1 us per outb(0x80) */
+        if (io_spins > 1000000ULL) io_spins = 1000000ULL;  /* cap worst case at ~1 s */
+        for (uint64_t i = 0; i < io_spins; i++) {
+            outb(0x80, 0);   /* POST-port write: tick-independent ISA-cycle delay */
         }
     }
 }

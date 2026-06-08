@@ -99,7 +99,9 @@ static ssize_t fat32_vfs_read(vfs_file_t* file, void* buf, size_t count) {
         return 0;
     }
 
-    if (file->offset + count > vfs_inode->size) {
+    /* offset < size is guaranteed above, so size - offset is safe; comparing this
+     * way avoids the offset+count overflow that let a huge `count` skip the clamp. */
+    if (count > vfs_inode->size - file->offset) {
         count = vfs_inode->size - file->offset;
     }
 

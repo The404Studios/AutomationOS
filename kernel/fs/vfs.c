@@ -103,6 +103,9 @@ static int ramfs_dir_add(vfs_inode_t* dir, vfs_dentry_t* dentry) {
 
     // No free slot - grow the array (double capacity)
     uint64_t new_cap = dir->data_capacity * 2;
+    if (new_cap <= dir->data_capacity) {     // capacity doubling overflowed -> bail
+        return -1;
+    }
     vfs_dentry_t** new_entries = (vfs_dentry_t**)kmalloc(sizeof(vfs_dentry_t*) * new_cap);
     if (!new_entries) {
         return -1;
@@ -130,6 +133,7 @@ static inline size_t vfs_strlen(const char* s) {
 }
 
 static inline void vfs_strcpy(char* dst, const char* src, size_t max) {
+    if (max == 0) return;            /* else max-1 underflows to SIZE_MAX (overflow) */
     size_t i;
     for (i = 0; i < max - 1 && src[i]; i++) {
         dst[i] = src[i];

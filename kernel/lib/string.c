@@ -472,7 +472,7 @@ int vsnprintf(char* buf, size_t size, const char* fmt, __builtin_va_list args) {
 
             char tmp[24]; int ti = 0;
             uint64_t uval;
-            if (val < 0) { PUTC('-'); uval = (uint64_t)(-val); width--; }
+            if (val < 0) { PUTC('-'); uval = -(uint64_t)val; width--; }  /* unsigned negate: UB-free for INT64_MIN */
             else           uval = (uint64_t)val;
             if (uval == 0) tmp[ti++] = '0';
             else while (uval) { tmp[ti++] = '0' + (uval % 10); uval /= 10; }

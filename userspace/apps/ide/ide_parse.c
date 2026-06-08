@@ -349,6 +349,114 @@ static void mp_pass_funcs(Model* m, AstNode* root) {
     }
 }
 
+/* ======================================================================= */
+/* ASM model builder: assembly files ALSO populate the Semantic LEGO Map.  */
+/* Each code label (name:) becomes a node ("function"); `call`/`jmp`/jcc to */
+/* a label is an outgoing edge -> the map renders the control-flow graph.   */
+/* `global`/`extern` directives become protos; data labels (db/dd/...)      */
+/* become globals. Supports both NASM (global foo) and GAS (.globl foo,     */
+/* labels like .L1) syntax. Freestanding line scanner; no AST.              */
+/* ======================================================================= */
+static char mp_lower(char c){ return (c >= 'A' && c <= 'Z') ? (char)(c - 'A' + 'a') : c; }
+static int  mp_asm_ident(char c){
+    return (c>='a'&&c<='z')||(c>='A'&&c<='Z')||(c>='0'&&c<='9')||c=='_'||c=='.'||c=='$'||c=='@';
+}
+static int mp_is_reg(const char* s){
+    static const char* const regs[] = {
+        "rax","rbx","rcx","rdx","rsi","rdi","rbp","rsp",
+        "r8","r9","r10","r11","r12","r13","r14","r15",
+        "eax","ebx","ecx","edx","esi","edi","ebp","esp",
+        "ax","bx","cx","dx","al","bl","cl","dl","ah","bh","ch","dh", 0 };
+    for (int i = 0; regs[i]; i++) if (ide_streq(s, regs[i])) return 1;
+    return 0;
+}
+/* filename ends with .asm / .s / .S / .inc / .nasm (case-insensitive)? */
+static int mp_filename_is_asm(const char* fn){
+    if (!fn) return 0;
+    int n = 0; while (fn[n]) n++;
+    int dot = -1;
+    for (int i = n - 1; i >= 0 && fn[i] != '/'; i--) if (fn[i] == '.') { dot = i; break; }
+    if (dot < 0) return 0;
+    char e[8]; int el = 0;
+    for (int i = dot + 1; i < n && el < 7; i++) e[el++] = mp_lower(fn[i]);
+    e[el] = 0;
+    return ide_streq(e,"asm") || ide_streq(e,"s") || ide_streq(e,"inc") || ide_streq(e,"nasm");
+}
+
+static void mp_parse_asm(Model* m, const char* src, int len){
+    int pos = 0, line = 1;
+    Func* cur = 0;
+    while (pos < len) {
+        int le = pos; while (le < len && src[le] != '\n') le++;     /* line = [pos, le) */
+        int i = pos; while (i < le && (src[i] == ' ' || src[i] == '\t')) i++;
+        int lineend = le;
+        for (int k = i; k < le; k++) if (src[k] == ';') { lineend = k; break; }  /* strip ; comment */
+
+        /* label?  ident ':'  */
+        if (i < lineend) {
+            int j = i; while (j < lineend && mp_asm_ident(src[j])) j++;
+            if (j > i && j < lineend && src[j] == ':') {
+                char name[M_NAME]; int nl = j - i; if (nl > M_NAME - 1) nl = M_NAME - 1;
+                for (int x = 0; x < nl; x++) name[x] = src[i + x]; name[nl] = 0;
+                /* data label? next token is a data/reserve directive */
+                int r = j + 1; while (r < lineend && (src[r] == ' ' || src[r] == '\t')) r++;
+                char d[8]; int dl = 0;
+                for (int rr = r; rr < lineend && mp_asm_ident(src[rr]) && dl < 7; rr++) d[dl++] = mp_lower(src[rr]);
+                d[dl] = 0;
+                int is_data = ide_streq(d,"db")||ide_streq(d,"dw")||ide_streq(d,"dd")||ide_streq(d,"dq")||
+                              ide_streq(d,"resb")||ide_streq(d,"resw")||ide_streq(d,"resd")||ide_streq(d,"resq")||
+                              ide_streq(d,"equ")||ide_streq(d,"times");
+                if (cur) cur->line_end = (line > 1 ? line - 1 : line);
+                if (is_data) {
+                    if (m->nglobals < M_MAXGLOBALS && mp_global_index(m, name) < 0) {
+                        Global* g = &m->globals[m->nglobals++];
+                        ide_strlcpy(g->name, name, M_NAME); ide_strlcpy(g->type, "data", M_TYPE);
+                        ide_strlcpy(g->file, m->cur_file, M_NAME); g->nreaders = 0; g->nwriters = 0;
+                    }
+                    cur = 0;
+                    pos = (le < len) ? le + 1 : le; line++; continue;
+                }
+                if (m->nfuncs < M_MAXFUNCS) {
+                    cur = &m->funcs[m->nfuncs++];
+                    ide_strlcpy(cur->name, name, M_NAME); ide_strlcpy(cur->ret, "label", M_TYPE);
+                    ide_strlcpy(cur->file, m->cur_file, M_NAME);
+                    cur->line_start = line; cur->line_end = line;
+                    cur->nparams = 0; cur->ncalls = 0; cur->nreads = 0; cur->nwrites = 0;
+                    cur->nports = 0; cur->closed = 0;
+                } else cur = 0;
+                i = j + 1;   /* scan the rest of the line for an instruction (e.g. "foo: call bar") */
+            }
+        }
+
+        /* instruction / directive on the rest of the line */
+        while (i < lineend && (src[i] == ' ' || src[i] == '\t')) i++;
+        if (i < lineend) {
+            int j = i; while (j < lineend && mp_asm_ident(src[j])) j++;
+            char mn[16]; int ml = j - i; if (ml > 15) ml = 15;
+            for (int x = 0; x < ml; x++) mn[x] = mp_lower(src[i + x]); mn[ml] = 0;
+            const char* mnn = (mn[0] == '.') ? mn + 1 : mn;   /* normalize GAS .globl etc. */
+            int o = j; while (o < lineend && (src[o] == ' ' || src[o] == '\t')) o++;
+            int oe = o; while (oe < lineend && mp_asm_ident(src[oe])) oe++;
+            char op[M_NAME]; int ol = oe - o; if (ol > M_NAME - 1) ol = M_NAME - 1;
+            for (int x = 0; x < ol; x++) op[x] = src[o + x]; op[ol] = 0;
+
+            if (ide_streq(mnn,"global") || ide_streq(mnn,"globl") || ide_streq(mnn,"extern")) {
+                if (op[0] && !mp_is_reg(op) && m->nprotos < M_MAXPROTOS) {
+                    Proto* pr = &m->protos[m->nprotos++];
+                    ide_strlcpy(pr->name, op, M_NAME);
+                    ide_strlcpy(pr->ret, ide_streq(mnn,"extern") ? "extern" : "global", M_TYPE);
+                    pr->line = line;
+                }
+            } else if (cur && op[0] && !mp_is_reg(op)) {
+                int isctl = ide_streq(mnn,"call") || (mnn[0] == 'j' && ide_strlen(mnn) <= 4);  /* call / jmp / jcc */
+                if (isctl) mp_list_add(cur->calls, &cur->ncalls, M_MAXCALLS, op);
+            }
+        }
+        pos = (le < len) ? le + 1 : le; line++;
+    }
+    if (cur) cur->line_end = (line > 1 ? line - 1 : line);
+}
+
 /* ----------------------------------------------------------------------- */
 /* entry point                                                             */
 /* ----------------------------------------------------------------------- */
@@ -390,6 +498,16 @@ void model_parse(Model* m, const char* src, int len, const char* filename) {
 
     /* nothing to parse: still produce a consistent (empty) model */
     if (!src || len <= 0) {
+        m->lexed  = 1;
+        m->parsed = 1;
+        return;
+    }
+
+    /* Assembly files: build the model from labels + call/jmp edges (a real
+     * control-flow graph) instead of the C parser, so .asm/.s ALSO render in
+     * the Semantic LEGO Map. */
+    if (mp_filename_is_asm(filename)) {
+        mp_parse_asm(m, src, len);
         m->lexed  = 1;
         m->parsed = 1;
         return;

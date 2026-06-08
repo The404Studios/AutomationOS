@@ -150,7 +150,10 @@ static js_string *scan_string(js_lexer *lx, int quote, int is_template)
                 js_u32 cp = 0;
                 if (peek(lx) == '{') {
                     lx->cur++;
-                    while (is_hex(peek(lx))) cp = cp*16 + hexval(adv(lx));
+                    /* a valid Unicode code point is <= 0x10FFFF (6 hex digits);
+                     * cap the loop so a hostile \u{FFFF...} can't wrap cp. */
+                    int uk = 0;
+                    while (is_hex(peek(lx)) && uk++ < 6) cp = cp*16 + hexval(adv(lx));
                     if (peek(lx) == '}') lx->cur++;
                 } else {
                     for (int k = 0; k < 4 && is_hex(peek(lx)); k++)

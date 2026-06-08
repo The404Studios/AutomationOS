@@ -102,8 +102,10 @@ static int buf_print_signed(kbuf_t* b, int64_t val, int min_width, char pad_char
     if (val < 0) {
         buf_putc(b, '-');
         count++;
-        val = -val;
         if (min_width > 0) min_width--;
+        /* unsigned negate is UB-free for INT64_MIN (where -val would overflow) */
+        count += buf_print_number_padded(b, -(uint64_t)val, 10, min_width, pad_char, 0);
+        return count;
     }
     count += buf_print_number_padded(b, (uint64_t)val, 10, min_width, pad_char, 0);
     return count;

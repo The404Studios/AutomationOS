@@ -417,12 +417,12 @@ typedef struct {
 static Enemy g_enemy[MAX_ENEMIES];
 static i32   g_enemy_count = 0;   /* current live count (for fast checks) */
 
-/* per-tier stats */
-static i32 tier_hp(i32 t)    { static const i32 v[6] = {0,1,2,3,5,8};   return v[t]; }
-static i32 tier_speed(i32 t) { static const i32 v[6] = {0,80,110,140,170,210}; return v[t]; } /* FP/tick-ish */
-static i32 tier_reward(i32 t){ static const i32 v[6] = {0,2,3,5,8,12};  return v[t]; }
-static i32 tier_lives(i32 t) { static const i32 v[6] = {0,1,1,2,3,4};   return v[t]; }
-static i32 tier_radius(i32 t){ static const i32 v[6] = {0,10,12,14,16,18}; return v[t]; }
+/* per-tier stats (bounds-guarded: t outside [0,5] returns 0, never an OOB read) */
+static i32 tier_hp(i32 t)    { static const i32 v[6] = {0,1,2,3,5,8};   return ((unsigned)t < 6) ? v[t] : 0; }
+static i32 tier_speed(i32 t) { static const i32 v[6] = {0,80,110,140,170,210}; return ((unsigned)t < 6) ? v[t] : 0; } /* FP/tick-ish */
+static i32 tier_reward(i32 t){ static const i32 v[6] = {0,2,3,5,8,12};  return ((unsigned)t < 6) ? v[t] : 0; }
+static i32 tier_lives(i32 t) { static const i32 v[6] = {0,1,1,2,3,4};   return ((unsigned)t < 6) ? v[t] : 0; }
+static i32 tier_radius(i32 t){ static const i32 v[6] = {0,10,12,14,16,18}; return ((unsigned)t < 6) ? v[t] : 0; }
 
 static i32 spawn_enemy(i32 tier, i32 dist_fp)
 {

@@ -261,8 +261,11 @@ void lapic_timer_init(uint32_t frequency) {
     udelay(TIMER_CALIBRATE_US);
     uint32_t ticks = 0xFFFFFFFF - lapic_read(LAPIC_TIMER_CCR);
 
-    // Calculate ticks per quantum (assumes frequency is in Hz)
-    uint32_t ticks_per_quantum = (ticks * frequency) / 1000;
+    // Calculate ticks per quantum (assumes frequency is in Hz). Promote to 64-bit
+    // before the multiply: ticks*frequency can exceed 32 bits and wrap to a tiny
+    // (or zero) quantum, which would hang/storm the scheduler timer.
+    uint32_t ticks_per_quantum = (uint32_t)(((uint64_t)ticks * frequency) / 1000);
+    if (ticks_per_quantum == 0) ticks_per_quantum = 1;
 
     // Set periodic mode with calculated value
     lapic_write(LAPIC_TIMER, LAPIC_TIMER_VECTOR | LAPIC_TIMER_PERIODIC);
@@ -287,7 +290,7 @@ void lapic_timer_init_vector(uint32_t frequency, uint8_t vector) {
     udelay(TIMER_CALIBRATE_US);
     uint32_t ticks = 0xFFFFFFFF - lapic_read(LAPIC_TIMER_CCR);
 
-    uint32_t ticks_per_quantum = (ticks * frequency) / 1000;
+    uint32_t ticks_per_quantum = (uint32_t)(((uint64_t)ticks * frequency) / 1000);
     if (ticks_per_quantum == 0) ticks_per_quantum = 1;
 
     lapic_write(LAPIC_TIMER, (uint32_t)vector | LAPIC_TIMER_PERIODIC);

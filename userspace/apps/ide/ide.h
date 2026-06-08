@@ -13,6 +13,7 @@
 #include "ide_library.h"
 #include "ide_gfx.h"
 #include "ide_sys.h"
+#include "ide_project.h"   /* IdeProject world model (IDE-PROJECT-0) */
 
 typedef struct Rect { int x, y, w, h; } Rect;
 static inline int rect_hit(Rect r, int mx, int my) {
@@ -68,11 +69,12 @@ typedef struct {
  * "New Project" modal. Ctrl+N (or the topbar [+ NEW] button) opens a small
  * centered overlay that (1) lists the project templates found under
  * /usr/src/templates/ so the user picks one, then (2) prompts for a project
- * name. Confirming clones the chosen template dir into /usr/src/<name>/ and
- * opens its main .c in the editor.
+ * name. Confirming scaffolds /Desktop/Projects/<name>/{src,build,res} + a
+ * project.json manifest, clones the template's main into src/main.c, and opens
+ * it in the editor (IDE-PROJECT-0).
  * ------------------------------------------------------------------------- */
 #define IDE_TEMPLATES_DIR "/usr/src/templates"
-#define IDE_PROJECTS_DIR  "/usr/src"
+#define IDE_PROJECTS_DIR  "/Desktop/Projects"   /* projects live on the desktop */
 #define NP_MAXTPL  16          /* templates listed in the picker            */
 #define NP_NAMELEN 64          /* max typed project-name length             */
 
@@ -173,6 +175,11 @@ typedef struct Ide {
 
     /* "New Project" modal (Ctrl+N / topbar [+ NEW]); see NewProj above. */
     NewProj  np;
+
+    /* Current IDE project world model (IDE-PROJECT-0): the /Desktop/Projects/<Name>/
+     * tree, its manifest fields, and the build/run targets. active=0 = no project
+     * (loose-file editing); set by New Project / opening a project folder. */
+    IdeProject project;
 
     int      mouse_x, mouse_y, buttons, prev_buttons;
 } Ide;

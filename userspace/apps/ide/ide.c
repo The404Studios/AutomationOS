@@ -666,31 +666,42 @@ static int np_is_preferred_main(const char* name) {
            ide_streq(name, "service.c")|| ide_streq(name, "main.c");
 }
 
-/* Clone template dir `src_dir` into `dst_dir`, copying every regular file.
- * Records the best "main .c" path into open_path (cap bytes). Returns the
- * number of files copied, or <0 on a fatal error (dst mkdir failed). */
+/* Clone template dir `src_dir` into `dst_dir` (the project's src/), copying every
+ * regular file. The chosen main .c is written as "main.c" so the manifest entry
+ * stays src/main.c; other files keep their names. open_path receives the path of
+ * the written main.c. Returns the number of files copied, or <0 on a fatal error. */
 static int np_clone(Ide* a, const char* src_dir, const char* dst_dir,
                     char* open_path, int open_cap) {
     if (open_cap > 0) open_path[0] = 0;
 
-    /* Create the destination project directory (recursive mkdir; ignore an
-     * "already exists" style error -- the write below would still succeed). */
     ide_sc(SYS_MKDIR_NUM, (long)dst_dir, 0755, 0, 0, 0, 0);
 
     IdeDirent ents[64];
     int got = ide_list_dir(src_dir, ents, 64);
     if (got < 0) return -1;
 
-    int copied = 0;
-    int have_main = 0;          /* 1 once a preferred main .c is chosen      */
+    /* Pick the main source: a preferred main (game/app/service/main.c) wins,
+     * else the first .c. */
+    int main_idx = -1;
     for (int i = 0; i < got; i++) {
-        if (ents[i].type != IDE_DT_REG) continue;     /* flat dir of files  */
-        if (is_dot_entry(ents[i].name)) continue;
+        if (ents[i].type != IDE_DT_REG || is_dot_entry(ents[i].name)) continue;
+        if (ends_with_dot_c(ents[i].name)) {
+            if (main_idx < 0) main_idx = i;
+            if (np_is_preferred_main(ents[i].name)) { main_idx = i; break; }
+        }
+    }
+
+    int copied = 0;
+    for (int i = 0; i < got; i++) {
+        if (ents[i].type != IDE_DT_REG || is_dot_entry(ents[i].name)) continue;
+        /* Don't let a non-main file literally named main.c clobber the renamed one. */
+        if (i != main_idx && ide_streq(ents[i].name, "main.c")) continue;
 
         char src_path[IDE_PATH];
         char dst_path[IDE_PATH];
         path_join(src_path, IDE_PATH, src_dir, ents[i].name);
-        path_join(dst_path, IDE_PATH, dst_dir, ents[i].name);
+        path_join(dst_path, IDE_PATH, dst_dir,
+                  (i == main_idx) ? "main.c" : ents[i].name);
 
         /* Copy bytes verbatim through the shared source buffer. */
         int n = ide_read_file(src_path, a->src, IDE_SRC_CAP);
@@ -699,66 +710,92 @@ static int np_clone(Ide* a, const char* src_dir, const char* dst_dir,
         if (ide_write_file(dst_path, a->src, n) < 0) continue;
         copied++;
 
-        /* Track which copied file to open: a preferred main wins outright;
-         * otherwise remember the first .c as a fallback. */
-        if (open_cap > 0 && ends_with_dot_c(ents[i].name)) {
-            if (!have_main && np_is_preferred_main(ents[i].name)) {
-                ide_strlcpy(open_path, dst_path, open_cap);
-                have_main = 1;
-            } else if (open_path[0] == 0) {
-                ide_strlcpy(open_path, dst_path, open_cap);
-            }
-        }
+        if (i == main_idx && open_cap > 0) ide_strlcpy(open_path, dst_path, open_cap);
     }
     return copied;
 }
 
-/* Confirm the typed name: validate, build the src/dst dirs, clone, rescan the
- * tree and open the new project's main .c. Updates np->status either way. */
+/* Confirm the typed name: validate, scaffold /Desktop/Projects/<name>/{src,build,
+ * res}, clone the template's main into src/main.c (or seed one), write
+ * project.json, rescan, and open the project's main source. Updates np->status. */
 static void np_confirm(Ide* a) {
     NewProj* np = &a->np;
 
-    if (np->ntpl <= 0) { np_close(a); return; }
     if (np->name_len <= 0) {
         ide_strlcpy(np->status, "type a project name, then Enter", 96);
         return;
     }
-    if (np->sel < 0 || np->sel >= np->ntpl) np->sel = 0;
-
-    char src_dir[IDE_PATH];
-    char dst_dir[IDE_PATH];
-    path_join(src_dir, IDE_PATH, IDE_TEMPLATES_DIR, np->tpl[np->sel]);
-    path_join(dst_dir, IDE_PATH, IDE_PROJECTS_DIR,  np->name);
-
-    char open_path[IDE_PATH];
-    int copied = np_clone(a, src_dir, dst_dir, open_path, IDE_PATH);
-    if (copied < 0) {
-        ide_strlcpy(np->status, "create failed (mkdir/readdir)", 96);
+    if (np->name_len > PROJECT_NAME_MAX) {
+        ide_strlcpy(np->status, "name too long (max 32 chars)", 96);
         return;
     }
-    if (copied == 0) {
-        ide_strlcpy(np->status, "template was empty", 96);
-        return;
-    }
+    if (np->ntpl > 0 && (np->sel < 0 || np->sel >= np->ntpl)) np->sel = 0;
 
-    /* Refresh the explorer so the new /usr/src/<name>/ appears, then open the
-     * project's main source (if we found one) and land in the editor. */
-    scan_project(a);
-    np_close(a);
-    if (open_path[0]) {
-        ide_open_file(a, open_path);
-        a->ws = WS_EDITOR;
-        a->term_focus = 0;
-        a->editor.focused = 1;
-        /* Select the opened file's row in the tree if we can find it. */
-        for (int i = 0; i < a->nentries; i++) {
-            if (!a->entries[i].is_dir &&
-                ide_streq(a->entries[i].path, open_path)) {
-                a->sel_entry = i;
-                break;
-            }
+    /* Project root on the desktop: /Desktop/Projects/<name>. */
+    char root[IDE_PATH];
+    path_join(root, IDE_PATH, IDE_PROJECTS_DIR, np->name);
+
+    /* Refuse to clobber an existing project of the same name. */
+    {
+        IdeDirent probe[1];
+        if (ide_list_dir(root, probe, 1) >= 0) {
+            ide_strlcpy(np->status, "a project with that name already exists", 96);
+            return;
         }
     }
+
+    /* Scaffold the project tree (recursive mkdir creates intermediates). */
+    char sub[IDE_PATH];
+    char src_dir[IDE_PATH];
+    ide_sc(SYS_MKDIR_NUM, (long)IDE_PROJECTS_DIR, 0755, 0, 0, 0, 0);  /* ensure /Desktop/Projects */
+    ide_sc(SYS_MKDIR_NUM, (long)root,             0755, 0, 0, 0, 0);
+    path_join(src_dir, IDE_PATH, root, "src");
+    ide_sc(SYS_MKDIR_NUM, (long)src_dir, 0755, 0, 0, 0, 0);
+    path_join(sub, IDE_PATH, root, "build"); ide_sc(SYS_MKDIR_NUM, (long)sub, 0755, 0, 0, 0, 0);
+    path_join(sub, IDE_PATH, root, "res");   ide_sc(SYS_MKDIR_NUM, (long)sub, 0755, 0, 0, 0, 0);
+
+    /* Clone the chosen template's sources into <root>/src (main -> main.c). */
+    char open_path[IDE_PATH];
+    open_path[0] = 0;
+    if (np->ntpl > 0) {
+        char tpl_dir[IDE_PATH];
+        path_join(tpl_dir, IDE_PATH, IDE_TEMPLATES_DIR, np->tpl[np->sel]);
+        np_clone(a, tpl_dir, src_dir, open_path, IDE_PATH);
+    }
+    /* No template (or none copied) -> seed a minimal, compilable src/main.c. */
+    if (!open_path[0]) {
+        path_join(open_path, IDE_PATH, src_dir, "main.c");
+        ide_project_seed_main(open_path);
+    }
+
+    /* Populate the project model + write project.json. */
+    IdeProject* p = &a->project;
+    p->active = 1;
+    ide_strlcpy(p->root, root, (int)sizeof(p->root));
+    ide_strlcpy(p->name, np->name, (int)sizeof(p->name));
+    ide_strlcpy(p->lang, "c", (int)sizeof(p->lang));
+    ide_strlcpy(p->entry, "src/main.c", (int)sizeof(p->entry));
+    {
+        char rt[96]; int n = 0;
+        const char* pre = "build/";
+        for (int i = 0; pre[i] && n < 91; i++) rt[n++] = pre[i];
+        for (int i = 0; p->name[i] && n < 91; i++) rt[n++] = p->name[i];
+        const char* ext = ".elf";
+        for (int i = 0; ext[i] && n < 95; i++) rt[n++] = ext[i];
+        rt[n] = 0;
+        ide_strlcpy(p->run_target, rt, (int)sizeof(p->run_target));
+    }
+    ide_project_write_manifest(p);
+
+    /* Refresh the explorer, close the modal, open the project's main source.
+     * (The new project lives under /Desktop/Projects, not the /usr/src explorer
+     * root, so it appears on the DESKTOP + opens directly in the editor here.) */
+    scan_project(a);
+    np_close(a);
+    ide_open_file(a, open_path);
+    a->ws = WS_EDITOR;
+    a->term_focus = 0;
+    a->editor.focused = 1;
 }
 
 /* Modal key handling. Returns 1 if the modal consumed the key (so the editor /

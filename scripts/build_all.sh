@@ -465,7 +465,7 @@ else
 fi
 
 echo "[all] IDE (Semantic LEGO Map)..."
-IDE_SRCS="ide ide_sys ide_gfx ide_lex ide_ast ide_pcore ide_pdecl ide_pstmt ide_pexpr ide_astprint ide_parse ide_semantic ide_explorer ide_funcs ide_map ide_codeview ide_inspector ide_runtime ide_chrome ide_gen elf_write as_x64 cc_type cc_codegen cc_expr tc_driver ide_build ide_editor ide_term ide_library ide_complete ide_config"
+IDE_SRCS="ide ide_sys ide_gfx ide_lex ide_ast ide_pcore ide_pdecl ide_pstmt ide_pexpr ide_astprint ide_parse ide_semantic ide_explorer ide_funcs ide_map ide_codeview ide_inspector ide_runtime ide_chrome ide_gen elf_write as_x64 cc_type cc_codegen cc_expr tc_driver ide_build ide_editor ide_term ide_library ide_complete ide_config ide_project"
 IDE_OBJS=""
 for s in $IDE_SRCS; do cc userspace/apps/ide/$s.c /tmp/ide_$s.o; IDE_OBJS="$IDE_OBJS /tmp/ide_$s.o"; done
 $LD $IDE_OBJS /tmp/wlc.o /tmp/bf.o /tmp/font2.o /tmp/keymap.o -o /tmp/ide.elf

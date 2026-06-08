@@ -78,7 +78,11 @@ int pty_dev_init(vfs_inode_t *dev_root) {
     ptmx_inode->mode = 0666;  // rw-rw-rw-
     ptmx_inode->ops = &ptmx_ops;
     ptmx_dentry->inode = ptmx_inode;
-    vfs_dentry_add_child((vfs_dentry_t *)dev_root->private_data, ptmx_dentry);
+    /* NOTE: dev_root->private_data is a vfs_dentry_t** child ARRAY (the inode's
+     * dentry table), NOT a vfs_dentry_t. The old vfs_dentry_add_child() call cast
+     * it to a parent dentry -> type confusion / wild read of *(array) as a dentry.
+     * Removed. When this (currently dead) path is integrated, register ptmx via a
+     * real dentry parent + child-array insert (see logic-item audit). */
 
     // Create /dev/pts/ directory
     vfs_dentry_t *pts_dir_dentry = vfs_dentry_alloc("pts");
@@ -103,7 +107,8 @@ int pty_dev_init(vfs_inode_t *dev_root) {
     memset(pts_dir_inode->private_data, 0, sizeof(vfs_dentry_t *) * 32);
 
     pts_dir_dentry->inode = pts_dir_inode;
-    vfs_dentry_add_child((vfs_dentry_t *)dev_root->private_data, pts_dir_dentry);
+    /* Same type confusion as the ptmx case above: dev_root->private_data is a
+     * dentry ARRAY, not a parent dentry. Removed the bad cast/call. */
 
     kprintf("[PTY] Created /dev/ptmx and /dev/pts/\n");
     return 0;
@@ -145,8 +150,10 @@ int pty_dev_create_slave(vfs_inode_t *pts_dir, uint32_t index) {
     slave_inode->private_data = (void *)(uintptr_t)index;  // Store PTY index
     slave_dentry->inode = slave_inode;
 
-    slaves[index] = slave_dentry;
-    vfs_dentry_add_child((vfs_dentry_t *)pts_dir->private_data, slave_dentry);
+    slaves[index] = slave_dentry;  /* correct registration: slaves[] IS pts_dir->private_data */
+    /* Removed: vfs_dentry_add_child((vfs_dentry_t *)pts_dir->private_data, ...) --
+     * that cast the slaves[] array to a parent dentry (type confusion / wild read).
+     * The slave is already registered via slaves[index] above. */
 
     kprintf("[PTY] Created /dev/pts/%u\n", index);
     return 0;

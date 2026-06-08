@@ -113,6 +113,10 @@ typedef struct cpu_stats {
 } cpu_stats_t;
 
 // The per-CPU structure. At N=1 only cpus[0] is ever touched (cpu_id()==0).
+// Wave-7 perf: cache-line aligned (64 bytes) to prevent false sharing between
+// CPUs on SMP. Also uses pointer indirection for rq_active/rq_expired so the
+// active/expired swap is a 2-pointer exchange (16 bytes) not a 2-struct copy
+// (~4.5 KB).
 typedef struct cpu {
     uint32_t    apic_id;        // LAPIC id; 0 for the BSP today
     int         online;         // 1 for the BSP (this CPU is up)
@@ -130,8 +134,12 @@ typedef struct cpu {
     // globals (active_rq / expired_rq / ready_count). ONE runqueue (cpu[0]'s) is
     // used exactly as before -- genuinely separate per-CPU runqueues with their
     // own picks are brick 6, NOT now.
-    runqueue_t  rq_active;      // was the global active_rq
-    runqueue_t  rq_expired;     // was the global expired_rq
+    // Wave-7 perf: rq_active/rq_expired are now POINTERS into the two backing
+    // rq_storage[] arrays. runqueue_swap() exchanges the two pointers (O(1), 16
+    // bytes) instead of copying the full structs (~4.5 KB).
+    runqueue_t* rq_active;      // points at rq_storage[0 or 1]
+    runqueue_t* rq_expired;     // points at rq_storage[1 or 0]
+    runqueue_t  rq_storage[2];  // backing storage for the two runqueues
     uint32_t    ready_count;    // was the global ready_count
     cpu_stats_t stats;          // per-CPU scheduler stats (unused at N=1)
     // F3-1: per-CPU runqueue mutation lock. Guards rq_active/rq_expired/ready_count
@@ -143,7 +151,7 @@ typedef struct cpu {
     // rename of which spinlock instance is taken (same granularity, same critical
     // sections, same enqueue targets) => byte-for-byte the old single-lock behavior.
     spinlock_t  rq_lock;
-} cpu_t;
+} __attribute__((aligned(64))) cpu_t;
 
 static cpu_t cpus[MAX_CPUS];
 
@@ -368,16 +376,19 @@ static int runqueue_remove(runqueue_t* rq, process_t* proc, int priority) {
     return 0;  // Not found
 }
 
-// Check if runqueue is empty
+// Check if runqueue is empty — O(1) direct bitmap OR test (no bitmap_ffs loop)
 static inline int runqueue_is_empty(const runqueue_t* rq) {
-    return bitmap_ffs(rq->bitmap) < 0;
+    uint64_t any = 0;
+    for (int i = 0; i < SCHED_BITMAP_WORDS; i++)
+        any |= rq->bitmap[i];
+    return any == 0;
 }
 
-// Swap active and expired runqueues
+// Swap active and expired runqueues — O(1) pointer exchange (wave-7 perf)
 static void runqueue_swap(void) {
     cpu_t* c = this_cpu();
-    runqueue_t tmp = c->rq_active;
-    c->rq_active = c->rq_expired;
+    runqueue_t* tmp = c->rq_active;
+    c->rq_active  = c->rq_expired;
     c->rq_expired = tmp;
 #ifndef SCHEDULER_QUIET
     kprintf("[SCHEDULER] Swapped active/expired runqueues\n");
@@ -578,7 +589,9 @@ static void scheduler_rqlock_selftest(void);
 static void scheduler_affinity_selftest(void);   // F3-2 (defined with the validators; perf-build stub)
 
 void scheduler_init(void) {
+#ifndef SCHEDULER_QUIET
     kprintf("[SCHEDULER] Initializing O(1) multi-level feedback queue scheduler...\n");
+#endif
 
     // RACE-001 fix: Initialize scheduler lock (retained as the OUTER/global lock for
     // scheduler_shutdown; per-CPU runqueue mutation now uses cpus[].rq_lock, F3-1).
@@ -604,9 +617,11 @@ void scheduler_init(void) {
     cpus[0].apic_id = 0;
     cpus[0].online  = 1;
 
-    // Initialize active and expired runqueues (now living in cpus[0].rq_*).
-    runqueue_init(&this_cpu()->rq_active);
-    runqueue_init(&this_cpu()->rq_expired);
+    // Initialize active and expired runqueues (pointer indirection into rq_storage[]).
+    this_cpu()->rq_active  = &this_cpu()->rq_storage[0];
+    this_cpu()->rq_expired = &this_cpu()->rq_storage[1];
+    runqueue_init(this_cpu()->rq_active);
+    runqueue_init(this_cpu()->rq_expired);
     this_cpu()->ready_count = 0;
 
     // Create the idle thread for this CPU (BSP). This is the fallback when no
@@ -625,6 +640,7 @@ void scheduler_init(void) {
     // process queued to expired — i.e. EVERY freshly spawned process — can never be
     // picked. That froze the whole system right after init spawned its services.)
 
+#ifndef SCHEDULER_QUIET
     kprintf("[SCHEDULER] O(1) scheduler initialized:\n");
     kprintf("[SCHEDULER]   - Priority levels: %d (0-139)\n", SCHED_PRIORITY_LEVELS);
     kprintf("[SCHEDULER]   - Time slice: %d ticks\n", DEFAULT_TIME_SLICE);
@@ -632,6 +648,7 @@ void scheduler_init(void) {
     kprintf("[SCHEDULER]   - Complexity: O(1) enqueue, O(1) dequeue, O(1) pick_next\n");
     kprintf("[SCHEDULER]   - SMP-safe: Yes\n");
     kprintf("[SCHEDULER]   - Idle thread: PID %d\n", this_cpu()->idle_thread->pid);
+#endif
 
     // F3-1: prove the per-CPU runqueue lock topology is sound AT REST (rq_lock
     // init'd, ready_count==walk, no cross-cpu duplicate, secondary cpus empty)
@@ -665,8 +682,10 @@ int scheduler_init_secondary_cpu(uint32_t cpu, uint32_t apic_id) {
     cpus[cpu].apic_id = apic_id;
     cpus[cpu].online  = 1;
 
-    runqueue_init(&cpus[cpu].rq_active);
-    runqueue_init(&cpus[cpu].rq_expired);
+    cpus[cpu].rq_active  = &cpus[cpu].rq_storage[0];
+    cpus[cpu].rq_expired = &cpus[cpu].rq_storage[1];
+    runqueue_init(cpus[cpu].rq_active);
+    runqueue_init(cpus[cpu].rq_expired);
     cpus[cpu].ready_count = 0;
     // F3-1 (F-2 hazard): init this AP's rq_lock BEFORE any code acquires it. The BSP
     // takes cpus[cpu].rq_lock cross-CPU in scheduler_add_process_to_cpu (called by
@@ -694,11 +713,13 @@ int scheduler_init_secondary_cpu(uint32_t cpu, uint32_t apic_id) {
      * fxsave64/context_switch_asm, and later switches back restore exactly that. So
      * idle is self-consistent without an explicit rip/cr3 override here. */
 
+#ifndef SCHEDULER_QUIET
     kprintf("[SCHEDULER] CPU%u secondary slot online: idle PID %d stack=%p "
             "(CPU0 idle PID %d stack=%p) rq_active=%p\n",
             cpu, idle->pid, (void*)idle->kernel_stack,
             cpus[0].idle_thread->pid, (void*)cpus[0].idle_thread->kernel_stack,
-            (void*)&cpus[cpu].rq_active);
+            (void*)&cpus[cpu].rq_storage[0]);
+#endif
     return 1;
 }
 
@@ -745,7 +766,7 @@ void scheduler_add_process_to_cpu(process_t* proc, uint32_t cpu) {
         proc->on_queue = 1;
         proc->queued_cpu = cpu;              // membership lands on the TARGET cpu
         int priority = process_get_priority(proc);
-        runqueue_enqueue(&cpus[cpu].rq_expired, proc, priority);
+        runqueue_enqueue(cpus[cpu].rq_expired, proc, priority);
         cpus[cpu].ready_count++;
     }
     spin_unlock(&cpus[cpu].rq_lock);
@@ -813,6 +834,10 @@ void ap_cooperative_schedule(void) {
     // voluntarily yielded (state still RUNNING). The idle fallback is never queued.
     if (current != cpu->idle_thread && current->state == PROCESS_RUNNING) {
         scheduler_add_process(current);       // this_cpu()==cpus[1] -> cpus[1].rq
+        // LEAK-FIX: drop the outgoing process's old "running" ref. The queue now
+        // holds a fresh ref from scheduler_add_process, so the process will not be
+        // freed. Mirrors the BSP cooperative schedule() LEAK-FIX.
+        process_unref(current);
     }
 
     cpu_set_current_thread(next);             // cpus[1].current_thread = next (per-CPU)
@@ -963,7 +988,7 @@ void scheduler_shutdown(void) {
     //    the scheduler's reference for each process.
     for (int prio = 0; prio < SCHED_PRIORITY_LEVELS; prio++) {
         process_t* proc;
-        while ((proc = runqueue_dequeue(&this_cpu()->rq_active, prio)) != NULL) {
+        while ((proc = runqueue_dequeue(this_cpu()->rq_active, prio)) != NULL) {
             proc->on_queue = 0;
             this_cpu()->ready_count--;
             drained_count++;
@@ -979,7 +1004,7 @@ void scheduler_shutdown(void) {
     // 3) Drain the EXPIRED runqueue.
     for (int prio = 0; prio < SCHED_PRIORITY_LEVELS; prio++) {
         process_t* proc;
-        while ((proc = runqueue_dequeue(&this_cpu()->rq_expired, prio)) != NULL) {
+        while ((proc = runqueue_dequeue(this_cpu()->rq_expired, prio)) != NULL) {
             proc->on_queue = 0;
             this_cpu()->ready_count--;
             drained_count++;
@@ -1053,6 +1078,14 @@ void scheduler_shutdown(void) {
 // ===========================================================================
 #ifdef SCHED_DEBUG
 static volatile uint64_t g_sched_invariant_violations = 0;
+// Wave-7 perf: sample validation every 64th call (not every call). The
+// validators are O(n) in the runqueue depth and dominate the add/remove/pick
+// hot path when SCHED_DEBUG is on. Sampling reduces that overhead by ~98%
+// while still catching invariant regressions within ~64 ticks (~64 ms).
+static volatile uint64_t g_sched_dbg_call_counter = 0;
+#define SCHED_DBG_SAMPLE_INTERVAL 64
+#define SCHED_DBG_SHOULD_SAMPLE() \
+    ((__atomic_add_fetch(&g_sched_dbg_call_counter, 1, __ATOMIC_RELAXED) & (SCHED_DBG_SAMPLE_INTERVAL - 1)) == 0)
 
 #define SCHED_VIOLATION(where, pid, fmt, ...)                                   \
     do {                                                                        \
@@ -1104,8 +1137,8 @@ static int sched_dbg_cross_cpu_duplicates(const process_t* p, const char* where)
     int seen = 0;
     for (uint32_t cid = 0; cid < MAX_CPUS; cid++) {
         if (!cpus[cid].online) continue;
-        if (sched_dbg_in_rq(&cpus[cid].rq_active,  p) ||
-            sched_dbg_in_rq(&cpus[cid].rq_expired, p)) {
+        if (sched_dbg_in_rq(cpus[cid].rq_active,  p) ||
+            sched_dbg_in_rq(cpus[cid].rq_expired, p)) {
             seen++;
         }
     }
@@ -1128,8 +1161,8 @@ static int sched_validate_task(process_t* p, const char* where) {
     uint32_t qcpu = (p->on_queue && p->queued_cpu < MAX_CPUS) ? p->queued_cpu : cpu_id();
     cpu_t* qc = &cpus[qcpu];
 
-    int in_active  = sched_dbg_in_rq(&qc->rq_active,  p);
-    int in_expired = sched_dbg_in_rq(&qc->rq_expired, p);
+    int in_active  = sched_dbg_in_rq(qc->rq_active,  p);
+    int in_expired = sched_dbg_in_rq(qc->rq_expired, p);
     int on_sleep   = sched_dbg_on_sleep_list(p);
     int on_wait    = (p->wait_on != NULL);
 
@@ -1263,15 +1296,15 @@ static int sched_validate_runqueues(const char* where) {
     for (uint32_t cid = 0; cid < MAX_CPUS; cid++) {
         if (!cpus[cid].online) continue;
         uint32_t counted = 0;
-        sched_dbg_walk_rq(&cpus[cid].rq_active,  cid, "active",  where, &counted);
-        sched_dbg_walk_rq(&cpus[cid].rq_expired, cid, "expired", where, &counted);
+        sched_dbg_walk_rq(cpus[cid].rq_active,  cid, "active",  where, &counted);
+        sched_dbg_walk_rq(cpus[cid].rq_expired, cid, "expired", where, &counted);
         if (counted != cpus[cid].ready_count) {
             kprintf("[SCHED_INVARIANT] VIOLATION at %s cpu=%u : ready_count=%u but counted %u nodes\n", where, cid, cpus[cid].ready_count, counted);
             g_sched_invariant_violations++;
         }
         if (cpus[cid].idle_thread &&
-            (sched_dbg_in_rq(&cpus[cid].rq_active,  cpus[cid].idle_thread) ||
-             sched_dbg_in_rq(&cpus[cid].rq_expired, cpus[cid].idle_thread))) {
+            (sched_dbg_in_rq(cpus[cid].rq_active,  cpus[cid].idle_thread) ||
+             sched_dbg_in_rq(cpus[cid].rq_expired, cpus[cid].idle_thread))) {
             kprintf("[SCHED_INVARIANT] VIOLATION at %s cpu=%u : idle_thread is enqueued\n", where, cid);
             g_sched_invariant_violations++;
         }
@@ -1288,7 +1321,7 @@ static int sched_validate_runqueues(const char* where) {
         for (uint32_t cid = 0; cid < MAX_CPUS; cid++) {
             if (!cpus[cid].online) continue;
             uint32_t bound = cpus[cid].ready_count + 16, visited = 0;
-            runqueue_t* rqs[2] = { &cpus[cid].rq_active, &cpus[cid].rq_expired };
+            runqueue_t* rqs[2] = { cpus[cid].rq_active, cpus[cid].rq_expired };
             for (int q = 0; q < 2; q++) {
                 for (int prio = 0; prio < SCHED_PRIORITY_LEVELS; prio++) {
                     process_t* it = rqs[q]->queues[prio];
@@ -1310,7 +1343,7 @@ static int sched_validate_runqueues(const char* where) {
     for (uint32_t cid = 0; cid < MAX_CPUS; cid++) {
         if (!cpus[cid].online) continue;
         uint32_t bound = cpus[cid].ready_count + 16, visited = 0;
-        runqueue_t* rqs[2] = { &cpus[cid].rq_active, &cpus[cid].rq_expired };
+        runqueue_t* rqs[2] = { cpus[cid].rq_active, cpus[cid].rq_expired };
         for (int q = 0; q < 2; q++)
             for (int prio = 0; prio < SCHED_PRIORITY_LEVELS; prio++) {
                 process_t* it = rqs[q]->queues[prio];
@@ -1365,9 +1398,21 @@ static void scheduler_rqlock_selftest(void) {
     // acquire any rq_lock, so cpu0's own lock still reads the init signature.
     for (uint32_t cid = 0; cid < MAX_CPUS; cid++) {
         if (!cpus[cid].online) continue;
-        if (cpus[cid].rq_lock.lock != 0 || cpus[cid].rq_lock.owner_cpu != 0xFFFFFFFF) {
-            kprintf("[SCHEDULER] RQLOCK: inv1 cpu=%u rq_lock not initialized (lock=%u owner=%x)\n",
-                    cid, cpus[cid].rq_lock.lock, cpus[cid].rq_lock.owner_cpu);
+        if (cpus[cid].rq_lock.lock != 0
+#ifdef SPINLOCK_DEBUG
+            || cpus[cid].rq_lock.owner_cpu != 0xFFFFFFFF
+#endif
+            ) {
+            kprintf("[SCHEDULER] RQLOCK: inv1 cpu=%u rq_lock not initialized (lock=%u"
+#ifdef SPINLOCK_DEBUG
+                    " owner=%x"
+#endif
+                    ")\n",
+                    cid, cpus[cid].rq_lock.lock
+#ifdef SPINLOCK_DEBUG
+                    , cpus[cid].rq_lock.owner_cpu
+#endif
+                    );
             fails++;
         }
     }
@@ -1380,7 +1425,7 @@ static void scheduler_rqlock_selftest(void) {
         if (!cpus[cid].online) continue;
         // Inv 2: ready_count == bounded node walk of active+expired.
         uint32_t counted = 0, bound = cpus[cid].ready_count + 16;
-        runqueue_t* rqs[2] = { &cpus[cid].rq_active, &cpus[cid].rq_expired };
+        runqueue_t* rqs[2] = { cpus[cid].rq_active, cpus[cid].rq_expired };
         for (int q = 0; q < 2; q++)
             for (int prio = 0; prio < SCHED_PRIORITY_LEVELS; prio++) {
                 process_t* it = rqs[q]->queues[prio];
@@ -1422,7 +1467,7 @@ static void scheduler_rqlock_selftest(void) {
         for (uint32_t cid = 0; cid < MAX_CPUS; cid++) {
             if (!cpus[cid].online) continue;
             uint32_t bound = cpus[cid].ready_count + 16, visited = 0;
-            runqueue_t* rqs[2] = { &cpus[cid].rq_active, &cpus[cid].rq_expired };
+            runqueue_t* rqs[2] = { cpus[cid].rq_active, cpus[cid].rq_expired };
             for (int q = 0; q < 2; q++)
                 for (int prio = 0; prio < SCHED_PRIORITY_LEVELS; prio++) {
                     process_t* it = rqs[q]->queues[prio];
@@ -1477,7 +1522,7 @@ static void scheduler_affinity_selftest(void) {
         // (3) Any queued task must have a non-zero mask, be allowed on the cpu it is
         // actually on, and (if pinned) be pinned to that cpu. Empty at boot; bounded.
         uint32_t bound = cpus[cid].ready_count + 16, visited = 0;
-        runqueue_t* rqs[2] = { &cpus[cid].rq_active, &cpus[cid].rq_expired };
+        runqueue_t* rqs[2] = { cpus[cid].rq_active, cpus[cid].rq_expired };
         for (int q = 0; q < 2; q++)
             for (int prio = 0; prio < SCHED_PRIORITY_LEVELS; prio++) {
                 process_t* it = rqs[q]->queues[prio];
@@ -1508,6 +1553,7 @@ static inline int sched_validate_task(process_t* p, const char* where) { (void)p
 static inline int sched_validate_runqueues(const char* where) { (void)where; return 0; }
 static void scheduler_rqlock_selftest(void) { }  /* perf build: no topology proof */
 static void scheduler_affinity_selftest(void) { }  /* perf build: no affinity proof */
+#define SCHED_DBG_SHOULD_SAMPLE() (0)  /* perf build: validation compiled out anyway */
 #endif /* SCHED_DEBUG */
 
 void scheduler_add_process(process_t* proc) {
@@ -1567,13 +1613,34 @@ void scheduler_add_process(process_t* proc) {
     // This implements round-robin within each priority level
     // When time_slice == 0, process exhausted quantum → expired queue
     // When time_slice > 0, process yielded early → expired queue (maintains fairness)
-    runqueue_enqueue(&this_cpu()->rq_expired, proc, priority);
+    runqueue_enqueue(this_cpu()->rq_expired, proc, priority);
 
     this_cpu()->ready_count++;
 
+#ifdef SCHED_DEBUG
+    // DIAGNOSTIC: the first time a NON-init process (pid>1) is successfully
+    // enqueued, paint a marker. This proves a spawned child was created, made
+    // READY, and added to the runqueue — i.e. the scheduler now HAS something to
+    // run. If this appears but "non-init proc RAN" does not, the child is queued
+    // but never switched to (a dispatch bug). If it never appears, no child was
+    // ever created (a load/spawn failure).
+    if (proc->pid > 1) {
+        static volatile int _child_enq_seen = 0;
+        if (!_child_enq_seen) {
+            _child_enq_seen = 1;
+            extern void framebuffer_puts_scaled(const char*, uint32_t, uint32_t,
+                                                uint32_t, uint32_t);
+            framebuffer_puts_scaled("child ENQUEUED (ready)", 40, 216, 0x0000FF00u, 2);
+        }
+    }
+#endif
+
     // F3-0 proof guard: settled state here (on_queue=1, state=READY, linked, counted).
-    sched_validate_task(proc, "add_process:exit");
-    sched_validate_runqueues("add_process:exit");
+    // Wave-7 perf: sampled every 64th call to keep the hot path fast.
+    if (SCHED_DBG_SHOULD_SAMPLE()) {
+        sched_validate_task(proc, "add_process:exit");
+        sched_validate_runqueues("add_process:exit");
+    }
 
     spin_unlock(&this_cpu()->rq_lock);
 
@@ -1635,13 +1702,13 @@ void scheduler_yield_requeue(process_t* proc) {
         // Spend one bonus turn: re-enter ACTIVE so this higher-priority process
         // is eligible to be picked again immediately (ahead of lower priorities).
         proc->yield_boost--;
-        runqueue_enqueue(&this_cpu()->rq_active, proc, priority);
+        runqueue_enqueue(this_cpu()->rq_active, proc, priority);
     } else {
         // Out of bonus turns (or never had any): refill from nice and rotate to
         // EXPIRED, guaranteeing lower-priority ready processes get their turn
         // after the next active/expired swap (anti-starvation preserved).
         proc->yield_boost = priority_yield_boost(proc->priority);
-        runqueue_enqueue(&this_cpu()->rq_expired, proc, priority);
+        runqueue_enqueue(this_cpu()->rq_expired, proc, priority);
     }
     this_cpu()->ready_count++;
     spin_unlock(&this_cpu()->rq_lock);
@@ -1674,11 +1741,11 @@ void scheduler_remove_process(process_t* proc) {
     int priority = process_get_priority(proc);
 
     // Try to remove from active runqueue first
-    int found = runqueue_remove(&this_cpu()->rq_active, proc, priority);
+    int found = runqueue_remove(this_cpu()->rq_active, proc, priority);
 
     // If not in active, try expired
     if (!found) {
-        found = runqueue_remove(&this_cpu()->rq_expired, proc, priority);
+        found = runqueue_remove(this_cpu()->rq_expired, proc, priority);
     }
 
     if (found) {
@@ -1688,7 +1755,10 @@ void scheduler_remove_process(process_t* proc) {
         // F3-0 proof guard: the runqueue must be consistent after removal. (The
         // removed task's state may be mid-transition at this site, so validate the
         // queue STRUCTURE only, not the removed task's per-state membership.)
-        sched_validate_runqueues("remove_process:exit");
+        // Wave-7 perf: sampled every 64th call.
+        if (SCHED_DBG_SHOULD_SAMPLE()) {
+            sched_validate_runqueues("remove_process:exit");
+        }
 
         spin_unlock(&this_cpu()->rq_lock);
 
@@ -1706,6 +1776,26 @@ void scheduler_remove_process(process_t* proc) {
 
     PERF_END(PERF_OP_SCHEDULER_REMOVE);
 }
+
+// DIAGNOSTIC markers (SCHED_DEBUG): split "scheduler picked the child" from
+// "scheduler found nothing runnable and returned idle". Fire once each.
+#ifdef SCHED_DEBUG
+#define SCHED_PICK_IDLE_MARK() do { \
+    static volatile int _pim = 0; \
+    if (!_pim) { _pim = 1; \
+        extern void framebuffer_puts_scaled(const char*,uint32_t,uint32_t,uint32_t,uint32_t); \
+        framebuffer_puts_scaled("pick=IDLE (no runnable child!)", 40, 260, 0x00FF0000u, 2); } \
+} while (0)
+#define SCHED_PICK_CHILD_MARK(p) do { \
+    static volatile int _pcm = 0; \
+    if (!_pcm && (p) && (p)->pid > 1) { _pcm = 1; \
+        extern void framebuffer_puts_scaled(const char*,uint32_t,uint32_t,uint32_t,uint32_t); \
+        framebuffer_puts_scaled("pick=CHILD ok (dispatching)", 40, 282, 0x0000FF00u, 2); } \
+} while (0)
+#else
+#define SCHED_PICK_IDLE_MARK() do {} while (0)
+#define SCHED_PICK_CHILD_MARK(p) do {} while (0)
+#endif
 
 process_t* scheduler_pick_next(void) {
     // RACE-001 fix: Acquire this cpu's runqueue lock before queue access (F3-1: was
@@ -1727,15 +1817,16 @@ process_t* scheduler_pick_next(void) {
 
 pick_again:
     // Try to pick highest priority process from active runqueue
-    next = runqueue_pick_next(&this_cpu()->rq_active);
+    next = runqueue_pick_next(this_cpu()->rq_active);
 
     if (next == NULL) {
         // Active runqueue is empty - check if expired has processes
-        if (runqueue_is_empty(&this_cpu()->rq_expired)) {
+        if (runqueue_is_empty(this_cpu()->rq_expired)) {
             // Both runqueues are empty: nothing runnable. Return the idle thread,
             // which is NOT enqueued (see scheduler_init) — it is the dedicated
             // fallback that runs only in this all-empty state.
             spin_unlock(&this_cpu()->rq_lock);
+            SCHED_PICK_IDLE_MARK();
             return this_cpu()->idle_thread;
         }
 
@@ -1743,12 +1834,13 @@ pick_again:
         runqueue_swap();
 
         // Try again from newly active runqueue
-        next = runqueue_pick_next(&this_cpu()->rq_active);
+        next = runqueue_pick_next(this_cpu()->rq_active);
 
         if (next == NULL) {
             // Expired was non-empty but yielded nothing pickable (all entries
             // drained as terminated): fall back to the idle thread.
             spin_unlock(&this_cpu()->rq_lock);
+            SCHED_PICK_IDLE_MARK();
             return this_cpu()->idle_thread;
         }
     }
@@ -1780,7 +1872,10 @@ pick_again:
     // F3-0 proof guard: validate the runqueue STRUCTURE only here. The just-picked
     // task is dequeued (on_queue=0) but still PROCESS_READY (READY->RUNNING happens
     // later in process_set_current), so a per-task check would false-positive.
-    sched_validate_runqueues("pick_next:exit");
+    // Wave-7 perf: sampled every 64th call.
+    if (SCHED_DBG_SHOULD_SAMPLE()) {
+        sched_validate_runqueues("pick_next:exit");
+    }
 
     spin_unlock(&this_cpu()->rq_lock);
 
@@ -1823,6 +1918,7 @@ pick_again:
 
     // Reference is transferred to caller - they own it now
     // (scheduler_add_process took a reference, we're just transferring ownership)
+    SCHED_PICK_CHILD_MARK(next);
     return next;
 }
 
@@ -2035,25 +2131,28 @@ void schedule(void) {
             // context_switch (RESUME_CRETURN) or iretq resume (RESUME_IRETQ) and
             // sets next's TSS/kernel stack.
             current->resume_mode = RESUME_CRETURN;
+
+            // LEAK-FIX: drop the outgoing process's "running" ref BEFORE the
+            // switch. scheduler_add_process(current) above already took a NEW
+            // queue ref, so current has at least creation(1) + queue(1) = 2 refs
+            // and will not be freed here. Without this, the running ref
+            // accumulates on every yield/preemption cycle: ref grows by +1 each
+            // time the process is re-enqueued and re-picked, and a long-running
+            // process that yields N times exits with ref = 2+N. The TERMINATED
+            // path only drops 1 (schedule's unref), the reaper drops 1 (creation),
+            // and process_destroy drops 1 -- total 3, leaving N-1 orphan refs that
+            // pin the PCB/8KB-stack/CR3/PID forever. Dropping it here restores the
+            // invariant: a queued process has ref = creation(1) + queue(1) = 2, and
+            // when re-picked the queue ref transfers to become the new running ref.
+            // Safe: this runs BEFORE cooperative_switch_to, so we are still on
+            // current's stack and current is still valid. Cannot reach ref 0:
+            // creation ref + queue ref guarantee >= 2. BUG-006 constraint (no code
+            // after context_switch) is respected: this is BEFORE the switch.
+            process_unref(current);
+
             cooperative_switch_to(current, next);
 
             // BUG-006 fix: Do NOT put ANY code here that references 'current' or local variables!
-            //
-            // When context_switch() "returns", we're actually resuming THIS process after it
-            // was previously switched out. At that point, local variables like 'current',
-            // 'next', and 'old' contain STALE values from the previous context switch.
-            //
-            // For example:
-            //   1. Process A switches to Process B (current=A, next=B)
-            //   2. Later, Process B switches to Process A
-            //   3. Process A resumes HERE with stale values (current=A, next=B from step 1)
-            //   4. Calling process_unref(current) would incorrectly unref Process A!
-            //
-            // Solution: Never access local variables after context_switch().
-            // The process reference counting is handled correctly because:
-            //   - scheduler_add_process() takes a reference when adding to ready queue
-            //   - scheduler_pick_next() transfers that reference to the caller
-            //   - When process terminates, scheduler_remove_process() releases it
         }
     }
 
@@ -2237,6 +2336,15 @@ void schedule_from_irq(interrupt_frame_t* frame) {
             current->need_resched = 0;
             current->total_time++;
             scheduler_add_process(current);
+            // LEAK-FIX: drop the outgoing process's old "running" ref. The queue
+            // now holds a fresh ref from scheduler_add_process, so ref >= 2
+            // (creation + queue); this will not free the process. Mirrors the
+            // cooperative schedule() LEAK-FIX.
+            process_unref(current);
+        } else {
+            // TERMINATED outgoing on the first-dispatch path (same as step 5):
+            // drop the running ref without re-enqueuing. See step 5 comment.
+            process_unref(current);
         }
 
         // SYNTHESIZE a fresh ring-3 entry frame directly into `frame`. Zero all
@@ -2326,6 +2434,20 @@ void schedule_from_irq(interrupt_frame_t* frame) {
         // Re-queue it (preserve remaining quantum semantics: a preempted
         // process that exhausted its quantum gets a fresh one in pick_next).
         scheduler_add_process(current);
+        // LEAK-FIX: drop the outgoing process's old "running" ref. The queue
+        // now holds a fresh ref from scheduler_add_process, so ref >= 2
+        // (creation + queue); this will not free the process. Mirrors the
+        // cooperative schedule() LEAK-FIX.
+        process_unref(current);
+    } else {
+        // TERMINATED current (self-SIGKILL that returned to ring 3, then
+        // preempted by the timer): do NOT re-enqueue (a dead process must
+        // never re-enter the ready queue), but DO drop the running ref so
+        // the zombie can reach ref 0 when the reaper drops the creation ref.
+        // This mirrors the cooperative schedule()'s KILL-FIX-002 unref of
+        // `dead`. Safe: the creation ref (reaped==0) keeps ref_count >= 1,
+        // so this cannot free the PCB here.
+        process_unref(current);
     }
 
     // 6) Make the incoming process current and load it into the on-stack frame
@@ -2367,12 +2489,39 @@ void schedule_from_irq(interrupt_frame_t* frame) {
 #endif // PREEMPTIVE
 
 void scheduler_start(void) {
+    // T410 diagnostics: paint fine-grained progress markers to the framebuffer
+    // so a photograph of a frozen T410 screen reveals the exact sub-step.
+    // These are ALWAYS compiled (the freeze is invisible without them) and are
+    // harmlessly overwritten by the compositor once the desktop comes up.
+    // The function is declared in drivers.h; we use a local extern to avoid
+    // pulling the full header into the scheduler.
+    extern void framebuffer_puts_scaled(const char*, uint32_t, uint32_t,
+                                        uint32_t, uint32_t);
+    // DIAGNOSTIC markers for the ring-3 hand-off. Each successive call paints on
+    // its OWN line (y advances 22px) so they DON'T overlap into an unreadable
+    // smear — the LAST legible yellow line on a frozen screen pinpoints exactly
+    // which sub-step died. Gated behind SCHED_DEBUG so SCHED_DEBUG=0 ships a
+    // clean boot screen. (Previously all markers wrote y=16 and OR'd on top of
+    // each other, which looked like "glitched" yellow text.)
+#ifdef SCHED_DEBUG
+    static int _sd_line = 0;
+#define SCHED_DIAG(msg) \
+    framebuffer_puts_scaled((msg), 40, 16 + (_sd_line++) * 22, 0x00FFFF00u, 2)
+#else
+#define SCHED_DIAG(msg) ((void)0)
+#endif
+
+    SCHED_DIAG("sched: pick_next");
+#ifndef SCHEDULER_QUIET
     kprintf("[SCHEDULER] ========================================\n");
     kprintf("[SCHEDULER] Starting scheduler...\n");
     kprintf("[SCHEDULER] ========================================\n");
+#endif
 
     // Pick the first process to run (may be idle thread if no user processes)
+#ifndef SCHEDULER_QUIET
     kprintf("[SCHEDULER] Picking first process from ready queue...\n");
+#endif
     process_t* first = scheduler_pick_next();
 
     // scheduler_pick_next() now always returns a valid process (either a real
@@ -2380,6 +2529,8 @@ void scheduler_start(void) {
     // The idle thread is a valid boot target - it will halt until an interrupt
     // (e.g., a device driver) readies a real process.
 
+    SCHED_DIAG("sched: picked, set TSS");
+#ifndef SCHEDULER_QUIET
     kprintf("[SCHEDULER] First process selected: '%s' (PID %d)\n", first->name, first->pid);
     kprintf("[SCHEDULER]   Entry point: 0x%016lx\n", first->context.rip);
     kprintf("[SCHEDULER]   Stack pointer: 0x%016lx\n", first->context.rsp);
@@ -2387,11 +2538,14 @@ void scheduler_start(void) {
     kprintf("[SCHEDULER]   CR3: 0x%016lx\n", first->context.cr3);
     kprintf("[SCHEDULER]   Time slice: %d ticks\n", first->time_slice);
     kprintf("[SCHEDULER]   State: %d -> RUNNING\n", first->state);
+#endif
 
     // Set as current process
     first->state = PROCESS_RUNNING;
     process_set_current(first);
+#ifndef SCHEDULER_QUIET
     kprintf("[SCHEDULER] Current process set to PID %d\n", first->pid);
+#endif
 
     // CRITICAL: Set TSS.RSP0 to this process's kernel stack
     // When userspace is interrupted, CPU loads kernel stack from TSS.RSP0
@@ -2410,8 +2564,10 @@ void scheduler_start(void) {
     extern uint64_t kernel_rsp_save;
     kernel_rsp_save = kstack_top;
 
+#ifndef SCHEDULER_QUIET
     kprintf("[SCHEDULER] TSS.RSP0 set to 0x%016lx (kernel stack top)\n", kstack_top);
     kprintf("[SCHEDULER]   Kernel stack base: 0x%016lx\n", (uint64_t)first->kernel_stack);
+#endif
 
     // Check if the first process is the idle thread (kernel thread) or a user
     // process. The idle thread has user_entry == 0 (it's kernel-only), so we
@@ -2419,11 +2575,14 @@ void scheduler_start(void) {
     if (first->user_entry == 0) {
         // Idle thread or other kernel thread: jump directly to its kernel function.
         // context.rip points at idle_thread_func (or whatever kernel function).
+        SCHED_DIAG("sched: IDLE (no user!)");
+#ifndef SCHEDULER_QUIET
         kprintf("[SCHEDULER] ========================================\n");
         kprintf("[SCHEDULER] Starting kernel thread '%s'...\n", first->name);
         kprintf("[SCHEDULER]   RIP=0x%016lx RSP=0x%016lx CR3=0x%016lx\n",
                 first->context.rip, first->context.rsp, first->context.cr3);
         kprintf("[SCHEDULER] ========================================\n");
+#endif
 
         // Switch to the idle thread's kernel stack and jump to its entry.
         // This is a one-way jump (no return) - the idle thread runs forever.
@@ -2441,14 +2600,54 @@ void scheduler_start(void) {
         // This prevents race where timer IRQ fires before kernel stack is configured
         // NOTE: Do NOT sti() here - IRETQ in enter_usermode sets IF=1 in RFLAGS
         // This avoids timer interrupt firing before we transition to ring 3
+
+        // ---------------------------------------------------------------
+        // FPU/SSE INIT for first dispatch (T410 cold-start fix).
+        //
+        // scheduler_start() calls enter_usermode() DIRECTLY, bypassing
+        // context_switch() which normally primes the FPU template and
+        // FXRSTOR's a clean state.  The hardware FPU registers retain
+        // whatever the BIOS / kernel boot left: on real hardware (T410)
+        // MXCSR may have unmasked SSE exceptions.  GCC-compiled userspace
+        // uses XMM registers for memcpy / integer vectorisation, so the
+        // very first SSE instruction would #XM with no handler -> #DF ->
+        // triple fault (appears as a freeze at "starting services").
+        //
+        // Fix: eagerly init the FPU template (idempotent if already done)
+        // and FXRSTOR the clean state so the hardware registers are safe
+        // BEFORE the one-shot enter_usermode IRETQ.
+        // ---------------------------------------------------------------
+        SCHED_DIAG("sched: fpu init");
+        {
+            extern void context_fpu_template_init(void);
+            context_fpu_template_init();
+
+            // Prime the process's fpu_state if still zeroed (same logic as
+            // context_switch / context_prime_fpu).
+            extern int  fpu_state_needs_init(const uint8_t* fpu_state);
+            extern void fpu_state_prime(uint8_t* fpu_state);
+            if (fpu_state_needs_init(first->context.fpu_state)) {
+                fpu_state_prime(first->context.fpu_state);
+            }
+
+            // Load the primed FPU state into the HARDWARE registers.
+            // enter_usermode does NOT fxrstor (it only builds an IRETQ
+            // frame), so without this the hardware retains stale MXCSR.
+            __asm__ volatile("fxrstor64 %0" :: "m"(first->context.fpu_state));
+        }
+
+#ifndef SCHEDULER_QUIET
         kprintf("[SCHEDULER] ========================================\n");
         kprintf("[SCHEDULER] Transitioning to ring 3 (user mode)...\n");
         kprintf("[SCHEDULER]   RIP=0x%016lx RSP=0x%016lx CR3=0x%016lx\n",
                 first->user_entry, first->user_rsp, first->context.cr3);
         kprintf("[SCHEDULER] ========================================\n");
+#endif
+        SCHED_DIAG("sched: enter_usermode");
         enter_usermode(first->user_entry, first->user_rsp, first->context.cr3);
     }
 
+#undef SCHED_DIAG
     // Should never reach here
     kernel_panic("scheduler_start: Returned from initial dispatch");
 }
@@ -2535,7 +2734,7 @@ int scheduler_validate_ready_count(uint32_t cpu_id) {
 
     // Count processes in active runqueue
     for (int prio = 0; prio < SCHED_PRIORITY_LEVELS; prio++) {
-        process_t* proc = cpu->rq_active.queues[prio];
+        process_t* proc = cpu->rq_active->queues[prio];
         while (proc) {
             actual_count++;
             proc = proc->next;
@@ -2544,7 +2743,7 @@ int scheduler_validate_ready_count(uint32_t cpu_id) {
 
     // Count processes in expired runqueue
     for (int prio = 0; prio < SCHED_PRIORITY_LEVELS; prio++) {
-        process_t* proc = cpu->rq_expired.queues[prio];
+        process_t* proc = cpu->rq_expired->queues[prio];
         while (proc) {
             actual_count++;
             proc = proc->next;

@@ -177,7 +177,7 @@ void bench_epoll_ctl(void) {
     // Create some file descriptors to monitor
     int fds[100];
     for (int i = 0; i < 100; i++) {
-        fds[i] = syscall3(SYS_SOCKET, AF_INET, SOCK_DGRAM, 0);
+        fds[i] = syscall1(SYS_SOCKET, SOCK_DGRAM);
     }
 
     // Benchmark EPOLL_CTL_ADD
@@ -254,7 +254,7 @@ void bench_epoll_wait_scalability(void) {
         // Create and register file descriptors
         int* fds = malloc(fd_count * sizeof(int));
         for (int i = 0; i < fd_count; i++) {
-            fds[i] = syscall3(SYS_SOCKET, AF_INET, SOCK_DGRAM, 0);
+            fds[i] = syscall1(SYS_SOCKET, SOCK_DGRAM);
 
             epoll_event_t ev;
             ev.events = EPOLLIN;
@@ -315,7 +315,7 @@ void bench_epoll_wait_with_events(void) {
     // Create 100 sockets, register all
     int fds[100];
     for (int i = 0; i < 100; i++) {
-        fds[i] = syscall3(SYS_SOCKET, AF_INET, SOCK_DGRAM, 0);
+        fds[i] = syscall1(SYS_SOCKET, SOCK_DGRAM);
 
         epoll_event_t ev;
         ev.events = EPOLLIN | EPOLLOUT;  // EPOLLOUT usually ready immediately
@@ -364,7 +364,7 @@ void bench_epoll_throughput(void) {
     }
 
     // Create one socket
-    int sock = syscall3(SYS_SOCKET, AF_INET, SOCK_DGRAM, 0);
+    int sock = syscall1(SYS_SOCKET, SOCK_DGRAM);
     if (sock < 0) {
         printf("[ERROR] Failed to create socket\n");
         return;

@@ -53,7 +53,7 @@ static int pipe_create(int pipefd[2]) {
 }
 
 /* Timer syscalls */
-#define SYS_GET_TICKS_MS 46
+#define SYS_GET_TICKS_MS 40
 static uint64_t get_ticks_ms(void) {
     uint64_t ret;
     asm volatile("syscall" : "=a"(ret) : "a"(SYS_GET_TICKS_MS) : "rcx", "r11", "memory");

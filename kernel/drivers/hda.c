@@ -23,8 +23,17 @@ void hda_msleep(uint32_t ms) {
     // Assuming 1000 Hz timer, convert to ticks
     uint64_t start = timer_get_ticks();
     uint64_t end = start + (ms * timer_get_frequency() / 1000);
+    /* Frozen-tick backstop: SYS_BEEP runs in syscall context with IF=0, so the
+     * PIT (IRQ0) cannot advance timer_get_ticks() while THIS task holds the CPU.
+     * The yield lets other IF=1 tasks run (IRQ0 ticks during them), but if the
+     * system is otherwise idle the tick may never advance -- so cap the spin so
+     * audio can NEVER hang the caller. Same rule as net resolve_mac():
+     * "any wall-clock wait inside a syscall MUST also have an iteration cap." */
+    uint32_t iters = 0;
+    const uint32_t iter_cap = 4000000u;
     while (timer_get_ticks() < end) {
         sys_yield(0, 0, 0, 0, 0, 0);  // Scheduler-aware sleep
+        if (++iters >= iter_cap) break;
     }
 }
 

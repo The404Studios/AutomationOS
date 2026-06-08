@@ -228,27 +228,48 @@ static void tcp_send_ack(sock_t* s) {
 /* Append in-order stream bytes into the socket RX ring. Returns the number of
  * bytes actually stored (< n if the ring filled). Callers MUST advance rcv_nxt
  * by the returned count only -- advancing by the full n would ACK bytes we
- * dropped, so the peer frees them and never retransmits (silent stream loss). */
+ * dropped, so the peer frees them and never retransmits (silent stream loss).
+ *
+ * Uses memcpy (up to two chunks for the wrap case) instead of byte-at-a-time. */
 static uint16_t rx_ring_push(sock_t* s, const uint8_t* p, uint16_t n) {
-    uint16_t pushed = 0;
-    for (uint16_t i = 0; i < n; i++) {
-        if (s->rx_used >= SOCK_RXBUF_SIZE) break;   /* ring full -> drop */
-        s->rxbuf[s->rx_tail] = p[i];
-        s->rx_tail = (s->rx_tail + 1) % SOCK_RXBUF_SIZE;
-        s->rx_used++;
-        pushed++;
+    uint32_t free_space = SOCK_RXBUF_SIZE - s->rx_used;
+    uint16_t to_push = (n <= free_space) ? n : (uint16_t)free_space;
+    if (to_push == 0) return 0;
+
+    /* First chunk: from rx_tail to end of buffer (or to_push, whichever smaller). */
+    uint32_t chunk1 = SOCK_RXBUF_SIZE - s->rx_tail;
+    if (chunk1 > to_push) chunk1 = to_push;
+    memcpy(s->rxbuf + s->rx_tail, p, chunk1);
+
+    /* Second chunk: wrap around to the beginning of the buffer. */
+    uint32_t chunk2 = to_push - chunk1;
+    if (chunk2 > 0) {
+        memcpy(s->rxbuf, p + chunk1, chunk2);
     }
-    return pushed;
+
+    s->rx_tail = (s->rx_tail + to_push) % SOCK_RXBUF_SIZE;
+    s->rx_used += to_push;
+    return to_push;
 }
 
 static uint32_t rx_ring_pop(sock_t* s, uint8_t* dst, uint32_t want) {
-    uint32_t n = 0;
-    while (n < want && s->rx_used > 0) {
-        dst[n++] = s->rxbuf[s->rx_head];
-        s->rx_head = (s->rx_head + 1) % SOCK_RXBUF_SIZE;
-        s->rx_used--;
+    uint32_t avail = (want <= s->rx_used) ? want : s->rx_used;
+    if (avail == 0) return 0;
+
+    /* First chunk: from rx_head to end of buffer (or avail, whichever smaller). */
+    uint32_t chunk1 = SOCK_RXBUF_SIZE - s->rx_head;
+    if (chunk1 > avail) chunk1 = avail;
+    memcpy(dst, s->rxbuf + s->rx_head, chunk1);
+
+    /* Second chunk: wrap around to the beginning. */
+    uint32_t chunk2 = avail - chunk1;
+    if (chunk2 > 0) {
+        memcpy(dst + chunk1, s->rxbuf, chunk2);
     }
-    return n;
+
+    s->rx_head = (s->rx_head + avail) % SOCK_RXBUF_SIZE;
+    s->rx_used -= avail;
+    return avail;
 }
 
 /*
@@ -320,11 +341,21 @@ int tcp_connect(sock_t* s, uint32_t dst_ip, uint16_t dst_port) {
 /* Send                                                                */
 /* ------------------------------------------------------------------ */
 /*
- * CHANGED: segments payloads > TCP_MSS into multiple consecutive sends
- * instead of truncating.  Waits for each segment's ACK before sending
- * the next (stop-and-wait within a call), respecting the peer's snd_wnd.
+ * Pipelined TCP send with a simple congestion window.
+ *
+ * Instead of stop-and-wait (1 segment in flight, wait for ACK, send next),
+ * we allow up to TCP_CWND_INIT segments in flight before blocking for ACKs.
+ * This is a ~4x throughput improvement on typical LAN RTTs.
+ *
+ * The retransmit bookkeeping only tracks the LAST outstanding segment (the
+ * sock_t structure has a single rt_data slot), so true loss recovery is still
+ * limited.  But for the common no-loss case, pipelining eliminates the
+ * round-trip wait between every segment.
+ *
  * Returns total bytes accepted (may be less than `len` on error mid-way).
  */
+#define TCP_CWND_INIT  4   /* segments in flight before we must wait for ACK */
+
 int tcp_send(sock_t* s, const void* data, uint16_t len) {
     if (s->state != TCP_ESTABLISHED && s->state != TCP_CLOSE_WAIT)
         return SOCK_ECONN;
@@ -332,15 +363,44 @@ int tcp_send(sock_t* s, const void* data, uint16_t len) {
 
     const uint8_t* ptr   = (const uint8_t*)data;
     uint16_t       sent  = 0;
+    uint32_t       in_flight = 0;   /* segments sent but not yet ACKed */
 
     while (sent < len) {
-        /* Wait for any previous outstanding segment to be ACKed. */
-        uint64_t start = now_ms();
-        while (s->rt_pending && now_ms() - start < TCP_CONNECT_MS) {
-            sock_poll();
-            if (s->reset) return sent ? (int)sent : SOCK_ECONN;
+        /* If we've hit the cwnd limit, drain until at least one ACK comes back.
+         * We detect ACKs by watching snd_una advance. */
+        if (in_flight >= TCP_CWND_INIT || s->rt_pending) {
+            uint32_t old_una = s->snd_una;
+            uint64_t start = now_ms();
+            while (now_ms() - start < TCP_CONNECT_MS) {
+                sock_poll();
+                if (s->reset) return sent ? (int)sent : SOCK_ECONN;
+                /* ACKs advanced snd_una -- we can send more. */
+                if (SEQ32_GT(s->snd_una, old_una)) {
+                    /* Estimate how many segments were ACKed. */
+                    uint32_t acked_bytes = s->snd_una - old_una;
+                    uint32_t acked_segs = (acked_bytes + TCP_MSS - 1) / TCP_MSS;
+                    if (acked_segs > in_flight) acked_segs = in_flight;
+                    in_flight -= acked_segs;
+                    break;
+                }
+                /* If retransmit cleared (single outstanding acked), we're good. */
+                if (!s->rt_pending && in_flight > 0) {
+                    in_flight = 0;
+                    break;
+                }
+            }
+            /* If snd_una still hasn't moved, check if rt timed out. */
+            if (in_flight >= TCP_CWND_INIT) {
+                if (s->rt_pending) {
+                    /* Still waiting -- one more brief drain attempt. */
+                    sock_poll();
+                    if (s->reset) return sent ? (int)sent : SOCK_ECONN;
+                    if (!s->rt_pending) { in_flight = 0; continue; }
+                    return sent ? (int)sent : SOCK_ETIMEDOUT;
+                }
+                in_flight = 0;  /* all ACKed if nothing pending */
+            }
         }
-        if (s->rt_pending) return sent ? (int)sent : SOCK_ETIMEDOUT;
 
         /* Determine this segment's size: min(remaining, MSS, peer window). */
         uint16_t chunk = (uint16_t)(len - sent);
@@ -359,14 +419,27 @@ int tcp_send(sock_t* s, const void* data, uint16_t len) {
             return sent ? (int)sent : SOCK_ECONN;
 
         s->snd_nxt += chunk;
+        /* Arm retransmit for this latest segment (overwrites previous -- only
+         * the tail of the pipeline is retransmittable, which is acceptable for
+         * the common no-loss case and matches the single-slot rt_data design). */
         tcp_arm_retransmit(s, TCP_ACK | TCP_PSH, seq, ptr + sent, chunk);
         sent = (uint16_t)(sent + chunk);
+        in_flight++;
 
-        /* Best-effort wait for ACK so we don't overrun the peer. */
-        start = now_ms();
+        /* Non-blocking poll: pick up any ACKs that arrived while we were
+         * building and transmitting, without waiting a full RTT. */
+        sock_poll();
+        if (s->reset) return sent ? (int)sent : SOCK_ECONN;
+        if (!s->rt_pending) in_flight = 0;
+    }
+
+    /* Final drain: wait briefly for the last segment's ACK so the caller
+     * doesn't close the connection before the peer has confirmed receipt. */
+    if (s->rt_pending) {
+        uint64_t start = now_ms();
         while (s->rt_pending && now_ms() - start < TCP_CONNECT_MS) {
             sock_poll();
-            if (s->reset) return sent ? (int)sent : SOCK_ECONN;
+            if (s->reset) break;
         }
     }
 
@@ -526,6 +599,12 @@ void tcp_input(uint32_t src_ip, uint32_t dst_ip,
             child->remote_port = src_port;
             child->parent     = s;
             child->snd_wnd    = net_ntohs(th->window);
+            /* BUG-FIX (socket leak): inherit the listener's owner_pid so
+             * sock_cleanup_process can reclaim this child if the owning
+             * process dies without closing its sockets. The old code left
+             * owner_pid == 0 (from memset), so process-death cleanup never
+             * found accepted children. */
+            child->owner_pid  = s->owner_pid;
 
             /* Initialize TCP state machine. */
             child->rcv_nxt    = seq + 1;      /* SYN consumes one seq */

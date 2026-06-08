@@ -733,6 +733,33 @@ static void ce_expr(Cg* g, const AstNode* e, int depth)
             cc_emit(g, "syscall");
             return;
         }
+        /* ---- generic syscall builtin: syscall(n[, a1, a2, a3]) ----
+         * Lets a SELF-CONTAINED single-file program reach ANY AutomationOS
+         * syscall (yield=15, get_ticks=40, fb_acquire=39, open/read/close, ...)
+         * WITHOUT inline asm or linking a libc -- the missing piece that made
+         * graphical/interactive programs impossible on the on-device compiler.
+         * ABI: n->rax, a1->rdi, a2->rsi, a3->rdx (up to 3 syscall args; covers
+         * almost every syscall). Returns the kernel's result in rax. */
+        if (callee && (ce_eq(callee, "syscall") || ce_eq(callee, "sys_call"))) {
+            static const char* const SCR[4] = { "rax", "rdi", "rsi", "rdx" };
+            int i;
+            if (nargs < 1) {
+                cc_error(g, e->span.start_line, "syscall(n,...) needs a number");
+                cc_emit(g, "mov rax, 0");
+                return;
+            }
+            if (nargs > 4)
+                cc_error(g, e->span.start_line, "syscall: at most 3 args after the number");
+            int n = nargs < 4 ? nargs : 4;
+            for (i = 0; i < n; i++) {
+                ce_expr(g, args[i], depth + 1);   /* arg i -> rax */
+                cc_emit(g, "push rax");
+            }
+            for (i = n - 1; i >= 0; i--)          /* reverse pop: top is arg n-1 */
+                ce_pop_into(g, SCR[i]);           /* arg0->rax(num), 1->rdi, 2->rsi, 3->rdx */
+            cc_emit(g, "syscall");                /* result left in rax */
+            return;
+        }
 
         /* ---- normal call ----
          * Evaluate each arg to rax and push (left-to-right). Maintain 16-byte

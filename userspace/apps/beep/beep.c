@@ -7,10 +7,10 @@
  *
  *     SYS_BEEP(freq_hz, ms)  ->  0 on success, negative on error
  *
- * SYS_BEEP is NOT yet wired into the kernel syscall table. The integrator must
- * register it (see the AUDIO ENGINEER report). Number 41 is the next free slot
- * after SYS_GET_TICKS_MS (40) in kernel/include/syscall.h. Until it is wired,
- * the call returns -ENOTSUP (-1) and this program prints a notice and exits 1.
+ * SYS_BEEP (45) is wired in the kernel syscall table (syscall.c) and routes
+ * to audio_beep() via the HDA audio driver.  If no HDA hardware is present,
+ * the call returns a negative error code and this program prints a notice
+ * and exits 1.
  *
  * Usage: this is a placeholder/demo. It plays A5 (880 Hz) for 250 ms, then
  * a 440 Hz "A4" for 250 ms.
@@ -34,7 +34,7 @@
  * --------------------------------------------------------------------- */
 #define SYS_EXIT   0
 #define SYS_WRITE  3
-#define SYS_BEEP   41   /* PROPOSED: not yet in kernel syscall.h / table */
+#define SYS_BEEP   45   /* kernel/include/syscall.h: SYS_BEEP = 45 */
 
 /* Two-arg syscall helper. RAX=number, RDI=a1, RSI=a2; clobbers per SYSV. */
 static inline long sc2(long n, long a1, long a2)

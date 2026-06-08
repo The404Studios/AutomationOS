@@ -34,3 +34,8 @@ uint32_t cpu_id(void) { return 0; }
 #endif
 void     scheduler_tick(void) { }
 void     vfs_sync_all(void) { }
+
+/* T410 thermal safety: thermal.c has deep deps (power.c -> cpufreq -> ...).
+ * The full power subsystem is not compiled yet, so stub the pit.c call-site.
+ * On real hardware this is a no-op until the power subsystem is wired up. */
+void     thermal_safety_tick(void) { }

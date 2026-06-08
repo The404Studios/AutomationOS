@@ -298,9 +298,32 @@ void* slab_alloc(slab_cache_t* c) {
     if (s->magic != SLAB_MAGIC || s->total_slots == 0 || obj == NULL ||
         ((uintptr_t)obj & SLAB_PAGE_MASK) != (uintptr_t)s) {
         kprintf("[SLAB] partial slab %p of cache '%s' has a corrupt header "
-                "(magic=%lx total=%u) — orphaning it and growing a fresh slab\n",
+                "(magic=%lx total=%u) — orphaning corrupt head\n",
                 s, c->name ? c->name : "?", (unsigned long)s->magic, s->total_slots);
-        c->partial = NULL;          /* drop the whole poisoned partial chain */
+
+        /* Salvage the rest of the partial chain if the next slab is valid.
+         * The corrupt slab's `next` pointer MAY be garbage, so validate it:
+         * it must be page-aligned and carry a valid magic canary. If not,
+         * we drop the entire chain (the old behaviour). */
+        slab_t* salvage = NULL;
+        {
+            slab_t* raw_next = s->next;
+            if (raw_next &&
+                ((uintptr_t)raw_next & (PAGE_SIZE - 1)) == 0 &&
+                raw_next->magic == SLAB_MAGIC) {
+                salvage = raw_next;
+                salvage->prev = NULL; /* unlink from the corrupt head */
+            }
+        }
+        c->partial = salvage;       /* keep valid tail, or NULL */
+
+        /* Account for the ONE orphaned slab page (leaked to avoid
+         * dereferencing a corrupt next/prev during list removal).
+         * objs_in_use is left inflated by whatever the corrupt slab had
+         * outstanding — those objects are unrecoverable. */
+        if (c->total_slabs > 0)
+            c->total_slabs--;
+
         s = slab_grow(c);           /* fresh backing page (re-links c->partial) */
         if (!s) { spin_unlock(&c->lock); return NULL; }
         obj = s->free_list;
@@ -355,6 +378,27 @@ void slab_free(slab_cache_t* c, void* obj) {
         kprintf("[SLAB] BLOCKED double/over free of %p in cache '%s'\n",
                 obj, c->name ? c->name : "?");
         return;
+    }
+
+    /* Per-object double-free detection: walk the free list to check whether this
+     * exact slot is already there. The free_count >= total_slots guard above only
+     * catches when ALL slots are free; without this scan a slot freed twice while
+     * other slots are still allocated silently creates a duplicate entry in the
+     * free list, causing two subsequent allocs to return the same pointer and
+     * leading to silent data corruption. The walk is O(free_count) per slab which
+     * is bounded by slots_per_slab (typically 20-60 for common size classes). */
+    {
+        void* node = s->free_list;
+        while (node) {
+            if (node == obj) {
+                spin_unlock(&c->lock);
+                kprintf("[SLAB] BLOCKED double-free of %p in cache '%s' "
+                        "(already on free list)\n",
+                        obj, c->name ? c->name : "?");
+                return;
+            }
+            node = *(void**)node;
+        }
     }
 
     bool was_full = (s->free_count == 0);

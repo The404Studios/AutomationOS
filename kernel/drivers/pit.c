@@ -45,6 +45,135 @@ static inline uint64_t pit_rflags_if(void)
     return rflags & (1ULL << 9);   /* RFLAGS.IF is bit 9 */
 }
 
+/* ================================================================
+ * T410 THERMAL SAFETY — self-contained in pit.c
+ * ================================================================
+ * The ThinkPad T410's Core i5 (Arrandale / Westmere) has a Digital Thermal
+ * Sensor (DTS) readable via MSR 0x19C (IA32_THERM_STATUS).  We probe for
+ * it at init time (CPUID leaf 6, EAX bit 0) and, once per second inside the
+ * timer IRQ, read the thermal margin and log warnings if the CPU is
+ * overheating or being hardware-throttled (PROCHOT#).
+ *
+ * This block is entirely self-contained: it uses only rdmsr() (inline in
+ * x86_64.h) and kprintf() -- no dependency on the power subsystem, which is
+ * not compiled into the default build.  The full power/thermal.c is upgraded
+ * too (real DTS read instead of fake 45 C) but that code is only active when
+ * the power subsystem is linked.
+ *
+ * Fan control is NOT attempted -- the T410 fan is managed by the Embedded
+ * Controller (EC register 0x2F via ACPI), which we don't have yet.
+ */
+
+#define MSR_IA32_THERM_STATUS       0x19C
+#define MSR_IA32_TEMPERATURE_TARGET 0x1A2
+
+#define THERM_STATUS_THROTTLING     (1U << 0)
+#define THERM_STATUS_READOUT_MASK   0x007F0000U   /* bits 22:16 */
+#define THERM_STATUS_READOUT_SHIFT  16
+#define THERM_STATUS_VALID          (1U << 31)
+
+#define THERMAL_WARN_C     85
+#define THERMAL_HIGH_C     90
+#define THERMAL_CRITICAL_C 95
+#define TJMAX_DEFAULT_C    100
+
+static bool     dts_available     = false;
+static uint32_t tjmax_c           = TJMAX_DEFAULT_C;
+static bool     throttle_warned   = false;
+static bool     warm_warned       = false;
+
+/*
+ * thermal_probe_dts() — called once from pit_init().
+ *
+ * Checks CPUID leaf 6 for the DTS feature bit and, on Intel family-6 CPUs,
+ * reads TjMax from MSR 0x1A2.  Safe on any x86-64 CPU: if DTS is absent the
+ * per-second check becomes a no-op.
+ */
+static void thermal_probe_dts(void) {
+    uint32_t max_leaf;
+    asm volatile("cpuid" : "=a"(max_leaf) : "a"(0) : "ebx", "ecx", "edx");
+    if (max_leaf < 6)
+        return;   /* CPU too old for leaf 6 */
+
+    uint32_t eax, ebx, ecx, edx;
+    asm volatile("cpuid"
+                 : "=a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx)
+                 : "a"(6), "c"(0));
+
+    if (!(eax & 1))
+        return;   /* no DTS */
+
+    dts_available = true;
+
+    /* Try to read TjMax from MSR 0x1A2 (bits 23:16) on Intel family 6. */
+    asm volatile("cpuid"
+                 : "=a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx)
+                 : "a"(1), "c"(0));
+    uint32_t family = (eax >> 8) & 0xF;
+
+    if (family == 6) {
+        uint64_t target = rdmsr(MSR_IA32_TEMPERATURE_TARGET);
+        uint32_t read_tj = (target >> 16) & 0xFF;
+        if (read_tj >= 80 && read_tj <= 120)
+            tjmax_c = read_tj;
+    }
+
+    kprintf("[THERMAL] DTS active: TjMax=%u C (safety tick enabled)\n", tjmax_c);
+}
+
+/*
+ * thermal_safety_tick_irq() — called from timer_handler() every 1000 ticks.
+ *
+ * In IRQ context with interrupts disabled.  Reads a single MSR, does a few
+ * integer comparisons, and conditionally logs.  Fast and non-blocking.
+ */
+static void thermal_safety_tick_irq(void) {
+    if (!dts_available)
+        return;
+
+    uint64_t raw = rdmsr(MSR_IA32_THERM_STATUS);
+    uint32_t status = (uint32_t)raw;
+
+    /* 1. Detect hardware throttling (PROCHOT#) */
+    if (status & THERM_STATUS_THROTTLING) {
+        if (!throttle_warned) {
+            kprintf("[THERMAL] WARNING: CPU is hardware-throttling (PROCHOT#)\n");
+            throttle_warned = true;
+        }
+    } else {
+        throttle_warned = false;
+    }
+
+    /* 2. Compute temperature from thermal margin */
+    uint32_t readout = (status & THERM_STATUS_READOUT_MASK) >> THERM_STATUS_READOUT_SHIFT;
+    if (readout == 0 && !(status & THERM_STATUS_VALID))
+        return;   /* no valid reading (e.g. QEMU without KVM) */
+
+    uint32_t temp_c = (readout <= tjmax_c) ? (tjmax_c - readout) : 0;
+
+    /* 3. Graded warnings:
+     *    >= 95 C : CRITICAL, logged every second
+     *    >= 90 C : HIGH, logged every second
+     *    >= 85 C : WARM, logged once per crossing
+     *    <  85 C : quiet, re-arms the one-shot */
+    if (temp_c >= THERMAL_CRITICAL_C) {
+        kprintf("[THERMAL] *** CRITICAL: CPU %u C >= %u C! ***\n",
+                temp_c, THERMAL_CRITICAL_C);
+    } else if (temp_c >= THERMAL_HIGH_C) {
+        kprintf("[THERMAL] HIGH: CPU %u C (TjMax=%u, margin=%u)\n",
+                temp_c, tjmax_c, tjmax_c - temp_c);
+        warm_warned = true;
+    } else if (temp_c >= THERMAL_WARN_C) {
+        if (!warm_warned) {
+            kprintf("[THERMAL] WARM: CPU %u C -- approaching thermal limit\n",
+                    temp_c);
+            warm_warned = true;
+        }
+    } else {
+        warm_warned = false;
+    }
+}
+
 // Timer interrupt handler (IRQ0)
 // COOPERATIVE MODE: only increments the tick counter.
 // Does NOT call schedule() -- preemptive scheduling is deferred.
@@ -64,8 +193,47 @@ static void timer_handler(void) {
     process_t* c = process_get_current();
     if (c) {
         c->cpu_ticks++;
+        // STACK CANARY CHECK: verify the running process's kernel stack has not
+        // overflowed. Checking every 1000 Hz tick catches overflows faster than
+        // waiting for the next context switch.
+        STACK_CANARY_CHECK(c);
     }
     scheduler_tick();  // SMP load balancing - redistributes processes across CPUs
+
+    // T410 thermal safety: read the DTS once per second (every 1000 ticks at
+    // 1000 Hz).  The function is a fast rdmsr + compare; safe in IRQ context.
+    // Self-contained here because the power subsystem is not in the default build.
+    if ((timer_ticks % 1000) == 0)
+        thermal_safety_tick_irq();
+
+#ifdef SCHED_DEBUG
+    // LIVENESS HEARTBEAT (diagnostic): cycle a 48x48 square through red→green→
+    // blue→yellow in the top-right corner ~4x/sec. A filled rect fully overwrites
+    // its area (no font OR-smear), so it's unambiguous. If this keeps cycling while
+    // the rest of the screen is frozen, the KERNEL + TIMER IRQ are ALIVE and the
+    // hang is a cooperative ring-3 livelock (init/compositor spinning, which the
+    // cooperative scheduler cannot preempt) or a process blocked forever. If the
+    // square FREEZES on one colour, the CPU itself is dead (triple fault / IF=0
+    // kernel spin / hard hang).
+    if ((timer_ticks % 250) == 0) {
+        extern void framebuffer_draw_rect(uint32_t, uint32_t, uint32_t,
+                                          uint32_t, uint32_t);
+        extern void framebuffer_puts_scaled(const char*, uint32_t, uint32_t,
+                                            uint32_t, uint32_t);
+        static const uint32_t hbcol[4] = {
+            0x00FF0000u, 0x0000FF00u, 0x000000FFu, 0x00FFFF00u
+        };
+        static uint32_t hi = 0;
+        framebuffer_draw_rect(1180, 12, 48, 48, hbcol[hi++ & 3]);
+        // Show the CURRENTLY-RUNNING process name (clear the cell first to avoid
+        // font OR-smear). When frozen, this names WHO is stuck: "init" = init
+        // spinning/waiting; "compositor" = compositor spinning; "idle" = every
+        // process is blocked (a deadlock — scheduler has nothing to run).
+        framebuffer_draw_rect(740, 12, 420, 28, 0x00102040u); /* dark-blue clear */
+        if (c)
+            framebuffer_puts_scaled(c->name, 744, 14, 0x00FFFFFFu, 2);
+    }
+#endif
 }
 
 // PREEMPTIVE build: irq0_preempt -> schedule_from_irq() OWNS IRQ0 instead of
@@ -125,6 +293,10 @@ void pit_init(uint32_t frequency) {
     kprintf("[PIT] Timer initialized at %u Hz\n", timer_frequency);
     kprintf("[PIT] Each tick is approximately %u ms\n",
             timer_frequency ? (1000 / timer_frequency) : 0);
+
+    // T410 thermal safety: probe for the Digital Thermal Sensor so the
+    // once-per-second thermal_safety_tick_irq() knows whether to read MSR 0x19C.
+    thermal_probe_dts();
 }
 
 // Get current tick count

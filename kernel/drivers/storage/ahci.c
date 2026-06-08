@@ -479,7 +479,19 @@ bool ahci_port_identify(ahci_port_t* port) {
     } else {
         port->sectors = ((uint32_t)id[61] << 16) | id[60];
     }
+    /*
+     * Determine logical sector size.  Word 106 bit 12 indicates that
+     * words 117-118 contain a valid logical sector size (in 16-bit words).
+     * If the bit is clear (legacy drives, QEMU's default virtio-blk /
+     * AHCI emulation) the sector size is the traditional 512 bytes.
+     */
     port->sector_size = 512;
+    if ((id[106] & (1u << 12)) && !(id[106] & (1u << 15))) {
+        uint32_t words_per_sector = ((uint32_t)id[118] << 16) | id[117];
+        if (words_per_sector > 0 && words_per_sector <= 32768) {
+            port->sector_size = words_per_sector * 2;   /* 16-bit words -> bytes */
+        }
+    }
 
     port->supports_ncq = (id[76] & (1 << 8)) &&
                          g_ahci_controller && g_ahci_controller->supports_ncq;
@@ -498,6 +510,8 @@ bool ahci_port_identify(ahci_port_t* port) {
 static bool ahci_rw_one(ahci_port_t* port, uint64_t lba, void* dma_buf, bool write) {
     int slot = ahci_port_alloc_slot(port);
     if (slot < 0) return false;
+
+    uint32_t ssz = port->sector_size ? port->sector_size : 512;
 
     ahci_cmd_header_t* hdr = &port->cmd_list[slot];
     hdr->cfl   = sizeof(fis_reg_h2d_t) / 4;
@@ -523,7 +537,7 @@ static bool ahci_rw_one(ahci_port_t* port, uint64_t lba, void* dma_buf, bool wri
     fis->counth = 0;
 
     tbl->prdt[0].dba = dma_phys(dma_buf);
-    tbl->prdt[0].dbc = 512 - 1;
+    tbl->prdt[0].dbc = ssz - 1;   /* actual sector size, not hardcoded 512 */
     tbl->prdt[0].i   = 0;
 
     wmb();
@@ -542,13 +556,14 @@ bool ahci_read_sectors(ahci_port_t* port, uint64_t lba, uint32_t count, void* bu
     // `sectors - count` never underflows.
     if (count > port->sectors || lba > port->sectors - count) return false;
 
+    uint32_t ssz = port->sector_size ? port->sector_size : 512;
     uint8_t* dst = (uint8_t*)buffer;
     for (uint32_t s = 0; s < count; s++) {
         if (!ahci_rw_one(port, lba + s, port->dma_bounce, /*write=*/false)) {
             if (g_ahci_controller) g_ahci_controller->total_errors++;
             return false;
         }
-        memcpy(dst + s * 512, port->dma_bounce, 512);
+        memcpy(dst + (uint64_t)s * ssz, port->dma_bounce, ssz);
         if (g_ahci_controller) g_ahci_controller->total_reads++;
     }
     return true;
@@ -563,9 +578,10 @@ bool ahci_write_sectors(ahci_port_t* port, uint64_t lba, uint32_t count, const v
     // `sectors - count` never underflows.
     if (count > port->sectors || lba > port->sectors - count) return false;
 
+    uint32_t ssz = port->sector_size ? port->sector_size : 512;
     const uint8_t* src = (const uint8_t*)buffer;
     for (uint32_t s = 0; s < count; s++) {
-        memcpy(port->dma_bounce, src + s * 512, 512);
+        memcpy(port->dma_bounce, src + (uint64_t)s * ssz, ssz);
         if (!ahci_rw_one(port, lba + s, port->dma_bounce, /*write=*/true)) {
             if (g_ahci_controller) g_ahci_controller->total_errors++;
             return false;

@@ -287,10 +287,43 @@ static void print_memory_dump(uint64_t addr) {
 /*
  * Main kernel panic handler
  * Displays comprehensive diagnostic information and halts the system
+ *
+ * RE-ENTRANCY GUARD: a panic can itself fault (e.g. the register dump reads
+ * an unmapped stack address, or the filesystem sync touches a corrupted
+ * inode). Without a guard the faulting panic re-enters kernel_panic(), which
+ * re-faults, and the kernel either triple-faults (undebuggable reset) or
+ * overflows the stack silently. The static `panic_in_progress` flag (atomically
+ * CAS'd 0->1 by the first entrant) lets the FIRST panic run the full
+ * diagnostic path while any recursive re-entry skips straight to the halt
+ * loop. The flag is never cleared — the system is dead after a panic.
+ *
+ * SMP HALT: on multi-CPU configurations the panicking CPU sends IPI_STOP to
+ * all other CPUs before printing diagnostics, so no remote core continues
+ * executing kernel code with potentially corrupted state.
  */
+static volatile int panic_in_progress = 0;
+
 void kernel_panic(const char* message) {
     // Disable interrupts - we're in critical failure mode
     cli();
+
+    // Re-entrancy guard: if we are already panicking (e.g. the panic handler
+    // itself faulted), skip the diagnostic output and go straight to the halt
+    // loop. __atomic_exchange prevents two CPUs from both claiming first-entry.
+    if (__atomic_exchange_n(&panic_in_progress, 1, __ATOMIC_SEQ_CST) != 0) {
+        // Recursive / concurrent panic — just halt.
+        while (1) { cli(); hlt(); }
+    }
+
+#ifdef SMP_FOUNDATION
+    // Halt all other CPUs so they stop executing while we dump state.
+    // ipi_stop_all_cpus sends IPI_STOP to every core except this one;
+    // the handler on the remote core enters a cli/hlt loop.
+    {
+        extern void ipi_stop_all_cpus(void);
+        ipi_stop_all_cpus();
+    }
+#endif
 
     kprintf("\n\n");
     kprintf("\033[1;31m"); /* Red bold */
@@ -342,7 +375,8 @@ void kernel_panic(const char* message) {
     kprintf("════════════════════════════════════════════════════════════\n");
     kprintf("\033[0m");
 
-    // Halt all CPUs (TODO: send IPI to halt other CPUs in SMP)
+    // Halt this CPU. Other CPUs were already stopped via IPI_STOP above
+    // (when SMP_FOUNDATION is enabled); without SMP this is the only CPU.
     while (1) {
         cli();
         hlt();

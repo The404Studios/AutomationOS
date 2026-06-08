@@ -189,22 +189,25 @@ static int fat32_vfs_close(vfs_file_t* file) {
 
 /**
  * VFS lseek operation for FAT32
+ *
+ * BUG-FIX (underflow): the old code assigned directly without validating,
+ * so a negative offset for SEEK_SET, or a negative SEEK_CUR/SEEK_END that
+ * exceeds the current position/file size, would wrap the uint64_t file->offset
+ * to a near-UINT64_MAX value, corrupting all subsequent read/write offset math.
  */
 static off_t fat32_vfs_lseek(vfs_file_t* file, off_t offset, int whence) {
+    uint64_t base;
     switch (whence) {
-        case SEEK_SET:
-            file->offset = offset;
-            break;
-        case SEEK_CUR:
-            file->offset += offset;
-            break;
-        case SEEK_END:
-            file->offset = file->inode->size + offset;
-            break;
-        default:
-            return -1;
+        case SEEK_SET: base = 0; break;
+        case SEEK_CUR: base = file->offset; break;
+        case SEEK_END: base = file->inode->size; break;
+        default:       return -1;
     }
-    return file->offset;
+    if (offset < 0 && (uint64_t)(-offset) > base) {
+        return -1;   /* would seek before byte 0 */
+    }
+    file->offset = base + (uint64_t)offset;
+    return (off_t)file->offset;
 }
 
 /**
@@ -427,8 +430,9 @@ static vfs_dentry_t* fat32_vfs_lookup(vfs_inode_t* dir, const char* name) {
             // Determine name to use (LFN if available, otherwise 8.3)
             char entry_name[260];
             if (lfn_name[0] != '\0') {
-                // Use long filename
-                strcpy(entry_name, lfn_name);
+                // Use long filename (bounded copy; lfn_name comes from disk)
+                strncpy(entry_name, lfn_name, sizeof(entry_name) - 1);
+                entry_name[sizeof(entry_name) - 1] = '\0';
             } else {
                 // Use short 8.3 name
                 fat32_name_to_string(entry->name, entry_name);
@@ -575,6 +579,19 @@ vfs_superblock_t* fat32_mount(const char* source, uint32_t flags) {
 
     if (fs_data->boot_sector->fat_size_32 == 0) {
         kprintf("[FAT32] Invalid FAT32 filesystem\n");
+        kfree(fs_data->boot_sector);
+        kfree(fs_data);
+        return NULL;
+    }
+
+    // Validate untrusted on-disk geometry BEFORE using as divisors/multipliers.
+    // A corrupt or crafted image with 0 in any of these fields would cause a
+    // ring-0 #DE (divide-by-zero) or nonsensical cluster/sector math.
+    if (fs_data->boot_sector->bytes_per_sector == 0 ||
+        fs_data->boot_sector->sectors_per_cluster == 0) {
+        kprintf("[FAT32] Invalid geometry: bytes_per_sector=%u sectors_per_cluster=%u\n",
+                fs_data->boot_sector->bytes_per_sector,
+                fs_data->boot_sector->sectors_per_cluster);
         kfree(fs_data->boot_sector);
         kfree(fs_data);
         return NULL;

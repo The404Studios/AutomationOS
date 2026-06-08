@@ -468,6 +468,10 @@ AstNode* parse_declaration(Parser* p) {
         if (body_follows) {
             adv(p);                             /* kw */
             AstNode* rec = ast_new(AST_RECORD);
+            /* Store the record keyword ("struct"/"union"/"enum") in type_str
+             * so the model builder can distinguish them. */
+            if (rec) d_settype(rec, is_enum ? "enum" :
+                               tok_is(kw, "union") ? "union" : "struct");
             Tok* tag = 0;
             if (at(p, TK_ID) || at(p, TK_TYPE)) {
                 tag = adv(p);

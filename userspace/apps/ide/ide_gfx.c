@@ -5,18 +5,36 @@
 #include "../../lib/font/bitfont.h"
 #include "../../lib/font2/font2.h"
 
-/* Runtime UI scale (see ide_gfx.h). Default 120% -> 9x19 cell: readable but
- * compact so the tab strips and side panels all fit without crowding (138% felt
- * "very big" and scrunched the chrome). The user can Ctrl+wheel / Ctrl+=/- to
- * rescale live; the whole layout reflows from this cell. */
-int g_ui_pct = 120, g_gfx_fw = 9, g_gfx_fh = 19;
+/* Runtime UI scale (see ide_gfx.h). Default 130% -> 10x20 cell: a good
+ * balance between readability and chrome density on a 1024x768 panel. The user
+ * can Ctrl+wheel / Ctrl+=/- to rescale live; the whole layout reflows from
+ * this cell because every panel derives geometry from GFX_FW/GFX_FH. */
+int g_ui_pct = 130, g_gfx_fw = 10, g_gfx_fh = 20;
+
+/* ---- IDE behaviour knobs (Settings panel; VIZ-6 / Ctrl+,) ----
+ * Runtime variables (formerly compile-time #defines) so every toggle/slider in
+ * the Settings panel applies LIVE. Defaults are byte-identical to the old
+ * #defines. Co-located with g_ui_pct so all translation units reach them via
+ * the ide_gfx.h externs (no new build unit). See ide_inspector.c for the UI and
+ * ide_config.c (Phase 4) for persistence. */
+int g_tab_width    = 4;    /* soft-tab / tab-stop width in columns (>=1)        */
+int g_blink_ms     = 500;  /* caret blink on/off half-period (ms)               */
+int g_ac_visible   = 8;    /* max autocomplete rows shown (<= AC_MAX_MATCHES)   */
+int g_ac_minpfx    = 2;    /* min typed prefix length before the popup opens    */
+int g_map_pan_step = 20;   /* LEGO map keyboard pan step (px)                   */
+int g_autocomplete = 1;    /* 1 = autocomplete popup enabled                    */
+int g_anno_gutter  = 1;    /* 1 = code-view right-margin semantic annotations   */
+int g_line_numbers = 1;    /* 1 = show the line-number gutter (editor + view)   */
+int g_auto_indent  = 1;    /* 1 = auto-indent new lines to the previous line    */
+int g_live_reparse = 0;    /* 1 = re-parse the model on every edit (experimental)*/
+int g_theme_mode   = 0;    /* 0 = dark (default); persisted now, themed later    */
 
 void gfx_set_scale(int pct) {
-    if (pct < 100) pct = 100;
+    if (pct < 50) pct = 50;
     if (pct > 250) pct = 250;
     g_ui_pct = pct;
-    g_gfx_fw = 8  * pct / 100; if (g_gfx_fw < 8)  g_gfx_fw = 8;  if (g_gfx_fw > 20) g_gfx_fw = 20;
-    g_gfx_fh = 16 * pct / 100; if (g_gfx_fh < 16) g_gfx_fh = 16; if (g_gfx_fh > 40) g_gfx_fh = 40;
+    g_gfx_fw = 8  * pct / 100; if (g_gfx_fw < 1)  g_gfx_fw = 1;  if (g_gfx_fw > 20) g_gfx_fw = 20;
+    g_gfx_fh = 16 * pct / 100; if (g_gfx_fh < 1)  g_gfx_fh = 1;  if (g_gfx_fh > 40) g_gfx_fh = 40;
 }
 
 #define A(c) (((c) >> 24) & 0xFFu)

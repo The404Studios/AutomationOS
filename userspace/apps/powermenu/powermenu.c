@@ -50,8 +50,8 @@
  * --------------------------------------------------------------------- */
 #define SYS_EXIT      0
 #define SYS_WRITE     3
-#define SYS_POWEROFF  41
-#define SYS_REBOOT    42
+#define SYS_POWEROFF  46
+#define SYS_REBOOT    47
 
 /* -----------------------------------------------------------------------
  * Inline syscall helper -- no libc.

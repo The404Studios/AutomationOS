@@ -588,11 +588,11 @@ check_libs() {
 check_coreutils2() {
     # The expanded coreutils each print "<NAME> SELFTEST: PASS" at boot.
     local missing=""
-    for t in GREP HEAD TAIL SORT UNIQ CUT TR NL DU TOUCH BASENAME DIRNAME LESS HEXDUMP; do
+    for t in GREP HEAD TAIL SORT UNIQ CUT TR NL DU TOUCH BASENAME DIRNAME LESS HEXDUMP LSPCI; do
         grep -qF "$t SELFTEST: PASS" "$LOG" || missing="$missing $t"
     done
     if [[ -z "$missing" ]]; then
-        pass "coreutils self-tests pass (grep/head/tail/sort/uniq/cut/tr/nl/du/touch/basename/dirname/less/hexdump)"
+        pass "coreutils self-tests pass (grep/head/tail/sort/uniq/cut/tr/nl/du/touch/basename/dirname/less/hexdump/lspci)"
         return 0
     else
         fail "coreutil self-test(s) missing/failed:${missing}"

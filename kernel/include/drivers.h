@@ -40,13 +40,16 @@ void framebuffer_draw_fluid_circle(int cx, int cy, int R, int dot_r,
                                    int phase_deg, uint32_t base_color);
 void framebuffer_boot_spinner(uint32_t duration_ms);
 
-#ifdef FB_WC
-/* GATED (only declared under -DFB_WC): program a variable-range MTRR to mark
- * the framebuffer physical region [base, base+size) Write-Combining, batching
- * the otherwise-uncached pixel stores into PCIe bursts on real hardware. No-op
- * to the default build -- this prototype does not exist unless FB_WC is set. */
+/* Power management: blank the framebuffer (write all-black). Returns 0 on
+ * success, -1 if framebuffer not initialized. Used by display_blank(). */
+int  framebuffer_blank(void);
+int  framebuffer_is_initialized(void);
+
+/* Program a variable-range MTRR to mark the framebuffer physical region
+ * [base, base+size) Write-Combining, coalescing the otherwise-uncached pixel
+ * stores into PCIe bursts on real hardware.  Always compiled; runtime-safe
+ * (bails cleanly if no free MTRR slot, base unaligned, or VCNT==0). */
 void fb_enable_write_combining(uint64_t base, uint64_t size);
-#endif
 
 // Timer driver (PIT - Programmable Interval Timer)
 void pit_init(uint32_t frequency);

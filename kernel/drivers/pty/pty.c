@@ -201,8 +201,14 @@ pty_pair_t *pty_get(uint32_t index) {
 }
 
 /**
- * Write data to master side (output from application)
- * Data goes to slave process
+ * Write data to master side (input from the terminal emulator / user).
+ * Data passes through line discipline (echo, canonical buffering, signal
+ * generation) before being delivered to the slave process.
+ *
+ * In the POSIX PTY model the master represents the "terminal" end: bytes
+ * written here are the user's keystrokes and must be cooked by the line
+ * discipline.  The slave side is the application end (shell, editor) and
+ * its writes are raw output that goes directly to the master for display.
  */
 ssize_t pty_master_write(uint32_t index, const uint8_t *data, uint32_t size) {
     pty_pair_t *pty = pty_get(index);
@@ -210,7 +216,14 @@ ssize_t pty_master_write(uint32_t index, const uint8_t *data, uint32_t size) {
         return -1;
     }
 
-    return pty_buffer_write(&pty->master_to_slave, data, size);
+    // Process every byte through line discipline (echo, canonical mode,
+    // signal generation).  pty_process_input() delivers cooked data into
+    // the slave_to_master buffer for the slave process to read.
+    for (uint32_t i = 0; i < size; i++) {
+        pty_process_input(pty, data[i]);
+    }
+
+    return (ssize_t)size;
 }
 
 /**
@@ -226,8 +239,9 @@ ssize_t pty_master_read(uint32_t index, uint8_t *data, uint32_t size) {
 }
 
 /**
- * Write data to slave side (input from user)
- * Data goes through line discipline
+ * Write data to slave side (output from the application / shell).
+ * Data goes directly to the master for display -- no line discipline
+ * processing (the application's output is already formatted).
  */
 ssize_t pty_slave_write(uint32_t index, const uint8_t *data, uint32_t size) {
     pty_pair_t *pty = pty_get(index);
@@ -235,12 +249,9 @@ ssize_t pty_slave_write(uint32_t index, const uint8_t *data, uint32_t size) {
         return -1;
     }
 
-    // Process input through line discipline
-    for (uint32_t i = 0; i < size; i++) {
-        pty_process_input(pty, data[i]);
-    }
-
-    return (ssize_t)size;
+    // Slave output bypasses line discipline and goes straight to the
+    // master (terminal emulator) for rendering.
+    return pty_buffer_write(&pty->slave_to_master, data, size);
 }
 
 /**
@@ -486,8 +497,8 @@ static void pty_process_input(pty_pair_t *pty, uint8_t c) {
                 }
             }
 
-            // Write line to slave input
-            pty_buffer_write(&pty->slave_to_master, pty->line_buffer, pty->line_pos);
+            // Write line to slave input (master_to_slave = what slave reads)
+            pty_buffer_write(&pty->master_to_slave, pty->line_buffer, pty->line_pos);
             pty->line_pos = 0;
             return;
         } else {
@@ -501,8 +512,8 @@ static void pty_process_input(pty_pair_t *pty, uint8_t c) {
             return;
         }
     } else {
-        // Raw mode - pass character directly
-        pty_buffer_write(&pty->slave_to_master, &c, 1);
+        // Raw mode - pass character directly to slave input
+        pty_buffer_write(&pty->master_to_slave, &c, 1);
         if (echo_enabled) {
             pty_echo(pty, c);
         }
@@ -516,5 +527,6 @@ static void pty_echo(pty_pair_t *pty, uint8_t c) {
     if (!pty) {
         return;
     }
-    pty_buffer_write(&pty->master_to_slave, &c, 1);
+    // Echo goes back to master for display (slave_to_master = what master reads)
+    pty_buffer_write(&pty->slave_to_master, &c, 1);
 }

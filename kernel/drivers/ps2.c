@@ -5,6 +5,16 @@
 #include "../include/irq.h"
 #include "../include/spinlock.h"
 #include "../include/drivers.h"   // timer_get_ticks / timer_get_frequency (bounded waits)
+#include "../include/sched.h"     // process_get_by_name, process types (Ctrl+Alt+R recovery)
+
+/* Gate verbose init chatter. The PS/2 controller init prints ~20 diagnostic
+ * lines on the happy path; each costs ~0.5ms on real serial hardware. Keep
+ * runtime hotkey messages (Ctrl+Alt+Del, recovery) ungated. */
+#ifdef BOOT_QUIET
+#define PS2_LOG(...) ((void)0)
+#else
+#define PS2_LOG(...) kprintf(__VA_ARGS__)
+#endif
 
 // PS/2 controller ports
 #define PS2_DATA_PORT    0x60
@@ -26,7 +36,12 @@
 #define PS2_CMD_TEST_PORT2      0xA9
 #define PS2_CMD_WRITE_PORT2     0xD4
 
+// PS/2 controller self-test
+#define PS2_CMD_SELF_TEST       0xAA
+#define PS2_SELFTEST_PASS       0x55
+
 // Keyboard commands
+#define KB_CMD_SET_TYPEMATIC    0xF3  // Set typematic rate/delay
 #define KB_CMD_ENABLE_SCAN      0xF4
 #define KB_CMD_RESET            0xFF
 
@@ -225,6 +240,12 @@ static void kb_buffer_put(char c) {
     restore_flags(flags);
 }
 
+// F11/F12 keycodes (scancodes 0x57/0x58). These are beyond the range defined
+// in input.h (which stops at KEY_SCROLLLOCK=70), so define them here with
+// their standard Linux evdev values.
+#define KC_F11       87
+#define KC_F12       88
+
 // Scancode to Linux keycode mapping
 static const uint16_t scancode_to_keycode[128] = {
     0, KEY_ESC, KEY_1, KEY_2, KEY_3, KEY_4, KEY_5, KEY_6,
@@ -237,7 +258,8 @@ static const uint16_t scancode_to_keycode[128] = {
     KEY_LEFTALT, KEY_SPACE, KEY_CAPSLOCK, KEY_F1, KEY_F2, KEY_F3, KEY_F4, KEY_F5,
     KEY_F6, KEY_F7, KEY_F8, KEY_F9, KEY_F10, KEY_NUMLOCK, KEY_SCROLLLOCK, 0,
     0, 0, 0, 0, 0, 0, 0, 0,
-    0, 0, 0, 0, 0, 0, 0, 0
+    0, 0, 0, 0, 0, 0, 0, KC_F11,   // 0x57 = F11
+    KC_F12, 0, 0, 0, 0, 0, 0, 0    // 0x58 = F12
 };
 
 // ---------------------------------------------------------------------------
@@ -277,6 +299,20 @@ static const uint16_t scancode_to_keycode[128] = {
 #define KC_RIGHTMETA 126  // right Super/Windows
 #define KC_MENU      127  // application/menu key
 
+// ThinkPad/multimedia extended scancodes (E0-prefixed).
+// These Fn combos produce E0 xx on ThinkPad keyboards (T410, etc.).
+// We map them to standard Linux evdev codes so userspace can act on them.
+#define KC_MUTE          113
+#define KC_VOLUMEDOWN    114
+#define KC_VOLUMEUP      115
+#define KC_NEXTSONG      163
+#define KC_PREVIOUSSONG  165
+#define KC_PLAYPAUSE     164
+#define KC_BRIGHTNESSDOWN 224
+#define KC_BRIGHTNESSUP   225
+#define KC_SLEEP         142
+#define KC_WLAN          238  // wireless toggle (Fn+F5 on ThinkPad)
+
 static const uint16_t scancode_to_keycode_ext[128] = {
     [0x1C] = KC_KPENTER,   // keypad Enter
     [0x1D] = KC_RIGHTCTRL, // right Ctrl
@@ -295,6 +331,20 @@ static const uint16_t scancode_to_keycode_ext[128] = {
     [0x5B] = KC_LEFTMETA,
     [0x5C] = KC_RIGHTMETA,
     [0x5D] = KC_MENU,
+
+    // ThinkPad / multimedia extended scancodes (Fn key combos).
+    // These are safe: unknown scancodes map to 0 and are silently dropped.
+    [0x20] = KC_MUTE,          // Fn+F1 (ThinkPad) or dedicated mute key
+    [0x2E] = KC_VOLUMEDOWN,    // Fn+F2 (ThinkPad) or dedicated vol-
+    [0x30] = KC_VOLUMEUP,      // Fn+F3 (ThinkPad) or dedicated vol+
+    [0x22] = KC_PLAYPAUSE,     // media play/pause
+    [0x19] = KC_NEXTSONG,      // media next
+    [0x10] = KC_PREVIOUSSONG,  // media prev
+    [0x5F] = KC_SLEEP,         // sleep key
+    // Brightness (Fn+Home / Fn+End on some ThinkPads; E0 maps vary by model)
+    // On the T410 these are typically ACPI events, not PS/2 scancodes, so they
+    // won't arrive here. The entries are harmless and ready if they do.
+
     // everything else 0 (e.g. 0x2A / 0x36 fake-shift, already filtered below)
 };
 
@@ -313,6 +363,157 @@ static char ext_scancode_to_ascii(uint8_t sc) {
         case 0x35: return '/';   // keypad '/'
         default:   return 0;     // navigation / right-modifiers: no ASCII
     }
+}
+
+// ---------------------------------------------------------------------------
+// Ctrl+Alt+Del — immediate system reboot (standard PC shortcut).
+//
+// Handled in the keyboard IRQ handler (ring 0) so it works even when the
+// desktop is frozen.  Three reboot layers for maximum reliability:
+//   1. Print a serial message so the event is logged.
+//   2. Issue the 8042 keyboard controller reset command (0xFE to port 0x64).
+//   3. Fallback: triple-fault via a null IDT — guarantees a CPU reset even
+//      if the 8042 ignores the pulse.
+// Delete = scancode 0x53 (non-extended, scancode set 1).
+// ---------------------------------------------------------------------------
+static void ps2_reboot_handler(void) {
+    kprintf("\n[REBOOT] Ctrl+Alt+Del pressed — rebooting system\n");
+
+    // Layer 1: 8042 keyboard controller system reset
+    outb(0x64, 0xFE);
+
+    // Layer 2: triple-fault via null IDT (reliable last resort)
+    {
+        struct { uint16_t limit; uint64_t base; } __attribute__((packed))
+            zero_idt = {0, 0};
+        __asm__ volatile("lidt %0" : : "m"(zero_idt));
+        __asm__ volatile("int $3");   // #BP -> #DF -> reset
+    }
+
+    // Should never reach here
+    while (1) { cli(); hlt(); }
+}
+
+// ---------------------------------------------------------------------------
+// Ctrl+Alt+Backspace — kill the compositor ("zap X server").
+//
+// Kills ONLY the compositor process.  init (PID 1) detects the death via its
+// waitpid loop and respawns sbin/compositor automatically, giving the user a
+// fresh desktop.  Mirrors the first-press behaviour of Ctrl+Alt+R but on its
+// own dedicated shortcut (the traditional X11 "kill server" chord).
+// Backspace = scancode 0x0E (non-extended, scancode set 1).
+//
+// Runs entirely in IRQ context — no sleeping, no blocking locks. All
+// functions called here (process_get_by_name, process_on_terminate,
+// scheduler_remove_process, process_unref) use spin_lock_irqsave internally,
+// which is safe from hard-IRQ context.
+// ---------------------------------------------------------------------------
+static void ps2_compositor_kill_handler(void) {
+    process_t* compositor = process_get_by_name("compositor");
+    if (!compositor) {
+        kprintf("\n[RECOVERY] Ctrl+Alt+Backspace: no compositor process found\n");
+        return;
+    }
+
+    if (compositor->state == PROCESS_TERMINATED) {
+        kprintf("\n[RECOVERY] Ctrl+Alt+Backspace: compositor already terminated\n");
+        process_unref(compositor);
+        return;
+    }
+
+    kprintf("\n[RECOVERY] Ctrl+Alt+Backspace: killing compositor (PID %u), init will respawn\n",
+            compositor->pid);
+
+    // Mirror the SIGKILL path from kill.c — safe from IRQ context because every
+    // function here uses spin_lock_irqsave internally.
+    // 1. If blocked on a wait_object, force-unlink it first.
+    {
+        struct wait_object* wo = compositor->wait_on;
+        if (compositor->state == PROCESS_BLOCKED && wo) {
+            wait_object_abort(wo, compositor);
+        }
+    }
+    // 2. Mark terminated and set conventional "killed by signal" exit status.
+    compositor->state = PROCESS_TERMINATED;
+    compositor->exit_status = 128 + 9;  // 128 + SIGKILL
+    // 3. Wake the parent (init) so its waitpid loop notices the death and respawns.
+    process_on_terminate(compositor);
+    // 4. Remove from scheduler ready queue (if it was queued).
+    scheduler_remove_process(compositor);
+    // 5. Drop the ref taken by process_get_by_name.
+    process_unref(compositor);
+}
+
+// ---------------------------------------------------------------------------
+// Ctrl+Alt+R — system recovery shortcut (SysRq-like).
+//
+// Handled in the keyboard IRQ handler (ring 0) so it works even when the
+// desktop compositor is frozen. Runs entirely in IRQ context — no sleeping,
+// no blocking locks. All functions called here (process_get_by_name,
+// process_on_terminate, scheduler_remove_process, process_unref) use
+// spin_lock_irqsave internally, which is safe from hard-IRQ context.
+//
+//   First press:  kill the compositor process; init (PID 1) detects the death
+//                 via its waitpid loop and respawns it automatically.
+//   Second press within 3 seconds: hard reboot via the 8042 keyboard
+//                 controller reset command (0xFE to port 0x64).
+// ---------------------------------------------------------------------------
+static uint64_t recovery_last_tick = 0;  // tick stamp of the last Ctrl+Alt+R
+
+static void ps2_recovery_handler(void) {
+    uint64_t now = timer_get_ticks();
+    uint32_t freq = timer_get_frequency();
+
+    // Double-press detection: if the last recovery keypress was < 3 seconds ago,
+    // the user wants a full reboot.
+    if (recovery_last_tick != 0 && freq != 0) {
+        uint64_t elapsed_ticks = now - recovery_last_tick;
+        uint64_t threshold = (uint64_t)freq * 3;  // 3 seconds worth of ticks
+        if (elapsed_ticks < threshold) {
+            kprintf("\n[RECOVERY] Ctrl+Alt+R double-press: REBOOTING\n");
+            // Hard reboot via 8042 keyboard controller reset
+            outb(0x64, 0xFE);
+            // If that didn't work (some emulators ignore it), triple-fault
+            while (1) { cli(); hlt(); }
+        }
+    }
+
+    // First press (or >3s since last): kill the compositor.
+    recovery_last_tick = now;
+
+    process_t* compositor = process_get_by_name("compositor");
+    if (!compositor) {
+        kprintf("\n[RECOVERY] Ctrl+Alt+R: no compositor process found\n");
+        return;
+    }
+
+    if (compositor->state == PROCESS_TERMINATED) {
+        kprintf("\n[RECOVERY] Ctrl+Alt+R: compositor already terminated\n");
+        process_unref(compositor);
+        return;
+    }
+
+    kprintf("\n[RECOVERY] Ctrl+Alt+R: killing compositor (PID %u), init will respawn\n",
+            compositor->pid);
+
+    // Mirror the SIGKILL path from kill.c — safe from IRQ context because every
+    // function here uses spin_lock_irqsave internally.
+    // 1. If blocked on a wait_object, force-unlink it first.
+    {
+        struct wait_object* wo = compositor->wait_on;
+        if (compositor->state == PROCESS_BLOCKED && wo) {
+            wait_object_abort(wo, compositor);
+        }
+    }
+    // 2. Mark terminated and set conventional "killed by signal" exit status.
+    compositor->state = PROCESS_TERMINATED;
+    compositor->exit_status = 128 + 9;  // 128 + SIGKILL
+    // 3. Wake the parent (init) so its waitpid loop notices the death and respawns.
+    process_on_terminate(compositor);
+    // 4. Remove from scheduler ready queue (if it was queued).
+    scheduler_remove_process(compositor);
+    // 5. Drop the ref taken by process_get_by_name.
+    process_unref(compositor);
 }
 
 // Handle keyboard scancode
@@ -362,6 +563,13 @@ static void ps2_handle_scancode(uint8_t scancode) {
             alt_pressed = !key_released;
         }
 
+        // Ctrl+Alt+Del — immediate reboot. The gray Delete key (navigation
+        // cluster) sends E0 53, which is the code most users will press.
+        if (!key_released && scancode == 0x53 && ctrl_pressed && alt_pressed) {
+            ps2_reboot_handler();
+            return;  // consume (never reached — handler reboots)
+        }
+
         // Forward the extended keycode (arrows, Home/End/PgUp/PgDn, Ins/Del,
         // keypad-Enter, keypad-'/', R-Ctrl, R-Alt, Super, Menu).
         if (keyboard_device) {
@@ -398,6 +606,28 @@ static void ps2_handle_scancode(uint8_t scancode) {
     }
     if (scancode == 0x3A && !key_released) {  // Caps Lock (toggle on press)
         caps_lock = !caps_lock;
+    }
+
+    // Ctrl+Alt+R — system recovery shortcut. Checked BEFORE the input subsystem
+    // so the compositor (which may be frozen) never sees the keypress. Only fires
+    // on key-DOWN (not release). R = scancode 0x13.
+    if (!key_released && scancode == 0x13 && ctrl_pressed && alt_pressed) {
+        ps2_recovery_handler();
+        return;  // consume the keypress — do not forward to input/stdin
+    }
+
+    // Ctrl+Alt+Del — immediate system reboot (standard PC shortcut).
+    // Delete = scancode 0x53 (non-extended, scancode set 1). Key-DOWN only.
+    if (!key_released && scancode == 0x53 && ctrl_pressed && alt_pressed) {
+        ps2_reboot_handler();
+        return;  // consume (never reached — handler reboots)
+    }
+
+    // Ctrl+Alt+Backspace — kill compositor ("zap X server"). init respawns it.
+    // Backspace = scancode 0x0E (non-extended, scancode set 1). Key-DOWN only.
+    if (!key_released && scancode == 0x0E && ctrl_pressed && alt_pressed) {
+        ps2_compositor_kill_handler();
+        return;  // consume the keypress — do not forward to input/stdin
     }
 
     // Report to input subsystem
@@ -579,7 +809,7 @@ void ps2_mouse_irq_wrapper(void) {
 
 // Initialize PS/2 mouse
 static int ps2_mouse_init(void) {
-    kprintf("[PS/2] Initializing mouse...\n");
+    PS2_LOG("[PS/2] Initializing mouse...\n");
 
     // Enable second PS/2 port
     ps2_write_command(PS2_CMD_ENABLE_PORT2);
@@ -596,11 +826,11 @@ static int ps2_mouse_init(void) {
     ps2_write_command(PS2_CMD_TEST_PORT2);
     uint8_t test_result = ps2_read_data_timeout(&m_ok);
     if (!m_ok) {
-        kprintf("[PS/2] Mouse port test timed out (no device?); skipping mouse\n");
+        PS2_LOG("[PS/2] Mouse port test timed out (no device?); skipping mouse\n");
         return -1;
     }
     if (test_result != 0x00) {
-        kprintf("[PS/2] Mouse port test failed (0x%x)\n", test_result);
+        PS2_LOG("[PS/2] Mouse port test failed (0x%x)\n", test_result);
         return -1;
     }
 
@@ -608,11 +838,11 @@ static int ps2_mouse_init(void) {
     ps2_write_mouse(MOUSE_CMD_SET_DEFAULTS);
     uint8_t response = ps2_read_mouse_timeout(&m_ok);
     if (!m_ok) {
-        kprintf("[PS/2] Mouse set defaults timed out (no ACK); skipping mouse\n");
+        PS2_LOG("[PS/2] Mouse set defaults timed out (no ACK); skipping mouse\n");
         return -1;
     }
     if (response != 0xFA) {
-        kprintf("[PS/2] Mouse set defaults failed (0x%x)\n", response);
+        PS2_LOG("[PS/2] Mouse set defaults failed (0x%x)\n", response);
         return -1;
     }
 
@@ -620,11 +850,11 @@ static int ps2_mouse_init(void) {
     ps2_write_mouse(MOUSE_CMD_ENABLE);
     response = ps2_read_mouse_timeout(&m_ok);
     if (!m_ok) {
-        kprintf("[PS/2] Mouse enable timed out (no ACK); skipping mouse\n");
+        PS2_LOG("[PS/2] Mouse enable timed out (no ACK); skipping mouse\n");
         return -1;
     }
     if (response != 0xFA) {
-        kprintf("[PS/2] Mouse enable failed (0x%x)\n", response);
+        PS2_LOG("[PS/2] Mouse enable failed (0x%x)\n", response);
         return -1;
     }
 
@@ -634,7 +864,7 @@ static int ps2_mouse_init(void) {
     ps2_write_command(PS2_CMD_READ_CONFIG);
     uint8_t config = ps2_read_data_timeout(&m_ok);
     if (!m_ok) {
-        kprintf("[PS/2] Mouse config read timed out; using defaults\n");
+        PS2_LOG("[PS/2] Mouse config read timed out; using defaults\n");
         config = 0;
     }
     config |= 0x02;  // Enable mouse interrupt (IRQ12)
@@ -645,15 +875,15 @@ static int ps2_mouse_init(void) {
     mouse_initialized = true;
     mouse_packet_index = 0;
 
-    kprintf("[PS/2] Mouse initialized\n");
+    PS2_LOG("[PS/2] Mouse initialized\n");
     return 0;
 }
 
 // Initialize PS/2 keyboard and mouse
 void ps2_init(void) {
-    kprintf("[PS/2] Initializing PS/2 controller...\n");
+    PS2_LOG("[PS/2] Initializing PS/2 controller...\n");
 
-    kprintf("[PS/2] Pre-registering IRQ handlers early\n");
+    PS2_LOG("[PS/2] Pre-registering IRQ handlers early\n");
     // Note: irq_register_handler will unmask, but that's OK since
     // PIC was initialized with all IRQs masked (0xFF) in idt_init()
 
@@ -672,19 +902,51 @@ void ps2_init(void) {
         inb(PS2_DATA_PORT);
     }
 
+    // ---- Controller self-test (command 0xAA) ----
+    // The 8042 resets its internal state and responds with 0x55 on success.
+    // On the T410, this clears any leftover USB-legacy emulation state that
+    // the BIOS may have left in the controller. If the self-test fails or
+    // times out, we continue degraded — the controller may still work.
+    bool st_ok;
+    ps2_write_command(PS2_CMD_SELF_TEST);
+    uint8_t st_result = ps2_read_data_timeout(&st_ok);
+    if (!st_ok) {
+        PS2_LOG("[PS/2] Warning: controller self-test timed out; continuing\n");
+    } else if (st_result != PS2_SELFTEST_PASS) {
+        PS2_LOG("[PS/2] Warning: controller self-test failed (0x%x, expected 0x55)\n",
+                st_result);
+    } else {
+        PS2_LOG("[PS/2] Controller self-test passed\n");
+    }
+
+    // NOTE: The controller self-test (0xAA) resets the controller and may
+    // re-disable both ports. Re-disable them explicitly to be safe, then
+    // flush any bytes the self-test may have generated.
+    ps2_write_command(0xAD);  // Disable port 1 (keyboard)
+    ps2_write_command(PS2_CMD_DISABLE_PORT2);  // Disable port 2 (mouse)
+    for (uint32_t flush2 = 0; flush2 < 64; flush2++) {
+        if (!(inb(PS2_STATUS_PORT) & PS2_STATUS_OUTPUT_FULL)) break;
+        inb(PS2_DATA_PORT);
+    }
+
     // Read controller configuration. If the controller never answers, fall back
     // to a safe default config rather than continuing with a garbage byte.
     bool cfg_ok;
     ps2_write_command(PS2_CMD_READ_CONFIG);
     uint8_t config = ps2_read_data_timeout(&cfg_ok);
     if (!cfg_ok) {
-        kprintf("[PS/2] Warning: controller config read timed out; using defaults\n");
+        PS2_LOG("[PS/2] Warning: controller config read timed out; using defaults\n");
         config = 0;  // start from a clean slate; we set the bits we need below
     }
 
-    // Enable interrupts for both ports
+    // Enable interrupts for both ports, ensure translation mode is ON.
+    // Bit 6 (0x40) = scancode translation: the 8042 translates scancode set 2
+    // (what the keyboard natively speaks) into set 1 (what this driver expects).
+    // Most BIOSes leave this on, but on some T410 configurations it can be off
+    // after the controller self-test resets the config byte.
     config |= 0x01;  // Enable keyboard interrupt (IRQ1)
     config |= 0x02;  // Enable mouse interrupt (IRQ12)
+    config |= 0x40;  // Enable scancode translation (set 2 -> set 1)
     config &= ~0x10; // Enable keyboard clock
     config &= ~0x20; // Enable mouse clock
 
@@ -704,18 +966,18 @@ void ps2_init(void) {
     ps2_write_command(PS2_CMD_TEST_PORT1);
     uint8_t test_result = ps2_read_data_timeout(&kb_ok);
     if (!kb_ok) {
-        kprintf("[PS/2] Warning: Keyboard port test timed out (no response)\n");
+        PS2_LOG("[PS/2] Warning: Keyboard port test timed out (no response)\n");
     } else if (test_result != 0x00) {
-        kprintf("[PS/2] Warning: Keyboard port test failed (0x%x)\n", test_result);
+        PS2_LOG("[PS/2] Warning: Keyboard port test failed (0x%x)\n", test_result);
     }
 
     // Reset and enable keyboard
     ps2_write_data(KB_CMD_RESET);
     uint8_t reset_response = ps2_read_data_timeout(&kb_ok);
     if (!kb_ok) {
-        kprintf("[PS/2] Warning: Keyboard reset timed out (no ACK); continuing\n");
+        PS2_LOG("[PS/2] Warning: Keyboard reset timed out (no ACK); continuing\n");
     } else if (reset_response != 0xFA) {  // 0xFA = ACK
-        kprintf("[PS/2] Warning: Keyboard reset failed (0x%x)\n", reset_response);
+        PS2_LOG("[PS/2] Warning: Keyboard reset failed (0x%x)\n", reset_response);
     }
 
     // Wait for self-test result (0xAA = passed). Only meaningful if the reset
@@ -723,18 +985,43 @@ void ps2_init(void) {
     // is skipped — still bounded, still non-blocking.
     uint8_t self_test = ps2_read_data_timeout(&kb_ok);
     if (!kb_ok) {
-        kprintf("[PS/2] Warning: Keyboard self-test timed out (no response)\n");
+        PS2_LOG("[PS/2] Warning: Keyboard self-test timed out (no response)\n");
     } else if (self_test != 0xAA) {
-        kprintf("[PS/2] Warning: Keyboard self-test failed (0x%x)\n", self_test);
+        PS2_LOG("[PS/2] Warning: Keyboard self-test failed (0x%x)\n", self_test);
     }
 
     // Enable scanning
     ps2_write_data(KB_CMD_ENABLE_SCAN);
     uint8_t enable_response = ps2_read_data_timeout(&kb_ok);
     if (!kb_ok) {
-        kprintf("[PS/2] Warning: Enable scan timed out (no ACK); continuing\n");
+        PS2_LOG("[PS/2] Warning: Enable scan timed out (no ACK); continuing\n");
     } else if (enable_response != 0xFA) {
-        kprintf("[PS/2] Warning: Enable scan failed (0x%x)\n", enable_response);
+        PS2_LOG("[PS/2] Warning: Enable scan failed (0x%x)\n", enable_response);
+    }
+
+    // ---- Set typematic rate/delay ----
+    // On real hardware (T410), the BIOS default repeat rate can be sluggish
+    // (e.g. 500ms delay, 10.9 cps). Set a responsive rate for desktop use.
+    //   Command 0xF3 followed by a parameter byte:
+    //     Bits 6-5: delay   (00=250ms, 01=500ms, 10=750ms, 11=1000ms)
+    //     Bits 4-0: rate    (0x00=30.0cps fastest ... 0x1F=2.0cps slowest)
+    //   0x00 = 250ms delay, 30.0 characters/sec — snappy desktop feel.
+    ps2_write_data(KB_CMD_SET_TYPEMATIC);
+    uint8_t typo_ack = ps2_read_data_timeout(&kb_ok);
+    if (!kb_ok) {
+        PS2_LOG("[PS/2] Warning: Set typematic timed out; using BIOS default\n");
+    } else if (typo_ack != 0xFA) {
+        PS2_LOG("[PS/2] Warning: Set typematic rejected (0x%x); using BIOS default\n",
+                typo_ack);
+    } else {
+        // ACK received — now send the rate/delay parameter byte.
+        ps2_write_data(0x00);  // 250ms delay, 30.0 cps
+        uint8_t typo_ack2 = ps2_read_data_timeout(&kb_ok);
+        if (!kb_ok || typo_ack2 != 0xFA) {
+            PS2_LOG("[PS/2] Warning: Typematic rate parameter not acknowledged\n");
+        } else {
+            PS2_LOG("[PS/2] Typematic rate set: 250ms delay, 30.0 cps\n");
+        }
     }
 
     // Register keyboard as input device
@@ -745,18 +1032,18 @@ void ps2_init(void) {
         keyboard_device->supports_abs = false;
         keyboard_device->supports_led = true;
         input_register_device(keyboard_device);
-        kprintf("[PS/2] Registered keyboard as input device\n");
+        PS2_LOG("[PS/2] Registered keyboard as input device\n");
     }
 
     ps2_initialized = true;
-    kprintf("[PS/2] Keyboard initialized\n");
+    PS2_LOG("[PS/2] Keyboard initialized\n");
 
     // Register keyboard IRQ handler
     extern void irq_register_handler(uint8_t irq, void (*handler)(void));
-    kprintf("[PS/2] Registering IRQ 1 (keyboard)...\n");
+    PS2_LOG("[PS/2] Registering IRQ 1 (keyboard)...\n");
     irq_register_handler(1, ps2_irq_handler);
 
-    kprintf("[PS/2] PS/2 keyboard ready\n");
+    PS2_LOG("[PS/2] PS/2 keyboard ready\n");
 
     // ---- Mouse bring-up (second PS/2 port) ----
     if (ps2_mouse_init() == 0) {
@@ -769,15 +1056,15 @@ void ps2_init(void) {
             mouse_device->supports_abs = false;
             mouse_device->supports_led = false;
             input_register_device(mouse_device);
-            kprintf("[PS/2] Registered mouse as input device\n");
+            PS2_LOG("[PS/2] Registered mouse as input device\n");
         }
 
         // Register mouse IRQ handler (IRQ12) via the void(void) wrapper.
-        kprintf("[PS/2] Registering IRQ 12 (mouse)...\n");
+        PS2_LOG("[PS/2] Registering IRQ 12 (mouse)...\n");
         irq_register_handler(12, ps2_mouse_irq_wrapper);
-        kprintf("[PS/2] PS/2 mouse ready\n");
+        PS2_LOG("[PS/2] PS/2 mouse ready\n");
     } else {
-        kprintf("[PS/2] Mouse not present or init failed; continuing\n");
+        PS2_LOG("[PS/2] Mouse not present or init failed; continuing\n");
     }
 }
 

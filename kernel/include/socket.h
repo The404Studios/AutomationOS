@@ -38,10 +38,10 @@
 
 /* Limits. */
 #define SOCK_MAX            16     /* concurrent sockets                  */
-#define SOCK_RXBUF_SIZE     8192   /* per-TCP-socket stream RX ring       */
+#define SOCK_RXBUF_SIZE     32768  /* per-TCP-socket stream RX ring       */
 #define UDP_QUEUE_DEPTH     8      /* per-UDP-socket queued datagrams     */
 #define UDP_DGRAM_MAX       1472   /* max UDP payload over 1500 MTU       */
-#define TCP_MSS             1024   /* our advertised/used segment payload */
+#define TCP_MSS             1460   /* standard MSS for 1500-byte MTU      */
 
 /* Socket errors (negative; match syscall.h conventions where they overlap). */
 #define SOCK_OK         0
@@ -121,6 +121,7 @@ typedef struct sock sock_t;  /* forward declaration for self-reference */
 struct sock {
     bool        used;
     int         type;          /* SOCK_STREAM | SOCK_DGRAM              */
+    uint32_t    owner_pid;     /* PID that created this socket           */
 
     /* Connection 4-tuple (host byte order). */
     uint32_t    local_ip;
@@ -258,6 +259,9 @@ int sock_recvfrom(int s, void* buf, uint32_t len,
 /* Close (TCP: send FIN if connected). 0 / negative. */
 int sock_close(int s);
 
+/* Close all sockets owned by a dying process. Called from process_unref(). */
+void sock_cleanup_process(uint32_t pid);
+
 /* ------------------------------------------------------------------ */
 /* In-kernel self test (optional; safe after net_init()).              */
 /* ------------------------------------------------------------------ */
@@ -267,19 +271,21 @@ void sock_selftest(void);
 /* Proposed userspace syscall surface (REPORTED to the integrator).    */
 /* ------------------------------------------------------------------ */
 /*
- * Add to kernel/include/syscall.h (44 is next free after SYS_GET_TICKS_MS=40
- * and the proposed SYS_NET_SEND/RECV/INFO = 41/42/43 from net.h):
+ * Syscall numbers (AUTHORITATIVE -- see kernel/include/syscall.h):
  *
- *     #define SYS_SOCKET    44   sys_sock_socket(type)
- *     #define SYS_CONNECT   45   sys_sock_connect(s, ip, port)
- *     #define SYS_SEND      46   sys_sock_send(s, buf, len)
- *     #define SYS_RECV      47   sys_sock_recv(s, buf, len)
- *     #define SYS_CLOSE_SK  48   sys_sock_close(s)   (distinct from SYS_CLOSE=5)
- *     #define SYS_SENDTO    49   sys_sock_sendto(s, buf, len, ip, port)
- *     #define SYS_RECVFROM  50   sys_sock_recvfrom(s, buf, len, out_addr)
- *     #define SYS_SOCK_POLL 51   sys_sock_poll()  (optional explicit pump)
+ *     #define SYS_SOCKET    51   sys_sock_socket(type)
+ *     #define SYS_CONNECT   52   sys_sock_connect(s, ip, port)
+ *     #define SYS_SEND      53   sys_sock_send(s, buf, len)
+ *     #define SYS_RECV      54   sys_sock_recv(s, buf, len)
+ *     #define SYS_CLOSE_SK  55   sys_sock_close(s)   (distinct from SYS_CLOSE=5)
+ *     #define SYS_SENDTO    56   sys_sock_sendto(s, buf, len, ip, port)
+ *     #define SYS_RECVFROM  57   sys_sock_recvfrom(s, buf, len, out_addr)
+ *     #define SYS_SOCK_POLL 58   sys_sock_poll()  (optional explicit pump)
+ *     #define SYS_BIND      76   sys_sock_bind(s, port)
+ *     #define SYS_LISTEN    77   sys_sock_listen(s, backlog)
+ *     #define SYS_ACCEPT    78   sys_sock_accept(s)
  *
- * and route them to the handlers below (kernel/net/socket.c). The handlers
+ * Routed to the handlers below (kernel/net/socket.c). The handlers
  * match syscall_handler_t and use copy_from_user/copy_to_user.
  */
 

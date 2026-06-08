@@ -131,12 +131,14 @@ static int rsa_verify_simple(const uint8_t* signature, const uint8_t* modulus,
         final[i] = 0;
     }
 
-    // Simplified multiplication
+    // Simplified multiplication (bounds-checked to prevent OOB stack write)
     for (int i = (int)key_bytes - 1; i >= 0; i--) {
         uint32_t carry = 0;
         for (int j = (int)key_bytes - 1; j >= 0; j--) {
-            uint32_t prod = (uint32_t)result[i] * temp[j] + final[i + j - (int)key_bytes + 1] + carry;
-            final[i + j - (int)key_bytes + 1] = (uint8_t)(prod & 0xFF);
+            int idx = i + j - (int)key_bytes + 1;
+            if (idx < 0 || idx >= (int)key_bytes) continue;  // bounds check
+            uint32_t prod = (uint32_t)result[i] * temp[j] + final[idx] + carry;
+            final[idx] = (uint8_t)(prod & 0xFF);
             carry = prod >> 8;
         }
     }
@@ -170,6 +172,12 @@ int rsa_verify_pkcs1_sha256(const rsa_public_key_t* key,
     }
 
     size_t key_bytes = key->bits / 8;
+
+    // Guard against oversized keys that would overflow stack buffers
+    if (key_bytes > RSA_4096_BYTES) {
+        kprintf("[RSA] Key too large: %zu bytes (max %u)\n", key_bytes, RSA_4096_BYTES);
+        return -1;
+    }
 
     // Check signature size
     if (signature->size != key_bytes) {
@@ -211,6 +219,12 @@ int rsa_verify_pkcs1_sha256(const rsa_public_key_t* key,
     size_t padding_end = 2;
     while (padding_end < key_bytes && decrypted[padding_end] == 0xFF) {
         padding_end++;
+    }
+
+    // PKCS#1 v1.5 requires at least 8 bytes of 0xFF padding
+    if (padding_end < 10) {  // 2 (header) + 8 (min padding) = 10
+        kprintf("[RSA] PKCS#1 padding too short: %zu bytes (minimum 8)\n", padding_end - 2);
+        return -1;
     }
 
     if (padding_end >= key_bytes || decrypted[padding_end] != 0x00) {

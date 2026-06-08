@@ -13,15 +13,15 @@
 #include "ide.h"
 #include "ide_theme.h"
 
-#define CHR_NTABS 5
+#define CHR_NTABS 6
 
-/* Tab numbers ("VIZ-1".."VIZ-5") and the words beside them are drawn
+/* Tab numbers ("VIZ-1".."VIZ-6") and the words beside them are drawn
  * separately so the number can be BLUE and the word dim. */
 static const char* const CHR_TAB_NUM[CHR_NTABS] = {
-    "VIZ-1", "VIZ-2", "VIZ-3", "VIZ-4", "VIZ-5",
+    "VIZ-1", "VIZ-2", "VIZ-3", "VIZ-4", "VIZ-5", "VIZ-6",
 };
 static const char* const CHR_TAB_WORD[CHR_NTABS] = {
-    "PROJECT MAP", "INSPECTOR", "RUNTIME", "ACTIONS", "POTENTIALS",
+    "PROJECT MAP", "INSPECTOR", "RUNTIME", "ACTIONS", "POTENTIALS", "SETTINGS",
 };
 
 /* Vertically centre a GFX_FH-tall line of text within a bar of height h. */
@@ -49,6 +49,17 @@ static inline int chr_new_w(void) { return gfx_textw(CHR_NEW_LABEL) + 2 * GFX_FW
 /* Left edge of the button: anchored to the right, leaving PAD margin. */
 static inline int chr_new_x(Rect r) { return r.x + r.w - PAD - chr_new_w(); }
 
+/* The 6 VIZ tabs pack into the bar MINUS a reserved right area (the coherence
+ * chip "COH 100%" + the [+ NEW] button + gaps), so they never collide with
+ * either. Render + hit-test both divide THIS width, not the full bar width. */
+static inline int chr_tabs_w(Rect r) {
+    int reserved = (8 * GFX_FW) + chr_new_w() + 3 * GFX_FW;
+    int w = r.w - reserved;
+    if (w < r.w / 2) w = r.w / 2;     /* keep the tab strip at >= half the bar */
+    if (w < 0) w = 0;
+    return w;
+}
+
 /* ------------------------------------------------------------------ top bar */
 void panel_topbar(Ide* a, Canvas* cv, Rect r) {
     if (r.w <= 0 || r.h <= 0) return;
@@ -60,10 +71,11 @@ void panel_topbar(Ide* a, Canvas* cv, Rect r) {
     gfx_hline(cv, r.x, r.y + r.h - 1, r.w, TH_BORDER);
 
     int ty = chr_text_y(r.y, r.h);
+    int tabsw = chr_tabs_w(r);          /* tabs occupy the bar minus the right chips */
 
     for (int i = 0; i < CHR_NTABS; i++) {
-        int cx0 = chr_tab_x(r.x, r.w, i);
-        int cx1 = chr_tab_x(r.x, r.w, i + 1);
+        int cx0 = chr_tab_x(r.x, tabsw, i);
+        int cx1 = chr_tab_x(r.x, tabsw, i + 1);
         int cw  = cx1 - cx0;
         if (cw <= 0) continue;
 
@@ -150,8 +162,10 @@ int panel_topbar_click(Ide* a, Rect r, int mx, int my) {
         if (mx >= bx && mx < bx + chr_new_w()) { ide_new_project(a); return 1; }
     }
 
+    int tabsw = chr_tabs_w(r);
     int rel = mx - r.x;
-    int i = (rel * CHR_NTABS) / r.w;
+    if (rel >= tabsw) return 1;          /* click in the reserved right area: no tab */
+    int i = (tabsw > 0) ? (rel * CHR_NTABS) / tabsw : 0;
     if (i < 0) i = 0;
     if (i >= CHR_NTABS) i = CHR_NTABS - 1;
     a->viz = (VizTab)i;

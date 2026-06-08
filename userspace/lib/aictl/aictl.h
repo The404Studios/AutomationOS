@@ -84,10 +84,11 @@ typedef struct {
  * sysinfo_t: system-wide statistics returned by SYS_SYSINFO.
  * ---------------------------------------------------------------------- */
 typedef struct {
-    u64 total_mem;   /* total physical memory in bytes */
-    u64 free_mem;    /* free physical memory in bytes  */
-    u64 uptime_ms;   /* milliseconds since boot        */
-    u32 proc_count;  /* total live processes           */
+    u64 total_mem;     /* total physical memory in bytes    */
+    u64 free_mem;      /* free physical memory in bytes     */
+    u64 uptime_ms;     /* milliseconds since boot           */
+    u32 proc_count;    /* total live processes              */
+    u32 heap_used_kb;  /* kernel heap usage in KiB (0=old)  */
 } sysinfo_t;
 
 /* -------------------------------------------------------------------------

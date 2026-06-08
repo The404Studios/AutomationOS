@@ -282,17 +282,24 @@ static int hexval(char c)
     if (c >= 'A' && c <= 'F') return c - 'A' + 10;
     return -1;
 }
-static void url_decode(char *s)
+static int url_decode(char *s)
 {
     char *w = s;
     for (char *r = s; *r; ) {
         if (r[0] == '%' && r[1] && r[2]) {
             int hi = hexval(r[1]), lo = hexval(r[2]);
-            if (hi >= 0 && lo >= 0) { *w++ = (char)((hi << 4) | lo); r += 3; continue; }
+            if (hi >= 0 && lo >= 0) {
+                int ch = (hi << 4) | lo;
+                if (ch == 0) return -1;  /* reject %00 (NUL injection) */
+                *w++ = (char)ch;
+                r += 3;
+                continue;
+            }
         }
         *w++ = *r++;
     }
     *w = '\0';
+    return 0;
 }
 
 /*
@@ -303,6 +310,9 @@ static void url_decode(char *s)
 static int path_is_safe(const char *p)
 {
     for (const char *c = p; *c; c++) {
+        /* Reject control characters (0x01..0x1F, 0x7F) in paths */
+        if ((unsigned char)*c < 0x20 || (unsigned char)*c == 0x7F)
+            return 0;
         if (c[0] == '.' && c[1] == '.') {
             char before = (c == p) ? '/' : c[-1];
             char after  = c[2];
@@ -477,9 +487,8 @@ static int handle_conn(long cfd, const char *root)
     /* Strip a query string. */
     for (char *q = url; *q; q++) { if (*q == '?') { *q = '\0'; break; } }
 
-    /* Decode %xx escapes, then reject directory traversal. */
-    url_decode(url);
-    if (url[0] != '/' || !path_is_safe(url)) {
+    /* Decode %xx escapes (reject %00), then reject directory traversal. */
+    if (url_decode(url) < 0 || url[0] != '/' || !path_is_safe(url)) {
         send_error(cfd, 400, "Bad Request");
         return 0;
     }

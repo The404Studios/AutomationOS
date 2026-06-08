@@ -282,8 +282,15 @@ static ssize_t ext2_vfs_read(vfs_file_t* file, void* buf, size_t count) {
         return 0;
     }
 
-    if (file->offset + count > vfs_inode->size) {
-        count = vfs_inode->size - file->offset;
+    /* BUG-FIX (integer overflow in read): the old code computed
+     *   file->offset + count > vfs_inode->size
+     * without guarding against overflow.  If file->offset is near UINT64_MAX
+     * the addition wraps and we'd copy 'count' bytes past EOF.  Compute the
+     * available byte count first using subtraction (safe because we already
+     * checked file->offset < inode->size), then clamp count to that. */
+    uint64_t available = vfs_inode->size - file->offset;
+    if ((uint64_t)count > available) {
+        count = (size_t)available;
     }
 
     size_t bytes_read = 0;
@@ -358,22 +365,23 @@ static int ext2_vfs_close(vfs_file_t* file) {
 
 /**
  * VFS lseek operation for ext2
+ *
+ * BUG-FIX (underflow): validate that the computed position does not wrap
+ * below zero, mirroring the ramfs and fat32 lseek fixes.
  */
 static off_t ext2_vfs_lseek(vfs_file_t* file, off_t offset, int whence) {
+    uint64_t base;
     switch (whence) {
-        case SEEK_SET:
-            file->offset = offset;
-            break;
-        case SEEK_CUR:
-            file->offset += offset;
-            break;
-        case SEEK_END:
-            file->offset = file->inode->size + offset;
-            break;
-        default:
-            return -1;
+        case SEEK_SET: base = 0; break;
+        case SEEK_CUR: base = file->offset; break;
+        case SEEK_END: base = file->inode->size; break;
+        default:       return -1;
     }
-    return file->offset;
+    if (offset < 0 && (uint64_t)(-offset) > base) {
+        return -1;   /* would seek before byte 0 */
+    }
+    file->offset = base + (uint64_t)offset;
+    return (off_t)file->offset;
 }
 
 /**
@@ -435,7 +443,11 @@ static vfs_dentry_t* ext2_vfs_lookup(vfs_inode_t* dir, const char* name) {
     // Read directory blocks
     uint32_t blocks_to_read = (dir->size + fs_data->block_size - 1) / fs_data->block_size;
 
-    for (uint32_t i = 0; i < blocks_to_read && i < 12; i++) {
+    /* BUG-FIX: the old cap `i < 12` restricted lookup to the 12 direct blocks,
+     * making files/dirs stored in indirect blocks invisible. ext2_get_block_num()
+     * already handles single/double/triple indirect lookups, so let the full
+     * block range be scanned. */
+    for (uint32_t i = 0; i < blocks_to_read; i++) {
         uint32_t block_num = ext2_get_block_num(fs_data, dir_inode, i);
         if (block_num == 0) {
             continue;

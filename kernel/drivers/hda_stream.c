@@ -20,9 +20,17 @@ extern uint32_t hda_send_verb4(hda_controller_t* ctrl, uint8_t codec_addr,
  * Allocate a stream descriptor
  */
 hda_stream_t* hda_stream_alloc(hda_controller_t* ctrl, bool is_output) {
-    // Find available stream
+    // Find available stream.
+    //
+    // Intel HDA spec: stream descriptor registers are laid out as:
+    //   SD[0..ISS-1]              = Input Stream Descriptors
+    //   SD[ISS..ISS+OSS-1]       = Output Stream Descriptors
+    //   SD[ISS+OSS..ISS+OSS+BSS-1] = Bidirectional Stream Descriptors
+    //
+    // For OUTPUT streams, the register base index is num_iss (skip inputs).
+    // For INPUT streams, the register base index is 0.
     uint8_t max_streams = is_output ? ctrl->num_oss : ctrl->num_iss;
-    uint8_t stream_base = is_output ? 0 : ctrl->num_oss;
+    uint8_t stream_base = is_output ? ctrl->num_iss : 0;
 
     for (uint8_t i = 0; i < max_streams; i++) {
         uint8_t stream_num = stream_base + i;
@@ -222,11 +230,18 @@ int hda_stream_setup(hda_controller_t* ctrl, hda_stream_t* stream,
         timeout--;
     }
 
-    // Clear reset
+    // Clear reset and wait for hardware to acknowledge (SRST reads back 0)
     ctl = hda_sd_read32(ctrl, sd, HDA_SD_CTL);
     ctl &= ~0x00000001;
     hda_sd_write32(ctrl, sd, HDA_SD_CTL, ctl);
-    hda_msleep(1);
+    timeout = 100;
+    while (timeout > 0) {
+        if (!(hda_sd_read32(ctrl, sd, HDA_SD_CTL) & 0x00000001)) {
+            break;
+        }
+        hda_msleep(1);
+        timeout--;
+    }
 
     // Set stream tag and channel
     ctl = hda_sd_read32(ctrl, sd, HDA_SD_CTL);

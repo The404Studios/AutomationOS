@@ -139,9 +139,43 @@ static inline void write_cr4(uint64_t val) {
 
 // CR4 bits
 #define CR4_PCIDE (1ULL << 17)
+#define CR4_SMEP  (1ULL << 20)  // Supervisor Mode Execution Prevention
+#define CR4_SMAP  (1ULL << 21)  // Supervisor Mode Access Prevention
+
+/*
+ * STAC / CLAC — Supervisor-mode user-page access brackets.
+ *
+ * When SMAP is enabled (CR4.SMAP=1), any supervisor-mode access to a page
+ * marked PAGE_USER raises #PF *unless* RFLAGS.AC is set.  STAC sets AC
+ * (opens the window), CLAC clears it (closes).  Every copy_from/to_user
+ * and every raw user-memory access (futex atomic load) must be wrapped in
+ * a stac() ... clac() bracket so the kernel can reach the user page.
+ *
+ * GUARD: STAC/CLAC are Haswell+ instructions (opcode 0F 01 CB/CA).  On
+ * Westmere/Arrandale (T410) they are UNDEFINED and cause #UD, freezing
+ * the kernel.  We gate on a global flag set by paging_init() only when
+ * SMAP is actually enabled.  Without SMAP the instructions are never
+ * needed (the CPU ignores RFLAGS.AC for page-fault checks).
+ */
+extern bool cpu_smap_active;
+
+static inline void stac(void) {
+    if (cpu_smap_active)
+        __asm__ volatile("stac" ::: "cc", "memory");
+}
+static inline void clac(void) {
+    if (cpu_smap_active)
+        __asm__ volatile("clac" ::: "cc", "memory");
+}
 
 // CPUID feature detection for INVPCID
+// GUARD: Westmere/Arrandale (T410) has max leaf 0xB but does not support
+// INVPCID (Haswell+).  Older CPUs with max leaf < 7 would return the
+// highest-supported-leaf result (garbage).  Always check max leaf first.
 static inline bool cpu_has_invpcid(void) {
+    uint32_t max_leaf;
+    asm volatile("cpuid" : "=a"(max_leaf) : "a"(0) : "ebx", "ecx", "edx");
+    if (max_leaf < 7) return false;
     uint32_t a, b, c, d;
     asm volatile("cpuid" : "=a"(a), "=b"(b), "=c"(c), "=d"(d) : "a"(7), "c"(0));
     return (b >> 10) & 1;

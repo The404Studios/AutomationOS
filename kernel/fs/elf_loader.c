@@ -115,9 +115,18 @@ static int elf_load_segment(const elf64_phdr_t* phdr, const void* elf_data,
     if (phdr->p_offset > file_size || phdr->p_filesz > file_size - phdr->p_offset)
         return ELF_ERR_INVALID;
 
-    // Calculate aligned boundaries
+    // Calculate aligned boundaries.
+    // ALIGN_UP overflow check: if p_vaddr + p_memsz is within PAGE_SIZE of
+    // UINT64_MAX, ALIGN_UP wraps to 0 and num_pages underflows catastrophically.
+    // The p_vaddr + p_memsz overflow was already guarded above, so the sum is
+    // valid; guard the rounding step here.
     uint64_t vaddr_start = ALIGN_DOWN(phdr->p_vaddr, PAGE_SIZE);
-    uint64_t vaddr_end = ALIGN_UP(phdr->p_vaddr + phdr->p_memsz, PAGE_SIZE);
+    uint64_t raw_end = phdr->p_vaddr + phdr->p_memsz;
+    uint64_t vaddr_end = ALIGN_UP(raw_end, PAGE_SIZE);
+    if (vaddr_end < raw_end) {
+        // ALIGN_UP wrapped around 64 bits
+        return ELF_ERR_INVALID;
+    }
     uint64_t num_pages = (vaddr_end - vaddr_start) / PAGE_SIZE;
 
     kprintf("[ELF]   Segment: vaddr=0x%016lx size=0x%lx pages=%lu flags=%s%s%s\n",
@@ -333,14 +342,46 @@ int elf_load(const char* path, int argc, char** argv,
         return ELF_ERR_INVALID;
     }
 
-    // Load PT_LOAD segments
+    // Load PT_LOAD segments with overlap detection.
+    // A crafted ELF could contain two PT_LOAD segments that map overlapping
+    // virtual address ranges; the second load would overwrite memory the first
+    // already initialised (or vice versa), which can corrupt code/data or
+    // bypass W^X by overwriting a read-only code segment with writable data.
+    // Track the [start,end) ranges of each loaded segment and reject overlaps.
     const elf64_phdr_t* phdr = (const elf64_phdr_t*)((uint8_t*)elf_data + ehdr->e_phoff);
+
+#define ELF_MAX_LOAD_SEGMENTS 16
+    struct { uint64_t start; uint64_t end; } loaded[ELF_MAX_LOAD_SEGMENTS];
+    int n_loaded = 0;
 
     for (int i = 0; i < ehdr->e_phnum; i++) {
         if (phdr[i].p_type == PT_LOAD) {
+            // Segment overlap detection: check against all previously loaded
+            uint64_t seg_start = ALIGN_DOWN(phdr[i].p_vaddr, PAGE_SIZE);
+            uint64_t seg_end_raw = phdr[i].p_vaddr + phdr[i].p_memsz;
+            uint64_t seg_end = ALIGN_UP(seg_end_raw, PAGE_SIZE);
+            if (seg_end < seg_end_raw) {
+                kprintf("[ELF] ERROR: segment %d ALIGN_UP overflow\n", i);
+                return ELF_ERR_INVALID;
+            }
+
+            for (int j = 0; j < n_loaded; j++) {
+                if (seg_start < loaded[j].end && seg_end > loaded[j].start) {
+                    kprintf("[ELF] ERROR: segment %d [0x%lx,0x%lx) overlaps segment [0x%lx,0x%lx)\n",
+                            i, seg_start, seg_end, loaded[j].start, loaded[j].end);
+                    return ELF_ERR_INVALID;
+                }
+            }
+
             int ret = elf_load_segment(&phdr[i], elf_data, file_size);
             if (ret != ELF_SUCCESS) {
                 return ret;
+            }
+
+            if (n_loaded < ELF_MAX_LOAD_SEGMENTS) {
+                loaded[n_loaded].start = seg_start;
+                loaded[n_loaded].end = seg_end;
+                n_loaded++;
             }
         } else {
             kprintf("[ELF]   Skipping segment type 0x%x\n", phdr[i].p_type);

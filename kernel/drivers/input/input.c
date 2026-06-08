@@ -12,6 +12,7 @@
 
 #define MAX_INPUT_DEVICES 16
 #define GLOBAL_EVENT_QUEUE_SIZE 512
+#define MAX_HELD_KEYS 16            /* track up to 16 simultaneously held keys */
 
 // Global input device registry
 static input_device_t* input_devices[MAX_INPUT_DEVICES];
@@ -22,6 +23,17 @@ static uint32_t next_device_id = 1;
 static input_event_t global_event_queue[GLOBAL_EVENT_QUEUE_SIZE];
 static volatile uint32_t global_queue_head = 0;
 static volatile uint32_t global_queue_tail = 0;
+
+// Overflow tracking -- counts dropped events across all device queues.
+static volatile uint32_t overflow_count = 0;
+
+// Held-key tracking for stuck-key prevention.
+// When a key-down event is received we record its keycode; on key-up we
+// remove it. If the held_keys table is full when a new key-down arrives
+// the oldest entry is evicted (synthetic release injected). This prevents
+// ghost held-keys when a key-up event is lost (e.g. USB poll miss).
+static uint16_t held_keys[MAX_HELD_KEYS];
+static uint32_t num_held_keys = 0;
 
 // Timer function to get current timestamp (microseconds since boot)
 extern uint64_t timer_get_ticks(void);
@@ -140,9 +152,9 @@ static void input_add_to_device_queue(input_device_t* dev, input_event_t* event)
     uint32_t next_tail = (dev->queue_tail + 1) % dev->queue_size;
 
     if (next_tail == dev->queue_head) {
-        // Queue full, drop oldest event
-        kprintf("[INPUT] Device queue full, dropping event\n");
+        // Queue full, drop oldest event and count the overflow
         dev->queue_head = (dev->queue_head + 1) % dev->queue_size;
+        overflow_count++;
     }
 
     dev->event_queue[dev->queue_tail] = *event;
@@ -162,9 +174,51 @@ static void input_add_to_global_queue(input_event_t* event) {
     global_queue_tail = next_tail;
 }
 
+/*
+ * Stuck-key prevention helpers.
+ * Track which keys are currently held; if a release is lost the table
+ * entry persists and the key appears "stuck". input_release_all_keys()
+ * can be called periodically or on focus change to inject synthetic
+ * releases for every tracked key.
+ */
+static void held_keys_add(uint16_t keycode) {
+    /* Already tracked? */
+    for (uint32_t i = 0; i < num_held_keys; i++) {
+        if (held_keys[i] == keycode) return;
+    }
+    if (num_held_keys >= MAX_HELD_KEYS) {
+        /* Table full -- evict oldest (index 0) to make room. */
+        /* We do NOT inject a synthetic release here because the caller
+         * may be in interrupt context; instead the entry is silently
+         * dropped. input_release_all_keys() handles bulk cleanup. */
+        for (uint32_t i = 1; i < num_held_keys; i++)
+            held_keys[i - 1] = held_keys[i];
+        num_held_keys--;
+    }
+    held_keys[num_held_keys++] = keycode;
+}
+
+static void held_keys_remove(uint16_t keycode) {
+    for (uint32_t i = 0; i < num_held_keys; i++) {
+        if (held_keys[i] == keycode) {
+            for (uint32_t j = i; j < num_held_keys - 1; j++)
+                held_keys[j] = held_keys[j + 1];
+            num_held_keys--;
+            return;
+        }
+    }
+}
+
 // Report key event
 void input_report_key(input_device_t* dev, uint16_t keycode, int32_t value) {
     if (!dev || !dev->supports_key) return;
+
+    /* Maintain held-key table for stuck-key prevention. */
+    if (value != 0) {    /* press or repeat */
+        held_keys_add(keycode);
+    } else {             /* release */
+        held_keys_remove(keycode);
+    }
 
     input_event_t event;
     event.timestamp = input_get_timestamp();
@@ -177,6 +231,32 @@ void input_report_key(input_device_t* dev, uint16_t keycode, int32_t value) {
 
     // Forward to evdev
     evdev_handle_event(dev, &event);
+}
+
+/*
+ * Release all currently held keys by injecting synthetic key-up events.
+ * Call on focus-loss, VT switch, or periodically to prevent ghost keys.
+ */
+void input_release_all_keys(input_device_t* dev) {
+    if (!dev) return;
+    while (num_held_keys > 0) {
+        uint16_t kc = held_keys[--num_held_keys];
+        input_event_t event;
+        event.timestamp = input_get_timestamp();
+        event.type = INPUT_EVENT_KEY;
+        event.code = kc;
+        event.value = 0;   /* release */
+        input_add_to_device_queue(dev, &event);
+        input_add_to_global_queue(&event);
+        evdev_handle_event(dev, &event);
+    }
+}
+
+/*
+ * Return the current event overflow count (number of dropped events).
+ */
+uint32_t input_get_overflow_count(void) {
+    return overflow_count;
 }
 
 // Report relative movement

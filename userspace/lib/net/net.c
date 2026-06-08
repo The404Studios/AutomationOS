@@ -10,7 +10,7 @@
  *   SYS_RECV     = 54  (fd, buf, len)
  *   SYS_CLOSE_SK = 55  (fd)
  *   SYS_SENDTO   = 56  (fd, buf, len, ip, port)
- *   SYS_RECVFROM = 57  (fd, buf, len, &ip, &port)
+ *   SYS_RECVFROM = 57  (fd, buf, len, &sock_addr_t)
  *   SYS_SOCK_POLL= 58  (fd)
  *   SYS_NET_INFO = 59  (fills net_info_t)
  *
@@ -188,13 +188,25 @@ int net_sendto(int fd, const void *buf, int len, u32 ip, u16 port)
 }
 
 /* net_recvfrom ----------------------------------------------------------- */
+
+/* Mirror of sock_addr_t from kernel/include/socket.h.  The kernel's
+ * sys_sock_recvfrom copies this struct to the user pointer in a4.       */
+typedef struct { u32 ip; u16 port; u16 _pad; } net_sock_addr_t;
+
 int net_recvfrom(int fd, void *buf, int len, u32 *src_ip, u16 *src_port)
 {
     if (fd < 0) return NET_ERR_BADF;
     if (!buf || len <= 0) return NET_ERR_INVAL;
     if (!net_available()) return NET_ERR_UNAVAIL;
+    net_sock_addr_t addr;
+    addr.ip = 0; addr.port = 0; addr._pad = 0;
+    int want_addr = (src_ip || src_port) ? 1 : 0;
     long rc = sc(SYS_RECVFROM, (long)fd, (long)buf, (long)len,
-                 (long)src_ip, (long)src_port, 0);
+                 want_addr ? (long)&addr : 0, 0, 0);
+    if (rc > 0 && want_addr) {
+        if (src_ip)   *src_ip   = addr.ip;
+        if (src_port) *src_port = addr.port;
+    }
     return map_rc(rc);
 }
 

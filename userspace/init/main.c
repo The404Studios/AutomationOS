@@ -14,6 +14,7 @@ typedef unsigned long size_t;
 #define SYS_YIELD   15
 #define SYS_SHMGET  18
 #define SYS_SHMAT   19
+#define SYS_TIME    41
 
 #ifdef SELFHEAL
 /* SELFHEAL: init creates+owns the compositor heartbeat SHM page. selfheal.h is
@@ -124,6 +125,12 @@ void _start(void) {
         print("[INIT] ERROR: Failed to spawn compositor!\n");
     }
 
+    // Auto-DHCP: spawns in the background, sleeps 2s (NIC PHY negotiate),
+    // checks link, runs DHCP if up, applies lease, exits. Non-blocking --
+    // init does not wait for it. If no NIC or DHCP fails, exits silently.
+    print("[INIT] Spawning autodhcp...\n");
+    spawn("sbin/autodhcp");
+
 #ifdef SELFHEAL
     /* SELFHEAL: the recovery supervisor. It polls the heartbeat and, on a freeze,
      * fires the recovery overlay + kills the compositor (init respawns it below). */
@@ -166,6 +173,22 @@ void _start(void) {
     // the cascade. It remains launchable from the dock.
     // spawn("sbin/dateapp");
 
+    // prioritytest's pid (referenced by the reaper loop). Declared here so it is
+    // visible in BOTH the full and DESKTOP_MINIMAL builds; -1 means "never spawned".
+    int prioritytest_pid = -1;
+
+    // ── DESKTOP_MINIMAL boot trim ───────────────────────────────────────────
+    // When built with -DDESKTOP_MINIMAL (the T410 desktop profile), init spawns
+    // ONLY the persistent desktop apps (compositor + terminal + filemanager +
+    // netman + browser + ide) and SKIPS the ~70 self-test programs below. Those
+    // tests are a dev smoke-suite, not part of the desktop: several (cryptotest,
+    // matbench, prioritytest) run long no-yield compute blocks that, on the slow
+    // cooperative T410, hold the CPU for seconds (the boot "lag"), and the rapid
+    // create/destroy churn of ~80 short-lived processes stresses the PCID/address-
+    // space teardown path. Trimming them gives a fast, smooth, low-churn boot and
+    // stops the SELFHEAL watchdog from false-tripping while the storm starves the
+    // compositor. The full self-test boot is still available by omitting the flag.
+#ifndef DESKTOP_MINIMAL
     // fork/CoW correctness probe: runs once, prints FORKTEST RESULT to serial,
     // exits. Verifies fork address-space isolation (eager copy today, CoW next).
     print("[INIT] Spawning forktest...\n");
@@ -304,12 +327,17 @@ void _start(void) {
     spawn("bin/basename"); spawn("bin/dirname");
     spawn("bin/uname"); spawn("bin/hostname"); spawn("bin/whoami"); spawn("bin/date");
     spawn("bin/less");  spawn("bin/hexdump");
+    spawn("bin/lspci");
+
+#endif  // !DESKTOP_MINIMAL (self-test storm, part A)
 
     // Network manager + web browser GUIs (open windows; user-facing net apps).
+    // PERSISTENT desktop apps -- spawned in BOTH the full and minimal builds.
     print("[INIT] Spawning netman + browser...\n");
     spawn("sbin/netman");
     spawn("sbin/browser");
 
+#ifndef DESKTOP_MINIMAL
     // Browser wave (22-agent): per-layer selftests + the new DOM-rendering
     // browser2. Each app prints "<NAME>: PASS" or "<NAME>: FAIL <which>" and
     // exits, so smoke can gate the entire web pipeline.
@@ -347,7 +375,7 @@ void _start(void) {
     // never perturbs the timing-sensitive sleeptest/prioritytest measurements. By
     // the time prioritytest (the last + slowest timing probe) exits, sleeptest has
     // long since finished and the boot storm has drained -- a clean, settled system.
-    int prioritytest_pid = spawn("sbin/prioritytest");
+    prioritytest_pid = spawn("sbin/prioritytest");
 
 #ifdef PREEMPT_STRESS
     // ========================================================================
@@ -376,6 +404,7 @@ void _start(void) {
     spawn("sbin/floattest");
     print("[INIT] PREEMPT_STRESS: 6 burners + 3 floattest spawned.\n");
 #endif
+#endif  // !DESKTOP_MINIMAL (self-test storm, part B)
 
     print("[INIT] All services started!\n");
 
@@ -403,6 +432,18 @@ void _start(void) {
     // system (clean PID reuse) without perturbing any measurement.
     int reaploop_spawned = 0;
 
+    // Compositor restart rate limiter: if the compositor dies 5 times within 30
+    // seconds, stop respawning it (crash loop — something is fundamentally broken;
+    // infinite respawn would just burn PIDs and CPU). Uses SYS_TIME (seconds since
+    // epoch) to track the last 5 death timestamps in a ring.
+    #define COMP_DEATH_LIMIT  5
+    #define COMP_DEATH_WINDOW 30   /* seconds */
+    long comp_death_times[COMP_DEATH_LIMIT];
+    int  comp_death_idx = 0;
+    int  comp_death_count = 0;
+    int  comp_rate_limited = 0;
+    for (int i = 0; i < COMP_DEATH_LIMIT; i++) comp_death_times[i] = 0;
+
     while (1) {
         int status;
         int pid = (int)syscall(SYS_WAITPID, -1, (long)&status, 0);
@@ -425,8 +466,36 @@ void _start(void) {
             }
 
             if (pid == compositor_pid) {
-                print("[INIT] Restarting compositor...\n");
-                compositor_pid = spawn("sbin/compositor");
+                if (comp_rate_limited) {
+                    print("[INIT] Compositor died again but rate-limited -- NOT restarting\n");
+                } else {
+                    long now = syscall(SYS_TIME, 0, 0, 0);
+                    // Record this death in the ring buffer
+                    comp_death_times[comp_death_idx] = now;
+                    comp_death_idx = (comp_death_idx + 1) % COMP_DEATH_LIMIT;
+                    if (comp_death_count < COMP_DEATH_LIMIT)
+                        comp_death_count++;
+
+                    // Check rate: if we have COMP_DEATH_LIMIT deaths and the
+                    // oldest one in the ring is within COMP_DEATH_WINDOW seconds
+                    // of now, we are crash-looping.
+                    if (comp_death_count >= COMP_DEATH_LIMIT) {
+                        long oldest = comp_death_times[comp_death_idx % COMP_DEATH_LIMIT];
+                        if (now - oldest < COMP_DEATH_WINDOW) {
+                            print("[INIT] Compositor crashed ");
+                            print_num(COMP_DEATH_LIMIT);
+                            print(" times in ");
+                            print_num(COMP_DEATH_WINDOW);
+                            print("s -- HALTING respawn\n");
+                            comp_rate_limited = 1;
+                        }
+                    }
+
+                    if (!comp_rate_limited) {
+                        print("[INIT] Restarting compositor...\n");
+                        compositor_pid = spawn("sbin/compositor");
+                    }
+                }
             }
 
 #ifdef SELFHEAL

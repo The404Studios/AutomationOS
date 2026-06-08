@@ -47,16 +47,27 @@
 #define SYS_NET_INFO      59   /* net_info(net_info_t*) -> 0 | -errno         */
 #define SYS_NET_RECV      69   /* net_recv(buf,len) -> framelen | 0 | -errno  */
 
-typedef unsigned char  u8;
-typedef unsigned short u16;
-typedef unsigned int   u32;
+typedef unsigned char      u8;
+typedef unsigned short     u16;
+typedef unsigned int       u32;
+typedef unsigned long long u64;
 
-/* net_info_t mirror (must match kernel/include/net.h -- same as ping/nettest). */
+/* net_info_t mirror -- MUST match kernel net_info_ext_t (kernel/include/netif.h). */
 typedef struct {
-    u8  mac[6];
-    u8  _pad[2];
-    u32 ip;        /* host byte order */
-    u32 gateway;   /* host byte order */
+    char ifname[16];
+    u8   mac[6];
+    u8   _pad[2];
+    u32  ip;
+    u32  netmask;
+    u32  gateway;
+    u32  dns;
+    u8   up;
+    u8   dhcp_active;
+    u8   _pad2[6];
+    u64  tx_packets;
+    u64  rx_packets;
+    u64  tx_bytes;
+    u64  rx_bytes;
 } net_info_t;
 
 /*

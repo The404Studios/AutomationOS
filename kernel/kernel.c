@@ -15,6 +15,15 @@
 #include "include/ipc.h"
 #include "include/health_monitor.h"
 
+/* Gate routine boot chatter (the "Initializing X... / X initialized" pairs).
+ * Defined via -DBOOT_QUIET in the build flags. Banners, errors, and key
+ * status lines are NOT gated — only the per-subsystem init noise. */
+#ifdef BOOT_QUIET
+#define BOOT_LOG(...) ((void)0)
+#else
+#define BOOT_LOG(...) kprintf(__VA_ARGS__)
+#endif
+
 typedef struct {
     uint32_t magic;
     uint32_t version;
@@ -105,7 +114,7 @@ static boot_info_t* parse_multiboot(uint64_t mb_info_addr) {
         uint32_t offset = 0;
         uint8_t* mmap_base = (uint8_t*)(uintptr_t)mb->mmap_addr;
 
-        kprintf("[BOOT] Parsing multiboot memory map (%u bytes)...\n", mb->mmap_length);
+        BOOT_LOG("[BOOT] Parsing multiboot memory map (%u bytes)...\n", mb->mmap_length);
 
         while (offset < mb->mmap_length && count < MAX_MMAP_ENTRIES) {
             multiboot_mmap_entry_t* entry = (multiboot_mmap_entry_t*)(mmap_base + offset);
@@ -124,7 +133,7 @@ static boot_info_t* parse_multiboot(uint64_t mb_info_addr) {
 
             if (entry->type == 1) {
                 total += entry->len;
-                kprintf("  [%u] 0x%lx - 0x%lx (%lu MB) Available\n",
+                BOOT_LOG("  [%u] 0x%lx - 0x%lx (%lu MB) Available\n",
                     count,
                     (unsigned long)entry->addr,
                     (unsigned long)(entry->addr + entry->len),
@@ -136,7 +145,7 @@ static boot_info_t* parse_multiboot(uint64_t mb_info_addr) {
         }
     } else if (mb->flags & 1) {
         /* Fallback: use mem_lower/mem_upper */
-        kprintf("[BOOT] Using basic memory info\n");
+        BOOT_LOG("[BOOT] Using basic memory info\n");
         mb_memory_map[0].base = 0;
         mb_memory_map[0].length = (uint64_t)mb->mem_lower * 1024;
         mb_memory_map[0].type = 1;
@@ -153,7 +162,7 @@ static boot_info_t* parse_multiboot(uint64_t mb_info_addr) {
     mb_boot_info.memory_map_count = count;
     mb_boot_info.total_memory = total;
 
-    kprintf("[BOOT] Total memory: %lu MB (%u regions)\n",
+    BOOT_LOG("[BOOT] Total memory: %lu MB (%u regions)\n",
         (unsigned long)(total / (1024*1024)), count);
 
     /* Parse multiboot modules (initrd) if available (bit 3 in flags) */
@@ -161,24 +170,24 @@ static boot_info_t* parse_multiboot(uint64_t mb_info_addr) {
         if (mb->mods_count > 0 && mb->mods_addr != 0) {
             multiboot_module_t* mods = (multiboot_module_t*)(uintptr_t)mb->mods_addr;
 
-            kprintf("[BOOT] Found %u multiboot module(s)\n", mb->mods_count);
+            BOOT_LOG("[BOOT] Found %u multiboot module(s)\n", mb->mods_count);
 
             /* First module is assumed to be initrd */
             if (mods[0].mod_start && mods[0].mod_end > mods[0].mod_start) {
                 mb_boot_info.initrd_addr = (uint64_t)mods[0].mod_start;
                 mb_boot_info.initrd_size = (uint64_t)(mods[0].mod_end - mods[0].mod_start);
 
-                kprintf("[BOOT] Initrd detected:\n");
-                kprintf("  Address: 0x%lx\n", (unsigned long)mb_boot_info.initrd_addr);
-                kprintf("  Size: %lu bytes (%lu KB)\n",
+                BOOT_LOG("[BOOT] Initrd detected:\n");
+                BOOT_LOG("  Address: 0x%lx\n", (unsigned long)mb_boot_info.initrd_addr);
+                BOOT_LOG("  Size: %lu bytes (%lu KB)\n",
                     (unsigned long)mb_boot_info.initrd_size,
                     (unsigned long)(mb_boot_info.initrd_size / 1024));
             }
         } else {
-            kprintf("[BOOT] No multiboot modules loaded\n");
+            BOOT_LOG("[BOOT] No multiboot modules loaded\n");
         }
     } else {
-        kprintf("[BOOT] No module information in multiboot\n");
+        BOOT_LOG("[BOOT] No module information in multiboot\n");
     }
 
     /* Parse framebuffer info if available (bit 12 in flags) */
@@ -190,14 +199,14 @@ static boot_info_t* parse_multiboot(uint64_t mb_info_addr) {
         mb_boot_info.framebuffer_bpp = mb->framebuffer_bpp;
         mb_boot_info.framebuffer_size = (uint64_t)mb->framebuffer_pitch * mb->framebuffer_height;
 
-        kprintf("[BOOT] Framebuffer detected:\n");
-        kprintf("  Address: 0x%lx\n", (unsigned long)mb->framebuffer_addr);
-        kprintf("  Resolution: %ux%u\n", mb->framebuffer_width, mb->framebuffer_height);
-        kprintf("  Pitch: %u bytes\n", mb->framebuffer_pitch);
-        kprintf("  BPP: %u bits\n", mb->framebuffer_bpp);
-        kprintf("  Type: %u\n", mb->framebuffer_type);
+        BOOT_LOG("[BOOT] Framebuffer detected:\n");
+        BOOT_LOG("  Address: 0x%lx\n", (unsigned long)mb->framebuffer_addr);
+        BOOT_LOG("  Resolution: %ux%u\n", mb->framebuffer_width, mb->framebuffer_height);
+        BOOT_LOG("  Pitch: %u bytes\n", mb->framebuffer_pitch);
+        BOOT_LOG("  BPP: %u bits\n", mb->framebuffer_bpp);
+        BOOT_LOG("  Type: %u\n", mb->framebuffer_type);
     } else {
-        kprintf("[BOOT] No framebuffer info available\n");
+        BOOT_LOG("[BOOT] No framebuffer info available\n");
     }
 
     return &mb_boot_info;
@@ -276,18 +285,18 @@ static void boot_mark(const char *label) {
 void kernel_main(void* raw_info) {
     serial_init();
 
-    kprintf("\n");
-    kprintf("=====================================\n");
-    kprintf("   AutomationOS v0.1.0\n");
-    kprintf("   created by fourzerofour & claude\n");
-    kprintf("   The kernel is ALIVE!\n");
-    kprintf("=====================================\n");
-    kprintf("\n");
+    BOOT_LOG("\n");
+    BOOT_LOG("=====================================\n");
+    BOOT_LOG("   AutomationOS v0.1.0\n");
+    BOOT_LOG("   created by fourzerofour & claude\n");
+    BOOT_LOG("   The kernel is ALIVE!\n");
+    BOOT_LOG("=====================================\n");
+    BOOT_LOG("\n");
 
     boot_info_t* boot_info = NULL;
 
     if (raw_info) {
-        kprintf("[BOOT] Multiboot info at 0x%lx\n", (unsigned long)(uintptr_t)raw_info);
+        BOOT_LOG("[BOOT] Multiboot info at 0x%lx\n", (unsigned long)(uintptr_t)raw_info);
         boot_info = parse_multiboot((uint64_t)(uintptr_t)raw_info);
     }
 
@@ -300,49 +309,49 @@ void kernel_main(void* raw_info) {
     uint64_t boot_start = rdtsc();
     uint64_t __perf_start = 0;
 
-    kprintf("\n[KERNEL] Initializing subsystems...\n\n");
+    BOOT_LOG("\n[KERNEL] Initializing subsystems...\n\n");
 
-    kprintf("[KERNEL] Initializing GDT...\n");
+    BOOT_LOG("[KERNEL] Initializing GDT...\n");
     gdt_init();
-    kprintf("[KERNEL] GDT initialized\n");
+    BOOT_LOG("[KERNEL] GDT initialized\n");
 
-    kprintf("[KERNEL] Initializing IDT...\n");
+    BOOT_LOG("[KERNEL] Initializing IDT...\n");
     idt_init();
-    kprintf("[KERNEL] IDT initialized\n");
+    BOOT_LOG("[KERNEL] IDT initialized\n");
 
     // Reserve initrd memory BEFORE PMM init (prevents PMM from overwriting it)
     if (boot_info->initrd_addr && boot_info->initrd_size) {
         extern void pmm_reserve_initrd(uint64_t start, uint64_t size);
         pmm_reserve_initrd(boot_info->initrd_addr, boot_info->initrd_size);
-        kprintf("[KERNEL] Reserved initrd memory: 0x%lx - 0x%lx (%lu KB)\n",
+        BOOT_LOG("[KERNEL] Reserved initrd memory: 0x%lx - 0x%lx (%lu KB)\n",
                 (unsigned long)boot_info->initrd_addr,
                 (unsigned long)(boot_info->initrd_addr + boot_info->initrd_size),
                 (unsigned long)(boot_info->initrd_size / 1024));
     }
 
-    kprintf("[KERNEL] Initializing PMM...\n");
+    BOOT_LOG("[KERNEL] Initializing PMM...\n");
     pmm_init(boot_info->memory_map, boot_info->memory_map_count);
-    kprintf("[KERNEL] PMM initialized\n");
+    BOOT_LOG("[KERNEL] PMM initialized\n");
 
-    kprintf("[KERNEL] Initializing VMM...\n");
+    BOOT_LOG("[KERNEL] Initializing VMM...\n");
     vmm_init();
-    kprintf("[KERNEL] VMM initialized\n");
+    BOOT_LOG("[KERNEL] VMM initialized\n");
 
     // Initialize lazy TLB shootdown (reduces IPI overhead by 60-80%)
-    kprintf("[KERNEL] Initializing lazy TLB shootdown...\n");
+    BOOT_LOG("[KERNEL] Initializing lazy TLB shootdown...\n");
     extern void tlb_init(void);
     tlb_init();
-    kprintf("[KERNEL] Lazy TLB shootdown initialized\n");
+    BOOT_LOG("[KERNEL] Lazy TLB shootdown initialized\n");
 
     // Add remaining physical memory pages above 1GB now that VMM/paging
     // has extended identity mapping to cover all RAM
-    kprintf("[KERNEL] Adding remaining physical memory pages...\n");
+    BOOT_LOG("[KERNEL] Adding remaining physical memory pages...\n");
     pmm_add_remaining_pages(boot_info->memory_map, boot_info->memory_map_count);
-    kprintf("[KERNEL] Remaining pages added\n");
+    BOOT_LOG("[KERNEL] Remaining pages added\n");
 
-    kprintf("[KERNEL] Initializing heap...\n");
+    BOOT_LOG("[KERNEL] Initializing heap...\n");
     heap_init();
-    kprintf("[KERNEL] Heap initialized\n");
+    BOOT_LOG("[KERNEL] Heap initialized\n");
 
     // Copy-on-write page refcount table (fork #20). Allocated from the PMM now
     // that it + heap are up; if this fails CoW disables itself and fork falls
@@ -350,29 +359,56 @@ void kernel_main(void* raw_info) {
     extern void cow_init(void);
     cow_init();
 
-    // Verify on-demand heap growth works (forces one extension, then frees).
+    // Boot-time selftests: verify heap growth, slab cache, and slab efficiency.
+    // Gated by BOOT_QUIET: each test prints many serial lines that add latency
+    // on real hardware (the T410). The allocators are exercised normally by the
+    // rest of the boot sequence anyway; these are diagnostic-only.
+#ifndef BOOT_QUIET
     extern void heap_selftest(void);
     heap_selftest();
 
-    // Verify the slab object-cache allocator (additive; complements kmalloc).
     extern int slab_selftest(void);
     slab_selftest();
 
-    // Benchmark slab allocator efficiency (demonstrates 100x page alloc reduction).
     extern void heap_slab_benchmark(void);
     heap_slab_benchmark();
+#endif
 
     /* Enumerate the PCI bus (needed by HDA audio, AHCI storage, NVMe, NICs). */
-    kprintf("[KERNEL] Scanning PCI bus...\n");
+    BOOT_LOG("[KERNEL] Scanning PCI bus...\n");
     extern void pci_init(void);
+    extern void pci_list(void);
     pci_init();
+
+    /* Print the full PCI device map with human-readable names and driver status.
+     * Invaluable for T410 debugging: shows every device the kernel sees, whether
+     * we have a driver for it, and highlights any unknowns. Pure kprintf output,
+     * no MMIO, no side effects -- safe on any machine including T410_SAFE_BOOT. */
+    pci_list();
+
+    /* ACPI: parse RSDP/RSDT/FADT/DSDT, decode _S5_ sleep type, enable ACPI mode.
+     * This gives us the PM1a control port for poweroff (S5) and the reset
+     * register for reboot. Also populates MADT/HPET/MCFG for later use.
+     * Called after PCI (not a dependency, just ordering clarity) and before
+     * the SMP MADT count so the full ACPI state is available. On failure
+     * (no RSDP), poweroff/reboot fall back to QEMU magic ports + 8042. */
+    boot_mark("ACPI");
+    {
+        extern int acpi_init(void);
+        if (acpi_init() < 0) {
+            BOOT_LOG("[KERNEL] WARNING: ACPI init failed (poweroff may not work)\n");
+        } else {
+            BOOT_LOG("[KERNEL] ACPI initialized (poweroff + reboot available)\n");
+        }
+    }
+    boot_mark("ACPI ok");
 
     /* SMP brick 0: READ-ONLY ACPI MADT enumeration. Makes the kernel AWARE of
      * how many CPUs the firmware reports. The system stays SINGLE-CORE -- this
      * only logs the count (no AP bring-up). The identity map covers low ACPI
      * memory at this point (boot.asm + the VMM extension above). */
     extern int madt_count_cpus(void);
-    kprintf("[SMP] detected %d cpus\n", madt_count_cpus());
+    BOOT_LOG("[SMP] detected %d cpus\n", madt_count_cpus());
 
 #ifdef SMP_FOUNDATION
     /* SMP brick 1 (GATED, SMP=1 build only): bring the BOOTSTRAP PROCESSOR's
@@ -391,7 +427,7 @@ void kernel_main(void* raw_info) {
     extern uint32_t lapic_get_id(void);
     extern uint32_t lapic_get_version(void);
     lapic_init();
-    kprintf("[SMP] BSP local APIC online: id=%u version=0x%x\n",
+    BOOT_LOG("[SMP] BSP local APIC online: id=%u version=0x%x\n",
             lapic_get_id(), lapic_get_version());
 
     /* SMP brick 2 (GATED, SMP=1 build only): CALIBRATE the BSP's LAPIC timer
@@ -448,7 +484,7 @@ void kernel_main(void* raw_info) {
         /* counted = post-divider ticks in 10ms. Input bus frequency =
          * counted * DIVISOR / 0.01s = counted * DIVISOR * 100. */
         uint64_t hz = (uint64_t)counted * DIVISOR * (1000000ULL / CAL_US);
-        kprintf("[SMP] LAPIC timer calibrated: %lu Hz (PIT remains system tick)\n",
+        BOOT_LOG("[SMP] LAPIC timer calibrated: %lu Hz (PIT remains system tick)\n",
                 (unsigned long)hz);
     }
 
@@ -462,7 +498,7 @@ void kernel_main(void* raw_info) {
      * (scheduler_start), so loading the BSP TSS early is harmless. */
     {
         extern void tss_init(void);
-        kprintf("[SMP] Brick B: installing per-CPU TSS array before AP bring-up...\n");
+        BOOT_LOG("[SMP] Brick B: installing per-CPU TSS array before AP bring-up...\n");
         tss_init();
     }
 #endif
@@ -483,7 +519,7 @@ void kernel_main(void* raw_info) {
         int smp_cpu_count = madt_count_cpus();
         if (smp_cpu_count >= 2) {
             if (try_start_cpu1()) {
-                kprintf("[SMP] CPU 1 online\n");        /* AP reached long mode */
+                BOOT_LOG("[SMP] CPU 1 online\n");        /* AP reached long mode */
 #ifdef SMP_SCHED
                 /* Brick A checkpoint: a REAL cpu_id(). The BSP must report 0; the
                  * AP recorded its own cpu_id() into g_ap_observed_cpuid (expect 1)
@@ -495,9 +531,9 @@ void kernel_main(void* raw_info) {
                     extern volatile uint16_t g_ap_observed_tr;
                     uint16_t bsp_tr;
                     __asm__ volatile("str %0" : "=r"(bsp_tr));
-                    kprintf("[SMP] Brick A cpu_id: BSP=%u (expect 0), AP=%u (expect 1)\n",
+                    BOOT_LOG("[SMP] Brick A cpu_id: BSP=%u (expect 0), AP=%u (expect 1)\n",
                             cpu_id(), g_ap_observed_cpuid);
-                    kprintf("[SMP] Brick B TR: BSP=0x%x (expect 0x28), AP=0x%x (expect 0x38)\n",
+                    BOOT_LOG("[SMP] Brick B TR: BSP=0x%x (expect 0x28), AP=0x%x (expect 0x38)\n",
                             bsp_tr, g_ap_observed_tr);
                 }
 #endif
@@ -518,7 +554,7 @@ void kernel_main(void* raw_info) {
                  * cpu1_job worker loop, so the coprocessor offload self-tests
                  * (worktest / matmul / rapid-offload) would submit jobs nobody
                  * services and just burn their deadlines. Skip them entirely. */
-                kprintf("[SMP] CPU1 in SCHEDULER mode (Brick F): coprocessor "
+                BOOT_LOG("[SMP] CPU1 in SCHEDULER mode (Brick F): coprocessor "
                         "offload self-tests skipped\n");
                 g_smp_ap_online = 1;
 #else
@@ -536,11 +572,11 @@ void kernel_main(void* raw_info) {
                 extern void cpu1_job_init(void);
                 cpu1_job_init();
                 if (cpu1_run(worktest, (void *)1000) && g_worktest == 500500) {
-                    kprintf("[SMP] CPU 1 ran worker job: sum(1..1000)=%ld "
+                    BOOT_LOG("[SMP] CPU 1 ran worker job: sum(1..1000)=%ld "
                             "(expected 500500)\n", g_worktest);
                     g_smp_boot_status = "SMP: CPU 1 WORKER OK";
                 } else {
-                    kprintf("[SMP] CPU 1 worker job FAILED or timed out "
+                    BOOT_LOG("[SMP] CPU 1 worker job FAILED or timed out "
                             "(got %ld)\n", g_worktest);
                     g_smp_boot_status = "SMP: CPU 1 worker FAIL";
                 }
@@ -568,11 +604,11 @@ void kernel_main(void* raw_info) {
                 test_rapid_cpu1_offload();
 #endif /* !SMP_SCHED_DISPATCH */
             } else {
-                kprintf("[SMP] AP failed to start, continuing single-core\n");
+                BOOT_LOG("[SMP] AP failed to start, continuing single-core\n");
                 g_smp_boot_status = "SMP: AP failed (single-core)";
             }
         } else {
-            kprintf("[SMP] single-core (firmware reports %d cpu); no AP to start\n",
+            BOOT_LOG("[SMP] single-core (firmware reports %d cpu); no AP to start\n",
                     smp_cpu_count);
             g_smp_boot_status = "SMP: single-core (1 cpu)";
         }
@@ -590,7 +626,7 @@ void kernel_main(void* raw_info) {
 
     /* Initialize framebuffer if available */
     if (boot_info->framebuffer_addr && boot_info->framebuffer_width > 0) {
-        kprintf("[KERNEL] Initializing framebuffer...\n");
+        BOOT_LOG("[KERNEL] Initializing framebuffer...\n");
 
         /* Map framebuffer physical address into kernel virtual space */
         /* For high addresses (>1GB), we need explicit page mappings */
@@ -599,7 +635,7 @@ void kernel_main(void* raw_info) {
         if (fb_phys >= 0x40000000ULL) {
             /* Framebuffer above 1GB — identity-map it */
             uint64_t fb_pages = (fb_size + PAGE_SIZE - 1) / PAGE_SIZE;
-            kprintf("[KERNEL] Mapping framebuffer: 0x%lx (%lu pages)\n",
+            BOOT_LOG("[KERNEL] Mapping framebuffer: 0x%lx (%lu pages)\n",
                     (unsigned long)fb_phys, (unsigned long)fb_pages);
             for (uint64_t i = 0; i < fb_pages; i++) {
                 vmm_map_page((void*)(fb_phys + i * PAGE_SIZE),
@@ -614,24 +650,35 @@ void kernel_main(void* raw_info) {
             boot_info->framebuffer_height,
             boot_info->framebuffer_pitch
         );
-        kprintf("[KERNEL] Framebuffer initialized at 0x%lx (%ux%u)\n",
-            (unsigned long)boot_info->framebuffer_addr,
-            boot_info->framebuffer_width,
-            boot_info->framebuffer_height);
+        /* T410 safety: verify framebuffer_init accepted the parameters.
+         * If it refused (bogus geometry or address beyond 16 GB identity
+         * map), the boot splash and on-screen boot_mark simply no-op. */
+        {
+            extern int framebuffer_get_info(fb_info_t*);
+            fb_info_t fbi;
+            if (framebuffer_get_info(&fbi) == 0) {
+                BOOT_LOG("[KERNEL] Framebuffer OK at 0x%lx (%ux%u pitch=%u bpp=%u)\n",
+                    (unsigned long)fbi.phys_base, fbi.width, fbi.height,
+                    fbi.pitch, fbi.bpp);
+            } else {
+                BOOT_LOG("[KERNEL] WARNING: framebuffer_init REFUSED "
+                        "(addr=0x%lx %ux%u pitch=%u)\n",
+                        (unsigned long)boot_info->framebuffer_addr,
+                        boot_info->framebuffer_width,
+                        boot_info->framebuffer_height,
+                        boot_info->framebuffer_pitch);
+            }
+        }
 
-#ifdef FB_WC
-        /* GATED Write-Combining (FB_WC=1 build only): now that the FB physical
-         * base/size are known and the pages are mapped (but BEFORE the splash
-         * + compositor hammer the framebuffer), program a variable-range MTRR
-         * to mark the FB region WC so pixel stores coalesce into PCIe bursts.
-         * This whole call vanishes from the DEFAULT build (no -DFB_WC). On the
-         * T410 (FB mapped UC by firmware) this is the speedup; in QEMU the FB
-         * is cached so there is nothing to measure -- it only proves clean boot.
-         * If firmware already marks the region UC, UC wins on overlap (see the
-         * caveat in fb_enable_write_combining): that's why this is opt-in. */
-        kprintf("[KERNEL] FB_WC build: enabling framebuffer write-combining...\n");
+        /* Write-Combining: now that the FB physical base/size are known and the
+         * pages are mapped (but BEFORE the splash + compositor hammer the
+         * framebuffer), program a variable-range MTRR to mark the FB region WC
+         * so pixel stores coalesce into PCIe bursts.  On the T410 (FB mapped UC
+         * by firmware) this is a 10-50x compositor speedup.  In QEMU the FB is
+         * already cached so WC is redundant -- the call just proves clean boot.
+         * Runtime-safe: bails cleanly if no free MTRR slot or base unaligned. */
+        BOOT_LOG("[KERNEL] Enabling framebuffer write-combining (MTRR)...\n");
         fb_enable_write_combining(fb_phys, fb_size);
-#endif
 
         /* Enable on-screen boot progress markers (see boot_mark). */
         g_boot_fb_ok = 1;
@@ -639,7 +686,7 @@ void kernel_main(void* raw_info) {
 
         /* Boot splash: a centered welcome that stays on screen until the
          * userspace compositor takes over the framebuffer. */
-        kprintf("[KERNEL] Drawing boot splash...\n");
+        BOOT_LOG("[KERNEL] Drawing boot splash...\n");
         framebuffer_clear(0x00101826);  /* dark slate background */
         {
             const char* l1 = "Welcome to AutomationOS";
@@ -657,14 +704,16 @@ void kernel_main(void* raw_info) {
             framebuffer_puts_scaled(l1, x1, y1, 0x00FFFFFF, s1);  /* white title  */
             framebuffer_puts_scaled(l2, x2, y2, 0x009FC8FF, s2);  /* blue credit  */
         }
-        kprintf("[KERNEL] Boot splash drawn!\n");
+        BOOT_LOG("[KERNEL] Boot splash drawn!\n");
 
         /* Cool loading animation: a fluid orbiting-dot spinner below the splash
          * title while the rest of boot proceeds. Bounded, rdtsc-timed (pre-PIT,
          * pre-scheduler -- single-threaded here), draws only to the framebuffer
          * (all serial/kprintf output is untouched, so headless smoke is unchanged).
          * OUTSIDE the SMP #ifdef so it runs on the shipping default kernel. */
-        framebuffer_boot_spinner(1200);
+        /* Boot spinner: brief enough to be visible but not a bottleneck.
+         * On T410's UC framebuffer each frame is expensive -- keep it short. */
+        framebuffer_boot_spinner(80);
 
 #ifdef SMP_FOUNDATION
         /* Paint the SMP/AP result + the REAL framebuffer geometry at a FIXED spot
@@ -715,7 +764,7 @@ void kernel_main(void* raw_info) {
             uint64_t hb_start    = rdtsc();
             uint64_t hb_deadline = HB_WINDOW_US * HB_TSC_PER_US;
             uint64_t repaint_gate = 0;                        /* throttle repaints  */
-            kprintf("[SMP] heartbeat proof window: BSP spins cpu_hb[0], "
+            BOOT_LOG("[SMP] heartbeat proof window: BSP spins cpu_hb[0], "
                     "AP %s (~4s)\n",
                     g_smp_ap_online ? "spin-polling worker slot (cpu_hb[1] frozen, "
                                       "idle_ticks climbing)"
@@ -723,6 +772,14 @@ void kernel_main(void* raw_info) {
             while ((rdtsc() - hb_start) < hb_deadline) {
                 /* BSP touches ONLY its own isolated counter. */
                 cpu_hb[0].v++;
+
+                /* Condition-driven early exit: once the AP has proven it is alive
+                 * (cpu_hb[1] > 0) there is no reason to burn another 3+ seconds
+                 * spinning. Break out immediately -- the final values are logged
+                 * below, and the on-screen paint already shows the proof. On
+                 * single-core (no AP) cpu_hb[1] stays 0 and we spin the full
+                 * window so the on-screen CPU0 counter is still visible. */
+                if (cpu_hb[1].v > 0) break;
 
                 /* Repaint the live line every ~65536 BSP increments so the on-screen
                  * "CPU0=.. CPU1=.." is readable (and we don't spend the whole window
@@ -750,7 +807,7 @@ void kernel_main(void* raw_info) {
              * poll count (ap1_idle_ticks now CLIMBS: the AP busy-polls its worker
              * slot because it has no wakeup IRQ yet -- IPI-wake is a later brick). */
             extern volatile uint64_t ap1_idle_ticks;
-            kprintf("[SMP] heartbeat: CPU0=%lu CPU1=%lu (proof-of-life); "
+            BOOT_LOG("[SMP] heartbeat: CPU0=%lu CPU1=%lu (proof-of-life); "
                     "CPU1 idle_ticks=%lu (worker spin-poll)\n",
                     cpu_hb[0].v, cpu_hb[1].v, ap1_idle_ticks);
 #ifdef SMP_SCHED
@@ -760,12 +817,12 @@ void kernel_main(void* raw_info) {
              * (a wrong EOI would have wedged the BSP's IRQ0 -> frozen desktop). */
             {
                 extern volatile uint64_t ap_timer_ticks;
-                kprintf("[SMP] Brick E: CPU1 LAPIC timer ticks=%lu (expect ~400 over 4s; "
+                BOOT_LOG("[SMP] Brick E: CPU1 LAPIC timer ticks=%lu (expect ~400 over 4s; "
                         ">0 proves CPU1 takes IRQs + EOIs LAPIC)\n", ap_timer_ticks);
 #ifdef SMP_SCHED_DISPATCH
                 {
                     extern volatile uint64_t ap_dbg_stage;
-                    kprintf("[SMP] DBG: ap_dbg_stage=%lu (1=enter,2=pre-switch,3=loop running)\n",
+                    BOOT_LOG("[SMP] DBG: ap_dbg_stage=%lu (1=enter,2=pre-switch,3=loop running)\n",
                             ap_dbg_stage);
                 }
 #endif
@@ -779,7 +836,7 @@ void kernel_main(void* raw_info) {
                 uint64_t c1 = ap_kthread_counter;
                 for (volatile int d = 0; d < 2000000; d++) { __asm__ volatile("pause"); }
                 uint64_t c2 = ap_kthread_counter;
-                kprintf("[SMP] Brick F2: AP kthread counter %lu -> %lu (delta=%lu; "
+                BOOT_LOG("[SMP] Brick F2: AP kthread counter %lu -> %lu (delta=%lu; "
                         ">0 proves CPU1 ran the pinned kernel thread)\n",
                         c1, c2, c2 - c1);
             }
@@ -793,7 +850,7 @@ void kernel_main(void* raw_info) {
         uint64_t fb_user_vaddr = 0x40000000ULL;
         uint64_t fb_pages = (fb_size + PAGE_SIZE - 1) / PAGE_SIZE;
 
-        kprintf("[KERNEL] Mapping framebuffer for userspace: phys=0x%lx -> virt=0x%lx (%lu pages)\n",
+        BOOT_LOG("[KERNEL] Mapping framebuffer for userspace: phys=0x%lx -> virt=0x%lx (%lu pages)\n",
                 (unsigned long)fb_phys, (unsigned long)fb_user_vaddr, (unsigned long)fb_pages);
 
         for (uint64_t i = 0; i < fb_pages; i++) {
@@ -801,25 +858,62 @@ void kernel_main(void* raw_info) {
                          (void*)(fb_phys + i * PAGE_SIZE),
                          PAGE_PRESENT | PAGE_WRITE | PAGE_USER);
         }
-        kprintf("[KERNEL] Framebuffer mapped for userspace at 0x%lx\n", (unsigned long)fb_user_vaddr);
+        BOOT_LOG("[KERNEL] Framebuffer mapped for userspace at 0x%lx\n", (unsigned long)fb_user_vaddr);
 
     } else {
-        kprintf("[KERNEL] No framebuffer available, skipping graphics init\n");
+        BOOT_LOG("[KERNEL] No framebuffer available, skipping graphics init\n");
     }
 
-    // Arm the PIT as a MONOTONIC TICK COUNTER only (1000 Hz). The IRQ0 handler
-    // increments a tick counter and never reschedules, so cooperative scheduling
-    // is preserved (preemptive scheduling is a later milestone). This gives
+    // Arm the PIT as a MONOTONIC TICK COUNTER. The IRQ0 handler increments a
+    // tick counter and never reschedules, so cooperative scheduling is
+    // preserved (preemptive scheduling is a later milestone). This gives
     // userspace a real time source via SYS_GET_TICKS_MS.
+    //
+    // POWER: 1000 Hz fires the timer IRQ 1000 times/second. On a laptop
+    // (T410) every IRQ wakes the CPU from HLT/C1, costing power. 250 Hz is
+    // the sweet spot: 4 ms tick granularity is fine for the desktop compositor
+    // (~60 fps = 16 ms) and sleep precision. The scheduler's DEFAULT_TIME_SLICE
+    // (10 ticks) becomes 40 ms at 250 Hz -- plenty for a cooperative / light-
+    // preempt workload. Enabled by -DT410_POWER_SAVE at build time; default
+    // build keeps 1000 Hz for maximum timing precision.
     boot_mark("timer (PIT)");
     extern void pit_init(uint32_t freq_hz);
-    pit_init(1000);
-#ifdef PREEMPTIVE
-    kprintf("[KERNEL] Timer: 1000 Hz, PREEMPTIVE (IRQ0 -> schedule_from_irq; ring-3 time-slicing)\n");
+#ifdef T410_POWER_SAVE
+    pit_init(250);
 #else
-    kprintf("[KERNEL] Timer: tick counter armed (1000 Hz, cooperative)\n");
+    pit_init(1000);
+#endif
+#ifdef T410_POWER_SAVE
+  #ifdef PREEMPTIVE
+    BOOT_LOG("[KERNEL] Timer: 250 Hz (power-save), PREEMPTIVE\n");
+  #else
+    BOOT_LOG("[KERNEL] Timer: tick counter armed (250 Hz, power-save, cooperative)\n");
+  #endif
+#else
+  #ifdef PREEMPTIVE
+    BOOT_LOG("[KERNEL] Timer: 1000 Hz, PREEMPTIVE (IRQ0 -> schedule_from_irq; ring-3 time-slicing)\n");
+  #else
+    BOOT_LOG("[KERNEL] Timer: tick counter armed (1000 Hz, cooperative)\n");
+  #endif
 #endif
     boot_mark("timer ok");
+
+#ifndef T410_SAFE_BOOT
+    /* HD Audio: PCI-scan for an Intel HDA controller, reset it, set up
+     * CORB/RIRB, enumerate the codec, and configure a DAC->pin output path.
+     * Must come after pci_init() AND pit_init() -- hda_msleep() uses
+     * timer_get_ticks() which requires a running PIT tick counter.
+     * GATED by T410_SAFE_BOOT: the T410's real HDA hardware hangs during
+     * controller reset or codec enumeration (QEMU's emulated HDA works fine).
+     * Safe when no HDA device is present (hda_init returns cleanly). */
+    boot_mark("audio (HDA)");
+    BOOT_LOG("[KERNEL] Initializing HD Audio (HDA)...\n");
+    extern void hda_init(void);
+    hda_init();
+    boot_mark("audio ok");
+#else
+    BOOT_LOG("[KERNEL] HDA audio skipped (T410_SAFE_BOOT)\n");
+#endif
 
     // Storage: generic block layer + AHCI/SATA driver (#13). PMM, heap, PCI and
     // the timer are all up by now, which is everything ahci_init() needs. When
@@ -844,9 +938,15 @@ void kernel_main(void* raw_info) {
     boot_mark("gpu SKIPPED (safe boot)");
 #endif
 
-#ifndef T410_SAFE_BOOT
+    /* AHCI/SATA + diskfs are now gated behind DISK_PERSIST (opt-in), DECOUPLED
+     * from T410_SAFE_BOOT so durable persistence can be enabled WITHOUT also
+     * re-enabling the NVIDIA GPU probe (the other T410 post-splash-hang suspect).
+     * Default OFF -> boot-to-RAM stays the safe default; build with DISK_PERSIST=1
+     * (scripts/quick_build.sh) to make /persist-backed files reboot-durable. The
+     * IDE config falls back to a session file when this is off (ahci_present()==0). */
+#ifdef DISK_PERSIST
     boot_mark("storage (AHCI/SATA disk)");
-    kprintf("[KERNEL] Initializing block layer + AHCI/SATA...\n");
+    BOOT_LOG("[KERNEL] Initializing block layer + AHCI/SATA...\n");
     extern void block_init(void);
     extern int  ahci_init(void);
     extern int  ahci_present(void);
@@ -856,12 +956,12 @@ void kernel_main(void* raw_info) {
         uint8_t s0[512];
         if (ahci_read(0, 1, s0) == 0) {
             uint16_t sig = (uint16_t)(s0[510] | ((uint16_t)s0[511] << 8));
-            kprintf("[AHCI] sector0 read OK: MBR sig=0x%04x "
+            BOOT_LOG("[AHCI] sector0 read OK: MBR sig=0x%04x "
                     "first8=%02x%02x%02x%02x%02x%02x%02x%02x\n",
                     sig, s0[0], s0[1], s0[2], s0[3],
                     s0[4], s0[5], s0[6], s0[7]);
         } else {
-            kprintf("[AHCI] sector0 read FAILED\n");
+            BOOT_LOG("[AHCI] sector0 read FAILED\n");
         }
     }
 
@@ -871,15 +971,16 @@ void kernel_main(void* raw_info) {
     // read+write+verify (see scripts/smoke_persist.sh).
     boot_mark("storage ok");
     boot_mark("diskfs (read disk)");
-    kprintf("[KERNEL] Initializing persistent diskfs...\n");
+    BOOT_LOG("[KERNEL] Initializing persistent diskfs...\n");
     extern void diskfs_init(void);
     diskfs_init();
     boot_mark("diskfs ok");
 #else
-    // SAFE BOOT (T410 regression hunt): skip block/AHCI/SATA + diskfs entirely.
-    // ahci_init() pokes the real SATA controller's MMIO (untestable in QEMU) and
-    // the boot is RAM-rooted, so no disk is needed to reach the desktop.
-    boot_mark("storage SKIPPED (safe boot)");
+    // DISK_PERSIST not defined (default): skip block/AHCI/SATA + diskfs entirely.
+    // ahci_init() pokes the real SATA controller's MMIO (untestable in QEMU and a
+    // T410 post-splash-hang suspect); the boot is RAM-rooted, so no disk is needed
+    // to reach the desktop. Build with DISK_PERSIST=1 to enable durable storage.
+    boot_mark("storage SKIPPED (no DISK_PERSIST)");
 #endif
 
     // Networking: detect the Intel e1000 NIC, read its MAC, assign the static
@@ -887,14 +988,15 @@ void kernel_main(void* raw_info) {
     // needs. The e1000 BAR sits in the <4GB MMIO hole, which the 16GB identity
     // map covers. With no NIC present net_init() returns non-zero and leaves
     // networking down (SYS_NET_INFO then returns ENOTSUP) -- a safe no-op.
-    // Networking re-enabled (was skipped during the T410 hang hunt). net_init()
-    // is now fully BOUNDED: the ARP settle loop has a hard iteration cap and the
-    // 82577LM PCH PHY bring-up uses short, capped spins, so on the T410 (where
-    // the NIC doesn't yet link) it bails in well under a second instead of
-    // hanging. In QEMU the e1000 links and resolves normally. GPU + disk remain
+    //
+    // PCH NIC (82577LM on T410): the driver now uses the ME-safe reset sequence
+    // (SWFLAG acquisition before CTRL_RST) and the full PHY bring-up over MDIO.
+    // Link-up polling allows ~3 seconds for real auto-negotiation; a no-cable
+    // T410 exits the poll in that time and boots with link=DOWN (not a hang).
+    // In QEMU the classic e1000 path is unchanged. GPU + disk remain
     // gated by T410_SAFE_BOOT above.
     boot_mark("network (e1000)");
-    kprintf("[KERNEL] Initializing networking (e1000)...\n");
+    BOOT_LOG("[KERNEL] Initializing networking (e1000)...\n");
     extern int net_init(void);
     net_init();
     extern bool e1000_present(void);
@@ -928,29 +1030,29 @@ void kernel_main(void* raw_info) {
     notify_init();
 
     boot_mark("vfs");
-    kprintf("[KERNEL] Initializing VFS...\n");
+    BOOT_LOG("[KERNEL] Initializing VFS...\n");
     vfs_init();
-    kprintf("[KERNEL] VFS initialized\n");
+    BOOT_LOG("[KERNEL] VFS initialized\n");
 
     // Initialize filesystem drivers
     boot_mark("fs drivers (ext2/fat32)");
-    kprintf("[KERNEL] Initializing filesystem drivers...\n");
+    BOOT_LOG("[KERNEL] Initializing filesystem drivers...\n");
     extern void ext2_init(void);
     extern void fat32_init(void);
     ext2_init();
     fat32_init();
-    kprintf("[KERNEL] Filesystem drivers initialized\n");
+    BOOT_LOG("[KERNEL] Filesystem drivers initialized\n");
 
     boot_mark("mount root (ramfs)");
-    kprintf("[KERNEL] Mounting root filesystem (ramfs)...\n");
+    BOOT_LOG("[KERNEL] Mounting root filesystem (ramfs)...\n");
     if (vfs_mount("none", "/", "ramfs") == 0) {
-        kprintf("[KERNEL] Root filesystem mounted\n");
+        BOOT_LOG("[KERNEL] Root filesystem mounted\n");
     } else {
         kprintf("[KERNEL] ERROR: Failed to mount root filesystem\n");
     }
 
     // Create mount points for additional filesystems
-    kprintf("[KERNEL] Creating mount points...\n");
+    BOOT_LOG("[KERNEL] Creating mount points...\n");
     vfs_mkdir("/mnt", 0755);
     vfs_mkdir("/mnt/data", 0755);
     vfs_mkdir("/mnt/ext2", 0755);
@@ -960,13 +1062,13 @@ void kernel_main(void* raw_info) {
     // IDE compiles programs here (double-click a .elf icon spawns it). Create it at
     // boot so the desktop scan + the IDE's build-output write always have a target.
     vfs_mkdir("/Desktop", 0777);
-    kprintf("[KERNEL] Mount points created\n");
+    BOOT_LOG("[KERNEL] Mount points created\n");
 
-    kprintf("[KERNEL] Creating /dev directory...\n");
+    BOOT_LOG("[KERNEL] Creating /dev directory...\n");
     if (vfs_mkdir("/dev", 0755) == 0) {
-        kprintf("[KERNEL] /dev directory created\n");
+        BOOT_LOG("[KERNEL] /dev directory created\n");
     } else {
-        kprintf("[KERNEL] Warning: /dev may already exist\n");
+        BOOT_LOG("[KERNEL] Warning: /dev may already exist\n");
     }
 
     // Attempt to auto-mount detected filesystems if AHCI is available.
@@ -976,147 +1078,166 @@ void kernel_main(void* raw_info) {
     // Re-enable once ext2/fat32 mount is hardened + tested on real hardware.
     if (0 /* was: ahci_present() */) {
         boot_mark("disk automount (ext2/fat32)");
-        kprintf("[KERNEL] Detecting and mounting filesystems...\n");
+        BOOT_LOG("[KERNEL] Detecting and mounting filesystems...\n");
 
         // Try to mount ext2 from first SATA drive
         // Note: AHCI driver registers devices as "sata0", "sata1", etc.
-        kprintf("[KERNEL] Attempting to mount sata0 as ext2...\n");
+        BOOT_LOG("[KERNEL] Attempting to mount sata0 as ext2...\n");
         if (vfs_mount("sata0", "/mnt/ext2", "ext2") == 0) {
-            kprintf("[FS] Successfully mounted /mnt/ext2 as ext2\n");
+            BOOT_LOG("[FS] Successfully mounted /mnt/ext2 as ext2\n");
 
             // Test filesystem access
-            kprintf("[FS] Testing ext2 filesystem access...\n");
+            BOOT_LOG("[FS] Testing ext2 filesystem access...\n");
             vfs_stat_t stat;
             if (vfs_stat("/mnt/ext2", &stat) == 0) {
-                kprintf("[FS] ext2 root directory accessible (inode=%lu)\n", (unsigned long)stat.st_ino);
+                BOOT_LOG("[FS] ext2 root directory accessible (inode=%lu)\n", (unsigned long)stat.st_ino);
             }
         } else {
-            kprintf("[FS] No ext2 filesystem found on sata0 (or device not present)\n");
+            BOOT_LOG("[FS] No ext2 filesystem found on sata0 (or device not present)\n");
         }
 
         // Try to mount FAT32 from first SATA drive (alternative attempt)
         // In a partition-aware system, this would be sata0p1, sata0p2, etc.
-        kprintf("[KERNEL] Attempting to mount sata0 as fat32...\n");
+        BOOT_LOG("[KERNEL] Attempting to mount sata0 as fat32...\n");
         if (vfs_mount("sata0", "/mnt/data", "fat32") == 0) {
-            kprintf("[FS] Successfully mounted /mnt/data as FAT32\n");
+            BOOT_LOG("[FS] Successfully mounted /mnt/data as FAT32\n");
 
             // Test filesystem access
-            kprintf("[FS] Testing FAT32 filesystem access...\n");
+            BOOT_LOG("[FS] Testing FAT32 filesystem access...\n");
             vfs_stat_t stat;
             if (vfs_stat("/mnt/data", &stat) == 0) {
-                kprintf("[FS] FAT32 root directory accessible (inode=%lu)\n", (unsigned long)stat.st_ino);
+                BOOT_LOG("[FS] FAT32 root directory accessible (inode=%lu)\n", (unsigned long)stat.st_ino);
             }
         } else {
-            kprintf("[FS] No FAT32 filesystem found on sata0 (already mounted as ext2 or wrong format)\n");
+            BOOT_LOG("[FS] No FAT32 filesystem found on sata0 (already mounted as ext2 or wrong format)\n");
         }
 
-        kprintf("[KERNEL] Filesystem detection complete\n");
-        kprintf("[FS] Note: Current implementation mounts entire drive, not partitions\n");
-        kprintf("[FS] For partition support, implement MBR/GPT partition table parsing\n");
+        BOOT_LOG("[KERNEL] Filesystem detection complete\n");
+        BOOT_LOG("[FS] Note: Current implementation mounts entire drive, not partitions\n");
+        BOOT_LOG("[FS] For partition support, implement MBR/GPT partition table parsing\n");
     } else {
-        kprintf("[KERNEL] No block storage detected, skipping filesystem mount\n");
+        BOOT_LOG("[KERNEL] No block storage detected, skipping filesystem mount\n");
     }
 
-    kprintf("[KERNEL] Creating PTY device nodes...\n");
+    BOOT_LOG("[KERNEL] Creating PTY device nodes...\n");
     if (vfs_mkdir("/dev/pts", 0755) == 0) {
-        kprintf("[KERNEL] /dev/pts directory created\n");
+        BOOT_LOG("[KERNEL] /dev/pts directory created\n");
     } else {
-        kprintf("[KERNEL] Warning: /dev/pts may already exist\n");
+        BOOT_LOG("[KERNEL] Warning: /dev/pts may already exist\n");
     }
     // TODO: Create /dev/ptmx and hook up PTY file operations
-    kprintf("[KERNEL] PTY device nodes created\n");
+    BOOT_LOG("[KERNEL] PTY device nodes created\n");
 
     // Input + keyboard MUST init after VFS mount + /dev mkdir, so that
     // dev_input_init() can create /dev/input and ps2_init() can link the
     // /dev/input/eventN device nodes into the mounted ramfs tree.
     boot_mark("input subsystem");
-    kprintf("[KERNEL] Initializing input subsystem...\n");
+    BOOT_LOG("[KERNEL] Initializing input subsystem...\n");
     extern void input_init(void);
     extern void dev_input_init(void);
     input_init();
     dev_input_init();
-    kprintf("[KERNEL] Input subsystem initialized\n");
+    BOOT_LOG("[KERNEL] Input subsystem initialized\n");
 
     boot_mark("keyboard/mouse (PS/2)");
-    kprintf("[KERNEL] Initializing keyboard + mouse...\n");
+    BOOT_LOG("[KERNEL] Initializing keyboard + mouse...\n");
     extern void ps2_init(void);
     ps2_init();
-    kprintf("[KERNEL] Keyboard + mouse initialized\n");
+    // NOTE: ps2mouse_init() (kernel/drivers/input/ps2mouse.c) is DELIBERATELY NOT
+    // called. It used to run after ps2_init() and OVERWRITE the IRQ12 handler with
+    // a "richer" one — but that created two fatal problems on real hardware:
+    //   1) ROUTING BUG: ps2_init() registers the mouse as /dev/input/event1 and
+    //      the compositor reads event1; ps2mouse_init() registered a SECOND mouse
+    //      device (event2) and pointed IRQ12 at it. Result: real mouse bytes went
+    //      to event2 while the compositor polled event1 -> cursor never moved.
+    //   2) FRAGILITY: ps2mouse.c's init waits ignore their timeouts and it logs
+    //      "bad sync" from IRQ context; on the T410's Synaptics touchpad that
+    //      mis-syncs readily, flooding IRQ12 and (pre-serial-IRQ-safe-fix) could
+    //      deadlock. The double-init also left the device in an inconsistent rate.
+    // ps2_init()'s own mouse handler is hardened (bounded waits, silent bad-packet
+    // drop, no IRQ-context logging) and feeds event1 — exactly what the compositor
+    // reads. So we keep ONE mouse driver. (Re-enabling ps2mouse needs it to claim
+    // event1, not event2, and to drop its IRQ-context kprintf first.)
+    // extern void ps2mouse_init(void);
+    // ps2mouse_init();
+    BOOT_LOG("[KERNEL] Keyboard + mouse initialized\n");
     boot_mark("keyboard/mouse ok");
 
     boot_mark("pty");
-    kprintf("[KERNEL] Initializing PTY subsystem...\n");
+    BOOT_LOG("[KERNEL] Initializing PTY subsystem...\n");
     extern void pty_init(void);
     pty_init();
-    kprintf("[KERNEL] PTY subsystem initialized\n");
+    BOOT_LOG("[KERNEL] PTY subsystem initialized\n");
 
-    kprintf("[KERNEL] Initializing process table...\n");
+    BOOT_LOG("[KERNEL] Initializing process table...\n");
     process_init();
-    kprintf("[KERNEL] Process table initialized\n");
+    BOOT_LOG("[KERNEL] Process table initialized\n");
 
-    kprintf("[KERNEL] Initializing scheduler...\n");
+    BOOT_LOG("[KERNEL] Initializing scheduler...\n");
     scheduler_init();
-    kprintf("[KERNEL] Scheduler initialized\n");
+    BOOT_LOG("[KERNEL] Scheduler initialized\n");
 
-    kprintf("[KERNEL] Initializing performance monitoring...\n");
+    BOOT_LOG("[KERNEL] Initializing performance monitoring...\n");
     perf_init();
-    kprintf("[KERNEL] Performance monitoring initialized\n");
+    BOOT_LOG("[KERNEL] Performance monitoring initialized\n");
 
-    kprintf("\n");
-    kprintf("[KERNEL] All subsystems initialized!\n");
-    kprintf("[KERNEL] Free memory: %lu MB\n",
+    BOOT_LOG("\n");
+    BOOT_LOG("[KERNEL] All subsystems initialized!\n");
+    BOOT_LOG("[KERNEL] Free memory: %lu MB\n",
             (unsigned long)(pmm_get_free_memory() / (1024 * 1024)));
 
     uint64_t boot_end = rdtsc();
     uint64_t boot_cycles = boot_end - boot_start;
-    kprintf("[BOOT] Total boot time: %lu.%02lu ms\n",
+    BOOT_LOG("[BOOT] Total boot time: %lu.%02lu ms\n",
             (unsigned long)cycles_to_ms(boot_cycles),
             (unsigned long)cycles_to_ms_frac(boot_cycles));
 
-    kprintf("\n");
-    kprintf("=====================================\n");
-    kprintf("   AutomationOS BOOT COMPLETE!\n");
-    kprintf("   All kernel subsystems: ONLINE\n");
-    kprintf("   created by fourzerofour & claude\n");
-    kprintf("=====================================\n");
-    kprintf("\n");
+    BOOT_LOG("\n");
+    BOOT_LOG("=====================================\n");
+    BOOT_LOG("   AutomationOS BOOT COMPLETE!\n");
+    BOOT_LOG("   All kernel subsystems: ONLINE\n");
+    BOOT_LOG("   created by fourzerofour & claude\n");
+    BOOT_LOG("=====================================\n");
+    BOOT_LOG("\n");
 
     if (boot_info->initrd_addr && boot_info->initrd_size) {
-        kprintf("[KERNEL] Loading initrd...\n");
+        BOOT_LOG("[KERNEL] Loading initrd...\n");
         initrd_init(boot_info->initrd_addr, boot_info->initrd_size);
 
-        kprintf("[KERNEL] Mounting initrd as root filesystem...\n");
+        BOOT_LOG("[KERNEL] Mounting initrd as root filesystem...\n");
         if (initrd_mount() == 0) {
-            kprintf("[KERNEL] Initrd mounted successfully\n");
+            BOOT_LOG("[KERNEL] Initrd mounted successfully\n");
 
             /* Create writable scratch dirs (/tmp, /var/tmp, /run) on the ramfs. */
             extern void vfs_fs_init(void);
             vfs_fs_init();
 
-            /* List initrd contents for debugging */
+            /* List initrd contents for debugging (gated: ~30 serial lines) */
+#ifndef BOOT_QUIET
             initrd_list_files();
+#endif
 
             /* Try to load and execute /sbin/init */
-            kprintf("[KERNEL] Loading /sbin/init...\n");
+            BOOT_LOG("[KERNEL] Loading /sbin/init...\n");
 
             uint64_t init_size = 0;
             void* init_data = initrd_get_file("sbin/init", &init_size);
 
             if (init_data && init_size > 0) {
-                kprintf("[KERNEL] Found init: %lu bytes\n", (unsigned long)init_size);
+                BOOT_LOG("[KERNEL] Found init: %lu bytes\n", (unsigned long)init_size);
 
                 /* Load init as ELF binary */
                 int pid = elf_load_and_exec(init_data, init_size, "/sbin/init");
 
                 if (pid > 0) {
-                    kprintf("[KERNEL] Init process started (PID %d)\n", pid);
+                    BOOT_LOG("[KERNEL] Init process started (PID %d)\n", pid);
 
 #ifdef SMP_FOUNDATION
                     /* Deferred from the SMP brick above: start the health-monitor
                      * kernel thread NOW that /sbin/init has claimed PID 1, so the
                      * monitor thread takes a later PID instead of stealing PID 1. */
                     health_monitor_start_thread();
-                    kprintf("[HEALTH] Monitor thread started (5s sampling)\n");
+                    BOOT_LOG("[HEALTH] Monitor thread started (5s sampling)\n");
 #endif
 
 #ifdef SMP_SCHED
@@ -1130,7 +1251,7 @@ void kernel_main(void* raw_info) {
                         int ap_apic = madt_get_apic_id(1);
                         uint32_t ap_apic_id = (ap_apic < 0) ? 1u : (uint32_t)ap_apic;
                         if (scheduler_init_secondary_cpu(1, ap_apic_id)) {
-                            kprintf("[SMP] Brick D: CPU1 scheduler slot initialized\n");
+                            BOOT_LOG("[SMP] Brick D: CPU1 scheduler slot initialized\n");
 #ifdef SMP_SCHED_DISPATCH
                             /* Brick F2: pin ONE ring-0 kernel test thread to CPU1.
                              * CPU1's ap_scheduler_loop context-switches into it on
@@ -1147,44 +1268,55 @@ void kernel_main(void* raw_info) {
                                     __asm__ volatile("pause");
                                 }
                                 uint64_t c1 = ap_kthread_counter;
-                                kprintf("[SMP] Brick F2 VERIFY: AP kthread counter "
+                                BOOT_LOG("[SMP] Brick F2 VERIFY: AP kthread counter "
                                         "%lu -> %lu (delta=%lu; >0 proves the FIRST "
                                         "AP context switch into a scheduled thread)\n",
                                         c0, c1, c1 - c0);
                             }
 #endif
                         } else {
-                            kprintf("[SMP] Brick D: CPU1 slot init FAILED (CPU1 stays coprocessor)\n");
+                            BOOT_LOG("[SMP] Brick D: CPU1 slot init FAILED (CPU1 stays coprocessor)\n");
                         }
                     }
 #endif
 
                     /* Initialize TSS for ring 3 transitions */
+                    boot_mark("TSS init");
 #ifdef SMP_SCHED
                     /* Brick B: already initialized the per-CPU TSS earlier (before
                      * AP bring-up); do NOT re-run it here (would re-zero/re-ltr). */
-                    kprintf("[KERNEL] TSS already initialized (per-CPU, pre-AP)\n");
+                    BOOT_LOG("[KERNEL] TSS already initialized (per-CPU, pre-AP)\n");
 #else
-                    kprintf("[KERNEL] Initializing TSS for usermode...\n");
+                    BOOT_LOG("[KERNEL] Initializing TSS for usermode...\n");
                     tss_init();
-                    kprintf("[KERNEL] TSS initialized\n");
+                    BOOT_LOG("[KERNEL] TSS initialized\n");
 #endif
+                    boot_mark("TSS ok");
 
                     /* Initialize syscall dispatch table */
+                    boot_mark("syscall dispatch table");
                     extern void syscall_init(void);
                     syscall_init();
+                    BOOT_LOG("[KERNEL] Syscall dispatch table initialized\n");
+                    boot_mark("syscall dispatch ok");
 
                     /* Initialize IPC subsystems (shared memory, message queues, notifications, clipboard) */
+                    boot_mark("IPC init");
                     extern void ipc_init(void);
                     ipc_init();
+                    BOOT_LOG("[KERNEL] IPC initialized\n");
+                    boot_mark("IPC ok");
 
                     /* Initialize SYSCALL/SYSRET MSRs for userspace */
+                    boot_mark("syscall MSR init");
                     extern void syscall_msr_init(void);
                     syscall_msr_init();
+                    BOOT_LOG("[KERNEL] SYSCALL/SYSRET MSRs programmed\n");
+                    boot_mark("syscall MSR ok");
 
                     /* Start scheduler (will enable interrupts after TSS.RSP0 is set) */
                     boot_mark("starting services (scheduler)");
-                    kprintf("[KERNEL] Starting scheduler...\n");
+                    BOOT_LOG("[KERNEL] Starting scheduler...\n");
                     scheduler_start();
 
                     /* Should never reach here */
@@ -1199,12 +1331,12 @@ void kernel_main(void* raw_info) {
             kprintf("[KERNEL] ERROR: Failed to mount initrd\n");
         }
     } else {
-        kprintf("[KERNEL] No initrd detected\n");
-        kprintf("[KERNEL] Desktop environment requires UEFI boot or initrd\n");
+        BOOT_LOG("[KERNEL] No initrd detected\n");
+        BOOT_LOG("[KERNEL] Desktop environment requires UEFI boot or initrd\n");
     }
 
-    kprintf("[KERNEL] Kernel initialization complete\n");
-    kprintf("[KERNEL] Entering idle loop\n");
+    BOOT_LOG("[KERNEL] Kernel initialization complete\n");
+    BOOT_LOG("[KERNEL] Entering idle loop\n");
     sti();
     while (1) {
         hlt();

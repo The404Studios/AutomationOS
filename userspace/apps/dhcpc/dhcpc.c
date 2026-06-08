@@ -50,8 +50,9 @@
 /* -------------------------------------------------------------------------
  * Syscall numbers (must match kernel/include/syscall.h).
  * ----------------------------------------------------------------------- */
-#define SYS_EXIT   0
-#define SYS_WRITE  3
+#define SYS_EXIT       0
+#define SYS_WRITE      3
+#define SYS_NET_CONFIG 89
 
 /* 6-argument inline syscall: rdi/rsi/rdx/r10/r8/r9. */
 static inline long sc(long n, long a1, long a2, long a3,
@@ -171,6 +172,56 @@ int main(int argc, char **argv)
     print("  server "); print_ip(lease.server);
     print("  lease "); print_dec(lease.lease_secs);
     print("s\n");
+
+    /*
+     * Apply the lease to the kernel's live network configuration via
+     * SYS_NET_CONFIG (89).  This updates eth0's IP/mask/gw/dns and syncs
+     * the legacy net.c globals so all subsequent networking (DNS, TCP, etc.)
+     * uses the DHCP-assigned address.
+     *
+     * The net_config_req_t layout: ifname[16], ip, netmask, gateway, dns, flags.
+     */
+    {
+        /*
+         * net_config_req_t layout (must match kernel/include/netif.h):
+         *   char     ifname[16];   // offset  0
+         *   uint32_t ip;           // offset 16   (host byte order)
+         *   uint32_t netmask;      // offset 20
+         *   uint32_t gateway;      // offset 24
+         *   uint32_t dns;          // offset 28
+         *   uint32_t flags;        // offset 32
+         * Total: 36 bytes.
+         */
+        struct {
+            char         ifname[16];
+            unsigned int ip;
+            unsigned int netmask;
+            unsigned int gateway;
+            unsigned int dns;
+            unsigned int flags;
+        } cfg;
+        unsigned char *cp = (unsigned char *)&cfg;
+        for (unsigned long i = 0; i < sizeof(cfg); i++) cp[i] = 0;
+        cfg.ifname[0] = 'e'; cfg.ifname[1] = 't';
+        cfg.ifname[2] = 'h'; cfg.ifname[3] = '0';
+        cfg.ip      = lease.ip;
+        cfg.netmask = lease.netmask;
+        cfg.gateway = lease.gateway;
+        cfg.dns     = lease.dns;
+        cfg.flags   = 0;
+
+        long cfgrc = sc(SYS_NET_CONFIG, (long)&cfg, 0, 0, 0, 0, 0);
+        if (cfgrc == 0) {
+            print("dhcpc: lease applied\n");
+        } else {
+            print("dhcpc: WARN: could not apply lease to kernel\n");
+        }
+    }
+
+    /* Update the DNS resolver to use the DHCP-assigned DNS server. */
+    /* (dns_set_server is in the dns.c lib but dhcpc doesn't link it;
+     * the dig/httpget tools each call dns_set_server themselves if needed.
+     * The kernel-side dns field is set via SYS_NET_CONFIG above.) */
 
     return 0;
 }

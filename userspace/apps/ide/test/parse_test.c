@@ -195,7 +195,7 @@ static void robustness_tests(void) {
     {
         static char blob[8192];
         int p = 0;
-        p += sprintf(blob + p, "int deep(void) {\n");
+        p += snprintf(blob + p, sizeof(blob) - p, "int deep(void) {\n");
         int depth = 0;
         for (int i = 0; i < 100 && p < (int)sizeof(blob) - 16; i++) {
             blob[p++] = '{'; blob[p++] = '\n'; depth++;
@@ -203,7 +203,7 @@ static void robustness_tests(void) {
         for (int i = 0; i < 95 && p < (int)sizeof(blob) - 16; i++) {
             blob[p++] = '}'; blob[p++] = '\n';
         }
-        p += sprintf(blob + p, "return 0;\n}\n");
+        p += snprintf(blob + p, sizeof(blob) - p, "return 0;\n}\n");
         blob[p] = '\0';
         robust_one("deep-nested-braces", blob);
     }

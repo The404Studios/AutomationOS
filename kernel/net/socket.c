@@ -26,6 +26,7 @@
 #include "../include/string.h"
 #include "../include/drivers.h"   /* timer_get_ticks_ms */
 #include "../include/mem.h"       /* kmalloc + copy_from_user/copy_to_user */
+#include "../include/sched.h"    /* process_get_current (for owner_pid)   */
 
 /* ------------------------------------------------------------------ */
 /* Socket table                                                        */
@@ -121,8 +122,22 @@ static int resolve_mac(uint32_t dst_ip, uint8_t out[ETH_ALEN]) {
      * normally a no-op fast path.) */
     const uint64_t budget_ms  = 300;   /* upper bound on first-contact wait */
     const uint64_t reissue_ms = 50;    /* re-ARP cadence                    */
+    /* HARD ITERATION CAP — the load-bearing backstop. This function runs inside a
+     * syscall, which executes with interrupts DISABLED (IA32_FMASK clears IF), so
+     * the PIT IRQ cannot fire and timer_get_ticks_ms() is FROZEN. That makes the
+     * wall-clock budget below useless on its own: `now - start` stays 0 forever,
+     * so the timeout never fires. On real hardware where the NIC has no link
+     * (e.g. the T410's 82577LM with no cable) ARP never resolves and this loop
+     * would spin FOREVER with interrupts off -> the whole cooperative system
+     * freezes (this is exactly the autodhcp-at-boot freeze). The iteration cap
+     * guarantees termination regardless of the clock; the wall-clock budget is
+     * the (faster) early-out on QEMU where ticks do advance via a different path.
+     * Mirrors the iter_cap that net_init()'s ARP settle already uses for the same
+     * frozen-tick reason. */
+    const uint32_t iter_cap   = 200000;
     uint64_t start = timer_get_ticks_ms();
     uint64_t last_req = 0;
+    uint32_t iters = 0;
     for (;;) {
         uint64_t now = timer_get_ticks_ms();
 
@@ -137,6 +152,7 @@ static int resolve_mac(uint32_t dst_ip, uint8_t out[ETH_ALEN]) {
         if (net_arp_lookup(dst_ip, out) == 0) return 0;
 
         if (now - start >= budget_ms) break;
+        if (++iters >= iter_cap) break;   /* frozen-tick backstop: never hang */
     }
     return -1;
 }
@@ -384,6 +400,12 @@ int sock_socket(int type) {
             s->local_port = sock_alloc_port();
             s->state      = TCP_CLOSED;
             s->snd_wnd    = 1024;
+            /* Track the creating process so sock_cleanup_process can
+             * reclaim leaked sockets on process death. */
+            {
+                process_t* cur = process_get_current();
+                s->owner_pid = cur ? cur->pid : 0;
+            }
             return i;
         }
     }
@@ -469,10 +491,12 @@ int sock_send(int s, const void* buf, uint32_t len) {
         if (so->remote_port == 0) return SOCK_ECONN;   /* not "connected" */
         return sock_sendto(s, buf, len, so->remote_ip, so->remote_port);
     }
-    /* TCP. */
+    /* TCP: tcp_send() handles segmentation internally, so pass the full
+     * length (capped to uint16_t max).  The old code truncated to TCP_MSS
+     * here, which silently dropped all bytes beyond 1024 on large sends. */
     if (so->state != TCP_ESTABLISHED && so->state != TCP_CLOSE_WAIT)
         return SOCK_ECONN;
-    return tcp_send(so, buf, (uint16_t)(len > TCP_MSS ? TCP_MSS : len));
+    return tcp_send(so, buf, (uint16_t)(len > 0xFFFF ? 0xFFFF : len));
 }
 
 int sock_recv(int s, void* buf, uint32_t len) {
@@ -547,19 +571,85 @@ int sock_close(int s) {
             }
         }
     }
-    if (so->state == TCP_LISTEN && so->accept_queue) {
-        /* Closing a listener: orphan its queued children so none points back
-         * at this freed slot. */
-        for (sock_t* c = so->accept_queue; c; ) {
-            sock_t* nx = c->accept_next;
-            c->parent = NULL;
-            c->accept_next = NULL;
-            c = nx;
+    if (so->state == TCP_LISTEN) {
+        /* Closing a listener: close ALL child sockets (both queued-and-accepted
+         * on the accept_queue AND still-handshaking SYN_RCVD children that
+         * haven't been enqueued yet).
+         *
+         * BUG-FIX (socket leak): the old code merely orphaned accept_queue
+         * children (cleared parent/accept_next) but left them used=true with
+         * no owner -- they leaked permanently because owner_pid==0 (set by
+         * tcp_input's memset) meant sock_cleanup_process never found them.
+         *
+         * BUG-FIX (SYN_RCVD dangling parent): SYN_RCVD children have
+         * parent==so but are NOT on the accept_queue.  If the listener closes
+         * and their slot is reused, completing the handshake writes into
+         * garbage (use-after-free).  The table scan below catches them.
+         */
+
+        /* First, detach the accept_queue so recursive sock_close on children
+         * doesn't re-walk it (sock_close checks so->parent and unlinks). */
+        sock_t* aq = so->accept_queue;
+        so->accept_queue = NULL;
+
+        /* Close everything on the accept queue. */
+        while (aq) {
+            sock_t* nx = aq->accept_next;
+            aq->parent = NULL;
+            aq->accept_next = NULL;
+            /* Find the child's fd index and close it properly. */
+            for (int ci = 0; ci < SOCK_MAX; ci++) {
+                if (&g_socks[ci] == aq) {
+                    /* Send FIN if established, then zero the slot. */
+                    if (aq->type == SOCK_STREAM &&
+                        (aq->state == TCP_ESTABLISHED || aq->state == TCP_CLOSE_WAIT)) {
+                        tcp_close(aq);
+                    }
+                    memset(aq, 0, sizeof(*aq));
+                    break;
+                }
+            }
+            aq = nx;
+        }
+
+        /* Scan the whole table for SYN_RCVD (or any other) children still
+         * pointing at this listener.  These aren't on the accept_queue yet. */
+        for (int ci = 0; ci < SOCK_MAX; ci++) {
+            if (g_socks[ci].used && g_socks[ci].parent == so) {
+                g_socks[ci].parent = NULL;
+                g_socks[ci].accept_next = NULL;
+                if (g_socks[ci].type == SOCK_STREAM &&
+                    (g_socks[ci].state == TCP_ESTABLISHED ||
+                     g_socks[ci].state == TCP_CLOSE_WAIT)) {
+                    tcp_close(&g_socks[ci]);
+                }
+                memset(&g_socks[ci], 0, sizeof(g_socks[ci]));
+            }
         }
     }
 
     memset(so, 0, sizeof(*so));
     return SOCK_OK;
+}
+
+/* ------------------------------------------------------------------ */
+/* Process cleanup: close all sockets owned by a dying process         */
+/* ------------------------------------------------------------------ */
+/*
+ * sock_cleanup_process - reclaim sockets held by a dying process.
+ *
+ * Called from process_unref() when the last reference to a process drops
+ * to zero.  Without this, sockets created by a process that exits without
+ * explicitly closing them stay marked `used` forever, leaking descriptors
+ * (and, for TCP, leaving half-open connections).
+ */
+void sock_cleanup_process(uint32_t pid) {
+    if (!g_socks) return;
+    for (int i = 0; i < SOCK_MAX; i++) {
+        if (g_socks[i].used && g_socks[i].owner_pid == pid) {
+            sock_close(i);
+        }
+    }
 }
 
 /* ------------------------------------------------------------------ */
@@ -630,18 +720,32 @@ int64_t sys_sock_send(uint64_t s, uint64_t buf, uint64_t len,
     (void)a4;(void)a5;(void)a6;
     if (buf == 0 || len == 0) return SOCK_EINVAL;
     if (len > 0xFFFF) len = 0xFFFF;
-    uint8_t kbuf[2048];
-    uint32_t cpy = (len > sizeof(kbuf)) ? sizeof(kbuf) : (uint32_t)len;
-    if (copy_from_user(kbuf, (const void*)buf, cpy) != COPY_SUCCESS)
-        return SOCK_EINVAL;
-    return sock_send((int)s, kbuf, cpy);
+
+    /* Send in chunks through a stack buffer to avoid a large kmalloc while
+     * still supporting sends up to 64KB (the uint16_t TCP len limit). */
+    uint8_t kbuf[4096];
+    uint32_t total_sent = 0;
+    uint32_t remaining = (uint32_t)len;
+
+    while (remaining > 0) {
+        uint32_t chunk = (remaining > sizeof(kbuf)) ? sizeof(kbuf) : remaining;
+        if (copy_from_user(kbuf, (const void*)(buf + total_sent), chunk) != COPY_SUCCESS)
+            return total_sent ? (int64_t)total_sent : SOCK_EINVAL;
+        int r = sock_send((int)s, kbuf, chunk);
+        if (r <= 0)
+            return total_sent ? (int64_t)total_sent : (int64_t)r;
+        total_sent += (uint32_t)r;
+        remaining  -= (uint32_t)r;
+        if ((uint32_t)r < chunk) break;   /* short send: don't spin */
+    }
+    return (int64_t)total_sent;
 }
 
 int64_t sys_sock_recv(uint64_t s, uint64_t buf, uint64_t len,
                       uint64_t a4, uint64_t a5, uint64_t a6) {
     (void)a4;(void)a5;(void)a6;
     if (buf == 0 || len == 0) return SOCK_EINVAL;
-    uint8_t kbuf[2048];
+    uint8_t kbuf[4096];
     uint32_t cap = (len > sizeof(kbuf)) ? sizeof(kbuf) : (uint32_t)len;
     int r = sock_recv((int)s, kbuf, cap);
     if (r > 0) {

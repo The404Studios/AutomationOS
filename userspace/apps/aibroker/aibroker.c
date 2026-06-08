@@ -118,11 +118,12 @@ typedef struct {            /* 64 bytes -- SYS_PROC_QUERY detail */
     char name[32];
 } proc_detail_t;
 
-typedef struct {            /* SYS_SYSINFO record */
+typedef struct {            /* SYS_SYSINFO record (must match kernel procapi.h: 32 bytes) */
     u64 total_mem;
     u64 free_mem;
     u64 uptime_ms;
     u32 proc_count;
+    u32 _pad;               /* reserved, always 0 */
 } sysinfo_t;
 
 /* vfs_stat_t prefix -- we only need st_size (kernel/include/vfs.h). */

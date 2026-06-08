@@ -171,8 +171,9 @@ static int evdev_close(vfs_file_t* file) {
         }
     }
 
-    // Fallback: free client anyway
-    kfree(client);
+    // Client was not found in any device's client list — it may have already
+    // been freed by evdev_unregister_device().  Do NOT kfree() again (double-
+    // free).  Just NULL the stale pointer so no further access occurs.
     file->private_data = NULL;
     return 0;
 }

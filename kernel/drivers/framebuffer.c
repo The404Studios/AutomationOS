@@ -8,13 +8,9 @@
 #include "../include/drivers.h"
 #include "../include/types.h"
 
-#ifdef FB_WC
 /* =========================================================================
- * GATED Write-Combining (WC) framebuffer acceleration  --  #ifdef FB_WC ONLY
+ * Write-Combining (WC) framebuffer acceleration  --  always compiled
  * =========================================================================
- *
- * NOTHING in this block compiles unless the kernel is built with -DFB_WC
- * (FB_WC=1 bash scripts/quick_build.sh). The DEFAULT kernel is byte-identical.
  *
  * WHY: On the ThinkPad T410 the firmware maps the linear framebuffer UNCACHED
  * (UC). Every pixel store to a full-screen game therefore round-trips to the
@@ -28,13 +24,15 @@
  * variable MTRR (PHYSMASK valid bit clear) so we never clobber a firmware
  * MTRR that is already in use.
  *
- * HONEST CAVEAT: MTRR overlap rules say UC WINS. If the firmware has already
- * placed a variable (or fixed) MTRR marking this region UC, our WC MTRR will
- * NOT take effect (the effective type stays UC). That is exactly why this is
- * opt-in/testable rather than default-on: it must be validated on the real
- * T410 panel, where only the user can see the fps change. In QEMU the FB is
- * cached anyway, so there is nothing to measure there -- we only prove the
- * setup runs and the kernel still boots cleanly.
+ * SAFETY: The function bails cleanly if: base/size are zero, VCNT==0, the FB
+ * base is not power-of-two-alignable, or all variable MTRRs are already in
+ * use by firmware.  It never clobbers an occupied slot.  In QEMU the FB is
+ * already cached, so WC is redundant but harmless -- it only proves the code
+ * path runs and the kernel still boots cleanly.
+ *
+ * NOTE: MTRR overlap rules say UC WINS. If the firmware has already placed a
+ * variable (or fixed) MTRR marking this region UC, our WC MTRR will NOT take
+ * effect (the effective type stays UC). The serial log prints a reminder.
  * ========================================================================= */
 
 #include "../include/kernel.h"   /* kprintf */
@@ -98,7 +96,7 @@ static uint64_t fb_wc_physmask_bits(void) {
 
 /**
  * fb_enable_write_combining -- mark [base, base+size) Write-Combining via a
- * free variable-range MTRR.  GATED: only built/linked under -DFB_WC.
+ * free variable-range MTRR.  Always compiled; runtime-safe.
  *
  * @param base  physical base of the framebuffer (e.g. 0xFD000000 on the T410)
  * @param size  framebuffer byte size (pitch * height, ~4 MB at 1280x800x4)
@@ -220,9 +218,8 @@ void fb_enable_write_combining(uint64_t base, uint64_t size) {
             slot, (unsigned long)physbase, slot, (unsigned long)physmask,
             (unsigned long)physmask_bits);
     kprintf("[FB-WC]   NOTE: if firmware already marks this region UC, UC wins "
-            "on overlap and WC will not take (opt-in/testable by design).\n");
+            "on overlap and WC will not take effect.\n");
 }
-#endif /* FB_WC */
 
 // Framebuffer state
 static struct {
@@ -460,6 +457,40 @@ static inline void plot_pixel(uint32_t x, uint32_t y, uint32_t color) {
  */
 void framebuffer_init(uint64_t fb_addr, uint32_t width, uint32_t height, uint32_t pitch) {
     if (!fb_addr || width == 0 || height == 0 || pitch == 0) {
+        return;
+    }
+
+    /*
+     * T410 SAFETY: validate the framebuffer geometry and address before we
+     * declare it initialised. A bogus/corrupted multiboot tag could cause the
+     * kernel to write to an unmapped or MMIO address, triple-faulting the boot.
+     *
+     * Sanity bounds:
+     *   - width/height:  must be <= 8192 (covers 8K displays with margin)
+     *   - pitch:         must be >= width*4 for a 32-bpp linear FB and
+     *                    <= 64K (absurd otherwise)
+     *   - fb_addr:       the 64-bit physical address must be below 16 GB (the
+     *                    upper bound of the kernel's identity map, set by
+     *                    vmm_init + the 0x40000000 explicit-map path in
+     *                    kernel.c). On real Intel HD Graphics (Ironlake on the
+     *                    T410) the MMIO aperture base is typically 0xC0000000-
+     *                    0xFD000000 (~3.0-4.0 GB), well within range.
+     *   - computed size: pitch * height must not overflow 32 bits (max ~4 GB).
+     */
+    if (width > 8192 || height > 8192) {
+        /* Bogus geometry from multiboot -- refuse to initialise. */
+        return;
+    }
+    if (pitch < width * 4 || pitch > 65536) {
+        return;
+    }
+    uint64_t fb_size = (uint64_t)pitch * height;
+    if (fb_size > 0x10000000ULL) {
+        /* >256 MB framebuffer -- clearly bogus. */
+        return;
+    }
+    /* The identity map extends to 16 GB; reject anything beyond that. */
+    if (fb_addr + fb_size > 0x400000000ULL) {
         return;
     }
 
@@ -815,4 +846,28 @@ void framebuffer_boot_spinner(uint32_t duration_ms) {
                               (uint32_t)(2 * box), (uint32_t)(2 * box), FB_SPIN_BG);
         framebuffer_draw_fluid_circle(cx, cy, R, dot_r, phase, 0x009FC8FFu);
     }
+}
+
+/**
+ * Blank the framebuffer by writing all-black pixels.
+ *
+ * On LCD panels with PWM backlight (like the T410's 1280x800 CCFL), writing
+ * all-zero pixels reduces power draw because the backlight doesn't have to
+ * fight the panel's transmittance for bright pixels. On LED-backlit panels
+ * the saving is modest (~0.3W) but still real. The compositor will repaint
+ * on the next input event or timer, so unblanking is automatic.
+ *
+ * Returns 0 on success, -1 if framebuffer is not initialized.
+ */
+int framebuffer_blank(void) {
+    if (!fb_state.initialized) return -1;
+    framebuffer_clear(0x00000000);
+    return 0;
+}
+
+/**
+ * Returns 1 if the framebuffer has been initialized, 0 otherwise.
+ */
+int framebuffer_is_initialized(void) {
+    return fb_state.initialized ? 1 : 0;
 }

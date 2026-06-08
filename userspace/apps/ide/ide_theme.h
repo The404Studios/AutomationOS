@@ -46,12 +46,12 @@
  * via the resize protocol). Height fits a 720p work area with the dock visible. */
 #define IDE_W          1180
 #define IDE_H          688
-#define TOPBAR_H       (GFX_FH + 12)   /* VIZ tab bar (fits one glyph + pad)  */
-#define STATUS_H       (GFX_FH + 6)    /* bottom shortcuts bar                */
-#define LEFT_W         (24 * GFX_FW)   /* explorer + funcs column (~24 chars) */
+#define TOPBAR_H       (GFX_FH + 8)    /* VIZ tab bar (fits one glyph + pad)  */
+#define STATUS_H       (GFX_FH + 4)    /* bottom shortcuts bar                */
+#define LEFT_W         (20 * GFX_FW)   /* explorer column (~20 chars, ~200px @ 130%) */
 #define RIGHT_W        (27 * GFX_FW)   /* inspector column (~27 chars)        */
 #define RUNTIME_H      (5  * GFX_FH)   /* bottom runtime-flow strip (~5 rows) */
-#define ROW_H          (GFX_FH + 4)    /* list row height                    */
+#define ROW_H          (GFX_FH + 2)    /* list row height (tighter for density) */
 #define PAD            6
 
 /* port-type -> accent colour mapping helper (inline) */

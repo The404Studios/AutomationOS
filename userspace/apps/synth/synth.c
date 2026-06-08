@@ -7,7 +7,7 @@
  * Keys W E T Y U  map to black keys C# D# F# G# A#.
  * Mouse click hit-tests the drawn key rects and plays the note.
  *
- * Audio: SYS_BEEP(freq_hz, ms) = syscall 41.  If it returns < 0 (not wired),
+ * Audio: SYS_BEEP(freq_hz, ms) = syscall 45.  If it returns < 0 (not wired),
  * the key is still highlighted and the note is printed to serial.
  *
  * Build (flags DIRECTLY on cmdline -- never via shell vars):
@@ -34,7 +34,7 @@
 #define SYS_WRITE        3
 #define SYS_YIELD        15
 #define SYS_GET_TICKS_MS 40
-#define SYS_BEEP         41   /* HDA tone: (freq_hz, ms); -ENOTSUP if unwired */
+#define SYS_BEEP         45   /* HDA tone: (freq_hz, ms); kernel/include/syscall.h */
 
 typedef unsigned int   u32;
 typedef int            i32;

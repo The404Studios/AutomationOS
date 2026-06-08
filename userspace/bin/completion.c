@@ -59,6 +59,10 @@ static void completion_init(void) {
     if (!g_completion.matches) {
         g_completion.match_capacity = MAX_COMPLETIONS;
         g_completion.matches = malloc(g_completion.match_capacity * sizeof(char *));
+        if (!g_completion.matches) {
+            g_completion.match_capacity = 0;
+            return;
+        }
         g_completion.match_count = 0;
     }
 }
@@ -82,7 +86,9 @@ static void completion_add(const char *match) {
         }
     }
 
-    g_completion.matches[g_completion.match_count++] = strdup(match);
+    char *dup = strdup(match);
+    if (!dup) return;
+    g_completion.matches[g_completion.match_count++] = dup;
 }
 
 static char **completion_get_matches(int *count) {

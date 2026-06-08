@@ -33,6 +33,14 @@ if [ "${GAMETEST:-0}" = "1" ]; then
     INIT_EXTRA="$INIT_EXTRA -DGAMETEST_RUN"
     echo "*** GAMETEST build: init compiled with -DGAMETEST_RUN (spawns sbin/gametest) ***"
 fi
+# DESKTOP_MINIMAL=1: init spawns ONLY the persistent desktop apps and skips the
+# ~70 self-test programs (the boot "storm"). This is the T410 desktop profile --
+# fast/smooth/low-churn boot, no long no-yield compute blocks freezing the
+# cooperative scheduler, no process-churn stressing the PCID teardown path.
+if [ "${DESKTOP_MINIMAL:-0}" = "1" ]; then
+    INIT_EXTRA="$INIT_EXTRA -DDESKTOP_MINIMAL"
+    echo "*** DESKTOP_MINIMAL build: init spawns desktop apps only (no self-test storm) ***"
+fi
 # SELFHEAL=1 wires the userspace desktop self-heal: the compositor publishes a
 # per-frame heartbeat into a SysV SHM page, init creates+owns that page and spawns
 # sbin/cwatchdog (the recovery supervisor). Threads -DSELFHEAL into the compositor
@@ -245,6 +253,8 @@ $LD /tmp/libtest.o /tmp/json.o /tmp/dhcp.o \
     /tmp/img_bmp.o /tmp/img_png.o /tmp/img_gif.o /tmp/img_codec.o /tmp/deflate.o /tmp/lstring.o -o /tmp/libtest.elf
 # dhcpc: obtain + print a DHCP lease (crt0+main; links dhcp).
 cc userspace/apps/dhcpc/dhcpc.c /tmp/dhcpc.o; $LD /tmp/crt0.o /tmp/dhcpc.o /tmp/dhcp.o -o /tmp/dhcpc.elf
+# autodhcp: auto-DHCP on boot -- sleeps 2s, checks link, runs DHCP if up.
+cc userspace/apps/autodhcp/autodhcp.c /tmp/autodhcp.o; $LD /tmp/crt0.o /tmp/autodhcp.o /tmp/dhcp.o -o /tmp/autodhcp.elf
 # apidemo: fetch http(s) URL + pretty-print JSON (crt0+main; HTTPS + json).
 cc userspace/apps/apidemo/apidemo.c /tmp/apidemo.o; $LD /tmp/crt0.o /tmp/apidemo.o /tmp/json.o $HTTPS_OBJS -o /tmp/apidemo.elf
 
@@ -333,7 +343,7 @@ cc userspace/apps/arp/arp.c         /tmp/arp.o;     $LD /tmp/crt0.o /tmp/arp.o  
 
 # ---- coreutils expansion + system info (argv-aware, crt0-linked) ----
 echo "[all] coreutils expansion..."
-for t in grep head tail sort uniq cut tr nl du touch basename dirname uname hostname whoami date less hexdump; do
+for t in grep head tail sort uniq cut tr nl du touch basename dirname uname hostname whoami date less hexdump lspci; do
     cc userspace/apps/$t/$t.c /tmp/$t.o
     $LD /tmp/crt0.o /tmp/$t.o -o /tmp/$t.elf
 done
@@ -355,7 +365,12 @@ build_game_app() { # $1=src $2=name
 }
 
 echo "[all] toolkit apps..."
-build_ui_app userspace/apps/filemanager/filemanager.c filemanager
+# filemanager is argv-aware: it opens the directory passed as argv[1] (the
+# compositor passes "/Desktop/<folder>" when a desktop folder icon is double-
+# clicked). So it is crt0-linked + main(argc,argv), NOT bare _start like the
+# other toolkit apps below.
+cc userspace/apps/filemanager/filemanager.c /tmp/filemanager.o
+$LD /tmp/crt0.o /tmp/filemanager.o /tmp/ui.o /tmp/wlc.o /tmp/bf.o /tmp/font2.o -o /tmp/filemanager.elf
 build_ui_app userspace/apps/calculator/calculator.c   calculator
 build_ui_app userspace/apps/clock/clock.c             clock
 build_ui_app userspace/apps/sysinfo/sysinfo.c         sysinfo
@@ -391,6 +406,9 @@ cc userspace/apps/cube3d/cube3d.c /tmp/cube3d.o
 $LD /tmp/cube3d.o /tmp/wlc.o /tmp/bf.o /tmp/g3d.o -o /tmp/cube3d.elf
 cc userspace/apps/ray/ray.c       /tmp/ray.o
 $LD /tmp/ray.o    /tmp/wlc.o /tmp/bf.o /tmp/g3d.o -o /tmp/ray.elf
+# derby: 3D demolition derby (g3d arena + AI). Same link set as cube3d.
+cc userspace/apps/derby/derby.c   /tmp/derby.o
+$LD /tmp/derby.o  /tmp/wlc.o /tmp/bf.o /tmp/g3d.o -o /tmp/derby.elf
 build_wl_app userspace/apps/sudoku/sudoku.c           sudoku
 build_wl_app userspace/apps/pacman/pacman.c           pacman
 build_wl_app userspace/apps/clockapp/clockapp.c       clockapp
@@ -447,7 +465,7 @@ else
 fi
 
 echo "[all] IDE (Semantic LEGO Map)..."
-IDE_SRCS="ide ide_sys ide_gfx ide_lex ide_ast ide_pcore ide_pdecl ide_pstmt ide_pexpr ide_astprint ide_parse ide_semantic ide_explorer ide_funcs ide_map ide_codeview ide_inspector ide_runtime ide_chrome ide_gen elf_write as_x64 cc_type cc_codegen cc_expr tc_driver ide_build ide_editor ide_term"
+IDE_SRCS="ide ide_sys ide_gfx ide_lex ide_ast ide_pcore ide_pdecl ide_pstmt ide_pexpr ide_astprint ide_parse ide_semantic ide_explorer ide_funcs ide_map ide_codeview ide_inspector ide_runtime ide_chrome ide_gen elf_write as_x64 cc_type cc_codegen cc_expr tc_driver ide_build ide_editor ide_term ide_library ide_complete ide_config"
 IDE_OBJS=""
 for s in $IDE_SRCS; do cc userspace/apps/ide/$s.c /tmp/ide_$s.o; IDE_OBJS="$IDE_OBJS /tmp/ide_$s.o"; done
 $LD $IDE_OBJS /tmp/wlc.o /tmp/bf.o /tmp/font2.o /tmp/keymap.o -o /tmp/ide.elf
@@ -467,7 +485,7 @@ $LD /tmp/crt0.o /tmp/cc.o \
     -o /tmp/cc.elf
 
 echo "[all] canary check (all must be 0):"
-for e in comp init filemanager calculator clock sysinfo settings sysmon uidemo dateapp applauncher taskman terminal editor snake paint synth tetris game2048 sheet notes calendar stopwatch mines piano dashboard welcome bench breakout pong invaders procmon soundtest solitaire aiconsole screenshot stress musicplayer ide bubbletd zombietd pacman clockapp forktest threadtest reaploop matmuljobs aibroker sed awk tar pkg make meminfo argvtest floattest sleeptest prioritytest matbench tensortest cpuburn blk ps kill free uptime find diff cmp tee wcx xargs gzip cc nettest sockettest cpu1offload smpstress wget netman browser cryptotest libtest ping nc netinfo netscan tcping dig httpget pktmon httpd traceroute arp grep head tail sort uniq cut tr nl du touch basename dirname uname hostname whoami date less hexdump tlsprobe certtool dhcpc apidemo js futextest epolltest sendfiletest perftest batchtest domtest htmltest csstest layouttest webtest browser2 webapitest cube3d ray chess asteroids sudoku photos startmenu controlcenter gametest; do
+for e in comp init filemanager calculator clock sysinfo settings sysmon uidemo dateapp applauncher taskman terminal editor snake paint synth tetris game2048 sheet notes calendar stopwatch mines piano dashboard welcome bench breakout pong invaders procmon soundtest solitaire aiconsole screenshot stress musicplayer ide bubbletd zombietd pacman clockapp forktest threadtest reaploop matmuljobs aibroker sed awk tar pkg make meminfo argvtest floattest sleeptest prioritytest matbench tensortest cpuburn blk ps kill free uptime find diff cmp tee wcx xargs gzip cc nettest sockettest cpu1offload smpstress wget netman browser cryptotest libtest ping nc netinfo netscan tcping dig httpget pktmon httpd traceroute arp grep head tail sort uniq cut tr nl du touch basename dirname uname hostname whoami date less hexdump lspci tlsprobe certtool dhcpc autodhcp apidemo js futextest epolltest sendfiletest perftest batchtest domtest htmltest csstest layouttest webtest browser2 webapitest cube3d ray chess asteroids sudoku photos startmenu controlcenter gametest; do
     n=$(objdump -d /tmp/$e.elf 2>/dev/null | grep -c "fs:0x28" || true)
     echo "  $e=$n"
 done
@@ -486,7 +504,7 @@ rm -rf /tmp/ird && mkdir -p /tmp/ird/sbin /tmp/ird/bin
 if [ "${SELFHEAL:-0}" != "1" ]; then rm -f /tmp/ird/sbin/cwatchdog; fi
 cp /tmp/comp.elf /tmp/ird/sbin/compositor
 cp /tmp/init.elf /tmp/ird/sbin/init
-for e in filemanager calculator clock sysinfo settings sysmon uidemo dateapp applauncher taskman terminal editor snake paint synth tetris game2048 sheet notes calendar stopwatch mines piano dashboard welcome bench breakout pong invaders procmon soundtest solitaire aiconsole screenshot stress musicplayer ide bubbletd startmenu controlcenter chess asteroids sudoku photos pacman clockapp zombietd forktest threadtest reaploop matmuljobs cube3d ray; do
+for e in filemanager calculator clock sysinfo settings sysmon uidemo dateapp applauncher taskman terminal editor snake paint synth tetris game2048 sheet notes calendar stopwatch mines piano dashboard welcome bench breakout pong invaders procmon soundtest solitaire aiconsole screenshot stress musicplayer ide bubbletd startmenu controlcenter chess asteroids sudoku photos pacman clockapp zombietd forktest threadtest reaploop matmuljobs cube3d ray derby; do
     cp /tmp/$e.elf /tmp/ird/sbin/$e
 done
 [ "$IV_OK" = "1" ] && cp /tmp/imageviewer.elf /tmp/ird/sbin/imageviewer
@@ -522,6 +540,8 @@ cp /tmp/gzip.elf /tmp/ird/bin/gunzip
 # nettest lives in /sbin (init spawns it like the other on-boot probes).
 cp /tmp/nettest.elf /tmp/ird/sbin/nettest
 cp /tmp/sockettest.elf /tmp/ird/sbin/sockettest
+# autodhcp -> /sbin (init spawns it at boot; sleeps 2s, checks link, auto-DHCP if up).
+cp /tmp/autodhcp.elf /tmp/ird/sbin/autodhcp
 # cpu1offload -> /sbin (init spawns it at boot; prints PASS on SMP, SKIP on default).
 cp /tmp/cpu1offload.elf /tmp/ird/sbin/cpu1offload
 # smpstress -> /sbin (init spawns it; PASS on SMP after thousands of CPU1 jobs, SKIP on default).
@@ -541,7 +561,7 @@ cp /tmp/wget.elf    /tmp/ird/bin/wget
 cp /tmp/netman.elf  /tmp/ird/sbin/netman
 cp /tmp/browser.elf /tmp/ird/sbin/browser
 # net tools + coreutils expansion -> /bin (shell-spawnable).
-for t in ping nc netinfo netscan tcping dig httpget pktmon httpd traceroute arp grep head tail sort uniq cut tr nl du touch basename dirname uname hostname whoami date less hexdump tlsprobe certtool dhcpc apidemo js; do
+for t in ping nc netinfo netscan tcping dig httpget pktmon httpd traceroute arp grep head tail sort uniq cut tr nl du touch basename dirname uname hostname whoami date less hexdump lspci tlsprobe certtool dhcpc apidemo js; do
     cp /tmp/$t.elf /tmp/ird/bin/$t
 done
 # KAT self-test harnesses -> /sbin (init spawns them at boot).
@@ -556,6 +576,14 @@ cp userspace/apps/ide/sample/towerdefense/*.h /tmp/ird/usr/src/towerdefense/ 2>/
 # Native-toolchain sample programs (the IDE compiles + runs these on-device)
 mkdir -p /tmp/ird/usr/src/native
 cp userspace/apps/ide/sample/native/* /tmp/ird/usr/src/native/ 2>/dev/null || true
+# Demolition Derby 3D: the runnable game (sbin/derby) AND an IDE project so the
+# Semantic LEGO Map can visualize its car/AI/physics/render structure.
+mkdir -p /tmp/ird/usr/src/derby
+cp userspace/apps/derby/derby.c /tmp/ird/usr/src/derby/ 2>/dev/null || true
+# IDE "complex" library: editable disk snippets (*.snip) loaded at IDE startup
+# (built-in core lives in ide_library.c; this dir extends it without recompiling).
+mkdir -p /tmp/ird/usr/lib/snippets
+cp userspace/apps/ide/snippets/*.snip /tmp/ird/usr/lib/snippets/ 2>/dev/null || true
 # Bubble Defense as an IDE project, + a Desktop folder for compiled output
 mkdir -p /tmp/ird/usr/src/bubbledefense
 cp userspace/apps/bubbletd/bubbletd.c /tmp/ird/usr/src/bubbledefense/ 2>/dev/null || true
@@ -575,27 +603,21 @@ mkdir -p /tmp/ird/Desktop
 # be launched. (The dock "Zt" icon launches it directly too.)
 mkdir -p /tmp/ird/Desktop/ZombieBastion
 cp /tmp/zombietd.elf /tmp/ird/Desktop/ZombieBastion/zombietd.elf 2>/dev/null || true
+# Ensure the ISO staging tree exists before writing the initrd into it. iso/ is
+# gitignored and is normally present from a prior build, but a cleaned/wiped tree
+# (or a stray tool that removed build artifacts) would otherwise make the tar -cf
+# below fail with "Cannot open: No such file or directory" and abort the build.
+mkdir -p iso/boot/grub
 ( cd /tmp/ird && tar --format=ustar --owner=0 --group=0 -cf /mnt/c/Users/wilde/Desktop/Kernel/iso/boot/initrd.img . )
 
 echo "[all] installing fresh kernel into ISO tree..."
-# Kernel selection. By DEFAULT (FB_WC unset) this installs build/kernel.elf --
-# the safe, byte-for-byte default kernel -- so the default ISO is untouched.
-# When FB_WC=1 is set we install build/kernel-wc.elf instead (the write-combining
-# kernel produced by `FB_WC=1 bash scripts/quick_build.sh`), so the resulting ISO
-# is the opt-in WC test image. This mirrors how quick_build.sh writes a separate
-# kernel-wc.elf and never lets a WC build clobber the default kernel.elf.
+# Kernel selection. Write-combining is always compiled into the default kernel
+# (fb_enable_write_combining runs at boot, bails safely if no free MTRR).
+# FB_WC=1 is no longer needed -- kept as a no-op for back-compat.
 KERNEL_FOR_ISO="build/kernel.elf"
-if [ "${FB_WC:-0}" = "1" ]; then
-    KERNEL_FOR_ISO="build/kernel-wc.elf"
-    if [ ! -f "$KERNEL_FOR_ISO" ]; then
-        echo "*** FB_WC=1 but $KERNEL_FOR_ISO missing -- run 'FB_WC=1 bash scripts/quick_build.sh' first ***"
-        exit 1
-    fi
-    echo "*** FB_WC build: installing WRITE-COMBINING kernel $KERNEL_FOR_ISO into ISO ***"
-fi
 # SMP=1 installs the SMP_FOUNDATION kernel (build/kernel-smp.elf from
 # `SMP=1 bash scripts/quick_build.sh`) so the desktop runs on the multi-core kernel
-# (needs QEMU -smp 2 / real >=2-core hardware). Mirrors the FB_WC opt-in.
+# (needs QEMU -smp 2 / real >=2-core hardware).
 if [ "${SMP:-0}" = "1" ]; then
     KERNEL_FOR_ISO="build/kernel-smp.elf"
     if [ ! -f "$KERNEL_FOR_ISO" ]; then

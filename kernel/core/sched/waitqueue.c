@@ -66,30 +66,12 @@ static void wo_ensure_init(wait_object_t* wo) {
     }
 }
 
-// Link `proc` at the tail of wo's intrusive FIFO waiter list and take the
-// object's reference on it. Caller holds no locks; we take wo->lock internally.
-static void wo_link_tail(wait_object_t* wo, process_t* proc) {
-    // The object owns a reference to the parked process. Without this, killing a
-    // process while it is BLOCKED (sys_kill sets state=TERMINATED but leaves it
-    // linked here, since scheduler_remove_process is a no-op for a non-queued
-    // process) would drop the last ref and free the PCB — leaving this list
-    // pointing at freed memory. The ref keeps the PCB alive until it is unlinked
-    // (and unref'd) by a later signal or the timer scan.
-    process_ref(proc);
-
-    uint64_t flags;
-    spin_lock_irqsave(&wo->lock, &flags);
-    proc->wait_on = wo;
-    proc->wait_next = NULL;
-    if (wo->tail) {
-        wo->tail->wait_next = proc;
-        wo->tail = proc;
-    } else {
-        wo->waiters = proc;
-        wo->tail = proc;
-    }
-    spin_unlock_irqrestore(&wo->lock, flags);
-}
+// (wo_link_tail was formerly here as a helper that linked a waiter at the tail
+// of wo's intrusive FIFO waiter list under wo->lock and took the object's
+// reference on it. REMOVED: both call sites (wait_object_block and
+// wait_object_prepare_futex) now inline its body so they can hold wo->lock
+// across the link AND the PROCESS_BLOCKED store, closing the lost-wakeup
+// window that the old separate lock-then-set-BLOCKED sequence had.)
 
 // Unlink `proc` from wo if it is currently linked there. Returns 1 if it was
 // found-and-removed (caller then owns the dropped object-ref and must unref),
@@ -240,6 +222,16 @@ static int wo_park_and_cleanup(wait_object_t* wo, process_t* current) {
         // and routes RESUME_IRETQ successors (timer-preempted ring-3 tasks, e.g.
         // CPU burners) through iretq so a blocking task can hand off to them.
         current->resume_mode = RESUME_CRETURN;
+        // LEAK-FIX: drop the outgoing process's "running" ref before the switch.
+        // The process is BLOCKED with ref >= 3 (creation + running + object-ref
+        // from the inline link in wait_object_block), so this will not free the process. Without this,
+        // the running ref accumulates through every block/wake/re-pick cycle,
+        // causing the same ref-count leak as the yield/preemption paths. After
+        // this drop: ref = creation(1) + object-ref(1) = 2; when the waker re-
+        // readies it (scheduler_add +1, process_unref of object-ref -1) the
+        // result is creation(1) + queue(1) = 2 -> re-pick transfers queue ref ->
+        // creation(1) + running(1) = 2. Stable.
+        process_unref(current);
         cooperative_switch_to(current, next);
         // Resumed here after a wakeup. (Stale locals above are NOT touched.)
     } else if (next == current) {
@@ -286,23 +278,44 @@ int wait_object_block(wait_object_t* wo, uint64_t deadline_or_0) {
         return 0;
     }
 
-    // Record the waiter BEFORE marking blocked / switching away, so a wakeup
-    // (signal or timer) racing in right after we set state cannot miss us.
-    // (Wakeups also take the object/sleep locks, and re-readying a not-yet-
-    // switched-out process is safe: it goes back on the ready queue and we never
-    // actually sleep.)
-    wo_link_tail(wo, current);
+    // LOST-WAKEUP FIX: link the waiter AND set PROCESS_BLOCKED under a SINGLE
+    // wo->lock hold, so a concurrent waker (wo_wake_one_proc) cannot pop us
+    // while state is still RUNNING and silently discard the wakeup. This mirrors
+    // the discipline in wait_object_prepare_futex (FUTEX-A fix). The old code
+    // called wo_link_tail() (which takes+drops wo->lock) and then set BLOCKED
+    // outside the lock -- a waker racing into that gap would pop our node, see
+    // state != BLOCKED, call process_unref + continue, and the wakeup was lost.
+    //
+    // Inline the wo_link_tail body here so we can hold wo->lock across both the
+    // link and the state transition:
+    process_ref(current);   // the object owns one reference on the parked waiter
+
+    {
+        uint64_t flags;
+        spin_lock_irqsave(&wo->lock, &flags);
+        current->wait_on   = wo;
+        current->wait_next = NULL;
+        if (wo->tail) {
+            wo->tail->wait_next = current;
+            wo->tail = current;
+        } else {
+            wo->waiters = current;
+            wo->tail    = current;
+        }
+        current->state = PROCESS_BLOCKED;
+        spin_unlock_irqrestore(&wo->lock, flags);
+    }
 
     // Timer-armed wait: also park on the global sleep list with the deadline, so
     // the per-tick scan (sleep_list_wake_due) can wake us if the timeout fires
     // before any signal. sleep_list_push brackets the list mutation with
-    // cli/restore so the timer IRQ can't observe a half-linked node.
+    // cli/restore so the timer IRQ can't observe a half-linked node. Safe after
+    // releasing wo->lock: state is already BLOCKED, so the timer scan will
+    // correctly find us as a valid waiter.
     if (deadline_or_0 != 0) {
         current->wake_deadline = deadline_or_0;
         sleep_list_push(current);
     }
-
-    current->state = PROCESS_BLOCKED;
 
     return wo_park_and_cleanup(wo, current);
 }
@@ -327,7 +340,13 @@ int wait_object_prepare_futex(wait_object_t* wo, int* uaddr, int val, uint64_t k
 
     uint64_t flags;
     spin_lock_irqsave(&wo->lock, &flags);
-    if (__atomic_load_n(uaddr, __ATOMIC_SEQ_CST) != val) {
+    // SMAP bracket: uaddr is a user-space pointer. When CR4.SMAP is enabled,
+    // the kernel cannot read user pages without RFLAGS.AC set. Open the
+    // window for this single atomic load and close it immediately after.
+    stac();
+    int uval = __atomic_load_n(uaddr, __ATOMIC_SEQ_CST);
+    clac();
+    if (uval != val) {
         spin_unlock_irqrestore(&wo->lock, flags);
         return 0;   // value changed under the lock -> EAGAIN, nothing linked
     }

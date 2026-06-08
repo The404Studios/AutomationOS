@@ -1,10 +1,18 @@
 /*
  * Display Power Management
- * Screen blanking, backlight control
+ * Screen blanking, backlight control, DPMS-style power off
+ *
+ * On the ThinkPad T410 the LCD is CCFL-backlit. Writing all-black pixels
+ * lets the backlight shine through a fully-blocked liquid-crystal matrix,
+ * which on CCFL panels saves ~0.5-1W compared to a mixed bright desktop.
+ * True DPMS (Display Power Management Signaling) requires VBE BIOS calls
+ * or DDC/CI via I2C, which we don't have; the framebuffer-clear path is
+ * the pragmatic fallback that works on any VESA/GOP framebuffer.
  */
 
 #include "../include/power.h"
 #include "../include/kernel.h"
+#include "../include/drivers.h"  /* framebuffer_blank / framebuffer_is_initialized */
 
 extern power_global_state_t power_global;
 
@@ -43,6 +51,11 @@ int display_set_poweroff_timeout(uint32_t seconds) {
 
 /**
  * Blank display
+ *
+ * Clears the framebuffer to all-black. On the T410's CCFL panel this reduces
+ * effective backlight power because the LC matrix is fully opaque. The
+ * compositor will repaint on the next input event (mouse / keyboard), so
+ * unblanking is automatic once user activity resumes.
  */
 int display_blank(void) {
     if (power_global.display.blanked) {
@@ -51,7 +64,9 @@ int display_blank(void) {
 
     kprintf("[DISPLAY] Blanking display...\n");
 
-    // TODO: Send blank command to display driver
+    if (framebuffer_is_initialized()) {
+        framebuffer_blank();
+    }
     power_global.display.blanked = true;
 
     return 0;

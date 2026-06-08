@@ -55,8 +55,24 @@ void *memset(void *dst, int val, size_t n)
 {
     unsigned char *d = (unsigned char *)dst;
     unsigned char  v = (unsigned char)val;
-    for (size_t i = 0; i < n; i++)
-        d[i] = v;
+
+    /* Byte-fill until 8-byte aligned. */
+    while (n && ((uintptr_t)d & 7)) { *d++ = v; n--; }
+
+    /* Bulk 8-byte stores (REP STOSQ path for the compiler). */
+    if (n >= 8) {
+        uint64_t w = v;
+        w |= w << 8;  w |= w << 16;  w |= w << 32;
+        uint64_t *d8 = (uint64_t *)d;
+        size_t qwords = n >> 3;
+        for (size_t i = 0; i < qwords; i++)
+            d8[i] = w;
+        size_t done = qwords << 3;
+        d += done; n -= done;
+    }
+
+    /* Tail bytes. */
+    while (n--) *d++ = v;
     return dst;
 }
 
@@ -64,8 +80,24 @@ void *memcpy(void *dst, const void *src, size_t n)
 {
     unsigned char       *d = (unsigned char *)dst;
     const unsigned char *s = (const unsigned char *)src;
-    for (size_t i = 0; i < n; i++)
-        d[i] = s[i];
+
+    /* Byte-copy until 8-byte aligned on the destination. */
+    while (n && ((uintptr_t)d & 7)) { *d++ = *s++; n--; }
+
+    /* Bulk 8-byte copies (widest GPR store -> coalesces into WC bursts
+     * on UC/WC framebuffer memory; ~8x fewer store instructions). */
+    if (n >= 8) {
+        uint64_t       *d8 = (uint64_t *)d;
+        const uint64_t *s8 = (const uint64_t *)s;
+        size_t qwords = n >> 3;
+        for (size_t i = 0; i < qwords; i++)
+            d8[i] = s8[i];
+        size_t done = qwords << 3;
+        d += done; s += done; n -= done;
+    }
+
+    /* Tail bytes. */
+    while (n--) *d++ = *s++;
     return dst;
 }
 
@@ -76,11 +108,32 @@ void *memmove(void *dst, const void *src, size_t n)
     if (d == s || n == 0)
         return dst;
     if (d < s) {
-        for (size_t i = 0; i < n; i++)
-            d[i] = s[i];
+        /* Forward: use 64-bit bulk when possible. */
+        while (n && ((uintptr_t)d & 7)) { *d++ = *s++; n--; }
+        if (n >= 8) {
+            uint64_t       *d8 = (uint64_t *)d;
+            const uint64_t *s8 = (const uint64_t *)s;
+            size_t qwords = n >> 3;
+            for (size_t i = 0; i < qwords; i++)
+                d8[i] = s8[i];
+            size_t done = qwords << 3;
+            d += done; s += done; n -= done;
+        }
+        while (n--) *d++ = *s++;
     } else {
-        for (size_t i = n; i > 0; i--)
-            d[i-1] = s[i-1];
+        /* Backward copy. */
+        d += n; s += n;
+        while (n && ((uintptr_t)d & 7)) { *--d = *--s; n--; }
+        if (n >= 8) {
+            size_t qwords = n >> 3;
+            uint64_t       *d8 = (uint64_t *)(d - (qwords << 3));
+            const uint64_t *s8 = (const uint64_t *)(s - (qwords << 3));
+            for (size_t i = 0; i < qwords; i++)
+                d8[i] = s8[i];
+            n -= qwords << 3;
+            d -= qwords << 3; s -= qwords << 3;
+        }
+        while (n--) *--d = *--s;
     }
     return dst;
 }

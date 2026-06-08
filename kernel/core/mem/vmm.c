@@ -347,10 +347,17 @@ int copy_from_user(void* kernel_dst, const void* user_src, size_t n) {
     // the destination is a kernel pointer supplied by the kernel itself so
     // we trust it.
     //
+    // SMAP bracket: when CR4.SMAP is set, kernel code cannot access
+    // user-accessible pages unless RFLAGS.AC is set. stac() opens the
+    // window; clac() closes it immediately after the copy so that any
+    // subsequent wild user-pointer deref in kernel code still faults.
+    //
     // Performance: 8-byte aligned middle + byte tail is handled inside
     // the compiler/libc memcpy. When string.c is replaced by another agent,
     // fall back to the manual loop below by swapping the call.
+    stac();
     memcpy(kernel_dst, user_src, n);
+    clac();
 
     return COPY_SUCCESS;
 }
@@ -727,8 +734,11 @@ int copy_to_user(void* user_dst, const void* kernel_src, size_t n) {
         return COPY_EFAULT;
     }
 
-    // Fast-path bulk copy (see copy_from_user comment above)
+    // Fast-path bulk copy (see copy_from_user comment above).
+    // SMAP bracket: open AC for the user-page write, close immediately after.
+    stac();
     memcpy(user_dst, kernel_src, n);
+    clac();
 
     return COPY_SUCCESS;
 }
@@ -800,6 +810,14 @@ int copy_user_string(void* kernel_dst, const void* user_src, size_t max) {
     // Reserve one byte for the NUL terminator we always append
     size_t copy_limit = max - 1;
 
+    // SMAP optimisation: instead of stac/clac per byte (~2 instructions per
+    // character = ~100% overhead on a 64-byte path), we open the AC window
+    // once per validated page and close it only at page boundaries (before
+    // re-validation) or on exit.  user_page_is_accessible runs with AC clear
+    // (it reads kernel page-table pages, not user data), so the bracket must
+    // close before each page check.
+    int smap_open = 0;
+
     while (copied < copy_limit) {
         uint64_t cur_addr = (uint64_t)(src + copied);
 
@@ -812,6 +830,8 @@ int copy_user_string(void* kernel_dst, const void* user_src, size_t max) {
         // At every page boundary (including the very first byte) verify the
         // page is actually mapped before dereferencing it.
         if ((cur_addr & 0xFFFULL) == 0) {
+            // Close SMAP window before page-table walk (kernel-page reads)
+            if (smap_open) { clac(); smap_open = 0; }
             if (!user_page_is_accessible(cur_addr)) {
                 // Next page is not mapped — stop here cleanly
                 kprintf("[VMM] copy_user_string: Page at %p not accessible\n",
@@ -819,6 +839,8 @@ int copy_user_string(void* kernel_dst, const void* user_src, size_t max) {
                 dst[copied] = '\0';
                 return COPY_EFAULT;
             }
+            // Re-open for the validated page
+            stac(); smap_open = 1;
         }
 
         char c = src[copied];
@@ -827,9 +849,12 @@ int copy_user_string(void* kernel_dst, const void* user_src, size_t max) {
 
         if (c == '\0') {
             // NUL already written; string is complete
+            if (smap_open) clac();
             return COPY_SUCCESS;
         }
     }
+
+    if (smap_open) clac();
 
     // Reached max without NUL — terminate and return success (truncated)
     dst[copied] = '\0';

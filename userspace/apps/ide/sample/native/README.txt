@@ -2,8 +2,8 @@ Native sample programs for the AutomationOS IDE toolchain.
 
 These are SOURCE assets only -- they are NOT compiled at build time.
 The IDE compiles each one on-device with its native toolchain via
-Build (B), then launches the resulting static ELF via Run (R). Each
-program proves the toolchain works by returning a known exit code.
+Build (Ctrl+B), then launches the resulting static ELF via Run (Ctrl+R).
+Each program proves the toolchain works by returning a known exit code.
 
 Expected exit codes:
   sum.c   -> 55   (1+2+...+10)
@@ -12,7 +12,7 @@ Expected exit codes:
   hello.c -> 0    (writes a line via sys_write, then exits)
   add.asm -> 7    (hand-written SYS_EXIT in the Intel-subset assembler)
 
-Games / demos (compile with B, run with R -- each prints to the console
+Games / demos (compile with Ctrl+B, run with Ctrl+R -- each prints to the console
 and exits 0; all self-contained, integer-only, no #include, no libc):
   hanoi.c  -> Towers of Hanoi solved recursively (15 moves for 4 disks).
   life.c   -> Conway's Game of Life: a glider + a blinker, six generations.

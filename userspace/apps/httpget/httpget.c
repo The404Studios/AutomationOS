@@ -167,6 +167,22 @@ static void out_ip(unsigned int ip)
     out_unum( ip        & 0xFFu);
 }
 
+/* Translate a negative errno to a short reason string (freestanding). */
+static const char *rc_str(long e) {
+    if (e >= 0)   return "ok";
+    long v = -e;
+    switch (v) {
+        case  11: return "would block";
+        case  12: return "out of memory";
+        case  22: return "invalid argument";
+        case 104: return "connection reset by peer";
+        case 110: return "connection timed out";
+        case 111: return "connection refused";
+        case 113: return "no route to host";
+        default:  return "error";
+    }
+}
+
 /* ===================================================================== */
 /* Buffers (static -> no big stack frames in -mno-red-zone code)         */
 /* ===================================================================== */
@@ -351,9 +367,11 @@ static int do_get(const char *ip_str, const char *path, long port)
 
     long fd = sc(SYS_SOCKET, SOCK_STREAM, 0, 0, 0, 0);
     if (fd < 0) {
-        out_puts("httpget: socket() failed rc=");
+        out_puts("httpget: cannot create socket: ");
+        out_puts(rc_str(fd));
+        out_puts(" (rc=");
         out_num(fd);
-        out_puts("\n");
+        out_puts(")\n");
         return 3;
     }
 
@@ -366,9 +384,15 @@ static int do_get(const char *ip_str, const char *path, long port)
     /* Single bounded connect; the kernel's tcp_connect has its own timeout. */
     long cr = sc(SYS_CONNECT, fd, (long)ip, port, 0, 0);
     if (cr < 0) {
-        out_puts("httpget: connect failed rc=");
+        out_puts("httpget: cannot connect to ");
+        out_puts(ip_str);
+        out_puts(":");
+        out_num(port);
+        out_puts(": ");
+        out_puts(rc_str(cr));
+        out_puts(" (rc=");
         out_num(cr);
-        out_puts("\n");
+        out_puts(")\n");
         sc(SYS_CLOSE_SK, fd, 0, 0, 0, 0);
         return 4;
     }
@@ -377,7 +401,9 @@ static int do_get(const char *ip_str, const char *path, long port)
     /* Build + send the fixed HTTP/1.0 GET request. */
     long want = build_request(path, ip_str);
     if (want < 0) {
-        out_puts("httpget: request too long\n");
+        out_puts("httpget: request too long for ");
+        out_puts(path);
+        out_puts("\n");
         sc(SYS_CLOSE_SK, fd, 0, 0, 0, 0);
         return 5;
     }
@@ -387,9 +413,13 @@ static int do_get(const char *ip_str, const char *path, long port)
 
     long s = send_all(fd, g_req, want);
     if (s < 0) {
-        out_puts("httpget: send failed rc=");
+        out_puts("httpget: send to ");
+        out_puts(ip_str);
+        out_puts(" failed: ");
+        out_puts(rc_str(s));
+        out_puts(" (rc=");
         out_num(s);
-        out_puts("\n");
+        out_puts(")\n");
         sc(SYS_CLOSE_SK, fd, 0, 0, 0, 0);
         return 6;
     }

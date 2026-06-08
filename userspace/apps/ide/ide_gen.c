@@ -1,4 +1,4 @@
-/*
+﻿/*
  * ide_gen.c -- the CODE-GENERATION module ("blueprint -> code").
  *
  * When the user APPLYs a recommended ACTION (e.g. "Add claim_slot() wrapper",
@@ -21,6 +21,7 @@
 #include "ide.h"
 #include "ide_ast.h"
 #include "ide_astprint.h"
+#include "ide_library.h"
 
 /* ---- tiny freestanding string helpers (no libc) ----------------------- */
 
@@ -201,3 +202,9 @@ int gen_apply_action(Ide* a, int idx) {
     model_analyze(&a->model);
     return 1;
 }
+
+
+
+
+
+

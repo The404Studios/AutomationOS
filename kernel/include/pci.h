@@ -69,4 +69,45 @@ uint64_t pci_get_bar(pci_device_t* dev, uint8_t bar_num);
 void pci_enable_bus_master(pci_device_t* dev);
 void pci_enable_memory_space(pci_device_t* dev);
 
+/* Indexed accessors -- expose the enumerated device list without leaking the
+ * static array. Safe to call any time after pci_init(). */
+uint32_t pci_get_device_count(void);
+pci_device_t* pci_get_device_by_index(uint32_t index);
+
+/* Human-readable PCI device lister with T410 device name database.
+ * Prints an lspci-style table to kprintf with device names and driver status.
+ * Safe to call any time after pci_init(). */
+void pci_list(void);
+
+/* ---- UAPI: userspace-visible PCI device info (SYS_PCI_LIST=92) ---- */
+
+/*
+ * Flat, fixed-size struct exported to userspace via SYS_PCI_LIST.  Mirrors the
+ * essential fields of pci_device_t without exposing BARs or driver-internal
+ * state.  All fields are in host byte order.
+ */
+typedef struct {
+    uint16_t vendor_id;
+    uint16_t device_id;
+    uint8_t  bus;
+    uint8_t  device;
+    uint8_t  function;
+    uint8_t  class_code;
+    uint8_t  subclass;
+    uint8_t  prog_if;
+    uint8_t  revision_id;
+    uint8_t  interrupt_line;
+    uint8_t  interrupt_pin;
+    uint8_t  _pad[3];        /* pad to 16 bytes for clean alignment */
+} pci_info_t;
+
+/*
+ * sys_pci_list -- SYS_PCI_LIST syscall handler.
+ *   arg1 = user pointer to array of pci_info_t
+ *   arg2 = max entries the buffer can hold
+ *   Returns: number of entries copied (>=0), or -errno.
+ */
+int64_t sys_pci_list(uint64_t out_ptr, uint64_t max_entries, uint64_t a3,
+                     uint64_t a4, uint64_t a5, uint64_t a6);
+
 #endif

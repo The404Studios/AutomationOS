@@ -197,7 +197,7 @@ js_value js_mk_undef(void) { js_value v; v.type = JS_UNDEFINED; v.u.n = 0; retur
 js_value js_mk_null(void)  { js_value v; v.type = JS_NULL; v.u.n = 0; return v; }
 js_value js_mk_bool(int b) { js_value v; v.type = JS_BOOL; v.u.b = b ? 1 : 0; return v; }
 js_value js_mk_num(double n){ js_value v; v.type = JS_NUMBER; v.u.n = n; return v; }
-js_value js_mk_str(js_string *s){ js_value v; v.type = JS_STRING; v.u.s = s; return v; }
+js_value js_mk_str(js_string *s){ if (!s) return js_mk_undef(); js_value v; v.type = JS_STRING; v.u.s = s; return v; }
 js_value js_mk_obj(js_object *o)
 {
     js_value v;

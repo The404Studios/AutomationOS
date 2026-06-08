@@ -291,6 +291,31 @@ static int attach_child(ui_widget_t* parent, ui_widget_t* child,
     return 0;
 }
 
+/* ---- widget free / detach ---- */
+
+void ui_widget_free_tree(ui_widget_t* w) {
+    if (!w) return;
+    /* Free children first (depth-first). */
+    for (int i = 0; i < w->nchildren; i++)
+        ui_widget_free_tree(w->children[i]);
+    w->nchildren = 0;
+    w->used = 0;   /* return slot to the pool */
+}
+
+int ui_widget_detach(ui_widget_t* parent, ui_widget_t* child) {
+    if (!parent || !child) return -1;
+    for (int i = 0; i < parent->nchildren; i++) {
+        if (parent->children[i] == child) {
+            /* Shift later children down. */
+            for (int j = i; j + 1 < parent->nchildren; j++)
+                parent->children[j] = parent->children[j + 1];
+            parent->nchildren--;
+            return 0;
+        }
+    }
+    return -1;
+}
+
 /* ---- public construction API ---- */
 
 ui_app_t* ui_app_create(const char* title, int w, int h) {
@@ -397,6 +422,16 @@ void ui_label_set_text(ui_widget_t* w, const char* text) {
     ui_strlcpy(w->text, text, UI_TEXT_CAP);
     if (w->kind == UI_LABEL)
         w->aw = (i32)ui_strlen(w->text) * g_ui_cw;  /* scaled width matches render */
+}
+
+void ui_widget_set_bg(ui_widget_t* w, unsigned int bg) {
+    if (!w) return;
+    w->bg = bg;
+}
+
+void ui_widget_set_fg(ui_widget_t* w, unsigned int fg) {
+    if (!w) return;
+    w->fg = fg;
 }
 
 void ui_app_set_tick(ui_app_t* app, void (*tick)(void* ud), void* ud) {

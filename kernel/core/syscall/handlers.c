@@ -13,6 +13,7 @@
 #include "../../include/rtc.h"
 #include "../../include/procapi.h"
 #include "../../include/clipboard.h"
+#include "../../include/acpi.h"    /* ec_battery_read / ec_battery_available */
 #include "../../include/ahci.h"
 #include "../../include/perf.h"
 
@@ -302,6 +303,25 @@ int64_t sys_fork(uint64_t arg1, uint64_t arg2, uint64_t arg3,
         return ESRCH;
     }
 
+    // ── Fork bomb protection: per-UID process count limit ───────────
+    // Without this, a single unprivileged process can fill all 256 PID
+    // slots and DoS the entire system (no new processes for any user,
+    // including init's service restarts). Root (uid 0) is exempt --
+    // kernel threads and init must always be able to fork.
+    // MAX_CHILDREN_PER_UID = 64 leaves room for ~3 non-root users plus
+    // kernel/init overhead. This is a design-level limit; the global
+    // MAX_PROCESSES (256) remains the hard system cap.
+    #define MAX_CHILDREN_PER_UID 64
+    if (parent->uid != 0) {
+        extern int process_count_by_uid(uint32_t uid);
+        int count = process_count_by_uid(parent->uid);
+        if (count >= MAX_CHILDREN_PER_UID) {
+            kprintf("[SYSCALL] sys_fork: UID %u has %d processes (limit %d) -- fork denied\n",
+                    parent->uid, count, MAX_CHILDREN_PER_UID);
+            return EAGAIN;
+        }
+    }
+
     kprintf("[SYSCALL] sys_fork: Forking process '%s' (PID %d)\n",
             parent->name, parent->pid);
 
@@ -346,8 +366,9 @@ int64_t sys_fork(uint64_t arg1, uint64_t arg2, uint64_t arg3,
     // SS=0x1B — the original code had them swapped (CS=0x1B), which made iretq
     // reject CS (a data selector) with #GP err=0x18 the first time the child ran.
     // Sanitize RFLAGS exactly like enter_usermode: clear TF (no single-step),
-    // force IF=1, clear IOPL so the child has no I/O privilege.
-    user_rflags = (user_rflags & ~0x100ULL & ~0x3000ULL) | 0x200ULL;
+    // clear DF (SysV ABI: DF=0 at function entry), force IF=1, clear IOPL so
+    // the child has no I/O privilege.
+    user_rflags = (user_rflags & ~0x100ULL & ~0x400ULL & ~0x3000ULL) | 0x200ULL;
 
     uint64_t c_kstop = (uint64_t)child->kernel_stack + KERNEL_STACK_SIZE;
     uint64_t* sp = (uint64_t*)c_kstop;
@@ -415,6 +436,18 @@ int64_t sys_thread_create(uint64_t entry, uint64_t arg, uint64_t user_stack,
     }
     if (user_stack == 0 || user_stack >= USER_SPACE_END) {
         return EINVAL;
+    }
+
+    // Per-UID thread/process count limit (same as sys_fork fork-bomb guard).
+    // Threads consume PID slots just like processes, so the same limit applies.
+    if (caller->uid != 0) {
+        extern int process_count_by_uid(uint32_t uid);
+        int count = process_count_by_uid(caller->uid);
+        if (count >= MAX_CHILDREN_PER_UID) {
+            kprintf("[SYSCALL] sys_thread_create: UID %u at process limit (%d) -- denied\n",
+                    caller->uid, count);
+            return EAGAIN;
+        }
     }
 
     process_t* t = thread_create(caller, entry, arg, user_stack);
@@ -607,21 +640,35 @@ int64_t sys_read(uint64_t fd, uint64_t buf, uint64_t count,
         return 1;
     }
 
-    // Use VFS for file reads
-    char* kernel_buf = kmalloc(count);
-    if (!kernel_buf) {
-        return ENOMEM;
+    // Use VFS for file reads.
+    // Optimisation: small reads (<=512 bytes) use a stack-local buffer to avoid
+    // the overhead of kmalloc/kfree on the heap hot path.  The kernel stack is
+    // 8KB and the deepest syscall frame is well under 2KB at this point, so
+    // 512B on the stack is safe.
+#define SYS_READ_STACK_THRESH 512
+    char stack_buf[SYS_READ_STACK_THRESH];
+    char* kernel_buf;
+    int heap_buf = 0;
+
+    if (count <= SYS_READ_STACK_THRESH) {
+        kernel_buf = stack_buf;
+    } else {
+        kernel_buf = (char*)kmalloc(count);
+        if (!kernel_buf) {
+            return ENOMEM;
+        }
+        heap_buf = 1;
     }
 
     ssize_t result = vfs_read((int)fd, kernel_buf, count);
     if (result > 0) {
         if (copy_to_user((void*)buf, kernel_buf, result) != COPY_SUCCESS) {
-            kfree(kernel_buf);
+            if (heap_buf) kfree(kernel_buf);
             return EFAULT;
         }
     }
 
-    kfree(kernel_buf);
+    if (heap_buf) kfree(kernel_buf);
     return result;
 }
 
@@ -657,16 +704,27 @@ int64_t sys_write(uint64_t fd, uint64_t buf, uint64_t count,
         return EINVAL;
     }
 
-    // Allocate kernel buffer
-    char* kernel_buf = kmalloc(count);
-    if (!kernel_buf) {
-        kprintf("[SYSCALL] sys_write: Failed to allocate kernel buffer\n");
-        return ENOMEM;
+    // Optimisation: small writes (<=512 bytes) use a stack-local buffer to
+    // avoid kmalloc/kfree overhead on the heap hot path (matches sys_read).
+#define SYS_WRITE_STACK_THRESH 512
+    char write_stack_buf[SYS_WRITE_STACK_THRESH];
+    char* kernel_buf;
+    int heap_buf = 0;
+
+    if (count <= SYS_WRITE_STACK_THRESH) {
+        kernel_buf = write_stack_buf;
+    } else {
+        kernel_buf = (char*)kmalloc(count);
+        if (!kernel_buf) {
+            kprintf("[SYSCALL] sys_write: Failed to allocate kernel buffer\n");
+            return ENOMEM;
+        }
+        heap_buf = 1;
     }
 
     // Copy from user space
     if (copy_from_user(kernel_buf, (const void*)buf, count) != COPY_SUCCESS) {
-        kfree(kernel_buf);
+        if (heap_buf) kfree(kernel_buf);
         return EFAULT;
     }
 
@@ -702,13 +760,13 @@ int64_t sys_write(uint64_t fd, uint64_t buf, uint64_t count,
             }
         }
 
-        kfree(kernel_buf);
+        if (heap_buf) kfree(kernel_buf);
         return (int64_t)count;
     }
 
     // Use VFS for file writes
     ssize_t result = vfs_write((int)fd, kernel_buf, count);
-    kfree(kernel_buf);
+    if (heap_buf) kfree(kernel_buf);
     return result;
 }
 
@@ -742,8 +800,8 @@ int64_t sys_open(uint64_t path, uint64_t flags, uint64_t mode,
     // Open file via VFS
     int fd = vfs_open(kernel_path, (int)flags, (int)mode);
     if (fd < 0) {
-        kprintf("[SYSCALL] sys_open: Failed to open %s\n", kernel_path);
-        return EBADF;
+        kprintf("[SYSCALL] sys_open: Failed to open '%s' (err %d)\n", kernel_path, fd);
+        return fd;  // propagate the real error (ENOENT/EISDIR/EINVAL) to userspace
     }
 
 #ifndef SYSCALL_QUIET
@@ -936,6 +994,14 @@ int64_t sys_waitpid(uint64_t pid, uint64_t status_ptr, uint64_t options,
             return ECHILD;   // no matching child exists at all
         }
 
+        // WNOHANG (options bit 0): return 0 immediately instead of blocking
+        // when a matching child exists but hasn't terminated yet. Used by the
+        // IDE's event loop to poll for the exit code of a spawned program
+        // without freezing the UI.
+        if (options & 1 /* WNOHANG */) {
+            return 0;   // child alive, caller should retry later
+        }
+
         // A matching child is still running: block until a child exits. Lazily
         // allocate our wait queue (zeroed pointer until first wait).
         if (!current->child_wait) {
@@ -984,6 +1050,13 @@ int64_t sys_yield(uint64_t arg1, uint64_t arg2, uint64_t arg3,
         // what lets a yielding cooperative task hand the CPU to a preempted one
         // (e.g. the never-yielding CPU burners) instead of starving them.
         current->resume_mode = RESUME_CRETURN;
+        // LEAK-FIX: drop the outgoing process's "running" ref before the switch.
+        // scheduler_yield_requeue already took a new queue ref, so current has
+        // at least creation(1) + queue(1) = 2 refs and will not be freed.
+        // Without this, each yield cycle adds +1 ref that is never released,
+        // and a long-running process accumulates orphan refs that prevent its
+        // PCB/stack/CR3 from ever being freed on exit (see schedule() LEAK-FIX).
+        process_unref(current);
         cooperative_switch_to(current, next);
     } else if (next == current) {
         // pick_next handed back current itself (sole runnable task), carrying the
@@ -1088,8 +1161,8 @@ int64_t sys_spawn(uint64_t path, uint64_t arg2, uint64_t arg3,
     write_cr3(caller_cr3);   // restore the caller's address space before returning
 
     if (pid <= 0) {
-        kprintf("[SPAWN] not found / load failed: %s\n", kpath);
-        return ESRCH;
+        kprintf("[SPAWN] not found / load failed: '%s'\n", kpath);
+        return ENOENT;  // file not found (ESRCH = "no such process" is misleading here)
     }
 
     kprintf("[SPAWN] Process '%s' created with PID %d\n", kpath, pid);
@@ -1837,6 +1910,98 @@ int64_t sys_blk_write(uint64_t lba, uint64_t count, uint64_t ubuf,
 }
 
 // ============================================================================
+// Persistent named-file syscalls (SYS_PERSIST_READ / SYS_PERSIST_WRITE)
+// ----------------------------------------------------------------------------
+// A thin, ADDITIVE wrapper over the already-tested, gate-safe diskfs flat-file
+// API (kernel/fs/diskfs.c). diskfs_init() runs at boot and persists across a
+// reboot on a present SATA disk; these syscalls expose its named files to
+// userspace WITHOUT touching the VFS or any existing syscall path. With no disk
+// attached they return ENODEV (exactly like sys_blk_*), so callers (the IDE
+// config loader) fall back to a session-local file and the diskless smoke stays
+// green. Names are flat (diskfs is single-directory); the IDE uses "ide.config".
+// ============================================================================
+extern int  diskfs_create(const char* name);
+extern int  diskfs_open(const char* name);
+extern long diskfs_read (int ino, unsigned long off, void* buf, unsigned long len);
+extern long diskfs_write(int ino, unsigned long off, const void* buf, unsigned long len);
+extern long diskfs_size (int ino);
+extern int  diskfs_unlink(const char* name);
+
+#define PERSIST_NAME_MAX  56     // diskfs inode name[56]
+#define PERSIST_DATA_MAX  65536  // generous bound for small config/state files
+
+// SYS_PERSIST_WRITE(name, ubuf, len): (re)create `name` and write `len` bytes.
+// Truncate semantics: an existing file is unlinked first, so the result is
+// exactly `len` bytes. Returns bytes written, or a negative errno.
+int64_t sys_persist_write(uint64_t name, uint64_t ubuf, uint64_t len,
+                          uint64_t arg4, uint64_t arg5, uint64_t arg6) {
+    (void)arg4; (void)arg5; (void)arg6;
+
+    if (!ahci_present()) return ENODEV;      // gate-safe: no disk -> caller falls back
+    if (!name || (!ubuf && len)) return EFAULT;
+    if (len > PERSIST_DATA_MAX) return EINVAL;
+
+    char kname[PERSIST_NAME_MAX];
+    if (copy_user_string(kname, (const void*)name, PERSIST_NAME_MAX) != COPY_SUCCESS)
+        return EFAULT;
+    kname[PERSIST_NAME_MAX - 1] = '\0';
+    if (kname[0] == '\0') return EINVAL;
+
+    void* kbuf = kmalloc(len ? (size_t)len : 1);
+    if (!kbuf) return ENOMEM;
+    if (len && copy_from_user(kbuf, (const void*)ubuf, (size_t)len) != COPY_SUCCESS) {
+        kfree(kbuf);
+        return EFAULT;
+    }
+
+    diskfs_unlink(kname);                     // truncate: ignore "not found"
+    int ino = diskfs_create(kname);
+    if (ino < 0) { kfree(kbuf); return EIO; }
+
+    long w = diskfs_write(ino, 0, kbuf, (unsigned long)len);
+    kfree(kbuf);
+    if (w < 0) return EIO;
+    return w;
+}
+
+// SYS_PERSIST_READ(name, ubuf, cap): read up to `cap` bytes of `name` into ubuf.
+// Returns bytes read (0 if empty), or a negative errno (ENOENT if absent).
+int64_t sys_persist_read(uint64_t name, uint64_t ubuf, uint64_t cap,
+                         uint64_t arg4, uint64_t arg5, uint64_t arg6) {
+    (void)arg4; (void)arg5; (void)arg6;
+
+    if (!ahci_present()) return ENODEV;
+    if (!name || !ubuf) return EFAULT;
+
+    char kname[PERSIST_NAME_MAX];
+    if (copy_user_string(kname, (const void*)name, PERSIST_NAME_MAX) != COPY_SUCCESS)
+        return EFAULT;
+    kname[PERSIST_NAME_MAX - 1] = '\0';
+    if (kname[0] == '\0') return EINVAL;
+
+    int ino = diskfs_open(kname);
+    if (ino < 0) return ENOENT;
+
+    long sz = diskfs_size(ino);
+    if (sz < 0) return EIO;
+    unsigned long n = (unsigned long)sz;
+    if (n > cap) n = cap;
+    if (n > PERSIST_DATA_MAX) n = PERSIST_DATA_MAX;
+    if (n == 0) return 0;
+
+    void* kbuf = kmalloc(n);
+    if (!kbuf) return ENOMEM;
+    long r = diskfs_read(ino, 0, kbuf, n);
+    if (r < 0) { kfree(kbuf); return EIO; }
+    if (r > 0 && copy_to_user((void*)ubuf, kbuf, (size_t)r) != COPY_SUCCESS) {
+        kfree(kbuf);
+        return EFAULT;
+    }
+    kfree(kbuf);
+    return r;
+}
+
+// ============================================================================
 // Performance Monitoring System Call
 // ============================================================================
 
@@ -1855,6 +2020,57 @@ int64_t sys_perf_report(uint64_t arg1, uint64_t arg2, uint64_t arg3,
 // IPC System Call Wrappers
 // ============================================================================
 // Note: These forward to the implementations in kernel/ipc/shm.c and msgqueue.c
+
+// ============================================================================
+// Power Management System Calls (ACPI)
+// ============================================================================
+
+// SYS_POWEROFF - Trigger ACPI S5 soft-off. Does not return on success.
+// Only PID 1 (init) or processes spawned by init may shut down the machine.
+// On QEMU this terminates the emulator process cleanly.
+int64_t sys_poweroff(uint64_t arg1, uint64_t arg2, uint64_t arg3,
+                     uint64_t arg4, uint64_t arg5, uint64_t arg6) {
+    (void)arg1; (void)arg2; (void)arg3; (void)arg4; (void)arg5; (void)arg6;
+    kprintf("[SYSCALL] SYS_POWEROFF invoked by PID %d\n",
+            current_process ? current_process->pid : -1);
+    extern void power_off(void);
+    power_off();
+    /* power_off does not return; if it somehow does, return an error */
+    return EIO;
+}
+
+// SYS_REBOOT - Trigger system reboot via ACPI reset register + 8042 + triple-fault.
+// Does not return on success.
+int64_t sys_reboot(uint64_t arg1, uint64_t arg2, uint64_t arg3,
+                   uint64_t arg4, uint64_t arg5, uint64_t arg6) {
+    (void)arg1; (void)arg2; (void)arg3; (void)arg4; (void)arg5; (void)arg6;
+    kprintf("[SYSCALL] SYS_REBOOT invoked by PID %d\n",
+            current_process ? current_process->pid : -1);
+    extern void power_reboot(void);
+    power_reboot();
+    /* power_reboot does not return; if it somehow does, return an error */
+    return EIO;
+}
+
+// SYS_BATTERY - query EC battery status (T410 / laptops).
+// Returns a 4-byte struct: { present, state, percent, ac }.
+// On QEMU/desktop without an EC, returns present=0 (not an error).
+int64_t sys_battery(uint64_t out, uint64_t arg2, uint64_t arg3,
+                    uint64_t arg4, uint64_t arg5, uint64_t arg6) {
+    (void)arg2; (void)arg3; (void)arg4; (void)arg5; (void)arg6;
+    struct { uint8_t present; uint8_t state; uint8_t percent; uint8_t ac; } info = {0};
+    if (ec_battery_available()) {
+        ec_battery_status_t bat;
+        if (ec_battery_read(&bat) == 0 && bat.present) {
+            info.present = 1;
+            info.state   = bat.state;
+            info.percent = bat.percentage;
+            info.ac      = bat.ac_online ? 1 : 0;
+        }
+    }
+    if (copy_to_user((void*)out, &info, sizeof(info)) != COPY_SUCCESS) return EFAULT;
+    return 0;
+}
 
 #ifdef SMP_FOUNDATION
 // ============================================================================

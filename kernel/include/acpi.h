@@ -408,4 +408,32 @@ void acpi_free_resources(void);
 void acpi_dump_tables(void);
 void acpi_print_info(void);
 
+/*
+ * Embedded Controller (EC) battery status -- lightweight, self-contained.
+ *
+ * Reads battery data directly from the ACPI Embedded Controller (ports
+ * 0x62/0x66) without requiring the full power management framework.
+ * On platforms without an EC (e.g. QEMU), the probe fails once and all
+ * subsequent calls return immediately with bat->present = false.
+ *
+ * This is intended for the taskbar battery indicator and the SYS_SYSINFO
+ * syscall. The full power subsystem (kernel/power/) can use this too once
+ * it is integrated into the build.
+ */
+typedef struct {
+    bool     present;       /* true if a battery was detected            */
+    bool     ac_online;     /* true if AC adapter is connected           */
+    uint8_t  percentage;    /* 0-100 charge level                       */
+    uint8_t  state;         /* 0=idle/full, 1=discharging, 2=charging   */
+    uint16_t voltage_mv;    /* present voltage in millivolts            */
+    uint16_t rate_mw;       /* present charge/discharge rate in mW      */
+    uint16_t remaining_mwh; /* remaining capacity in mWh                */
+    uint16_t full_cap_mwh;  /* last full charge capacity in mWh         */
+    uint16_t design_mwh;    /* design capacity in mWh                   */
+    uint16_t time_min;      /* estimated minutes to empty (or to full)  */
+} ec_battery_status_t;
+
+int  ec_battery_read(ec_battery_status_t *out);
+bool ec_battery_available(void);
+
 #endif // ACPI_H

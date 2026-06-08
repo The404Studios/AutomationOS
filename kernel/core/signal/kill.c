@@ -188,6 +188,7 @@ int64_t sys_kill(uint64_t pid, uint64_t sig, uint64_t arg3,
                     target->pid, target->name);
             if (target->state == PROCESS_RUNNING || target->state == PROCESS_READY) {
                 target->state = PROCESS_BLOCKED;
+                target->stopped_by_signal = 1;
                 scheduler_remove_process(target);
             }
             break;
@@ -220,7 +221,8 @@ int64_t sys_kill(uint64_t pid, uint64_t sig, uint64_t arg3,
             // SIGCONT to a READY or RUNNING process is a no-op per POSIX.
             kprintf("[KILL] Sending SIGCONT to process %u (%s)\n",
                     target->pid, target->name);
-            if (target->state == PROCESS_BLOCKED) {
+            if (target->state == PROCESS_BLOCKED && target->stopped_by_signal) {
+                target->stopped_by_signal = 0;
                 process_set_ready(target);
                 scheduler_add_process(target);
                 // Note: scheduler_add_process() calls process_ref() internally,

@@ -97,6 +97,13 @@
 #define SYS_FSYNC       86  // flush file data to storage
 #define SYS_SYNC        87  // flush all dirty data to storage
 #define SYS_RECOVERY_OVERLAY 88 // draw the self-heal fluid-circle recovery animation
+#define SYS_NET_CONFIG  89  // apply IP/mask/gw/dns to a named interface
+#define SYS_ROUTE_TABLE 90  // dump routing table entries
+#define SYS_ARP_TABLE   91  // dump ARP cache entries
+#define SYS_PCI_LIST    92  // dump PCI device list to user buffer
+#define SYS_BATTERY     93  // EC battery status (ec_battery_status_t subset: 4 bytes)
+#define SYS_PERSIST_READ  94 // read a named diskfs file into a user buffer  (handlers.c)
+#define SYS_PERSIST_WRITE 95 // write a user buffer to a named diskfs file   (handlers.c)
 #define SYS_VMA_TEST    200 // VMA red-black tree testing and benchmarking
 
 // ---- SMP coprocessor offload (GATED: only registered under SMP_FOUNDATION) ----
@@ -285,6 +292,12 @@ int64_t sys_blk_read(uint64_t lba, uint64_t count, uint64_t ubuf,
 int64_t sys_blk_write(uint64_t lba, uint64_t count, uint64_t ubuf,
                       uint64_t arg4, uint64_t arg5, uint64_t arg6);
 
+// Persistent named-file syscalls (diskfs flat files; gate-safe via ahci_present).
+int64_t sys_persist_read(uint64_t name, uint64_t ubuf, uint64_t cap,
+                         uint64_t arg4, uint64_t arg5, uint64_t arg6);
+int64_t sys_persist_write(uint64_t name, uint64_t ubuf, uint64_t len,
+                          uint64_t arg4, uint64_t arg5, uint64_t arg6);
+
 // Futex (fast userspace mutex) syscall
 int64_t sys_futex(uint64_t uaddr, uint64_t op, uint64_t val,
                   uint64_t timeout, uint64_t uaddr2, uint64_t val3);
@@ -332,6 +345,18 @@ int64_t sys_perf_report(uint64_t arg1, uint64_t arg2, uint64_t arg3,
 //   sys_cpu1_offload(job_type, user_arg, arg_len, user_res, res_len)
 int64_t sys_cpu1_offload(uint64_t job_type, uint64_t user_arg, uint64_t arg_len,
                          uint64_t user_res, uint64_t res_len);
+
+// Power management syscalls (ACPI S5 shutdown + reboot)
+int64_t sys_poweroff(uint64_t arg1, uint64_t arg2, uint64_t arg3,
+                     uint64_t arg4, uint64_t arg5, uint64_t arg6);
+int64_t sys_reboot(uint64_t arg1, uint64_t arg2, uint64_t arg3,
+                   uint64_t arg4, uint64_t arg5, uint64_t arg6);
+
+// Battery status (EC embedded controller)
+//   sys_battery(out_ptr, 0, 0) -> 0 on success, <0 on error
+//   out_ptr -> battery_info_user_t { present, state, percent, ac } (4 bytes)
+int64_t sys_battery(uint64_t out, uint64_t arg2, uint64_t arg3,
+                    uint64_t arg4, uint64_t arg5, uint64_t arg6);
 
 // Error codes now live in errno.h (included above) — canonical negative set.
 

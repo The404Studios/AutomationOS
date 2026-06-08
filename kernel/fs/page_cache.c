@@ -19,6 +19,7 @@ static struct {
     page_cache_entry_t* hash_table[PAGE_CACHE_HASH_SIZE];
     page_cache_entry_t* lru_head;      /* Most recently used */
     page_cache_entry_t* lru_tail;      /* Least recently used */
+    page_cache_entry_t* clock_hand;    /* CLOCK eviction hand position */
     page_cache_stats_t stats;
     uint32_t initialized;
     uint64_t timestamp;                /* Monotonic counter for LRU */
@@ -168,26 +169,66 @@ static int cache_flush_entry(page_cache_entry_t* entry) {
     return 0;
 }
 
-/* Evict least recently used page, prioritizing read-ahead pages */
+/**
+ * CLOCK eviction algorithm (replaces linear LRU scan).
+ *
+ * The CLOCK hand sweeps through the circular LRU list.  Each page has a
+ * "referenced" bit (PCE_ACCESSED).  When the hand visits a page:
+ *   - If ACCESSED is clear: evict this page (it was not touched recently).
+ *   - If ACCESSED is set:   clear it and advance (give it a second chance).
+ *
+ * Unused read-ahead pages (PCE_READAHEAD && !PCE_ACCESSED) are still preferred
+ * as victims on a fast first pass, since they represent wasted prefetch.
+ *
+ * This avoids the O(N) linear scan of pure LRU eviction.
+ */
 static int cache_evict_lru(void) {
     page_cache_entry_t* victim = NULL;
 
-    /* Strategy: prefer evicting read-ahead pages that were never accessed */
-    /* First pass: find read-ahead page that was never used */
+    /* Fast pass: find an unused read-ahead page anywhere in the list. These are
+     * wasted prefetches and should be reclaimed before real pages. */
     page_cache_entry_t* curr = cache_state.lru_tail;
     while (curr) {
         if ((curr->flags & PCE_READAHEAD) && !(curr->flags & PCE_ACCESSED)) {
-            /* Found unused read-ahead page - perfect victim */
             victim = curr;
-            if (victim->flags & PCE_READAHEAD) {
-                cache_state.stats.readahead_misses++;
-            }
+            cache_state.stats.readahead_misses++;
             break;
         }
         curr = curr->lru_prev;
     }
 
-    /* Second pass: if no unused read-ahead pages, evict LRU normally */
+    /* CLOCK sweep: if no dead read-ahead page, use the clock hand. */
+    if (!victim) {
+        if (!cache_state.clock_hand) {
+            cache_state.clock_hand = cache_state.lru_tail;
+        }
+
+        /* Sweep at most 2*total_pages entries (two full rotations max) to
+         * guarantee termination even when every page is accessed. */
+        uint64_t budget = cache_state.stats.total_pages * 2;
+        while (cache_state.clock_hand && budget > 0) {
+            page_cache_entry_t* hand = cache_state.clock_hand;
+            budget--;
+
+            if (hand->flags & PCE_ACCESSED) {
+                /* Second chance: clear the bit and advance. */
+                hand->flags &= ~(uint32_t)PCE_ACCESSED;
+                cache_state.clock_hand = hand->lru_prev ? hand->lru_prev : cache_state.lru_head;
+            } else {
+                /* Victim found. */
+                victim = hand;
+                /* Advance the hand past the victim before removing it. */
+                cache_state.clock_hand = hand->lru_prev ? hand->lru_prev : cache_state.lru_head;
+                if (cache_state.clock_hand == victim) {
+                    cache_state.clock_hand = NULL; /* last entry */
+                }
+                break;
+            }
+        }
+    }
+
+    /* Ultimate fallback: if CLOCK couldn't find a victim (all pages accessed
+     * and budget exhausted), just take the LRU tail. */
     if (!victim) {
         victim = cache_state.lru_tail;
     }
@@ -235,6 +276,7 @@ void page_cache_init(void) {
 
     cache_state.lru_head = NULL;
     cache_state.lru_tail = NULL;
+    cache_state.clock_hand = NULL;
     cache_state.stats.max_pages = PAGE_CACHE_MAX_PAGES;
     cache_state.timestamp = 0;
     cache_state.initialized = 1;
@@ -609,6 +651,11 @@ void page_cache_evict_inode(vfs_inode_t* inode) {
                 /* Remove from hash chain */
                 *slot = entry->hash_next;
 
+                /* Advance clock hand if it points at this entry */
+                if (cache_state.clock_hand == entry) {
+                    cache_state.clock_hand = entry->lru_prev ? entry->lru_prev : entry->lru_next;
+                }
+
                 /* Remove from LRU */
                 lru_remove(entry);
 
@@ -665,6 +712,16 @@ void page_cache_print_stats(void) {
                                cache_state.stats.readahead_pages;
         kprintf("  Read-ahead Accuracy: %llu%%\n", ra_hit_rate);
     }
+}
+
+/**
+ * page_cache_readahead - Public API for sequential read-ahead.
+ *
+ * Wraps the internal cache_readahead so that filesystem drivers and the VFS
+ * layer can trigger read-ahead without accessing the static helper directly.
+ */
+void page_cache_readahead(vfs_inode_t* inode, uint64_t offset, uint64_t window) {
+    cache_readahead(inode, offset, window);
 }
 
 /**

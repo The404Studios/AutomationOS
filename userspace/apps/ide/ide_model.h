@@ -25,6 +25,10 @@
 #define M_MAXRISKS    12
 #define M_MAXACTIONS  10
 #define M_MAXFLOW     16
+#define M_MAXINCLUDES 32
+#define M_MAXMACROS   32
+#define M_MAXRECORDS  32
+#define M_MAXPROTOS   32
 
 /* ---- port semantics (the heart of the "LEGO" model) ---- */
 typedef enum {
@@ -84,13 +88,47 @@ typedef struct {
 } Conn;
 
 typedef struct { char title[64]; char risk[32]; int score; } Risk;     /* score 0..100 */
-typedef struct { char title[64]; int  dcoherence; } Action;            /* signed, x100 */
+typedef struct {
+    char title[64];       /* action title or library complex name */
+    int  dcoherence;      /* signed, x100: coherence delta if applied */
+    int  lib_id;          /* library complex ID (-1 = not a library action) */
+    int  category;        /* LibraryCategory if lib_id >= 0, else unused */
+    int  complexity;      /* 0..100: estimated code complexity */
+} Action;            /* includes hardcoded + library actions */
 typedef struct { char label[24]; int  absent; } FlowStep;
+
+/* ---- file-level code elements (for LEGO overview) ---- */
+typedef struct {
+    char path[M_NAME];    /* e.g. "stdio.h" or "<stdint.h>"         */
+    int  line;            /* source line (1-based)                   */
+} Include;
+
+typedef struct {
+    char name[M_NAME];    /* e.g. "MAX_SIZE"                        */
+    int  line;            /* source line (1-based)                   */
+} Macro;
+
+typedef struct {
+    char name[M_NAME];    /* e.g. "Foo" for struct Foo               */
+    char kind_tag[16];    /* "struct", "union", "enum", "typedef"    */
+    int  line;            /* source line (1-based)                   */
+    int  nfields;         /* number of fields/enumerators            */
+} Record;
+
+typedef struct {
+    char name[M_NAME];    /* function name                           */
+    char ret[M_TYPE];     /* return type                             */
+    int  line;            /* source line (1-based)                   */
+} Proto;
 
 /* ---- the whole analyzed model ---- */
 typedef struct {
     Func     funcs[M_MAXFUNCS];     int nfuncs;
     Global   globals[M_MAXGLOBALS]; int nglobals;
+    Include  includes[M_MAXINCLUDES]; int nincludes;
+    Macro    macros[M_MAXMACROS];     int nmacros;
+    Record   records[M_MAXRECORDS];   int nrecords;
+    Proto    protos[M_MAXPROTOS];     int nprotos;
 
     int      focus;                 /* index into funcs[], or -1 */
 

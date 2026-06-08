@@ -189,6 +189,9 @@ QEMU_CMD+=(-smp "$CPUS")
 # PS/2 keyboard & mouse
 QEMU_CMD+=(-device isa-ps2)
 
+# Intel HD Audio (HDA) — required for SYS_BEEP / audio playback
+QEMU_CMD+=(-device intel-hda -device hda-duplex)
+
 # Serial output: tee to both stdio and file
 QEMU_CMD+=(-serial "file:$SERIAL_LOG")
 QEMU_CMD+=(-serial mon:stdio)

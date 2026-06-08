@@ -4,6 +4,10 @@
  * folder/file glyphs, selection highlight and vertical scrolling. Click maps
  * a panel-relative y back to a row index, selects it, and opens files.
  *
+ * VS-Code-style file tree: expand/collapse arrows, file-type prefixes,
+ * current-file highlight, 2-char-per-level indentation, mouse-wheel scroll,
+ * and auto-expand-to-current-file on open.
+ *
  * Freestanding: no libc, no malloc, no stdio. All helpers are file-static and
  * prefixed expl_. Drawing stays inside the supplied Rect r.
  */
@@ -13,11 +17,15 @@
 /* Header bar height: the title row + a hairline divider underneath it. */
 #define EXPL_HEADER_H  (ROW_H + 2)
 
-/* Pixels reserved before a row's text for the leading glyph (folder/file). */
-#define EXPL_GLYPH_W   (GFX_FW + 4)
+/* Pixels reserved for the expand/collapse arrow on directory rows. */
+#define EXPL_ARROW_W   (GFX_FW)
 
-/* Pixels per tree depth level (one indent "stop"). */
-#define EXPL_LEVEL_W   (GFX_FW + 4)
+/* Pixels reserved for the file-type tag (e.g. "[C]"). */
+#define EXPL_TAG_W     (3 * GFX_FW + 2)
+
+/* Pixels per tree depth level: 2 characters of indent per nesting level,
+ * matching the VS-Code convention of compact tree indentation. */
+#define EXPL_LEVEL_W   (2 * GFX_FW)
 
 /* Indent in pixels for one tree depth level. */
 static inline int expl_indent(int depth) {
@@ -29,6 +37,11 @@ static int expl_strlen(const char* s) {
     int n = 0;
     while (s[n]) n++;
     return n;
+}
+
+/* Case-insensitive character compare (ASCII only). */
+static inline int expl_tolower(char c) {
+    return (c >= 'A' && c <= 'Z') ? c + 32 : c;
 }
 
 /* Last path component of `path` into `out` (cap chars incl. NUL). Strips a
@@ -44,15 +57,124 @@ static void expl_basename(const char* path, char* out, int cap) {
     out[j] = 0;
 }
 
-/* Pick a name's accent colour: .c cyan-ish, .h dim, everything else primary. */
-static uint32_t expl_file_color(const char* name, int selected) {
+/* ---------------------------------------------------------------------------
+ * File-type classification: returns a short tag string and accent colour.
+ * Tags are terse ASCII that render in the bitmap font (no Unicode needed).
+ * -------------------------------------------------------------------------*/
+typedef enum {
+    FTYPE_DIR,       /* directory            */
+    FTYPE_C,         /* .c source            */
+    FTYPE_H,         /* .h header            */
+    FTYPE_MAKE,      /* Makefile / makefile   */
+    FTYPE_TXT,       /* .txt text            */
+    FTYPE_ELF,       /* .elf binary          */
+    FTYPE_ASM,       /* .asm / .s assembly   */
+    FTYPE_UNKNOWN    /* anything else        */
+} FileType;
+
+static FileType expl_classify(const char* name, int is_dir) {
+    if (is_dir) return FTYPE_DIR;
     int len = expl_strlen(name);
+
+    /* Check for Makefile (case insensitive first char) */
+    if (len >= 8) {
+        int is_makefile = 1;
+        const char* mf = "makefile";
+        for (int i = 0; i < 8; i++) {
+            if (expl_tolower(name[i]) != mf[i]) { is_makefile = 0; break; }
+        }
+        if (is_makefile && (len == 8 || name[8] == '.')) return FTYPE_MAKE;
+    }
+    /* Extension-based classification */
     if (len >= 2 && name[len - 2] == '.') {
         char c = name[len - 1];
-        if (c == 'c' || c == 'C') return TH_CYAN;
-        if (c == 'h' || c == 'H') return selected ? TH_TEXT : TH_TEXT_DIM;
+        if (c == 'c' || c == 'C') return FTYPE_C;
+        if (c == 'h' || c == 'H') return FTYPE_H;
+        if (c == 's' || c == 'S') return FTYPE_ASM;
+        if (c == 'o')             return FTYPE_ELF;
     }
-    return selected ? TH_TEXT : TH_TEXT_DIM;
+    if (len >= 4 && name[len - 4] == '.') {
+        char e1 = expl_tolower(name[len - 3]);
+        char e2 = expl_tolower(name[len - 2]);
+        char e3 = expl_tolower(name[len - 1]);
+        if (e1 == 'e' && e2 == 'l' && e3 == 'f') return FTYPE_ELF;
+        if (e1 == 't' && e2 == 'x' && e3 == 't') return FTYPE_TXT;
+        if (e1 == 'a' && e2 == 's' && e3 == 'm') return FTYPE_ASM;
+    }
+    return FTYPE_UNKNOWN;
+}
+
+/* Tag string for a file type. */
+static const char* expl_tag(FileType ft) {
+    switch (ft) {
+        case FTYPE_C:       return "[C]";
+        case FTYPE_H:       return "[H]";
+        case FTYPE_MAKE:    return "[M]";
+        case FTYPE_TXT:     return "[T]";
+        case FTYPE_ELF:     return "[E]";
+        case FTYPE_ASM:     return "[S]";
+        case FTYPE_UNKNOWN: return "[?]";
+        default:            return "";
+    }
+}
+
+/* Accent colour for a file type (name text). */
+static uint32_t expl_file_color(FileType ft, int selected, int is_open) {
+    if (is_open) return TH_TEXT;      /* always bright for the active file */
+    switch (ft) {
+        case FTYPE_C:    return TH_CYAN;
+        case FTYPE_H:    return selected ? TH_TEXT : TH_TEXT_DIM;
+        case FTYPE_MAKE: return TH_YELLOW;
+        case FTYPE_ASM:  return TH_PURPLE;
+        case FTYPE_ELF:  return TH_GREEN;
+        case FTYPE_TXT:  return selected ? TH_TEXT : TH_TEXT_DIM;
+        default:         return selected ? TH_TEXT : TH_TEXT_DIM;
+    }
+}
+
+/* Tag colour (the "[C]" prefix). Slightly dimmer than the name colour. */
+static uint32_t expl_tag_color(FileType ft) {
+    switch (ft) {
+        case FTYPE_C:    return TH_CYAN;
+        case FTYPE_H:    return TH_BLUE;
+        case FTYPE_MAKE: return TH_YELLOW;
+        case FTYPE_ASM:  return TH_PURPLE;
+        case FTYPE_ELF:  return TH_GREEN;
+        case FTYPE_TXT:  return TH_TEXT_DIM;
+        default:         return TH_TEXT_FAINT;
+    }
+}
+
+/* Current-file highlight: a subtle accent background, distinct from the
+ * selection highlight (TH_SELECT) and hover (TH_HOVER). This uses a dark
+ * tinted blue so the open file is always visually identifiable even when
+ * the selection cursor is elsewhere. */
+#define TH_OPEN_FILE   0xFF162440u
+
+/* Draw a tiny expand/collapse arrow (triangle) for directory rows.
+ * Collapsed = right-pointing triangle (>); expanded = downward (v). */
+static void expl_draw_arrow(Canvas* cv, int ax, int ay, int collapsed,
+                            uint32_t col) {
+    int cx = ax + GFX_FW / 2;
+    int cy = ay + GFX_FH / 2;
+    int sz = GFX_FW / 3;
+    if (sz < 2) sz = 2;
+
+    if (collapsed) {
+        /* Right-pointing triangle: three horizontal lines narrowing */
+        for (int dy = -sz; dy <= sz; dy++) {
+            int w = sz - (dy < 0 ? -dy : dy);
+            if (w < 0) w = 0;
+            gfx_hline(cv, cx - 1, cy + dy, w + 1, col);
+        }
+    } else {
+        /* Down-pointing triangle: three vertical lines narrowing */
+        for (int dx = -sz; dx <= sz; dx++) {
+            int h = sz - (dx < 0 ? -dx : dx);
+            if (h < 0) h = 0;
+            gfx_vline(cv, cx + dx, cy - 1, h + 1, col);
+        }
+    }
 }
 
 /* Draw a tiny folder glyph (8x10-ish) inside the GFX_FW cell at (gx,gy). */
@@ -127,14 +249,16 @@ void panel_explorer(Ide* a, Canvas* cv, Rect r) {
 
     int scroll = a->explorer_scroll;
     if (scroll < 0) scroll = 0;
-    int max_scroll = a->nentries - 1;
+    /* Better scroll clamping: ensure at least one row shows when possible. */
+    int vis = expl_visible_rows(body);
+    int max_scroll = a->nentries - vis;
     if (max_scroll < 0) max_scroll = 0;
     if (scroll > max_scroll) scroll = max_scroll;
+    a->explorer_scroll = scroll;   /* write back clamped value */
 
     /* Reserve a sliver on the right for the scrollbar when content overflows. */
-    int vis = expl_visible_rows(body);
     int overflow = (a->nentries > vis);
-    int sb_w = overflow ? 3 : 0;
+    int sb_w = overflow ? 4 : 0;   /* slightly wider for easier grab */
 
     int clip_x = body.x + PAD;
     int clip_w = body.w - 2 * PAD - sb_w;
@@ -158,46 +282,84 @@ void panel_explorer(Ide* a, Canvas* cv, Rect r) {
         if (row_h <= 0) break;
 
         int selected = (idx == a->sel_entry);
+        int is_open  = !e->is_dir && ide_streq(e->path, a->cur_file);
+        int is_dirty = is_open && ide_editor_dirty(a);
+        FileType ft  = expl_classify(e->name, e->is_dir);
+
+        /* Row background: layered priority:
+         *   1. selected row (keyboard/click selection)
+         *   2. currently open file (persistent highlight)
+         *   3. hovered row (mouse hover) */
         if (selected)
             gfx_fill(cv, body.x, ry, body.w - sb_w, row_h, TH_SELECT);
+        else if (is_open)
+            gfx_fill(cv, body.x, ry, body.w - sb_w, row_h, TH_OPEN_FILE);
         else if (row == hover_row)
             gfx_fill(cv, body.x, ry, body.w - sb_w, row_h, TH_HOVER);
 
-        /* Faint vertical guide line at each ancestor indent stop, for a tree
-         * feel. Skip depth 0 (no guide needed at the root column). */
+        /* Faint vertical guide lines at each ancestor indent stop, giving the
+         * tree structure a visual spine. Skip depth 0 (root needs no guide). */
         for (int d = 1; d <= e->depth; d++) {
             int gx = body.x + PAD + (d - 1) * EXPL_LEVEL_W + EXPL_LEVEL_W / 2;
             if (gx < clip_x + clip_w)
                 gfx_vline(cv, gx, ry, row_h, TH_BORDER);
         }
 
+        /* Layout:  [indent] [arrow(dir only)] [glyph] [tag] [name]
+         *   - indent: depth * 2 chars
+         *   - arrow:  1 char width (dirs only, expand/collapse indicator)
+         *   - glyph:  1 char width (folder or file icon)
+         *   - tag:    3 chars (e.g. "[C]") + 1 char gap  (files only)
+         *   - name:   the entry basename
+         */
         int tx = body.x + PAD + expl_indent(e->depth);
         int ty = ry + (ROW_H - GFX_FH) / 2;
-        int nx = tx + EXPL_GLYPH_W;             /* text starts after glyph  */
 
         if (e->is_dir) {
-            /* Folder glyph: yellow when expanded, dim when collapsed. */
-            uint32_t fcol = e->collapsed ? TH_TEXT_DIM : TH_YELLOW;
-            if (tx + GFX_FW <= clip_x + clip_w)
-                expl_draw_folder(cv, tx, ry + (ROW_H - GFX_FH) / 2, fcol);
-            gfx_text_clip(cv, nx, ty, e->name, TH_TEXT, clip_x, clip_w);
-        } else {
-            /* File glyph + suffix-aware name colour. */
-            uint32_t col = expl_file_color(e->name, selected);
-            if (tx + GFX_FW <= clip_x + clip_w)
-                expl_draw_file(cv, tx, ry + (ROW_H - GFX_FH) / 2, TH_TEXT_FAINT);
+            /* --- Directory row --- */
+            /* Expand/collapse arrow */
+            int arrow_x = tx;
+            uint32_t arrow_col = e->collapsed ? TH_TEXT_FAINT : TH_TEXT_DIM;
+            if (arrow_x + EXPL_ARROW_W <= clip_x + clip_w)
+                expl_draw_arrow(cv, arrow_x, ty, e->collapsed, arrow_col);
 
-            /* Check if this is the currently open file and it's dirty */
-            int is_open = ide_streq(e->path, a->cur_file);
-            int is_dirty = is_open && ide_editor_dirty(a);
+            /* Folder glyph: yellow when expanded, dim when collapsed. */
+            int glyph_x = arrow_x + EXPL_ARROW_W;
+            uint32_t fcol = e->collapsed ? TH_TEXT_DIM : TH_YELLOW;
+            if (glyph_x + GFX_FW <= clip_x + clip_w)
+                expl_draw_folder(cv, glyph_x, ty, fcol);
+
+            /* Directory name */
+            int name_x = glyph_x + GFX_FW + 2;
+            gfx_text_clip(cv, name_x, ty, e->name, TH_TEXT, clip_x, clip_w);
+        } else {
+            /* --- File row --- */
+            /* File glyph */
+            int glyph_x = tx;
+            if (glyph_x + GFX_FW <= clip_x + clip_w)
+                expl_draw_file(cv, glyph_x, ty, expl_tag_color(ft));
+
+            /* File type tag */
+            int tag_x = glyph_x + GFX_FW + 2;
+            const char* tag = expl_tag(ft);
+            if (tag[0])
+                gfx_text_clip(cv, tag_x, ty, tag, expl_tag_color(ft), clip_x, clip_w);
+
+            /* File name, offset past the tag */
+            int name_x = tag_x + (tag[0] ? EXPL_TAG_W : 0);
+            uint32_t ncol = expl_file_color(ft, selected, is_open);
 
             /* Show asterisk for dirty files */
             if (is_dirty) {
-                /* Draw orange asterisk before filename */
-                gfx_text_clip(cv, nx, ty, "*", TH_ORANGE, clip_x, clip_w);
-                gfx_text_clip(cv, nx + GFX_FW, ty, e->name, col, clip_x, clip_w);
+                gfx_text_clip(cv, name_x, ty, "*", TH_ORANGE, clip_x, clip_w);
+                gfx_text_clip(cv, name_x + GFX_FW, ty, e->name, ncol, clip_x, clip_w);
             } else {
-                gfx_text_clip(cv, nx, ty, e->name, col, clip_x, clip_w);
+                gfx_text_clip(cv, name_x, ty, e->name, ncol, clip_x, clip_w);
+            }
+
+            /* Open-file indicator: a small bright bar on the left edge. */
+            if (is_open) {
+                gfx_fill(cv, body.x, ry, 2, row_h, TH_CYAN);
             }
         }
     }
@@ -208,7 +370,7 @@ void panel_explorer(Ide* a, Canvas* cv, Rect r) {
         gfx_fill(cv, track_x, body.y, sb_w, body.h, TH_PANEL2);
 
         int thumb_h = body.h * vis / a->nentries;
-        if (thumb_h < 12) thumb_h = 12;
+        if (thumb_h < 16) thumb_h = 16;
         if (thumb_h > body.h) thumb_h = body.h;
 
         int range = body.h - thumb_h;
@@ -216,7 +378,8 @@ void panel_explorer(Ide* a, Canvas* cv, Rect r) {
         if (max_scroll > 0)
             thumb_y += range * scroll / max_scroll;
 
-        gfx_fill(cv, track_x, thumb_y, sb_w, thumb_h, TH_BORDER_LT);
+        /* Rounded scrollbar thumb (VS Code style). */
+        gfx_round(cv, track_x, thumb_y, sb_w, thumb_h, 2, TH_BORDER_LT);
     }
 }
 

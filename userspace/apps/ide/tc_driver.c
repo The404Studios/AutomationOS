@@ -190,7 +190,14 @@ int tc_build(const char* path, TcResult* res)
     srclen = ide_read_file(path, g_src, TC_ASM_CAP);
     if (srclen < 0) {
         res->ok = 0;
-        set_msg(res, "cannot read file");
+        /* Build a message that includes the filename so the user knows what failed. */
+        {
+            int mi = 0;
+            sk_copy(res->message, "cannot read '", (int)sizeof(res->message));
+            mi = 13;  /* length of "cannot read '" */
+            mi += sk_copy(res->message + mi, path, (int)sizeof(res->message) - mi);
+            sk_copy(res->message + mi, "' -- check file exists", (int)sizeof(res->message) - mi);
+        }
         return 0;
     }
     if (srclen > TC_ASM_CAP - 1)      /* clamp; keep room for NUL */
@@ -214,7 +221,10 @@ int tc_build(const char* path, TcResult* res)
         }
         if (!cc_compile(tu, g_asm, TC_ASM_CAP, res->diags, &res->ndiags)) {
             res->ok = 0;
-            set_msg(res, "C compile failed");
+            if (res->ndiags > 0)
+                set_msg(res, "C compile failed -- see diagnostics below");
+            else
+                set_msg(res, "C compile failed (codegen error)");
             copy_preview(res, g_asm);
             return 0;
         }
@@ -241,7 +251,10 @@ int tc_build(const char* path, TcResult* res)
                      &res->code_len, res->diags, &res->ndiags)
         || res->code_len <= 0) {
         res->ok = 0;
-        set_msg(res, "assembly failed");
+        if (res->ndiags > 0)
+            set_msg(res, "assembly failed -- see diagnostics below");
+        else
+            set_msg(res, "assembly failed (no instructions produced)");
         copy_preview(res, g_asm);
         return 0;
     }
@@ -255,77 +268,65 @@ int tc_build(const char* path, TcResult* res)
     }
     res->elf_len = elen;
 
-    /* 6. Output goes into a dedicated "build/" folder NEXT TO the source file
-     *    (e.g. /usr/src/towerdefense/build/tower.elf) so the project explorer --
-     *    which is rooted at the project tree -- can enumerate and reveal it. The
-     *    artifact keeps a ".elf" suffix so it is obvious in the tree (and is
-     *    still directly SYS_SPAWN-able). Falls back to /tmp/build so a build
-     *    never silently fails even if the source dir is read-only. */
+    /* 6. The PRIMARY deliverable is a runnable ELF on the DESKTOP, named after
+     *    the PROGRAM (e.g. /Desktop/hello.elf), so it shows up as a clickable
+     *    icon and is directly SYS_SPAWN-able. The compositor enumerates /Desktop
+     *    and SYS_SPAWNs a file icon on double-click.
+     *
+     *    (Previously the primary output went to "<srcdir>/build/<base>.elf" and
+     *    the desktop copy was named after the source *directory*. For the default
+     *    scratch project rooted at /usr/src/native that produced
+     *    /Desktop/native.elf and made every build look like it "went into native"
+     *    instead of onto the desktop. The desktop path named after the program is
+     *    the one the user expects.) Falls back to /tmp so a build never silently
+     *    fails even if /Desktop is read-only. A best-effort copy is still dropped
+     *    into "<srcdir>/build/" so the project explorer can reveal it in-tree. */
     basename_noext(path, base, (int)sizeof(base));
 
     /* preview is independent of where we write. */
     copy_preview(res, g_asm);
 
-    /* Build "<srcdir>/build" into res->out_dir (srcdir empty -> "build"). */
+    /* out_dir = "/Desktop", out_path = "/Desktop/<base>.elf" */
+    ide_sc(67 /* SYS_MKDIR */, (long)"/Desktop", 0755, 0, 0, 0, 0);
+    sk_copy(res->out_dir, "/Desktop", (int)sizeof(res->out_dir));
     {
-        char dir[160];
-        dirname_of(path, dir, (int)sizeof(dir));
-        int n = 0;
-        if (dir[0]) {
-            n  = sk_copy(res->out_dir, dir, (int)sizeof(res->out_dir));
-            n += sk_copy(res->out_dir + n, "/build", (int)sizeof(res->out_dir) - n);
-        } else {
-            n = sk_copy(res->out_dir, "build", (int)sizeof(res->out_dir));
-        }
-    }
-
-    /* mkdir the build folder (recursive; ignore "already exists"/errors). */
-    ide_sc(67 /* SYS_MKDIR */, (long)res->out_dir, 0755, 0, 0, 0, 0);
-
-    /* out_path = "<out_dir>/<base>.elf" */
-    {
-        int n = sk_copy(res->out_path, res->out_dir, (int)sizeof(res->out_path));
-        n += sk_copy(res->out_path + n, "/", (int)sizeof(res->out_path) - n);
+        int n = sk_copy(res->out_path, "/Desktop/", (int)sizeof(res->out_path));
         n += sk_copy(res->out_path + n, base, (int)sizeof(res->out_path) - n);
         sk_copy(res->out_path + n, ".elf", (int)sizeof(res->out_path) - n);
     }
 
-    /* 7. write the ELF, with a /tmp/build fallback. */
+    /* 7. write the ELF to the desktop, with a /tmp fallback. */
     if (ide_write_file(res->out_path, (char*)g_elf, elen) < 0) {
-        /* Source dir not writable -> fall back to /tmp/build/<base>.elf. */
-        ide_sc(67 /* SYS_MKDIR */, (long)"/tmp/build", 0755, 0, 0, 0, 0);
-        sk_copy(res->out_dir, "/tmp/build", (int)sizeof(res->out_dir));
-        int n = sk_copy(res->out_path, "/tmp/build/", (int)sizeof(res->out_path));
+        /* /Desktop not writable -> fall back to /tmp/<base>.elf. */
+        ide_sc(67 /* SYS_MKDIR */, (long)"/tmp", 0755, 0, 0, 0, 0);
+        sk_copy(res->out_dir, "/tmp", (int)sizeof(res->out_dir));
+        int n = sk_copy(res->out_path, "/tmp/", (int)sizeof(res->out_path));
         n += sk_copy(res->out_path + n, base, (int)sizeof(res->out_path) - n);
         sk_copy(res->out_path + n, ".elf", (int)sizeof(res->out_path) - n);
         if (ide_write_file(res->out_path, (char*)g_elf, elen) < 0) {
             res->ok = 0;
-            set_msg(res, "elf write failed (build/ and /tmp/build)");
+            set_msg(res, "elf write failed (/Desktop and /tmp)");
             return 0;
         }
     }
 
-    /* 7b. Also drop a runnable copy on the DESKTOP so the built program appears as a
-     * clickable icon: the compositor enumerates /Desktop and SYS_SPAWNs a file icon
-     * on double-click ("the IDE compiles programs to /Desktop"). Named after the
-     * PROJECT (basename of the source's directory) so a multi-file project yields one
-     * obvious artifact, e.g. /usr/src/towerdefense/tower.c -> /Desktop/towerdefense.elf.
-     * Best-effort: a failure here never fails the build. */
+    /* 7b. Best-effort: also drop a copy into "<srcdir>/build/<base>.elf" so the
+     * project explorer (rooted at the project tree) can enumerate and reveal it.
+     * A failure here NEVER fails the build -- the desktop artifact above is the
+     * real deliverable. */
     {
-        char dir[160], proj[80];
+        char dir[160];
         dirname_of(path, dir, (int)sizeof(dir));
-        const char* b = dir;                        /* basename of the project dir */
-        for (int i = 0; dir[i]; i++)
-            if (dir[i] == '/' || dir[i] == '\\') b = &dir[i + 1];
-        sk_copy(proj, b, (int)sizeof(proj));
-        if (proj[0] == '\0') sk_copy(proj, base, (int)sizeof(proj));  /* lone file */
-
-        ide_sc(67 /* SYS_MKDIR */, (long)"/Desktop", 0755, 0, 0, 0, 0);
-        char dpath[160];
-        int dn = sk_copy(dpath, "/Desktop/", (int)sizeof(dpath));
-        dn += sk_copy(dpath + dn, proj, (int)sizeof(dpath) - dn);
-        sk_copy(dpath + dn, ".elf", (int)sizeof(dpath) - dn);
-        ide_write_file(dpath, (char*)g_elf, elen);   /* best-effort; ignore failure */
+        if (dir[0]) {
+            char bpath[200];
+            int n  = sk_copy(bpath, dir, (int)sizeof(bpath));
+            n += sk_copy(bpath + n, "/build", (int)sizeof(bpath) - n);
+            ide_sc(67 /* SYS_MKDIR */, (long)bpath, 0755, 0, 0, 0, 0);
+            n += sk_copy(bpath + n, "/", (int)sizeof(bpath) - n);
+            n += sk_copy(bpath + n, base, (int)sizeof(bpath) - n);
+            sk_copy(bpath + n, ".elf", (int)sizeof(bpath) - n);
+            ide_write_file(bpath, (char*)g_elf, elen);   /* best-effort; ignore failure */
+        }
     }
 
     res->ok = 1;

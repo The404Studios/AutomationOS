@@ -72,7 +72,7 @@ int audit_buffer_write(audit_buffer_t* buffer, audit_event_t* event) {
         // Overwrite oldest entry (circular buffer behavior)
         buffer->tail = (buffer->tail + 1) % AUDIT_BUFFER_SIZE;
         buffer->dropped++;
-        audit_stats.events_dropped++;
+        __atomic_add_fetch(&audit_stats.events_dropped, 1, __ATOMIC_RELAXED);
     } else {
         buffer->count++;
     }
@@ -133,7 +133,12 @@ uint32_t audit_buffer_count(audit_buffer_t* buffer) {
 
 bool audit_buffer_is_full(audit_buffer_t* buffer) {
     if (!buffer) return true;
-    return buffer->count >= AUDIT_BUFFER_SIZE;
+
+    spin_lock(&buffer->lock);
+    bool full = buffer->count >= AUDIT_BUFFER_SIZE;
+    spin_unlock(&buffer->lock);
+
+    return full;
 }
 
 // Batch read for userspace tools (reads multiple events at once)

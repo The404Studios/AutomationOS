@@ -262,11 +262,11 @@ int procapi_sysinfo(sysinfo_t* out)
         n = 0;
     }
 
-    out->total_mem  = pmm_get_total_memory();
-    out->free_mem   = pmm_get_free_memory();
-    out->uptime_ms  = timer_get_ticks_ms();
-    out->proc_count = (uint32_t)n;
-    out->_pad       = 0;
+    out->total_mem    = pmm_get_total_memory();
+    out->free_mem     = pmm_get_free_memory();
+    out->uptime_ms    = timer_get_ticks_ms();
+    out->proc_count   = (uint32_t)n;
+    out->heap_used_kb = (uint32_t)(heap_get_used_bytes() / 1024);
 
     return 0;
 }

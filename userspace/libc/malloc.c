@@ -202,6 +202,11 @@ static inline unsigned _tcache_bin(unsigned long size) {
     return (unsigned)((aligned / TCACHE_MIN_SIZE) - 1);
 }
 
+// Forward declarations: payload<->header conversions are defined below but used
+// here by the tcache double-free-detection path (_tcache_get reads hdr->free).
+static inline void* _blk_payload(blk_hdr_t *h);
+static inline blk_hdr_t* _payload_blk(void *p);
+
 // Get a chunk from the tcache (if available). Returns NULL if bin is empty.
 static void* _tcache_get(unsigned long size) {
     unsigned bin = _tcache_bin(size);
@@ -211,7 +216,11 @@ static void* _tcache_get(unsigned long size) {
     if (b->count == 0) return (void*)0;
 
     b->count--;
-    return b->entries[b->count];  // pop from stack
+    void* ptr = b->entries[b->count];  // pop from stack
+    // Mark block as in-use (free set it to 1 for double-free detection)
+    blk_hdr_t* hdr = _payload_blk(ptr);
+    hdr->free = 0;
+    return ptr;
 }
 
 // Put a chunk into the tcache (if not full). Returns 0 on success, -1 if full.
@@ -405,7 +414,10 @@ void free(void* ptr) {
     if (!ptr || !_heap_ready) return;
 
     blk_hdr_t *h = _payload_blk(ptr);
-    if (h->magic != BLOCK_MAGIC) return;  // corrupt / double-free guard
+    if (h->magic != BLOCK_MAGIC) return;  // corrupt pointer guard
+    if (h->free) return;                  // double-free detection
+
+    h->free = 1;  // mark freed BEFORE caching or returning to arena
 
     // ────────────────────────────────────────────────────────────────────────
     // FAST PATH: try to cache in tcache (no syscall!)

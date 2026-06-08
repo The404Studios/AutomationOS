@@ -154,19 +154,25 @@ for LLM_PATH in "${LLM_PATHS[@]}"; do
     fi
 done
 
-# Copy model file if available (Qwen GGUF)
-MODEL_PATHS=(
-    "$KERNEL_ROOT/models/qwen.gguf"
-    "$KERNEL_ROOT/models/qwen2.5-0.5b-q4_0.gguf"
-)
+# Copy model file if available (Qwen GGUF).
+# GATED: model files are large (300+ MB) and dramatically inflate the initrd.
+# Set INITRD_INCLUDE_MODEL=1 to include them; omitted by default for fast boot.
+if [ "${INITRD_INCLUDE_MODEL:-0}" = "1" ]; then
+    MODEL_PATHS=(
+        "$KERNEL_ROOT/models/qwen.gguf"
+        "$KERNEL_ROOT/models/qwen2.5-0.5b-q4_0.gguf"
+    )
 
-for MODEL_PATH in "${MODEL_PATHS[@]}"; do
-    if [ -f "$MODEL_PATH" ]; then
-        cp "$MODEL_PATH" "$INITRD_ROOT/models/qwen.gguf"
-        echo "  [OK] Copied model: $MODEL_PATH ($(stat -c%s "$MODEL_PATH" 2>/dev/null || stat -f%z "$MODEL_PATH" 2>/dev/null || echo "?") bytes)"
-        break
-    fi
-done
+    for MODEL_PATH in "${MODEL_PATHS[@]}"; do
+        if [ -f "$MODEL_PATH" ]; then
+            cp "$MODEL_PATH" "$INITRD_ROOT/models/qwen.gguf"
+            echo "  [OK] Copied model: $MODEL_PATH ($(stat -c%s "$MODEL_PATH" 2>/dev/null || stat -f%z "$MODEL_PATH" 2>/dev/null || echo "?") bytes)"
+            break
+        fi
+    done
+else
+    echo "  [--] Model file skipped (set INITRD_INCLUDE_MODEL=1 to include)"
+fi
 
 # Copy terminal (to bin/terminal)
 TERMINAL_PATHS=(
@@ -210,20 +216,26 @@ for FILES_PATH in "${FILES_APP_PATHS[@]}"; do
     fi
 done
 
-# Copy batch syscall benchmark (to bin/bench_batch)
-BENCH_BATCH_PATHS=(
-    "$USERSPACE_DIR/tests/bench_batch"
-    "$BUILD_DIR/userspace/tests/bench_batch"
-)
+# Copy batch syscall benchmark (to bin/bench_batch).
+# GATED: test/benchmark binaries are not needed for production boot.
+# Set INITRD_INCLUDE_BENCH=1 to include them.
+if [ "${INITRD_INCLUDE_BENCH:-0}" = "1" ]; then
+    BENCH_BATCH_PATHS=(
+        "$USERSPACE_DIR/tests/bench_batch"
+        "$BUILD_DIR/userspace/tests/bench_batch"
+    )
 
-for BENCH_PATH in "${BENCH_BATCH_PATHS[@]}"; do
-    if [ -f "$BENCH_PATH" ]; then
-        cp "$BENCH_PATH" "$INITRD_ROOT/bin/bench_batch"
-        chmod +x "$INITRD_ROOT/bin/bench_batch"
-        echo "  [OK] Copied batch benchmark: $BENCH_PATH"
-        break
-    fi
-done
+    for BENCH_PATH in "${BENCH_BATCH_PATHS[@]}"; do
+        if [ -f "$BENCH_PATH" ]; then
+            cp "$BENCH_PATH" "$INITRD_ROOT/bin/bench_batch"
+            chmod +x "$INITRD_ROOT/bin/bench_batch"
+            echo "  [OK] Copied batch benchmark: $BENCH_PATH"
+            break
+        fi
+    done
+else
+    echo "  [--] Benchmark binary skipped (set INITRD_INCLUDE_BENCH=1 to include)"
+fi
 
 echo ""
 echo "[3/6] Copying libraries..."

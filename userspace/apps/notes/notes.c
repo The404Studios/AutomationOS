@@ -196,6 +196,7 @@ static void draw_border(u32 *pixels, u32 stride_px, u32 bw, u32 bh,
 #define KEY_TAB         15
 #define KEY_ENTER       28
 #define KEY_LEFTCTRL    29
+#define KEY_S           31
 #define KEY_LEFTSHIFT   42
 #define KEY_RIGHTSHIFT  54
 #define KEY_SPACE       57
@@ -899,6 +900,12 @@ static void handle_key(int keycode, int pressed)
     }
 
     if (!pressed) return;
+
+    /* Ctrl chords. */
+    if (g_ctrl) {
+        if (keycode == KEY_S) { save_note(); return; }
+        /* Other Ctrl combos fall through to normal handling. */
+    }
 
     switch (keycode) {
     case KEY_ENTER:

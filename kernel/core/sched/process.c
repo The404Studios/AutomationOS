@@ -287,6 +287,9 @@ process_t* process_create(const char* name, void* entry_point) {
 
     uint64_t kstack_top = (uint64_t)proc->kernel_stack + KERNEL_STACK_SIZE;
 
+    // Plant a canary at the BOTTOM of the kernel stack to detect overflow.
+    STACK_CANARY_PLANT(proc);
+
     // Setup initial CPU context
     memset(&proc->context, 0, sizeof(cpu_context_t));
     proc->context.rip = (uint64_t)entry_point;  // Instruction pointer
@@ -447,6 +450,9 @@ process_t* thread_create(process_t* parent, uint64_t entry, uint64_t arg,
         free_pid(pid);
         return NULL;
     }
+
+    // Plant a canary at the BOTTOM of the kernel stack to detect overflow.
+    STACK_CANARY_PLANT(t);
 
     // SHARE the parent's address space: same CR3, same as_refcount, +1 owner.
     // This is the crux of "a thread shares its parent's address space" and of the
@@ -713,6 +719,15 @@ void process_unref(process_t* proc) {
         extern void vfs_close_all_fds(struct process* proc);
         vfs_close_all_fds(proc);
 
+        // Close any sockets the process had open (owner_pid match). Without
+        // this, a process that exits without explicit sock_close() leaks its
+        // socket descriptors forever (and, for TCP, leaves half-open
+        // connections). sock_cleanup_process iterates the socket table and
+        // calls sock_close on each matching slot. Safe here: the process is
+        // already off the scheduler and unreachable.
+        extern void sock_cleanup_process(uint32_t pid);
+        sock_cleanup_process(proc->pid);
+
         // Free the lazily-allocated waitpid wait queue, if any.
         if (proc->child_wait) {
             kfree(proc->child_wait);
@@ -841,9 +856,39 @@ process_t* process_get_by_pid(uint32_t pid) {
     // IMPORTANT: Callers MUST call process_unref() when done with the returned process!
 }
 
-process_t* process_get_current(void) {
-    return current_process;
+// Find the first live process whose name contains `needle` (substring match).
+// Returns a ref'd process_t* (caller MUST process_unref) or NULL if not found.
+// IRQ-safe: uses spin_lock_irqsave on process_table_lock, same as process_get_by_pid.
+// Skips TERMINATED processes so a zombie compositor is not returned.
+process_t* process_get_by_name(const char* needle) {
+    if (!needle || !needle[0]) return NULL;
+
+    uint64_t flags;
+    spin_lock_irqsave(&process_table_lock, &flags);
+    for (uint32_t i = 1; i < MAX_PROCESSES; i++) {
+        process_t* p = process_table[i];
+        if (!p || p->state == PROCESS_TERMINATED) continue;
+        // Substring match: the compositor's name is "sbin/compositor",
+        // so searching for "compositor" will find it.
+        const char* hay = p->name;
+        const char* n = needle;
+        for (const char* h = hay; *h; h++) {
+            const char* hh = h;
+            const char* nn = n;
+            while (*nn && *hh && *hh == *nn) { hh++; nn++; }
+            if (!*nn) {
+                // Found — take a ref and return.
+                process_ref(p);
+                spin_unlock_irqrestore(&process_table_lock, flags);
+                return p;
+            }
+        }
+    }
+    spin_unlock_irqrestore(&process_table_lock, flags);
+    return NULL;
 }
+
+// process_get_current() is now static inline in sched.h (hot-path optimisation).
 
 // ===========================================================================
 // process_set_ready — validated CREATED/BLOCKED -> READY transition
@@ -950,4 +995,21 @@ int process_list(proc_info_t* out, int max) {
     }
     spin_unlock_irqrestore(&process_table_lock, flags);
     return n;
+}
+
+// Count the number of live processes owned by a given UID. Used by sys_fork
+// for fork-bomb protection (per-UID process count limit). O(MAX_PROCESSES)
+// under the table lock -- acceptable at fork time (not a hot path).
+int process_count_by_uid(uint32_t uid) {
+    int count = 0;
+    uint64_t flags;
+    spin_lock_irqsave(&process_table_lock, &flags);
+    for (int i = 0; i < MAX_PROCESSES; i++) {
+        process_t* p = process_table[i];
+        if (p && p->uid == uid) {
+            count++;
+        }
+    }
+    spin_unlock_irqrestore(&process_table_lock, flags);
+    return count;
 }

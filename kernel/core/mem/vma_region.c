@@ -73,6 +73,11 @@ int handle_page_fault(uint64_t fault_addr, uint64_t err_code) {
     if (!v) {
         return 0;   // no mapping covers this address -> genuine segfault
     }
+    // Guard pages are NEVER faulted in -- they exist solely to detect stack
+    // overflow (or other boundary violations). Any access is a fatal fault.
+    if (v->flags & VMA_FLAG_GUARD) {
+        return 0;   // guard page hit -> kill the process
+    }
     if (is_write && !(v->perm & VMA_W)) {
         return 0;   // write to a read-only region -> protection violation
     }

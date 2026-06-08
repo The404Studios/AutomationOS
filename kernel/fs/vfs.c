@@ -377,6 +377,15 @@ void vfs_close_all_fds(struct process* proc) {
     for (int fd = 3; fd < VFS_MAX_FDS; fd++) {
         vfs_file_t* file = t[fd];
         if (!file) continue;
+
+        /* BUG-FIX: flush dirty page-cache pages before dropping the inode
+         * reference. vfs_close() does this, but vfs_close_all_fds() was
+         * missing it — dirty data written via page_cache_write() would be
+         * lost when the process exits without an explicit close(). */
+        if (file->inode) {
+            page_cache_flush_inode(file->inode);
+        }
+
         if (file->ops && file->ops->close) {
             file->ops->close(file);
         }
@@ -777,6 +786,38 @@ int vfs_open(const char* path, int flags, int mode) {
 }
 
 /**
+ * vfs_read_fast -- inline fast path for ramfs files with inode->data.
+ *
+ * When a file's ops pointer is the ramfs_file_ops (the overwhelmingly common
+ * case for initrd + tmpfs files), the full ramfs_read() function pointer
+ * dispatch is unnecessary overhead.  This inline does the same bounds-check +
+ * memcpy directly, avoiding the call/return overhead on the hot read path.
+ * Returns >= 0 if handled, < 0 if the caller should fall through to the
+ * generic ops->read path.
+ */
+static inline ssize_t vfs_read_fast(vfs_file_t* file, void* buf, size_t count) {
+    /* Only handle ramfs files with existing inode data */
+    if (file->ops != &ramfs_file_ops || !file->inode || !file->inode->data) {
+        return -1;  /* not handled -- fall through */
+    }
+
+    vfs_inode_t* inode = file->inode;
+    if (file->offset >= inode->size) {
+        return 0;  /* EOF */
+    }
+
+    uint64_t available = inode->size - file->offset;
+    size_t bytes_to_read = count;
+    if ((uint64_t)bytes_to_read > available) {
+        bytes_to_read = (size_t)available;
+    }
+
+    memcpy(buf, (uint8_t*)inode->data + file->offset, bytes_to_read);
+    file->offset += bytes_to_read;
+    return (ssize_t)bytes_to_read;
+}
+
+/**
  * Read from file
  */
 ssize_t vfs_read(int fd, void* buf, size_t count) {
@@ -795,6 +836,12 @@ ssize_t vfs_read(int fd, void* buf, size_t count) {
     }
     if (!file->ops || !file->ops->read) {
         return VFS_ERR_NOSYS;
+    }
+
+    /* Fast path: direct inode->data copy for ramfs, skips function pointer. */
+    ssize_t fast = vfs_read_fast(file, buf, count);
+    if (fast >= 0) {
+        return fast;
     }
 
     return file->ops->read(file, buf, count);
@@ -1938,7 +1985,15 @@ int vfs_ramfs_create_dir(vfs_inode_t* dir, const char* name, uint32_t mode) {
         return -1;
     }
 
-    return ramfs_mkdir(dir, dentry, mode);
+    int result = ramfs_mkdir(dir, dentry, mode);
+    /* BUG-FIX (dentry leak): if ramfs_mkdir fails (duplicate name, OOM in
+     * dir_ensure or dir_add), the dentry we allocated is orphaned -- nobody
+     * else holds a reference.  vfs_mkdir() handles this correctly; this
+     * convenience wrapper did not. */
+    if (result < 0) {
+        vfs_dentry_free(dentry);
+    }
+    return result;
 }
 
 /**

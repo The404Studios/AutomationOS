@@ -222,8 +222,11 @@ typedef struct {
 static path_filter_t path_filters[MAX_PATH_FILTERS];
 static uint32_t path_filter_count = 0;
 
-static bool simple_glob_match(const char* text, const char* pattern) {
+#define GLOB_MAX_DEPTH 16
+
+static bool simple_glob_match_depth(const char* text, const char* pattern, int depth) {
     if (!text || !pattern) return false;
+    if (depth >= GLOB_MAX_DEPTH) return false;
 
     while (*pattern) {
         if (*pattern == '*') {
@@ -231,7 +234,7 @@ static bool simple_glob_match(const char* text, const char* pattern) {
             if (!*pattern) return true;
 
             while (*text) {
-                if (simple_glob_match(text, pattern)) {
+                if (simple_glob_match_depth(text, pattern, depth + 1)) {
                     return true;
                 }
                 text++;
@@ -246,6 +249,10 @@ static bool simple_glob_match(const char* text, const char* pattern) {
     }
 
     return *text == '\0';
+}
+
+static bool simple_glob_match(const char* text, const char* pattern) {
+    return simple_glob_match_depth(text, pattern, 0);
 }
 
 int audit_filter_add_path_pattern(const char* pattern) {

@@ -28,6 +28,11 @@ static page_table_t* active_pml4 = NULL;  // Currently targeted PML4 for mapping
 static uint16_t next_pcid = 1;          // PCID 0 reserved for kernel
 static bool pcid_supported = false;
 
+// Global: set true by paging_init() when SMAP is enabled.  STAC/CLAC
+// (x86_64.h) check this to avoid emitting Haswell-only opcodes on older
+// CPUs (Westmere/Arrandale) where they would #UD.
+bool cpu_smap_active = false;
+
 // Get index for each paging level
 #define PML4_INDEX(addr) (((uint64_t)(addr) >> 39) & 0x1FF)
 #define PDPT_INDEX(addr) (((uint64_t)(addr) >> 30) & 0x1FF)
@@ -326,6 +331,81 @@ void paging_init(void) {
             }
             pmm_free_page(probe);
         }
+    }
+
+    // Enable SMEP and SMAP if the CPU supports them.
+    //
+    // SMEP (Supervisor Mode Execution Prevention, CR4 bit 20): prevents the
+    // kernel from EXECUTING code on user-accessible pages. A #PF is raised
+    // instead, blocking ret2user / JOP into user-mapped trampolines.
+    //
+    // SMAP (Supervisor Mode Access Prevention, CR4 bit 21): prevents the
+    // kernel from READING or WRITING user-accessible pages unless RFLAGS.AC
+    // is explicitly set (via the STAC instruction). This forces every kernel
+    // user-memory access through the validated copy_from/to_user paths
+    // (which bracket the access with stac/clac) and catches wild dereferences
+    // of user pointers in kernel code.
+    //
+    // CPUID.07H:EBX: bit 7 = SMEP, bit 20 = SMAP.
+    // GUARD: Westmere/Arrandale (T410) max CPUID leaf is 0xB.  Leaf 7 is in
+    // range but returns zeroes for SMEP/SMAP (those are Haswell+).  Older CPUs
+    // with max leaf < 7 would get the highest-supported-leaf result (garbage),
+    // so always check max leaf first.
+    {
+        uint32_t max_leaf;
+        __asm__ volatile("cpuid"
+                         : "=a"(max_leaf)
+                         : "a"(0)
+                         : "ebx", "ecx", "edx");
+        uint64_t cr4 = read_cr4();
+        if (max_leaf >= 7) {
+            uint32_t eax7, ebx7, ecx7, edx7;
+            __asm__ volatile("cpuid"
+                             : "=a"(eax7), "=b"(ebx7), "=c"(ecx7), "=d"(edx7)
+                             : "a"(7), "c"(0));
+            if (ebx7 & (1U << 7)) {
+                cr4 |= CR4_SMEP;
+                kprintf("[VMM] SMEP enabled (Supervisor Mode Execution Prevention)\n");
+            } else {
+                kprintf("[VMM] SMEP not supported on this CPU\n");
+            }
+            if (ebx7 & (1U << 20)) {
+                cr4 |= CR4_SMAP;
+                cpu_smap_active = true;  // arm STAC/CLAC in x86_64.h
+                kprintf("[VMM] SMAP enabled (Supervisor Mode Access Prevention)\n");
+            } else {
+                kprintf("[VMM] SMAP not supported on this CPU\n");
+            }
+            // ERMS (Enhanced REP MOVSB/STOSB), CPUID.07H:EBX[bit 9]. Ivy-Bridge
+            // 2012+. Gates the kernel's fast REP-string memcpy/memset path
+            // (kernel/lib/string.c, g_string_erms_ok — default 0). The T410's
+            // 2010 Westmere i5 reports 0 here, so it keeps the portable, DF-safe
+            // word-copy loop. Under T410_SAFE the whole block is compiled out so
+            // ERMS can never arm regardless of what CPUID claims.
+#ifndef T410_SAFE
+            {
+                extern volatile int g_string_erms_ok;
+                if (ebx7 & (1U << 9)) {
+                    g_string_erms_ok = 1;
+                    kprintf("[VMM] ERMS enabled (fast REP MOVSB/STOSB string ops)\n");
+                } else {
+                    kprintf("[VMM] ERMS not supported; portable word-copy loop\n");
+                }
+            }
+#endif
+        } else {
+            kprintf("[VMM] CPUID max leaf %u < 7, skipping SMEP/SMAP detection\n",
+                    max_leaf);
+        }
+        write_cr4(cr4);
+        if (cpu_smap_active)
+            __asm__ volatile("clac" ::: "cc");  // establish AC=0 default
+        kprintf("[CPU] features: SMEP=%d SMAP=%d leaf7=%d\n",
+                (cr4 & CR4_SMEP) ? 1 : 0,
+                cpu_smap_active ? 1 : 0,
+                (max_leaf >= 7) ? 1 : 0);
+        kprintf("[CPU] usercopy: STAC/CLAC %s\n",
+                cpu_smap_active ? "active" : "disabled (pre-Haswell CPU)");
     }
 
     // Enable PCID if supported (must be done AFTER setting up paging)
@@ -1040,10 +1120,17 @@ void paging_destroy_address_space(uint64_t cr3) {
 
             for (int k = 0; k < 512; k++) {
                 if (!(pd->entries[k] & PTE_PRESENT)) continue;
-                // 2MB huge page (e.g. identity-mapped RAM copied by value in
-                // paging_create_address_space): no PT beneath it and the
-                // physical RAM is shared. Do not dereference or free it.
-                if (pd->entries[k] & PTE_HUGE) continue;
+                // 2MB huge page: no PT beneath it. Identity-mapped huge pages
+                // (inherited from the kernel, no PTE_OWNED) are shared RAM and
+                // must NOT be freed. Process-private huge pages (PTE_OWNED,
+                // created by paging_map_huge_page for user code) must be freed.
+                if (pd->entries[k] & PTE_HUGE) {
+                    if (pd->entries[k] & PTE_OWNED) {
+                        void* huge_phys = (void*)(pd->entries[k] & 0x000FFFFFFFFFF000ULL);
+                        pmm_free_huge_page(huge_phys);
+                    }
+                    continue;
+                }
                 page_table_t* pt = (page_table_t*)(pd->entries[k] & 0x000FFFFFFFFFF000ULL);
 
                 // SHARED-KERNEL-PT GUARD: create_address_space() copies a split

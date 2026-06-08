@@ -51,6 +51,26 @@ static char* strcat(char* dest, const char* src) {
     return dest;
 }
 
+static char* strncpy(char* dest, const char* src, size_t n) {
+    size_t i;
+    for (i = 0; i < n - 1 && src[i]; i++)
+        dest[i] = src[i];
+    dest[i] = '\0';
+    return dest;
+}
+
+/* Bounded concatenation: appends src to dest, never writes past dest[maxlen-1]. */
+static char* strncat_safe(char* dest, const char* src, size_t maxlen) {
+    size_t dlen = strlen(dest);
+    if (dlen >= maxlen - 1) return dest;
+    size_t remaining = maxlen - dlen - 1;
+    size_t i;
+    for (i = 0; i < remaining && src[i]; i++)
+        dest[dlen + i] = src[i];
+    dest[dlen + i] = '\0';
+    return dest;
+}
+
 // Global linker context
 linker_context_t* g_linker_ctx = NULL;
 
@@ -87,10 +107,10 @@ int linker_init(linker_context_t* ctx) {
     memset(ctx, 0, sizeof(linker_context_t));
 
     // Set default search paths
-    strcpy(ctx->search_paths[0], "/lib");
-    strcpy(ctx->search_paths[1], "/usr/lib");
-    strcpy(ctx->search_paths[2], "/lib64");
-    strcpy(ctx->search_paths[3], "/usr/lib64");
+    strncpy(ctx->search_paths[0], "/lib", MAX_PATH_LENGTH);
+    strncpy(ctx->search_paths[1], "/usr/lib", MAX_PATH_LENGTH);
+    strncpy(ctx->search_paths[2], "/lib64", MAX_PATH_LENGTH);
+    strncpy(ctx->search_paths[3], "/usr/lib64", MAX_PATH_LENGTH);
     ctx->num_search_paths = 4;
 
     // Set global context
@@ -111,16 +131,16 @@ static int find_library(linker_context_t* ctx, const char* name, char* path_out)
     // If name contains '/', it's a path - use as-is
     for (const char* p = name; *p; p++) {
         if (*p == '/') {
-            strcpy(path_out, name);
+            strncpy(path_out, name, MAX_PATH_LENGTH);
             return 0;
         }
     }
 
     // Search in library paths
     for (int i = 0; i < ctx->num_search_paths; i++) {
-        strcpy(path_out, ctx->search_paths[i]);
-        strcat(path_out, "/");
-        strcat(path_out, name);
+        strncpy(path_out, ctx->search_paths[i], MAX_PATH_LENGTH);
+        strncat_safe(path_out, "/", MAX_PATH_LENGTH);
+        strncat_safe(path_out, name, MAX_PATH_LENGTH);
 
         // Check if file exists (would need syscall_stat or similar)
         // For now, assume it exists
@@ -204,15 +224,15 @@ shared_object_t* linker_load_object(linker_context_t* ctx, const char* path, int
         return NULL;
     }
 
-    // Set name and path
-    strcpy(so->path, path);
+    // Set name and path (bounded to MAX_PATH_LENGTH)
+    strncpy(so->path, path, MAX_PATH_LENGTH);
     const char* name = path;
     for (const char* p = path; *p; p++) {
         if (*p == '/') {
             name = p + 1;
         }
     }
-    strcpy(so->name, name);
+    strncpy(so->name, name, MAX_PATH_LENGTH);
 
     // Load ELF file
     int ret = load_elf_file(path, so);

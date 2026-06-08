@@ -103,22 +103,23 @@ static const unsigned int k_accents[ACCENT_COUNT] = {
 /* ---- config ---- */
 #define CONF_BYTES  6
 
-/* ---- sysinfo struct matching kernel definition ---- */
+/* ---- sysinfo struct matching kernel definition (32 bytes, kernel/include/procapi.h) ---- */
 typedef struct {
     unsigned long long total_mem;
     unsigned long long free_mem;
     unsigned long long uptime_ms;
     unsigned int       proc_count;
+    unsigned int       _pad;        /* reserved, always 0 */
 } sysinfo_t;
 
-/* ---- gettime struct ---- */
+/* ---- gettime struct (must match kernel rtc_time_t: 7 bytes packed) ---- */
 typedef struct {
-    unsigned int year;
-    unsigned int month;
-    unsigned int day;
-    unsigned int hour;
-    unsigned int minute;
-    unsigned int second;
+    unsigned short year;    /* full 4-digit year, e.g. 2026 */
+    unsigned char  month;   /* 1..12 */
+    unsigned char  day;     /* 1..31 */
+    unsigned char  hour;    /* 0..23 */
+    unsigned char  minute;  /* 0..59 */
+    unsigned char  second;  /* 0..59 */
 } kerneltime_t;
 
 /* ===========================================================
@@ -483,9 +484,29 @@ static void cb_toggle_theme(void *ud) {
     conf_save();
 }
 
+/* Checkbox-compatible toggle for theme (int state, void *ud). */
+static void cb_toggle_theme_chk(int state, void *ud) {
+    (void)ud;
+    g_state.theme_dark = state;
+    if (g_state.theme_val)
+        ui_label_set_text(g_state.theme_val,
+                          g_state.theme_dark ? "Dark" : "Light");
+    conf_save();
+}
+
 static void cb_toggle_animations(void *ud) {
     (void)ud;
     g_state.animations ^= 1;
+    if (g_state.anim_val)
+        ui_label_set_text(g_state.anim_val,
+                          g_state.animations ? "On" : "Off");
+    conf_save();
+}
+
+/* Checkbox-compatible toggle for animations (int state, void *ud). */
+static void cb_toggle_animations_chk(int state, void *ud) {
+    (void)ud;
+    g_state.animations = state;
     if (g_state.anim_val)
         ui_label_set_text(g_state.anim_val,
                           g_state.animations ? "On" : "Off");
@@ -541,7 +562,7 @@ static void build_appearance(ui_widget_t *panel) {
     ui_widget_t *chk_theme = ui_checkbox(panel, 16, 174,
                                          "Dark mode",
                                          g_state.theme_dark,
-                                         (void(*)(int,void*))0,
+                                         cb_toggle_theme_chk,
                                          &g_state);
     if (!chk_theme) {
         /* Fallback: plain toggle button */
@@ -561,7 +582,7 @@ static void build_appearance(ui_widget_t *panel) {
     ui_widget_t *chk_anim = ui_checkbox(panel, 16, 258,
                                         "Enabled",
                                         g_state.animations,
-                                        (void(*)(int,void*))0,
+                                        cb_toggle_animations_chk,
                                         &g_state);
     if (!chk_anim) {
         ui_button(panel, 16, 258, 90, 24,
@@ -602,6 +623,16 @@ static void cb_toggle_sound(void *ud) {
     conf_save();
 }
 
+/* Checkbox-compatible toggle for sound (int state, void *ud). */
+static void cb_toggle_sound_chk(int state, void *ud) {
+    (void)ud;
+    g_state.sound_on = state;
+    if (g_state.sound_val)
+        ui_label_set_text(g_state.sound_val,
+                          g_state.sound_on ? "On" : "Off");
+    conf_save();
+}
+
 static void cb_test_beep(void *ud) {
     (void)ud;
     /* SYS_BEEP(frequency_hz, duration_ms) -- graceful if <0 */
@@ -626,7 +657,7 @@ static void build_sound(ui_widget_t *panel) {
     ui_widget_t *chk_sound = ui_checkbox(panel, 16, 86,
                                          "Sound enabled",
                                          g_state.sound_on,
-                                         (void(*)(int,void*))0,
+                                         cb_toggle_sound_chk,
                                          &g_state);
     if (!chk_sound) {
         ui_button(panel, 16, 86, 100, 24,
@@ -711,6 +742,16 @@ static void build_about(ui_widget_t *panel) {
 static void switch_category(int cat) {
     g_state.active_cat = cat;
     clear_section_ptrs();
+
+    /* Free the previous content panel and all its children so widget pool
+     * slots are reclaimed.  Without this, each category switch leaks ~20-40
+     * widgets and the 512-slot pool exhausts after ~5-6 switches, causing
+     * all subsequent widget creation to silently fail (NULL returns).      */
+    if (g_state.content_panel) {
+        ui_widget_detach(g_state.root, g_state.content_panel);
+        ui_widget_free_tree(g_state.content_panel);
+        g_state.content_panel = (void*)0;
+    }
 
     ui_widget_t *panel = ui_panel(g_state.root,
                                   CONTENT_X, 4,

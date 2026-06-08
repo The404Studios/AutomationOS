@@ -350,7 +350,14 @@ file_explorer_t* explorer_create(compositor_t *compositor, const char *initial_p
 void explorer_destroy(file_explorer_t *explorer) {
     if (!explorer) return;
 
-    // TODO: Cleanup window, free resources
+    // Cleanup window
+    if (explorer->window) {
+        window_destroy(explorer->window);
+        explorer->window = NULL;
+    }
+
+    // Clear clipboard paths (stack-allocated inside struct, no free needed)
+    explorer->clipboard.count = 0;
 
     free(explorer);
 }
@@ -699,8 +706,10 @@ void explorer_paste(file_explorer_t *explorer) {
 
     if (op) {
         operation_start(op);
-        printf("[File Explorer] Started %s operation\n",
+        operation_wait(op);
+        printf("[File Explorer] Completed %s operation\n",
                explorer->clipboard.is_cut ? "move" : "copy");
+        operation_destroy(op);
     }
 
     // Clear clipboard if cut

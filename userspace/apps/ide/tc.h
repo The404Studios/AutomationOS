@@ -20,7 +20,7 @@
  *  - e_entry = 0x200000 + 120 = first emitted instruction (must be _start).
  *  - Entered with RSP 16-byte aligned near 0x7FFFFFFFE000. No argc/argv.
  *  - Syscalls: `syscall`; number in RAX; args RDI,RSI,RDX,R10,R8,R9; ret RAX.
- *    SYS_EXIT=1 (rdi=code), SYS_WRITE=3 (rdi=fd, rsi=buf, rdx=len).
+ *    SYS_EXIT=0 (rdi=code), SYS_WRITE=3 (rdi=fd, rsi=buf, rdx=len).
  *
  * ===========================================================================
  *  SUPPORTED ASSEMBLY SUBSET (Intel syntax, one instruction per line)

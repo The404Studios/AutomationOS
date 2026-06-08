@@ -57,17 +57,23 @@ static void pmm_free_page_slow(void* page_addr);
  * Physical page frame index:
  *   pfn = (phys_addr - BITMAP_BASE) / PAGE_SIZE
  *
- * BITMAP_BASE = 0  (we keep the full 4 GB range so that all physical
+ * BITMAP_BASE = 0  (we keep the full range so that all physical
  * addresses map to a valid index without a subtraction per access).
  *
- * Sizing: 4 GB / 4 KB = 2^20 pages.  2^20 bits = 128 KB of static data.
- * That is well within normal BSS for a kernel.
+ * Sizing: 16 GB / 4 KB = 2^22 pages.  2^22 bits = 512 KB of static data.
+ * That is well within normal BSS for a kernel, and matches both the
+ * identity-map extent (paging_init maps 0..16GB) and DIRECT_MAP_SPAN.
+ *
+ * HISTORY: was 4 GB (2^20 pages, 128 KB).  On a T410 with 8 GB RAM,
+ * pages above 4 GB were added to the free list but never tracked in
+ * the bitmap, so the bitmap-only allocator could never return them --
+ * silently wasting up to half the machine's memory.
  *
  * Bit convention: 1 = FREE, 0 = USED/RESERVED.
  * Using "1 = free" lets us use __builtin_ctzll on the raw word to find
  * the first free bit without inverting.
  * ----------------------------------------------------------------------- */
-#define BITMAP_TOTAL_PAGES  (1UL << 20)          /* 4 GB / 4 KB */
+#define BITMAP_TOTAL_PAGES  (1UL << 22)          /* 16 GB / 4 KB */
 #define BITMAP_WORDS        (BITMAP_TOTAL_PAGES / 64)
 
 static uint64_t pmm_bitmap[BITMAP_WORDS];        /* 1 = free, 0 = used */
@@ -111,7 +117,12 @@ typedef struct {
     uint64_t alloc_fast;       // Fast path hits (cache hit)
     uint64_t alloc_slow;       // Slow path (cache miss/refill)
     spinlock_t lock;           // Protects cache access
-} per_cpu_page_cache_t;
+} __attribute__((aligned(64))) per_cpu_page_cache_t;
+// Cache-line aligned (64B) to prevent false sharing between per-CPU caches on
+// SMP. Without this, two CPUs' caches can share a cache line and each CPU's
+// alloc/free bounces the other's cache line (up to 100 cycles per access on
+// modern x86). sizeof(per_cpu_page_cache_t) exceeds 64B so it spans multiple
+// lines, but alignment ensures CPU0's first line != CPU1's first line.
 
 static per_cpu_page_cache_t cpu_caches[MAX_CPUS];
 static spinlock_t global_pmm_lock;  // Protects free lists + bitmap
@@ -286,6 +297,70 @@ static void* pmm_alloc_page_slow(void) {
 }
 
 /**
+ * Batch slow path: allocate up to `want` pages under a SINGLE global lock
+ * acquisition. Returns the number of pages actually allocated into out[].
+ * Avoids the old refill pattern of calling pmm_alloc_page_slow() in a loop
+ * (16 separate lock round-trips per cache refill -> 1 lock round-trip).
+ * MUST be called WITHOUT any locks held.
+ */
+static uint32_t pmm_alloc_batch_slow(void** out, uint32_t want) {
+    if (want == 0) return 0;
+
+    spin_lock(&global_pmm_lock);
+
+    uint64_t total_pfns = total_memory / MIN_PAGE_SIZE;
+    if (total_pfns == 0 || total_pfns > BITMAP_TOTAL_PAGES) total_pfns = BITMAP_TOTAL_PAGES;
+    uint64_t total_words = (total_pfns + 63) / 64;
+    uint64_t hint = (pmm_bitmap_hint < total_words) ? pmm_bitmap_hint : 0;
+    uint32_t found = 0;
+
+    for (uint64_t scanned = 0; scanned < total_words && found < want; scanned++) {
+        uint64_t w = hint + scanned;
+        if (w >= total_words) w -= total_words;
+        uint64_t bits = pmm_bitmap[w];
+        if (bits == 0) continue;
+
+        /* Extract ALL free bits from this word (multiple pages per word) */
+        while (bits != 0 && found < want) {
+            uint64_t bit = (uint64_t)__builtin_ctzll(bits);
+            uint64_t pfn = w * 64 + bit;
+            bits &= ~(1ULL << bit);           /* clear this bit for the inner loop */
+            if (pfn == 0 || pfn >= total_pfns) continue;
+            bitmap_set_used(pfn);
+            used_memory += MIN_PAGE_SIZE;
+            out[found++] = addr_of_pfn(pfn);
+        }
+        pmm_bitmap_hint = w;
+    }
+
+    spin_unlock(&global_pmm_lock);
+    return found;
+}
+
+/**
+ * Batch slow path: free up to `count` pages under a SINGLE global lock
+ * acquisition. Mirrors pmm_alloc_batch_slow() for the drain direction.
+ * MUST be called WITHOUT any locks held.
+ */
+static void pmm_free_batch_slow(void** pages, uint32_t count) {
+    if (count == 0) return;
+
+    spin_lock(&global_pmm_lock);
+
+    for (uint32_t i = 0; i < count; i++) {
+        if (!pages[i]) continue;
+        uint64_t pfn = pfn_of(pages[i]);
+        if (pfn < BITMAP_TOTAL_PAGES) {
+            bitmap_set_free(pfn);
+            pmm_bitmap_hint = pfn / 64;
+        }
+        used_memory -= MIN_PAGE_SIZE;
+    }
+
+    spin_unlock(&global_pmm_lock);
+}
+
+/**
  * Fast path: allocate page from per-CPU cache (10x faster)
  *
  * Performance:
@@ -322,18 +397,14 @@ void* pmm_alloc_page(void) {
     cache->alloc_slow++;
 
     // DEADLOCK FIX: Release cache lock before refilling from global pool
-    // This prevents lock order violation: cache->lock → global_pmm_lock
+    // This prevents lock order violation: cache->lock -> global_pmm_lock
     spin_unlock(&cache->lock);
 
-    // Allocate multiple pages at once to amortize refill cost
-    // Note: This happens WITHOUT holding cache lock to avoid deadlock
+    // Batch-allocate all pages under a SINGLE global lock acquisition.
+    // The old code called pmm_alloc_page_slow() in a loop (16 separate lock
+    // round-trips per refill). The new pmm_alloc_batch_slow() does 1 round-trip.
     void* refill_pages[PER_CPU_CACHE_SIZE];
-    uint32_t refill_count = 0;
-    for (uint32_t i = 0; i < PER_CPU_CACHE_SIZE; i++) {
-        void* page = pmm_alloc_page_slow();
-        if (!page) break;  // Out of memory
-        refill_pages[refill_count++] = page;
-    }
+    uint32_t refill_count = pmm_alloc_batch_slow(refill_pages, PER_CPU_CACHE_SIZE);
 
     // Re-acquire cache lock to update the cache with refilled pages
     spin_lock(&cache->lock);
@@ -361,8 +432,13 @@ void* pmm_alloc_page(void) {
     spin_unlock(&cache->lock);
 
     if (!result) {
-        // Completely out of memory
-        kernel_panic("PMM: Out of memory");
+        // Out of physical memory: return NULL so the caller can handle it
+        // gracefully (e.g. heap_extend fails, kmalloc returns NULL, syscall
+        // returns ENOMEM to userspace).  Panicking here turns a recoverable
+        // per-request OOM into a whole-kernel crash -- an unprivileged DoS.
+        kprintf("[PMM] WARNING: out of physical memory (used=%lu total=%lu)\n",
+                (unsigned long)used_memory, (unsigned long)total_memory);
+        return NULL;
     }
     if (*(volatile uint64_t*)result == 0x51AB0BACE51AB0BULL)
         kprintf("[SLABPROBE] pmm_alloc(slow) handed out LIVE SLAB %p\n", result);
@@ -498,10 +574,25 @@ void pmm_free_page(void* page_addr) {
         return;
     }
 
+    // Slow path: cache full. Batch-drain half the cache to the global pool
+    // under a single lock acquisition (the old code drained 0 pages from the
+    // cache and just freed the incoming page, so the NEXT free also overflowed
+    // -- ping-ponging through the slow path on every free when the cache is
+    // persistently full). Draining half (8 pages) amortizes the global lock
+    // cost over 8 subsequent frees before the next overflow.
+    uint32_t drain_count = cache->count / 2;
+    void* drain_pages[PER_CPU_CACHE_SIZE];
+    for (uint32_t i = 0; i < drain_count; i++) {
+        cache->count--;
+        drain_pages[i] = cache->pages[cache->count];
+    }
+    // Now store the incoming page in the freed slot
+    cache->pages[cache->count] = page_addr;
+    cache->count++;
     spin_unlock(&cache->lock);
 
-    // Slow path: cache full, return to global pool (also updates bitmap)
-    pmm_free_page_slow(page_addr);
+    // Batch-free the drained pages under a single global lock acquisition
+    pmm_free_batch_slow(drain_pages, drain_count);
 }
 
 /* -----------------------------------------------------------------------
@@ -796,7 +887,6 @@ void pmm_free_pages(void* base, size_t count) {
         if (pfn >= BITMAP_TOTAL_PAGES) break;  /* Safety: never go out of bounds */
 
         void* page_addr = addr_of_pfn(pfn);
-        page_t* page = (page_t*)page_addr;
 
         // LIVE-SLAB GUARD (same rationale as pmm_free_page): a page still carrying
         // SLAB_MAGIC is a live kmalloc slab. Freeing it here would bitmap_set_free a
@@ -812,32 +902,28 @@ void pmm_free_pages(void* base, size_t count) {
             continue;
         }
 
-        if (page->is_free) {
-            /*
-             * Already marked free — either a double-free or the page is in
-             * the per-CPU cache with is_free true but bitmap bit still 0.
-             *
-             * In the per-CPU cache case, is_free is NOT set to true by
-             * pmm_free_page(): look at pmm_free_page() — it stores the
-             * raw pointer in cache->pages[] without touching page_t at all.
-             * So is_free == true here means a genuine double-free; skip it
-             * safely.  The bitmap is not touched (it may already be 1 from
-             * a prior pmm_add_page_locked or pmm_free_page_slow call).
-             */
+        /* Bitmap-authoritative double-free guard: the bitmap is the single source
+         * of truth for page allocation state. The old code checked the embedded
+         * page_t::is_free field, but pmm_alloc_page_slow() (the current bitmap-
+         * only allocator) never clears is_free when handing out a page, leaving it
+         * stale from boot. A page whose data bytes happened to leave the is_free
+         * byte nonzero would be silently skipped here and LEAKED. The bitmap is
+         * always correct: bit=1 means free (never allocated, or already freed),
+         * bit=0 means allocated. */
+        if (bitmap_is_free(pfn)) {
+            /* Already free in the bitmap -- genuine double-free or the page is
+             * sitting in a per-CPU cache (whose bitmap bit is kept clear/used).
+             * A per-CPU cached page has bit=0, so we only reach here for pages
+             * that are truly free in the global pool. Skip safely. */
             continue;
         }
 
-        /*
-         * Page is allocated (is_free == false).  Return it to the global
-         * free-list and mark the bitmap bit free so future pmm_alloc_pages
-         * scans can select it.
-         */
-        page->is_free = true;
-        page->order = 0;
-        page->next = free_lists[0];
-        free_lists[0] = page;
-        used_memory -= MIN_PAGE_SIZE;
+        /* Page is allocated (bitmap bit == 0). Mark it free in the bitmap.
+         * Bitmap-only: we do NOT write page_t headers or push onto the embedded
+         * free list, matching pmm_free_page_slow(). The allocator is bitmap-driven;
+         * touching page memory risks faulting on an unmapped/shadowed VA. */
         bitmap_set_free(pfn);
+        used_memory -= MIN_PAGE_SIZE;
     }
 
     /* Nudge hint back toward the freed range if it helps future allocs */
@@ -897,15 +983,16 @@ void pmm_add_remaining_pages(memory_map_entry_t* mmap, uint32_t mmap_count) {
                 if (addr >= kernel_start_phys && addr < kernel_end_phys) continue;
                 if (pmm_initrd_start && addr >= pmm_initrd_start && addr < pmm_initrd_end) continue;
 
-                page_t* page = (page_t*)addr;
-                page->order = 0;
-                page->is_free = true;
-                page->next = free_lists[0];
-                free_lists[0] = page;
-
                 uint64_t pfn = addr / MIN_PAGE_SIZE;
-                if (pfn < BITMAP_TOTAL_PAGES)
-                    bitmap_set_free(pfn);
+                if (pfn >= BITMAP_TOTAL_PAGES) continue; /* past bitmap range */
+
+                /* Bitmap-only: mark the page free in the bitmap. The allocator
+                 * (pmm_alloc_page_slow) is bitmap-driven and never walks the
+                 * embedded free list, so writing page_t headers into the page
+                 * (the old approach) was dead code for pages beyond the old 4GB
+                 * bitmap and unsafe on pages that may contain live data on some
+                 * firmware memory maps. */
+                bitmap_set_free(pfn);
 
                 free_pages++;
             }

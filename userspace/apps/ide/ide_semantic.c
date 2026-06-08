@@ -1,4 +1,4 @@
-/*
+﻿/*
  * ide_semantic.c -- Semantic analyzer for the "Semantic LEGO Map" IDE.
  *
  * The parser (ide_parse.c) fills m->funcs[] / m->globals[] with names, params,
@@ -14,6 +14,7 @@
 
 #include "ide_model.h"
 #include "ide_sys.h"
+#include "ide_library.h"
 
 /* ===========================================================================
  * Tiny string helpers (freestanding -- no <string.h>).
@@ -231,6 +232,9 @@ static void sem_add_action(Model* m, const char* title, int dcoherence)
     a = &m->actions[m->nactions++];
     sem_cpy(a->title, title, 64);
     a->dcoherence = dcoherence;
+    a->lib_id = -1;      /* not a library action by default */
+    a->category = 0;
+    a->complexity = 0;
 }
 
 static void sem_add_flow(Model* m, const char* label, int absent)
@@ -491,3 +495,5 @@ void model_analyze(Model* m)
     (void)sem_has_port;   /* retained helper; silence unused warning */
     m->analyzed = 1;
 }
+
+

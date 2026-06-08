@@ -1421,7 +1421,7 @@ static void bm_save(void)
     sc(SYS_MKDIR, (i64)BM_DIR, BM_MODE, 0, 0, 0, 0);
     i64 fd = sc(SYS_OPEN, (i64)BM_PATH, O_WRONLY | O_CREAT | O_TRUNC, BM_MODE, 0, 0, 0);
     if (fd < 0) {
-        k_strlcpy(g_status, "Bookmark save failed (open)", sizeof(g_status));
+        k_strlcpy(g_status, "Bookmark save failed: cannot write " BM_PATH, sizeof(g_status));
         return;
     }
     int len = 0;
@@ -1863,6 +1863,8 @@ static int draw_render_span(u32 *pix, u32 stride_px, u32 bw, u32 bh,
                             int x, int y, int off, int len, u32 color, int bold)
 {
     int cx = x;
+    if (off < 0 || off >= g_render_len) return 0;
+    if (len > g_render_len - off) len = g_render_len - off;
     for (int i = 0; i < len; i++) {
         char c = g_render[off + i];
         if (c < 0x20 || c > 0x7E) c = ' ';
@@ -1883,6 +1885,8 @@ static void draw_underline(u32 *pix, u32 stride_px, u32 bw, u32 bh,
 static void draw_table_span(u32 *pix, u32 stride_px, u32 bw, u32 bh,
                             int x, int y, int off, int len, u32 color)
 {
+    if (off < 0 || off >= g_render_len) return;
+    if (len > g_render_len - off) len = g_render_len - off;
     int col = 0;
     for (int i = 0; i < len; i++) {
         char c = g_render[off + i];
@@ -2028,6 +2032,8 @@ static void render_window(wl_window *win, u64 ticks)
                                        CONTENT_X, y, "--- Links ---", COL_HEADING);
             (void)adv;
         } else if (L->kind == LK_LINKROW) {
+            if (L->link_idx < 0 || L->link_idx >= g_nlinks) { /* skip invalid link_idx */ }
+            else {
             link_t *lk = &g_links[L->link_idx];
             char head[24];
             int hn = 0;
@@ -2053,6 +2059,7 @@ static void render_window(wl_window *win, u64 ticks)
             }
             int total_cols = (int)(k_strlen(head)) + drawn;
             draw_underline(pix, stride_px, bw, bh, CONTENT_X, y, total_cols, COL_LINK);
+            }
         } else if (L->kind == LK_HEADING) {
             int adv = draw_render_span(pix, stride_px, bw, bh,
                                        CONTENT_X, y, L->off, L->len,
@@ -2390,7 +2397,8 @@ static void on_pointer(int x, int y, int buttons, int *prev_btn)
             } else if (y >= CONTENT_Y && y < CONTENT_BOT) {
                 int vi = (y - CONTENT_Y) / FONT_H;
                 int li = g_scroll + vi;
-                if (li >= 0 && li < g_nlines && g_lines[li].kind == LK_LINKROW) {
+                if (li >= 0 && li < g_nlines && g_lines[li].kind == LK_LINKROW &&
+                    g_lines[li].link_idx >= 0 && g_lines[li].link_idx < g_nlinks) {
                     follow_link(g_lines[li].link_idx + 1);
                 } else {
                     g_addr_focus = 0;

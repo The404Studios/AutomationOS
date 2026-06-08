@@ -242,7 +242,7 @@ static js_string *con_format(js_vm *vm, js_string *fmt,
             char buf[24];
             js_i64 iv = (js_i64)js_to_number(vm, av);
             int neg = iv < 0;
-            js_u64 uv = neg ? (js_u64)(-iv) : (js_u64)iv;
+            js_u64 uv = neg ? (js_u64)0 - (js_u64)iv : (js_u64)iv;
             js_usize n = con_fmt_u64(uv, buf + 1);
             if (neg) { buf[0] = '-'; result = js_str_concat(vm, result, js_str_new(vm, buf, n + 1)); }
             else     { result = js_str_concat(vm, result, js_str_new(vm, buf + 1, n)); }

@@ -1073,6 +1073,15 @@ static void chess_strcat(char *dst, const char *src)
     dst[n] = 0;
 }
 
+/* Bounded strcat: never writes past dst[cap-1]. */
+static void chess_strcat_n(char *dst, int cap, const char *src)
+{
+    int n = chess_strlen(dst);
+    int i = 0;
+    while (n < cap - 1 && src[i]) dst[n++] = src[i++];
+    dst[n] = 0;
+}
+
 static void chess_strcpy(char *dst, const char *src)
 {
     int i = 0;
@@ -1102,7 +1111,7 @@ static void build_captured_str(int captured[7], char *out, int max_len)
     int total = 0;
     for (int t = 1; t <= 6; t++) {
         for (int c = 0; c < captured[t] && total < max_len - 2; c++, total++) {
-            chess_strcat(out, piece_glyph(t));
+            chess_strcat_n(out, max_len, piece_glyph(t));
         }
     }
 }
@@ -1252,10 +1261,10 @@ static void render(game_t *gctx, chess_t *g)
     char cap_b[64] = "B captured: ";
     char tmp_buf[32]; tmp_buf[0] = 0;
     build_captured_str(g->white_captured, tmp_buf, 28);
-    chess_strcat(cap_w, tmp_buf);
+    chess_strcat_n(cap_w, sizeof(cap_w), tmp_buf);
     tmp_buf[0] = 0;
     build_captured_str(g->black_captured, tmp_buf, 28);
-    chess_strcat(cap_b, tmp_buf);
+    chess_strcat_n(cap_b, sizeof(cap_b), tmp_buf);
 
     g_text(gctx, 8,      STATUS_Y + 20, cap_w, COL_WHITE_CAP);
     g_text(gctx, 8,      STATUS_Y + 38, cap_b, COL_BLACK_CAP);

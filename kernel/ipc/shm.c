@@ -280,6 +280,26 @@ int64_t sys_shmget(uint64_t key, uint64_t size, uint64_t shmflg,
     sz = ALIGN_UP(sz, PAGE_SIZE);
     uint32_t pages = sz / PAGE_SIZE;
 
+    /* ── OOM guard: reject if the request would exhaust physical memory ───
+     * A non-root process can trivially DoS the system by creating many
+     * large SHM segments until pmm_alloc_page starts returning NULL,
+     * crashing every subsequent kmalloc/page-table alloc. Reject early
+     * if less than 25% of physical memory would remain after this alloc.
+     * Root is exempt (kernel/init SHM allocations during boot must succeed). */
+    if (current->uid != 0) {
+        uint64_t free_mem = pmm_get_free_memory();
+        uint64_t need = (uint64_t)pages * PAGE_SIZE;
+        uint64_t total = pmm_get_total_memory();
+        uint64_t reserve = total / 4;
+        if (free_mem < need + reserve) {
+            kprintf("[SHMGET] Denied: would leave <25%% free memory "
+                    "(free=%lu need=%lu reserve=%lu)\n",
+                    (unsigned long)free_mem, (unsigned long)need,
+                    (unsigned long)reserve);
+            return IPC_ENOMEM;
+        }
+    }
+
     /* ── Phase 1: key/exist check + ID reservation (under lock) ─────────── */
 
     spin_lock(&shm_lock);

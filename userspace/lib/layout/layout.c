@@ -289,6 +289,7 @@ static void finish_line(inline_state *S, const css_computed *parent_style)
     if (parent_style && parent_style->text_align != CSS_ALIGN_LEFT
             && S->line_x < S->max_w) {
         int gap = S->max_w - S->line_x;
+        if (gap < 0) gap = 0;
         int shift = 0;
         if (parent_style->text_align == CSS_ALIGN_CENTER) shift = gap / 2;
         else if (parent_style->text_align == CSS_ALIGN_RIGHT) shift = gap;
@@ -389,8 +390,10 @@ static void emit_inline_subtree(ctx *C, const struct dom_node *n,
         if (inner_w < 0) inner_w = 0;
         blk->w = inner_w;
         box_attach(block, blk);
+        int content_w = inner_w - cs.padding_l - cs.padding_r;
+        if (content_w < 0) content_w = 0;
         int used = layout_node(C, n, blk,
-                               inner_w - cs.padding_l - cs.padding_r,
+                               content_w,
                                blk->x + cs.padding_l,
                                blk->y + cs.padding_t,
                                depth + 1);
@@ -536,8 +539,10 @@ static int layout_node(ctx *C, const struct dom_node *node, layout_box *block,
             if (inner_w < 0) inner_w = 0;
             blk->w = inner_w;
 
+            int content_w = inner_w - cs.padding_l - cs.padding_r;
+            if (content_w < 0) content_w = 0;
             int used = layout_node(C, c, blk,
-                                   inner_w - cs.padding_l - cs.padding_r,
+                                   content_w,
                                    blk->x + cs.padding_l,
                                    blk->y + cs.padding_t,
                                    depth + 1);
@@ -629,8 +634,10 @@ layout_box *layout_compute(struct dom_document *doc,
             if (inner_w < 0) inner_w = 0;
             bb->w = inner_w;
             /* Content area starts at padding offset from outer edge. */
+            int body_cw = inner_w - bcs.padding_l - bcs.padding_r;
+            if (body_cw < 0) body_cw = 0;
             int u = layout_node(&C, body, bb,
-                                inner_w - bcs.padding_l - bcs.padding_r,
+                                body_cw,
                                 bb->x + bcs.padding_l,
                                 bb->y + bcs.padding_t,
                                 0);

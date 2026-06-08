@@ -300,8 +300,14 @@ int elf_load_and_exec(void* elf_data, size_t elf_size, const char* name) {
     // Target the PROCESS's PML4 for all user page mappings
     paging_set_target(proc->context.cr3);
 
-    // Load PT_LOAD segments into process address space
+    // Load PT_LOAD segments into process address space, with overlap detection.
+    // A crafted ELF with overlapping PT_LOAD segments could overwrite previously
+    // loaded code/data or bypass W^X by replacing a read-only code page.
     const elf64_phdr_t* phdr = (const elf64_phdr_t*)((uint8_t*)elf_data + ehdr->e_phoff);
+
+#define EXEC_MAX_LOAD_SEGMENTS 16
+    struct { uint64_t start; uint64_t end; } exec_loaded[EXEC_MAX_LOAD_SEGMENTS];
+    int exec_n_loaded = 0;
 
     for (int i = 0; i < ehdr->e_phnum; i++) {
         EXEC_LOG("[EXEC]   Segment %d: type=0x%x offset=0x%lx filesz=0x%lx memsz=0x%lx\n",
@@ -317,10 +323,27 @@ int elf_load_and_exec(void* elf_data, size_t elf_size, const char* name) {
                 elf_cleanup_failed_load(proc);
                 return ELF_ERR_INVALID;
             }
-            // Calculate aligned boundaries
+            // Calculate aligned boundaries (with ALIGN_UP overflow guard)
             uint64_t vaddr_start = ALIGN_DOWN(phdr[i].p_vaddr, PAGE_SIZE);
-            uint64_t vaddr_end = ALIGN_UP(phdr[i].p_vaddr + phdr[i].p_memsz, PAGE_SIZE);
+            uint64_t raw_end = phdr[i].p_vaddr + phdr[i].p_memsz;
+            uint64_t vaddr_end = ALIGN_UP(raw_end, PAGE_SIZE);
+            if (vaddr_end < raw_end) {
+                EXEC_LOG("[EXEC] ERROR: seg %d ALIGN_UP overflow\n", i);
+                elf_cleanup_failed_load(proc);
+                return ELF_ERR_INVALID;
+            }
             uint64_t num_pages = (vaddr_end - vaddr_start) / PAGE_SIZE;
+
+            // Segment overlap detection: reject overlapping PT_LOAD segments
+            for (int j = 0; j < exec_n_loaded; j++) {
+                if (vaddr_start < exec_loaded[j].end && vaddr_end > exec_loaded[j].start) {
+                    EXEC_LOG("[EXEC] ERROR: seg %d [0x%lx,0x%lx) overlaps seg [0x%lx,0x%lx)\n",
+                            i, vaddr_start, vaddr_end,
+                            exec_loaded[j].start, exec_loaded[j].end);
+                    elf_cleanup_failed_load(proc);
+                    return ELF_ERR_INVALID;
+                }
+            }
 
             EXEC_LOG("[EXEC]   Loading PT_LOAD segment %d:\n", i);
             EXEC_LOG("[EXEC]     Virtual address: 0x%016lx (aligned: 0x%016lx - 0x%016lx)\n",
@@ -548,6 +571,13 @@ int elf_load_and_exec(void* elf_data, size_t elf_size, const char* name) {
             };
             vma_add(proc, &seg_vma);
 
+            // Record this segment for overlap detection
+            if (exec_n_loaded < EXEC_MAX_LOAD_SEGMENTS) {
+                exec_loaded[exec_n_loaded].start = vaddr_start;
+                exec_loaded[exec_n_loaded].end = vaddr_end;
+                exec_n_loaded++;
+            }
+
             EXEC_LOG("[EXEC]   Segment %d loaded (filesz=0x%lx, %lu pages)\n",
                     i, filesz, num_pages);
         }
@@ -623,6 +653,25 @@ int elf_load_and_exec(void* elf_data, size_t elf_size, const char* name) {
         }
     }
 #endif
+
+    // Install a guard page immediately below the stack. This page is never
+    // faulted in -- any access to it (stack overflow) is detected by the
+    // page-fault handler via VMA_FLAG_GUARD and kills the process cleanly
+    // instead of silently corrupting adjacent mappings.
+    if (stack_bottom >= PAGE_SIZE) {
+        vma_t guard_vma = {
+            .vaddr    = stack_bottom - PAGE_SIZE,
+            .length   = PAGE_SIZE,
+            .perm     = 0,              // no permissions -- any access faults
+            .flags    = VMA_FLAG_GUARD,
+            .backing  = VMA_ANON,
+            .file_ptr = 0,
+            .file_off = 0,
+            .file_sz  = 0,
+            .next     = NULL,
+        };
+        vma_add(proc, &guard_vma);
+    }
 
     // Record the stack as an anonymous, grow-down VMA. With LAZY_ANON_STACK the
     // not-present pages below the top are faulted in on first write via this

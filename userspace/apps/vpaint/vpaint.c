@@ -50,8 +50,8 @@
  * ----------------------------------------------------------------------- */
 #define SYS_WRITE  3
 #define SYS_YIELD  15
-#define SYS_OPEN   2
-#define SYS_CLOSE  6
+#define SYS_OPEN   4
+#define SYS_CLOSE  5
 
 static inline long sc6(long n, long a1, long a2, long a3,
                         long a4, long a5, long a6)

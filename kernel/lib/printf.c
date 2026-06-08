@@ -134,6 +134,11 @@ int kprintf(const char* format, ...) {
 
         /* --- flags --- */
         char pad_char = ' ';
+        int left_align = 0;
+        if (*p == '-') {
+            left_align = 1;
+            p++;
+        }
         if (*p == '0') {
             pad_char = '0';
             p++;
@@ -182,13 +187,22 @@ int kprintf(const char* format, ...) {
                 const char* str = __builtin_va_arg(args, const char*);
                 if (!str) str = "(null)";
                 int slen = (int)strlen(str);
-                /* Right-pad with spaces to width before the string */
-                for (int i = slen; i < width; i++) {
-                    buf_putc(&b, ' ');
-                    count++;
+                if (!left_align) {
+                    /* Right-align: pad with spaces before the string */
+                    for (int i = slen; i < width; i++) {
+                        buf_putc(&b, ' ');
+                        count++;
+                    }
                 }
                 buf_write(&b, str, (size_t)slen);
                 count += slen;
+                if (left_align) {
+                    /* Left-align: pad with spaces after the string */
+                    for (int i = slen; i < width; i++) {
+                        buf_putc(&b, ' ');
+                        count++;
+                    }
+                }
                 break;
             }
             case 'c': {

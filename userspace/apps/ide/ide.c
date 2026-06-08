@@ -1,4 +1,4 @@
-/*
+﻿/*
  * ide.c -- MAIN integrator for the Semantic LEGO Map IDE (freestanding ring 3).
  * =============================================================================
  *
@@ -25,9 +25,12 @@
 #include "ide_gfx.h"
 #include "ide_sys.h"
 #include "ide_theme.h"
+#include "ide_library.h"
 #include "ide_build.h"          /* native toolchain: Build/Run + build panel */
 #include "ide_editor.h"         /* editable code editor (EDITOR workspace)   */
 #include "ide_term.h"           /* integrated terminal panel                 */
+#include "ide_library.h"        /* "complex" snippet library (disk loader)   */
+#include "ide_config.h"         /* persist Settings knobs (load on init)     */
 #include "../../lib/wl/wl_client.h"
 
 /* When set (after pressing B in the LEGO workspace), the center-top shows the
@@ -60,6 +63,8 @@ static int g_build_view = 0;
 #define KEY_BACKSPC  14          /* edit the typed project name                   */
 #define KEY_J        36          /* Ctrl+J toggle bottom panel focus              */
 #define KEY_E        18          /* Ctrl+E toggle workspace (editor <-> LEGO)     */
+#define KEY_W        17          /* Ctrl+W toggle word wrap (editor)              */
+#define KEY_M        50          /* Ctrl+M toggle minimap (editor)                */
 #define KEY_GRAVE    41          /* Ctrl+` focus terminal                         */
 #define KEY_LEFTCTRL  29
 #define KEY_RIGHTCTRL 97
@@ -72,6 +77,9 @@ static int g_build_view = 0;
 #define KEY_EQUAL    13          /* Ctrl+= zoom in (LEGO map)                     */
 #define KEY_MINUS    12          /* Ctrl+- zoom out (LEGO map)                    */
 #define KEY_0        11          /* Ctrl+0 reset zoom to 100% (LEGO map)          */
+#define KEY_Z        44          /* Ctrl+Z undo (editor)                          */
+#define KEY_Y        21          /* Ctrl+Y redo (editor)                          */
+#define KEY_COMMA    51          /* Ctrl+, open Settings (VIZ-6)                   */
 /* PageUp/PageDown ARE in the evdev set we receive (104/109); the editor binds
  * them. Arrow-key scrolling also works in the LEGO workspace. */
 
@@ -151,7 +159,7 @@ static char ide_keycode_ascii(int kc, int shift) {
 #define INSP_DETAILS  4
 
 /* ---- map pan step (pixels per arrow press / drag is 1:1) ---- */
-#define MAP_PAN_STEP 20
+#define MAP_PAN_STEP (g_map_pan_step < 1 ? 1 : g_map_pan_step)   /* Settings knob */
 
 /* ============================================================================
  * The one big app-state instance. MUST live in .bss (never on the stack): the
@@ -159,6 +167,111 @@ static char ide_keycode_ascii(int kc, int shift) {
  * reasonable stack.
  * ==========================================================================*/
 static Ide g_ide;
+
+/* Multi-file tab source backing stores (.bss, 8*128KB = 1MB). */
+static char g_tab_src[IDE_MAX_TABS][IDE_SRC_CAP];
+
+static void tab_save_active(Ide* a) {
+    int i = a->tab_active;
+    if (i < 0 || i >= IDE_MAX_TABS || !a->tabs[i].used) return;
+    ide_strlcpy(a->tabs[i].path, a->cur_file, IDE_PATH);
+    a->tabs[i].src_len    = a->src_len;
+    a->tabs[i].editor     = a->editor;
+    a->tabs[i].focus_func = a->focus_func;
+    a->tabs[i].prev_focus = a->prev_focus;
+    for (int j = 0; j < a->src_len && j < IDE_SRC_CAP; j++)
+        g_tab_src[i][j] = a->src[j];
+}
+
+static void tab_restore(Ide* a, int idx) {
+    if (idx < 0 || idx >= IDE_MAX_TABS || !a->tabs[idx].used) return;
+    int len = a->tabs[idx].src_len;
+    if (len > IDE_SRC_CAP) len = IDE_SRC_CAP;
+    if (len < 0) len = 0;
+    for (int j = 0; j < len; j++)
+        a->src[j] = g_tab_src[idx][j];
+    a->src_len    = len;
+    a->editor     = a->tabs[idx].editor;
+    a->focus_func = a->tabs[idx].focus_func;
+    a->prev_focus = a->tabs[idx].prev_focus;
+    ide_strlcpy(a->cur_file, a->tabs[idx].path, IDE_PATH);
+    a->tab_active = idx;
+    model_parse(&a->model, a->src, a->src_len, a->cur_file);
+    if (a->model.nfuncs > 0) {
+        if (a->focus_func >= a->model.nfuncs) a->focus_func = 0;
+        a->model.focus = a->focus_func;
+    } else { a->model.focus = -1; }
+    model_analyze(&a->model);
+}
+
+static int tab_find(Ide* a, const char* path) {
+    for (int i = 0; i < IDE_MAX_TABS; i++)
+        if (a->tabs[i].used && ide_streq(a->tabs[i].path, path)) return i;
+    return -1;
+}
+
+static int tab_alloc(Ide* a) {
+    for (int i = 0; i < IDE_MAX_TABS; i++)
+        if (!a->tabs[i].used) { a->tabs[i].used = 1; a->tab_count++; return i; }
+    return -1;
+}
+
+static const char* tab_basename(const char* path) {
+    const char* base = path;
+    for (const char* p = path; *p; p++)
+        if (*p == '/') base = p + 1;
+    return base;
+}
+
+void ide_tab_switch(Ide* a, int idx) {
+    if (idx < 0 || idx >= IDE_MAX_TABS || !a->tabs[idx].used) return;
+    if (idx == a->tab_active) return;
+    tab_save_active(a);
+    tab_restore(a, idx);
+}
+
+void ide_tab_close(Ide* a, int idx) {
+    if (idx < 0 || idx >= IDE_MAX_TABS || !a->tabs[idx].used) return;
+    if (idx == a->tab_active && a->editor.dirty && a->cur_file[0])
+        ide_editor_save(a);
+    a->tabs[idx].used = 0;
+    a->tabs[idx].path[0] = 0;
+    a->tabs[idx].src_len = 0;
+    a->tab_count--;
+    if (a->tab_count < 0) a->tab_count = 0;
+    if (idx == a->tab_active) {
+        int next = -1;
+        for (int i = idx + 1; i < IDE_MAX_TABS; i++)
+            if (a->tabs[i].used) { next = i; break; }
+        if (next < 0)
+            for (int i = idx - 1; i >= 0; i--)
+                if (a->tabs[i].used) { next = i; break; }
+        if (next >= 0) {
+            a->tab_active = -1;
+            tab_restore(a, next);
+        } else {
+            a->tab_active = -1;
+            a->src_len = 0;
+            a->cur_file[0] = 0;
+            ide_editor_reset(a);
+            model_parse(&a->model, a->src, 0, "");
+            a->model.focus = -1; a->focus_func = -1;
+            model_analyze(&a->model);
+        }
+    }
+}
+
+void ide_tab_next(Ide* a) {
+    if (a->tab_count <= 1) return;
+    int start = a->tab_active;
+    if (start < 0) start = 0;
+    int i = start;
+    for (;;) {
+        i = (i + 1) % IDE_MAX_TABS;
+        if (a->tabs[i].used) { ide_tab_switch(a, i); return; }
+        if (i == start) return;
+    }
+}
 
 /* ===========================================================================
  * Tiny local string helpers (kept independent of libc).
@@ -194,6 +307,10 @@ static int is_dot_entry(const char* name) {
             (name[1] == 0 || (name[1] == '.' && name[2] == 0)));
 }
 
+/* Forward declaration: auto-expand parent dirs of opened file (defined below
+ * rebuild_visible_entries, after the collapse helpers it depends on). */
+static void ide_expand_to_file(Ide* a, const char* file_path);
+
 /* ===========================================================================
  * File loading + focus plumbing (declared in ide.h; called by panels too).
  * ==========================================================================*/
@@ -201,44 +318,70 @@ static int is_dot_entry(const char* name) {
 void ide_open_file(Ide* a, const char* path) {
     if (!a || !path) return;
 
-    /* A built artifact is a PROGRAM, not source: RUN it (SYS_SPAWN) rather than load
-     * its binary bytes into the text editor (which showed garbage -- the user's "the
-     * elfs don't open" complaint). Both the explorer click/Enter and the post-build
-     * reveal route through here, so double-clicking a .elf now launches it. */
+    /* A built artifact is a PROGRAM, not source: RUN it (SYS_SPAWN). */
     if (ends_with_dot_elf(path)) {
         ide_sc(16 /* SYS_SPAWN */, (long)path, 0, 0, 0, 0, 0);
         return;
     }
 
+    /* Multi-file tab integration: if the file is already open in a tab, switch
+     * to it. Otherwise save the current tab and create a new one. */
+    {
+        int existing = tab_find(a, path);
+        if (existing >= 0) {
+            ide_tab_switch(a, existing);
+            ide_expand_to_file(a, path);
+            return;
+        }
+        tab_save_active(a);
+        int slot = tab_alloc(a);
+        if (slot < 0) {
+            /* All tabs full: reuse the active slot. */
+            slot = a->tab_active;
+            if (slot < 0) slot = 0;
+            if (!a->tabs[slot].used) { a->tabs[slot].used = 1; a->tab_count++; }
+        }
+        a->tab_active = slot;
+        ide_strlcpy(a->tabs[slot].path, path, IDE_PATH);
+    }
+
     int n = ide_read_file(path, a->src, IDE_SRC_CAP);
     if (n < 0) n = 0;                 /* clamp errors to an empty buffer   */
     if (n > IDE_SRC_CAP) n = IDE_SRC_CAP;
+
+    /* Binary content guard: scan the first 256 bytes (or the whole file if
+     * shorter) for NUL characters. Text files never contain NUL; ELF headers,
+     * .o relocatables, and other binary formats do. When detected, replace the
+     * buffer with a clear message instead of showing raw binary garbage. */
+    {
+        int probe = n < 256 ? n : 256;
+        int is_bin = 0;
+        for (int i = 0; i < probe; i++) {
+            if (a->src[i] == '\0') { is_bin = 1; break; }
+        }
+        if (is_bin) {
+            const char* msg = "(binary file -- cannot display in the editor)";
+            int ml = 0; while (msg[ml]) ml++;
+            for (int i = 0; i < ml && i < IDE_SRC_CAP; i++) a->src[i] = msg[i];
+            n = ml < IDE_SRC_CAP ? ml : IDE_SRC_CAP;
+        }
+    }
+
     a->src_len = n;
 
     ide_strlcpy(a->cur_file, path, IDE_PATH);
 
     model_parse(&a->model, a->src, a->src_len, path);
-    /* Default focus = the "richest" function (most reads+writes+calls) so the
-     * map opens on the most interesting node instead of the first declaration. */
-    a->model.focus = 0;
-    a->focus_func  = 0;
-    if (a->model.nfuncs <= 0) {
-        a->model.focus = -1;
-        a->focus_func  = 0;
-    } else {
-        int best = 0, best_score = -1;
-        for (int i = 0; i < a->model.nfuncs; i++) {
-            Func* f = &a->model.funcs[i];
-            int score = f->nreads + f->nwrites + f->ncalls;
-            if (score > best_score) { best_score = score; best = i; }
-        }
-        a->model.focus = best;
-        a->focus_func  = best;
-    }
+    /* Default focus = overview (all elements visible as LEGO tiles).
+     * The user clicks a function tile to drill into the dependency graph. */
+    a->model.focus = -1;
+    a->focus_func  = -1;
+    a->prev_focus  = -1;
     model_analyze(&a->model);
 
     /* Reset per-file view state so we don't keep a stale scroll/pan. */
     a->code_scroll      = 0;
+    a->codeview_focus   = 0;   /* code view starts unfocused on a new file */
     a->inspector_scroll = 0;
     a->funcs_scroll     = 0;
     a->map_ox = 0;
@@ -247,18 +390,28 @@ void ide_open_file(Ide* a, const char* path) {
 
     /* Reset the editable editor's caret/scroll/dirty for the new file. */
     ide_editor_reset(a);
+
+    /* Sync the new tab's metadata with what we just loaded. */
+    tab_save_active(a);
+
+    /* Auto-expand parent directories so the opened file is visible in the
+     * explorer tree, and scroll/select its row. */
+    ide_expand_to_file(a, path);
 }
 
 void ide_set_focus(Ide* a, int func_idx) {
     if (!a) return;
+    a->flow_step_focus = -1;          /* a focus change clears any runtime-flow trace */
+    a->map_selected    = -1;          /* ...and any map-node selection (satellites change) */
     int n = a->model.nfuncs;
     if (n <= 0) {                     /* nothing to focus                  */
-        a->focus_func  = 0;
+        a->focus_func  = -1;
         a->model.focus = -1;
         model_analyze(&a->model);
         return;
     }
-    if (func_idx < 0)   func_idx = 0;
+    /* func_idx == -1 => go to overview (no function focused) */
+    if (func_idx < -1)  func_idx = -1;
     if (func_idx >= n)  func_idx = n - 1;
     a->focus_func  = func_idx;
     a->model.focus = func_idx;
@@ -379,6 +532,54 @@ void rebuild_visible_entries(Ide* a) {
     }
     if (a->explorer_scroll > a->nentries - 1) a->explorer_scroll = a->nentries - 1;
     if (a->explorer_scroll < 0) a->explorer_scroll = 0;
+}
+
+/* Auto-expand parent directories so `file_path` is visible in the tree.
+ * Walks the path from root to leaf, un-collapsing every ancestor directory
+ * that is currently collapsed, then rebuilds the visible tree and scrolls
+ * the target entry into view. Called after ide_open_file so the newly opened
+ * file is always visible in the explorer. */
+static void ide_expand_to_file(Ide* a, const char* file_path) {
+    if (!a || !file_path || !file_path[0]) return;
+
+    /* Build each ancestor prefix of file_path and ensure it is NOT in the
+     * collapsed set. For "/usr/src/game/main.c" we check "/usr", "/usr/src",
+     * "/usr/src/game" -- skipping the leaf (the file itself). */
+    int plen = ide_strlen(file_path);
+    int changed = 0;
+    for (int i = 1; i < plen; i++) {
+        if (file_path[i] == '/') {
+            /* Extract prefix [0..i) */
+            char prefix[IDE_PATH];
+            int j;
+            for (j = 0; j < i && j < IDE_PATH - 1; j++)
+                prefix[j] = file_path[j];
+            prefix[j] = 0;
+
+            /* If this directory is collapsed, un-collapse it */
+            if (ide_is_collapsed(a, prefix)) {
+                ide_toggle_collapsed(a, prefix);
+                changed = 1;
+            }
+        }
+    }
+
+    if (changed)
+        rebuild_visible_entries(a);
+
+    /* Now find the file in the visible entries and select + scroll to it. */
+    for (int i = 0; i < a->nentries; i++) {
+        if (ide_streq(a->entries[i].path, file_path)) {
+            a->sel_entry = i;
+            /* Scroll so the file is visible, centered-ish in the panel. */
+            int vis_approx = 12;  /* conservative; actual depends on panel size */
+            int target_scroll = i - vis_approx / 3;
+            if (target_scroll < 0) target_scroll = 0;
+            if (target_scroll > a->nentries - 1) target_scroll = a->nentries - 1;
+            a->explorer_scroll = target_scroll;
+            break;
+        }
+    }
 }
 
 /* Re-scan the project (fully expanded) and reveal a build artifact: select the
@@ -618,6 +819,15 @@ static void init(Ide* a) {
     ide_strlcpy(a->root, "/usr/src", IDE_PATH);
     a->prev_focus = 0;
 
+    /* Load the editable "complex" library from /usr/lib/snippets (extends the
+     * built-in core). Non-fatal if the dir is absent. */
+    lib_load_disk(a);
+
+    /* Initialize multi-file tab state. */
+    a->tab_count = 0;
+    a->tab_active = -1;
+    for (int ti = 0; ti < IDE_MAX_TABS; ti++) a->tabs[ti].used = 0;
+
     scan_project(a);
 
     /* Pick a friendly starting file: prefer "tower.c" (small + parser-safe);
@@ -644,19 +854,22 @@ static void init(Ide* a) {
         a->cur_file[0] = 0;
         model_parse(&a->model, a->src, 0, "");
         a->model.focus = -1;
-        a->focus_func = 0;
+        a->focus_func = -1;
         model_analyze(&a->model);
     }
 
     a->viz = VIZ_MAP;
     a->insp_tab = 2;                  /* PORTS                              */
+    a->flow_step_focus = -1;          /* no runtime-flow step traced yet     */
+    a->map_selected = -1;             /* no map node selected yet            */
     a->map_zoom = 100;                /* 100% zoom initially                 */
 
     /* ---- EDITOR workspace defaults (this is the default face) ---- */
     a->ws = WS_EDITOR;
     a->btab = BTAB_TERMINAL;
-    a->bottom_h = 200;                /* initial bottom-dock height (px)     */
+    a->bottom_h = 8 * GFX_FH;         /* initial bottom-dock height (~8 rows / ~150px) */
     a->term_focus = 0;                /* editor has keys initially           */
+    a->zen_mode = 0;                  /* zen mode off initially              */
     a->explorer_focused = 0;          /* explorer unfocused initially        */
     a->goto_active = 0;               /* go-to-line inactive initially       */
     a->goto_len = 0;
@@ -664,6 +877,11 @@ static void init(Ide* a) {
     a->editor.focused = 1;
     ide_editor_reset(a);
     ide_term_init(&a->term, a->root); /* terminal starts in the project root */
+
+    /* Apply persisted Settings knobs LAST (they override the hardcoded defaults
+     * above) and before the first layout(), so saved zoom/flags take effect with
+     * no first-frame flash. Safe + silent if no config file exists yet. */
+    ide_config_load();
 }
 
 /* ===========================================================================
@@ -779,6 +997,7 @@ static void layout(Ide* a, wl_window* win) {
  * ==========================================================================*/
 
 #define E_BTAB_H   (ROW_H + 4)        /* bottom tab strip height */
+#define E_TOOLBAR_H (ROW_H + 4)      /* editor toolbar height   */
 
 static void layout_editor(Ide* a, wl_window* win) {
     int W = (int)win->w;
@@ -788,14 +1007,42 @@ static void layout_editor(Ide* a, wl_window* win) {
     a->r_topbar.x = 0;  a->r_topbar.y = 0;  a->r_topbar.w = W;  a->r_topbar.h = TOPBAR_H;
     a->r_status.x = 0;  a->r_status.y = H - STATUS_H;  a->r_status.w = W;  a->r_status.h = STATUS_H;
 
-    int work_top = TOPBAR_H;
+    /* Toolbar sits immediately below the top bar. */
+    a->r_e_toolbar.x = 0;  a->r_e_toolbar.y = TOPBAR_H;
+    a->r_e_toolbar.w = W;  a->r_e_toolbar.h = E_TOOLBAR_H;
+
+    /* File tab bar: one row below the toolbar when tabs are open. */
+    int ftab_h = (a->tab_count > 0) ? (ROW_H + 2) : 0;
+
+    int work_top = TOPBAR_H + E_TOOLBAR_H + ftab_h;
     int work_bottom = H - STATUS_H;
     int work_h = work_bottom - work_top;
     if (work_h < 0) work_h = 0;
 
-    /* Left file tree: LEFT_W but never more than ~30% of a wide window. */
+    a->r_e_filetabs.x = 0;  a->r_e_filetabs.y = TOPBAR_H + E_TOOLBAR_H;
+    a->r_e_filetabs.w = W;  a->r_e_filetabs.h = ftab_h;
+
+    /* Zen mode (Ctrl+Shift+E): hide file tree and bottom panel entirely,
+     * giving the editor the full window width minus only topbar/toolbar/status. */
+    if (a->zen_mode) {
+        a->r_e_tree.x = 0; a->r_e_tree.y = work_top;
+        a->r_e_tree.w = 0; a->r_e_tree.h = 0;
+
+        a->r_e_editor.x = 0;  a->r_e_editor.y = work_top;
+        a->r_e_editor.w = W;  a->r_e_editor.h = work_h;
+
+        a->r_e_btabs.x = 0;  a->r_e_btabs.y = work_top + work_h;
+        a->r_e_btabs.w = 0;  a->r_e_btabs.h = 0;
+
+        a->r_e_bottom.x = 0; a->r_e_bottom.y = work_top + work_h;
+        a->r_e_bottom.w = 0; a->r_e_bottom.h = 0;
+        return;
+    }
+
+    /* Left file tree: LEFT_W but never more than ~22% of the window so the
+     * editor gets the lion's share on 1280x800 (~200px tree, ~800px editor). */
     int tree_w = LEFT_W;
-    int max_tree = (W * 30) / 100;
+    int max_tree = (W * 22) / 100;
     if (tree_w > max_tree) tree_w = max_tree;
     if (tree_w > W) tree_w = W;
     if (tree_w < 0) tree_w = 0;
@@ -808,9 +1055,10 @@ static void layout_editor(Ide* a, wl_window* win) {
     int right_w = W - tree_w;
     if (right_w < 0) right_w = 0;
 
-    /* Clamp bottom-dock height to [E_BTAB_H+GFX_FH, 60% of work_h]. */
+    /* Bottom dock: cap at 40% (was 60%) so the editor keeps more vertical
+     * space on 1280x800. Default bottom_h (~150px) yields ~8 lines of output. */
     int bh = a->bottom_h;
-    int max_bh = (work_h * 60) / 100;
+    int max_bh = (work_h * 40) / 100;
     int min_bh = E_BTAB_H + GFX_FH;     /* at least the tab strip + one row */
     if (bh > max_bh) bh = max_bh;
     if (bh < min_bh) bh = min_bh;
@@ -838,7 +1086,7 @@ static void layout_editor(Ide* a, wl_window* win) {
  * card geometry is recomputed from the live window size so it always centers.
  * ==========================================================================*/
 
-#define NP_CARD_W   360
+#define NP_CARD_W   (40 * GFX_FW)   /* ~40 chars wide, scales with font */
 #define NP_ROW_H    ROW_H
 
 /* Compute the centered card rect for the current window size. */
@@ -1015,13 +1263,13 @@ static void render_center_top(Ide* a, Canvas* cv) {
         return;
     }
     switch (a->viz) {
-    case VIZ_INSPECTOR: {
-        int saved = a->insp_tab;
-        a->insp_tab = INSP_SYNTAX;            /* enlarged inspector / AST   */
+    case VIZ_INSPECTOR:
+        /* Interactive inspector: render whatever sub-tab the user selected
+         * (SYN/CAT/PORT/CONN/INFO). Previously this force-set INSP_SYNTAX every
+         * frame which -- together with the matching force in the click router --
+         * made the sub-tabs impossible to switch (every click was reverted). */
         panel_inspector(a, cv, a->r_map);
-        a->insp_tab = saved;
         break;
-    }
     case VIZ_RUNTIME:
         panel_runtime(a, cv, a->r_map);
         break;
@@ -1033,6 +1281,9 @@ static void render_center_top(Ide* a, Canvas* cv) {
         a->insp_tab = saved;
         break;
     }
+    case VIZ_SETTINGS:
+        panel_settings(a, cv, a->r_map);      /* knobs & switches (VIZ-6)   */
+        break;
     case VIZ_MAP:
     default:
         panel_map(a, cv, a->r_map);
@@ -1141,6 +1392,12 @@ static void editor_btabs(Ide* a, Canvas* cv, Rect r) {
             gfx_fill(cv, x - GFX_FW / 2, r.y + 1, tw, r.h - 1, TH_PANEL2);
             gfx_hline(cv, x - GFX_FW / 2, r.y + 1, tw, TH_BLUE);
         }
+        /* Flash the BUILD tab green/red briefly after a build completes. */
+        if (i == 1 /* BTAB_BUILD */) {
+            uint32_t fc = ide_build_flash_color();
+            if (fc)
+                gfx_blend(cv, x - GFX_FW / 2, r.y + 1, tw, r.h - 1, fc);
+        }
         gfx_text_clip(cv, x, ty, E_BTAB_LABEL[i],
                       active ? TH_TEXT : TH_TEXT_DIM, r.x, r.w);
         x += tw + GFX_FW;
@@ -1175,41 +1432,343 @@ static void editor_bottom(Ide* a, Canvas* cv, Rect r) {
     }
 }
 
-/* Slim status bar for the editor workspace. */
+/* Slim status bar for the editor workspace. Shows Ln/Col, file name, lines,
+ * dirty state, and a right-aligned shortcut legend. */
 static void editor_status(Ide* a, Canvas* cv, Rect r) {
     gfx_fill(cv, r.x, r.y, r.w, r.h, TH_HEADER);
     gfx_hline(cv, r.x, r.y, r.w, TH_BORDER);
     int ty = r.y + (r.h - GFX_FH) / 2;
     int x = r.x + PAD;
+    int clip_x0 = r.x + PAD;
     int clip_w = r.w - 2 * PAD;
+    int compact = (r.w < 80 * GFX_FW);   /* compact at narrow widths */
 
-    /* lines */
-    gfx_text_clip(cv, x, ty, "LINES:", TH_TEXT_DIM, x, clip_w);
-    x += gfx_textw("LINES:") + GFX_FW;
-    { char nb[16]; int n = ide_itoa(a->model.total_lines, nb); nb[n] = 0;
-      gfx_text_clip(cv, x, ty, nb, TH_TEXT_DIM, r.x + PAD, clip_w);
-      x += n * GFX_FW + 2 * GFX_FW; }
-
-    /* dirty/saved */
-    if (ide_editor_dirty(a)) {
-        gfx_text_clip(cv, x, ty, "UNSAVED", TH_ORANGE, r.x + PAD, clip_w);
-        x += gfx_textw("UNSAVED") + 2 * GFX_FW;
-    } else {
-        gfx_text_clip(cv, x, ty, "SAVED", TH_GREEN, r.x + PAD, clip_w);
-        x += gfx_textw("SAVED") + 2 * GFX_FW;
+    /* Ln, Col -- compact: "42:8" */
+    {
+        char lc[40]; int p = 0;
+        char nb[16]; int nn;
+        if (compact) {
+            nn = ide_itoa(a->editor.caret_line + 1, nb);
+            for (int i = 0; i < nn; i++) lc[p++] = nb[i];
+            lc[p++] = ':';
+            nn = ide_itoa(a->editor.caret_col + 1, nb);
+            for (int i = 0; i < nn; i++) lc[p++] = nb[i];
+        } else {
+            lc[p++] = 'L'; lc[p++] = 'n'; lc[p++] = ' ';
+            nn = ide_itoa(a->editor.caret_line + 1, nb);
+            for (int i = 0; i < nn; i++) lc[p++] = nb[i];
+            lc[p++] = ','; lc[p++] = ' ';
+            lc[p++] = 'C'; lc[p++] = 'o'; lc[p++] = 'l'; lc[p++] = ' ';
+            nn = ide_itoa(a->editor.caret_col + 1, nb);
+            for (int i = 0; i < nn; i++) lc[p++] = nb[i];
+        }
+        lc[p] = 0;
+        gfx_text_clip(cv, x, ty, lc, TH_TEXT, clip_x0, clip_w);
+        x += gfx_textw(lc) + 2 * GFX_FW;
     }
 
-    /* right-aligned shortcut legend */
-    const char* leg = "Ctrl+N new  B build  R run  S save  F find  H replace  E map";
-    int lw = gfx_textw(leg);
-    int lx = r.x + r.w - PAD - lw;
-    if (lx > x) gfx_text_clip(cv, lx, ty, leg, TH_TEXT_FAINT, x, clip_w);
+    /* current file name (basename only for brevity) */
+    if (a->cur_file[0]) {
+        const char* base = a->cur_file;
+        for (const char* p = a->cur_file; *p; p++)
+            if (*p == '/') base = p + 1;
+        gfx_text_clip(cv, x, ty, base, TH_TEXT_DIM, clip_x0, clip_w);
+        x += gfx_textw(base) + 2 * GFX_FW;
+    }
+
+    /* dirty/saved -- compact: "*" or "-" */
+    if (compact) {
+        const char* ind = ide_editor_dirty(a) ? "*" : "-";
+        uint32_t col = ide_editor_dirty(a) ? TH_ORANGE : TH_GREEN;
+        gfx_text_clip(cv, x, ty, ind, col, clip_x0, clip_w);
+        x += gfx_textw(ind) + GFX_FW;
+    } else {
+        if (ide_editor_dirty(a)) {
+            gfx_text_clip(cv, x, ty, "UNSAVED", TH_ORANGE, clip_x0, clip_w);
+            x += gfx_textw("UNSAVED") + 2 * GFX_FW;
+        } else {
+            gfx_text_clip(cv, x, ty, "SAVED", TH_GREEN, clip_x0, clip_w);
+            x += gfx_textw("SAVED") + 2 * GFX_FW;
+        }
+    }
+
+    /* lines -- skip in compact mode to save horizontal space */
+    if (!compact) {
+        gfx_text_clip(cv, x, ty, "LINES:", TH_TEXT_DIM, clip_x0, clip_w);
+        x += gfx_textw("LINES:") + GFX_FW;
+        { extern int ed_line_count(const char* src, int len);
+          int live_lines = ed_line_count(a->src, a->src_len);
+          char nb[16]; int n = ide_itoa(live_lines, nb); nb[n] = 0;
+          gfx_text_clip(cv, x, ty, nb, TH_TEXT_DIM, clip_x0, clip_w);
+          x += n * GFX_FW + 2 * GFX_FW; }
+    }
+
+    /* Zen mode indicator */
+    if (a->zen_mode) {
+        gfx_text_clip(cv, x, ty, "ZEN", TH_PURPLE, clip_x0, clip_w);
+        x += gfx_textw("ZEN") + GFX_FW;
+    }
+
+    /* right-aligned shortcut legend -- omit in compact mode */
+    if (!compact) {
+        const char* leg = "^S save ^B build ^F find ^Tab tab ^` term";
+        int lw = gfx_textw(leg);
+        int lx = r.x + r.w - PAD - lw;
+        if (lx > x) gfx_text_clip(cv, lx, ty, leg, TH_TEXT_FAINT, x, clip_w);
+    }
+}
+
+
+/* ===========================================================================
+ * "New File" action: clear the editor buffer for a fresh untitled file.
+ * If the buffer is dirty, auto-save first (no discard dialog in freestanding).
+ * ==========================================================================*/
+static void ide_new_file(Ide* a) {
+    if (a->cur_file[0] && ide_editor_dirty(a))
+        ide_editor_save(a);
+    /* Save the current tab before clearing for the new file. */
+    tab_save_active(a);
+    {
+        int slot = tab_alloc(a);
+        if (slot < 0) { slot = a->tab_active; if (slot < 0) slot = 0;
+            if (!a->tabs[slot].used) { a->tabs[slot].used = 1; a->tab_count++; } }
+        a->tab_active = slot;
+        a->tabs[slot].path[0] = 0;
+    }
+    a->src_len = 0;
+    a->cur_file[0] = 0;
+    model_parse(&a->model, a->src, 0, "");
+    a->model.focus = -1;
+    a->focus_func = -1;
+    model_analyze(&a->model);
+    ide_editor_reset(a);
+    a->editor.focused = 1;
+    /* Dismiss any open overlay prompts so they don't persist over the new file. */
+    a->find_active = 0;
+    a->goto_active = 0;
+}
+
+/* ===========================================================================
+ * Editor toolbar: clickable pill buttons for common actions.
+ * Buttons: [New] [Save] [Build] [Run] | [Find] [Replace] [Go to Ln]
+ * ==========================================================================*/
+typedef struct { const char* label; const char* compact; uint32_t color; } TbBtn;
+static const TbBtn TB_BUTTONS[] = {
+    { "New",       "N", 0xFF54D17Au },
+    { "Save",      "S", 0xFF4D9BE6u },
+    { "Build",     "B", 0xFFE6C24Au },
+    { "Run",       "R", 0xFF49C5D6u },
+    { "Find",      "F", 0xFF8A98AAu },
+    { "Replace",   "H", 0xFF8A98AAu },
+    { "Go to Ln",  "G", 0xFF8A98AAu },
+};
+#define TB_NBUTTONS ((int)(sizeof(TB_BUTTONS) / sizeof(TB_BUTTONS[0])))
+#define TB_GAP      (GFX_FW)
+#define TB_PAD_X    (GFX_FW)
+#define TB_PILL_H   (GFX_FH + 4)
+
+/* Return 1 if compact mode is needed (full labels don't fit in the toolbar). */
+static int tb_need_compact(Rect r) {
+    int x = r.x + PAD;
+    for (int i = 0; i < TB_NBUTTONS; i++) {
+        int tw = gfx_textw(TB_BUTTONS[i].label) + 2 * TB_PAD_X;
+        x += tw + TB_GAP;
+        if (i == 3) x += TB_GAP;
+    }
+    return (x > r.x + r.w - PAD);
+}
+
+static void tb_btn_geometry(Rect r, int* out_x, int* out_w, int compact) {
+    int x = r.x + PAD;
+    for (int i = 0; i < TB_NBUTTONS; i++) {
+        const char* lbl = compact ? TB_BUTTONS[i].compact : TB_BUTTONS[i].label;
+        int tw = gfx_textw(lbl) + 2 * TB_PAD_X;
+        out_x[i] = x;
+        out_w[i] = tw;
+        x += tw + TB_GAP;
+        if (i == 3) x += TB_GAP;
+    }
+}
+
+static void editor_toolbar(Ide* a, Canvas* cv, Rect r) {
+    if (r.w <= 0 || r.h <= 0) return;
+    gfx_fill(cv, r.x, r.y, r.w, r.h, TH_PANEL);
+    gfx_hline(cv, r.x, r.y + r.h - 1, r.w, TH_BORDER);
+    int ty = r.y + (r.h - GFX_FH) / 2;
+    int pill_y = r.y + (r.h - TB_PILL_H) / 2;
+    int compact = tb_need_compact(r);
+    int bx[TB_NBUTTONS], bw[TB_NBUTTONS];
+    tb_btn_geometry(r, bx, bw, compact);
+    for (int i = 0; i < TB_NBUTTONS; i++) {
+        if (bx[i] + bw[i] > r.x + r.w - PAD) break;
+        int hov = (a->mouse_y >= r.y && a->mouse_y < r.y + r.h &&
+                   a->mouse_x >= bx[i] && a->mouse_x < bx[i] + bw[i]);
+        uint32_t bg = hov ? TH_SELECT : TH_PANEL2;
+        gfx_round(cv, bx[i], pill_y, bw[i], TB_PILL_H, 3, bg);
+        gfx_stroke(cv, bx[i], pill_y, bw[i], TB_PILL_H, TB_BUTTONS[i].color);
+        int tx2 = bx[i] + TB_PAD_X;
+        const char* lbl = compact ? TB_BUTTONS[i].compact : TB_BUTTONS[i].label;
+        gfx_text_clip(cv, tx2, ty, lbl,
+                      hov ? TH_TEXT : TB_BUTTONS[i].color, bx[i], bw[i]);
+    }
+    {
+        const char* hint = compact
+            ? "^S ^B ^R ^F ^H ^G"
+            : "Ctrl: S save  B build  F find  W wrap  M minimap  D multi";
+        int hw = gfx_textw(hint);
+        int hx = r.x + r.w - PAD - hw;
+        int last_r = TB_NBUTTONS > 0 ? bx[TB_NBUTTONS-1] + bw[TB_NBUTTONS-1] + TB_GAP : r.x + PAD;
+        if (hx > last_r)
+            gfx_text_clip(cv, hx, ty, hint, TH_TEXT_FAINT, last_r, r.w);
+    }
+    (void)pill_y;
+}
+
+static int editor_toolbar_click(Ide* a, Rect r, int mx, int my) {
+    if (!rect_hit(r, mx, my)) return 0;
+    int compact = tb_need_compact(r);
+    int bx[TB_NBUTTONS], bw[TB_NBUTTONS];
+    tb_btn_geometry(r, bx, bw, compact);
+    for (int i = 0; i < TB_NBUTTONS; i++) {
+        /* Skip buttons that extend past the visible toolbar (same clip test as
+         * editor_toolbar's render loop) so invisible buttons can't be clicked. */
+        if (bx[i] + bw[i] > r.x + r.w - PAD) break;
+        if (mx >= bx[i] && mx < bx[i] + bw[i]) {
+            switch (i) {
+            case 0: ide_new_file(a); break;
+            case 1: ide_editor_save(a); break;
+            case 2:
+                if (a->cur_file[0] && ide_editor_dirty(a)) ide_editor_save(a);
+                ide_do_build(a); a->btab = BTAB_BUILD; break;
+            case 3: ide_do_run(a); a->btab = BTAB_BUILD; break;
+            case 4:
+                a->find_active = 1; a->find_replace = 0;
+                a->find_len = 0; a->find_buf[0] = '\0'; a->goto_active = 0; break;
+            case 5:
+                a->find_active = 1; a->find_replace = 1; a->find_repl_focus = 0;
+                a->find_len = 0; a->find_buf[0] = '\0';
+                a->repl_len = 0; a->repl_buf[0] = '\0'; a->goto_active = 0; break;
+            case 6:
+                a->goto_active = 1; a->goto_len = 0; a->goto_buf[0] = '\0'; break;
+            }
+            return 1;
+        }
+    }
+    return 1;
+}
+
+/* ===========================================================================
+ * File tab bar: render + click for multi-file tabs.
+ * Renders one tab per open file (basename only). Active tab is highlighted.
+ * Each tab has a close [x] button. Dirty tabs show a dot indicator.
+ * ==========================================================================*/
+
+#define FTAB_CLOSE_W  (GFX_FW + 4)   /* width of the close-x area */
+
+static void editor_filetabs(Ide* a, Canvas* cv, Rect r) {
+    if (r.h <= 0 || r.w <= 0 || a->tab_count <= 0) return;
+    gfx_fill(cv, r.x, r.y, r.w, r.h, TH_PANEL);
+    gfx_hline(cv, r.x, r.y + r.h - 1, r.w, TH_BORDER);
+
+    int ty = r.y + (r.h - GFX_FH) / 2;
+    int x = r.x + PAD;
+    for (int i = 0; i < IDE_MAX_TABS; i++) {
+        if (!a->tabs[i].used) continue;
+        const char* name;
+        int dirty;
+        if (i == a->tab_active) {
+            name = tab_basename(a->cur_file[0] ? a->cur_file : "(new)");
+            dirty = a->editor.dirty;
+        } else {
+            name = a->tabs[i].path[0] ? tab_basename(a->tabs[i].path) : "(new)";
+            dirty = a->tabs[i].editor.dirty;
+        }
+
+        int tw = gfx_textw(name);
+        int dot_w = dirty ? (GFX_FW + 2) : 0;
+        int tab_w = PAD + dot_w + tw + PAD + FTAB_CLOSE_W + PAD;
+        int active = (i == a->tab_active);
+
+        if (x + tab_w > r.x + r.w - PAD) break;
+
+        if (active) {
+            gfx_fill(cv, x, r.y, tab_w, r.h - 1, TH_PANEL2);
+            gfx_hline(cv, x, r.y, tab_w, TH_BLUE);
+        } else {
+            if (a->mouse_y >= r.y && a->mouse_y < r.y + r.h &&
+                a->mouse_x >= x && a->mouse_x < x + tab_w)
+                gfx_fill(cv, x, r.y, tab_w, r.h - 1, TH_HOVER);
+        }
+        gfx_vline(cv, x + tab_w - 1, r.y + 2, r.h - 4, TH_BORDER);
+
+        int tx = x + PAD;
+
+        if (dirty) {
+            int dot_x = tx + GFX_FW / 2 - 2;
+            int dot_y = ty + GFX_FH / 2 - 2;
+            gfx_fill(cv, dot_x, dot_y, 4, 4, TH_ORANGE);
+            tx += GFX_FW + 2;
+        }
+
+        gfx_text_clip(cv, tx, ty, name,
+                      active ? TH_TEXT : TH_TEXT_DIM, x, tab_w);
+        tx += tw;
+
+        int cx = x + tab_w - FTAB_CLOSE_W - PAD / 2;
+        int close_hov = (a->mouse_y >= r.y && a->mouse_y < r.y + r.h &&
+                         a->mouse_x >= cx && a->mouse_x < cx + FTAB_CLOSE_W);
+        if (close_hov)
+            gfx_fill(cv, cx, r.y + 2, FTAB_CLOSE_W, r.h - 5, TH_SELECT);
+        gfx_text_clip(cv, cx + 2, ty, "x",
+                      close_hov ? TH_RED : TH_TEXT_FAINT, cx, FTAB_CLOSE_W);
+
+        x += tab_w;
+    }
+}
+
+static int editor_filetabs_click(Ide* a, Rect r, int mx, int my) {
+    if (!rect_hit(r, mx, my)) return 0;
+    if (a->tab_count <= 0) return 1;
+
+    int x = r.x + PAD;
+    for (int i = 0; i < IDE_MAX_TABS; i++) {
+        if (!a->tabs[i].used) continue;
+        const char* name;
+        int dirty;
+        if (i == a->tab_active) {
+            name = tab_basename(a->cur_file[0] ? a->cur_file : "(new)");
+            dirty = a->editor.dirty;
+        } else {
+            name = a->tabs[i].path[0] ? tab_basename(a->tabs[i].path) : "(new)";
+            dirty = a->tabs[i].editor.dirty;
+        }
+        int tw = gfx_textw(name);
+        int dot_w = dirty ? (GFX_FW + 2) : 0;
+        int tab_w = PAD + dot_w + tw + PAD + FTAB_CLOSE_W + PAD;
+
+        if (x + tab_w > r.x + r.w - PAD) break;
+
+        if (mx >= x && mx < x + tab_w) {
+            int cx = x + tab_w - FTAB_CLOSE_W - PAD / 2;
+            if (mx >= cx && mx < cx + FTAB_CLOSE_W) {
+                ide_tab_close(a, i);
+            } else {
+                ide_tab_switch(a, i);
+            }
+            return 1;
+        }
+        x += tab_w;
+    }
+    return 1;
 }
 
 static void render_editor(Ide* a, Canvas* cv) {
+
     gfx_fill(cv, 0, 0, cv->w, cv->h, TH_BG);
 
     editor_topbar (a, cv, a->r_topbar);
+    editor_toolbar(a, cv, a->r_e_toolbar);    /* action toolbar             */
+    editor_filetabs(a, cv, a->r_e_filetabs);  /* open file tabs             */
     panel_explorer(a, cv, a->r_e_tree);       /* reuse the project tree     */
     ide_editor_render(a, cv, a->r_e_editor);  /* the editable editor        */
     editor_btabs  (a, cv, a->r_e_btabs);
@@ -1218,24 +1777,25 @@ static void render_editor(Ide* a, Canvas* cv) {
 
     render_newproj(a, cv);                     /* modal overlay (if open)    */
 
-    /* Go-to-line prompt overlay (bottom-center, inline) */
+    /* Go-to-line prompt overlay (bottom-center, inline).
+     * Dimensions derived from the runtime font cell so the prompt scales. */
     if (a->goto_active) {
-        int prompt_w = 200;
-        int prompt_h = 30;
+        int prompt_w = 22 * GFX_FW;           /* ~22 chars wide        */
+        int prompt_h = GFX_FH + 2 * PAD;      /* one row + padding     */
         int px = (cv->w - prompt_w) / 2;
-        int py = cv->h - 60;  /* 60px from bottom */
+        int py = cv->h - STATUS_H - prompt_h - PAD;
 
         /* Background box */
         gfx_fill(cv, px, py, prompt_w, prompt_h, TH_PANEL2);
         gfx_stroke(cv, px, py, prompt_w, prompt_h, TH_CYAN);
 
         /* Prompt text */
-        int tx = px + 8;
+        int tx = px + PAD;
         int ty = py + (prompt_h - GFX_FH) / 2;
         gfx_text(cv, tx, ty, "Go to line:", TH_TEXT);
 
         /* User input */
-        int input_x = tx + 11 * GFX_FW + 8;
+        int input_x = tx + gfx_textw("Go to line:") + GFX_FW;
         gfx_text(cv, input_x, ty, a->goto_buf, TH_GREEN);
 
         /* Blinking cursor */
@@ -1249,37 +1809,38 @@ static void render_editor(Ide* a, Canvas* cv) {
 
     /* Find (Ctrl+F) / Find&Replace (Ctrl+H) overlay. One row for find (+ ok/no);
      * a second row for the replacement in replace mode. The focused field's label
-     * is accent-coloured. The match is highlighted in the editor body. */
+     * is accent-coloured. The match is highlighted in the editor body.
+     * All dimensions derived from the runtime font cell so the prompt scales. */
     if (a->find_active) {
         int rows = a->find_replace ? 2 : 1;
-        int prompt_w = 420;
-        int row_h = 26;
-        int prompt_h = rows * row_h + 8;
+        int prompt_w = 46 * GFX_FW;           /* ~46 chars wide        */
+        int row_h = GFX_FH + PAD;             /* one text row + pad    */
+        int prompt_h = rows * row_h + PAD + 2;
         int px = (cv->w - prompt_w) / 2;
-        int py = cv->h - 40 - prompt_h;
+        int py = cv->h - STATUS_H - prompt_h - PAD;
         gfx_fill  (cv, px, py, prompt_w, prompt_h, TH_PANEL2);
         gfx_stroke(cv, px, py, prompt_w, prompt_h, TH_BLUE);
-        int tx = px + 8;
+        int tx = px + PAD;
         int input_x = tx + 8 * GFX_FW;
         int hint_w  = 4 * GFX_FW;
-        int avail   = (px + prompt_w - 8 - hint_w) - input_x;
+        int avail   = (px + prompt_w - PAD - hint_w) - input_x;
         /* row 0: Find */
-        int ty0 = py + 4 + (row_h - GFX_FH) / 2;
+        int ty0 = py + PAD / 2 + (row_h - GFX_FH) / 2;
         int find_foc = !(a->find_replace && a->find_repl_focus);
         gfx_text(cv, tx, ty0, "Find:", find_foc ? TH_BLUE : TH_TEXT_DIM);
         if (avail > 0) gfx_text_clip(cv, input_x, ty0, a->find_buf, TH_GREEN, input_x, avail);
         if (a->find_len > 0) {
             int has = (a->editor.sel_anchor_off >= 0);
-            gfx_text(cv, px + prompt_w - 8 - hint_w, ty0, has ? "ok" : "no",
+            gfx_text(cv, px + prompt_w - PAD - hint_w, ty0, has ? "ok" : "no",
                      has ? TH_GREEN : TH_ORANGE);
         }
         /* row 1: Replace (replace mode only) */
         if (a->find_replace) {
-            int ty1 = py + 4 + row_h + (row_h - GFX_FH) / 2;
+            int ty1 = py + PAD / 2 + row_h + (row_h - GFX_FH) / 2;
             int repl_foc = a->find_repl_focus;
             gfx_text(cv, tx, ty1, "Repl:", repl_foc ? TH_BLUE : TH_TEXT_DIM);
             if (avail > 0) gfx_text_clip(cv, input_x, ty1, a->repl_buf, TH_CYAN, input_x, avail);
-            gfx_text(cv, px + prompt_w - 8 - 8 * GFX_FW, ty1, "Tab/Ent", TH_TEXT_FAINT);
+            gfx_text(cv, px + prompt_w - PAD - 8 * GFX_FW, ty1, "Tab/Ent", TH_TEXT_FAINT);
         }
     }
 }
@@ -1294,23 +1855,28 @@ static void render_editor(Ide* a, Canvas* cv) {
  * with the pixels on screen, then restored). */
 static void route_center_top_click(Ide* a, int mx, int my) {
     switch (a->viz) {
-    case VIZ_INSPECTOR: {
-        int saved = a->insp_tab;
-        a->insp_tab = INSP_SYNTAX;
+    case VIZ_INSPECTOR:
+        /* Let the inspector's own click handler switch its sub-tab / select a
+         * row. (No more force-to-SYNTAX + restore, which silently ate the
+         * SYN/CAT/PORT/CONN/INFO tab clicks the user reported.) */
         panel_inspector_click(a, a->r_map, mx, my);
-        a->insp_tab = saved;
         break;
-    }
     case VIZ_ACTIONS:
     case VIZ_POTENTIALS: {
+        /* ACTIONS/POTENTIALS are the DETAILS view; force DETAILS only for the
+         * duration of the hit-test so the [APPLY] buttons line up, but if the
+         * user clicked a sub-tab honor it (don't blindly revert). */
         int saved = a->insp_tab;
         a->insp_tab = INSP_DETAILS;
         panel_inspector_click(a, a->r_map, mx, my);
-        a->insp_tab = saved;
+        if (a->insp_tab == INSP_DETAILS) a->insp_tab = saved;  /* no tab clicked */
         break;
     }
     case VIZ_RUNTIME:
-        /* runtime has no interactive handler */
+        panel_runtime_click(a, a->r_map, mx, my);
+        break;
+    case VIZ_SETTINGS:
+        panel_settings_click(a, a->r_map, mx, my, 0);   /* phase 0: grab/toggle */
         break;
     case VIZ_MAP:
     default:
@@ -1325,6 +1891,10 @@ static void route_click(Ide* a, int mx, int my) {
     /* (g_build_view is cleared in the LEGO pointer-press branch before this is
      * reached, so any click dismisses the transient BUILD overlay -- see the
      * TAB-TRAP FIX comment in the event loop.) */
+    /* Any click in the LEGO workspace drops code-view keyboard focus first; a
+     * click landing in r_code re-takes it via panel_code_click below. This frees
+     * the arrow keys for map navigation when the user clicks elsewhere. */
+    a->codeview_focus = 0;
     if (panel_topbar_click(a, a->r_topbar, mx, my)) return;
 
     if (rect_hit(a->r_explorer, mx, my)) {
@@ -1343,7 +1913,18 @@ static void route_click(Ide* a, int mx, int my) {
         panel_inspector_click(a, a->r_inspector, mx, my);
         return;
     }
-    /* code / runtime / status: no interactive handler for v1. */
+    if (rect_hit(a->r_runtime, mx, my)) {
+        /* the persistent bottom RUNTIME-FLOW strip: click a step to trace it
+         * and cross-focus the corresponding function in the map. */
+        panel_runtime_click(a, a->r_runtime, mx, my);
+        return;
+    }
+    if (rect_hit(a->r_code, mx, my)) {
+        /* code view is now editable: place the caret + take keyboard focus */
+        panel_code_click(a, a->r_code, mx, my, g_shift_down);
+        return;
+    }
+    /* status: no interactive handler. */
 }
 
 /* Hit-test the two workspace tabs in the top bar; switch a->ws if clicked.
@@ -1387,6 +1968,8 @@ static int editor_btabs_click(Ide* a, Rect r, int mx, int my) {
 /* Route a left-button press in the EDITOR workspace. */
 static void route_click_editor(Ide* a, int mx, int my) {
     if (editor_topbar_click(a, a->r_topbar, mx, my)) return;
+    if (editor_toolbar_click(a, a->r_e_toolbar, mx, my)) return;
+    if (editor_filetabs_click(a, a->r_e_filetabs, mx, my)) return;
 
     if (rect_hit(a->r_e_tree, mx, my)) {
         /* The tree uses the same explorer panel. If clicking a file, open it
@@ -1411,16 +1994,19 @@ static void route_click_editor(Ide* a, int mx, int my) {
         a->term_focus = 0;
         a->explorer_focused = 0;
         a->editor.focused = 1;
-        ide_editor_click(a, a->r_e_editor, mx, my);
+        ide_editor_click(a, a->r_e_editor, mx, my, g_shift_down);
         return;
     }
     if (editor_btabs_click(a, a->r_e_btabs, mx, my)) return;
     if (rect_hit(a->r_e_bottom, mx, my)) {
-        /* clicking the bottom dock body focuses the terminal (when shown) */
         if (a->btab == BTAB_TERMINAL) {
+            /* clicking the terminal body focuses it */
             a->term_focus = 1;
             a->explorer_focused = 0;
             a->editor.focused = 0;
+        } else if (a->btab == BTAB_BUILD) {
+            /* click-to-jump: clicking a diagnostic row jumps the editor there */
+            panel_build_click(a, a->r_e_bottom, mx, my);
         }
         return;
     }
@@ -1434,8 +2020,16 @@ static void scroll_under_mouse(Ide* a, int delta, int horizontal) {
     int* target = 0;
 
     /* Center-top region: pan the map (only meaningful for VIZ_MAP, but panning
-     * the offsets is harmless for the other tabs). */
+     * the offsets is harmless for the other tabs). The SETTINGS view (VIZ-6)
+     * scrolls its knob list (inspector_scroll, in px) instead of panning. */
     if (rect_hit(a->r_map, mx, my)) {
+        if (a->viz == VIZ_SETTINGS) {
+            if (!horizontal) {
+                a->inspector_scroll += delta * ROW_H;
+                if (a->inspector_scroll < 0) a->inspector_scroll = 0;
+            }
+            return;
+        }
         if (horizontal) a->map_ox += delta * MAP_PAN_STEP;
         else            a->map_oy += delta * MAP_PAN_STEP;
         return;
@@ -1463,7 +2057,21 @@ static void scroll_under_mouse(Ide* a, int delta, int horizontal) {
 
 /* Shared Ctrl-chord actions available in BOTH workspaces. Returns 1 if the
  * chord was handled. Modifier state is already tracked in g_ctrl_down. */
+/* True when keystrokes should drive the shared text editor: the EDITOR
+ * workspace with the editor focused, OR the LEGO workspace with the code view
+ * focused (Phase 2: code in every view). Lets the core editing chords (undo,
+ * copy/cut/paste, select-all, dup/delete-line) work in both places. */
+static int ed_input_active(Ide* a) {
+    return (a->ws == WS_EDITOR && a->editor.focused) ||
+           (a->ws == WS_LEGO   && a->codeview_focus);
+}
+
 static int handle_ctrl_chord(Ide* a, int keycode) {
+    /* Dismiss autocomplete popup on any Ctrl chord -- Ctrl+S (save), Ctrl+B
+     * (build), etc. should not leave the popup visible. The editor's own key
+     * handler never sees Ctrl chords (they are consumed here), so the popup
+     * must be cleared here rather than in ide_editor_key. */
+    a->editor.ac_active = 0;
     switch (keycode) {
     case KEY_N:               /* Ctrl+N: open the New Project templates picker */
         np_open(a);
@@ -1475,7 +2083,7 @@ static int handle_ctrl_chord(Ide* a, int keycode) {
         gfx_set_scale(g_ui_pct - 25);
         return 1;
     case KEY_0:               /* Ctrl+0 : reset the IDE text zoom to the default */
-        gfx_set_scale(120);
+        gfx_set_scale(130);
         return 1;
     case KEY_B:               /* Ctrl+B: build the open file */
         /* Build what's on screen: flush unsaved editor edits to disk first so
@@ -1495,17 +2103,32 @@ static int handle_ctrl_chord(Ide* a, int keycode) {
     case KEY_S:               /* Ctrl+S: save (editor) */
         ide_editor_save(a);
         return 1;
-    case KEY_A:               /* Ctrl+A: select all (editor) */
-        if (a->ws == WS_EDITOR && a->editor.focused) ide_editor_select_all(a);
+    case KEY_A:               /* Ctrl+A: select all (editor / code view) */
+        if (ed_input_active(a)) ide_editor_select_all(a);
         return 1;
-    case KEY_C:               /* Ctrl+C: copy selection / current line (editor) */
-        if (a->ws == WS_EDITOR && a->editor.focused) ide_editor_copy(a);
+    case KEY_C:               /* Ctrl+C: copy selection / current line */
+        if (ed_input_active(a)) ide_editor_copy(a);
         return 1;
-    case KEY_X:               /* Ctrl+X: cut selection / current line (editor) */
-        if (a->ws == WS_EDITOR && a->editor.focused) ide_editor_cut(a);
+    case KEY_X:               /* Ctrl+X: cut selection / current line */
+        if (ed_input_active(a)) ide_editor_cut(a);
         return 1;
-    case KEY_V:               /* Ctrl+V: paste (editor) */
-        if (a->ws == WS_EDITOR && a->editor.focused) ide_editor_paste(a);
+    case KEY_V:               /* Ctrl+V: paste */
+        if (ed_input_active(a)) ide_editor_paste(a);
+        return 1;
+    case KEY_Z:               /* Ctrl+Z: undo  /  Ctrl+Shift+Z: redo */
+        if (ed_input_active(a)) {
+            if (g_shift_down) ide_editor_redo(a);
+            else              ide_editor_undo(a);
+        }
+        return 1;
+    case KEY_Y:               /* Ctrl+Y: redo */
+        if (ed_input_active(a)) ide_editor_redo(a);
+        return 1;
+    case KEY_COMMA:           /* Ctrl+, : open the Settings panel (VIZ-6) */
+        a->ws  = WS_LEGO;
+        a->viz = VIZ_SETTINGS;
+        a->codeview_focus = 0;
+        g_build_view = 0;
         return 1;
     case KEY_F:               /* Ctrl+F: open the find prompt (editor) */
         if (a->ws == WS_EDITOR) {
@@ -1533,30 +2156,55 @@ static int handle_ctrl_chord(Ide* a, int keycode) {
             a->goto_buf[0] = '\0';
         }
         return 1;
-    case KEY_D:               /* Ctrl+D: duplicate line (editor only) */
-        if (a->ws == WS_EDITOR && a->editor.focused)
-            ide_editor_duplicate_line(a);
+    case KEY_D:               /* Ctrl+D: multi-cursor (with selection) or duplicate line */
+        if (ed_input_active(a))
+            ide_editor_multi_cursor_add(a);
         return 1;
-    case KEY_K:               /* Ctrl+Shift+K: delete line (editor only) */
-        if (g_shift_down && a->ws == WS_EDITOR && a->editor.focused)
+    case KEY_K:               /* Ctrl+Shift+K: delete line */
+        if (g_shift_down && ed_input_active(a))
             ide_editor_delete_line(a);
         return 1;
-    case KEY_E:               /* Ctrl+E: toggle workspace */
-        a->ws = (a->ws == WS_EDITOR) ? WS_LEGO : WS_EDITOR;
+    case KEY_W:               /* Ctrl+W: toggle word wrap (editor only) */
+        if (a->ws == WS_EDITOR && a->editor.focused)
+            ide_editor_toggle_wrap(a);
+        return 1;
+    case KEY_M:               /* Ctrl+M: toggle minimap (editor only) */
+        if (a->ws == WS_EDITOR && a->editor.focused)
+            ide_editor_toggle_minimap(a);
+        return 1;
+    case KEY_E:
+        if (g_shift_down) {
+            /* Ctrl+Shift+E: toggle zen mode (hide tree + bottom) */
+            a->zen_mode = !a->zen_mode;
+            if (a->zen_mode) {
+                a->editor.focused = 1;
+                a->term_focus = 0;
+                a->explorer_focused = 0;
+            }
+        } else {
+            /* Ctrl+E: toggle workspace */
+            a->ws = (a->ws == WS_EDITOR) ? WS_LEGO : WS_EDITOR;
+        }
         return 1;
     case KEY_GRAVE:           /* Ctrl+`: focus terminal + show it */
         if (a->ws == WS_EDITOR) {
             a->btab = BTAB_TERMINAL;
             a->term_focus = !a->term_focus;
             a->editor.focused = !a->term_focus;
+            a->explorer_focused = 0;
         }
         return 1;
     case KEY_J:               /* Ctrl+J: toggle bottom-panel focus */
         if (a->ws == WS_EDITOR) {
             a->term_focus = !a->term_focus;
             a->editor.focused = !a->term_focus;
+            a->explorer_focused = 0;
             if (a->term_focus) a->btab = BTAB_TERMINAL;
         }
+        return 1;
+    case KEY_TAB:             /* Ctrl+Tab: cycle to the next open file tab */
+        if (a->ws == WS_EDITOR)
+            ide_tab_next(a);
         return 1;
     default:
         return 0;
@@ -1685,6 +2333,20 @@ static void handle_key(Ide* a, int keycode, int pressed) {
         if (handle_ctrl_chord(a, keycode)) return;
     }
 
+    /* CODE VIEW (LEGO workspace) keyboard editing: when the code panel has
+     * focus, route typing/arrows/backspace to the shared editor (mirrored in
+     * both views). Esc releases focus -- handled here, BEFORE the global
+     * ESC=exit below, so editing the map's code panel never quits the IDE. */
+    if (a->ws == WS_LEGO && a->codeview_focus) {
+        if (keycode == KEY_ESC) { a->codeview_focus = 0; return; }
+        char ch = ide_keycode_ascii(keycode, g_shift_down);
+        ide_editor_key(a, keycode, ch, g_shift_down, 0);
+        /* The autocomplete popup is drawn only by the main editor; suppress it
+         * in the code view so an invisible popup can't capture Tab/Enter (v1). */
+        a->editor.ac_active = 0;
+        return;
+    }
+
     /* ESC always exits (matches the LEGO workspace's original behaviour). */
     if (keycode == KEY_ESC) { ide_exit(0); return; }
 
@@ -1744,9 +2406,17 @@ static void handle_key(Ide* a, int keycode, int pressed) {
 
     /* =================== LEGO workspace: analysis shortcuts =============== */
 
-    /* VIZ tab shortcuts '1'..'5' (keycodes 2..6). */
-    if (keycode >= KEY_1 && keycode <= KEY_5) {
-        a->viz = (VizTab)(keycode - KEY_1);   /* 0..4 == VIZ_MAP..POTENTIALS */
+    /* Per-VIZ panel keyboard control (input works in every center panel). Each is
+     * gated on the active VIZ tab (only one is shown at a time, so arrows never
+     * conflict); each returns 0 for keys it doesn't use, so digits/'q'/etc. fall
+     * through to the global LEGO shortcuts below. */
+    if (a->viz == VIZ_SETTINGS  && panel_settings_key (a, keycode)) return;
+    if (a->viz == VIZ_INSPECTOR && panel_inspector_key(a, keycode)) return;
+    if (a->viz == VIZ_RUNTIME   && panel_runtime_key  (a, keycode)) return;
+
+    /* VIZ tab shortcuts '1'..'6' (keycodes 2..7) -> VIZ_MAP..VIZ_SETTINGS. */
+    if (keycode >= KEY_1 && keycode <= KEY_1 + (int)VIZ_SETTINGS) {
+        a->viz = (VizTab)(keycode - KEY_1);
         g_build_view = 0;                     /* leave the build view        */
         return;
     }
@@ -1760,25 +2430,48 @@ static void handle_key(Ide* a, int keycode, int pressed) {
         ide_do_run(a);
         g_build_view = 1;
         break;
+    /* Arrow keys: in the MAP (both the focused-function view AND the file
+     * overview) they move the node selection -- keyboard navigation across the
+     * lego nodes (map_nav no-ops safely if no layout). Other VIZ tabs scroll/pan.
+     * The first arrow press in overview selects the first node. */
     case KEY_UP:
-        scroll_under_mouse(a, -1, 0);
+        if (a->viz == VIZ_MAP) map_nav(a, 0);
+        else scroll_under_mouse(a, -1, 0);
         break;
     case KEY_DOWN:
-        scroll_under_mouse(a, +1, 0);
+        if (a->viz == VIZ_MAP) map_nav(a, 1);
+        else scroll_under_mouse(a, +1, 0);
         break;
     case KEY_LEFT:
-        scroll_under_mouse(a, -1, 1);     /* horizontal: pans map_ox        */
+        if (a->viz == VIZ_MAP) map_nav(a, 2);
+        else scroll_under_mouse(a, -1, 1);     /* horizontal: pans map_ox     */
         break;
     case KEY_RIGHT:
-        scroll_under_mouse(a, +1, 1);
+        if (a->viz == VIZ_MAP) map_nav(a, 3);
+        else scroll_under_mouse(a, +1, 1);
+        break;
+    case KEY_ENTER:                  /* activate the selected map node (= click it) */
+        if (a->viz == VIZ_MAP) map_activate(a);
         break;
     case KEY_TAB: {
         int n = a->model.nfuncs;
-        if (n > 0) ide_set_focus(a, (a->focus_func + 1) % n);
+        if (n > 0) {
+            if (a->focus_func < 0)
+                ide_set_focus(a, 0);          /* from overview -> first func */
+            else
+                ide_set_focus(a, (a->focus_func + 1) % n);
+        }
         break;
     }
-    case KEY_BACKSPC:                 /* go BACK to the previously-focused node */
-        ide_set_focus(a, a->prev_focus);
+    case KEY_BACKSPC:                 /* go BACK to the previously-focused node or overview */
+        if (a->focus_func >= 0 && a->prev_focus == a->focus_func) {
+            /* No distinct previous focus -- go to overview */
+            a->prev_focus = a->focus_func;
+            ide_set_focus(a, -1);
+        } else if (a->focus_func >= 0) {
+            ide_set_focus(a, a->prev_focus);
+        }
+        /* if already in overview (focus_func < 0), do nothing */
         break;
     case KEY_G:
         if (a->model.nactions > 0 && gen_apply_action(a, 0)) {
@@ -1837,6 +2530,7 @@ void _start(void) {
      *   drag_dx/dy   -- accumulated movement since press (for the threshold) */
     int drag_active = 0, drag_panning = 0;
     int drag_px = 0, drag_py = 0, drag_dx = 0, drag_dy = 0;
+    int settings_drag = 0;   /* dragging a Settings slider (VIZ-6) */
     const int DRAG_THRESH = 4;            /* px of travel before it's a drag */
 
     long last_ms = ide_ticks_ms();
@@ -1861,15 +2555,28 @@ void _start(void) {
         last_ms = now_ms;
         ide_editor_tick(a, dt);
         ide_term_tick(&a->term, dt);
+        /* Decay the BUILD tab flash (green=ok / red=fail). If the flash is
+         * still active, force a redraw so the fading tint animates smoothly. */
+        if (ide_build_flash_color()) {
+            ide_build_tick(dt);
+            g_ide_redraw = 1;
+        }
 
         /* Caret blink: force a redraw at a throttled ~400ms cadence only when a
          * text caret is visible+focused, so the cursor blinks without busy-
          * redrawing. Idle + unfocused => ZERO redraws/commits (the lag fix). */
-        int blink_active = (a->ws == WS_EDITOR && a->editor.focused) || a->term_focus;
+        int blink_active = (a->ws == WS_EDITOR && a->editor.focused) || a->term_focus ||
+                           (a->ws == WS_LEGO && a->codeview_focus);
         if (blink_active && (now_ms - last_blink_ms) >= 400) {
             g_ide_redraw = 1;
             last_blink_ms = now_ms;
         }
+
+        /* Poll for child-process exit (non-blocking WNOHANG). When the spawned
+         * program terminates, the run message updates to show its exit code and
+         * we force a redraw so the build panel reflects it immediately. */
+        if (ide_run_poll())
+            g_ide_redraw = 1;
 
         /* Only re-render + commit when something actually changed (input, zoom,
          * resize, or the blink tick above). No more full-surface recomposite of
@@ -1915,13 +2622,29 @@ void _start(void) {
                     int scroll_lines = -wheel;  /* invert: wheel up = scroll up = decrease scroll */
                     if (a->ws == WS_EDITOR) {
                         if (rect_hit(a->r_e_editor, ea, eb)) {
-                            /* Scroll editor */
+                            /* Scroll editor -- clamp to [0, total_lines-1] so
+                             * the user cannot scroll past the end of the file. */
+                            extern int ed_line_count(const char* src, int len);
                             a->editor.top_line += scroll_lines;
                             if (a->editor.top_line < 0) a->editor.top_line = 0;
-                        } else if (rect_hit(a->r_explorer, ea, eb)) {
-                            /* Scroll explorer */
+                            int max_top = ed_line_count(a->src, a->src_len) - 1;
+                            if (max_top < 0) max_top = 0;
+                            if (a->editor.top_line > max_top)
+                                a->editor.top_line = max_top;
+                        } else if (rect_hit(a->r_e_tree, ea, eb)) {
+                            /* Scroll file tree in editor workspace */
                             a->explorer_scroll += scroll_lines;
                             if (a->explorer_scroll < 0) a->explorer_scroll = 0;
+                            if (a->nentries > 0 && a->explorer_scroll > a->nentries - 1)
+                                a->explorer_scroll = a->nentries - 1;
+                        } else if (rect_hit(a->r_e_bottom, ea, eb)) {
+                            if (a->btab == BTAB_BUILD) {
+                                /* Scroll the build output panel */
+                                panel_build_scroll(scroll_lines);
+                            } else if (a->btab == BTAB_TERMINAL) {
+                                /* Scroll terminal scrollback (wheel up = back in history) */
+                                ide_term_scroll(&a->term, -scroll_lines);
+                            }
                         }
                     } else {
                         /* LEGO workspace: scroll map */
@@ -1959,14 +2682,22 @@ void _start(void) {
                          * panel path (route_click). The result is kept (ide_build_active)
                          * so Ctrl+B re-shows it on demand. */
                         g_build_view = 0;
-                        if (rect_hit(a->r_map, ea, eb)) {
+                        if (a->viz == VIZ_SETTINGS && rect_hit(a->r_map, ea, eb)) {
+                            /* Settings (VIZ-6): a press grabs/toggles a row; if it
+                             * landed on a slider knob, subsequent moves drag it. No
+                             * map panning in this view. */
+                            panel_settings_click(a, a->r_map, ea, eb, 0);
+                            settings_drag = 1;
+                        } else if (rect_hit(a->r_map, ea, eb)) {
                             drag_active = 1; drag_panning = 0;
                             drag_px = ea; drag_py = eb; drag_dx = 0; drag_dy = 0;
                         } else {
                             route_click(a, ea, eb);
                         }
                     } else if (left_now && left_prev) {
-                        if (drag_active) {
+                        if (settings_drag) {
+                            panel_settings_click(a, a->r_map, ea, eb, 1);  /* drag move */
+                        } else if (drag_active) {
                             int mdx = ea - drag_px;
                             int mdy = eb - drag_py;
                             drag_dx += (mdx < 0 ? -mdx : mdx);
@@ -1981,8 +2712,12 @@ void _start(void) {
                             drag_px = ea; drag_py = eb;
                         }
                     } else if (!left_now && left_prev) {
-                        if (drag_active && !drag_panning)
+                        if (settings_drag) {
+                            panel_settings_click(a, a->r_map, ea, eb, 2);  /* release */
+                            settings_drag = 0;
+                        } else if (drag_active && !drag_panning) {
                             route_center_top_click(a, ea, eb);
+                        }
                         drag_active = 0; drag_panning = 0;
                     }
                 }
@@ -1998,3 +2733,4 @@ void _start(void) {
         ide_sc(SYS_YIELD, 0, 0, 0, 0, 0, 0);
     }
 }
+

@@ -164,6 +164,23 @@ void process_enter_usermode_trampoline(void) {
     extern uint64_t kernel_rsp_save;
     kernel_rsp_save = kstack_top;
 
+#ifdef SCHED_DEBUG
+    // DIAGNOSTIC: the first time the spawned-process trampoline runs, paint a
+    // marker. This is the ring-0 step a fresh process executes right before its
+    // IRETQ to ring 3. If this appears but "non-init proc RAN" does not, the
+    // switch worked but enter_usermode (the IRETQ to ring 3) fails for spawned
+    // processes. If it never appears, the scheduler never switched to the child.
+    {
+        static volatile int _tramp_seen = 0;
+        if (!_tramp_seen) {
+            _tramp_seen = 1;
+            extern void framebuffer_puts_scaled(const char*, uint32_t, uint32_t,
+                                                uint32_t, uint32_t);
+            framebuffer_puts_scaled("trampoline RAN (ring0->ring3)", 40, 304, 0x0000FF00u, 2);
+        }
+    }
+#endif
+
     enter_usermode(entry, stack, cr3);
 }
 

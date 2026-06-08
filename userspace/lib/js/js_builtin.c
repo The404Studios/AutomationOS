@@ -421,7 +421,14 @@ static int n_isSafeInteger(js_vm *vm, js_value t, js_value *a, int n, js_value *
 /* ================================================================== */
 /*  String.prototype methods (this is a string value)                */
 /* ================================================================== */
-static js_string *this_str(js_vm *vm, js_value t) { return js_to_string(vm, t); }
+static js_string *this_str(js_vm *vm, js_value t) {
+    js_string *s = js_to_string(vm, t);
+    if (!s) {
+        static js_string empty = { 0, 0, { 0 } };
+        return &empty;
+    }
+    return s;
+}
 
 static int s_charAt(js_vm *vm, js_value t, js_value *a, int n, js_value *out)
 {

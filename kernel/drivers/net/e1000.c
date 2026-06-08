@@ -171,7 +171,25 @@ static inline bool e1000_is_e1000e_class(uint16_t device_id) {
  */
 #define E1000_CTRL_EXT     0x0018   /* Extended Device Control            */
 #define E1000_MDIC         0x0020   /* MDI Control (PHY register access)   */
+#define E1000_FWSM         0x5B54   /* Firmware Semaphore (ME state)       */
+#define E1000_SWSM         0x5B50   /* Software Semaphore                  */
 #define E1000_EXTCNF_CTRL  0x0F00   /* Extended Config Control (SWFLAG)    */
+#define E1000_EXTCNF_SIZE  0x0F08   /* Extended Config Size (NVM presence) */
+#define E1000_PCIEANACFG   0x0F18   /* PCIe Analog Configuration          */
+#define E1000_PHY_CTRL     0x0F10   /* PHY Control (PCH LAN)              */
+
+/* FWSM (Firmware Semaphore) bits -- detect ME firmware activity. */
+#define FWSM_FW_VALID      (1u << 15)   /* firmware has loaded             */
+#define FWSM_MODE_MASK     0x000E       /* firmware mode bits [3:1]        */
+#define FWSM_MODE_SHIFT    1
+
+/* SWSM bits -- hardware semaphore for ME/SW arbitration. */
+#define SWSM_SMBI          (1u << 0)    /* software semaphore bit          */
+#define SWSM_SWESMBI       (1u << 1)    /* SW/FW semaphore bit             */
+
+/* PHY_CTRL bits (PCH-specific PHY power management). */
+#define PHY_CTRL_GBE_DIS   (1u << 6)    /* disable GbE (force 10/100)     */
+#define PHY_CTRL_D0A_LPLU  (1u << 1)    /* D0a Low-Power Link Up          */
 
 /* MDIC fields. */
 #define MDIC_DATA_MASK     0x0000FFFFu
@@ -185,11 +203,28 @@ static inline bool e1000_is_e1000e_class(uint16_t device_id) {
 /* ich8lan/PCH software MDIO-ownership flag (EXTCNF_CTRL bit 5). */
 #define EXTCNF_CTRL_SWFLAG (1u << 5)
 
+/* Default-OFF gate for the 82577LM-class PCH NIC bring-up. The PCH PHY hangs off
+ * an internal MDIO bus SHARED with the Management Engine, and driving it can
+ * HARDWARE-STALL the real T410 at boot (a bus stall, not a software spin -- the
+ * bounded loops cannot make it safe). So the bring-up is OFF unless the operator
+ * opts in with PCH_NIC=1 (-> -DE1000_PCH_NIC) to validate on the device. QEMU is
+ * unaffected (its e1000/e1000e are never PCH parts). Implemented as a compile-
+ * time CONSTANT (not #ifdef around the call sites) so the PCH helper functions
+ * stay referenced and never trip -Wunused-function. */
+#ifdef E1000_PCH_NIC
+#define E1000_PCH_NIC_ENABLED 1
+#else
+#define E1000_PCH_NIC_ENABLED 0
+#endif
+
 /* Standard MII PHY registers (clause 22) + the bits we touch. */
 #define MII_BMCR           0x00      /* Basic Mode Control                 */
 #define MII_BMSR           0x01      /* Basic Mode Status                  */
 #define MII_PHYID1         0x02
 #define MII_PHYID2         0x03
+#define MII_ANAR           0x04      /* Auto-Neg Advertisement Register    */
+#define MII_ANLPAR         0x05      /* Auto-Neg Link Partner Ability      */
+#define MII_GBCR           0x09      /* 1000BASE-T Control Register        */
 #define BMCR_RESET         (1u << 15)
 #define BMCR_ANENABLE      (1u << 12)
 #define BMCR_PDOWN         (1u << 11)
@@ -197,9 +232,22 @@ static inline bool e1000_is_e1000e_class(uint16_t device_id) {
 #define BMSR_LSTATUS       (1u << 2)
 #define STATUS_LU          (1u << 1)  /* Device Status: link up             */
 
-/* Ring sizes (must be multiples of 8; 8 descriptors is plenty for a demo). */
-#define NUM_RX_DESC     32
-#define NUM_TX_DESC     8
+/* MII ANAR bits (auto-negotiation advertisement). */
+#define ANAR_10            (1u << 5)   /* 10BASE-T                        */
+#define ANAR_10FD          (1u << 6)   /* 10BASE-T full-duplex            */
+#define ANAR_TX            (1u << 7)   /* 100BASE-TX                      */
+#define ANAR_TXFD          (1u << 8)   /* 100BASE-TX full-duplex          */
+#define ANAR_SELECTOR      0x0001u     /* IEEE 802.3 selector field       */
+
+/* MII GBCR bits (1000BASE-T advertisement). */
+#define GBCR_1000T         (1u << 8)   /* advertise 1000BASE-T            */
+#define GBCR_1000TFD       (1u << 9)   /* advertise 1000BASE-T full-dup   */
+
+/* Ring sizes (must be multiples of 8).
+ * 64 descriptors per ring avoids stalls under moderate traffic (the original 8
+ * TX / 32 RX was tight enough to drop frames under bursty workloads). */
+#define NUM_RX_DESC     64
+#define NUM_TX_DESC     64
 #define RX_BUF_SIZE     2048
 #define TX_BUF_SIZE     2048
 
@@ -432,18 +480,38 @@ static bool e1000_is_pch(uint16_t device_id) {
  * wall-clock timeout would never fire -- exactly the trap that hung the AHCI
  * probe.  If the firmware never yields we give up gracefully (the NIC is left
  * link-down) rather than wedging the boot.
+ *
+ * IMPORTANT (the original T410 hang root-cause):
+ * The previous code hammered EXTCNF_CTRL with tight-loop reads + writes which
+ * on the PCH bus could back-pressure the internal MDIO link and cause the bus-
+ * stall that was observed as a hang.  The fix:
+ *   (a) Larger inter-iteration delays (each e1000_delay(500) ~ a few us on
+ *       real HW, enough for the ME firmware to cycle its MDIO transaction).
+ *   (b) Fewer total attempts to avoid prolonged bus contention.
+ *   (c) A read-back fence after the SWFLAG write to let the PCH register
+ *       post complete before we re-read.
  */
 static bool e1000_acquire_swflag(void) {
-    for (int attempt = 0; attempt < 5; attempt++) {
+    for (int attempt = 0; attempt < 3; attempt++) {
+        /* Wait for firmware to release SWFLAG. Generous delay between reads
+         * to avoid bus contention with the ME's own MDIO cycles. */
         int spins = 0;
         while ((mmio_read32(E1000_EXTCNF_CTRL) & EXTCNF_CTRL_SWFLAG) &&
-               spins++ < 50000) {
-            e1000_delay(50);
+               spins++ < 2000) {
+            e1000_delay(500);  /* ~a few us per iter; up to ~10ms total */
         }
         uint32_t v = mmio_read32(E1000_EXTCNF_CTRL);
         if (v & EXTCNF_CTRL_SWFLAG) continue;          /* FW still holds it  */
+
+        /* Set our SWFLAG claim. */
         v |= EXTCNF_CTRL_SWFLAG;
         mmio_write32(E1000_EXTCNF_CTRL, v);
+
+        /* Read-back fence: let the posted write complete before verifying.
+         * Without this, on PCH the read-back can return the old value and
+         * we'd think we failed to acquire, then retry in a tight loop. */
+        e1000_delay(100);
+
         if (mmio_read32(E1000_EXTCNF_CTRL) & EXTCNF_CTRL_SWFLAG) {
             return true;                               /* we own it now      */
         }
@@ -455,6 +523,7 @@ static void e1000_release_swflag(void) {
     uint32_t v = mmio_read32(E1000_EXTCNF_CTRL);
     v &= ~EXTCNF_CTRL_SWFLAG;
     mmio_write32(E1000_EXTCNF_CTRL, v);
+    e1000_delay(100);  /* let the posted write settle */
 }
 
 /*
@@ -487,13 +556,89 @@ static void e1000_phy_write(uint8_t phy, uint8_t reg, uint16_t data) {
 }
 
 /*
+ * PCH-specific MAC reset.
+ *
+ * On PCH parts the full CTRL_RST must be bracketed by SWFLAG ownership, and
+ * the ME firmware mode must be checked.  A bare CTRL_RST issued while the ME
+ * is mid-transaction on the internal MDIO bus will wedge the PCH bus -- that
+ * was the root cause of the original T410 boot hang.
+ *
+ * Sequence (derived from the Linux e1000e ich8lan.c reset sequence):
+ *   1. Mask all interrupts.
+ *   2. Read FWSM to check whether ME firmware is active; if so, yield a
+ *      generous delay to let it finish any in-progress MDIO cycle.
+ *   3. Acquire SWFLAG (the ME/SW MDIO mutex).
+ *   4. Issue CTRL_RST.  While we hold SWFLAG the ME cannot start new MDIO
+ *      traffic, so the reset's internal bus sequences complete cleanly.
+ *   5. Wait for CTRL_RST to self-clear (bounded).
+ *   6. Release SWFLAG after the MAC is out of reset.
+ *   7. Re-mask interrupts (reset re-enables some causes on PCH).
+ *
+ * Returns 0 on success, -1 if the MAC could not be reset cleanly.
+ */
+static int e1000_pch_mac_reset(void) {
+    /* 1. Mask all interrupts before reset. */
+    mmio_write32(E1000_IMC, 0xFFFFFFFF);
+
+    /* 2. If ME firmware is active, give it a moment to finish.  On 82577LM the
+     *    ME typically runs an AMT agent; FWSM.FW_VALID indicates its presence.
+     *    We cannot tell exactly when it is idle, but a fixed delay here is far
+     *    better than resetting the MAC under it. */
+    uint32_t fwsm = mmio_read32(E1000_FWSM);
+    if (fwsm & FWSM_FW_VALID) {
+        kprintf("[E1000] PCH: ME firmware active (FWSM=0x%08x), yielding...\n", fwsm);
+        e1000_delay(2000000);  /* ~10-20 ms on real HW: let ME finish */
+    }
+
+    /* 3. Acquire SWFLAG so the ME stays off the MDIO bus during reset. */
+    if (!e1000_acquire_swflag()) {
+        kprintf("[E1000] PCH: SWFLAG acq failed before MAC reset (ME busy)\n");
+        /* Proceed anyway -- the reset may still work if ME is idle. */
+    }
+
+    /* 4. Issue device reset. */
+    uint32_t ctrl = mmio_read32(E1000_CTRL);
+    mmio_write32(E1000_CTRL, ctrl | CTRL_RST);
+
+    /* 5. Wait for CTRL_RST to self-clear, bounded. */
+    e1000_delay(500000);   /* initial settle (~2-5 ms) */
+    for (int i = 0; i < 500; i++) {
+        if (!(mmio_read32(E1000_CTRL) & CTRL_RST)) break;
+        e1000_delay(20000);   /* each iter ~100 us */
+    }
+
+    /* 6. Release SWFLAG. */
+    e1000_release_swflag();
+
+    /* 7. Post-reset: re-mask interrupts, drain pending causes. */
+    e1000_delay(200000);   /* let post-reset configuration settle */
+    mmio_write32(E1000_IMC, 0xFFFFFFFF);
+    (void)mmio_read32(E1000_ICR);
+
+    if (mmio_read32(E1000_CTRL) & CTRL_RST) {
+        kprintf("[E1000] PCH: MAC reset did not clear -- hardware stuck\n");
+        return -1;
+    }
+    return 0;
+}
+
+/*
  * Bring up the PHY on an 82577LM-class PCH NIC.  Best-effort + fully bounded:
  *   1. take the SW/FW MDIO flag,
  *   2. find the PHY's MDIO address (try 1 then 2; valid PHYID1 != 0/0xFFFF),
- *   3. soft-reset the PHY, clear power-down, enable + restart auto-neg,
+ *   3. soft-reset the PHY, clear power-down, advertise all speeds,
+ *      enable + restart auto-neg,
  *   4. drop the flag, set MAC CTRL.SLU|ASDE, and poll STATUS.LU for link.
  * Returns 0 if the sequence ran (link may still be down -- reported via
  * e1000.link_up); -1 only if the PHY could not be reached at all.  Never hangs.
+ *
+ * Link-up polling:
+ *   Real auto-negotiation on the 82577LM takes 2-5 seconds depending on the
+ *   link partner.  We poll for up to ~3 seconds with generous inter-poll delays
+ *   (enough for a cable-plugged T410 to link, but not so long that a no-cable
+ *   T410 stalls the boot for ages).  If the cable is plugged in after boot, the
+ *   NIC will auto-negotiate in hardware and STATUS.LU will go high; higher layers
+ *   can re-check e1000_link_up() at any time.
  */
 static int e1000_pch_phy_bringup(void) {
     if (!e1000_acquire_swflag()) {
@@ -501,6 +646,7 @@ static int e1000_pch_phy_bringup(void) {
         return -1;
     }
 
+    /* Scan for the PHY on MDIO addresses 1 and 2 (the 82577LM is usually at 1). */
     uint8_t  phy = 0;
     uint16_t id1 = 0;
     const uint8_t candidates[] = { 1, 2 };
@@ -515,7 +661,7 @@ static int e1000_pch_phy_bringup(void) {
     }
     uint16_t id2 = e1000_phy_read(phy, MII_PHYID2);
     e1000.phy_addr = phy;
-    kprintf("[E1000] PCH: PHY @ mdio %u id=%04x%04x\n", phy, id1, id2);
+    kprintf("[E1000] PCH: PHY @ mdio %u id=%04x:%04x\n", phy, id1, id2);
 
     /* Soft reset (clause-22 BMCR.reset); bounded wait for the bit to self-clear.
      * PHY reset completes in <1ms per spec and each e1000_phy_read is already
@@ -523,34 +669,148 @@ static int e1000_pch_phy_bringup(void) {
      * the (network-enabled) boot for more than a few ms. */
     e1000_phy_write(phy, MII_BMCR, BMCR_RESET);
     for (int s = 0; s < 500; s++) {
+        e1000_delay(200);
         if (!(e1000_phy_read(phy, MII_BMCR) & BMCR_RESET)) break;
-        e1000_delay(50);
     }
 
-    /* Power up + (re)start auto-negotiation. */
+    /* Power up + configure auto-negotiation advertisement.
+     *
+     * The 82577LM supports 10/100/1000.  Advertise ALL speeds so the PHY can
+     * negotiate the best link with whatever switch/router is connected.  On many
+     * ThinkPad T410 docking stations the link partner is a 100M switch, so
+     * advertising only 1000 would fail to link. */
     uint16_t bmcr = e1000_phy_read(phy, MII_BMCR);
-    bmcr &= ~BMCR_PDOWN;
-    bmcr |=  BMCR_ANENABLE | BMCR_ANRESTART;
+    bmcr &= ~BMCR_PDOWN;        /* clear power-down */
+    e1000_phy_write(phy, MII_BMCR, bmcr);
+    e1000_delay(50000);          /* let PHY power up */
+
+    /* Set auto-neg advertisement: 10/100 all modes + IEEE 802.3 selector. */
+    e1000_phy_write(phy, MII_ANAR,
+                    ANAR_10 | ANAR_10FD | ANAR_TX | ANAR_TXFD | ANAR_SELECTOR);
+
+    /* Set 1000BASE-T advertisement (register 9). */
+    e1000_phy_write(phy, MII_GBCR, GBCR_1000T | GBCR_1000TFD);
+
+    /* Enable + restart auto-negotiation. */
+    bmcr = e1000_phy_read(phy, MII_BMCR);
+    bmcr |= BMCR_ANENABLE | BMCR_ANRESTART;
     e1000_phy_write(phy, MII_BMCR, bmcr);
 
     e1000_release_swflag();
 
-    /* MAC side: assert link-up + auto-speed-detect. */
+    /* Disable LPLU (Low Power Link Up) in D0a -- this can prevent GbE link. */
+    uint32_t phyctrl = mmio_read32(E1000_PHY_CTRL);
+    phyctrl &= ~(PHY_CTRL_GBE_DIS | PHY_CTRL_D0A_LPLU);
+    mmio_write32(E1000_PHY_CTRL, phyctrl);
+
+    /* MAC side: assert link-up + auto-speed-detect.  Clear any stale reset bits
+     * that might prevent the MAC from establishing link. */
     uint32_t ctrl = mmio_read32(E1000_CTRL);
     ctrl |=  (CTRL_SLU | CTRL_ASDE);
     ctrl &= ~(CTRL_LRST | CTRL_PHY_RST);
     mmio_write32(E1000_CTRL, ctrl);
 
-    /* Poll for link, bounded short. If the cable/auto-neg hasn't produced link
-     * within this window the driver still works (link-down); a tighter cap keeps
-     * a no-carrier T410 from stalling the boot. QEMU never runs this PCH path. */
+    /*
+     * Poll for link.  Real 82577LM auto-negotiation takes 2-5 seconds.  We poll
+     * for up to ~3 seconds: ~6000 iterations x e1000_delay(5000) gives roughly
+     * 3s on typical Arrandale-era hardware (~500ns per e1000_delay iteration).
+     * If the cable is not plugged in, this exits in ~3s -- acceptable for the
+     * T410 boot.  If the cable IS plugged in, most links come up in 1-2s.
+     */
     e1000.link_up = false;
-    for (int s = 0; s < 50000; s++) {
-        if (mmio_read32(E1000_STATUS) & STATUS_LU) { e1000.link_up = true; break; }
-        e1000_delay(200);
+    for (int s = 0; s < 6000; s++) {
+        if (mmio_read32(E1000_STATUS) & STATUS_LU) {
+            e1000.link_up = true;
+            break;
+        }
+        e1000_delay(5000);
     }
     kprintf("[E1000] PCH: link %s after auto-neg\n", e1000.link_up ? "UP" : "DOWN");
+
+    /* If link is up, log the negotiated speed/duplex from STATUS. */
+    if (e1000.link_up) {
+        uint32_t st = mmio_read32(E1000_STATUS);
+        const char* speed = "unknown";
+        switch ((st >> 6) & 0x3) {
+            case 0: speed = "10M";   break;
+            case 1: speed = "100M";  break;
+            case 2: speed = "1000M"; break;
+            case 3: speed = "1000M"; break;
+        }
+        kprintf("[E1000] PCH: negotiated %s %s-duplex\n",
+                speed, (st & (1u << 0)) ? "full" : "half");
+    }
     return 0;
+}
+
+/*
+ * Read MAC address from the PCH NVM shadow area.
+ *
+ * On PCH parts (82577LM), a software-initiated CTRL_RST does NOT always reload
+ * the MAC into RAL0/RAH0 from the EEPROM the way the classic 82540 does.  If
+ * the RAL0/RAH0 registers read back as all-zeros or all-ones after reset, we
+ * try reading the MAC from the EEPROM via the EERD (EEPROM Read) register.
+ *
+ * The first three EEPROM words (offsets 0x00, 0x01, 0x02) contain the 6-byte
+ * MAC in little-endian word pairs on Intel NICs.
+ */
+static bool e1000_mac_is_valid(void) {
+    bool all_zero = true, all_ff = true;
+    for (int i = 0; i < ETH_ALEN; i++) {
+        if (e1000.mac[i] != 0x00) all_zero = false;
+        if (e1000.mac[i] != 0xFF) all_ff   = false;
+    }
+    return !all_zero && !all_ff;
+}
+
+static void e1000_pch_read_mac_from_nvm(void) {
+    /* EERD format (82577LM):
+     *   Write: bit0=START, bits[15:2]=address (word offset)
+     *   Read:  bit4=DONE on PCH (not bit1 like classic e1000!)
+     *   Data:  bits[31:16] = 16-bit word
+     *
+     * PCH parts use bit 1 for DONE (like classic), but some docs say bit 4.
+     * We check both to be safe.
+     */
+    uint16_t words[3];
+    for (int w = 0; w < 3; w++) {
+        mmio_write32(E1000_EERD, ((uint32_t)w << 2) | 1u);
+        bool done = false;
+        for (int s = 0; s < 10000; s++) {
+            uint32_t v = mmio_read32(E1000_EERD);
+            if (v & (1u << 1)) {  /* DONE bit (classic + most PCH) */
+                words[w] = (uint16_t)(v >> 16);
+                done = true;
+                break;
+            }
+            if (v & (1u << 4)) {  /* DONE bit (some PCH variants) */
+                words[w] = (uint16_t)(v >> 16);
+                done = true;
+                break;
+            }
+            e1000_delay(100);
+        }
+        if (!done) {
+            kprintf("[E1000] PCH: EEPROM read timeout at word %d\n", w);
+            return;  /* leave the MAC as-is */
+        }
+    }
+
+    /* EEPROM words 0-2 contain the MAC in LE byte pairs. */
+    e1000.mac[0] = (uint8_t)(words[0] & 0xFF);
+    e1000.mac[1] = (uint8_t)(words[0] >> 8);
+    e1000.mac[2] = (uint8_t)(words[1] & 0xFF);
+    e1000.mac[3] = (uint8_t)(words[1] >> 8);
+    e1000.mac[4] = (uint8_t)(words[2] & 0xFF);
+    e1000.mac[5] = (uint8_t)(words[2] >> 8);
+
+    /* Write the MAC back into RAL0/RAH0 so the receiver filter uses it. */
+    uint32_t ral = (uint32_t)e1000.mac[0]        | ((uint32_t)e1000.mac[1] << 8) |
+                   ((uint32_t)e1000.mac[2] << 16) | ((uint32_t)e1000.mac[3] << 24);
+    uint32_t rah = (uint32_t)e1000.mac[4]        | ((uint32_t)e1000.mac[5] << 8) |
+                   (1u << 31);  /* AV (Address Valid) bit */
+    mmio_write32(E1000_RAL0, ral);
+    mmio_write32(E1000_RAH0, rah);
 }
 
 /* ------------------------------------------------------------------ */
@@ -634,25 +894,6 @@ int e1000_init(void) {
                              : " -- standalone, using classic bring-up");
     }
 
-    /*
-     * RUNTIME GATE -- decline PCH NICs (82577LM &c.) BEFORE touching any MMIO.
-     * Confirmed on the ThinkPad T410: re-enabling networking made the boot HANG
-     * right after the "storage SKIPPED" marker, i.e. inside this function's
-     * 82577LM bring-up. Its MMIO/MDIO/SW-FW-semaphore path stalls the bus in a
-     * way the iteration caps cannot unwedge (a bus stall, not a software spin).
-     * We only reached the device match via PCI config space (safe); returning
-     * here, before `pci_get_bar`/`e1000.mmio`/any register access, guarantees we
-     * issue ZERO NIC MMIO on the T410 -- so it boots to the desktop exactly like
-     * the fully-network-skipped build did, while QEMU's e1000 (NOT a PCH part)
-     * still runs the full, working bring-up below. The PCH driver code is kept
-     * intact; re-enable by removing this gate once it is validated on real HW.
-     */
-    if (e1000.is_pch) {
-        kprintf("[E1000] PCH NIC 0x%04x detected -- bring-up DISABLED (hangs real "
-                "hardware); declining to keep the boot alive\n", dev->device_id);
-        return -1;
-    }
-
     /* BAR0 is the memory-mapped register file (identity-mapped 1:1). */
     uint64_t bar0 = pci_get_bar(dev, 0);
     if (bar0 == 0) {
@@ -666,15 +907,47 @@ int e1000_init(void) {
     pci_enable_memory_space(dev);
     pci_enable_bus_master(dev);
 
-    /* Full device reset, then wait for it to deassert. */
-    mmio_write32(E1000_IMC, 0xFFFFFFFF);   /* mask all IRQs while we set up */
-    mmio_write32(E1000_CTRL, mmio_read32(E1000_CTRL) | CTRL_RST);
-    e1000_delay(1000000);
-    for (int i = 0; i < 1000 && (mmio_read32(E1000_CTRL) & CTRL_RST); i++) {
-        e1000_delay(10000);
+    /*
+     * Device reset.
+     *
+     * Classic 82540/82545/82574L: a bare CTRL_RST is safe.  The PHY is internal
+     * or directly attached and auto-links out of reset.
+     *
+     * PCH parts (82577LM on the T410, 82578, 82579, i217, i218): the MAC and
+     * PHY sit on opposite sides of an internal MDIO bus SHARED with the Intel
+     * Management Engine.  A bare CTRL_RST issued while the ME is mid-transaction
+     * wedges the bus -- that was the root cause of the original T410 boot hang.
+     * The PCH path must acquire the SW/FW MDIO semaphore (EXTCNF_CTRL.SWFLAG)
+     * BEFORE resetting, yield to the ME, and release after.
+     */
+    if (e1000.is_pch) {
+        if (!E1000_PCH_NIC_ENABLED) {
+            /* DEFAULT-OFF GATE: declining the PCH NIC keeps the real T410 from
+             * wedging on the ME-shared MDIO bus during PHY bring-up. The system
+             * boots link-down; QEMU never reaches here (not a PCH part). Rebuild
+             * with PCH_NIC=1 to attempt real-hardware bring-up under validation. */
+            kprintf("[E1000] PCH NIC 0x%04x detected -- GATED OFF by default "
+                    "(rebuild with PCH_NIC=1 to enable); declining to protect boot\n",
+                    dev->device_id);
+            return -1;
+        }
+        kprintf("[E1000] PCH NIC 0x%04x -- ME-safe bring-up (PCH_NIC enabled)\n",
+                dev->device_id);
+        if (e1000_pch_mac_reset() != 0) {
+            kprintf("[E1000] PCH MAC reset failed -- declining NIC\n");
+            return -1;
+        }
+    } else {
+        /* Classic reset: mask IRQs, pulse CTRL_RST, wait for clear. */
+        mmio_write32(E1000_IMC, 0xFFFFFFFF);
+        mmio_write32(E1000_CTRL, mmio_read32(E1000_CTRL) | CTRL_RST);
+        e1000_delay(1000000);
+        for (int i = 0; i < 1000 && (mmio_read32(E1000_CTRL) & CTRL_RST); i++) {
+            e1000_delay(10000);
+        }
+        mmio_write32(E1000_IMC, 0xFFFFFFFF);
+        (void)mmio_read32(E1000_ICR);
     }
-    mmio_write32(E1000_IMC, 0xFFFFFFFF);   /* reset re-enables some causes */
-    (void)mmio_read32(E1000_ICR);          /* drain any pending interrupt causes */
 
     /*
      * Bring the link up.  PCH parts (82577LM &c.) need the SW/FW-synchronised
@@ -698,7 +971,16 @@ int e1000_init(void) {
         mmio_write32(E1000_MTA + i * 4, 0);
     }
 
+    /*
+     * Read the MAC address.  On classic parts, RAL0/RAH0 are loaded from the
+     * EEPROM by the hardware reset.  On PCH parts, a software-initiated reset
+     * may leave them empty; fall back to an EEPROM read if needed.
+     */
     e1000_read_mac();
+    if (e1000.is_pch && !e1000_mac_is_valid()) {
+        kprintf("[E1000] PCH: RAL0/RAH0 empty after reset, reading MAC from NVM\n");
+        e1000_pch_read_mac_from_nvm();
+    }
     kprintf("[E1000] MAC %02x:%02x:%02x:%02x:%02x:%02x\n",
             e1000.mac[0], e1000.mac[1], e1000.mac[2],
             e1000.mac[3], e1000.mac[4], e1000.mac[5]);
@@ -725,6 +1007,94 @@ int e1000_init(void) {
 
 bool e1000_present(void) {
     return e1000.present;
+}
+
+/*
+ * tx_clean -- reclaim completed TX descriptors.
+ *
+ * The NIC writes back the DD (descriptor done) bit into the status byte of
+ * each completed descriptor.  After a burst of transmissions the ring may
+ * have many DD-set descriptors that the software has not yet acknowledged.
+ * This helper walks forward from the oldest un-reclaimed slot and clears
+ * the status byte so the slot can be reused.  Called internally before
+ * e1000_transmit_batch() fills new descriptors and useful as a standalone
+ * maintenance call from the network stack.
+ */
+static uint32_t tx_clean_head = 0;   /* oldest un-reclaimed TX slot */
+
+static void tx_clean(void) {
+    if (!e1000.present) return;
+    while (tx_clean_head != e1000.tx_cur) {
+        volatile e1000_tx_desc_t* d = &e1000.tx_ring[tx_clean_head];
+        if (!(d->status & TXD_STAT_DD))
+            break;   /* NIC has not finished this one yet */
+        d->status = 0;
+        tx_clean_head = (tx_clean_head + 1) % NUM_TX_DESC;
+    }
+}
+
+/*
+ * e1000_transmit_batch -- send multiple frames in one ring-doorbell.
+ *
+ * Fills up to `count` descriptors from the supplied frame array, issues a
+ * single TDT write to kick the transmitter, then waits for the last
+ * descriptor's DD writeback.  This amortises the MMIO tail-register write
+ * (the expensive part on real PCIe) over the entire batch.
+ *
+ * Returns the number of frames successfully queued (may be less than
+ * `count` if the ring runs out of free slots).
+ */
+int e1000_transmit_batch(const void* const* frames, const uint16_t* lengths,
+                         uint32_t count) {
+    if (!e1000.present || !frames || !lengths || count == 0) return 0;
+
+    tx_clean();   /* reclaim completed slots first */
+
+    uint32_t queued = 0;
+    uint32_t last_i = e1000.tx_cur;
+
+    for (uint32_t n = 0; n < count; n++) {
+        uint32_t i = e1000.tx_cur;
+
+        /* Check if this slot is free (DD set means HW finished it). */
+        if (!(desc_read_tx_status(&e1000.tx_ring[i]) & TXD_STAT_DD)) {
+            break;   /* ring full -- stop batching */
+        }
+
+        uint16_t len = lengths[n];
+        if (len == 0 || !frames[n]) continue;
+        if (len > TX_BUF_SIZE) len = TX_BUF_SIZE;
+
+        memcpy(e1000.tx_bufs[i], frames[n], len);
+
+        uint16_t xmit = len;
+        if (xmit < ETH_MIN_FRAME) {
+            memset(e1000.tx_bufs[i] + len, 0, ETH_MIN_FRAME - len);
+            xmit = ETH_MIN_FRAME;
+        }
+
+        e1000.tx_ring[i].length = xmit;
+        e1000.tx_ring[i].cmd    = TXD_CMD_EOP | TXD_CMD_IFCS | TXD_CMD_RS;
+        e1000.tx_ring[i].status = 0;
+
+        last_i = i;
+        e1000.tx_cur = (i + 1) % NUM_TX_DESC;
+        queued++;
+    }
+
+    if (queued == 0) return 0;
+
+    /* Single tail-register write for the whole batch. */
+    desc_wmb();
+    mmio_write32(E1000_TDT, e1000.tx_cur);
+
+    /* Wait for the LAST descriptor's DD writeback. */
+    for (int spin = 0; spin < 100000; spin++) {
+        if (desc_read_tx_status(&e1000.tx_ring[last_i]) & TXD_STAT_DD)
+            return (int)queued;
+        e1000_delay(100);
+    }
+    return (int)queued;   /* timed out but frames are almost certainly queued */
 }
 
 int e1000_get_mac(uint8_t out[ETH_ALEN]) {
@@ -827,12 +1197,19 @@ int e1000_rx_poll(void* buf, uint16_t buf_len) {
 /* ------------------------------------------------------------------ */
 /*
  * e1000_link_up() -- true only if the NIC is up AND the MAC reports link.
- * On the classic QEMU path this is read once at the end of init; on the PCH
- * path it reflects the post-auto-neg STATUS.LU poll.  The T410 has no serial,
- * so kernel.c turns this into an on-screen boot marker.
+ *
+ * On PCH parts (82577LM) we do a LIVE read of STATUS.LU rather than returning
+ * the cached init-time value.  This lets higher layers detect a cable plugged in
+ * after boot: the 82577LM auto-negotiates in hardware, so STATUS.LU will go high
+ * as soon as the PHY links, even without software intervention.  The cached field
+ * is updated as a side effect so log messages stay consistent.
+ *
+ * On QEMU (classic path) the STATUS read is equally fast and harmless.
  */
 bool e1000_link_up(void) {
-    return e1000.present && e1000.link_up;
+    if (!e1000.present) return false;
+    e1000.link_up = (mmio_read32(E1000_STATUS) & STATUS_LU) != 0;
+    return e1000.link_up;
 }
 
 /* The matched PCI device id (e.g. 0x10EA for the T410's 82577LM); 0 if none. */

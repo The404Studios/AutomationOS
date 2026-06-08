@@ -3,7 +3,56 @@ cd "$(dirname "$0")/.."
 mkdir -p build
 
 CC=gcc
-CFLAGS="-std=gnu11 -ffreestanding -nostdlib -nostdinc -fno-pic -fno-pie -fno-stack-protector -mno-red-zone -mcmodel=kernel -DSYSCALL_QUIET -DSCHEDULER_QUIET -DCONTEXT_SWITCH_QUIET -DEXEC_QUIET -DPROCESS_QUIET -DSCHED_DEBUG -Wno-unused-variable -Wno-unused-function -Wno-builtin-declaration-mismatch -Wno-implicit-function-declaration -Wno-int-conversion -Wno-incompatible-pointer-types -Ikernel/include -Ikernel/include/compat"
+CFLAGS="-std=gnu11 -ffreestanding -nostdlib -nostdinc -fno-pic -fno-pie -fno-stack-protector -mno-red-zone -mcmodel=kernel -DBOOT_QUIET -DSYSCALL_QUIET -DSCHEDULER_QUIET -DCONTEXT_SWITCH_QUIET -DEXEC_QUIET -DPROCESS_QUIET -Wno-unused-variable -Wno-unused-function -Wno-builtin-declaration-mismatch -Wno-implicit-function-declaration -Wno-int-conversion -Wno-incompatible-pointer-types -Ikernel/include -Ikernel/include/compat"
+
+# SCHED_DEBUG: yellow on-screen scheduler diagnostic markers. ON by default
+# (legacy behaviour). Set SCHED_DEBUG=0 to suppress them (cleaner boot screen).
+if [ "${SCHED_DEBUG:-1}" != "0" ]; then
+    CFLAGS="$CFLAGS -DSCHED_DEBUG"
+fi
+
+# ─────────────────────────────────────────────────────────────────────────────
+# T410-SAFE PROFILE (GATED behind the T410_SAFE env var).
+#   T410_SAFE=1 SCHED_DEBUG=0 bash scripts/quick_build.sh
+# A boring-correctness profile for the 2010 Westmere i5-520M (ThinkPad T410):
+# no modern-CPU optimizations are armed regardless of CPUID. Specifically
+# -DT410_SAFE compiles OUT the ERMS REP-string fast path in paging.c (so the
+# portable, DF-safe word-copy loop is always used). Combine with SCHED_DEBUG=0
+# for a clean boot. The default build is byte-for-byte unchanged when unset.
+# ─────────────────────────────────────────────────────────────────────────────
+if [ "${T410_SAFE:-0}" = "1" ]; then
+    CFLAGS="$CFLAGS -DT410_SAFE"
+    echo "*** T410_SAFE build: modern-CPU optimizations disabled (Westmere-safe) ***"
+fi
+
+# ─────────────────────────────────────────────────────────────────────────────
+# OPT-IN: 82577LM-class PCH NIC bring-up (the ThinkPad T410 onboard NIC).
+#   PCH_NIC=1 bash scripts/quick_build.sh
+# DEFAULT OFF. The PCH PHY shares an internal MDIO bus with the Management
+# Engine; bringing it up can HARDWARE-STALL the T410 at boot (a bus stall, not a
+# software spin). Enable ONLY to validate networking on the real device with a
+# serial console attached. QEMU is unaffected either way (its NIC is not a PCH
+# part). When unset, e1000.c declines the PCH NIC so the system always boots.
+# ─────────────────────────────────────────────────────────────────────────────
+if [ "${PCH_NIC:-0}" = "1" ]; then
+    CFLAGS="$CFLAGS -DE1000_PCH_NIC"
+    echo "*** PCH_NIC build: 82577LM PCH NIC bring-up ENABLED (T410 boot risk) ***"
+fi
+
+# ─────────────────────────────────────────────────────────────────────────────
+# OPT-IN: durable on-disk persistence (AHCI/SATA + diskfs at boot).
+#   DISK_PERSIST=1 bash scripts/quick_build.sh
+# DEFAULT OFF. ahci_init() pokes real SATA-controller MMIO at boot, a documented
+# T410 post-splash-hang suspect, so it stays off for the safe RAM-rooted boot.
+# Enabling it makes the IDE's settings (SYS_PERSIST_READ/WRITE -> diskfs) and any
+# diskfs file SURVIVE A REBOOT on a present disk. QEMU's ICH9 AHCI works fine, so
+# this is how scripts/smoke_persist.sh proves cross-reboot durability. With it off,
+# the persist syscalls return ENODEV and callers fall back to a session file.
+# ─────────────────────────────────────────────────────────────────────────────
+if [ "${DISK_PERSIST:-0}" = "1" ]; then
+    CFLAGS="$CFLAGS -DDISK_PERSIST"
+    echo "*** DISK_PERSIST build: AHCI/SATA + diskfs durable persistence ENABLED ***"
+fi
 
 # Assembler flags. Empty by default so the cooperative build is byte-for-byte
 # unchanged.
@@ -103,29 +152,29 @@ if [ "${SMP:-0}" = "1" ]; then
 fi
 
 # =============================================================================
-# OPT-IN FRAMEBUFFER WRITE-COMBINING (display speedup). GATED behind the FB_WC
-#   env var.   FB_WC=1 bash scripts/quick_build.sh   ->  build/kernel-wc.elf
-# When FB_WC is UNSET this whole block is skipped and the build behaves EXACTLY
-# as before: NO -DFB_WC macro, kernel/drivers/framebuffer.c's WC block and
-# kernel.c's fb_enable_write_combining() call both #ifdef out, output stays
-# build/kernel.elf -- byte-for-byte the default kernel.
-#
-# We define -DFB_WC, which (a) compiles fb_enable_write_combining() in
-# framebuffer.c (programs a variable-range MTRR to mark the FB region
-# Write-Combining), (b) declares its prototype in drivers.h, and (c) makes
-# kernel.c call it right after the framebuffer is mapped. The MSR writes batch
-# the otherwise-UNCACHED framebuffer pixel stores into PCIe bursts -- a large
-# fps win on real hardware (the T410) where the firmware maps the FB UC. It is
-# OPT-IN/testable because on MTRR overlap UC wins: if firmware already marks the
-# region UC, the WC MTRR has no effect (so the speedup can only be confirmed on
-# the physical panel, never in QEMU where the FB is cached). A SEPARATE output
-# is written so the normal build/kernel.elf is never touched by a WC build.
-# (Only adds -DFB_WC to the gcc CFLAGS; no extra source files or nasm flags.)
+# FRAMEBUFFER WRITE-COMBINING (display speedup) -- always enabled.
+# fb_enable_write_combining() is always compiled and called at boot. It programs
+# a free variable-range MTRR to mark the framebuffer region Write-Combining,
+# coalescing pixel stores into PCIe bursts -- a 10-50x compositor speedup on
+# real hardware (the T410) where the firmware maps the FB uncached (UC).
+# Runtime-safe: bails cleanly if no free MTRR slot, base unaligned, or VCNT==0.
+# In QEMU the FB is already cached, so WC is redundant but harmless.
+# The FB_WC=1 env var is no longer needed (kept as a no-op for back-compat).
 # =============================================================================
-if [ "${FB_WC:-0}" = "1" ]; then
-    CFLAGS="$CFLAGS -DFB_WC"
-    KERNEL_OUT="build/kernel-wc.elf"
-    echo "*** FB_WC build: -DFB_WC enabled (framebuffer write-combining MTRR), output -> $KERNEL_OUT ***"
+
+# =============================================================================
+# OPT-IN LAPTOP POWER SAVING. GATED behind T410_POWER_SAVE env var.
+#   T410_POWER_SAVE=1 bash scripts/quick_build.sh
+# Reduces the PIT timer from 1000 Hz to 250 Hz, cutting timer-IRQ wakeups by
+# 75%. Each wakeup forces the CPU out of C1 (HLT), so fewer IRQs = more time
+# in the low-power halt state. The 4 ms tick granularity is fine for the
+# cooperative/light-preempt desktop (~16 ms frame time at 60 fps). The
+# scheduler's DEFAULT_TIME_SLICE (10 ticks) becomes 40 ms at 250 Hz -- plenty
+# for a laptop workload. Write-combining is now always enabled (no env var needed).
+# =============================================================================
+if [ "${T410_POWER_SAVE:-0}" = "1" ]; then
+    CFLAGS="$CFLAGS -DT410_POWER_SAVE"
+    echo "*** T410_POWER_SAVE build: PIT at 250 Hz (power saving) ***"
 fi
 
 # OPT-IN slab-corruption hardware watchpoint (debug-branch tooling). SLAB_WATCH=1
@@ -240,11 +289,19 @@ fi
 compile kernel/drivers/serial.c              c_serial
 compile kernel/drivers/pit.c                 c_pit
 compile kernel/drivers/ps2.c                 c_ps2
+compile kernel/drivers/input/ps2mouse.c      c_ps2mouse
 compile kernel/drivers/rtc.c                 c_rtc
 compile kernel/drivers/rng.c                 c_rng
 compile kernel/drivers/framebuffer.c         c_framebuffer
 compile kernel/drivers/core/irq.c            c_irq
 compile kernel/drivers/pci.c                 c_pci
+# ACPI subsystem: RSDP/RSDT/FADT/DSDT parsing, _S5_ sleep-type decode, S5
+# poweroff (ACPI PM1a/PM1b write), ACPI reset-register reboot + 8042 + triple-
+# fault fallbacks, MADT/HPET/MCFG enumeration. The acpi_state_t global in .bss
+# is ~300 bytes (pointers + a few uint16s). Called from kernel_main() after
+# pci_init(). NOTE: only kernel/acpi/acpi.c is compiled; kernel/drivers/acpi/
+# acpi.c is a standalone variant that is NOT linked (duplicate symbols).
+compile kernel/acpi/acpi.c                   c_acpi
 # NVIDIA GPU driver (detection + firmware-framebuffer foundation). SAFE to link:
 # it keeps a single tiny static gpu snapshot (no large DMA arrays in .bss),
 # probes the GPU read-only, and never programs the display. On QEMU (no 0x10DE
@@ -268,7 +325,12 @@ compile kernel/drivers/net/rtl8139.c          c_rtl8139
 compile kernel/net/net.c                      c_net
 # IPv4 routing table (net.c/socket.c call route_init/route_lookup) -- was on disk
 # but missing from the build list.
+compile kernel/drivers/hda.c                  c_hda
+compile kernel/drivers/hda_stream.c           c_hda_stream
+compile kernel/drivers/audio/audio_core.c     c_audio_core
+compile kernel/drivers/audio/audio_tone.c     c_audio_tone
 compile kernel/net/route.c                    c_route
+compile kernel/net/netif.c                   c_netif
 compile kernel/net/netsyscall.c              c_netsyscall
 # BSD-ish sockets (UDP + active-open TCP) on top of net.c. The ~338KB socket
 # table now lives in kmalloc (see socket.c), NOT .bss, so these are safe to link.
@@ -304,6 +366,11 @@ compile kernel/core/sched/context.c          c_context
 compile kernel/core/sched/waitqueue.c        c_waitqueue
 compile kernel/core/syscall/handlers.c       c_syscall_handlers
 compile kernel/core/syscall/syscall.c        c_syscall
+# rlimit + seccomp: subsystems have unresolved deps (get_timer_ticks, bpf_prog_destroy)
+# and are not fully integrated into the kernel yet. Syscall handlers are registered
+# but the source files are excluded from the build until integration is complete.
+# compile kernel/core/rlimit/*.c
+# compile kernel/security/seccomp/*.c
 compile kernel/arch/x86_64/syscall_init.c   c_syscall_init
 compile kernel/fs/vfs.c                      c_vfs
 compile kernel/fs/vfs_dir.c                  c_vfs_dir

@@ -136,15 +136,24 @@ typedef char _block_size_check[(sizeof(block_t) == 64) ? 1 : -1];
  */
 #define NUM_BINS  13
 
-/* Returns bin index for a given (already 16-aligned) size */
+/* Returns bin index for a given (already 16-aligned) size — O(1) via CLZ.
+ * Wave-7 perf: replaces the while-loop with a single __builtin_clzll (BSR
+ * instruction on x86-64, 1-3 cycles). bin = floor(log2(size)) - 4, clamped
+ * to [0, NUM_BINS-1]. The old loop iterated up to 12 times. */
 static inline int bin_for_size(size_t size) {
-    /* size is at least 16 */
-    int b = 0;
-    size_t s = 16;
-    while (b < NUM_BINS - 1 && s < size) {
-        s <<= 1;
-        b++;
-    }
+    if (size <= 16) return 0;
+    /* floor(log2(size)): 63 - clzll gives the position of the highest set bit.
+     * Bin 0 covers [16,32) = bits 4..4, so subtract 4 to get the bin index. */
+    int b = 63 - __builtin_clzll((unsigned long long)size);
+    b -= 4;  /* bin 0 = sizes with MSB at bit 4 (16..31) */
+    if (b < 0) b = 0;
+    /* Sizes that are exact powers of 2 land in the bin whose min equals them
+     * (e.g. size=32 -> b=1 -> bin 1 covers [32,64)). Non-powers land one bin
+     * higher which is correct (their MSB position implies they exceed the lower
+     * bin's range). But we need to check: if size > bin_min(b) (i.e. size is
+     * not exactly 16<<b), it needs the next bin up. */
+    if (size > (16ULL << b)) b++;
+    if (b >= NUM_BINS) b = NUM_BINS - 1;
     return b;
 }
 
@@ -398,15 +407,28 @@ static bool heap_extend(size_t need) {
     if (mapped == 0) return false;
     chunk = mapped * PAGE_SIZE;                  /* may be short if RAM ran out */
 
-    /* Publish the new region as a single free block. prev_phys is left NULL:
-     * forward-coalescing from the old tail block still works (kfree fixes the
-     * chain), so we never lose the ability to merge — only a one-time backward
-     * merge from this block is skipped, which is harmless. */
+    /* Publish the new region as a single free block. Find the old tail block
+     * (the last block before the extension) and link prev_phys so that backward
+     * coalescing across the extension boundary works correctly in kfree. Without
+     * this link, a kfree of the first allocation carved from this extension block
+     * cannot merge into an adjacent free tail block, causing permanent heap
+     * fragmentation at every extension boundary. */
     block_t* nb = (block_t*)base;
     nb->size      = chunk - sizeof(block_t);
-    nb->prev_phys = NULL;
     nb->bin_next  = NULL;
     nb->bin_prev  = NULL;
+
+    /* Walk from heap_first to find the block whose end == base. This is O(n) in
+     * the number of blocks, but heap_extend is called only on OOM (rare) and the
+     * walk is bounded by the number of live blocks (typically <100 at extension
+     * time). A maintained heap_last pointer would make this O(1), but is not worth
+     * the bookkeeping complexity for a cold path. */
+    block_t* tail = NULL;
+    for (block_t* b = heap_first; b; b = block_next_phys(b)) {
+        tail = b;
+    }
+    nb->prev_phys = tail;   /* NULL only if heap is empty (should not happen) */
+
     block_set_free(nb, true);
 
     heap_mapped_end = base + chunk;
@@ -428,7 +450,11 @@ void* kmalloc(size_t size) {
     if (size == 0) return NULL;
 
     ASSERT_ALWAYS(size > 0);
-    ASSERT_ALWAYS(size <= HEAP_SIZE);  // Sanity check for reasonable allocations
+    // Sanity: reject allocations larger than the heap can ever grow to.
+    // The old check used HEAP_SIZE (16 MiB initial), but heap_extend() can
+    // grow the heap up to HEAP_MAX_SIZE (256 MiB). A legitimate allocation
+    // between 16 MiB and 256 MiB would kernel_panic on the old assertion.
+    ASSERT_ALWAYS(size <= HEAP_MAX_SIZE);
 
     /* Round up to 16-byte multiple */
     size = ALIGN_UP(size, 16);
@@ -593,19 +619,44 @@ void* krealloc(void* ptr, size_t new_size) {
 
     size_t old_size = block->size;
 
-    /* If new size fits in current block (within 16-byte rounding), reuse it */
+    /* Round to 16-byte alignment to match kmalloc granularity */
     size_t aligned_new = ALIGN_UP(new_size, 16);
-    if (aligned_new <= old_size && old_size - aligned_new < 256) {
-        /* Size change is small enough to reuse the block without splitting */
+
+    /* SHRINK (or exact fit): always reuse the current block in place.
+     * The old code only reused when the difference was < 256 bytes, causing
+     * unnecessary kmalloc+memcpy+kfree for moderate shrinks (e.g. 4KB->2KB).
+     * Now we always reuse, and split off the tail as a free block when the
+     * remainder is large enough to be useful (>= sizeof(block_t) + 16). */
+    if (aligned_new <= old_size) {
+        size_t remainder = old_size - aligned_new;
+        if (remainder >= sizeof(block_t) + 16) {
+            /* Split: carve a free block from the tail (requires heap_lock) */
+            spin_lock(&heap_lock);
+            block->size = aligned_new;
+            block_t* split = (block_t*)((uint8_t*)block + sizeof(block_t) + aligned_new);
+            split->size      = remainder - sizeof(block_t);
+            split->prev_phys = block;
+            split->bin_next  = NULL;
+            split->bin_prev  = NULL;
+            block_set_free(split, true);
+
+            /* Fix up next block's prev_phys to point to the new split block */
+            block_t* after_split = block_next_phys(split);
+            if (after_split) after_split->prev_phys = split;
+
+            heap_used -= remainder;
+            bin_push(split);
+            spin_unlock(&heap_lock);
+        }
+        /* Remainder too small to split: reuse the block as-is (no copy) */
         return ptr;
     }
 
-    /* Allocate new block, copy data, free old */
+    /* GROW: allocate new block, copy data, free old */
     void* new_ptr = kmalloc(new_size);
     if (!new_ptr) return NULL;
 
-    size_t copy_size = (new_size < old_size) ? new_size : old_size;
-    memcpy(new_ptr, ptr, copy_size);
+    memcpy(new_ptr, ptr, old_size);
 
     kfree(ptr);
     return new_ptr;
@@ -668,21 +719,34 @@ void kfree(void* ptr) {
         return;
     }
 
-    spin_lock(&heap_lock);
-
+    /* Wave-7 perf: pre-lock validation. The block header is in heap memory that
+     * is only WRITTEN under heap_lock, but READING magic/free-flag is safe
+     * without the lock (they are atomic-width fields that are never torn on
+     * x86-64). Catching corruption/double-free BEFORE the lock avoids holding
+     * the heap spinlock during the kernel_panic path (which prints, may
+     * deadlock, or never returns). The flags field is re-checked under the lock
+     * before any mutation in case of a race (belt-and-braces). */
     block_t* block = (block_t*)((uint8_t*)ptr - sizeof(block_t));
 
-    /* Validate magic */
+    /* Validate magic (pre-lock, read-only check) */
     if (!block_magic_ok(block)) {
-        spin_unlock(&heap_lock);
         kernel_panic("kfree: bad magic (corruption or invalid pointer)");
         return;
     }
 
-    /* Double-free detection */
+    /* Double-free detection (pre-lock, read-only check) */
+    if (block_is_free(block)) {
+        kernel_panic("kfree: double free detected");
+        return;
+    }
+
+    spin_lock(&heap_lock);
+
+    /* Re-validate under lock (race defense: another CPU could have freed this
+     * block between our pre-lock check and acquiring the lock). */
     if (block_is_free(block)) {
         spin_unlock(&heap_lock);
-        kernel_panic("kfree: double free detected");
+        kernel_panic("kfree: double free detected (under lock)");
         return;
     }
 

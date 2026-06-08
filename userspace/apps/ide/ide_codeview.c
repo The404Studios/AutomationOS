@@ -20,7 +20,7 @@
 #define CV_GUTTER_CH  5                  /* gutter width in characters       */
 #define CV_LINECAP    1024               /* max chars classified per line    */
 #define CV_TAGCAP     80                 /* max chars in a built tag string  */
-#define CV_TABW       4                  /* tab stop width in columns        */
+#define CV_TABW       (g_tab_width < 1 ? 1 : g_tab_width)  /* tab stop width (Settings knob) */
 #define CV_SBAR_W     3                  /* scrollbar indicator width (px)   */
 #define CV_FOCUS_PAD  2                  /* lines above focus_start on recentre */
 
@@ -125,6 +125,30 @@ static int cv_col_advance(int col, char ch) {
     return col + 1;
 }
 
+/* Tab-aware visual column for character index `charcol` within line[0..llen).
+ * Mirrors the editor caret model (char index) onto the code view's tab-stop
+ * rendering, so the shared a->editor caret lands in the right cell here. */
+static int cv_caret_viscol(const char* line, int llen, int charcol) {
+    int col = 0, i;
+    if (charcol > llen) charcol = llen;
+    if (charcol < 0) charcol = 0;
+    for (i = 0; i < charcol; i++) col = cv_col_advance(col, line[i]);
+    return col;
+}
+
+/* Inverse of cv_caret_viscol: the character index whose cell contains visual
+ * column `viscol` (clamped to llen). Used to place the caret from a click. */
+static int cv_charcol_from_vis(const char* line, int llen, int viscol) {
+    int col = 0, i;
+    if (viscol <= 0) return 0;
+    for (i = 0; i < llen; i++) {
+        int adv = cv_col_advance(col, line[i]);
+        if (viscol < adv) return i;     /* click lands within this char's span */
+        col = adv;
+    }
+    return llen;
+}
+
 /* Count newline-delimited lines in src[0..slen). An empty buffer is 0 lines;
  * a buffer with no trailing '\n' still counts its final partial line. */
 static int cv_count_lines(const char* src, int slen) {
@@ -136,16 +160,16 @@ static int cv_count_lines(const char* src, int slen) {
     return n;
 }
 
-/* class value -> text colour */
+/* class value -> text colour (kept in sync with ide_editor.c ed_class_color) */
 static uint32_t cv_class_color(unsigned char c) {
     switch (c) {
         case LEXCLS_KEYWORD: return TH_PURPLE;
         case LEXCLS_TYPE:    return TH_CYAN;
-        case LEXCLS_STRING:  return TH_GREEN;
+        case LEXCLS_STRING:  return TH_ORANGE;
         case LEXCLS_COMMENT: return TH_TEXT_FAINT;
-        case LEXCLS_NUMBER:  return TH_ORANGE;
+        case LEXCLS_NUMBER:  return TH_GREEN;
         case LEXCLS_PREPROC: return TH_MAGENTA;
-        case LEXCLS_CALL:    return TH_BLUE;
+        case LEXCLS_CALL:    return TH_YELLOW;
         default:             return TH_TEXT;
     }
 }
@@ -156,25 +180,27 @@ static uint32_t cv_class_color(unsigned char c) {
  * drawn if it fits to the right of `min_x` (the right edge of the code). col
  * is the accent/text colour; the fill is a dim tint of the panel.
  */
-static void cv_draw_tag(Canvas* cv, Rect body, int ry, int min_x,
-                        const char* text, uint32_t col) {
-    int tw = cv_slen(text) * GFX_FW;
-    int chip_w = tw + 2 * PAD;
-    int chip_h = GFX_FH + 2;
-    int right = body.x + body.w - PAD;
-    int chip_x = right - chip_w;
-    int chip_y = ry + (ROW_H - chip_h) / 2;
+/* Draw a semantic annotation in the RIGHT-MARGIN gutter, connected to the code
+ * by a short dashed line + a colored bullet -- VS Code "inlay hint" style. This
+ * replaces the old right-aligned chip, which shared the right edge with the code
+ * text and so overlapped it on longer lines ("towers[i Control: tower_init").
+ *   code_end : right pixel of the drawn code on this row (connector start)
+ *   gutter_x : left edge of the reserved annotation gutter (label start)
+ * Code is clipped to stop before gutter_x by the caller, so there is no overlap. */
+static void cv_draw_tag(Canvas* cv, Rect body, int ry, int code_end,
+                        int gutter_x, const char* text, uint32_t col) {
+    int liney = ry + GFX_FH / 2;
+    int lbl_x = gutter_x + 6;
+    int avail = body.x + body.w - PAD - lbl_x;
+    if (avail <= GFX_FW) return;                  /* no room for the label */
+    if (ry < body.y || ry + GFX_FH > body.y + body.h) return;
 
-    if (chip_w <= 0) return;
-    /* must fit inside body and not overlap the code text region */
-    if (chip_x < min_x + GFX_FW) return;          /* keep a gap from code */
-    if (chip_x < body.x) return;
-    if (chip_y < body.y) chip_y = body.y;
-    if (chip_y + chip_h > body.y + body.h) return;
-
-    gfx_round(cv, chip_x, chip_y, chip_w, chip_h, 4, TH_SELECT);
-    gfx_text_clip(cv, chip_x + PAD, chip_y + 1, text, col,
-                  chip_x + PAD, tw);
+    /* dashed connector from end-of-code to the gutter */
+    if (code_end + 2 < gutter_x - 2)
+        gfx_dashed(cv, code_end + 2, liney, gutter_x - 2, liney, TH_TEXT_FAINT, 3);
+    /* colored bullet at the gutter edge, then the label text */
+    gfx_fill(cv, gutter_x, liney - 1, 3, 3, col);
+    gfx_text_clip(cv, lbl_x, ry, text, col, lbl_x, avail);
 }
 
 void panel_code(Ide* a, Canvas* cv, Rect r) {
@@ -193,6 +219,7 @@ void panel_code(Ide* a, Canvas* cv, Rect r) {
     int total_lines;
     Func* ff = 0;
     int code_x, code_clip_w;
+    int anno_x, anno_w;               /* reserved right-margin annotation gutter */
 
     if (!a || r.w <= 0 || r.h <= 0) return;
 
@@ -225,14 +252,32 @@ void panel_code(Ide* a, Canvas* cv, Rect r) {
     body = cv_body(r);
     if (body.h <= 0) return;
 
-    gutter_w   = cv_gutter_w();
+    gutter_w   = g_line_numbers ? cv_gutter_w() : 0;   /* Settings knob */
     code_x     = body.x + gutter_w + PAD;
-    code_clip_w = body.x + body.w - PAD - code_x;
+
+    /* Reserve a RIGHT-MARGIN gutter for semantic annotations so they never
+     * overlap the code. Room for ~"Control: <name>"; capped to 2/5 of the body,
+     * and dropped entirely if that would leave fewer than 16 code columns (e.g.
+     * a very narrow code pane) -- in which case code uses the full width and the
+     * annotations simply don't draw. The annotation gutter is also a Settings knob. */
+    anno_w = g_anno_gutter ? (22 * GFX_FW + 8) : 0;
+    if (anno_w > (body.w * 2) / 5) anno_w = (body.w * 2) / 5;
+    anno_x = body.x + body.w - anno_w;
+    if (anno_w <= 0 || anno_x < code_x + 16 * GFX_FW) {
+        anno_w = 0;
+        anno_x = body.x + body.w;            /* no gutter: code uses full width */
+    }
+    code_clip_w = anno_x - PAD - code_x;
     if (code_clip_w < 0) code_clip_w = 0;
 
-    /* gutter background + divider */
-    gfx_fill(cv, body.x, body.y, gutter_w, body.h, TH_PANEL);
-    gfx_vline(cv, body.x + gutter_w, body.y, body.h, TH_BORDER);
+    /* gutter background + divider (only when line numbers are shown) */
+    if (g_line_numbers) {
+        gfx_fill(cv, body.x, body.y, gutter_w, body.h, TH_PANEL);
+        gfx_vline(cv, body.x + gutter_w, body.y, body.h, TH_BORDER);
+    }
+    /* faint divider marking the annotation gutter (when reserved) */
+    if (anno_w > 0)
+        gfx_vline(cv, anno_x - PAD, body.y, body.h, TH_BORDER);
 
     vis = body.h / line_h;            /* fully visible code rows */
     if (vis < 1) vis = 1;
@@ -254,7 +299,19 @@ void panel_code(Ide* a, Canvas* cv, Rect r) {
     scroll = a->code_scroll;
     if (scroll < 0) scroll = 0;
 
-    if (a->focus_func != last_focus) {
+    if (a->codeview_focus) {
+        /* Editing in the code view: keep the CARET line on screen rather than
+         * auto-recentering on the focused function. Mirrors ed_scroll_to_caret. */
+        int vrows = body.h / line_h; if (vrows < 1) vrows = 1;
+        int cl = a->editor.caret_line;
+        if (cl < scroll) scroll = cl;
+        else if (cl > scroll + vrows - 1) scroll = cl - vrows + 1;
+        int maxs = total_lines - vrows; if (maxs < 0) maxs = 0;
+        if (scroll > maxs) scroll = maxs;
+        if (scroll < 0) scroll = 0;
+        a->code_scroll = scroll;
+        last_focus = a->focus_func;   /* don't snap-recenter when focus released */
+    } else if (a->focus_func != last_focus) {
         last_focus = a->focus_func;
         if (focus_ls >= 1) {
             int top = scroll + 1;            /* first visible 1-based line */
@@ -326,9 +383,36 @@ void panel_code(Ide* a, Canvas* cv, Rect r) {
                     gfx_blend(cv, body.x, ry, body.w, line_h,
                               (0x40u << 24) | (TH_SELECT & 0x00FFFFFFu));
 
-                cv_itoa_pad(lineno, CV_GUTTER_CH, numbuf, (int)sizeof(numbuf));
-                gfx_text_clip(cv, body.x + PAD, ry, numbuf, TH_TEXT_FAINT,
-                              body.x + PAD, CV_GUTTER_CH * GFX_FW);
+                if (g_line_numbers) {
+                    cv_itoa_pad(lineno, CV_GUTTER_CH, numbuf, (int)sizeof(numbuf));
+                    gfx_text_clip(cv, body.x + PAD, ry, numbuf, TH_TEXT_FAINT,
+                                  body.x + PAD, CV_GUTTER_CH * GFX_FW);
+                }
+            }
+
+            /* ---- selection highlight (code-view editing), under the text ---- */
+            if (a->codeview_focus) {
+                int slo, shi;
+                if (ide_editor_sel_range(a, &slo, &shi)) {
+                    int lend2 = lstart + llen;
+                    if (shi > lstart && slo <= lend2) {
+                        int c0 = (slo > lstart ? slo : lstart) - lstart;  /* char idx */
+                        int c1 = (shi < lend2 ? shi : lend2) - lstart;    /* char idx */
+                        int eol_extra = (shi > lend2) ? 1 : 0;  /* spans the newline */
+                        int v0 = cv_caret_viscol(src + lstart, llen, c0);
+                        int v1 = cv_caret_viscol(src + lstart, llen, c1) + eol_extra;
+                        if (v1 > v0) {
+                            int hx = code_x + v0 * GFX_FW;
+                            int hw = (v1 - v0) * GFX_FW;
+                            int sel_right = code_x + code_clip_w;
+                            if (hx < sel_right) {
+                                if (hx + hw > sel_right) hw = sel_right - hx;
+                                gfx_blend(cv, hx, ry, hw, line_h,
+                                          (0x66u << 24) | (TH_BLUE & 0x00FFFFFFu));
+                            }
+                        }
+                    }
+                }
             }
 
             /* ---- classify + draw the code text, char-by-char, tab-aware ---- */
@@ -355,10 +439,18 @@ void panel_code(Ide* a, Canvas* cv, Rect r) {
                 if (text_right > code_right) text_right = code_right;
             }
 
+            /* ---- caret (code-view editing), drawn on top of the text ---- */
+            if (a->codeview_focus && a->editor.caret_line == lineno - 1) {
+                int vc = cv_caret_viscol(src + lstart, llen, a->editor.caret_col);
+                int cx = code_x + vc * GFX_FW;
+                if (cx >= code_x && cx < code_x + code_clip_w)
+                    gfx_fill(cv, cx, ry, 2, line_h, TH_BLUE);
+            }
+
             /* ---- annotation chip (focus-function lines only) ----
              * Only drawn when it fits to the right of text_right without
              * overlapping the code (cv_draw_tag enforces the gap). */
-            if (ff && in_focus && n > 0) {
+            if (ff && in_focus && n > 0 && anno_w > 0) {
                 const char* ln = src + lstart;
                 int tag_done = 0;
                 int k;
@@ -372,7 +464,7 @@ void panel_code(Ide* a, Canvas* cv, Rect r) {
                         int p = 0;
                         cv_append(tagbuf, &p, CV_TAGCAP, "Write: ");
                         cv_append(tagbuf, &p, CV_TAGCAP, g);
-                        cv_draw_tag(cv, body, ry, text_right, tagbuf, TH_GREEN);
+                        cv_draw_tag(cv, body, ry, text_right, anno_x, tagbuf, TH_GREEN);
                         tag_done = 1;
                     }
                 }
@@ -385,7 +477,7 @@ void panel_code(Ide* a, Canvas* cv, Rect r) {
                         int p = 0;
                         cv_append(tagbuf, &p, CV_TAGCAP, "Read: ");
                         cv_append(tagbuf, &p, CV_TAGCAP, g);
-                        cv_draw_tag(cv, body, ry, text_right, tagbuf, TH_CYAN);
+                        cv_draw_tag(cv, body, ry, text_right, anno_x, tagbuf, TH_CYAN);
                         tag_done = 1;
                     }
                 }
@@ -398,7 +490,7 @@ void panel_code(Ide* a, Canvas* cv, Rect r) {
                         int p = 0;
                         cv_append(tagbuf, &p, CV_TAGCAP, "Control: ");
                         cv_append(tagbuf, &p, CV_TAGCAP, c);
-                        cv_draw_tag(cv, body, ry, text_right, tagbuf, TH_YELLOW);
+                        cv_draw_tag(cv, body, ry, text_right, anno_x, tagbuf, TH_YELLOW);
                         tag_done = 1;
                     }
                 }
@@ -442,4 +534,62 @@ void panel_code(Ide* a, Canvas* cv, Rect r) {
             gfx_fill(cv, track_x, thumb_y, CV_SBAR_W, thumb_h, TH_BORDER_LT);
         }
     }
+}
+
+/*
+ * Left-click in the code view: give it keyboard focus and place the shared
+ * a->editor caret at the clicked cell. Geometry mirrors panel_code exactly
+ * (cv_body + cv_gutter_w + a->code_scroll), and the visual->char mapping is
+ * tab-aware (cv_charcol_from_vis) so the caret lands where the glyph is drawn.
+ * shift extends the existing selection instead of dropping it.
+ */
+int panel_code_click(Ide* a, Rect r, int mx, int my, int shift) {
+    Editor* e;
+    Rect body;
+    int line_h, gutter_w, code_x, scroll, total, row, ln, lstart, llen, viscol, ci;
+    int slen;
+
+    if (!a || r.w <= 0 || r.h <= 0) return 0;
+    e = &a->editor;
+    body = cv_body(r);
+    if (body.h <= 0) return 0;
+
+    /* Take keyboard focus for the code view (drop the editor's own focus). */
+    a->codeview_focus = 1;
+    e->focused = 0;
+    e->ac_active = 0;
+
+    if (my < body.y) return 1;          /* header click: focus only, no caret move */
+
+    line_h   = GFX_FH;
+    gutter_w = g_line_numbers ? cv_gutter_w() : 0;   /* mirror panel_code */
+    code_x   = body.x + gutter_w + PAD;
+
+    scroll = a->code_scroll; if (scroll < 0) scroll = 0;
+
+    slen = a->src_len;
+    if (slen < 0) slen = 0;
+    if (slen > IDE_SRC_CAP) slen = IDE_SRC_CAP;
+    total = cv_count_lines(a->src, slen);
+    if (total < 1) total = 1;
+
+    row = (my - body.y) / line_h;
+    ln  = scroll + row;
+    if (ln < 0) ln = 0;
+    if (ln >= total) ln = total - 1;
+
+    /* Shift+click extends the selection from the existing caret (anchor once). */
+    if (shift) { if (e->sel_anchor_off < 0) e->sel_anchor_off = ide_editor_caret_off(a); }
+    else         e->sel_anchor_off = -1;
+
+    lstart = ide_editor_line_start(a, ln);
+    llen   = ide_editor_line_len(a, ln);
+    viscol = (mx - code_x) / GFX_FW;
+    if (viscol < 0) viscol = 0;
+    ci = cv_charcol_from_vis(a->src + lstart, llen, viscol);
+
+    e->caret_line = ln;
+    e->caret_col  = ci;
+    e->want_col   = ci;
+    return 1;
 }

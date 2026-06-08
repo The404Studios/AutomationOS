@@ -26,7 +26,7 @@ $(BUILD_DIR)/boot.elf: $(BUILD_DIR)/boot.o $(BUILD_DIR)/loader.o
 $(BUILD_DIR)/BOOTX64.EFI: $(BUILD_DIR)/boot.elf
 	@mkdir -p $(dir $@)
 	$(OBJCOPY) -j .text -j .rodata -j .data -j .bss \
-	    --target efi-app-x86_64 \
+	    -I elf64-x86-64 -O pe-x86-64 \
 	    --subsystem=10 \
 	    $(BUILD_DIR)/boot.elf $(BUILD_DIR)/BOOTX64.EFI
 	@echo "  PE/COFF UEFI binary: $(BUILD_DIR)/BOOTX64.EFI"

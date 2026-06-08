@@ -230,10 +230,12 @@ typedef struct {
     char     fname[M_NAME];   /* for MK_CALL: the called function name   */
 } MapSat;
 
-/* Upper bound: reads + writes + calls + absent ports + inbound callers, all
- * M-capped. The + M_MAXFUNCS reserves room for the FAR-LEFT caller column so a
- * heavily-called function's callers are never silently dropped by map_sat_push. */
-#define MAP_MAXSAT (M_MAXREFS + M_MAXREFS + M_MAXCALLS + M_MAXPORTS + M_MAXFUNCS)
+/* Upper bound: must accommodate both the per-function dependency view (reads +
+ * writes + calls + absent ports + inbound callers) AND the file overview (all
+ * includes + macros + records + globals + protos + funcs). We take the larger. */
+#define MAP_MAXSAT_FUNC  (M_MAXREFS + M_MAXREFS + M_MAXCALLS + M_MAXPORTS + M_MAXFUNCS)
+#define MAP_MAXSAT_OV    (M_MAXINCLUDES + M_MAXMACROS + M_MAXRECORDS + M_MAXGLOBALS + M_MAXPROTOS + M_MAXFUNCS)
+#define MAP_MAXSAT       (MAP_MAXSAT_FUNC > MAP_MAXSAT_OV ? MAP_MAXSAT_FUNC : MAP_MAXSAT_OV)
 
 static MapSat map_sats[MAP_MAXSAT];
 static int    map_nsats;
@@ -293,12 +295,14 @@ void panel_map(Ide* a, Canvas* cv, Rect r)
     if (zoom < 1)   zoom = 1;        /* clamp scale range 0.01 (1%) .. 1.00 (100%) */
     if (zoom > 100) zoom = 100;
 
-    /* Title: "SEMANTIC LEGO MAP - <focusname> [zoom%]". */
+    /* Title: "SEMANTIC LEGO MAP - <focusname> [zoom%]" or "FILE OVERVIEW". */
     buf[0] = '\0';
     map_cat(buf, "SEMANTIC LEGO MAP", sizeof(buf));
     if (focus >= 0 && focus < m->nfuncs && m->funcs[focus].name[0]) {
         map_cat(buf, " - ", sizeof(buf));
         map_cat(buf, m->funcs[focus].name, sizeof(buf));
+    } else {
+        map_cat(buf, " - FILE OVERVIEW", sizeof(buf));
     }
     /* Show zoom level in header */
     if (zoom != 100) {
@@ -323,13 +327,120 @@ void panel_map(Ide* a, Canvas* cv, Rect r)
     map_sat_reset();
     map_have_layout = 1;
 
-    /* ---- no focus: centered hint ---- */
+    /* ---- FILE OVERVIEW: all code elements as colored LEGO tiles ---- */
     if (focus < 0 || focus >= m->nfuncs) {
-        const char* hint = "Select a function";
-        int tw = gfx_textw(hint);
-        gfx_text_clip(cv, body.x + (body.w - tw) / 2,
-                      body.y + (body.h - GFX_FH) / 2,
-                      hint, TH_TEXT_DIM, body.x, body.w);
+        /* Total element count for the overview */
+        int total = m->nincludes + m->nmacros + m->nrecords +
+                    m->nglobals + m->nfuncs + m->nprotos;
+        if (total == 0) {
+            const char* hint = "No code elements found";
+            int tw = gfx_textw(hint);
+            gfx_text_clip(cv, body.x + (body.w - tw) / 2,
+                          body.y + (body.h - GFX_FH) / 2,
+                          hint, TH_TEXT_DIM, body.x, body.w);
+            return;
+        }
+
+        /* Tile geometry */
+        #define OV_TILE_W   180
+        #define OV_TILE_H   28
+        #define OV_GAP_X    10
+        #define OV_GAP_Y    6
+        #define OV_GLYPH_W  24     /* space for the small type icon */
+        #define OV_HDRBAND  5      /* accent header band height */
+
+        int cols = (body.w - 2 * PAD + OV_GAP_X) / (OV_TILE_W + OV_GAP_X);
+        if (cols < 1) cols = 1;
+
+        int tile_idx = 0;
+        int scroll_y = a->map_oy;  /* reuse map pan for scrolling */
+
+        /* Helper macro to place a tile and record it in the satellite table.
+         * kind = MK_CALL for function tiles (navigable), MK_READ otherwise. */
+        #define OV_TILE(accent, label, fname_str, mk) do {                  \
+            int col = tile_idx % cols;                                      \
+            int row = tile_idx / cols;                                      \
+            int tx = body.x + PAD + col * (OV_TILE_W + OV_GAP_X);          \
+            int ty = body.y + PAD + row * (OV_TILE_H + OV_GAP_Y) + scroll_y;\
+            Rect sc; sc.x = tx; sc.y = ty; sc.w = OV_TILE_W; sc.h = OV_TILE_H;\
+            if (ty + OV_TILE_H > body.y && ty < body.y + body.h) {         \
+                map_card(cv, tx, ty, OV_TILE_W, OV_TILE_H, OV_HDRBAND,    \
+                         TH_PANEL2, (accent));                             \
+                if (tile_idx == a->map_selected) {                        \
+                    gfx_stroke(cv, tx,   ty,   OV_TILE_W,   OV_TILE_H,   TH_BLUE);\
+                    gfx_stroke(cv, tx-1, ty-1, OV_TILE_W+2, OV_TILE_H+2, TH_BLUE);\
+                }                                                          \
+                int lx = tx + PAD + OV_GLYPH_W;                           \
+                int ly = ty + OV_HDRBAND + (OV_TILE_H - OV_HDRBAND - GFX_FH) / 2;\
+                gfx_text_clip(cv, lx, ly, (label), TH_TEXT,               \
+                              lx, OV_TILE_W - PAD - OV_GLYPH_W - PAD);   \
+                /* small type icon */                                       \
+                gfx_text_clip(cv, tx + PAD, ly, (mk == MK_CALL ? "{}" :   \
+                    (accent) == TH_GREEN ? "S" :                           \
+                    (accent) == TH_YELLOW ? "=" :                          \
+                    (accent) == TH_PURPLE ? "#" :                          \
+                    (accent) == TH_TEXT_DIM ? ">" :                        \
+                    (accent) == TH_CYAN ? "p" : "?"),                     \
+                    (accent), tx + PAD, OV_GLYPH_W);                      \
+            }                                                               \
+            map_sat_push(sc, (mk), (accent), 0, 0, 0, (label), (fname_str));\
+            tile_idx++;                                                     \
+        } while(0)
+
+        /* == SECTION: Includes (gray) == */
+        for (i = 0; i < m->nincludes && i < M_MAXINCLUDES; i++) {
+            OV_TILE(TH_TEXT_DIM, m->includes[i].path, "", MK_READ);
+        }
+
+        /* == SECTION: Macros (purple) == */
+        for (i = 0; i < m->nmacros && i < M_MAXMACROS; i++) {
+            OV_TILE(TH_PURPLE, m->macros[i].name, "", MK_READ);
+        }
+
+        /* == SECTION: Records/typedefs (green) == */
+        for (i = 0; i < m->nrecords && i < M_MAXRECORDS; i++) {
+            buf[0] = '\0';
+            map_cat(buf, m->records[i].kind_tag, sizeof(buf));
+            map_cat(buf, " ", sizeof(buf));
+            map_cat(buf, m->records[i].name, sizeof(buf));
+            OV_TILE(TH_GREEN, buf, "", MK_READ);
+        }
+
+        /* == SECTION: Globals (yellow) == */
+        for (i = 0; i < m->nglobals && i < M_MAXGLOBALS; i++) {
+            buf[0] = '\0';
+            if (m->globals[i].type[0]) {
+                map_cat(buf, m->globals[i].type, sizeof(buf));
+                map_cat(buf, " ", sizeof(buf));
+            }
+            map_cat(buf, m->globals[i].name, sizeof(buf));
+            OV_TILE(TH_YELLOW, buf, "", MK_READ);
+        }
+
+        /* == SECTION: Function prototypes (blue, dim) == */
+        for (i = 0; i < m->nprotos && i < M_MAXPROTOS; i++) {
+            buf[0] = '\0';
+            map_cat(buf, m->protos[i].name, sizeof(buf));
+            map_cat(buf, "()", sizeof(buf));
+            OV_TILE(TH_CYAN, buf, "", MK_READ);
+        }
+
+        /* == SECTION: Function definitions (blue, clickable) == */
+        for (i = 0; i < m->nfuncs && i < M_MAXFUNCS; i++) {
+            buf[0] = '\0';
+            map_cat(buf, m->funcs[i].name, sizeof(buf));
+            map_cat(buf, "()", sizeof(buf));
+            OV_TILE(TH_BLUE, buf, m->funcs[i].name, MK_CALL);
+        }
+
+        #undef OV_TILE
+
+        /* footer legend */
+        {
+            const char* hint = "gray #include  purple #define  green struct/type  yellow global  cyan proto  blue func (click)";
+            gfx_text_clip(cv, body.x + PAD, body.y + body.h - GFX_FH - 2,
+                          hint, TH_TEXT_FAINT, body.x + PAD, body.w - 2 * PAD);
+        }
         return;
     }
 
@@ -616,6 +727,12 @@ void panel_map(Ide* a, Canvas* cv, Rect r)
         Rect    sc  = s->r;
         int     ty  = sc.y + sathdr_h + (sc.h - sathdr_h - GFX_FH) / 2;
 
+        /* SELECTION glow: a larger accent rect drawn BEHIND the card so a cyan
+         * border shows once the card paints on top -- visual feedback that the
+         * map is interactive (click or keyboard-select a node). */
+        if (i == a->map_selected)
+            gfx_round(cv, sc.x - 3, sc.y - 3, sc.w + 6, sc.h + 6, 6, TH_CYAN);
+
         if (s->kind == MK_ABSENT) {
             /* dashed-red two-line card: "(ABSENT)" then "fit 0.NN" */
             map_card_dashed(cv, sc.x, sc.y, sc.w, sc.h, TH_PANEL2, s->accent);
@@ -662,9 +779,58 @@ void panel_map(Ide* a, Canvas* cv, Rect r)
  * to it via ide_set_focus().
  * ------------------------------------------------------------------------- */
 
+/* Follow a satellite node (shared by click + keyboard activate):
+ *   CALL        -> refocus the called function.
+ *   READ/WRITE  -> jump to a producer/consumer of that global.
+ *   ABSENT      -> no-op (quick-fix menu TODO). */
+static void map_sat_follow(Ide* a, MapSat* s)
+{
+    int j;
+    switch (s->kind) {
+    case MK_CALL:
+        if (s->fname[0]) {
+            for (j = 0; j < a->model.nfuncs && j < M_MAXFUNCS; j++) {
+                if (map_streq(a->model.funcs[j].name, s->fname)) {
+                    a->prev_focus = a->focus_func;   /* remember for Backspace = back */
+                    ide_set_focus(a, j);
+                    return;
+                }
+            }
+        }
+        break;
+    case MK_READ:
+    case MK_WRITE:
+        /* Navigate by dependency. s->fname holds the BARE global name.
+         *   READ  port -> jump to a function that WRITES it (the producer).
+         *   WRITE port -> jump to a function that READS it (a consumer).
+         * Skip the currently-focused function so the move is always visible. */
+        if (s->fname[0]) {
+            for (j = 0; j < a->model.nfuncs && j < M_MAXFUNCS; j++) {
+                Func* g = &a->model.funcs[j];
+                int k, nref, hit = 0;
+                if (j == a->focus_func) continue;
+                if (s->kind == MK_READ) {
+                    nref = g->nwrites; if (nref > M_MAXREFS) nref = M_MAXREFS;
+                    for (k = 0; k < nref; k++)
+                        if (g->writes[k][0] && map_streq(g->writes[k], s->fname)) { hit = 1; break; }
+                } else {
+                    nref = g->nreads;  if (nref > M_MAXREFS) nref = M_MAXREFS;
+                    for (k = 0; k < nref; k++)
+                        if (g->reads[k][0] && map_streq(g->reads[k], s->fname)) { hit = 1; break; }
+                }
+                if (hit) { a->prev_focus = a->focus_func; ide_set_focus(a, j); return; }
+            }
+        }
+        break;
+    case MK_ABSENT:
+    default:
+        break;
+    }
+}
+
 int panel_map_click(Ide* a, Rect r, int mx, int my)
 {
-    int i, j;
+    int i;
     if (!a) return 0;
     if (!rect_hit(r, mx, my)) return 0;   /* outside our panel: pass through */
 
@@ -673,59 +839,50 @@ int panel_map_click(Ide* a, Rect r, int mx, int my)
     for (i = 0; i < map_nsats && i < MAP_MAXSAT; i++) {
         MapSat* s = &map_sats[i];
         if (!rect_hit(s->r, mx, my)) continue;
-
-        /* Handle different satellite types */
-        switch (s->kind) {
-        case MK_CALL:
-            if (s->fname[0]) {
-                /* find the called function in the model and refocus to it */
-                for (j = 0; j < a->model.nfuncs && j < M_MAXFUNCS; j++) {
-                    if (map_streq(a->model.funcs[j].name, s->fname)) {
-                        a->prev_focus = a->focus_func;   /* remember for Backspace = back */
-                        ide_set_focus(a, j);
-                        return 1;
-                    }
-                }
-            }
-            break;
-
-        case MK_READ:
-        case MK_WRITE:
-            /* Navigate by dependency. s->fname holds the BARE global name.
-             *   READ  port  -> jump to a function that WRITES it (the producer).
-             *   WRITE port  -> jump to a function that READS it (a consumer).
-             * Scan the model for the first matching counterpart and refocus. We
-             * skip the currently-focused function so the click always moves. */
-            if (s->fname[0]) {
-                for (j = 0; j < a->model.nfuncs && j < M_MAXFUNCS; j++) {
-                    Func* g = &a->model.funcs[j];
-                    int k, nref, hit = 0;
-                    if (j == a->focus_func) continue;
-                    if (s->kind == MK_READ) {
-                        nref = g->nwrites; if (nref > M_MAXREFS) nref = M_MAXREFS;
-                        for (k = 0; k < nref; k++)
-                            if (g->writes[k][0] && map_streq(g->writes[k], s->fname)) { hit = 1; break; }
-                    } else {
-                        nref = g->nreads;  if (nref > M_MAXREFS) nref = M_MAXREFS;
-                        for (k = 0; k < nref; k++)
-                            if (g->reads[k][0] && map_streq(g->reads[k], s->fname)) { hit = 1; break; }
-                    }
-                    if (hit) {
-                        a->prev_focus = a->focus_func;   /* Backspace = back */
-                        ide_set_focus(a, j);
-                        return 1;
-                    }
-                }
-            }
-            break;
-
-        case MK_ABSENT:
-            /* Clicked an absent port - could show why it's missing or offer to add it
-             * This is revolutionary "auto-fix architecture violations" */
-            /* TODO: Show absent port details or quick-fix menu */
-            break;
-        }
-        return 1;   /* clicked a satellite: consume */
+        a->map_selected = i;              /* select (highlight) the clicked node */
+        map_sat_follow(a, s);             /* then follow it (may refocus)        */
+        return 1;                         /* clicked a satellite: consume        */
     }
     return 1;       /* clicked empty map space: consume */
+}
+
+/* Keyboard navigation across map nodes (uses last frame's laid-out geometry).
+ * dir: 0=up 1=down 2=left 3=right. Moves a->map_selected to the nearest node in
+ * that direction; with nothing selected yet, selects the first node. */
+void map_nav(Ide* a, int dir)
+{
+    int i, cx, cy, best = -1;
+    long bestd = 0;
+    if (!a || !map_have_layout || map_nsats <= 0) return;
+    if (a->map_selected < 0 || a->map_selected >= map_nsats) { a->map_selected = 0; return; }
+    cx = map_sats[a->map_selected].r.x + map_sats[a->map_selected].r.w / 2;
+    cy = map_sats[a->map_selected].r.y + map_sats[a->map_selected].r.h / 2;
+    for (i = 0; i < map_nsats && i < MAP_MAXSAT; i++) {
+        int ix, iy, dx, dy, adx, ady, ok = 0;
+        if (i == a->map_selected) continue;
+        ix = map_sats[i].r.x + map_sats[i].r.w / 2;
+        iy = map_sats[i].r.y + map_sats[i].r.h / 2;
+        dx = ix - cx; dy = iy - cy;
+        adx = dx < 0 ? -dx : dx; ady = dy < 0 ? -dy : dy;
+        switch (dir) {
+        case 0: ok = (dy < 0 && ady >= adx); break;   /* up    */
+        case 1: ok = (dy > 0 && ady >= adx); break;   /* down  */
+        case 2: ok = (dx < 0 && adx >= ady); break;   /* left  */
+        case 3: ok = (dx > 0 && adx >= ady); break;   /* right */
+        }
+        if (ok) {
+            long d = (long)dx * dx + (long)dy * dy;
+            if (best < 0 || d < bestd) { best = i; bestd = d; }
+        }
+    }
+    if (best >= 0) a->map_selected = best;
+}
+
+/* Activate (follow) the keyboard-selected map node -- the Enter key analogue of
+ * clicking it. */
+void map_activate(Ide* a)
+{
+    if (!a || !map_have_layout) return;
+    if (a->map_selected < 0 || a->map_selected >= map_nsats) return;
+    map_sat_follow(a, &map_sats[a->map_selected]);
 }

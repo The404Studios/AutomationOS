@@ -148,6 +148,89 @@ static void mp_collect_calls(Func* f, AstNode* n, int depth) {
 }
 
 /* ----------------------------------------------------------------------- */
+/* PASS 0: pre-parse scan of preprocessor tokens for #include and #define  */
+/* (called before parser_init strips them).                                */
+/* ----------------------------------------------------------------------- */
+static int mp_startswith(const char* s, int len, const char* prefix) {
+    int i = 0;
+    if (!s || !prefix) return 0;
+    while (prefix[i]) {
+        if (i >= len) return 0;
+        if (s[i] != prefix[i]) return 0;
+        i++;
+    }
+    return 1;
+}
+
+static void mp_pass_preproc(Model* m, const char* src, int src_len) {
+    /* Scan each line looking for #include and #define directives. */
+    int pos = 0, line = 1;
+    while (pos < src_len) {
+        /* skip leading whitespace on the line */
+        while (pos < src_len && (src[pos] == ' ' || src[pos] == '\t')) pos++;
+
+        if (pos < src_len && src[pos] == '#') {
+            pos++; /* skip '#' */
+            /* skip spaces after '#' */
+            while (pos < src_len && (src[pos] == ' ' || src[pos] == '\t')) pos++;
+
+            int remaining = src_len - pos;
+
+            if (mp_startswith(src + pos, remaining, "include")) {
+                /* #include directive */
+                pos += 7; /* skip "include" */
+                while (pos < src_len && (src[pos] == ' ' || src[pos] == '\t')) pos++;
+                if (m->nincludes < M_MAXINCLUDES) {
+                    Include* inc = &m->includes[m->nincludes];
+                    inc->line = line;
+                    inc->path[0] = '\0';
+                    /* extract the path: "foo.h" or <foo.h> */
+                    if (pos < src_len && (src[pos] == '"' || src[pos] == '<')) {
+                        char close = (src[pos] == '"') ? '"' : '>';
+                        int pstart = pos;
+                        pos++;
+                        while (pos < src_len && src[pos] != close && src[pos] != '\n') pos++;
+                        if (pos < src_len && src[pos] == close) pos++;
+                        int plen = pos - pstart;
+                        if (plen > M_NAME - 1) plen = M_NAME - 1;
+                        for (int i = 0; i < plen; i++) inc->path[i] = src[pstart + i];
+                        inc->path[plen] = '\0';
+                    }
+                    m->nincludes++;
+                }
+            } else if (mp_startswith(src + pos, remaining, "define")) {
+                /* #define directive */
+                pos += 6; /* skip "define" */
+                while (pos < src_len && (src[pos] == ' ' || src[pos] == '\t')) pos++;
+                if (m->nmacros < M_MAXMACROS) {
+                    Macro* mac = &m->macros[m->nmacros];
+                    mac->line = line;
+                    mac->name[0] = '\0';
+                    /* extract macro name (identifier chars) */
+                    int nstart = pos;
+                    while (pos < src_len && ((src[pos] >= 'a' && src[pos] <= 'z') ||
+                           (src[pos] >= 'A' && src[pos] <= 'Z') ||
+                           (src[pos] >= '0' && src[pos] <= '9') ||
+                           src[pos] == '_')) pos++;
+                    int nlen = pos - nstart;
+                    if (nlen > 0) {
+                        if (nlen > M_NAME - 1) nlen = M_NAME - 1;
+                        for (int i = 0; i < nlen; i++) mac->name[i] = src[nstart + i];
+                        mac->name[nlen] = '\0';
+                        m->nmacros++;
+                    }
+                }
+            }
+        }
+
+        /* advance to end of line */
+        while (pos < src_len && src[pos] != '\n') pos++;
+        if (pos < src_len) pos++; /* skip '\n' */
+        line++;
+    }
+}
+
+/* ----------------------------------------------------------------------- */
 /* PASS 1: top-level globals                                               */
 /* ----------------------------------------------------------------------- */
 static void mp_pass_globals(Model* m, AstNode* root) {
@@ -164,6 +247,53 @@ static void mp_pass_globals(Model* m, AstNode* root) {
         g->nreaders = 0;
         g->nwriters = 0;
         m->nglobals++;
+    }
+}
+
+/* ----------------------------------------------------------------------- */
+/* PASS 1b: top-level records (struct/union/enum) and typedefs             */
+/* ----------------------------------------------------------------------- */
+static void mp_pass_records(Model* m, AstNode* root) {
+    for (AstNode* c = root->first_child; c; c = c->next) {
+        if (c->kind == AST_RECORD) {
+            if (m->nrecords >= M_MAXRECORDS) continue;
+            Record* r = &m->records[m->nrecords];
+            ide_strlcpy(r->name, c->name, M_NAME);
+            /* figure out the kind tag from the type_str or by context */
+            r->kind_tag[0] = '\0';
+            if (c->type_str[0])
+                ide_strlcpy(r->kind_tag, c->type_str, 16);
+            else
+                ide_strlcpy(r->kind_tag, "struct", 16);
+            r->line = c->span.start_line;
+            r->nfields = c->nchildren;
+            m->nrecords++;
+        } else if (c->kind == AST_TYPEDEF) {
+            if (m->nrecords >= M_MAXRECORDS) continue;
+            Record* r = &m->records[m->nrecords];
+            ide_strlcpy(r->name, c->name, M_NAME);
+            ide_strlcpy(r->kind_tag, "typedef", 16);
+            r->line = c->span.start_line;
+            r->nfields = 0;
+            m->nrecords++;
+        }
+    }
+}
+
+/* ----------------------------------------------------------------------- */
+/* PASS 1c: top-level function prototypes                                  */
+/* ----------------------------------------------------------------------- */
+static void mp_pass_protos(Model* m, AstNode* root) {
+    for (AstNode* c = root->first_child; c; c = c->next) {
+        if (c->kind != AST_FUNC_PROTO) continue;
+        if (m->nprotos >= M_MAXPROTOS) break;
+        if (!c->name[0]) continue;
+
+        Proto* pr = &m->protos[m->nprotos];
+        ide_strlcpy(pr->name, c->name, M_NAME);
+        ide_strlcpy(pr->ret,  c->type_str, M_TYPE);
+        pr->line = c->span.start_line;
+        m->nprotos++;
     }
 }
 
@@ -226,13 +356,17 @@ void model_parse(Model* m, const char* src, int len, const char* filename) {
     if (!m) return;
 
     /* 1. reset model */
-    m->nfuncs   = 0;
-    m->nglobals = 0;
-    m->nconns   = 0;
-    m->nrisks   = 0;
-    m->nactions = 0;
-    m->nflow    = 0;
-    m->focus    = -1;
+    m->nfuncs    = 0;
+    m->nglobals  = 0;
+    m->nincludes = 0;
+    m->nmacros   = 0;
+    m->nrecords  = 0;
+    m->nprotos   = 0;
+    m->nconns    = 0;
+    m->nrisks    = 0;
+    m->nactions  = 0;
+    m->nflow     = 0;
+    m->focus     = -1;
     m->coherence = 0;
     m->analyzed  = 0;
     m->lexed     = 0;
@@ -261,7 +395,10 @@ void model_parse(Model* m, const char* src, int len, const char* filename) {
         return;
     }
 
-    /* 2. parse to an AST */
+    /* 2a. pre-parse scan for #include / #define (before parser_init strips them) */
+    mp_pass_preproc(m, src, len);
+
+    /* 2b. parse to an AST */
     parser_init(&P, src, len, toks, PARSE_MAX_TOKS);
     m->lexed = 1;
     AstNode* root = parse_translation_unit(&P);
@@ -270,6 +407,8 @@ void model_parse(Model* m, const char* src, int len, const char* filename) {
     if (root) {
         mp_pass_globals(m, root);   /* PASS 1: globals first (so func walk
                                        can recognise global references)     */
+        mp_pass_records(m, root);   /* PASS 1b: structs/typedefs/enums      */
+        mp_pass_protos(m, root);    /* PASS 1c: function prototypes         */
         mp_pass_funcs(m, root);     /* PASS 2: functions + bodies           */
     }
 

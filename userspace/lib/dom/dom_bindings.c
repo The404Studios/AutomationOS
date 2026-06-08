@@ -249,18 +249,23 @@ static dom_node *unwrap_node(js_value v)
 }
 
 /* Find first child element with the given tag (lowercased). */
-static dom_node *find_child_tag(dom_node *root, const char *tag)
+static dom_node *find_child_tag_r(dom_node *root, const char *tag, int depth)
 {
-    if (!root || !tag) return NULL;
+    if (!root || !tag || depth >= 256) return NULL;
     unsigned long guard = 0;
     for (dom_node *c = root->first_child; c && guard++ < (1u << 20);
          c = c->next_sibling) {
         if (c->type == DOM_NODE_ELEMENT && c->tag && str_eq(c->tag, tag))
             return c;
-        dom_node *r = find_child_tag(c, tag);
+        dom_node *r = find_child_tag_r(c, tag, depth + 1);
         if (r) return r;
     }
     return NULL;
+}
+
+static dom_node *find_child_tag(dom_node *root, const char *tag)
+{
+    return find_child_tag_r(root, tag, 0);
 }
 
 /* ================================================================== */

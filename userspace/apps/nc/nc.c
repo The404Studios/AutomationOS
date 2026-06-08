@@ -177,6 +177,22 @@ static void out_ip(unsigned int ip)
     out_unum( ip        & 0xFFu);
 }
 
+/* Translate a negative errno to a short reason string (freestanding). */
+static const char *rc_str(long e) {
+    if (e >= 0)   return "ok";
+    long v = -e;
+    switch (v) {
+        case  11: return "would block";
+        case  12: return "out of memory";
+        case  22: return "invalid argument";
+        case 104: return "connection reset by peer";
+        case 110: return "connection timed out";
+        case 111: return "connection refused";
+        case 113: return "no route to host";
+        default:  return "error";
+    }
+}
+
 /* ===================================================================== */
 /* Socket relay                                                          */
 /* ===================================================================== */
@@ -293,9 +309,11 @@ static int do_connect(const char *host, long port, const char *text)
 
     long fd = sc(SYS_SOCKET, SOCK_STREAM, 0, 0, 0, 0);
     if (fd < 0) {
-        out_puts("nc: socket() failed rc=");
+        out_puts("nc: cannot create socket: ");
+        out_puts(rc_str(fd));
+        out_puts(" (rc=");
         out_num(fd);
-        out_puts("\n");
+        out_puts(")\n");
         return 3;
     }
 
@@ -308,9 +326,15 @@ static int do_connect(const char *host, long port, const char *text)
     /* Single bounded connect; the kernel's tcp_connect has its own timeout. */
     long cr = sc(SYS_CONNECT, fd, (long)ip, port, 0, 0);
     if (cr < 0) {
-        out_puts("nc: connect failed rc=");
+        out_puts("nc: cannot connect to ");
+        out_puts(host);
+        out_puts(":");
+        out_num(port);
+        out_puts(": ");
+        out_puts(rc_str(cr));
+        out_puts(" (rc=");
         out_num(cr);
-        out_puts("\n");
+        out_puts(")\n");
         sc(SYS_CLOSE_SK, fd, 0, 0, 0, 0);
         return 4;
     }
@@ -322,9 +346,13 @@ static int do_connect(const char *host, long port, const char *text)
         long want = (long)n_strlen(text);
         long s = send_all(fd, text, want);
         if (s < 0) {
-            out_puts("nc: send failed rc=");
+            out_puts("nc: send to ");
+            out_puts(host);
+            out_puts(" failed: ");
+            out_puts(rc_str(s));
+            out_puts(" (rc=");
             out_num(s);
-            out_puts("\n");
+            out_puts(")\n");
             sc(SYS_CLOSE_SK, fd, 0, 0, 0, 0);
             return 5;
         }

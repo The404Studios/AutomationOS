@@ -215,6 +215,15 @@ dll_handle_t* dll_load(const char *dll_name) {
 
     // Call DllMain with DLL_PROCESS_ATTACH
     if (pe->entry_point) {
+        // Validate entry point is within the loaded image
+        if (pe->entry_point >= pe->image_size) {
+            printf("DLL: Entry point 0x%lx exceeds image size 0x%x\n",
+                   (unsigned long)pe->entry_point, pe->image_size);
+            free(dll);
+            pe_free(pe);
+            return NULL;
+        }
+
         uint64_t entry = (uint64_t)pe->loaded_base + pe->entry_point;
         dll_main_t dll_main = (dll_main_t)entry;
 

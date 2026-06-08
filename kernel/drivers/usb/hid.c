@@ -533,28 +533,57 @@ static void hid_process_gamepad_report(hid_device_t* hid, uint8_t* data, uint32_
     input_sync(hid->input_dev);
 }
 
+// Maximum sane report descriptor size (HID spec allows up to 4 KB).
+#define HID_REPORT_DESC_MAX 4096
+
 // Parse report descriptor (simplified parser)
 static int hid_parse_report_descriptor(hid_device_t* hid) {
     // This is a very simplified parser
     // A full implementation would build a complete report structure
 
+    if (!hid || !hid->report_descriptor) return -1;
+
     uint8_t* desc = hid->report_descriptor;
     uint16_t size = hid->report_desc_size;
+
+    // Reject obviously oversized or empty descriptors.
+    if (size == 0 || size > HID_REPORT_DESC_MAX) {
+        kprintf("[HID] Report descriptor invalid (size=%u)\n", size);
+        return -1;
+    }
 
     uint16_t usage_page = 0;
     uint16_t usage = 0;
 
     for (uint16_t i = 0; i < size;) {
         uint8_t item = desc[i++];
+
+        // Long items (bSize == 3 in the low 2 bits AND tag == 0xF) are rare
+        // in practice; reject them cleanly rather than mis-parsing.
+        if (item == 0xFE) {
+            // Long item: next byte is data size, byte after is tag.
+            if (i + 1 >= size) break;
+            uint8_t long_size = desc[i++];
+            i++;  // skip long item tag
+            if (long_size > size - i) break;  // would overrun
+            i += long_size;
+            continue;
+        }
+
         uint8_t item_type = (item >> 2) & 0x03;
         uint8_t item_tag = (item >> 4) & 0x0F;
         uint8_t item_size = item & 0x03;
 
         if (item_size == 3) item_size = 4;
 
+        // Bounds check: ensure item_size bytes remain in the descriptor.
+        if (item_size > size - i) {
+            kprintf("[HID] Report descriptor truncated at offset %u\n", i);
+            break;
+        }
+
         uint32_t data = 0;
         for (uint8_t j = 0; j < item_size; j++) {
-            if (i >= size) break;
             data |= (uint32_t)desc[i++] << (j * 8);
         }
 
@@ -568,6 +597,9 @@ static int hid_parse_report_descriptor(hid_device_t* hid) {
             }
         }
     }
+
+    (void)usage_page;
+    (void)usage;
 
     return 0;
 }

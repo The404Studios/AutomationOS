@@ -206,7 +206,7 @@ typedef struct {
 } proc_detail_t;   /* 64 bytes total */
 
 /*
- * sysinfo_t -- returned by SYS_SYSINFO=62
+ * sysinfo_t -- returned by SYS_SYSINFO=62 (must match kernel procapi.h: 32 bytes)
  *   sc(62, (long)&si, 0, 0, ...) → 0 on success, <0 on error
  */
 typedef struct {
@@ -214,22 +214,32 @@ typedef struct {
     u64 free_mem;
     u64 uptime_ms;
     u32 proc_count;
+    u32 _pad;        /* reserved, always 0 */
 } sysinfo_t;
 
 /*
  * net_info_t -- filled by SYS_NET_INFO=59
- *   sc(59, (long)&info, 0, 0, ...) → 0 on success, <0 if networking is down.
- * Layout MUST mirror the kernel's struct (kernel/include/net.h):
- *   { uint8_t mac[6]; uint8_t _pad[2]; uint32_t ip; uint32_t gateway; }
+ *   sc(59, (long)&info, 0, 0, ...) -> 0 on success, <0 if networking is down.
+ * Layout MUST mirror the kernel's uapi_net_info_t (kernel/include/uapi/net.h).
  * ip and gateway are in host byte order (0xAABBCCDD == A.B.C.D), so octet A is
- * the high byte ((ip >> 24) & 0xFF).  16 bytes total.
+ * the high byte ((ip >> 24) & 0xFF).  80 bytes total.
  */
 typedef struct {
+    char          ifname[16];
     unsigned char mac[6];
     unsigned char _pad[2];
-    u32           ip;        /* host byte order */
-    u32           gateway;   /* host byte order */
-} net_info_t;   /* 16 bytes total */
+    u32           ip;
+    u32           netmask;
+    u32           gateway;
+    u32           dns;
+    unsigned char up;
+    unsigned char dhcp_active;
+    unsigned char _pad2[6];
+    unsigned long long tx_packets;
+    unsigned long long rx_packets;
+    unsigned long long tx_bytes;
+    unsigned long long rx_bytes;
+} net_info_t;
 
 /* 6-argument inline syscall (args rdi/rsi/rdx/r10/r8/r9). */
 static inline long sc(long n, long a1, long a2, long a3, long a4, long a5, long a6) {
@@ -326,26 +336,43 @@ static void run_block(const char *text);
 
 /* Character grid: spaces are treated as blank cells. */
 static char grid[MAX_ROWS][MAX_COLS];
+static u32  grid_color[MAX_ROWS][MAX_COLS];   /* per-cell foreground color */
+static u32  g_cur_color;     /* color used by the next grid_putchar     */
 static int  g_cols;          /* derived from the granted window width  */
 static int  g_rows;          /* derived from the granted window height */
 static int  cur_row;
 static int  cur_col;
 
+/* Color constants for prompt and highlights. */
+#define CLR_DEFAULT   FG_COLOR
+#define CLR_PROMPT    0xFF50C878u   /* green   -- user prompt   */
+#define CLR_ROOT      0xFFE05050u   /* red     -- root prompt   */
+#define CLR_PATH      0xFF60A0D0u   /* blue    -- path in prompt */
+#define CLR_BANNER    0xFF80B0E0u   /* softer blue -- banner     */
+#define CLR_BANNERHI  0xFFE0A050u   /* warm amber -- banner highlight */
+
 static void grid_clear(void) {
     for (int r = 0; r < MAX_ROWS; r++)
-        for (int c = 0; c < MAX_COLS; c++)
+        for (int c = 0; c < MAX_COLS; c++) {
             grid[r][c] = ' ';
+            grid_color[r][c] = CLR_DEFAULT;
+        }
     cur_row = 0;
     cur_col = 0;
+    g_cur_color = CLR_DEFAULT;
 }
 
 /* Scroll the grid up one line; clear the freed bottom line. */
 static void grid_scroll_up(void) {
     for (int r = 1; r < g_rows; r++)
-        for (int c = 0; c < g_cols; c++)
+        for (int c = 0; c < g_cols; c++) {
             grid[r - 1][c] = grid[r][c];
-    for (int c = 0; c < g_cols; c++)
+            grid_color[r - 1][c] = grid_color[r][c];
+        }
+    for (int c = 0; c < g_cols; c++) {
         grid[g_rows - 1][c] = ' ';
+        grid_color[g_rows - 1][c] = CLR_DEFAULT;
+    }
 }
 
 /* Move cursor to start of next row, scrolling if needed. */
@@ -370,6 +397,7 @@ static void grid_putchar(char ch) {
     if (ch == '\t') { do { grid_putchar(' '); } while (cur_col % 4 != 0); return; }
     if (cur_col >= g_cols) grid_newline();
     grid[cur_row][cur_col] = ch;
+    grid_color[cur_row][cur_col] = g_cur_color;
     cur_col++;
     if (cur_col >= g_cols) grid_newline();
 }
@@ -379,10 +407,12 @@ static void grid_backspace(void) {
     if (cur_col > 0) {
         cur_col--;
         grid[cur_row][cur_col] = ' ';
+        grid_color[cur_row][cur_col] = CLR_DEFAULT;
     } else if (cur_row > 0) {
         cur_row--;
         cur_col = g_cols - 1;
         grid[cur_row][cur_col] = ' ';
+        grid_color[cur_row][cur_col] = CLR_DEFAULT;
     }
 }
 
@@ -412,6 +442,33 @@ static void grid_put_unum_w(unsigned long n, int width) {
     while (i > 0) grid_putchar(b[--i]);
 }
 
+/* Translate a negative errno (from a syscall return) into a short human-readable
+ * reason string. Covers the codes userspace is most likely to encounter. */
+static const char *errno_str(long e) {
+    if (e >= 0)   return "success";
+    long v = -e;
+    switch (v) {
+        case  1: return "operation not permitted";
+        case  2: return "no such file or directory";
+        case  3: return "no such process";
+        case  5: return "I/O error";
+        case  9: return "bad file descriptor";
+        case 11: return "resource temporarily unavailable";
+        case 12: return "out of memory";
+        case 13: return "permission denied";
+        case 14: return "bad address";
+        case 17: return "file exists";
+        case 20: return "not a directory";
+        case 21: return "is a directory";
+        case 22: return "invalid argument";
+        case 28: return "no space left on device";
+        case 111: return "connection refused";
+        case 110: return "connection timed out";
+        case 104: return "connection reset";
+        default: return "unknown error";
+    }
+}
+
 /* Fill a clipped rectangle in the ARGB32, stride-addressed window buffer. */
 static void fill_rect(u32 *buf, u32 bw, u32 bh, u32 stride_px,
                       i32 x, i32 y, i32 w, i32 h, u32 color) {
@@ -439,7 +496,7 @@ static void render(wl_window *win, u32 stride_px) {
             if (ch == ' ' || ch == 0) continue;
             font_draw_char(win->pixels, (int)stride_px,
                            (int)win->w, (int)win->h,
-                           c * FONT_W, r * FONT_H, ch, FG_COLOR);
+                           c * FONT_W, r * FONT_H, ch, grid_color[r][c]);
         }
     }
 
@@ -532,11 +589,22 @@ static int hist_nav;   /* starts at -1 (not navigating) */
  * slash except for the root "/".  Used by the prompt and all fs builtins. */
 static char g_cwd[256] = "/";
 
-/* Bash-like, cwd-aware prompt:  os:<cwd>$  */
+/* Write a string in a specific color, then restore default. */
+static void grid_puts_color(const char *s, u32 color) {
+    u32 prev = g_cur_color;
+    g_cur_color = color;
+    grid_puts(s);
+    g_cur_color = prev;
+}
+
+/* Colored bash-like prompt:  root@aos:<cwd>$  */
 static void shell_prompt(void) {
-    grid_puts("os:");
-    grid_puts(g_cwd);
-    grid_puts("$ ");
+    grid_puts_color("root", CLR_PROMPT);
+    grid_puts_color("@", CLR_PROMPT);
+    grid_puts_color("aos", CLR_PROMPT);
+    grid_puts_color(":", CLR_DEFAULT);
+    grid_puts_color(g_cwd, CLR_PATH);
+    grid_puts_color("$ ", CLR_DEFAULT);
 }
 
 /* Skip leading spaces. */
@@ -755,9 +823,11 @@ static void cmd_ls(const char *args) {
 
     long dfd = sc(SYS_OPENDIR, (long)path, 0, 0, 0, 0, 0);
     if (dfd < 0) {
-        grid_puts("ls: cannot open '");
+        grid_puts("ls: ");
         grid_puts(path);
-        grid_puts("'\n");
+        grid_puts(": ");
+        grid_puts(errno_str(dfd));
+        grid_putchar('\n');
         return;
     }
 
@@ -792,9 +862,11 @@ static void cmd_cat(const char *args) {
 
     long fd = sc(SYS_OPEN, (long)path, O_RDONLY, 0, 0, 0, 0);
     if (fd < 0) {
-        grid_puts("cat: cannot open '");
+        grid_puts("cat: ");
         grid_puts(path);
-        grid_puts("'\n");
+        grid_puts(": ");
+        grid_puts(errno_str(fd));
+        grid_putchar('\n');
         return;
     }
 
@@ -828,9 +900,13 @@ static void cmd_run(const char *args) {
 
     long pid = sc(SYS_SPAWN, (long)spawn_path, 0, 0, 0, 0, 0);
     if (pid <= 0) {
-        grid_puts("run: failed to spawn '");
+        grid_puts("run: cannot execute '");
         grid_puts(spawn_path);
-        grid_puts("'\n");
+        grid_puts("': ");
+        grid_puts(errno_str(pid));
+        grid_puts(" (");
+        grid_put_num(pid);
+        grid_puts(")\n");
         return;
     }
     grid_puts("spawned '");
@@ -864,9 +940,13 @@ static void cmd_spawn(const char *args) {
 
     long pid = sc(SYS_SPAWN, (long)spawn_path, 0, 0, 0, 0, 0);
     if (pid <= 0) {
-        grid_puts("spawn: failed to spawn '");
+        grid_puts("spawn: cannot execute '");
         grid_puts(spawn_path);
-        grid_puts("'\n");
+        grid_puts("': ");
+        grid_puts(errno_str(pid));
+        grid_puts(" (");
+        grid_put_num(pid);
+        grid_puts(")\n");
         return;
     }
     grid_puts("spawned '");
@@ -942,7 +1022,7 @@ static void cmd_ps(void) {
  *
  * proc_detail_t: {u32 pid,ppid,state,prio; u64 cpu_ticks; u32 mem_pages,
  *                 vma_count; char name[32]}   (64 bytes)
- * sysinfo_t:     {u64 total_mem,free_mem,uptime_ms; u32 proc_count}
+ * sysinfo_t:     {u64 total_mem,free_mem,uptime_ms; u32 proc_count,_pad}
  * ----------------------------------------------------------------------- */
 static sysinfo_t top_si;
 static proc_detail_t top_det;
@@ -1263,9 +1343,11 @@ static void cmd_write(const char *args) {
 
     long fd = sc(SYS_OPEN, (long)path, O_WRONLY | O_CREAT | O_TRUNC, 0644, 0, 0, 0);
     if (fd < 0) {
-        grid_puts("write: cannot open '");
+        grid_puts("write: ");
         grid_puts(path);
-        grid_puts("'\n");
+        grid_puts(": ");
+        grid_puts(errno_str(fd));
+        grid_putchar('\n');
         return;
     }
 
@@ -1273,7 +1355,11 @@ static void cmd_write(const char *args) {
     if (tlen > 0) {
         long w = sc(SYS_WRITE, fd, (long)text, tlen, 0, 0, 0);
         if (w < 0) {
-            grid_puts("write: write error\n");
+            grid_puts("write: ");
+            grid_puts(path);
+            grid_puts(": ");
+            grid_puts(errno_str(w));
+            grid_putchar('\n');
             sc(SYS_CLOSE, fd, 0, 0, 0, 0, 0);
             return;
         }
@@ -1339,13 +1425,15 @@ static void cmd_cp(const char *args) {
 
     long n = slurp_file(cp_src);
     if (n == -1) {
-        grid_puts("cp: cannot open '");
+        grid_puts("cp: ");
         grid_puts(cp_src);
-        grid_puts("'\n");
+        grid_puts(": no such file or directory\n");
         return;
     }
     if (n == -2) {
-        grid_puts("cp: file too large\n");
+        grid_puts("cp: ");
+        grid_puts(cp_src);
+        grid_puts(": file too large (exceeds 64 KB buffer)\n");
         return;
     }
 
@@ -1354,7 +1442,9 @@ static void cmd_cp(const char *args) {
     if (fd < 0) {
         grid_puts("cp: cannot create '");
         grid_puts(dst);
-        grid_puts("'\n");
+        grid_puts("': ");
+        grid_puts(errno_str(fd));
+        grid_putchar('\n');
         return;
     }
     if (n > 0) {
@@ -1391,13 +1481,15 @@ static void cmd_grep(const char *args) {
     const char *path = resolve_path(ftok);
     long n = slurp_file(path);
     if (n == -1) {
-        grid_puts("grep: cannot open '");
+        grid_puts("grep: ");
         grid_puts(path);
-        grid_puts("'\n");
+        grid_puts(": no such file or directory\n");
         return;
     }
     if (n == -2) {
-        grid_puts("grep: file too large\n");
+        grid_puts("grep: ");
+        grid_puts(path);
+        grid_puts(": file too large (exceeds 64 KB buffer)\n");
         return;
     }
 
@@ -1431,13 +1523,15 @@ static void cmd_wc(const char *args) {
     const char *path = resolve_path(ftok);
     long n = slurp_file(path);
     if (n == -1) {
-        grid_puts("wc: cannot open '");
+        grid_puts("wc: ");
         grid_puts(path);
-        grid_puts("'\n");
+        grid_puts(": no such file or directory\n");
         return;
     }
     if (n == -2) {
-        grid_puts("wc: file too large\n");
+        grid_puts("wc: ");
+        grid_puts(path);
+        grid_puts(": file too large (exceeds 64 KB buffer)\n");
         return;
     }
 
@@ -1473,13 +1567,15 @@ static void cmd_head(const char *args) {
     const char *path = resolve_path(ftok);
     long n = slurp_file(path);
     if (n == -1) {
-        grid_puts("head: cannot open '");
+        grid_puts("head: ");
         grid_puts(path);
-        grid_puts("'\n");
+        grid_puts(": no such file or directory\n");
         return;
     }
     if (n == -2) {
-        grid_puts("head: file too large\n");
+        grid_puts("head: ");
+        grid_puts(path);
+        grid_puts(": file too large (exceeds 64 KB buffer)\n");
         return;
     }
 
@@ -1506,13 +1602,15 @@ static void cmd_tail(const char *args) {
     const char *path = resolve_path(ftok);
     long n = slurp_file(path);
     if (n == -1) {
-        grid_puts("tail: cannot open '");
+        grid_puts("tail: ");
         grid_puts(path);
-        grid_puts("'\n");
+        grid_puts(": no such file or directory\n");
         return;
     }
     if (n == -2) {
-        grid_puts("tail: file too large\n");
+        grid_puts("tail: ");
+        grid_puts(path);
+        grid_puts(": file too large (exceeds 64 KB buffer)\n");
         return;
     }
     if (n == 0) return;
@@ -1722,7 +1820,7 @@ static void cmd_cut(const char *args) {
 
     const char *path = resolve_path(ftok);
     long n = slurp_file(path);
-    if (n == -1) { grid_puts("cut: cannot open '"); grid_puts(path); grid_puts("'\n"); return; }
+    if (n == -1) { grid_puts("cut: "); grid_puts(path); grid_puts(": no such file or directory\n"); return; }
     if (n == -2) { grid_puts("cut: file too large\n"); return; }
 
     long start = 0;
@@ -1768,7 +1866,7 @@ static void cmd_tr(const char *args) {
     }
     const char *path = resolve_path(ftok);
     long n = slurp_file(path);
-    if (n == -1) { grid_puts("tr: cannot open '"); grid_puts(path); grid_puts("'\n"); return; }
+    if (n == -1) { grid_puts("tr: "); grid_puts(path); grid_puts(": no such file or directory\n"); return; }
     if (n == -2) { grid_puts("tr: file too large\n"); return; }
 
     int alen = (int)k_strlen(setA);
@@ -1828,7 +1926,7 @@ static void cmd_sort(const char *args) {
     if (!next_token(&p, ftok, sizeof(ftok))) { grid_puts("sort: usage: sort <file>\n"); return; }
     const char *path = resolve_path(ftok);
     long n = slurp_file(path);
-    if (n == -1) { grid_puts("sort: cannot open '"); grid_puts(path); grid_puts("'\n"); return; }
+    if (n == -1) { grid_puts("sort: "); grid_puts(path); grid_puts(": no such file or directory\n"); return; }
     if (n == -2) { grid_puts("sort: file too large\n"); return; }
 
     long c = index_lines(n);
@@ -1853,7 +1951,7 @@ static void cmd_uniq(const char *args) {
     if (!next_token(&p, ftok, sizeof(ftok))) { grid_puts("uniq: usage: uniq <file>\n"); return; }
     const char *path = resolve_path(ftok);
     long n = slurp_file(path);
-    if (n == -1) { grid_puts("uniq: cannot open '"); grid_puts(path); grid_puts("'\n"); return; }
+    if (n == -1) { grid_puts("uniq: "); grid_puts(path); grid_puts(": no such file or directory\n"); return; }
     if (n == -2) { grid_puts("uniq: file too large\n"); return; }
 
     long c = index_lines(n);
@@ -1930,7 +2028,7 @@ static void cmd_ln(const char *args) {
     k_strlcpy(ln_src, resolve_path(srctok), KPATH_MAX);
 
     long n = slurp_file(ln_src);
-    if (n == -1) { grid_puts("ln: cannot open '"); grid_puts(ln_src); grid_puts("'\n"); return; }
+    if (n == -1) { grid_puts("ln: "); grid_puts(ln_src); grid_puts(": no such file or directory\n"); return; }
     if (n == -2) { grid_puts("ln: file too large\n"); return; }
 
     const char *dst = resolve_path(dsttok);
@@ -2146,9 +2244,9 @@ static void cmd_sh(const char *args, const char *verb) {
     long n = slurp_file(path);
     if (n == -1) {
         grid_puts(verb);
-        grid_puts(": cannot open '");
+        grid_puts(": ");
         grid_puts(path);
-        grid_puts("'\n");
+        grid_puts(": no such file or directory\n");
         return;
     }
     if (n == -2 || n >= SCRIPT_MAX) {
@@ -2517,9 +2615,10 @@ static void dispatch_one(char *seg) {
         long flags = O_WRONLY | O_CREAT | (redir == 2 ? O_APPEND : O_TRUNC);
         long fd = sc(SYS_OPEN, (long)path, flags, 0644, 0, 0, 0);
         if (fd < 0) {
-            grid_puts("cannot open '");
             grid_puts(path);
-            grid_puts("' for writing\n");
+            grid_puts(": ");
+            grid_puts(errno_str(fd));
+            grid_putchar('\n');
             return;
         }
         if (g_cap_len > 0)
@@ -2991,6 +3090,210 @@ static void erase_input_line(void) {
     line_len = 0;
 }
 
+/* =========================================================================
+ *  Tab completion
+ *
+ *  On Tab press, complete the current word:
+ *    - If the cursor is on the FIRST word, complete from builtins.
+ *    - Otherwise, complete from filenames in the cwd (or the dir prefix).
+ *  A single match auto-inserts; multiple matches show all candidates below
+ *  the prompt and re-draw the input.
+ * ========================================================================= */
+
+/* Builtin names for first-word completion. */
+static const char *g_builtins[] = {
+    "help", "echo", "clear", "uptime", "ls", "cat", "cp", "grep", "wc",
+    "head", "tail", "date", "uname", "whoami", "about", "run", "launch",
+    "spawn", "ps", "top", "kill", "mem", "sysinfo", "history", "pwd",
+    "cd", "mkdir", "touch", "rm", "mv", "write", "git", "env", "export",
+    "set", "stat", "cut", "tr", "sort", "uniq", "seq", "basename",
+    "dirname", "test", "sh", "source", "true", "false", "yes", "ln",
+    "du", "df", "wget", "curl", "ping", "nc", "ifconfig", "ip", "host",
+    "nslookup",
+    (void *)0
+};
+
+/* prefix match: does s start with prefix[0..plen)? */
+static int starts_with(const char *s, const char *prefix, int plen) {
+    for (int i = 0; i < plen; i++)
+        if (!s[i] || s[i] != prefix[i]) return 0;
+    return 1;
+}
+
+/* Find the longest common prefix of matches[0..count) (each NUL-terminated).
+ * Returns length of the common prefix. */
+#define TAB_MATCH_MAX  64
+#define TAB_MATCH_LEN  128
+static char tab_matches[TAB_MATCH_MAX][TAB_MATCH_LEN];
+static int  tab_match_count;
+
+static int common_prefix_len(void) {
+    if (tab_match_count == 0) return 0;
+    if (tab_match_count == 1) return (int)k_strlen(tab_matches[0]);
+    int len = 0;
+    for (;;) {
+        char ch = tab_matches[0][len];
+        if (!ch) break;
+        int ok = 1;
+        for (int i = 1; i < tab_match_count; i++)
+            if (tab_matches[i][len] != ch) { ok = 0; break; }
+        if (!ok) break;
+        len++;
+    }
+    return len;
+}
+
+/* Collect builtin matches for `word[0..wlen)`. */
+static void tab_complete_builtins(const char *word, int wlen) {
+    for (int i = 0; g_builtins[i]; i++) {
+        if (starts_with(g_builtins[i], word, wlen) && tab_match_count < TAB_MATCH_MAX) {
+            k_strlcpy(tab_matches[tab_match_count], g_builtins[i], TAB_MATCH_LEN);
+            tab_match_count++;
+        }
+    }
+}
+
+/* Collect filename matches for `word[0..wlen)` from a directory.
+ * `word` may contain a directory prefix (e.g. "bin/f").  We split at the
+ * last '/' to get the directory to opendir and the partial filename. */
+static char tab_dir[KPATH_MAX] __attribute__((aligned(16)));
+static char tab_partial[LINE_MAX];
+
+static void tab_complete_files(const char *word, int wlen) {
+    /* Find the last '/' in word to split dir/partial. */
+    int last_slash = -1;
+    for (int i = 0; i < wlen; i++)
+        if (word[i] == '/') last_slash = i;
+
+    int dir_len = 0;
+    int partial_len = 0;
+    if (last_slash >= 0) {
+        /* dir = word[0..last_slash], partial = word[last_slash+1..] */
+        for (int i = 0; i <= last_slash && i < KPATH_MAX - 1; i++)
+            tab_dir[i] = word[i];
+        tab_dir[last_slash + 1] = '\0';
+        dir_len = last_slash + 1;
+        partial_len = wlen - last_slash - 1;
+        for (int i = 0; i < partial_len && i < LINE_MAX - 1; i++)
+            tab_partial[i] = word[last_slash + 1 + i];
+        tab_partial[partial_len] = '\0';
+    } else {
+        /* No slash: opendir the cwd, partial is the whole word. */
+        k_strlcpy(tab_dir, g_cwd, KPATH_MAX);
+        dir_len = 0;
+        partial_len = wlen;
+        for (int i = 0; i < wlen && i < LINE_MAX - 1; i++)
+            tab_partial[i] = word[i];
+        tab_partial[partial_len] = '\0';
+    }
+
+    /* Resolve the directory path. We need to avoid clobbering g_pathbuf's
+     * state; resolve_path returns g_pathbuf so copy it out. */
+    const char *dir_resolved = resolve_path(tab_dir);
+    /* Clear tab_dir fully for kernel safety. */
+    for (int i = 0; i < KPATH_MAX; i++) tab_dir[i] = '\0';
+    k_strlcpy(tab_dir, dir_resolved, KPATH_MAX);
+
+    long dfd = sc(SYS_OPENDIR, (long)tab_dir, 0, 0, 0, 0, 0);
+    if (dfd < 0) return;
+
+    struct k_dirent de;
+    for (;;) {
+        long r = sc(SYS_READDIR, dfd, (long)&de, 0, 0, 0, 0);
+        if (r != 0) break;
+        de.d_name[NAME_MAX_ - 1] = '\0';
+        if (de.d_name[0] == '\0') continue;
+        if (k_streq(de.d_name, ".") || k_streq(de.d_name, "..")) continue;
+
+        if (starts_with(de.d_name, tab_partial, partial_len) &&
+            tab_match_count < TAB_MATCH_MAX) {
+            /* Build the completion: the dir prefix typed by the user + name. */
+            char *m = tab_matches[tab_match_count];
+            int pos = 0;
+            if (last_slash >= 0) {
+                /* Re-add the user's directory prefix. */
+                for (int i = 0; i <= last_slash && pos < TAB_MATCH_LEN - 2; i++)
+                    m[pos++] = word[i];
+            }
+            for (int i = 0; de.d_name[i] && pos < TAB_MATCH_LEN - 2; i++)
+                m[pos++] = de.d_name[i];
+            /* Append '/' for directories. */
+            if (de.d_type == DT_DIR && pos < TAB_MATCH_LEN - 1)
+                m[pos++] = '/';
+            m[pos] = '\0';
+            tab_match_count++;
+        }
+    }
+    sc(SYS_CLOSEDIR, dfd, 0, 0, 0, 0, 0);
+}
+
+/*
+ * tab_complete: called when Tab is pressed. Finds the word under the cursor
+ * in line_buf[0..line_len), runs completion, and either auto-inserts a unique
+ * match or shows candidates.
+ *
+ * Returns 1 if the display needs a re-render, 0 otherwise.
+ */
+static int tab_complete(void) {
+    if (line_len == 0) return 0;
+
+    /* Identify the current word (the last whitespace-delimited token). */
+    int word_start = line_len;
+    while (word_start > 0 && line_buf[word_start - 1] != ' ' &&
+           line_buf[word_start - 1] != '\t')
+        word_start--;
+    int wlen = line_len - word_start;
+    const char *word = line_buf + word_start;
+
+    /* Determine if this is the first word (command position). */
+    int is_first = 1;
+    for (int i = 0; i < word_start; i++)
+        if (line_buf[i] != ' ' && line_buf[i] != '\t') { is_first = 0; break; }
+
+    tab_match_count = 0;
+    if (is_first) {
+        tab_complete_builtins(word, wlen);
+        /* Also complete files in case the user is typing a path to run. */
+        tab_complete_files(word, wlen);
+    } else {
+        tab_complete_files(word, wlen);
+    }
+
+    if (tab_match_count == 0) return 0;   /* no matches */
+
+    int cplen = common_prefix_len();   /* longest common prefix of all matches */
+    if (cplen <= wlen && tab_match_count > 1) {
+        /* No additional prefix to insert. Show all candidates. */
+        grid_putchar('\n');
+        for (int i = 0; i < tab_match_count; i++) {
+            grid_puts("  ");
+            grid_puts(tab_matches[i]);
+            grid_putchar('\n');
+        }
+        /* Re-draw the prompt + current input. */
+        shell_prompt();
+        for (int i = 0; i < line_len; i++) grid_putchar(line_buf[i]);
+        return 1;
+    }
+
+    /* Insert the extension (characters beyond what the user already typed). */
+    const char *best = tab_matches[0];   /* all share the common prefix */
+    for (int i = wlen; i < cplen && line_len < LINE_MAX - 1; i++) {
+        char ch = best[i];
+        line_buf[line_len++] = ch;
+        grid_putchar(ch);
+    }
+    /* If unique match and it doesn't end with '/', add a trailing space. */
+    if (tab_match_count == 1 && line_len < LINE_MAX - 1) {
+        char last_ch = line_buf[line_len - 1];
+        if (last_ch != '/') {
+            line_buf[line_len++] = ' ';
+            grid_putchar(' ');
+        }
+    }
+    return 1;
+}
+
 void _start(void) {
     print("[TERM] starting (in-process shell)\n");
 
@@ -3021,7 +3324,10 @@ void _start(void) {
 
     /* Banner + first prompt. */
     grid_clear();
-    grid_puts("AutomationOS terminal -- type 'help'\n");
+    grid_puts_color("AutomationOS", CLR_BANNERHI);
+    grid_puts_color(" v0.1.0 -- terminal\n", CLR_BANNER);
+    grid_puts_color("Type 'help' for commands, Tab to complete, "
+                    "Up/Down for history.\n\n", CLR_BANNER);
     shell_prompt();
     line_len  = 0;
     hist_nav  = -1;   /* not currently navigating history */
@@ -3030,9 +3336,11 @@ void _start(void) {
 
     long last = sc(SYS_GET_TICKS_MS, 0, 0, 0, 0, 0, 0);
     int shift_down = 0;
+    int ctrl_down  = 0;
     /* US-QWERTY layout + modifier state for printable input. We track the shift
-     * edges ourselves (mirrored into km.shift_l each resolve); km also owns the
-     * caps-lock toggle, folded in when a CapsLock key-DOWN reaches keymap_resolve. */
+     * and ctrl edges ourselves (mirrored into km.shift_l each resolve); km also
+     * owns the caps-lock toggle, folded in when a CapsLock key-DOWN reaches
+     * keymap_resolve. */
     keymap_state_t km;
     keymap_reset(&km);
 
@@ -3068,12 +3376,34 @@ void _start(void) {
             int keycode = a;
             int pressed = b;
 
-            /* Track shift state on press AND release. */
+            /* Track modifier state on press AND release. */
             if (keycode == KEY_LEFTSHIFT || keycode == KEY_RIGHTSHIFT) {
                 shift_down = pressed ? 1 : 0;
                 continue;
             }
+            if (keycode == KEY_LEFTCTRL) {
+                ctrl_down = pressed ? 1 : 0;
+                continue;
+            }
             if (!pressed) continue;               /* key-DOWN only          */
+
+            /* Ctrl+C: cancel the current input line and show a fresh prompt. */
+            if (ctrl_down && keycode == KEY_C) {
+                grid_puts("^C\n");
+                line_len = 0;
+                hist_nav = -1;
+                shell_prompt();
+                dirty = 1;
+                continue;
+            }
+            /* Ctrl+L: clear the screen and redraw prompt + current input. */
+            if (ctrl_down && keycode == KEY_L) {
+                grid_clear();
+                shell_prompt();
+                for (int i = 0; i < line_len; i++) grid_putchar(line_buf[i]);
+                dirty = 1;
+                continue;
+            }
 
             if (keycode == KEY_UP) {
                 /*
@@ -3124,6 +3454,12 @@ void _start(void) {
                 shell_prompt();                    /* next prompt            */
                 line_len = 0;
                 dirty = 1;
+            } else if (keycode == KEY_TAB) {
+                /* Tab completion. */
+                if (tab_complete()) {
+                    hist_nav = -1;
+                    dirty = 1;
+                }
             } else if (keycode == KEY_BACKSPACE) {
                 if (line_len > 0) {
                     print("[TERM] key 8\n");        /* BS == 8 */

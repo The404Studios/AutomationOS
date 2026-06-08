@@ -214,7 +214,7 @@ int test_multiple_windows(void) {
             .height = 240,
             .parent_id = 0,
         };
-        sprintf(req.title, "Window %d", i + 1);
+        snprintf(req.title, sizeof(req.title), "Window %d", i + 1);
 
         IPC_MSG_SET_PAYLOAD(&msg, &req, sizeof(req));
 

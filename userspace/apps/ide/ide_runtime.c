@@ -37,6 +37,22 @@
 #define RT_MAXWARN    3                /* warnings shown                      */
 #define RT_ABSENT_FILL 0x33E2574Au     /* dim red fill for absent gates       */
 
+/* ---- flow-step hit-test table -----------------------------------------------
+ * Rebuilt every time the flow strip is drawn (the persistent bottom strip is
+ * drawn last each frame, so this reflects its on-screen geometry). Lets
+ * panel_runtime_click() map a click back to a flow step. */
+typedef struct { Rect r; int step; } RtHit;
+static RtHit rt_hits[M_MAXFLOW];
+static int   rt_nhits;
+
+/* tiny streq (freestanding; no libc): 1 if equal */
+static int rt_streq(const char* a, const char* b) {
+    int i = 0;
+    if (!a || !b) return 0;
+    for (; a[i] && b[i]; i++) if (a[i] != b[i]) return 0;
+    return a[i] == b[i];
+}
+
 /* number of glyph cells that fit in `wpx` pixels (>= 0). */
 static int rt_fit_chars(int wpx) {
     if (wpx <= 0) return 0;
@@ -141,6 +157,8 @@ static void rt_ring(Canvas* cv, int cx, int cy, int rad, int thick,
 static void rt_draw_flow(Ide* a, Canvas* cv, int x, int y, int w, int h) {
     Model* m = &a->model;
 
+    rt_nhits = 0;                       /* rebuild the click hit-test table */
+
     /* title: "RUNTIME FLOW (<focusname>)" assembled into one buffer */
     {
         const char* fname = "-";
@@ -206,6 +224,24 @@ static void rt_draw_flow(Ide* a, Canvas* cv, int x, int y, int w, int h) {
             gfx_stroke(cv, bx, by, bw, RT_BOX_H, TH_BORDER_LT);
             /* a faint top highlight line for a touch of depth */
             gfx_hline(cv, bx + 3, by + 1, bw - 6, TH_HEADER);
+        }
+
+        /* record this pill for hit-testing (panel_runtime_click) */
+        if (rt_nhits < M_MAXFLOW) {
+            rt_hits[rt_nhits].r.x = bx;  rt_hits[rt_nhits].r.y = by;
+            rt_hits[rt_nhits].r.w = bw;  rt_hits[rt_nhits].r.h = RT_BOX_H;
+            rt_hits[rt_nhits].step = i;
+            rt_nhits++;
+        }
+
+        /* TRACE highlight: when a step has been clicked, ring every step from
+         * the start up to (and including) it; the clicked step gets a brighter,
+         * double ring so the user can "trace it from start to finish". */
+        if (a->flow_step_focus >= 0 && i <= a->flow_step_focus) {
+            uint32_t hc = (i == a->flow_step_focus) ? TH_CYAN : TH_YELLOW;
+            gfx_stroke(cv, bx, by, bw, RT_BOX_H, hc);
+            if (i == a->flow_step_focus)
+                gfx_stroke(cv, bx - 1, by - 1, bw + 2, RT_BOX_H + 2, hc);
         }
 
         int lx = bx + RT_BOX_PADX;
@@ -433,4 +469,66 @@ void panel_runtime(Ide* a, Canvas* cv, Rect r) {
         rt_draw_coherence(a, cv, coh_x, inner_y, coh_iw, inner_h);
     if (warn_iw > 0)
         rt_draw_warnings(a, cv, warn_x, inner_y, warn_iw, inner_h);
+}
+
+/* Click handler for the RUNTIME-FLOW strip: hit-test a flow-step pill, trace
+ * the chain up to it, and -- if the step names a function call -- cross-focus
+ * that function so the Semantic Lego Map shows it. Returns 1 if consumed. */
+int panel_runtime_click(Ide* a, Rect r, int mx, int my) {
+    if (!a || !rect_hit(r, mx, my)) return 0;
+    for (int i = 0; i < rt_nhits && i < M_MAXFLOW; i++) {
+        if (!rect_hit(rt_hits[i].r, mx, my)) continue;
+        int step = rt_hits[i].step;
+        Model* m = &a->model;
+        if (step >= 0 && step < m->nflow) {
+            /* A CALL step's label is the bare callee name (ide_semantic.c) --
+             * match it to a function and refocus. ide_set_focus() clears
+             * flow_step_focus, so set the trace AFTER it. */
+            const char* lbl = m->flow[step].label;
+            int fi = -1, j;
+            for (j = 0; j < m->nfuncs && j < M_MAXFUNCS; j++) {
+                if (rt_streq(lbl, m->funcs[j].name)) { fi = j; break; }
+            }
+            if (fi >= 0) ide_set_focus(a, fi);
+        }
+        a->flow_step_focus = step;
+        return 1;
+    }
+    return 1;   /* consume clicks anywhere in the runtime strip */
+}
+
+/* Keyboard control of the RUNTIME-FLOW panel (VIZ-3). Up/Left and Down/Right
+ * move the traced step within [0, nflow); Enter cross-focuses the function that
+ * step names (same as clicking it). Returns 1 if consumed. */
+int panel_runtime_key(Ide* a, int keycode) {
+    enum { RK_UP = 103, RK_DOWN = 108, RK_LEFT = 105, RK_RIGHT = 106, RK_ENTER = 28 };
+    Model* m = &a->model;
+    int nflow = m->nflow;
+    if (nflow > M_MAXFLOW) nflow = M_MAXFLOW;
+    if (nflow <= 0) return 0;
+    switch (keycode) {
+    case RK_UP:
+    case RK_LEFT:
+        if (a->flow_step_focus < 0)      a->flow_step_focus = 0;
+        else if (a->flow_step_focus > 0) a->flow_step_focus--;
+        return 1;
+    case RK_DOWN:
+    case RK_RIGHT:
+        if (a->flow_step_focus < 0)            a->flow_step_focus = 0;
+        else if (a->flow_step_focus < nflow-1) a->flow_step_focus++;
+        return 1;
+    case RK_ENTER: {
+        int step = a->flow_step_focus;
+        if (step >= 0 && step < nflow) {
+            const char* lbl = m->flow[step].label;
+            int fi = -1, j;
+            for (j = 0; j < m->nfuncs && j < M_MAXFUNCS; j++)
+                if (rt_streq(lbl, m->funcs[j].name)) { fi = j; break; }
+            if (fi >= 0) ide_set_focus(a, fi);
+            a->flow_step_focus = step;   /* ide_set_focus cleared it; restore trace */
+        }
+        return 1;
+    }
+    }
+    return 0;
 }

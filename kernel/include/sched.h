@@ -7,6 +7,37 @@
 
 #define KERNEL_STACK_SIZE 8192
 
+// ---------------------------------------------------------------------------
+// Kernel-stack canary -- detect stack overflow / corruption before it causes
+// a silent GPF or data corruption during context switch or timer IRQ.
+//
+// STACK_CANARY_PLANT(proc) writes the sentinel at the BOTTOM of the process's
+// kernel stack (the first 8 bytes, which are the last to be overwritten on
+// overflow). STACK_CANARY_CHECK(proc) verifies it; on mismatch it prints a
+// diagnostic and kernel_panic()s before the corrupted stack can cause a
+// harder-to-debug crash. Called from process_create/thread_create (plant) and
+// context_switch / timer_handler (check).
+// ---------------------------------------------------------------------------
+#define STACK_CANARY_VALUE  0xDEAD57AC0CA4A47FULL  /* "DEAD STACK CANARY" */
+
+#define STACK_CANARY_PLANT(proc) do {                                      \
+    if ((proc) && (proc)->kernel_stack) {                                   \
+        *(volatile uint64_t*)((proc)->kernel_stack) = STACK_CANARY_VALUE;   \
+    }                                                                       \
+} while (0)
+
+#define STACK_CANARY_CHECK(proc) do {                                      \
+    if ((proc) && (proc)->kernel_stack &&                                   \
+        *(volatile uint64_t*)((proc)->kernel_stack) != STACK_CANARY_VALUE) {\
+        kprintf("[CANARY] STACK OVERFLOW detected in '%s' (PID %u) "       \
+                "canary=0x%016llx expected=0x%016llx\n",                    \
+                (proc)->name, (proc)->pid,                                  \
+                (unsigned long long)*(volatile uint64_t*)(proc)->kernel_stack,\
+                (unsigned long long)STACK_CANARY_VALUE);                     \
+        kernel_panic("kernel stack canary corrupted");                      \
+    }                                                                       \
+} while (0)
+
 // O(1) Scheduler constants
 #define SCHED_PRIORITY_LEVELS 140  // 140 priority queues (0-139, Linux O(1) pattern)
 #define SCHED_BITMAP_WORDS 3       // ceil(140/64) = 3 uint64_t words for bitmap
@@ -359,6 +390,14 @@ typedef struct process {
     // documented for a future >cpu63 brick.
     uint64_t allowed_cpus;
     uint32_t pinned_cpu;   // CPU_NONE if not pinned
+
+    // SIGSTOP/SIGCONT discipline: SIGCONT must only resume a process that was
+    // stopped by SIGSTOP, NOT an arbitrary BLOCKED process (e.g. one sleeping
+    // in sys_sleep or waiting on a futex). SIGSTOP sets stopped_by_signal = 1;
+    // SIGCONT checks it and only resumes if set. Cleared on resume. Without
+    // this, sending SIGCONT to any BLOCKED process would incorrectly wake it.
+    // memset-zeroed by process_create()/thread_create().
+    int stopped_by_signal;
 } process_t;
 
 // Global pointer to current process (for PE loader and other subsystems)
@@ -403,7 +442,11 @@ void process_ref(process_t* proc);      // Increment reference count
 void process_unref(process_t* proc);    // Decrement reference count (frees if 0)
 void process_on_terminate(process_t* child);  // wake parent's waitpid + drain own wait queue
 process_t* process_get_by_pid(uint32_t pid);
-process_t* process_get_current(void);
+process_t* process_get_by_name(const char* needle);  // Find first live process by name substring (ref'd)
+// Inlined: process_get_current is on the syscall dispatch hot path (called for
+// every SYS_GETPID, SYS_YIELD, and the table-lookup fallback). A cross-TU
+// function call costs ~5 cycles; inlining a global-load is a single MOV.
+static inline process_t* process_get_current(void) { return current_process; }
 void process_set_current(process_t* proc);
 int process_set_ready(process_t* proc); // Validated CREATED/BLOCKED->READY transition (ret 0=OK, -1=rejected)
 

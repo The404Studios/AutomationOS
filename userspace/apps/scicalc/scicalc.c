@@ -94,6 +94,16 @@ static void k_strcat(char *dst, const char *src)
     dst[d] = '\0';
 }
 
+/* Bounded strcat: appends src to dst, never writes past dst[cap-1]. */
+static void k_strcat_n(char *dst, int cap, const char *src)
+{
+    int d = 0;
+    while (d < cap && dst[d]) d++;
+    int s = 0;
+    while (d < cap - 1 && src[s]) { dst[d++] = src[s++]; }
+    if (d < cap) dst[d] = '\0';
+}
+
 static int k_strcmp(const char *a, const char *b)
 {
     while (*a && *b && *a == *b) { a++; b++; }
@@ -778,10 +788,10 @@ static void on_op(void *ud)
     fp_to_str(st->accumulator, rbuf, DISP_MAX);
     k_strcpy(st->expr_str, rbuf);
     switch (o->op) {
-    case OP_ADD: k_strcat(st->expr_str, " + "); break;
-    case OP_SUB: k_strcat(st->expr_str, " - "); break;
-    case OP_MUL: k_strcat(st->expr_str, " x "); break;
-    case OP_DIV: k_strcat(st->expr_str, " / "); break;
+    case OP_ADD: k_strcat_n(st->expr_str, sizeof(st->expr_str), " + "); break;
+    case OP_SUB: k_strcat_n(st->expr_str, sizeof(st->expr_str), " - "); break;
+    case OP_MUL: k_strcat_n(st->expr_str, sizeof(st->expr_str), " x "); break;
+    case OP_DIV: k_strcat_n(st->expr_str, sizeof(st->expr_str), " / "); break;
     default: break;
     }
 
@@ -804,7 +814,7 @@ static void on_equals(void *ud)
     char rbuf[DISP_MAX];
     fp_to_str(st->accumulator, rbuf, DISP_MAX);
     k_strcpy(st->expr_str, "= ");
-    k_strcat(st->expr_str, rbuf);
+    k_strcat_n(st->expr_str, sizeof(st->expr_str), rbuf);
 
     st->op           = OP_NONE;
     st->fresh_result = 1;
@@ -865,7 +875,8 @@ static void on_fn(void *ud)
         res = fp_sin(r);
         k_strcpy(st->expr_str, "sin("); {
             char tb[DISP_MAX]; fp_to_str(val, tb, DISP_MAX);
-            k_strcat(st->expr_str, tb); k_strcat(st->expr_str, ")");
+            k_strcat_n(st->expr_str, sizeof(st->expr_str), tb);
+            k_strcat_n(st->expr_str, sizeof(st->expr_str), ")");
         }
         break;
     }
@@ -874,7 +885,8 @@ static void on_fn(void *ud)
         res = fp_cos(r);
         k_strcpy(st->expr_str, "cos("); {
             char tb[DISP_MAX]; fp_to_str(val, tb, DISP_MAX);
-            k_strcat(st->expr_str, tb); k_strcat(st->expr_str, ")");
+            k_strcat_n(st->expr_str, sizeof(st->expr_str), tb);
+            k_strcat_n(st->expr_str, sizeof(st->expr_str), ")");
         }
         break;
     }
@@ -883,7 +895,8 @@ static void on_fn(void *ud)
         res = fp_tan(r);
         k_strcpy(st->expr_str, "tan("); {
             char tb[DISP_MAX]; fp_to_str(val, tb, DISP_MAX);
-            k_strcat(st->expr_str, tb); k_strcat(st->expr_str, ")");
+            k_strcat_n(st->expr_str, sizeof(st->expr_str), tb);
+            k_strcat_n(st->expr_str, sizeof(st->expr_str), ")");
         }
         break;
     }
@@ -891,42 +904,48 @@ static void on_fn(void *ud)
         res = fp_sqrt(val);
         k_strcpy(st->expr_str, "sqrt("); {
             char tb[DISP_MAX]; fp_to_str(val, tb, DISP_MAX);
-            k_strcat(st->expr_str, tb); k_strcat(st->expr_str, ")");
+            k_strcat_n(st->expr_str, sizeof(st->expr_str), tb);
+            k_strcat_n(st->expr_str, sizeof(st->expr_str), ")");
         }
         break;
     case FN_SQ:
         res = fp_mul(val, val);
         k_strcpy(st->expr_str, "("); {
             char tb[DISP_MAX]; fp_to_str(val, tb, DISP_MAX);
-            k_strcat(st->expr_str, tb); k_strcat(st->expr_str, ")^2");
+            k_strcat_n(st->expr_str, sizeof(st->expr_str), tb);
+            k_strcat_n(st->expr_str, sizeof(st->expr_str), ")^2");
         }
         break;
     case FN_INV:
         res = (val != 0) ? fp_div(FP_ONE, val) : 0;
         k_strcpy(st->expr_str, "1/("); {
             char tb[DISP_MAX]; fp_to_str(val, tb, DISP_MAX);
-            k_strcat(st->expr_str, tb); k_strcat(st->expr_str, ")");
+            k_strcat_n(st->expr_str, sizeof(st->expr_str), tb);
+            k_strcat_n(st->expr_str, sizeof(st->expr_str), ")");
         }
         break;
     case FN_LN:
         res = fp_ln(val);
         k_strcpy(st->expr_str, "ln("); {
             char tb[DISP_MAX]; fp_to_str(val, tb, DISP_MAX);
-            k_strcat(st->expr_str, tb); k_strcat(st->expr_str, ")");
+            k_strcat_n(st->expr_str, sizeof(st->expr_str), tb);
+            k_strcat_n(st->expr_str, sizeof(st->expr_str), ")");
         }
         break;
     case FN_LOG10:
         res = fp_log10(val);
         k_strcpy(st->expr_str, "log("); {
             char tb[DISP_MAX]; fp_to_str(val, tb, DISP_MAX);
-            k_strcat(st->expr_str, tb); k_strcat(st->expr_str, ")");
+            k_strcat_n(st->expr_str, sizeof(st->expr_str), tb);
+            k_strcat_n(st->expr_str, sizeof(st->expr_str), ")");
         }
         break;
     case FN_EXP:
         res = fp_exp(val);
         k_strcpy(st->expr_str, "e^("); {
             char tb[DISP_MAX]; fp_to_str(val, tb, DISP_MAX);
-            k_strcat(st->expr_str, tb); k_strcat(st->expr_str, ")");
+            k_strcat_n(st->expr_str, sizeof(st->expr_str), tb);
+            k_strcat_n(st->expr_str, sizeof(st->expr_str), ")");
         }
         break;
     case FN_PI:
@@ -942,7 +961,8 @@ static void on_fn(void *ud)
         res = fp_factorial(n);
         k_strcpy(st->expr_str, "("); {
             char tb[DISP_MAX]; fp_to_str(val, tb, DISP_MAX);
-            k_strcat(st->expr_str, tb); k_strcat(st->expr_str, ")!");
+            k_strcat_n(st->expr_str, sizeof(st->expr_str), tb);
+            k_strcat_n(st->expr_str, sizeof(st->expr_str), ")!");
         }
         break;
     }
@@ -958,7 +978,7 @@ static void on_fn(void *ud)
         res = fp_div(val, fp_from_int(100));
         {
             char tb[DISP_MAX]; fp_to_str(res, tb, DISP_MAX);
-            k_strcpy(st->expr_str, tb); k_strcat(st->expr_str, "%");
+            k_strcpy(st->expr_str, tb); k_strcat_n(st->expr_str, sizeof(st->expr_str), "%");
         }
         break;
     case FN_POW:
@@ -973,7 +993,7 @@ static void on_fn(void *ud)
         st->fresh_result = 0;
         {
             char tb[DISP_MAX]; fp_to_str(st->accumulator, tb, DISP_MAX);
-            k_strcpy(st->expr_str, tb); k_strcat(st->expr_str, " ^ ");
+            k_strcpy(st->expr_str, tb); k_strcat_n(st->expr_str, sizeof(st->expr_str), " ^ ");
         }
         sc_update_display(st);
         return;   /* do NOT call sc_set_result */

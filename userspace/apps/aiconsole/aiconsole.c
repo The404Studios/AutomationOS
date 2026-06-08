@@ -110,12 +110,13 @@ typedef struct {
     char name[32];
 } proc_detail_t;
 
-/* sysinfo_t -- returned by SYS_SYSINFO=62 */
+/* sysinfo_t -- returned by SYS_SYSINFO=62 (must match kernel procapi.h: 32 bytes) */
 typedef struct {
     u64 total_mem;
     u64 free_mem;
     u64 uptime_ms;
     u32 proc_count;
+    u32 _pad;        /* reserved, always 0 */
 } sysinfo_t;
 
 /* =========================================================================

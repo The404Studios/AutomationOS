@@ -165,13 +165,14 @@ typedef struct {
 } cc_rtc_t;
 
 /* ================================================================== */
-/* sysinfo struct (partial, enough for battery/uptime)                */
+/* sysinfo struct (must match kernel sysinfo_t in procapi.h: 32 bytes) */
 /* ================================================================== */
 typedef struct {
-    unsigned long uptime_ms;
-    unsigned long mem_total_kb;
-    unsigned long mem_free_kb;
-    unsigned long proc_count;
+    unsigned long long total_mem;   /* total physical memory in bytes */
+    unsigned long long free_mem;    /* free physical memory in bytes  */
+    unsigned long long uptime_ms;   /* milliseconds since boot        */
+    unsigned int       proc_count;  /* total live processes           */
+    unsigned int       _pad;        /* reserved, always 0             */
 } cc_sysinfo_t;
 
 /* ================================================================== */
@@ -276,11 +277,11 @@ static unsigned int tile_accent_off[NUM_TILES] = {
 static void tile_refresh_appearance(int idx)
 {
     cc_tile_t *t = &g_state.tiles[idx];
-    /* background colour */
-    /* Note: ui_panel_set_bg doesn't exist in the toolkit, so we overlay
-       a label whose colour conveys state.  We use the state_lbl to show
-       "On" (white text on accent) or "Off" (dim text on dark).        */
-    (void)tile_accent_on; (void)tile_accent_off;  /* suppress unused warning */
+    /* Update the tile background color to reflect on/off state. */
+    if (t->bg_pnl) {
+        ui_widget_set_bg(t->bg_pnl,
+                         t->state ? tile_accent_on[idx] : tile_accent_off[idx]);
+    }
     if (t->state) {
         ui_label_set_text(t->state_lbl, "On");
     } else {

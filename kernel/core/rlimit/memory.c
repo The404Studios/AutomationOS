@@ -103,12 +103,29 @@ void rlimit_oom_kill(process_t* proc) {
     kprintf("[RLIMIT] OOM: Killing process '%s' (PID %d) due to memory limit\n",
             proc->name, proc->pid);
 
+    // If the victim is BLOCKED on a wait_object, force-unlink it so the
+    // object-ref it holds is dropped. Without this, an event-only waiter
+    // (futex/waitpid/epoll, not on the timer sleep list) stays linked
+    // forever, the object-ref leaks, ref_count never reaches 0, and the
+    // PCB is never reaped. Same discipline as SIGKILL in kill.c.
+    {
+        struct wait_object* wo = proc->wait_on;
+        if (proc->state == PROCESS_BLOCKED && wo) {
+            extern int wait_object_abort(struct wait_object* wo, process_t* proc);
+            wait_object_abort(wo, proc);
+        }
+    }
+
     // Set process state to terminated
     proc->state = PROCESS_TERMINATED;
     proc->exit_status = 137;            // 128 + SIGKILL: OOM-killed
     process_on_terminate(proc);         // wake a parent blocked in waitpid()
 
-    // TODO: Free process resources
+    // Remove from the scheduler's ready queue (drops the scheduler's ref).
+    // Without this, the terminated process remains visible to the scheduler
+    // and can be dispatched as a zombie.
+    extern void scheduler_remove_process(process_t* proc);
+    scheduler_remove_process(proc);
 }
 
 // Memory pressure notification (warning before OOM)

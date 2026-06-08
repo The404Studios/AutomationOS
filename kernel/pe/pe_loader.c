@@ -90,7 +90,7 @@ pe_file_t* pe_parse(const void *data, size_t size) {
         pe->is_dll = (pe->coff_header->characteristics & IMAGE_FILE_DLL) != 0;
     }
 
-    // Parse sections
+    // Parse sections -- validate that the section table fits within the file
     section_header_t *sections = (section_header_t *)((uint8_t *)pe->optional_header +
                                                       pe->coff_header->size_of_optional_header);
     pe->section_count = pe->coff_header->number_of_sections;
@@ -98,6 +98,20 @@ pe_file_t* pe_parse(const void *data, size_t size) {
     if (pe->section_count > PE_MAX_SECTIONS) {
         printf("PE: Too many sections: %u\n", pe->section_count);
         pe->section_count = PE_MAX_SECTIONS;
+    }
+
+    // Bounds-check: section table must not extend past the file buffer
+    {
+        uint64_t sec_table_offset = (uint8_t *)sections - (uint8_t *)pe->file_data;
+        uint64_t sec_table_end = sec_table_offset +
+                                 (uint64_t)pe->section_count * sizeof(section_header_t);
+        if (sec_table_end > size) {
+            printf("PE: Section table extends beyond file (offset 0x%lx, end 0x%lx, file 0x%lx)\n",
+                   (unsigned long)sec_table_offset, (unsigned long)sec_table_end, (unsigned long)size);
+            free(pe->file_data);
+            free(pe);
+            return NULL;
+        }
     }
 
     for (uint32_t i = 0; i < pe->section_count; i++) {
@@ -298,6 +312,18 @@ int pe_map_sections(pe_file_t *pe) {
 
     uint8_t *base = (uint8_t *)pe->loaded_base;
 
+    // Validate size_of_headers against both file and image sizes
+    if (pe->optional_header->size_of_headers > pe->file_size) {
+        printf("PE: size_of_headers (0x%x) exceeds file size (0x%lx)\n",
+               pe->optional_header->size_of_headers, (unsigned long)pe->file_size);
+        return -1;
+    }
+    if (pe->optional_header->size_of_headers > pe->image_size) {
+        printf("PE: size_of_headers (0x%x) exceeds image size (0x%x)\n",
+               pe->optional_header->size_of_headers, pe->image_size);
+        return -1;
+    }
+
     // Copy headers
     memcpy(base, pe->file_data, pe->optional_header->size_of_headers);
 
@@ -354,6 +380,12 @@ int pe_apply_relocations(pe_file_t *pe, void *new_base) {
     base_relocation_t *reloc = pe->relocations;
 
     while (reloc->virtual_address != 0) {
+        // Validate relocation block size
+        if (reloc->size_of_block < sizeof(base_relocation_t)) {
+            printf("PE: Invalid relocation block size: %u\n", reloc->size_of_block);
+            return -1;
+        }
+
         uint32_t num_entries = (reloc->size_of_block - sizeof(base_relocation_t)) / sizeof(uint16_t);
         uint16_t *entries = (uint16_t *)((uint8_t *)reloc + sizeof(base_relocation_t));
 
@@ -361,6 +393,14 @@ int pe_apply_relocations(pe_file_t *pe, void *new_base) {
             uint16_t entry = entries[i];
             uint16_t type = entry >> 12;
             uint16_t offset = entry & 0xFFF;
+
+            // Bounds-check: relocation target must be within the loaded image
+            uint64_t target_offset = (uint64_t)reloc->virtual_address + offset;
+            if (target_offset + 8 > pe->image_size) {  // 8 for largest reloc (DIR64)
+                printf("PE: Relocation target out of bounds: 0x%lx\n",
+                       (unsigned long)target_offset);
+                continue;  // Skip invalid relocation
+            }
 
             void *target = base + reloc->virtual_address + offset;
 
@@ -560,7 +600,14 @@ int pe_load_and_execute(const char *exe_path) {
         return -1;
     }
 
-    // Set entry point
+    // Validate and set entry point
+    if (pe->entry_point >= pe->image_size) {
+        printf("PE: Entry point 0x%lx exceeds image size 0x%x\n",
+               (unsigned long)pe->entry_point, pe->image_size);
+        pe_free(pe);
+        process_destroy(proc);
+        return -1;
+    }
     uint64_t entry = (uint64_t)pe->loaded_base + pe->entry_point;
     proc->entry_point = (void *)entry;
 

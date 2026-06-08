@@ -50,17 +50,29 @@ typedef signed long long   i64;
 #define NET_ERR_BADF     (-9)    /* -EBADF: bad socket fd                  */
 
 /*
- * net_info_t -- filled by net_info(); mirrors kernel net_info struct.
+ * net_info_t -- filled by net_info(); mirrors kernel net_info_ext_t
+ * (kernel/include/netif.h).
  *
  * All addresses are in host byte order (u32 = 0xAABBCCDD for A.B.C.D).
+ *
+ * IMPORTANT: the field order and sizes must match the kernel struct EXACTLY
+ * because SYS_NET_INFO does a raw copy_to_user of the whole struct.
  */
 typedef struct {
-    u32 ip;        /* our IPv4 address    */
-    u32 gateway;   /* default gateway     */
-    u32 netmask;   /* subnet mask         */
-    u8  mac[6];    /* hardware address    */
-    u8  _pad[2];
-    u32 link_up;   /* 1 = link up, 0 = down */
+    char ifname[16]; /* interface name, e.g. "eth0" (NETIF_NAME_MAX) */
+    u8   mac[6];     /* hardware address    */
+    u8   _pad[2];
+    u32  ip;         /* our IPv4 address    */
+    u32  netmask;    /* subnet mask         */
+    u32  gateway;    /* default gateway     */
+    u32  dns;        /* DNS server          */
+    u8   up;         /* 1 = link up         */
+    u8   dhcp_active;
+    u8   _pad2[6];
+    u64  tx_packets;
+    u64  rx_packets;
+    u64  tx_bytes;
+    u64  rx_bytes;
 } net_info_t;
 
 /* ---- address helpers ---- */

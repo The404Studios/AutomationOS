@@ -263,6 +263,8 @@ uint32_t thermal_get_temperature(const char* name);
 int thermal_set_cooling_state(const char* name, uint32_t state);
 int thermal_throttle_cpu(uint32_t cpu, uint32_t percentage);
 void thermal_check_trip_points(thermal_zone_t* zone);
+void thermal_monitor(void);       // Update all zones + check trip points
+void thermal_safety_tick(void);   // T410: once-per-second DTS check (when power subsystem linked)
 
 // Display Power Management
 int display_power_init(void);

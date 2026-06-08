@@ -126,10 +126,15 @@ static input_device_t* mouse_device = NULL;
 // small enough that a dead device only costs a fraction of a second of boot.
 #define PS2_TIMEOUT_MS 200
 
-// Iteration cap used only when the PIT frequency is unavailable. Tuned to be
-// in the same ballpark as the previous unconditional 100000-spin so the QEMU
-// happy path is unchanged, scaled by the requested millisecond budget.
-#define PS2_SPIN_PER_MS 100000UL
+// Hard iteration backstop, used when the PIT frequency is unavailable (ps2_init
+// runs pre-sti, so timer_get_ticks() is frozen and the wall-clock bound below is
+// dead). FLAT cap matching the proven prior 100000-spin -- NOT scaled by
+// PS2_TIMEOUT_MS. The earlier `PS2_SPIN_PER_MS * PS2_TIMEOUT_MS` was 100000*200 =
+// 20,000,000; since each iteration does an inb (~1 us on a real ISA-decoded 8042)
+// that is ~20 SECONDS per timed-out wait -- a multi-second boot freeze on a slow/
+// quirky real controller (e.g. the T410's SMM/USB-legacy port emulation). The cap
+// only bounds TIMEOUTS; the happy path returns early the instant the status bit hits.
+#define PS2_WAIT_SPIN_LIMIT 100000UL
 
 // Wait until (status & mask) == want, bounded by PS2_TIMEOUT_MS.
 // Returns true if the condition was met, false on timeout (caller degrades).
@@ -144,7 +149,7 @@ static bool ps2_wait_status(uint8_t mask, uint8_t want) {
     // hangs the boot. The wall-clock check is kept as a SECONDARY bound that is
     // only effective once IRQ0 is live and ticks are advancing. (Same dual-bound
     // discipline as the AHCI frozen-tick fix.)
-    uint64_t iter_cap       = PS2_SPIN_PER_MS * PS2_TIMEOUT_MS;
+    uint64_t iter_cap       = PS2_WAIT_SPIN_LIMIT;
     uint64_t start          = freq ? timer_get_ticks() : 0;
     uint64_t timeout_ticks  = freq ? (((uint64_t)PS2_TIMEOUT_MS * freq) / 1000) : 0;
     if (freq && timeout_ticks == 0) timeout_ticks = 1;  // sub-tick budget -> 1 tick
@@ -154,10 +159,17 @@ static bool ps2_wait_status(uint8_t mask, uint8_t want) {
             return true;
         }
         if (freq && (timer_get_ticks() - start) > timeout_ticks) {
-            return false;   // wall-clock bound (only fires once IRQ0 is live)
+            break;          // wall-clock bound (only fires once IRQ0 is live)
         }
     }
-    return false;           // iteration bound (always effective, incl. pre-sti)
+    // Timed out (iteration or wall-clock bound). Warn ONCE -- callers degrade
+    // gracefully, and a slow/absent controller must not spam this per byte.
+    static int ps2_timeout_warned = 0;
+    if (!ps2_timeout_warned) {
+        kprintf("[PS2] wait timeout (status bit never reached) -- degrading\n");
+        ps2_timeout_warned = 1;
+    }
+    return false;
 }
 
 // Wait for PS/2 controller to be ready for input (input buffer empty).

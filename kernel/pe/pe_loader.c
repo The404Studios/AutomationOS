@@ -83,6 +83,19 @@ pe_file_t* pe_parse(const void *data, size_t size) {
     if (pe->coff_header->size_of_optional_header > 0) {
         pe->optional_header = (optional_header_t *)((uint8_t *)pe->coff_header + sizeof(coff_header_t));
 
+        // The optional header (including its fixed 16-entry data_directory[],
+        // indexed up to IMAGE_DIRECTORY_ENTRY_TLS below) is dereferenced below.
+        // A crafted/truncated PE could place it near the end of the buffer, so
+        // require the whole struct to lie inside the file before any read.
+        uint64_t opt_off = (uint64_t)((uint8_t *)pe->optional_header - (uint8_t *)pe->file_data);
+        if (opt_off + sizeof(optional_header_t) > size) {
+            printf("PE: Optional header extends beyond file (off 0x%lx, file 0x%lx)\n",
+                   (unsigned long)opt_off, (unsigned long)size);
+            free(pe->file_data);
+            free(pe);
+            return NULL;
+        }
+
         // Extract key info
         pe->entry_point = pe->optional_header->address_of_entry_point;
         pe->image_base = pe->optional_header->image_base;
@@ -233,17 +246,30 @@ void* pe_rva_to_ptr(pe_file_t *pe, uint32_t rva) {
     for (uint32_t i = 0; i < pe->section_count; i++) {
         section_header_t *sec = pe->sections[i];
 
-        if (rva >= sec->virtual_address &&
-            rva < sec->virtual_address + sec->virtual_size) {
+        // 64-bit range math: virtual_address + virtual_size are attacker-
+        // controlled u32s that can wrap a 32-bit sum and spoof a containment.
+        uint64_t va  = (uint64_t)sec->virtual_address;
+        uint64_t vsz = (uint64_t)sec->virtual_size;
+        if ((uint64_t)rva >= va && (uint64_t)rva < va + vsz) {
 
-            uint32_t offset = rva - sec->virtual_address;
+            uint64_t offset = (uint64_t)rva - va;
 
             if (pe->is_loaded) {
-                // Return pointer in loaded image
-                return (uint8_t *)pe->loaded_base + sec->virtual_address + offset;
+                // Pointer into the loaded image; keep it inside the allocation
+                // (the image is reserved to image_size).
+                uint64_t img_off = va + offset;
+                if (img_off >= (uint64_t)pe->image_size) return NULL;
+                return (uint8_t *)pe->loaded_base + img_off;
             } else {
-                // Return pointer in file data
-                return (uint8_t *)pe->file_data + sec->pointer_to_raw_data + offset;
+                // Translate RVA -> file offset within this section's raw data.
+                // Both the within-section offset and pointer_to_raw_data are
+                // attacker-controlled, so require the byte to live in the file
+                // buffer (else a crafted section yields an arbitrary far OOB
+                // pointer that callers would dereference).
+                if (offset >= (uint64_t)sec->size_of_raw_data) return NULL;
+                uint64_t file_off = (uint64_t)sec->pointer_to_raw_data + offset;
+                if (file_off >= (uint64_t)pe->file_size) return NULL;
+                return (uint8_t *)pe->file_data + file_off;
             }
         }
     }
@@ -337,17 +363,37 @@ int pe_map_sections(pe_file_t *pe) {
         printf("PE: Mapping section %s at RVA 0x%x (size 0x%x)\n",
                name, sec->virtual_address, sec->virtual_size);
 
+        // Validate the section's destination range against the loaded image
+        // BEFORE deriving dest. virtual_address/virtual_size are attacker-
+        // controlled u32s; an unchecked dest past the image is an OOB write.
+        uint64_t va_end = (uint64_t)sec->virtual_address + (uint64_t)sec->virtual_size;
+        if (va_end > (uint64_t)pe->image_size) {
+            printf("PE: section %u [0x%x+0x%x] exceeds image size 0x%x\n",
+                   i, sec->virtual_address, sec->virtual_size, pe->image_size);
+            return -1;
+        }
+
         void *dest = base + sec->virtual_address;
 
         // Copy section data
         if (sec->size_of_raw_data > 0) {
+            // The source range must lie inside the file buffer; pointer_to_raw_data
+            // and size_of_raw_data are attacker-controlled (OOB read otherwise).
+            uint64_t raw_end = (uint64_t)sec->pointer_to_raw_data + (uint64_t)sec->size_of_raw_data;
+            if (raw_end > (uint64_t)pe->file_size) {
+                printf("PE: section %u raw data [0x%x+0x%x] exceeds file size 0x%lx\n",
+                       i, sec->pointer_to_raw_data, sec->size_of_raw_data,
+                       (unsigned long)pe->file_size);
+                return -1;
+            }
             void *src = (uint8_t *)pe->file_data + sec->pointer_to_raw_data;
             size_t copy_size = sec->size_of_raw_data < sec->virtual_size ?
                               sec->size_of_raw_data : sec->virtual_size;
             memcpy(dest, src, copy_size);
         }
 
-        // Zero remaining space (BSS)
+        // Zero remaining space (BSS). va_end <= image_size guarantees the
+        // [size_of_raw_data, virtual_size) tail stays inside the image.
         if (sec->virtual_size > sec->size_of_raw_data) {
             size_t zero_size = sec->virtual_size - sec->size_of_raw_data;
             memset(dest + sec->size_of_raw_data, 0, zero_size);

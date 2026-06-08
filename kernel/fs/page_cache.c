@@ -516,9 +516,14 @@ ssize_t page_cache_write(vfs_file_t* file, const void* buf, size_t count) {
         file->offset = offset;
     }
 
-    /* Check for overflow */
-    if (offset + count > (256ULL * 1024 * 1024)) {
-        return -1; /* Would exceed max file size */
+    /* Overflow-safe cap: bound each operand BEFORE summing so offset+count
+     * cannot wrap uint64 (a large lseek offset + large count would otherwise
+     * wrap to a small value, bypassing the cap and running the write loop far
+     * past the intended limit). Mirrors ramfs_write's proven guard in vfs.c. */
+    if (offset > (256ULL * 1024 * 1024) ||
+        count  > (256ULL * 1024 * 1024) ||
+        offset + count > (256ULL * 1024 * 1024)) {
+        return -1; /* Would exceed max file size / overflow */
     }
 
     /* Write page by page */

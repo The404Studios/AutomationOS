@@ -557,10 +557,13 @@ int hda_enumerate_codecs(hda_controller_t* ctrl) {
         // uint8 loop variable, `nid < start_nid + num_nodes` is ALWAYS true once the
         // int-promoted sum exceeds 255 -- nid wraps at 256 and never reaches it, so a
         // malformed codec wedges init in an infinite hda_send_command loop (IF off).
-        // Widen the loop math so it terminates and cap the count to a sane maximum.
+        // Bound the scan by the real hardware limit instead: a NID is an 8-bit
+        // command field, so the highest possible node is 255 (end-exclusive = 256).
+        // Widen the loop math to uint16 so it actually terminates.
         codec->afg_nid = 0;
-        if (num_nodes > HDA_MAX_WIDGETS) num_nodes = HDA_MAX_WIDGETS;
-        for (uint16_t nid = start_nid; nid < (uint16_t)start_nid + num_nodes; nid++) {
+        uint16_t end_nid = (uint16_t)start_nid + (uint16_t)num_nodes;
+        if (end_nid > 256) end_nid = 256;
+        for (uint16_t nid = start_nid; nid < end_nid; nid++) {
             uint32_t func_type = hda_send_command(ctrl, addr, (uint8_t)nid, HDA_VERB_GET_PARAMETER, HDA_PARAM_FUNC_GROUP_TYPE);
             if ((func_type & 0xFF) == 0x01) {  // Audio Function Group
                 codec->afg_nid = (uint8_t)nid;

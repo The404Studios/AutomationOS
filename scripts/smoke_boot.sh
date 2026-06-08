@@ -85,6 +85,13 @@ maybe_build() {
         bash "${KERNEL_ROOT}/scripts/quick_build.sh" || {
             printf "ERROR: quick_build.sh failed\n" >&2; exit 1
         }
+        # Stage the freshly-built kernel into the ISO tree. quick_build.sh writes
+        # build/kernel.elf, but grub-mkrescue below packages iso/boot/kernel.elf --
+        # without this copy, --build silently re-packaged a STALE kernel, so the
+        # smoke test validated whatever was last left in iso/boot/, not the new build.
+        cp "${KERNEL_ROOT}/build/kernel.elf" "${KERNEL_ROOT}/iso/boot/kernel.elf" || {
+            printf "ERROR: failed to stage build/kernel.elf into iso/boot/\n" >&2; exit 1
+        }
         if command -v grub-mkrescue &>/dev/null; then
             grub-mkrescue -o "${ISO}" "${KERNEL_ROOT}/iso/" || {
                 printf "ERROR: grub-mkrescue failed\n" >&2; exit 1

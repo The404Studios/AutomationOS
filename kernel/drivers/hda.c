@@ -625,10 +625,20 @@ int hda_codec_read_widgets(hda_codec_t* codec, hda_controller_t* ctrl) {
     serial_putchar('\n');
 
     // Read each widget
+    // afg_start_nid/afg_num_nodes are device-reported (uint8). A uint8 loop var
+    // makes `nid < afg_start_nid + afg_num_nodes` always true once the int-promoted
+    // sum exceeds 255 (nid wraps at 256); the num_widgets guard then stops the loop
+    // after 128 iterations but over the WRONG NID range (0..127 instead of the real
+    // range), corrupting the audio topology. Iterate a uint16 over the real 8-bit
+    // NID space (end-exclusive 256) AND the widget array; the body keeps the uint8
+    // `nid` it expects. Mirrors the AFG-search fix.
     codec->num_widgets = 0;
-    for (uint8_t nid = codec->afg_start_nid;
-         nid < codec->afg_start_nid + codec->afg_num_nodes && codec->num_widgets < HDA_MAX_WIDGETS;
-         nid++) {
+    uint16_t end_nid = (uint16_t)codec->afg_start_nid + (uint16_t)codec->afg_num_nodes;
+    if (end_nid > 256) end_nid = 256;
+    for (uint16_t n = codec->afg_start_nid;
+         n < end_nid && codec->num_widgets < HDA_MAX_WIDGETS;
+         n++) {
+        uint8_t nid = (uint8_t)n;
 
         hda_widget_t* widget = &codec->widgets[codec->num_widgets];
         widget->nid = nid;

@@ -184,13 +184,21 @@ static void pci_read_function(uint8_t bus, uint8_t device, uint8_t function,
             /* I/O-space BAR: store raw 32-bit value. */
             dev->bar[i] = (uint64_t)lo;
         } else if ((lo & PCI_BAR_MEM_TYPE_MASK) == PCI_BAR_MEM_TYPE_64) {
-            /* 64-bit memory BAR: combine this dword with the next one. */
+            /* 64-bit memory BAR: it occupies THIS slot plus the next (high dword).
+             * A well-formed device only marks a BAR 64-bit where a high-half slot
+             * exists (i+1 < num_bars). A malformed device that marks the LAST BAR
+             * 64-bit would otherwise make us read off+4 -- a NON-BAR config register
+             * (e.g. the Cardbus CIS pointer at 0x28 for BAR5) -- and fold that
+             * garbage into dev->bar[i]. Guard it: with no high-half slot, treat the
+             * low dword as a plain 32-bit BAR. */
+            if (i + 1 >= num_bars) {
+                dev->bar[i] = (uint64_t)lo;
+                continue;
+            }
             uint32_t hi = pci_config_read_dword(bus, device, function,
                                                 (uint8_t)(off + 4));
-            dev->bar[i] = ((uint64_t)hi << 32) | (uint64_t)lo;
-            if (i + 1 < 6) {
-                dev->bar[i + 1] = 0;  /* high dword consumed by the pair */
-            }
+            dev->bar[i]     = ((uint64_t)hi << 32) | (uint64_t)lo;
+            dev->bar[i + 1] = 0;  /* high dword consumed by the pair (i+1 < num_bars) */
             i++;  /* skip the BAR slot we just absorbed */
         } else {
             /* 32-bit memory BAR: store raw 32-bit value. */

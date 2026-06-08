@@ -492,6 +492,14 @@ bool ahci_port_identify(ahci_port_t* port) {
             port->sector_size = words_per_sector * 2;   /* 16-bit words -> bytes */
         }
     }
+    /* port->dma_bounce is a single page (dma_alloc_page); a device-reported
+     * logical sector larger than a page would overflow it in BOTH the per-sector
+     * bounce memcpy (ahci_read/write_sectors) and the PRDT DMA (dbc = ssz-1),
+     * giving a hostile/buggy drive an out-of-bounds write into kernel memory.
+     * Cap to the bounce size; real drives are 512 or 4096. */
+    if (port->sector_size > 4096) {
+        port->sector_size = 512;
+    }
 
     port->supports_ncq = (id[76] & (1 << 8)) &&
                          g_ahci_controller && g_ahci_controller->supports_ncq;

@@ -1715,6 +1715,9 @@ static int desk_name_is_elf(const char* s) {
     int n = 0; while (s[n]) n++;
     return n >= 4 && s[n-4] == '.' && s[n-3] == 'e' && s[n-2] == 'l' && s[n-1] == 'f';
 }
+static int desk_streq(const char* a, const char* b) {
+    int i = 0; while (a[i] && b[i]) { if (a[i] != b[i]) return 0; i++; } return a[i] == b[i];
+}
 
 static void desk_scan(void) {
     int prev_count = g_desk_count;
@@ -1739,6 +1742,9 @@ static void desk_scan(void) {
              (ent.d_name[1] == '.' && ent.d_name[2] == '\0')))
             continue;
         if (ent.d_name[0] == '\0') continue;      /* defensive */
+        /* The projects container is not shown as a plain folder -- its children
+         * are surfaced individually as PROJECT icons below. */
+        if (ent.d_type == DT_DIR && desk_streq(ent.d_name, "Projects")) continue;
 
         desk_icon_t *di = &g_desk_icons[n];
         /* display label: truncated for the grid. */
@@ -1758,6 +1764,38 @@ static void desk_scan(void) {
         n++;
     }
     syscall(SYS_CLOSEDIR, dfd, 0, 0);
+
+    /* Surface each project under /Desktop/Projects as a PROJECT icon on the
+     * desktop -- the project folder IS the desktop icon. Bails silently if the
+     * directory doesn't exist yet (no projects created). */
+    long pfd = syscall(SYS_OPENDIR, (long)"/Desktop/Projects", 0, 0);
+    if (pfd >= 0) {
+        struct dirent pent;
+        while (n < DESK_MAX_ICONS) {
+            long rr = syscall(SYS_READDIR, pfd, (long)&pent, 0);
+            if (rr < 0) break;
+            if (pent.d_name[0] == '.' &&
+                (pent.d_name[1] == '\0' ||
+                 (pent.d_name[1] == '.' && pent.d_name[2] == '\0'))) continue;
+            if (pent.d_name[0] == '\0') continue;
+            if (pent.d_type != DT_DIR) continue;      /* projects are directories */
+
+            desk_icon_t *di = &g_desk_icons[n];
+            int i = 0;
+            while (pent.d_name[i] && i < DESK_NAME_DISP) { di->name[i] = pent.d_name[i]; i++; }
+            di->name[i] = '\0';
+            { const char* pre = "/Desktop/Projects/"; int p = 0;
+              while (pre[p] && p < (int)sizeof(di->path) - 1) { di->path[p] = pre[p]; p++; }
+              int q = 0;
+              while (pent.d_name[q] && p < (int)sizeof(di->path) - 1) di->path[p++] = pent.d_name[q++];
+              di->path[p] = '\0'; }
+            di->is_dir = 1;
+            di->kind   = DI_PROJECT;
+            n++;
+        }
+        syscall(SYS_CLOSEDIR, pfd, 0, 0);
+    }
+
     /* PERF: the periodic /Desktop rescan only changes the screen when the icon
      * set changed. Use the count as a cheap change proxy and mark dirty so a
      * newly-created/removed icon repaints (the common case: IDE output, New

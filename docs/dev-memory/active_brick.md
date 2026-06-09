@@ -11,7 +11,7 @@
   T1 scrollback ring · T2 line-editing cleanup (cursor_pos + Left/Right/Home/End/Del, kill `[TERM] key`
   spam) · T3 minimal ANSI/VT (SGR color first — `grid_color[][]` substrate exists) · T4 delete ~3000
   lines dead terminal code. ALL userspace (`terminal_m3.c`); does NOT touch the kernel primitive.
-- **status:** **T0 + T1 + T2 LANDED.** T0 (`3eac1bb`): defer the prompt for a bound child + waitpid-lite
+- **status:** **T0 + T1 + T2 + T3 LANDED.** T0 (`3eac1bb`): defer the prompt for a bound child + waitpid-lite
   (`SYS_WAITPID` WNOHANG=1, non-blocking) → prompt prints AFTER the output. T1: **scrollback ring**
   (256-line `sb[][]` ring; `cur_row` → `sb_head`/`sb_view`/`sb_follow` viewport; `grid_putchar` is the
   ONE append path; PageUp/PageDown scroll, PageDown re-follows). SCREENSHOT-verified (`t0demo.png`,
@@ -20,9 +20,14 @@
   Left/Right/Home/End/Backspace/Delete/insert all cursor-aware; `[TERM] key` spam gated behind
   `TERM_DEBUG_KEYS` (default off). Screenshot-verified (`t2check.png`: a multi-line self-check runs
   the three acceptance cases through the SAME edit primitives → PASS lines in scrollback; `t2final.png`
-  = clean build with the temp self-check removed).
-  record: `docs/dev-memory/bricks/TERMINAL-0.md`. **Next: T3** (minimal ANSI/VT — SGR color first;
-  the `grid_color`/`g_cur_color` substrate already exists), then T4 (delete the dead terminal code).
+  = clean build with the temp self-check removed). **T3 (`a6b1efc`): minimal ANSI/VT SGR colour** —
+  a 3-state parser (`ANSI_TEXT`/`ESC`/`CSI`) sits BEFORE `grid_putchar` (ANSI = state mutation, not
+  output); colour ONLY (`ESC[0m` reset, `30-37`/`90-97` fg, `39` default, `1` bold retro-brightens so
+  `31;1`==`1;31`); 32-byte CSI buffer, overflow→TEXT; child drain routes through `term_write()` +
+  `ansi_reset()` on child-exit; builtins/prompt keep explicit colour (no ANSI). Screenshot-verified
+  (`t3check.png`: red/green/bright-red render, `ESC[999m` sane in default, NO escape junk; `t3final.png`
+  clean). record: `docs/dev-memory/bricks/TERMINAL-0.md`. **Next: T4** — delete the ~3,000 lines of dead
+  terminal code now superseded by the proven T0–T3 active path (output, scrollback, editing, colour).
 
 ## CHANNEL-0 — FROZEN / COMPLETE (P0–P4, pushed to origin)
 - **branch:** `brick/channel-0` (PUSHED, commit `1dd5107`) · **spec:** `docs/superpowers/specs/2026-06-08-channel-0-design.md`

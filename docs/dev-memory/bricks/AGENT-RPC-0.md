@@ -170,8 +170,50 @@ checkpoints:
       smoke_proves_claim: true          # RUNNER+TOOLRUN PASS = the typed dispatch chain executed
       raw_pointers_or_truncation: none  # typed recv buffers (tool_run_t/tool_result_t); bounded drain
     verdict: pass
+  - id: P6c
+    title: make stdout_token real -- a one-shot read-only CH_BYTE capability grant/accept (agent reads the EXACT stdout)
+    commits: [f2d3882]
+    files:
+      - kernel/include/syscall.h          # SYS_CH_GRANT=104, SYS_CH_ACCEPT=105
+      - kernel/include/channel.h          # sys_ch_grant/accept protos
+      - kernel/ipc/channel.c              # bounded grant table + grant/accept handlers + death-sweep cleanup
+      - kernel/core/syscall/syscall.c     # register 104/105
+      - userspace/lib/channel.h           # ch_grant/ch_accept + CH_E* errno constants
+      - userspace/lib/agent_rpc.h         # rename stdout_handle -> stdout_token + per-checkpoint semantics
+      - userspace/apps/rpctest/rpctest.c  # field rename (stdout_token)
+      - userspace/apps/echoproof/echoproof.c  # NEW deterministic 17-byte stdout tool ("AGENT-RPC-0-PROOF")
+      - userspace/apps/toolrun/toolrun.c  # runner GRANTs (no drain); agent ACCEPTs + reads + byte-compares + ACK
+      - scripts/build_all.sh / docs/AGENT_RPC_WIRE.md  # stage echoproof; doc the capability + token semantics
+    tests: [build_test/p6c_verify.sh]
+    result: >
+      quick_build+build_all clean; serial 'TOOLRUN: PASS ... accept=1 agent_read=17 exact=1 ro=1
+      dblaccept_deny=1 bogus_deny=1' + 'RUNNER: PASS grant=1 ctrl_deny=1 inv_deny=1 norights_deny=1
+      wrongpid_deny=1 enospc=1 acked=1' -- the agent reads the tool's EXACT 17 stdout bytes through a
+      transferred READ-ONLY handle; every reject fires. P6a/P6b/P5b/[CHAN] still PASS; p6cfinal.png clean.
+    design:
+      - NOT general fd passing: a narrow capability -- CH_BYTE only (never CH_MSG/ctrl), CH_END_MASTER,
+        CH_R_READ forced (no WRITE/escalation), bound to one to_pid, single-use. grant_id =
+        (gen<<16)|(slot+1) [1-based slot so a valid id is always >=1; id 0 = none]; accept validates
+        slot-range + occupied + generation + to_pid, then consumes (slot cleared, gen++) so stale/dup ids
+        -> EBADF. Bounded table (8) -> ENOSPC; grants from/to a dying pid swept (no leaked refs).
+      - explicit to_pid (auditable), passed as runner setup metadata (spawn_ex "r:<agentpid>"), NOT as a
+        TOOL_RUN arg -- the TOOL_RUN payload stays path-only (args_len==0). An ACK handshake makes the
+        runner outlive the agent's accept (grants die with the granter).
+      - GOTCHA (found+fixed in-loop): slot0/gen0 first encoded grant_id=0 (falsy) so RUNNER reported
+        grant=0 even though the agent's accept worked; fixed with the 1-based-slot encoding. The whole
+        capability mechanism (exact read, all rejects, ENOSPC, cleanup, ACK) was correct first try.
+    review:
+      default_build_changed: false      # additive syscalls; CH_BYTE/CH_MSG/byte selftests all still pass
+      all_waits_bounded: true           # bounded poll+yield loops; no kernel blocking; bounded grant table
+      hardware_init_gated: n/a
+      touches_userspace: true
+      touches_kernel: true              # the grant/accept capability primitive (the one kernel change in P6)
+      preserves_known_good_t410: true
+      smoke_proves_claim: true          # exact=1 + ro=1 + the full reject matrix in serial
+      raw_pointers_or_truncation: none  # forced rights/end/type; 1-based id; bounded table; both-side sweep
+    verdict: pass
 next_checkpoints:
-  - P6c argv (NUL-separated argv bytes, validated) + cross-process stdout delivery to the agent (handle transfer)
+  - P6d argv: NUL-separated argv bytes, validated (reject empty arg0 / missing final NUL / malformed empties); still no shell
 deferred:
   - P7 async submission/completion batch · P8 NIC RX/TX as channels
 ```

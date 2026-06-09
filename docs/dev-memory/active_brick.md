@@ -41,9 +41,17 @@
   sent=1 result=1 type=1 rid=1 valid=1 handle_nz=1`. All hard-no's held (no shell/parser/PATH/env/
   stdin/stderr/concurrency). **TRUST-BOUNDARY NOTE:** no up-transfer in CHANNEL-0, so the RUNNER reads
   stdout; `stdout_handle` is the runner's token; agent-side cross-process stdout-read is P6c. No kernel
-  change; RPCTEST/MSGTEST/[CHAN] green; `p6bcheck.png` clean, 0 panic. **Next: P6c** — argv
-  (NUL-separated, validated) + cross-process stdout delivery to the agent. P6b committed local, awaiting
-  review/push.
+  change; RPCTEST/MSGTEST/[CHAN] green; `p6bcheck.png` clean, 0 panic. **P6b PUSHED** (`694185e`) +
+  token-semantics doc (`de30b37`). **P6c (`f2d3882`): `stdout_token` is REAL — capability grant/accept.**
+  Two syscalls `SYS_CH_GRANT(handle,to_pid)` / `SYS_CH_ACCEPT(grant_id)`: a one-shot, **CH_BYTE-only,
+  MASTER-end, CH_R_READ-forced, to_pid-bound** transfer (NOT general fd passing). `grant_id=(gen<<16)|
+  (slot+1)`; bounded table→`ENOSPC`; grants swept on either side's death. The runner GRANTs the tool's
+  stdout (no drain); the agent ACCEPTs → read-only handle → reads the **exact 17 bytes** (`exact=1`,
+  `ro=1`); ACK handshake so the runner outlives the accept. Renamed `stdout_handle→stdout_token`. Serial
+  `TOOLRUN: PASS … agent_read=17 exact=1 ro=1 dblaccept_deny=1 bogus_deny=1` + `RUNNER: PASS grant=1
+  ctrl_deny=1 inv_deny=1 norights_deny=1 wrongpid_deny=1 enospc=1`. All prior selftests green;
+  `p6cfinal.png` clean, 0 panic. **Next: P6d** — argv (NUL-separated, validated; no shell). P6c committed
+  local, awaiting review/push.
 
 ## TERMINAL-0 — FROZEN / COMPLETE (T0–T4, pushed to origin `935f54f`) — CHANNEL-0 console output human-stable
 - **branch:** `brick/terminal-0` (off `brick/channel-0`), **PUSHED** `git push origin brick/terminal-0`

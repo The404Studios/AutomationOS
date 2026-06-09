@@ -16,6 +16,8 @@
 #define SYS_SPAWN_EX   101
 #define SYS_CH_SENDMSG 102
 #define SYS_CH_RECVMSG 103
+#define SYS_CH_GRANT   104
+#define SYS_CH_ACCEPT  105
 
 /* ch_create flags */
 #define CH_BYTE       0x0001u
@@ -91,8 +93,27 @@ static inline int ch_recvmsg(int h, ch_msg_hdr *hdr, void *payload, unsigned int
     return (int)_ch_sc(SYS_CH_RECVMSG, (long)h, (long)hdr, (long)payload, (long)cap, 0, 0);
 }
 
+/* ---- CHANNEL-0 P6c: one-shot read-only CH_BYTE capability transfer ----
+ * ch_grant(handle, to_pid): offer a READ-only, MASTER-end capability to the
+ * CH_BYTE channel behind `handle` to process `to_pid`. Returns a grant_id (>0)
+ * or <0 (EBADF bad/owned handle, EPERM no READ right, EINVAL not CH_BYTE,
+ * ENOSPC grant table full). ch_accept(grant_id): the target pid claims it once,
+ * receiving a read-only local handle (>0), or <0 (EBADF bogus/stale/consumed id,
+ * EPERM wrong pid, EMFILE local table full). */
+static inline int ch_grant(int h, unsigned int to_pid) {
+    return (int)_ch_sc(SYS_CH_GRANT, (long)h, (long)to_pid, 0, 0, 0, 0);
+}
+static inline int ch_accept(int grant_id) {
+    return (int)_ch_sc(SYS_CH_ACCEPT, (long)grant_id, 0, 0, 0, 0, 0);
+}
+
 /* common kernel errno values userspace checks (negative, Linux ABI) */
+#define CH_EPERM     (-1)
+#define CH_EBADF     (-9)
 #define CH_EAGAIN    (-11)
+#define CH_EINVAL    (-22)
+#define CH_EMFILE    (-24)
+#define CH_ENOSPC    (-28)
 #define CH_EMSGSIZE  (-90)
 
 #endif /* USERSPACE_CHANNEL_H */

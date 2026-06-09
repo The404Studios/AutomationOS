@@ -52,7 +52,7 @@ int main(void) {
     /* TOOL_RESULT encode + round-trip + version rejection */
     tool_result_t res;
     if (tool_result_encode(&res, 0) != AR_OK)               ok = 0;
-    if (res.exit_code != 0 || res.stdout_handle != 0)       ok = 0;   /* P6a: no channel passing */
+    if (res.exit_code != 0 || res.stdout_token != 0)        ok = 0;   /* P6a: no channel passing */
     if (tool_result_validate(&res, sizeof(res)) != AR_OK)   ok = 0;
     tool_result_t bad_r = res; bad_r.version = 99;
     int rej_res = (tool_result_validate(&bad_r, sizeof(bad_r)) == AR_E_VERSION);

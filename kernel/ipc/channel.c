@@ -50,6 +50,26 @@ static int ring_read(ch_ring_t* r, uint8_t* d, uint32_t len) {
     return (int)n;
 }
 
+/* ---- CHANNEL-0 P6c: one-shot, read-only CH_BYTE handle-transfer grants ----
+ * A narrow capability: a holder of a CH_BYTE channel may GRANT a READ-only,
+ * MASTER-end capability to ONE specific recipient pid; that recipient (and only
+ * it) may ACCEPT it ONCE to obtain a read-only local handle. This is NOT general
+ * fd passing: CH_BYTE only (never CH_MSG/control), READ only (never WRITE),
+ * MASTER end only, target pid only, single-use. The grant_id encodes
+ * (generation << 16 | slot) so a stale or re-used id fails cleanly. Bounded
+ * kernel state; grants from/to a dying process are swept (no leaked refs). */
+#define CH_NGRANTS 8
+struct ch_grant {
+    int        used;
+    uint32_t   from_pid;
+    uint32_t   to_pid;
+    channel_t* ch;
+    int        end;       /* forced CH_END_MASTER */
+    uint32_t   rights;    /* forced CH_R_READ     */
+    uint16_t   gen;       /* bumped on consume/sweep to invalidate stale ids */
+};
+static struct ch_grant g_grants[CH_NGRANTS];
+
 /* ---- channel object ---- */
 channel_t* channel_alloc(uint32_t flags, uint32_t capacity) {
     channel_t* ch = (channel_t*)kmalloc(sizeof(channel_t));
@@ -167,6 +187,15 @@ void channel_cleanup_process(struct process* p) {
         channel_t* ch = (channel_t*)p->ch_handles[h].ch;
         if (ch) { p->ch_handles[h].ch = (void*)0; p->ch_handles[h].rights = 0; channel_unref(ch); }
     }
+    /* P6c: release any pending grants from OR to this dying process (no leaked
+     * channel refs if the runner exits before the agent accepts, or vice versa). */
+    for (int i = 0; i < CH_NGRANTS; i++) {
+        if (g_grants[i].used && (g_grants[i].from_pid == p->pid || g_grants[i].to_pid == p->pid)) {
+            channel_unref(g_grants[i].ch);
+            g_grants[i].used = 0; g_grants[i].gen++;
+            g_grants[i].ch = (channel_t*)0; g_grants[i].from_pid = 0; g_grants[i].to_pid = 0;
+        }
+    }
 }
 
 /* ---- syscalls (negative errno on error, like the rest of the kernel) ---- */
@@ -272,6 +301,51 @@ int64_t sys_ch_recvmsg(uint64_t handle, uint64_t uhdr, uint64_t upayload, uint64
     if (r > 0 && copy_to_user((void*)upayload, kbuf, (uint32_t)r) != COPY_SUCCESS) { if (kbuf) kfree(kbuf); return EFAULT; }
     if (kbuf) kfree(kbuf);
     return r;                                            /* payload bytes delivered */
+}
+
+/* ---- P6c: one-shot read-only CH_BYTE grant/accept ---- */
+int64_t sys_ch_grant(uint64_t handle, uint64_t to_pid, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6) {
+    (void)a3; (void)a4; (void)a5; (void)a6;
+    process_t* cur = process_get_current();
+    int end;
+    channel_t* ch = process_get_handle(cur, (int)handle, &end, 0);
+    if (!ch) return EBADF;                                          /* invalid handle               */
+    if (!process_get_handle(cur, (int)handle, (int*)0, CH_R_READ))
+        return EPERM;                                              /* must hold READ to grant READ */
+    if (!(ch->flags & CH_BYTE)) return EINVAL;                      /* CH_BYTE only (never CH_MSG)   */
+    for (int i = 0; i < CH_NGRANTS; i++) {
+        if (!g_grants[i].used) {
+            channel_ref(ch);
+            g_grants[i].used     = 1;
+            g_grants[i].from_pid = cur->pid;
+            g_grants[i].to_pid   = (uint32_t)to_pid;
+            g_grants[i].ch       = ch;
+            g_grants[i].end      = CH_END_MASTER;                   /* forced: read the tool's stdout */
+            g_grants[i].rights   = CH_R_READ;                       /* forced: read-only, no escalation */
+            /* grant_id = (gen << 16) | (slot+1) -- slot is 1-based so a valid id
+             * is ALWAYS >= 1 (id 0 is reserved "none"). */
+            return (int64_t)(((uint32_t)g_grants[i].gen << 16) | (uint32_t)(i + 1));
+        }
+    }
+    return ENOSPC;                                                  /* bounded grant table full     */
+}
+int64_t sys_ch_accept(uint64_t grant_id, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6) {
+    (void)a2; (void)a3; (void)a4; (void)a5; (void)a6;
+    process_t* cur = process_get_current();
+    uint32_t raw = (uint32_t)(grant_id & 0xFFFFu);                  /* 1-based slot */
+    uint32_t gen = (uint32_t)((grant_id >> 16) & 0xFFFFu);
+    if (raw == 0 || raw > CH_NGRANTS)  return EBADF;                /* out of range / bogus id      */
+    uint32_t slot = raw - 1;
+    struct ch_grant* g = &g_grants[slot];
+    if (!g->used)                      return EBADF;                /* empty / already consumed     */
+    if (g->gen != (uint16_t)gen)       return EBADF;                /* stale generation             */
+    if (g->to_pid != cur->pid)         return EPERM;                /* wrong owner -- not the target */
+    int h = process_alloc_handle(cur, g->ch, g->end, g->rights);   /* read-only, master end        */
+    if (h < 0)                         return EMFILE;               /* caller table full; grant kept */
+    /* consume one-shot: the channel ref moves from the grant to the new handle */
+    g->used = 0; g->gen++;
+    g->ch = (channel_t*)0; g->from_pid = 0; g->to_pid = 0;
+    return h;
 }
 
 /* ---- boot self-test (P1): prove the ring + both ends end-to-end ---- */

@@ -122,5 +122,9 @@ int64_t sys_spawn_ex (uint64_t path, uint64_t args, uint64_t stdin_h, uint64_t s
  * user payload); recvmsg(handle, user hdr-out, user payload-out, payload_cap). */
 int64_t sys_ch_sendmsg(uint64_t handle, uint64_t hdr, uint64_t payload, uint64_t a4, uint64_t a5, uint64_t a6);
 int64_t sys_ch_recvmsg(uint64_t handle, uint64_t hdr, uint64_t payload, uint64_t payload_cap, uint64_t a5, uint64_t a6);
+/* P6c: one-shot, read-only CH_BYTE capability transfer. grant(handle, to_pid) ->
+ * grant_id (>0); accept(grant_id) -> a read-only local handle for the target pid. */
+int64_t sys_ch_grant (uint64_t handle, uint64_t to_pid, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6);
+int64_t sys_ch_accept(uint64_t grant_id, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6);
 
 #endif /* CHANNEL_H */

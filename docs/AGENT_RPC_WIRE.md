@@ -50,26 +50,29 @@ msg_packet_t { type, flags, len, request_id }  +  payload[len]
 | `version`       | u16  | `= AGENT_RPC_VERSION` (1)                               |
 | `flags`         | u16  | `TOOL_F_*` (reserved; 0 in P6a)                         |
 | `exit_code`     | i32  | the tool's exit status                                 |
-| `stdout_handle` | u32  | a byte-channel handle for the tool's output (see the semantics note below) |
+| `stdout_token`  | u32  | opaque, checkpoint-defined stdout token — **not** a usable handle (see the semantics note below) |
 | `reserved`      | u32  | 0                                                      |
 
-### `stdout_handle` semantics (READ THIS before claiming "the agent reads stdout")
+### `stdout_token` semantics (READ THIS before claiming "the agent reads stdout")
 
-The meaning of `stdout_handle` has changed per checkpoint. Be precise about what
-each level actually proves — do not let a summary overclaim:
+The field was renamed `stdout_handle` → `stdout_token` so no reader assumes it is
+a directly-usable process-local handle. Its meaning is checkpoint-defined — be
+precise about what each level actually proves; do not let a summary overclaim:
 
 - **P6a:** always `0`. Inert. No tool was run.
 - **P6b:** a **runner-local handle token** — the handle, in the *runner's* handle
   table, of the `CH_BYTE` channel it bound to the tool's stdout and **drained
-  itself**. It is **non-zero but NOT dereferenceable by the agent**: CHANNEL-0
-  has no cross-process handle transfer, so the number is meaningless in the
-  agent's table. P6b's real invariant is *"the runner created a stdout channel,
-  the tool wrote to it, and the runner drained N bytes"* — NOT *"the agent read
-  stdout"*. The token is returned honestly so the contract is ready for P6c.
-- **P6c+:** `stdout_handle` becomes **agent-readable** only after an explicit,
-  one-shot, read-only **handle-transfer/capability primitive** moves the stdout
-  *read* end from the runner to the requesting agent. Only then may anything
-  claim the agent reads the tool's stdout.
+  itself**. Non-zero but **NOT dereferenceable by the agent** (CHANNEL-0 had no
+  cross-process handle transfer yet). P6b's real invariant is *"the runner created
+  a stdout channel, the tool wrote to it, and the runner drained N bytes"* — NOT
+  *"the agent read stdout"*.
+- **P6c (DONE):** a **one-shot grant id**. The runner calls `SYS_CH_GRANT(out_handle,
+  agent_pid)` and returns the grant id here; the agent **MUST** call
+  `SYS_CH_ACCEPT(stdout_token)` to convert it into a **read-only** local handle,
+  then read the tool's stdout itself. The grant is `CH_BYTE`-only, `CH_END_MASTER`,
+  `CH_R_READ`-only, bound to `agent_pid`, single-use (`grant_id = (gen<<16)|(slot+1)`,
+  so a stale/reused id fails). Only now may anything claim *the agent reads the
+  tool's stdout* — and only after a successful `ACCEPT`.
 
 ## Validation rules (enforced by `*_validate`)
 
@@ -95,11 +98,17 @@ Encoding rejects an over-long `path`/`args` with `AR_E_TOOLONG`.
   { exit_code, stdout_handle }`. `stdout_handle` is a **runner-local token**
   (see the semantics note above). Proof `sbin/toolrun`: serial `RUNNER: PASS
   ... stdout_bytes=183` + `TOOLRUN: PASS ...`.
-- **P6c — NEXT (capability only):** make `stdout_handle` real — a one-shot,
-  read-only transfer of the *tool's stdout read end* from the runner to the
-  requesting agent, so the agent can read the exact stdout bytes. No argv. This
-  is the capability/security change, kept isolated from parsing risk.
-- **P6d — after P6c:** argv — `args` as NUL-separated argv bytes, validated
-  (reject empty `arg0`, missing final NUL, malformed empty entries). Still no
-  shell. Kept separate from P6c so an ABI/parsing failure can't be confused with
-  a capability failure.
+- **P6c — DONE (capability only):** `stdout_token` is real. New syscalls
+  `SYS_CH_GRANT(handle, to_pid)` / `SYS_CH_ACCEPT(grant_id)` — a one-shot,
+  read-only, `CH_BYTE`-only, `MASTER`-end, target-pid-bound capability transfer.
+  The runner grants the tool's stdout read end to the agent's pid; the agent
+  accepts → read-only handle → reads the **exact** stdout bytes. Proof
+  `sbin/toolrun` + `sbin/echoproof` (deterministic 17-byte stdout): serial
+  `TOOLRUN: PASS … agent_read=17 exact=1 ro=1 dblaccept_deny=1 bogus_deny=1` +
+  `RUNNER: PASS grant=1 ctrl_deny=1 inv_deny=1 norights_deny=1 wrongpid_deny=1
+  enospc=1`. Grants from/to a dead process are swept (no leaked refs). NOT general
+  fd passing.
+- **P6d — NEXT:** argv — `args` as NUL-separated argv bytes, validated (reject
+  empty `arg0`, missing final NUL, malformed empty entries). Still no shell. Kept
+  separate from P6c so an ABI/parsing failure can't be confused with a capability
+  failure.

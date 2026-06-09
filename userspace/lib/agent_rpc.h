@@ -49,12 +49,16 @@ typedef struct tool_result {
     unsigned short version;          /* = AGENT_RPC_VERSION                  */
     unsigned short flags;            /* TOOL_F_*                             */
     int            exit_code;        /* the tool's exit status               */
-    /* stdout byte-channel handle. P6a: 0 (inert). P6b: a RUNNER-LOCAL token --
-     * non-zero but NOT dereferenceable by the agent (no cross-process handle
-     * transfer yet); the runner drained stdout itself. P6c: becomes
-     * agent-readable after a one-shot read-only handle transfer. See
-     * docs/AGENT_RPC_WIRE.md ("stdout_handle semantics"). */
-    unsigned int   stdout_handle;
+    /* Opaque stdout token -- its meaning is checkpoint-defined, NOT a stable
+     * process-local handle. Renamed from stdout_handle so no reader assumes it
+     * is directly usable:
+     *   P6a: 0 (inert -- no tool ran).
+     *   P6b: a RUNNER-LOCAL handle token, non-dereferenceable by the agent
+     *        (the runner drained stdout itself).
+     *   P6c: a one-shot GRANT ID. The agent MUST call SYS_CH_ACCEPT(stdout_token)
+     *        to convert it into a read-only local handle, then read the tool's
+     *        stdout. See docs/AGENT_RPC_WIRE.md ("stdout_token semantics"). */
+    unsigned int   stdout_token;
     unsigned int   reserved;         /* 0                                    */
 } tool_result_t;
 
@@ -106,11 +110,11 @@ static int tool_run_validate(const tool_run_t* t, unsigned payload_len) {
 static int tool_result_encode(tool_result_t* out, int exit_code) {
     if (!out) return AR_E_FIELD;
     ar_zero_(out, sizeof(*out));
-    out->version       = AGENT_RPC_VERSION;
-    out->flags         = TOOL_F_NONE;
-    out->exit_code     = exit_code;
-    out->stdout_handle = 0;
-    out->reserved      = 0;
+    out->version      = AGENT_RPC_VERSION;
+    out->flags        = TOOL_F_NONE;
+    out->exit_code    = exit_code;
+    out->stdout_token = 0;
+    out->reserved     = 0;
     return AR_OK;
 }
 

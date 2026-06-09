@@ -230,6 +230,11 @@ void syscall_init(void) {
         extern int64_t sys_ch_recvmsg(uint64_t,uint64_t,uint64_t,uint64_t,uint64_t,uint64_t);
         syscall_table[SYS_CH_SENDMSG] = sys_ch_sendmsg;
         syscall_table[SYS_CH_RECVMSG] = sys_ch_recvmsg;
+        // P6c: one-shot read-only CH_BYTE capability grant/accept (AGENT-RPC-0 stdout transfer).
+        extern int64_t sys_ch_grant (uint64_t,uint64_t,uint64_t,uint64_t,uint64_t,uint64_t);
+        extern int64_t sys_ch_accept(uint64_t,uint64_t,uint64_t,uint64_t,uint64_t,uint64_t);
+        syscall_table[SYS_CH_GRANT]  = sys_ch_grant;
+        syscall_table[SYS_CH_ACCEPT] = sys_ch_accept;
     }
 
 #if defined(SMP_FOUNDATION) && !defined(SMP_SCHED_DISPATCH)

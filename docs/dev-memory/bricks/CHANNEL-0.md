@@ -67,8 +67,27 @@ checkpoints:
       smoke_proves_claim: true        # synthetic binding/rights selftest (end-to-end output is P3/P4)
       raw_pointers_or_truncation: none
     verdict: pass
+  - id: P3
+    title: sys_write fd1/2 + sys_read fd0 route to the bound channel (routing only, non-blocking)
+    files: [kernel/core/syscall/handlers.c]   # +#include channel.h; route inside the fd1/2 and fd0 blocks
+    tests: [build_test/channel_p1.sh]
+    result: "91 compiled / SUCCESS; P1 + p2 selftests still PASS; desktop reached; 0 panic"
+    design:
+      - routing only: no terminal work, no blocking. sys_write fd1/2 -> channel_write if stdio_chan[fd]
+        bound (CH_R_WRITE), else serial/VGA. sys_read fd0 -> channel_read if bound (CH_R_READ), else ps2.
+      - non-blocking: ring full on write -> partial (bytes accepted); ring empty on read -> 0. No parking.
+      - return semantics: sys_write -> bytes written; sys_read -> >0 bytes / 0 no-data / <0 error (EFAULT/EBADF).
+      - unbound fd (stdio_chan[fd]==0) falls through to the serial/ps2 path byte-for-byte unchanged.
+    review:
+      default_build_changed: false       # unbound path identical; every existing program boots clean
+      all_waits_bounded: true            # non-blocking, no parking (blocking I/O deferred to P3.5/P5)
+      touches_userspace: false
+      preserves_known_good_t410: true
+      smoke_proves_claim: partial        # no-regression proven at boot; the BOUND path is observable at P4 (needs a reader)
+      raw_pointers_or_truncation: none   # bounded 512B read buffer; rights-checked handles; heap_buf freed
+    verdict: pass
 next_checkpoints:
-  - P3: sys_write fd1/2 + sys_read fd0 route to the bound channel (before the serial/ps2 fallback)
+  - P4: terminal holds the master, spawns externals via SYS_SPAWN_EX bound to a channel, drains master -> grid (the visible win)
   - P4: terminal_m3.c ch_create + spawn-bound + drain master into the grid; SYS_WAITPID for $?
 deferred:
   - P5 typed msg_packet_t channels · P6 AGENT-RPC-0 (TOOL_RUN/TOOL_RESULT) · P7 async batch · P8 NIC rings

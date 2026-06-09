@@ -16,6 +16,7 @@
 #include "../../include/acpi.h"    /* ec_battery_read / ec_battery_available */
 #include "../../include/ahci.h"
 #include "../../include/perf.h"
+#include "../../include/channel.h"   /* CHANNEL-0 P3: stdio<->channel routing */
 
 // External serial driver functions
 extern void serial_write(const char* str, size_t len);
@@ -626,6 +627,22 @@ int64_t sys_read(uint64_t fd, uint64_t buf, uint64_t count,
 
     // Handle stdin specially (fd 0)
     if (fd == 0) {
+        // CHANNEL-0 P3: if stdin is bound to a stdio channel, read from it
+        // (non-blocking) instead of the PS/2 keyboard. Unbound -> ps2 path below.
+        {
+            process_t* _cp = process_get_current();
+            if (_cp && _cp->stdio_chan[0]) {
+                int _ce;
+                channel_t* _cch = process_get_handle(_cp, _cp->stdio_chan[0], &_ce, CH_R_READ);
+                if (!_cch) return EBADF;
+                char _cb[512];
+                uint32_t _want = (count < sizeof(_cb)) ? (uint32_t)count : (uint32_t)sizeof(_cb);
+                int _n = channel_read(_cch, _ce, (uint8_t*)_cb, _want);
+                if (_n <= 0) return 0;   /* non-blocking: no data available yet */
+                if (copy_to_user((void*)buf, _cb, _n) != COPY_SUCCESS) return EFAULT;
+                return _n;
+            }
+        }
         // Read from PS/2 keyboard
         char c = ps2_getchar();
         if (c == 0) {
@@ -730,6 +747,20 @@ int64_t sys_write(uint64_t fd, uint64_t buf, uint64_t count,
 
     // Handle stdout/stderr specially (fd 1, 2)
     if (fd == 1 || fd == 2) {
+        // CHANNEL-0 P3: if this fd is bound to a stdio channel, the bytes go into
+        // the channel (non-blocking) instead of serial/VGA. Unbound
+        // (stdio_chan[fd]==0) falls through to the serial path below, unchanged.
+        {
+            process_t* _cp = process_get_current();
+            if (_cp && _cp->stdio_chan[fd]) {
+                int _ce;
+                channel_t* _cch = process_get_handle(_cp, _cp->stdio_chan[fd], &_ce, CH_R_WRITE);
+                int64_t _r = _cch ? (int64_t)channel_write(_cch, _ce, (const uint8_t*)kernel_buf, (uint32_t)count)
+                                  : (int64_t)EBADF;   /* bytes written (partial if ring full), or error */
+                if (heap_buf) kfree(kernel_buf);
+                return _r;
+            }
+        }
         // Write to serial console
         serial_write(kernel_buf, (size_t)count);
 

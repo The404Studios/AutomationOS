@@ -8,12 +8,14 @@
 - **goal:** one kernel primitive (handle → shared rings) = our StdIO model + the structured-tool rail.
 - **build order:** P0 handle table · P1 ring + `ch_*` syscalls + self-test · P2 spawn binds child
   stdio · P3 sys_write/read route fd0/1/2 · P4 terminal holds master, externals' output in the grid.
-- **status:** **P0/P1/P2 landed.** P0/P1 (`41a1c0a`): primitive + 5 syscalls + `[CHAN] selftest PASS`.
-  P2: **`SYS_SPAWN_EX` (101)** binds a child's fd0/1/2 to channels — additive (`SYS_SPAWN` untouched),
-  child gets the **slave end with narrowed rights** (stdin READ, stdout/stderr WRITE), master never
-  leaked, refs transfer on success / freed on failure; `[CHAN] p2 selftest PASS`.
-  **Next: P3** — `sys_write` fd1/2 (`handlers.c:731`) + `sys_read` fd0 (`:628`) route to the bound
-  channel (`stdio_chan[fd]`) before the serial/ps2 fallback (unbound = unchanged).
+- **status:** **P0/P1/P2/P3 landed.** P0/P1 (`41a1c0a`): primitive + 5 syscalls. P2 (`2d745b9`):
+  **`SYS_SPAWN_EX` (101)** binds a child's fd0/1/2 to channels (slave end, narrowed rights, additive).
+  P3: **`sys_write` fd1/2 + `sys_read` fd0 route to the bound channel** (`stdio_chan[fd]`) before the
+  serial/ps2 fallback — **non-blocking** (full→partial, empty→0), rights-checked, return = bytes
+  (sys_write) / >0|0|<0 (sys_read); unbound = unchanged (every existing program still boots clean).
+  **Next: P4 (the visible win)** — the terminal holds the master, spawns externals via `SYS_SPAWN_EX`
+  bound to a channel, and drains the master into the grid → `sed`/`cc`/`make` output appears in the
+  terminal instead of vanishing to serial. P4 is userspace (terminal_m3.c + a userspace ch_* wrapper).
 
 ## Parked / adjacent
 - `brick/usb-ehci-0` — EHCI driver, **E1/E2 landed** (routing ledger); E3 (routing decision) next.

@@ -14,7 +14,15 @@
   NO's:** no networking, no model inference, no async batching, no complex tool registry.
 - **acceptance:** `AGENTHOST: PASS path_ok=1 argv_ok=1 stdout_exact=1 exit=0` (runs `echoargs` with an
   argv vector, reads exact stdout via the P6c capability) + `malformed_rejected=1`; desktop 0 panic.
-- **status:** STARTING.
+- **status:** **LANDED (`98bd950`).** `sbin/agenthost` self-spawns a clean runner; one host loop drives a
+  VALID call (`TOOL_RUN{sbin/echoargs, ["hello world","a;b|c"]}` → spawn via `SYS_SPAWN_EX_ARGV` + grant
+  → accept token → read the **exact 32-byte stdout** → decide) and a MALFORMED call (clobbered final NUL
+  → `argv_validate` fails → runner replies `TOOL_F_ERR`, no spawn). Serial `AGENTHOST: PASS path_ok=1
+  argv_ok=1 stdout_exact=1 exit=0 malformed_rejected=1`. Only schema add = `TOOL_F_ERR`; no kernel change;
+  whole rail still green; `ahcheck.png` clean, 0 panic. **The first AI-OS milestone is real.** record:
+  `docs/dev-memory/bricks/AGENT-HOST-0.md`. NOT pushed (new brick, awaiting review). **Next (user's
+  call):** a real tool set + structured `TOOL_RESULT` fields · an external-model host (llama.cpp/GGUF)
+  driving this rail · or P7/P8 (async batch / NIC channels).
 
 ## AGENT-RPC-0 — FROZEN / COMPLETE (P6a–P6d, pushed to origin `9460446`) — the typed-tool rail
 - **branch:** `brick/agent-rpc-0` (off the published `brick/terminal-0` HEAD `47a2bc0`) · **spec (P5/P6):**

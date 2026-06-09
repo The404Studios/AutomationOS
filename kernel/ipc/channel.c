@@ -234,6 +234,46 @@ int64_t sys_ch_close(uint64_t handle, uint64_t a2, uint64_t a3, uint64_t a4, uin
     return 0;
 }
 
+/* ---- P5b: explicit CH_MSG packet syscalls (byte channels untouched) ---- */
+int64_t sys_ch_sendmsg(uint64_t handle, uint64_t uhdr, uint64_t upayload, uint64_t a4, uint64_t a5, uint64_t a6) {
+    (void)a4; (void)a5; (void)a6;
+    process_t* cur = process_get_current();
+    int end;
+    channel_t* ch = process_get_handle(cur, (int)handle, &end, CH_R_WRITE);
+    if (!ch) return EBADF;
+    msg_packet_t hdr;
+    if (copy_from_user(&hdr, (const void*)uhdr, sizeof(hdr)) != COPY_SUCCESS) return EFAULT;
+    if (hdr.len > CH_MAX_IO) return EMSGSIZE;            /* syscall-level message cap */
+    uint8_t* kbuf = (uint8_t*)0;
+    if (hdr.len) {
+        if (!upayload) return EINVAL;
+        kbuf = (uint8_t*)kmalloc(hdr.len);
+        if (!kbuf) return ENOMEM;
+        if (copy_from_user(kbuf, (const void*)upayload, hdr.len) != COPY_SUCCESS) { kfree(kbuf); return EFAULT; }
+    }
+    int r = channel_write_msg(ch, end, &hdr, kbuf);     /* atomic; EMSGSIZE/EAGAIN/total */
+    if (kbuf) kfree(kbuf);
+    return r;
+}
+int64_t sys_ch_recvmsg(uint64_t handle, uint64_t uhdr, uint64_t upayload, uint64_t payload_cap, uint64_t a5, uint64_t a6) {
+    (void)a5; (void)a6;
+    process_t* cur = process_get_current();
+    int end;
+    channel_t* ch = process_get_handle(cur, (int)handle, &end, CH_R_READ);
+    if (!ch) return EBADF;
+    uint32_t cap = (uint32_t)payload_cap;
+    if (cap > CH_MAX_IO) cap = CH_MAX_IO;
+    uint8_t* kbuf = (uint8_t*)0;
+    if (cap) { kbuf = (uint8_t*)kmalloc(cap); if (!kbuf) return ENOMEM; }
+    msg_packet_t hdr;
+    int r = channel_read_msg(ch, end, &hdr, kbuf, cap);  /* one packet; EAGAIN/EMSGSIZE/len */
+    if (r < 0) { if (kbuf) kfree(kbuf); return r; }      /* nothing consumed on error */
+    if (copy_to_user((void*)uhdr, &hdr, sizeof(hdr)) != COPY_SUCCESS) { if (kbuf) kfree(kbuf); return EFAULT; }
+    if (r > 0 && copy_to_user((void*)upayload, kbuf, (uint32_t)r) != COPY_SUCCESS) { if (kbuf) kfree(kbuf); return EFAULT; }
+    if (kbuf) kfree(kbuf);
+    return r;                                            /* payload bytes delivered */
+}
+
 /* ---- boot self-test (P1): prove the ring + both ends end-to-end ---- */
 void channel_selftest(void) {
     channel_t* ch = channel_alloc(CH_BYTE, CH_PAGE);

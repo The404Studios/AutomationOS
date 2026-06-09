@@ -8,12 +8,14 @@
 #define USERSPACE_CHANNEL_H
 
 /* syscall numbers (must match kernel/include/syscall.h) */
-#define SYS_CH_CREATE  96
-#define SYS_CH_WRITE   97
-#define SYS_CH_READ    98
-#define SYS_CH_WAIT    99
-#define SYS_CH_CLOSE  100
-#define SYS_SPAWN_EX  101
+#define SYS_CH_CREATE   96
+#define SYS_CH_WRITE    97
+#define SYS_CH_READ     98
+#define SYS_CH_WAIT     99
+#define SYS_CH_CLOSE   100
+#define SYS_SPAWN_EX   101
+#define SYS_CH_SENDMSG 102
+#define SYS_CH_RECVMSG 103
 
 /* ch_create flags */
 #define CH_BYTE       0x0001u
@@ -66,5 +68,31 @@ static inline int ch_close(int h) {
 static inline long spawn_ex(const char *path, const char *args, int stdin_h, int stdout_h, int stderr_h) {
     return _ch_sc(SYS_SPAWN_EX, (long)path, (long)args, (long)stdin_h, (long)stdout_h, (long)stderr_h, 0);
 }
+
+/* ---- CHANNEL-0 P5b: typed message packets (CH_MSG channels) ----
+ * Mirrors kernel/include/channel.h msg_packet_t exactly (16-byte header, no
+ * padding). Byte channels keep using ch_write/ch_read (stream semantics). */
+typedef struct ch_msg_hdr {
+    unsigned short type;        /* message type (P6 assigns TOOL_RUN, ...) */
+    unsigned short flags;
+    unsigned int   len;         /* payload length in bytes                 */
+    unsigned long  request_id;  /* correlate request <-> response          */
+} ch_msg_hdr;
+/* Send one packet. hdr->len payload bytes are taken from `payload`. Returns the
+ * total framed bytes (>0), or <0: EMSGSIZE (-90) too big, EAGAIN (-11) ring
+ * full, EINVAL (-22) misuse, EBADF (-9) bad handle/rights. */
+static inline int ch_sendmsg(int h, const ch_msg_hdr *hdr, const void *payload) {
+    return (int)_ch_sc(SYS_CH_SENDMSG, (long)h, (long)hdr, (long)payload, 0, 0, 0);
+}
+/* Receive one whole packet: fills *hdr and up to cap payload bytes. Returns the
+ * payload length (>=0; 0 = empty-payload packet), or <0: EAGAIN (-11) no
+ * message queued, EMSGSIZE (-90) cap too small (message left intact). */
+static inline int ch_recvmsg(int h, ch_msg_hdr *hdr, void *payload, unsigned int cap) {
+    return (int)_ch_sc(SYS_CH_RECVMSG, (long)h, (long)hdr, (long)payload, (long)cap, 0, 0);
+}
+
+/* common kernel errno values userspace checks (negative, Linux ABI) */
+#define CH_EAGAIN    (-11)
+#define CH_EMSGSIZE  (-90)
 
 #endif /* USERSPACE_CHANNEL_H */

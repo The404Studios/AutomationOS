@@ -110,6 +110,8 @@
 #define SYS_CH_WAIT     99  // CHANNEL-0: poll readiness (CH_READABLE/WRITABLE/CLOSED)
 #define SYS_CH_CLOSE   100  // CHANNEL-0: close/release a channel handle
 #define SYS_SPAWN_EX   101  // CHANNEL-0 P2: spawn with fd0/1/2 bound to channel handles
+#define SYS_CH_SENDMSG 102  // CHANNEL-0 P5b: send one framed packet on a CH_MSG channel
+#define SYS_CH_RECVMSG 103  // CHANNEL-0 P5b: receive one framed packet from a CH_MSG channel
 #define SYS_VMA_TEST    200 // VMA red-black tree testing and benchmarking
 
 // ---- SMP coprocessor offload (GATED: only registered under SMP_FOUNDATION) ----

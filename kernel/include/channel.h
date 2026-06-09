@@ -117,5 +117,10 @@ int64_t sys_ch_wait  (uint64_t handle, uint64_t events, uint64_t timeout_ms, uin
 int64_t sys_ch_close (uint64_t handle, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6);
 /* P2: additive spawn that binds the child's fd0/fd1/fd2 to channel handles. */
 int64_t sys_spawn_ex (uint64_t path, uint64_t args, uint64_t stdin_h, uint64_t stdout_h, uint64_t stderr_h, uint64_t a6);
+/* P5b: explicit packet syscalls for CH_MSG channels (byte channels keep using
+ * sys_ch_write/read -- stream semantics stay pure). sendmsg(handle, user hdr,
+ * user payload); recvmsg(handle, user hdr-out, user payload-out, payload_cap). */
+int64_t sys_ch_sendmsg(uint64_t handle, uint64_t hdr, uint64_t payload, uint64_t a4, uint64_t a5, uint64_t a6);
+int64_t sys_ch_recvmsg(uint64_t handle, uint64_t hdr, uint64_t payload, uint64_t payload_cap, uint64_t a5, uint64_t a6);
 
 #endif /* CHANNEL_H */

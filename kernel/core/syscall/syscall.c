@@ -225,6 +225,11 @@ void syscall_init(void) {
         // P5: typed CH_MSG message framing (substrate only; no syscall/agent yet).
         extern void channel_selftest_p5(void);
         channel_selftest_p5();
+        // P5b: explicit CH_MSG packet syscalls (byte channels keep stream semantics).
+        extern int64_t sys_ch_sendmsg(uint64_t,uint64_t,uint64_t,uint64_t,uint64_t,uint64_t);
+        extern int64_t sys_ch_recvmsg(uint64_t,uint64_t,uint64_t,uint64_t,uint64_t,uint64_t);
+        syscall_table[SYS_CH_SENDMSG] = sys_ch_sendmsg;
+        syscall_table[SYS_CH_RECVMSG] = sys_ch_recvmsg;
     }
 
 #if defined(SMP_FOUNDATION) && !defined(SMP_SCHED_DISPATCH)

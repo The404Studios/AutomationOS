@@ -206,6 +206,12 @@ void _start(void) {
     print("[INIT] Spawning argvtest...\n");
     spawn_args("sbin/argvtest", "hello world");
 
+    // CHANNEL-0 P5b: userspace CH_MSG send/recv round-trip. The parent creates a
+    // CH_MSG channel, proves EAGAIN+EMSGSIZE, self-spawns a bound child, and
+    // exchanges a framed packet both ways. Prints MSGTEST: PASS to serial.
+    print("[INIT] Spawning msgtest...\n");
+    spawn("sbin/msgtest");
+
     // ring-3 float/SSE probe: proves SSE is enabled + context-switched for user
     // tasks (scalar float, a 2x2 float matmul, a reduction). Prints FLOATTEST: PASS.
     print("[INIT] Spawning floattest...\n");

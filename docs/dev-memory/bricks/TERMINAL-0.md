@@ -40,6 +40,30 @@ checkpoints:
       smoke_proves_claim: true          # screenshot = the human-visible proof (prompt after output)
       raw_pointers_or_truncation: none
     verdict: pass
+  - id: T1
+    title: scrollback ring -- viewport over recent lines (one append path)
+    files: [userspace/apps/terminal/terminal_m3.c]
+    tests: [build_test/shot.sh]
+    result: "build_all clean; SCREENSHOT (screenshots/t1demo.png) shows a scrolled-back viewport of LINE rows the old 25-row discard grid would have lost = scrollback holds; no-regression desktop"
+    design:
+      - ONE buffer: sb[256][80] ring; the visible grid is a VIEWPORT (sb_view..sb_view+g_rows).
+        cur_row is gone -> sb_head (monotonic logical line) + cur_col + sb_view + sb_follow.
+      - ONE append path: grid_putchar -> sb[sb_head%256][cur_col]; \n/wrap advance sb_head + clear
+        the new line; grid_scroll_up removed (the ring + view scroll). Builtins, child channel
+        output, and the prompt all go through grid_putchar (no separate grid mutation paths).
+      - sb_follow=1 pins the view to the bottom (new output auto-scrolls); PageUp clears follow and
+        scrolls back (clamped to oldest = sb_head-255), PageDown scrolls forward and re-follows at
+        the bottom. render() draws the viewport + the cursor only while following + a thin right-edge
+        bar when scrolled. resize re-pins the view if following.
+    review:
+      default_build_changed: false      # terminal-only; builtins/prompt/output identical at the bottom
+      all_waits_bounded: true           # no new loops in the hot path; render bounded by g_rows
+      touches_userspace: true           # terminal-only, as scoped
+      touches_kernel: false
+      preserves_known_good_t410: true
+      smoke_proves_claim: true          # screenshot shows old lines preserved + a scrolled viewport
+      raw_pointers_or_truncation: none  # ring indices via sb_slot (logical % 256); view clamped each render
+    verdict: pass
 next_checkpoints:
-  - T1 scrollback ring | T2 line-editing cleanup | T3 minimal ANSI/VT (SGR color first) | T4 delete dead terminal code
+  - T2 line-editing cleanup | T3 minimal ANSI/VT (SGR color first) | T4 delete dead terminal code
 ```

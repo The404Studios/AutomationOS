@@ -11,10 +11,13 @@
   T1 scrollback ring · T2 line-editing cleanup (cursor_pos + Left/Right/Home/End/Del, kill `[TERM] key`
   spam) · T3 minimal ANSI/VT (SGR color first — `grid_color[][]` substrate exists) · T4 delete ~3000
   lines dead terminal code. ALL userspace (`terminal_m3.c`); does NOT touch the kernel primitive.
-- **status:** **T0 LANDED** — defer the prompt for a bound child + waitpid-lite (`SYS_WAITPID`
-  WNOHANG=1, non-blocking); the prompt now prints AFTER the child's output. SCREENSHOT-verified
-  (`screenshots/t0demo.png`: `/bin/free` output THEN the `root@` prompt); build_all clean; desktop.
-  record: `docs/dev-memory/bricks/TERMINAL-0.md`. **Next: T1** (scrollback ring).
+- **status:** **T0 + T1 LANDED.** T0 (`3eac1bb`): defer the prompt for a bound child + waitpid-lite
+  (`SYS_WAITPID` WNOHANG=1, non-blocking) → prompt prints AFTER the output. T1: **scrollback ring**
+  (256-line `sb[][]` ring; `cur_row` → `sb_head`/`sb_view`/`sb_follow` viewport; `grid_putchar` is the
+  ONE append path; PageUp/PageDown scroll, PageDown re-follows). SCREENSHOT-verified (`t0demo.png`,
+  `t1demo.png` — a scrolled-back viewport holds lines the old discard grid lost); build_all clean;
+  desktop. record: `docs/dev-memory/bricks/TERMINAL-0.md`. **Next: T2** (line-editing cleanup:
+  `cursor_pos` + Left/Right/Home/End/Del; kill the per-keystroke `[TERM] key` serial spam).
 
 ## CHANNEL-0 — FROZEN / COMPLETE (P0–P4, pushed to origin)
 - **branch:** `brick/channel-0` (PUSHED, commit `1dd5107`) · **spec:** `docs/superpowers/specs/2026-06-08-channel-0-design.md`

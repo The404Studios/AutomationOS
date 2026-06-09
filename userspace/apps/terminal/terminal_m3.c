@@ -335,14 +335,29 @@ static int g_last_status;   /* 0 == success, non-zero == failure */
  * it even though both live above run_block's definition. */
 static void run_block(const char *text);
 
-/* Character grid: spaces are treated as blank cells. */
-static char grid[MAX_ROWS][MAX_COLS];
-static u32  grid_color[MAX_ROWS][MAX_COLS];   /* per-cell foreground color */
+/* TERMINAL-0 T1 scrollback ring. The terminal keeps ONE buffer of recent lines;
+ * the visible grid is just a VIEWPORT over it. All output -- builtins, child
+ * channel bytes, the prompt -- goes through the single append path grid_putchar
+ * (no separate mutation paths). sb_head is the monotonic logical index of the
+ * line being written (ring slot = sb_head % SB_LINES); cur_col is the column on
+ * it. sb_view is the logical index of the top visible row; sb_follow==1 pins the
+ * view to the bottom (new output auto-scrolls) and is cleared while paged up. */
+#define SB_LINES 256
+static char sb[SB_LINES][MAX_COLS];
+static u32  sb_color[SB_LINES][MAX_COLS];     /* per-cell foreground color */
 static u32  g_cur_color;     /* color used by the next grid_putchar     */
-static int  g_cols;          /* derived from the granted window width  */
-static int  g_rows;          /* derived from the granted window height */
-static int  cur_row;
-static int  cur_col;
+static int  g_cols;          /* visible columns (from the window width) */
+static int  g_rows;          /* visible rows    (from the window height)*/
+static long sb_head;         /* logical index of the line being written */
+static int  cur_col;         /* column on the head line                 */
+static long sb_view;         /* logical index of the top visible row    */
+static int  sb_follow = 1;   /* 1 = view pinned to the bottom (live)    */
+#ifndef KEY_PAGEUP
+#define KEY_PAGEUP   104
+#endif
+#ifndef KEY_PAGEDOWN
+#define KEY_PAGEDOWN 109
+#endif
 
 /* Color constants for prompt and highlights. */
 #define CLR_DEFAULT   FG_COLOR
@@ -352,68 +367,54 @@ static int  cur_col;
 #define CLR_BANNER    0xFF80B0E0u   /* softer blue -- banner     */
 #define CLR_BANNERHI  0xFFE0A050u   /* warm amber -- banner highlight */
 
+static int  sb_slot(long logical) { return (int)(logical % SB_LINES); }
+static void sb_clear_line(long logical) {
+    int s = sb_slot(logical);
+    for (int c = 0; c < MAX_COLS; c++) { sb[s][c] = ' '; sb_color[s][c] = CLR_DEFAULT; }
+}
+
 static void grid_clear(void) {
-    for (int r = 0; r < MAX_ROWS; r++)
-        for (int c = 0; c < MAX_COLS; c++) {
-            grid[r][c] = ' ';
-            grid_color[r][c] = CLR_DEFAULT;
-        }
-    cur_row = 0;
-    cur_col = 0;
-    g_cur_color = CLR_DEFAULT;
+    sb_head = 0; cur_col = 0; sb_view = 0; sb_follow = 1; g_cur_color = CLR_DEFAULT;
+    sb_clear_line(0);
 }
 
-/* Scroll the grid up one line; clear the freed bottom line. */
-static void grid_scroll_up(void) {
-    for (int r = 1; r < g_rows; r++)
-        for (int c = 0; c < g_cols; c++) {
-            grid[r - 1][c] = grid[r][c];
-            grid_color[r - 1][c] = grid_color[r][c];
-        }
-    for (int c = 0; c < g_cols; c++) {
-        grid[g_rows - 1][c] = ' ';
-        grid_color[g_rows - 1][c] = CLR_DEFAULT;
-    }
-}
-
-/* Move cursor to start of next row, scrolling if needed. */
+/* Finalize the current line and start a fresh one below it. The ring + the view
+ * provide scrolling: old lines stay in the ring (scroll-back), and when the view
+ * is following the bottom it advances with the head so new output auto-scrolls. */
 static void grid_newline(void) {
+    sb_head++;
+    sb_clear_line(sb_head);
     cur_col = 0;
-    cur_row++;
-    if (cur_row >= g_rows) {
-        grid_scroll_up();
-        cur_row = g_rows - 1;
+    if (sb_follow) {
+        sb_view = sb_head - (g_rows - 1);
+        if (sb_view < 0) sb_view = 0;
     }
 }
 
-/* Write one printable char at the cursor, advancing with wrap + scroll. */
+/* The single output path: append one char at the head line / cursor, wrapping to
+ * a new line at the right edge. \n and \t handled; redirection capture preserved. */
 static void grid_putchar(char ch) {
-    /* When capturing for redirection, append to g_cap instead of drawing.
-     * Bounded: silently drop once the buffer is full. */
     if (g_cap_on) {
-        if (g_cap_len < CAP_MAX) g_cap[g_cap_len++] = ch;
+        if (g_cap_len < CAP_MAX) g_cap[g_cap_len++] = ch;   /* bounded; drop when full */
         return;
     }
     if (ch == '\n') { grid_newline(); return; }
     if (ch == '\t') { do { grid_putchar(' '); } while (cur_col % 4 != 0); return; }
     if (cur_col >= g_cols) grid_newline();
-    grid[cur_row][cur_col] = ch;
-    grid_color[cur_row][cur_col] = g_cur_color;
+    int s = sb_slot(sb_head);
+    sb[s][cur_col] = ch;
+    sb_color[s][cur_col] = g_cur_color;
     cur_col++;
     if (cur_col >= g_cols) grid_newline();
 }
 
-/* Erase the character left of the cursor (does not cross row boundaries). */
+/* Erase the character left of the cursor on the current (head) line. */
 static void grid_backspace(void) {
     if (cur_col > 0) {
         cur_col--;
-        grid[cur_row][cur_col] = ' ';
-        grid_color[cur_row][cur_col] = CLR_DEFAULT;
-    } else if (cur_row > 0) {
-        cur_row--;
-        cur_col = g_cols - 1;
-        grid[cur_row][cur_col] = ' ';
-        grid_color[cur_row][cur_col] = CLR_DEFAULT;
+        int s = sb_slot(sb_head);
+        sb[s][cur_col] = ' ';
+        sb_color[s][cur_col] = CLR_DEFAULT;
     }
 }
 
@@ -491,18 +492,36 @@ static void render(wl_window *win, u32 stride_px) {
     fill_rect(win->pixels, win->w, win->h, stride_px,
               0, 0, (i32)win->w, (i32)win->h, BG_COLOR);
 
+    /* clamp the viewport into the valid scroll-back range */
+    long oldest = sb_head - (SB_LINES - 1); if (oldest < 0) oldest = 0;
+    long bottom = sb_head - (g_rows - 1);   if (bottom < 0) bottom = 0;
+    if (sb_view < oldest) sb_view = oldest;
+    if (sb_view > bottom) sb_view = bottom;
+
     for (int r = 0; r < g_rows; r++) {
+        long logical = sb_view + (long)r;
+        if (logical < oldest || logical > sb_head) continue;   /* blank line */
+        int s = sb_slot(logical);
         for (int c = 0; c < g_cols; c++) {
-            char ch = grid[r][c];
+            char ch = sb[s][c];
             if (ch == ' ' || ch == 0) continue;
             font_draw_char(win->pixels, (int)stride_px,
                            (int)win->w, (int)win->h,
-                           c * FONT_W, r * FONT_H, ch, grid_color[r][c]);
+                           c * FONT_W, r * FONT_H, ch, sb_color[s][c]);
         }
     }
 
-    fill_rect(win->pixels, win->w, win->h, stride_px,
-              cur_col * FONT_W, cur_row * FONT_H, FONT_W, FONT_H, CURSOR_COLOR);
+    /* cursor block: only while following (the live bottom line is on screen) */
+    if (sb_follow) {
+        int crow = (int)(sb_head - sb_view);
+        if (crow >= 0 && crow < g_rows)
+            fill_rect(win->pixels, win->w, win->h, stride_px,
+                      cur_col * FONT_W, crow * FONT_H, FONT_W, FONT_H, CURSOR_COLOR);
+    } else {
+        /* thin right-edge bar = "you're scrolled up, viewing history" */
+        fill_rect(win->pixels, win->w, win->h, stride_px,
+                  (i32)win->w - 3, 0, 3, (i32)win->h, 0xFF404858u);
+    }
 
     wl_commit(win);
 }
@@ -3394,7 +3413,8 @@ void _start(void) {
                 if (g_rows < 1) g_rows = 1;
                 stride_px = win->stride / 4u;
                 if (cur_col >= g_cols) cur_col = g_cols - 1;
-                if (cur_row >= g_rows) cur_row = g_rows - 1;
+                /* T1: re-pin the viewport to the bottom on resize if following. */
+                if (sb_follow) { sb_view = sb_head - (g_rows - 1); if (sb_view < 0) sb_view = 0; }
                 dirty = 1;
                 continue;
             }
@@ -3412,6 +3432,24 @@ void _start(void) {
                 continue;
             }
             if (!pressed) continue;               /* key-DOWN only          */
+
+            /* TERMINAL-0 T1: PageUp/PageDown scroll the viewport over the
+             * scrollback ring. PageDown back to the bottom re-enables following. */
+            if (keycode == KEY_PAGEUP) {
+                long oldest = sb_head - (SB_LINES - 1); if (oldest < 0) oldest = 0;
+                sb_view -= (g_rows > 1 ? g_rows - 1 : 1);
+                if (sb_view < oldest) sb_view = oldest;
+                sb_follow = 0;
+                dirty = 1;
+                continue;
+            }
+            if (keycode == KEY_PAGEDOWN) {
+                long bottom = sb_head - (g_rows - 1); if (bottom < 0) bottom = 0;
+                sb_view += (g_rows > 1 ? g_rows - 1 : 1);
+                if (sb_view >= bottom) { sb_view = bottom; sb_follow = 1; }
+                dirty = 1;
+                continue;
+            }
 
             /* Ctrl+C: cancel the current input line and show a fresh prompt. */
             if (ctrl_down && keycode == KEY_C) {

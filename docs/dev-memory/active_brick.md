@@ -19,7 +19,19 @@
 - **after this (user-set order):** net-stack Phase 1 → E1000-PCH-0 → TOOL-AUTH-0 / TOOL-RESULT-0 →
   real llama.cpp model bridge. Native Wi-Fi stays PARKED (travel-router client-bridge + hardened
   wired NIC is the route).
-- **status:** OPEN.
+- **status:** **LANDED (fix `8a0aafc` + feat `f597d3b`, committed local, awaiting review/push).**
+  `BROWSER2-IMG: PASS png=1 gif=1 bmp=1 missing_safe=1 bounded=1` + `imgcheck7.png` (all five cases
+  visible). LB_IMAGE = atomic inline box via a dims-provider seam (`layout_set_img_dims_provider`);
+  clamped box + clipped blit = the bounded guarantee; bordered placeholder on failure. TWO BUGS
+  SURFACED EN ROUTE: **(1) FIXED — the c70ee87 malloc tcache regression** (free=1 before caching →
+  the arena walker double-allocated tcache-parked blocks → heap corruption in every malloc-heavy
+  app; browser2 had been CRASHING at boot since June 8 and HTMLTEST/CSSTEST/WEBTEST FAILing,
+  masked because smokes grep only rail markers; three-state flag fix resurrected the whole browser
+  pipeline; likely also DESKTOP-PROJECT-REGRESSION-0's stray window). **(2) OPEN — INITRD-ALIAS-0**
+  (initrd-backed VFS reads return exact counts but ALL-ZERO data inside mmap-heavy processes;
+  proven not-the-bytes / not-the-destination via a same-4KiB-page working/broken file pair; needs
+  its own kernel brick) — so about:imgtest sources EMBEDDED generated fixtures (`fixture:` scheme);
+  the file/network loaders are in place for real pages. record: `bricks/BROWSER2-IMG-0.md`.
 
 ## MODEL-BRIDGE-0 — FROZEN / COMPLETE (pushed to origin `ceeb886`) — the seam fed by an external model transport
 - **branch:** `brick/model-bridge-0` (off the frozen `brick/chainlayer-host-0` HEAD `7553849`) · **record:**

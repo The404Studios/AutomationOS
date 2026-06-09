@@ -53,9 +53,17 @@
   `p6cfinal.png` clean, 0 panic. **P6c PUSHED** (`47ee247`, ls-remote verified) and **FROZEN as the
   capability/security checkpoint** — the grant/accept primitive (CH_BYTE-only, READ-only, MASTER-end,
   to_pid-bound, one-shot, bounded, death-swept) is locked; nothing downstream should loosen it.
-  **Next: P6d** — argv as NUL-separated bytes, bounded + validated, NO shell, NO PATH lookup, path stays
-  explicit. Law: **argv is a vector, not a command line.** Separate ABI/parsing brick (kept off the
-  capability brick so a parsing failure can't be confused with a capability failure).
+  **P6d (`dd0213d`): argv as a VECTOR.** Dedicated **`SYS_SPAWN_EX_ARGV(path, argv_buf, argv_len, …)`**
+  (NOT an a6 overload — the vector ABI is loud in the table). `path`=argv[0]; `argv_buf`=NUL-separated
+  `argv[1..]` ONLY; `exec.c` splits on NUL ONLY → entries **intact** (no whitespace split, no shell, no
+  PATH). `SYS_SPAWN`/`SYS_SPAWN_EX` byte-for-byte unchanged; staged vector cleared post-spawn.
+  `argv_validate` matrix (path-only / cap / final-NUL / empty-entry / too-many; metachars literal).
+  Proof: `TOOL_RUN{sbin/echoargs, "hello world\0a;b|c\0"}` → `TOOLRUN: PASS … agent_read=32 exact=1
+  **vector=1** …` (multi-word ONE arg, `;|` literal, read via the P6c capability) + `RPCTEST … argv(
+  zero=1,ok=1,nonul=1,empty=1,many=1,cap=1)`. `p6dfinal.png` clean, 0 panic. **AGENT-RPC-0 core arc
+  COMPLETE: schema (P6a) → runner (P6b) → capability (P6c) → argv (P6d).** P6d committed local, awaiting
+  review/push. **Next (user's call):** P7 async batch · P8 NIC channels · or the typed agent runtime /
+  chainlayer2 host integration.
 
 ## TERMINAL-0 — FROZEN / COMPLETE (T0–T4, pushed to origin `935f54f`) — CHANNEL-0 console output human-stable
 - **branch:** `brick/terminal-0` (off `brick/channel-0`), **PUSHED** `git push origin brick/terminal-0`

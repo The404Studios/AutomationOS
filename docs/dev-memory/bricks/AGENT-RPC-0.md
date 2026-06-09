@@ -212,8 +212,50 @@ checkpoints:
       smoke_proves_claim: true          # exact=1 + ro=1 + the full reject matrix in serial
       raw_pointers_or_truncation: none  # forced rights/end/type; 1-based id; bounded table; both-side sweep
     verdict: pass
+  - id: P6d
+    title: argv as a VECTOR -- dedicated SYS_SPAWN_EX_ARGV (NUL-separated argv[1..]; no shell/split/PATH)
+    commits: [dd0213d]
+    files:
+      - kernel/include/syscall.h          # SYS_SPAWN_EX_ARGV=106
+      - kernel/include/channel.h          # sys_spawn_ex_argv proto
+      - kernel/ipc/channel.c              # sys_spawn_ex_argv + shared stdio-staging helpers (stage_/clear_spawn_stdio)
+      - kernel/core/syscall/syscall.c     # register 106
+      - kernel/fs/exec.c                  # g_exec_spawn_argv[] vector + NUL-split argv[1..] build (else legacy ws-split)
+      - userspace/lib/channel.h           # spawn_ex_argv wrapper
+      - userspace/lib/agent_rpc.h         # argv_validate + tool_run_set_argv + TOOL_ARGV_MAX + AR_E_EMPTYARG
+      - userspace/apps/rpctest/rpctest.c  # argv validation matrix (in-memory)
+      - userspace/apps/echoargs/echoargs.c # NEW: prints its argv one entry per line
+      - userspace/apps/toolrun/toolrun.c  # agent sends an argv vector; runner validates + SYS_SPAWN_EX_ARGV; agent verifies
+      - scripts/build_all.sh / docs/AGENT_RPC_WIRE.md  # stage echoargs; doc the vector ABI + argv rules
+    tests: [build_test/p6c_verify.sh]
+    result: >
+      quick_build+build_all clean (kernel 499720 B); serial 'TOOLRUN: PASS ... agent_read=32 exact=1
+      vector=1 ro=1 dblaccept_deny=1 bogus_deny=1' + 'RPCTEST: PASS ... argv(zero=1,ok=1,nonul=1,empty=1,
+      many=1,cap=1)' -- TOOL_RUN{path=sbin/echoargs, args="hello world\0a;b|c\0"} reaches the tool as
+      argv=[sbin/echoargs,"hello world","a;b|c"] (multi-word arg ONE arg, ";|" literal), read back through
+      the P6c capability. RUNNER + P6c + MSGTEST + [CHAN] still PASS; p6dfinal.png clean, 0 panic.
+    design:
+      - DEDICATED syscall (user's call -- not an a6 overload of SYS_SPAWN_EX): the vector ABI is loud in
+        the table (command-line spawn != argv-vector spawn). path = argv[0] (explicit); args = argv[1..]
+        ONLY (no duplicated path state). exec splits the staged vector on NUL ONLY -> entries intact:
+        no whitespace split, no shell, no PATH lookup. SYS_SPAWN/SYS_SPAWN_EX byte-for-byte unchanged
+        (stdio-staging refactored into a shared helper); the staged vector is always cleared post-spawn
+        so it can't leak into a later command-line spawn.
+      - argv_validate matrix: args_len==0 OK (path-only); >=cap AR_E_FIELD; missing final NUL AR_E_NUL;
+        empty entry AR_E_EMPTYARG; >TOOL_ARGV_MAX AR_E_FIELD; shell metacharacters accepted as literal.
+        Law: argv is a vector, not a command line.
+    review:
+      default_build_changed: false      # SYS_SPAWN/SYS_SPAWN_EX unchanged; all existing apps spawn identically
+      all_waits_bounded: true           # no new loops in the kernel path; exec build bounded by EXEC_MAX_ARGS
+      hardware_init_gated: n/a
+      touches_userspace: true
+      touches_kernel: true              # new vector-spawn syscall + exec argv build (additive)
+      preserves_known_good_t410: true
+      smoke_proves_claim: true          # vector=1 (multi-word+metachar intact) + the full argv reject matrix
+      raw_pointers_or_truncation: none  # argv_len bounded (<=255); copy_from_user; NUL-split bounded; cleared post-spawn
+    verdict: pass
 next_checkpoints:
-  - P6d argv: NUL-separated argv bytes, validated (reject empty arg0 / missing final NUL / malformed empties); still no shell
+  - (AGENT-RPC-0 core complete: schema -> runner -> capability -> argv) P7 async batch | P8 NIC channels | the typed agent runtime / chainlayer2 host integration
 deferred:
   - P7 async submission/completion batch · P8 NIC RX/TX as channels
 ```

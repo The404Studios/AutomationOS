@@ -2,7 +2,32 @@
 
 > Warm memory. Refresh per checkpoint. One active brick at a time.
 
-## BROWSER2-IMG-0 (ACTIVE) — `<img>` rendering in browser2 from code already in-tree
+## INITRD-ALIAS-0 (ACTIVE) — kill the kernel file-read alias bug before building on it
+- **branch:** `brick/initrd-alias-0` (off the frozen `brick/browser2-img-0` HEAD) · **record:**
+  `bricks/INITRD-ALIAS-0.md` (to write)
+- **why (user's call, ahead of net Phase 1):** kernel CORRECTNESS bug — "initrd file content is
+  untrustworthy inside mmap-heavy processes" poisons every higher-level browser/network/tool test
+  that reads initrd files. More fundamental than TCP queue depth or browser polish.
+- **the pinned failure:** VFS reads of initrd-backed (zero-copy) files return the EXACT byte count
+  but ALL-ZERO data when the reader is mmap-heavy (browser2: wl SHM + JS arenas). Same-4KiB-page
+  discriminator: tool_read reads toolset0.txt fine from the SAME initrd page that browser2 reads as
+  zeros; destination irrelevant (stack-bounce + pre-touch both still zero) → per-process
+  address-space aliasing over the kernel/identity initrd mapping (family of the fixed
+  higher-half/identity PD alias bug).
+- **scope (user-set, narrow):** prove WHY → fix the address-space aliasing / kernel initrd mapping
+  access → regression test with an mmap-heavy reader + browser2 initrd-backed image. **HARD NO's:**
+  no browser layout, no network, no image decode changes.
+- **constraints:** single-core runtime; T410 (2010 hardware) must stay safe — pure memory-management
+  fix, no new hardware init, default boot preserved.
+- **acceptance:** same initrd file, same byte count, same expected bytes from BOTH a pristine reader
+  (tool_read) and an mmap-heavy reader; browser2 initrd-backed image loads real bytes; no all-zero
+  buffer; desktop 0 panic. Proof: `INITRD-ALIAS: PASS pristine_read=1 mmapheavy_read=1 same_bytes=1
+  browser_file_img=1 zero_bug_gone=1`.
+- **after this (user-set order):** net-stack Phase 1 → E1000-PCH-0; ALSO retest the T410 desktop
+  regression with the malloc fix (prime suspect for the stray color-shifting window).
+- **status:** OPEN (root-cause first: initrd virtual placement vs the user mmap/SHM VA allocator).
+
+## BROWSER2-IMG-0 — FROZEN / COMPLETE (pushed to origin `a5a9267`) — `<img>` rendering in browser2 from code already in-tree
 - **branch:** `brick/browser2-img-0` (off the frozen `brick/model-bridge-0` HEAD) · **record:**
   `bricks/BROWSER2-IMG-0.md` (to write)
 - **why (user's call):** highest visible return for the least architectural risk. The 5-agent audit
@@ -32,6 +57,9 @@
   proven not-the-bytes / not-the-destination via a same-4KiB-page working/broken file pair; needs
   its own kernel brick) — so about:imgtest sources EMBEDDED generated fixtures (`fixture:` scheme);
   the file/network loaders are in place for real pages. record: `bricks/BROWSER2-IMG-0.md`.
+- **user verdict on freeze:** approved — "the fix(malloc) commit belongs in this branch... it was a
+  prerequisite fix that resurrected the browser pipeline." Pushed (`a5a9267`, ls-remote verified).
+  Next = INITRD-ALIAS-0 BEFORE net Phase 1 (kernel correctness first).
 
 ## MODEL-BRIDGE-0 — FROZEN / COMPLETE (pushed to origin `ceeb886`) — the seam fed by an external model transport
 - **branch:** `brick/model-bridge-0` (off the frozen `brick/chainlayer-host-0` HEAD `7553849`) · **record:**

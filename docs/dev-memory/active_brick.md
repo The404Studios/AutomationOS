@@ -4,7 +4,7 @@
 
 ## CHAINLAYER-HOST-0 (ACTIVE) — the OS-side rail meets the chainlayer2 brain
 - **branch:** `brick/chainlayer-host-0` (off the frozen `brick/toolset-0` HEAD `6ff7be0`) · **record:**
-  `bricks/CHAINLAYER-HOST-0.md` (to write)
+  [`bricks/CHAINLAYER-HOST-0.md`](bricks/CHAINLAYER-HOST-0.md)
 - **why:** all the OS-side foundation is done (CHANNEL-0 → TERMINAL-0 → AGENT-RPC-0 → AGENT-HOST-0 →
   TOOLSET-0). The next proof is the full agent step: **a model chooses a tool → host validates → tool
   runs safely → model sees the result → model makes the next decision.**
@@ -19,11 +19,18 @@
   `read_file("/etc/toolset0.txt")` → host validates name+path → `tool_read` runs → host reads the
   `stdout_token` → model answers `TOOLSET-0-FILE`. Proof: `CHAINHOST: PASS selected_tool=read_file
   policy_ok=1 read_exact=1 model_answer_exact=1 rejected_bad_tool=1`; desktop 0 panic.
-- **status:** DESIGN (flagging the stub-model approach for sign-off, then implement).
+- **status:** **LANDED.** `sbin/chainhost`: the seam = `model_select(prompt)`→JSON / `model_answer(obs)`
+  →text (deterministic stubs; the external llama.cpp brain replaces ONLY those two bodies later). Host
+  gate = strict one-shape JSON parse (exact keys, no escapes, no trailing bytes) → TOOLSET-0 whitelist →
+  path policy, all BEFORE dispatch; tool runs via the self-spawn runner; stdout read exactly via the P6c
+  token. Serial `CHAINHOST: PASS selected_tool=read_file policy_ok=1 read_exact=1 model_answer_exact=1
+  rejected_bad_tool=1` FIRST TRY (rejected_bad_tool = unknown tool AND traversal AND shape-violation
+  `'} rm -rf'` all dead at the gate). Whole rail green, kernel unchanged, desktop clean 0 panic.
+  record: `bricks/CHAINLAYER-HOST-0.md`. NOT pushed (awaiting review).
 
 ## TOOLSET-0 — FROZEN / COMPLETE (pushed to origin `6ff7be0`) — safe structured tool surface
 - **branch:** `brick/toolset-0` (off the frozen `brick/agent-host-0` HEAD `19e96c3`) · **record:**
-  `bricks/TOOLSET-0.md` (to write)
+  [`bricks/TOOLSET-0.md`](bricks/TOOLSET-0.md)
 - **why:** before plugging a real model into the rail, harden a tiny tool SURFACE with stable schemas.
   The model should drive safe typed tools, not arbitrary process execution.
 - **scope:** `tool.run` (path+argv, exists) · `tool.echoargs` (proven) · **`tool.read_file`** (bounded
@@ -42,7 +49,7 @@
   read_exact=1 run=1 unknown_rejected=1 malformed_rejected=1 oversize_rejected=1 traversal_rejected=1`
   (fixture `/etc/toolset0.txt`, 15 B). `SYS_READDIR` returns 0=entry (found+fixed). No kernel change;
   whole rail green; `tsfinal.png` clean, 0 panic. Policy = traversal-denial NOT a jail (→ TOOL-AUTH-0);
-  plain-text results (→ TOOL-RESULT-0). record: `bricks/TOOLSET-0.md`. NOT pushed (awaiting review).
+  plain-text results (→ TOOL-RESULT-0). record: `bricks/TOOLSET-0.md`. Pushed (`6ff7be0`).
 - **then:** **CHAINLAYER-HOST-0** — a local/API model chooses among these typed tools (the chainlayer2
   host agent). Later: TOOL-AUTH-0 (root allowlists / per-tool authority) · TOOL-RESULT-0 (typed results).
 

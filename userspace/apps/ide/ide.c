@@ -2538,7 +2538,7 @@ void _start(void) {
         ide_exit(1);
     }
 
-    wl_window* win = wl_create_window(IDE_W, IDE_H, "ide");
+    wl_window* win = wl_create_window(IDE_W, IDE_H, "Semantic IDE");
     if (!win) {
         ide_exit(1);
     }

@@ -2065,9 +2065,13 @@ static void render_window_static(uint32_t *buf, uint32_t w, uint32_t h, uint32_t
             }
         }
 
-        /* window title text */
+        /* window title text. IDE-REPAIR-0 I0: sanitize a path-like title to its
+         * last component so a stray raw VFS path never shows in a titlebar. */
+        const char *tt = win->title[0] ? win->title : "window", *tb = tt;
+        for (const char *p = tt; *p; p++) if (*p == '/') tb = p + 1;
+        if (!*tb) tb = "window";
         cz_text(buf, (int)stride, (int)w, (int)h,
-                         fx + 8, fy + (TITLEBAR_H - FONT_H) / 2, win->title,
+                         fx + 8, fy + (TITLEBAR_H - FONT_H) / 2, tb,
                          focused ? COL_TEXT : COL_TEXT_DIM);
 
         /* client surface. Clamp the SOURCE read to the client's REAL SHM extent
@@ -2465,11 +2469,18 @@ static void render_panel(uint32_t *buf, uint32_t w, uint32_t h, uint32_t stride,
     fill_rect(buf, w, h, stride, 0, 0, (int32_t)w, PANEL_H, COL_PANEL);
     fill_rect(buf, w, h, stride, 0, PANEL_H - 1, (int32_t)w, 1, COL_BORDER);
 
-    /* left: focused window title (or product name) */
+    /* left: focused window title (or product name).
+     * IDE-REPAIR-0 I0 / DESKTOP-PROJECT-REGRESSION-0: a focused window's title
+     * must be an app NAME, never a raw VFS path. If it contains a '/', ignore
+     * it and keep the product name so "sbin/..." can never render up here. */
     const char *title = "AutomationOS";
     int slot = focused_slot();
-    if (slot >= 0 && g_windows[slot].used && g_windows[slot].title[0])
-        title = g_windows[slot].title;
+    if (slot >= 0 && g_windows[slot].used && g_windows[slot].title[0]) {
+        const char *wt = g_windows[slot].title;
+        int pathlike = 0;
+        for (const char *p = wt; *p; p++) if (*p == '/') { pathlike = 1; break; }
+        if (!pathlike) title = wt;
+    }
     cz_text(buf, (int)stride, (int)w, (int)h,
                      12, (PANEL_H - FONT_H) / 2, title, COL_TEXT);
 

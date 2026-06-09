@@ -5,10 +5,15 @@ mkdir -p build
 CC=gcc
 CFLAGS="-std=gnu11 -ffreestanding -nostdlib -nostdinc -fno-pic -fno-pie -fno-stack-protector -mno-red-zone -mcmodel=kernel -DBOOT_QUIET -DSYSCALL_QUIET -DSCHEDULER_QUIET -DCONTEXT_SWITCH_QUIET -DEXEC_QUIET -DPROCESS_QUIET -Wno-unused-variable -Wno-unused-function -Wno-builtin-declaration-mismatch -Wno-implicit-function-declaration -Wno-int-conversion -Wno-incompatible-pointer-types -Ikernel/include -Ikernel/include/compat"
 
-# SCHED_DEBUG: yellow on-screen scheduler diagnostic markers. ON by default
-# (legacy behaviour). Set SCHED_DEBUG=0 to suppress them (cleaner boot screen).
-if [ "${SCHED_DEBUG:-1}" != "0" ]; then
+# SCHED_DEBUG: on-screen scheduler diagnostics -- the yellow boot markers PLUS
+# the timer-ISR liveness heartbeat (pit.c: a 48x48 colour-cycling square at
+# (1180,12) and the CURRENT PROCESS NAME in 2x text at (744,14), drawn straight
+# onto the framebuffer over the desktop). DEFAULT OFF (IDE-REPAIR-0 I0): users
+# saw "sbin/compositor" + a flashing square painted over the desktop on the
+# T410. Set SCHED_DEBUG=1 to opt back in when debugging scheduler hangs.
+if [ "${SCHED_DEBUG:-0}" = "1" ]; then
     CFLAGS="$CFLAGS -DSCHED_DEBUG"
+    echo "*** SCHED_DEBUG build: on-screen scheduler diagnostics ENABLED ***"
 fi
 
 # ─────────────────────────────────────────────────────────────────────────────

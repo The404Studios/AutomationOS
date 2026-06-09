@@ -217,6 +217,11 @@ void syscall_init(void) {
         syscall_table[SYS_CH_CLOSE]  = sys_ch_close;
         extern void channel_selftest(void);
         channel_selftest();
+        // P2: additive spawn that binds a child's stdio to channel handles.
+        extern int64_t sys_spawn_ex(uint64_t,uint64_t,uint64_t,uint64_t,uint64_t,uint64_t);
+        syscall_table[SYS_SPAWN_EX] = sys_spawn_ex;
+        extern void channel_selftest_p2(void);
+        channel_selftest_p2();
     }
 
 #if defined(SMP_FOUNDATION) && !defined(SMP_SCHED_DISPATCH)

@@ -43,8 +43,31 @@ checkpoints:
       smoke_proves_claim: true           # the boot self-test exercises the ring end-to-end
       raw_pointers_or_truncation: none   # bounded rings, rights-checked handles, kmalloc'd copies
     verdict: pass
+  - id: P2
+    title: SYS_SPAWN_EX binds a child's fd0/1/2 to channels (slave end, narrowed rights)
+    files:
+      - kernel/ipc/channel.c            # sys_spawn_ex + channel_install_spawn_stdio + g_exec_stdio + p2 selftest
+      - kernel/include/channel.h        # protos
+      - kernel/include/syscall.h        # SYS_SPAWN_EX = 101
+      - kernel/core/syscall/syscall.c   # register + channel_selftest_p2()
+      - kernel/fs/exec.c                # install hook in elf_load_and_exec (before scheduling)
+    tests: [build_test/channel_p1.sh]
+    result: "91 compiled / SUCCESS; [CHAN] p2 selftest PASS (slave-READ denied; bad-handle denied); P1 still PASS; desktop reached; 0 panic"
+    design:
+      - additive: SYS_SPAWN_EX is new (#101); SYS_SPAWN untouched; plain spawn leaves child stdio unbound
+      - capability hygiene: parent passes HANDLES (needs CH_R_TRANSFER), not pointers; child gets the
+        SLAVE end only, with narrowed rights (stdin=READ, stdout/stderr=WRITE); master never leaked
+      - ref ownership: staged+ref'd in sys_spawn_ex; transferred to the child handle on success
+        (freed at child teardown), or unref'd by sys_spawn_ex on any spawn failure (no leak/double-free)
+    review:
+      default_build_changed: false
+      all_waits_bounded: true
+      touches_userspace: false
+      preserves_known_good_t410: true
+      smoke_proves_claim: true        # synthetic binding/rights selftest (end-to-end output is P3/P4)
+      raw_pointers_or_truncation: none
+    verdict: pass
 next_checkpoints:
-  - P2: sys_spawn arg3 -> install channel as the child's slave-end stdio in elf_load_and_exec
   - P3: sys_write fd1/2 + sys_read fd0 route to the bound channel (before the serial/ps2 fallback)
   - P4: terminal_m3.c ch_create + spawn-bound + drain master into the grid; SYS_WAITPID for $?
 deferred:

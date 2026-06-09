@@ -8,9 +8,12 @@
 - **goal:** one kernel primitive (handle → shared rings) = our StdIO model + the structured-tool rail.
 - **build order:** P0 handle table · P1 ring + `ch_*` syscalls + self-test · P2 spawn binds child
   stdio · P3 sys_write/read route fd0/1/2 · P4 terminal holds master, externals' output in the grid.
-- **status:** **P0/P1 landed** (commit `41a1c0a`, `[CHAN] selftest PASS`, default build unchanged).
-  **Next: P2** (extend `sys_spawn` arg3 → install channel as the child's slave-end stdio in
-  `elf_load_and_exec`).
+- **status:** **P0/P1/P2 landed.** P0/P1 (`41a1c0a`): primitive + 5 syscalls + `[CHAN] selftest PASS`.
+  P2: **`SYS_SPAWN_EX` (101)** binds a child's fd0/1/2 to channels — additive (`SYS_SPAWN` untouched),
+  child gets the **slave end with narrowed rights** (stdin READ, stdout/stderr WRITE), master never
+  leaked, refs transfer on success / freed on failure; `[CHAN] p2 selftest PASS`.
+  **Next: P3** — `sys_write` fd1/2 (`handlers.c:731`) + `sys_read` fd0 (`:628`) route to the bound
+  channel (`stdio_chan[fd]`) before the serial/ps2 fallback (unbound = unchanged).
 
 ## Parked / adjacent
 - `brick/usb-ehci-0` — EHCI driver, **E1/E2 landed** (routing ledger); E3 (routing decision) next.

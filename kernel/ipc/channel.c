@@ -207,3 +207,86 @@ void channel_selftest(void) {
             ok ? "PASS" : "FAIL", w, r, (char*)out);
     channel_unref(ch);
 }
+
+/* ===== CHANNEL-0 P2: bind a child's stdio to channels at spawn (additive) ===== */
+
+/* Staged by sys_spawn_ex, consumed by channel_install_spawn_stdio() on the exec
+ * success path. File-static: spawn is single-threaded on the cooperative core,
+ * like exec.c's g_exec_spawn_args. */
+struct exec_stdio_bind { channel_t* ch; int end; uint32_t rights; };
+static struct exec_stdio_bind g_exec_stdio[3];
+
+void channel_install_spawn_stdio(struct process* child) {
+    if (!child) return;
+    for (int fd = 0; fd < 3; fd++) {
+        channel_t* ch = g_exec_stdio[fd].ch;
+        if (!ch) continue;
+        int h = process_alloc_handle(child, ch, g_exec_stdio[fd].end, g_exec_stdio[fd].rights);
+        if (h > 0) child->stdio_chan[fd] = (uint8_t)h;   /* child fd -> this handle */
+        else        channel_unref(ch);                   /* handle table full: don't leak the ref */
+        g_exec_stdio[fd].ch = (channel_t*)0;             /* consumed (ref transferred or freed) */
+    }
+}
+
+/*
+ * sys_spawn_ex(path, args, stdin_h, stdout_h, stderr_h) -- additive spawn that
+ * binds the child's fd0/fd1/fd2 to channels. The handles are the PARENT's master
+ * handles (must hold CH_R_TRANSFER); the child receives the SLAVE end with
+ * narrowed rights (stdin READ, stdout/stderr WRITE) -- the master end is never
+ * leaked into the child. A 0 handle leaves that fd unbound (serial/ps2 fallback,
+ * unchanged). SYS_SPAWN itself is untouched.
+ */
+int64_t sys_spawn_ex(uint64_t path, uint64_t args, uint64_t stdin_h, uint64_t stdout_h, uint64_t stderr_h, uint64_t a6) {
+    (void)a6;
+    process_t* cur = process_get_current();
+    uint64_t hin[3] = { stdin_h, stdout_h, stderr_h };
+    for (int fd = 0; fd < 3; fd++) {
+        g_exec_stdio[fd].ch = (channel_t*)0;
+        g_exec_stdio[fd].end = CH_END_SLAVE;
+        g_exec_stdio[fd].rights = 0;
+        if (!hin[fd]) continue;
+        channel_t* ch = process_get_handle(cur, (int)hin[fd], (int*)0, CH_R_TRANSFER);
+        if (!ch) {                                       /* invalid / insufficient rights */
+            for (int j = 0; j < fd; j++)
+                if (g_exec_stdio[j].ch) { channel_unref(g_exec_stdio[j].ch); g_exec_stdio[j].ch = (channel_t*)0; }
+            return EBADF;
+        }
+        channel_ref(ch);                                 /* this ref is the child's (transferred on success) */
+        g_exec_stdio[fd].ch = ch;
+        g_exec_stdio[fd].rights = (fd == 0) ? CH_R_READ : CH_R_WRITE;
+    }
+    /* delegate to the normal spawn; on success elf_load_and_exec consumes the
+     * bindings (channel_install_spawn_stdio), transferring the refs to the child. */
+    extern int64_t sys_spawn(uint64_t,uint64_t,uint64_t,uint64_t,uint64_t,uint64_t);
+    int64_t pid = sys_spawn(path, args, 0, 0, 0, 0);
+    /* spawn failed before install -> release the refs we staged (no leak) */
+    for (int fd = 0; fd < 3; fd++)
+        if (g_exec_stdio[fd].ch) { channel_unref(g_exec_stdio[fd].ch); g_exec_stdio[fd].ch = (channel_t*)0; }
+    return pid;
+}
+
+/* P2 synthetic self-test: prove the binding/rights mechanism (slave-end handle +
+ * narrowed rights enforced + invalid handle denied + clean teardown) without a
+ * live spawn -- there is no current process at boot-time syscall_init. */
+void channel_selftest_p2(void) {
+    process_t* fake = (process_t*)kmalloc(sizeof(process_t));
+    if (!fake) { kprintf("[CHAN] p2 selftest FAIL: kmalloc proc\n"); return; }
+    memset(fake, 0, sizeof(*fake));
+    channel_t* ch = channel_alloc(CH_BYTE, CH_PAGE);
+    if (!ch) { kfree(fake); kprintf("[CHAN] p2 selftest FAIL: alloc ch\n"); return; }
+    int hm = process_alloc_handle(fake, ch, CH_END_MASTER, CH_R_ALL);    /* master (full rights)        */
+    channel_ref(ch);
+    int hs = process_alloc_handle(fake, ch, CH_END_SLAVE, CH_R_WRITE);   /* child stdout (write-only)   */
+    int em = -1, es = -1;
+    channel_t* gm   = process_get_handle(fake, hm, &em, CH_R_READ);      /* master has ALL  -> ok       */
+    channel_t* gsw  = process_get_handle(fake, hs, &es, CH_R_WRITE);     /* slave WRITE     -> ok       */
+    channel_t* gsr  = process_get_handle(fake, hs, (int*)0, CH_R_READ);  /* slave lacks READ-> denied   */
+    channel_t* gbad = process_get_handle(fake, 99, (int*)0, 0);          /* invalid handle  -> denied   */
+    int ok = (hm > 0 && hs > 0 && hm != hs && gm == ch && gsw == ch &&
+              gsr == (channel_t*)0 && gbad == (channel_t*)0 &&
+              em == CH_END_MASTER && es == CH_END_SLAVE);
+    kprintf("[CHAN] p2 selftest %s (m=%d s=%d; slave-READ denied=%d; bad-handle denied=%d)\n",
+            ok ? "PASS" : "FAIL", hm, hs, gsr == (channel_t*)0, gbad == (channel_t*)0);
+    channel_cleanup_process(fake);   /* unref both handles -> channel freed */
+    kfree(fake);
+}

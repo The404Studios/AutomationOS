@@ -78,6 +78,11 @@ void       channel_cleanup_process(struct process* p);
 
 /* boot self-test (P1): create a channel, write via slave, read via master */
 void       channel_selftest(void);
+void       channel_selftest_p2(void);                          /* P2 binding/rights test */
+
+/* P2: install parent-supplied stdio channels into a freshly-built child (slave
+ * end, narrowed rights). Called from elf_load_and_exec(); no-op for plain spawn. */
+void       channel_install_spawn_stdio(struct process* child);
 
 /* ---- syscall handlers (registered in syscall.c) ---- */
 int64_t sys_ch_create(uint64_t flags, uint64_t capacity, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6);
@@ -85,5 +90,7 @@ int64_t sys_ch_write (uint64_t handle, uint64_t buf, uint64_t len, uint64_t a4, 
 int64_t sys_ch_read  (uint64_t handle, uint64_t buf, uint64_t len, uint64_t a4, uint64_t a5, uint64_t a6);
 int64_t sys_ch_wait  (uint64_t handle, uint64_t events, uint64_t timeout_ms, uint64_t a4, uint64_t a5, uint64_t a6);
 int64_t sys_ch_close (uint64_t handle, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6);
+/* P2: additive spawn that binds the child's fd0/fd1/fd2 to channel handles. */
+int64_t sys_spawn_ex (uint64_t path, uint64_t args, uint64_t stdin_h, uint64_t stdout_h, uint64_t stderr_h, uint64_t a6);
 
 #endif /* CHANNEL_H */

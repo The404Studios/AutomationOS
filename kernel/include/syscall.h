@@ -109,6 +109,7 @@
 #define SYS_CH_READ     98  // CHANNEL-0: read bytes from a channel handle
 #define SYS_CH_WAIT     99  // CHANNEL-0: poll readiness (CH_READABLE/WRITABLE/CLOSED)
 #define SYS_CH_CLOSE   100  // CHANNEL-0: close/release a channel handle
+#define SYS_SPAWN_EX   101  // CHANNEL-0 P2: spawn with fd0/1/2 bound to channel handles
 #define SYS_VMA_TEST    200 // VMA red-black tree testing and benchmarking
 
 // ---- SMP coprocessor offload (GATED: only registered under SMP_FOUNDATION) ----

@@ -788,6 +788,14 @@ int elf_load_and_exec(void* elf_data, size_t elf_size, const char* name) {
     EXEC_LOG("[EXEC]   User entry=0x%016lx stack=0x%016lx\n", ehdr->e_entry, stack_ptr);
     EXEC_LOG("[EXEC]   Kernel RSP=0x%016lx CR3=0x%016lx\n", proc->context.rsp, proc->context.cr3);
 
+    // CHANNEL-0 P2: install any parent-supplied stdio channels into the child
+    // (slave end, narrowed rights). No-op for a plain SYS_SPAWN (g_exec_stdio is
+    // empty). Done here -- child fully built, not yet scheduled.
+    {
+        extern void channel_install_spawn_stdio(struct process* child);
+        channel_install_spawn_stdio(proc);
+    }
+
     // Mark as ready to run
     process_set_ready(proc);
     EXEC_LOG("[EXEC] Process state set to READY\n");

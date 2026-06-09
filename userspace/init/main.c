@@ -391,6 +391,14 @@ void _start(void) {
     // a wider-than-viewport image). Prints "BROWSER2-IMG: PASS png=1 gif=1
     // bmp=1 missing_safe=1 bounded=1" after its first paint and exits.
     spawn_args("sbin/browser2", "about:imgtest");
+
+    // INITRD-ALIAS-0: the big-image (16 MiB pad, spans VA 16 MiB) + mmap-heavy
+    // reader; reads an initrd-backed file on its own shadow-prone CR3,
+    // byte-compares against the embedded fixture, spawns the tiny pristine
+    // control (sbin/initrdp), and prints "INITRD-ALIAS: PASS pristine_read=1
+    // mmapheavy_read=1 same_bytes=1 zero_bug_gone=1".
+    print("[INIT] Spawning initrdalias...\n");
+    spawn("sbin/initrdalias");
     // webapitest: pure JS web-API selftest (timers/fetch/storage/console/url);
     // prints "WEBAPITEST: PASS" and exits.
     spawn("sbin/webapitest");

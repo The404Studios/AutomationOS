@@ -1198,6 +1198,10 @@ static int load_page(const char *url, js_vm *vm,
         "<p>bmp</p><img src=\"fixture:t.bmp\">"
         "<p>missing</p><img src=\"fixture:missing.png\">"
         "<p>big</p><img src=\"fixture:big.png\">"
+        /* INITRD-ALIAS-0 probe: the SAME png read from the initrd via the
+         * VFS file loader. Reports on its own BROWSER2-IMG-FILE line (the
+         * frozen BROWSER2-IMG flags above stay fixture-only). */
+        "<p>file</p><img src=\"/etc/imgtest/t.png\">"
         "<p>end</p>"
         "</body></html>";
 
@@ -1853,6 +1857,23 @@ int main(int argc, char **argv)
                 b2_puts(" bmp=");          b2_puts(f_bmp ? "1" : "0");
                 b2_puts(" missing_safe="); b2_puts(f_missing_safe ? "1" : "0");
                 b2_puts(" bounded=");      b2_puts(f_bounded ? "1" : "0");
+                b2_puts("\n");
+
+                /* INITRD-ALIAS-0: the same png loaded from the initrd via
+                 * the VFS file path -- browser2 IS the big-image process
+                 * that exposed the zero-read aliasing, so this decoding to
+                 * a real 8x8 proves the kernel fix end to end in the
+                 * original failing context. */
+                int f_file = 0;
+                for (int i = 0; i < g_img_count; i++)
+                    if (b2_streq(g_imgs[i].src, "/etc/imgtest/t.png") &&
+                        g_imgs[i].state == B2IMG_OK &&
+                        g_imgs[i].w == 8 && g_imgs[i].h == 8)
+                        f_file = 1;
+                b2_puts("BROWSER2-IMG-FILE: ");
+                b2_puts(f_file ? "PASS" : "FAIL");
+                b2_puts(" initrd_img=");
+                b2_puts(f_file ? "1" : "0");
                 b2_puts("\n");
             }
             reported = 1;

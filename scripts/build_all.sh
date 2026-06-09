@@ -156,6 +156,12 @@ cc userspace/apps/chainhost/chainhost.c /tmp/chainhost.o; $LD /tmp/crt0.o /tmp/c
 # scripts/model_server_stub.py standing in for llama.cpp). Same parser/whitelist/
 # policy/runner as chainhost; SKIPs (bounded) when net/endpoint absent.
 cc userspace/apps/modelbridge/modelbridge.c /tmp/modelbridge.o; $LD /tmp/crt0.o /tmp/modelbridge.o -o /tmp/modelbridge.elf
+# INITRD-ALIAS-0 regression pair: initrdp (tiny pristine reader) + initrdalias
+# (16 MiB-pad big-image + mmap-heavy reader; spawns initrdp; prints the
+# INITRD-ALIAS verdict). Both compare the initrd-staged t.png byte-for-byte
+# against the embedded generated fixture (b2_img_fixtures.h).
+cc userspace/apps/initrdp/initrdp.c /tmp/initrdp.o; $LD /tmp/crt0.o /tmp/initrdp.o -o /tmp/initrdp.elf
+cc userspace/apps/initrdalias/initrdalias.c /tmp/initrdalias.o; $LD /tmp/crt0.o /tmp/initrdalias.o -o /tmp/initrdalias.elf
 # floattest: proves ring-3 float/SSE at runtime (scalar + 2x2 matmul + reduction).
 cc userspace/apps/floattest/floattest.c /tmp/floattest.o; $LD /tmp/crt0.o /tmp/floattest.o -o /tmp/floattest.elf
 # sleeptest: proves SYS_SLEEP is a real, ms-granularity, BLOCKING sleep (measures
@@ -528,7 +534,7 @@ $LD /tmp/crt0.o /tmp/cc.o \
     -o /tmp/cc.elf
 
 echo "[all] canary check (all must be 0):"
-for e in comp init filemanager calculator clock sysinfo settings sysmon uidemo dateapp applauncher taskman terminal editor snake paint synth tetris game2048 sheet notes calendar stopwatch mines piano dashboard welcome bench breakout pong invaders procmon soundtest solitaire aiconsole screenshot stress musicplayer ide bubbletd zombietd pacman clockapp forktest threadtest reaploop matmuljobs aibroker sed awk tar pkg make meminfo argvtest msgtest rpctest toolrun echoproof echoargs agenthost tool_read tool_ls tool_stat toolset_host chainhost modelbridge floattest sleeptest prioritytest matbench tensortest cpuburn blk ps kill free uptime find diff cmp tee wcx xargs gzip cc nettest sockettest cpu1offload smpstress wget netman browser cryptotest libtest ping nc netinfo netscan tcping dig httpget pktmon httpd traceroute arp grep head tail sort uniq cut tr nl du touch basename dirname uname hostname whoami date less hexdump lspci tlsprobe certtool dhcpc autodhcp apidemo js futextest epolltest sendfiletest perftest batchtest domtest htmltest csstest layouttest webtest browser2 webapitest cube3d ray chess asteroids sudoku photos startmenu controlcenter gametest; do
+for e in comp init filemanager calculator clock sysinfo settings sysmon uidemo dateapp applauncher taskman terminal editor snake paint synth tetris game2048 sheet notes calendar stopwatch mines piano dashboard welcome bench breakout pong invaders procmon soundtest solitaire aiconsole screenshot stress musicplayer ide bubbletd zombietd pacman clockapp forktest threadtest reaploop matmuljobs aibroker sed awk tar pkg make meminfo argvtest msgtest rpctest toolrun echoproof echoargs agenthost tool_read tool_ls tool_stat toolset_host chainhost modelbridge initrdp initrdalias floattest sleeptest prioritytest matbench tensortest cpuburn blk ps kill free uptime find diff cmp tee wcx xargs gzip cc nettest sockettest cpu1offload smpstress wget netman browser cryptotest libtest ping nc netinfo netscan tcping dig httpget pktmon httpd traceroute arp grep head tail sort uniq cut tr nl du touch basename dirname uname hostname whoami date less hexdump lspci tlsprobe certtool dhcpc autodhcp apidemo js futextest epolltest sendfiletest perftest batchtest domtest htmltest csstest layouttest webtest browser2 webapitest cube3d ray chess asteroids sudoku photos startmenu controlcenter gametest; do
     n=$(objdump -d /tmp/$e.elf 2>/dev/null | grep -c "fs:0x28" || true)
     echo "  $e=$n"
 done
@@ -584,6 +590,9 @@ cp /tmp/toolset_host.elf /tmp/ird/sbin/toolset_host
 cp /tmp/chainhost.elf /tmp/ird/sbin/chainhost
 # MODEL-BRIDGE-0 -> /sbin (init spawns it; the seam fed by the external endpoint).
 cp /tmp/modelbridge.elf /tmp/ird/sbin/modelbridge
+# INITRD-ALIAS-0 regression pair -> /sbin (init spawns initrdalias; it spawns initrdp).
+cp /tmp/initrdp.elf /tmp/ird/sbin/initrdp
+cp /tmp/initrdalias.elf /tmp/ird/sbin/initrdalias
 # TOOLSET-0 test fixture: a small file with KNOWN content (15 bytes) for read_file/stat.
 mkdir -p /tmp/ird/etc && printf 'TOOLSET-0-FILE\n' > /tmp/ird/etc/toolset0.txt
 # BROWSER2-IMG-0 fixtures: deterministic PNG/GIF/BMP (+ a wider-than-viewport

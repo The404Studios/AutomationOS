@@ -180,6 +180,17 @@ static void thermal_safety_tick_irq(void) {
 // EOI is sent by the IRQ dispatch layer (idt.c:irq_handler) after we return.
 static void timer_handler(void) {
     timer_ticks++;
+#ifdef USB_UHCI
+    /* USB-MOUSE-0: poll the UHCI HID interrupt endpoint(s) ~every 8 ms (125 Hz,
+     * the default USB mouse report rate). uhci_poll() is bounded (<=4 HID devices,
+     * one TD-status read + a bounded decode each) and injects via input_report_*
+     * exactly like the PS/2 mouse IRQ -- so running it from IRQ context here is
+     * consistent and cannot hog the single core. No-op until uhci_init() succeeds. */
+    if ((timer_ticks & 7u) == 0) {
+        extern void uhci_poll(void);
+        uhci_poll();
+    }
+#endif
     // Real-sleep wakeups: re-ready any process whose blocking-sleep deadline has
     // arrived (1 tick == 1 ms at 1000 Hz). Runs once per tick here (the
     // cooperative IRQ0 path); the PREEMPTIVE build does the equivalent at the top

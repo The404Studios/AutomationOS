@@ -1160,6 +1160,20 @@ void kernel_main(void* raw_info) {
     // event1, not event2, and to drop its IRQ-context kprintf first.)
     // extern void ps2mouse_init(void);
     // ps2mouse_init();
+#ifdef USB_UHCI
+    /* USB-MOUSE-0 (gated, default OFF): bring up the UHCI host controller and
+     * enumerate a wired boot mouse. uhci.c is self-contained -- it enumerates the
+     * root hub and injects pointer events through the SAME input_report_* and
+     * input_sync path as the PS/2 mouse (above) -- the compositor needs no new path.
+     * Safe: returns cleanly with no controller/device, every controller/transfer
+     * wait is bounded, and uhci_poll() is driven from timer_handler() (pit.c).
+     * NOTE: usb_core.c::usb_init() is a SIMULATION stub; the real hardware entry is
+     * uhci_init() -- a usb_hc dispatch wrapper can wrap it when EHCI/xHCI land. */
+    {
+        extern int uhci_init(void);
+        uhci_init();
+    }
+#endif
     BOOT_LOG("[KERNEL] Keyboard + mouse initialized\n");
     boot_mark("keyboard/mouse ok");
 

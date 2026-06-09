@@ -988,10 +988,17 @@ static int32_t g_rdock_open_folder = -1;
 #define DESK_LABEL_GAP    4    /* gap between tile bottom and label           */
 #define DESK_DBLCLICK_MS 400   /* two clicks within this window = double      */
 #define DESK_RESCAN_FRAMES 120 /* periodic rescan cadence (frames ~ 2s)       */
+#define DESK_PATH        256   /* full VFS path stored per icon (identity)    */
+
+/* Icon kind drives the double-click action. The FULL path is identity; the
+ * (truncated) name is only the grid label. */
+typedef enum { DI_FOLDER = 0, DI_APP, DI_FILE, DI_PROJECT } desk_kind_t;
 
 typedef struct {
-    char name[DESK_NAME_DISP + 1];   /* truncated display/spawn name          */
-    int  is_dir;                     /* 1 = directory                         */
+    char        name[DESK_NAME_DISP + 1];  /* truncated display label ONLY         */
+    char        path[DESK_PATH];           /* full VFS path = identity (spawn/open) */
+    desk_kind_t kind;
+    int         is_dir;                    /* 1 = directory (quick check)          */
 } desk_icon_t;
 
 static desk_icon_t g_desk_icons[DESK_MAX_ICONS];
@@ -1703,6 +1710,12 @@ static void render_desktop(uint32_t *buf, uint32_t w, uint32_t h, uint32_t strid
  * code reads directories: opendir -> readdir loop -> closedir. Skips "." and
  * "..". Robust: bails silently if /Desktop can't be opened (e.g. not mounted
  * yet) and just leaves the previous list. */
+/* Does the name end in ".elf"? (a runnable app icon). */
+static int desk_name_is_elf(const char* s) {
+    int n = 0; while (s[n]) n++;
+    return n >= 4 && s[n-4] == '.' && s[n-3] == 'e' && s[n-2] == 'l' && s[n-1] == 'f';
+}
+
 static void desk_scan(void) {
     int prev_count = g_desk_count;
     long dfd = syscall(SYS_OPENDIR, (long)"/Desktop", 0, 0);
@@ -1728,10 +1741,20 @@ static void desk_scan(void) {
         if (ent.d_name[0] == '\0') continue;      /* defensive */
 
         desk_icon_t *di = &g_desk_icons[n];
+        /* display label: truncated for the grid. */
         int i = 0;
         while (ent.d_name[i] && i < DESK_NAME_DISP) { di->name[i] = ent.d_name[i]; i++; }
         di->name[i] = '\0';
-        di->is_dir  = (ent.d_type == DT_DIR);
+        /* identity: the FULL VFS path, built from the UNtruncated name -- never
+         * reconstructed from the label (that was the open-the-wrong-folder bug). */
+        { const char* pre = "/Desktop/"; int p = 0;
+          while (pre[p] && p < (int)sizeof(di->path) - 1) { di->path[p] = pre[p]; p++; }
+          int q = 0;
+          while (ent.d_name[q] && p < (int)sizeof(di->path) - 1) di->path[p++] = ent.d_name[q++];
+          di->path[p] = '\0'; }
+        di->is_dir = (ent.d_type == DT_DIR);
+        di->kind   = di->is_dir ? DI_FOLDER
+                   : (desk_name_is_elf(ent.d_name) ? DI_APP : DI_FILE);
         n++;
     }
     syscall(SYS_CLOSEDIR, dfd, 0, 0);
@@ -4783,24 +4806,17 @@ static int desk_handle_click(int32_t cx, int32_t cy, uint32_t W, uint32_t H, lon
     g_desk_last_idx = -1;            /* reset so a 3rd click starts fresh */
     desk_icon_t *di = &g_desk_icons[idx];
 
-    if (di->is_dir) {
-        /* Pass the folder's full path as the spawn args string (argv[1]) so the
-         * file manager opens THAT directory instead of always starting at "/". */
-        char path[64];
-        int len = 0; path[0] = '\0';
-        desk_strcat(path, &len, (int)sizeof(path), "/Desktop/");
-        desk_strcat(path, &len, (int)sizeof(path), di->name);
-        long r = syscall(SYS_SPAWN, (long)"sbin/filemanager", (long)path, 0);
-        print("[SHELL] desktop open dir "); print(path);
+    /* Identity is the full stored path -- never reconstruct it from the
+     * (truncated) display label. Dispatch by kind: folders/projects open in the
+     * file manager at their real directory; apps/files are spawned directly. */
+    if (di->kind == DI_FOLDER || di->kind == DI_PROJECT) {
+        long r = syscall(SYS_SPAWN, (long)"sbin/filemanager", (long)di->path, 0);
+        print("[SHELL] desktop open "); print(di->path);
         if (r < 0) { print(" (spawn fail r="); print_num(r); print(")"); }
         print("\n");
     } else {
-        char path[64];
-        int len = 0; path[0] = '\0';
-        desk_strcat(path, &len, (int)sizeof(path), "/Desktop/");
-        desk_strcat(path, &len, (int)sizeof(path), di->name);
-        long r = syscall(SYS_SPAWN, (long)path, 0, 0);
-        print("[SHELL] desktop run "); print(path);
+        long r = syscall(SYS_SPAWN, (long)di->path, 0, 0);
+        print("[SHELL] desktop run "); print(di->path);
         if (r < 0) { print(" (spawn fail r="); print_num(r); print(")"); }
         print("\n");
     }

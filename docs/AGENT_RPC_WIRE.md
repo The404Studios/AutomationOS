@@ -50,8 +50,26 @@ msg_packet_t { type, flags, len, request_id }  +  payload[len]
 | `version`       | u16  | `= AGENT_RPC_VERSION` (1)                               |
 | `flags`         | u16  | `TOOL_F_*` (reserved; 0 in P6a)                         |
 | `exit_code`     | i32  | the tool's exit status                                 |
-| `stdout_handle` | u32  | a byte-channel handle for the tool's output — **P6b**; always **0** in P6a |
+| `stdout_handle` | u32  | a byte-channel handle for the tool's output (see the semantics note below) |
 | `reserved`      | u32  | 0                                                      |
+
+### `stdout_handle` semantics (READ THIS before claiming "the agent reads stdout")
+
+The meaning of `stdout_handle` has changed per checkpoint. Be precise about what
+each level actually proves — do not let a summary overclaim:
+
+- **P6a:** always `0`. Inert. No tool was run.
+- **P6b:** a **runner-local handle token** — the handle, in the *runner's* handle
+  table, of the `CH_BYTE` channel it bound to the tool's stdout and **drained
+  itself**. It is **non-zero but NOT dereferenceable by the agent**: CHANNEL-0
+  has no cross-process handle transfer, so the number is meaningless in the
+  agent's table. P6b's real invariant is *"the runner created a stdout channel,
+  the tool wrote to it, and the runner drained N bytes"* — NOT *"the agent read
+  stdout"*. The token is returned honestly so the contract is ready for P6c.
+- **P6c+:** `stdout_handle` becomes **agent-readable** only after an explicit,
+  one-shot, read-only **handle-transfer/capability primitive** moves the stdout
+  *read* end from the runner to the requesting agent. Only then may anything
+  claim the agent reads the tool's stdout.
 
 ## Validation rules (enforced by `*_validate`)
 
@@ -68,8 +86,20 @@ Encoding rejects an over-long `path`/`args` with `AR_E_TOOLONG`.
 
 ## Status
 
-- **P6a (this doc):** schema + `tool_run_encode/validate`, `tool_result_encode/validate`,
-  and an in-memory encode→validate→reject self-test (`sbin/rpctest`, spawned by
-  init): serial `RPCTEST: PASS ...`. No spawn, no fd passing, no stdout channel.
-- **P6b (next):** the minimal runner — recv `TOOL_RUN`, spawn the tool with its
-  stdout bound to a byte channel, send `TOOL_RESULT { exit_code, stdout_handle }`.
+- **P6a — DONE:** schema + `tool_run_encode/validate`, `tool_result_encode/validate`,
+  and an in-memory encode→validate→reject self-test (`sbin/rpctest`): serial
+  `RPCTEST: PASS ...`. No spawn, no fd passing, no stdout channel.
+- **P6b — DONE:** the path-only runner — recv one `TOOL_RUN` (args rejected:
+  `args_len` must be 0), spawn the tool with its stdout bound to a `CH_BYTE`
+  channel, the **runner drains the stdout itself**, send `TOOL_RESULT
+  { exit_code, stdout_handle }`. `stdout_handle` is a **runner-local token**
+  (see the semantics note above). Proof `sbin/toolrun`: serial `RUNNER: PASS
+  ... stdout_bytes=183` + `TOOLRUN: PASS ...`.
+- **P6c — NEXT (capability only):** make `stdout_handle` real — a one-shot,
+  read-only transfer of the *tool's stdout read end* from the runner to the
+  requesting agent, so the agent can read the exact stdout bytes. No argv. This
+  is the capability/security change, kept isolated from parsing risk.
+- **P6d — after P6c:** argv — `args` as NUL-separated argv bytes, validated
+  (reject empty `arg0`, missing final NUL, malformed empty entries). Still no
+  shell. Kept separate from P6c so an ABI/parsing failure can't be confused with
+  a capability failure.

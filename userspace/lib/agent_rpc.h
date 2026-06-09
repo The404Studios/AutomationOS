@@ -49,7 +49,12 @@ typedef struct tool_result {
     unsigned short version;          /* = AGENT_RPC_VERSION                  */
     unsigned short flags;            /* TOOL_F_*                             */
     int            exit_code;        /* the tool's exit status               */
-    unsigned int   stdout_handle;    /* P6b: a byte-channel handle; 0 in P6a */
+    /* stdout byte-channel handle. P6a: 0 (inert). P6b: a RUNNER-LOCAL token --
+     * non-zero but NOT dereferenceable by the agent (no cross-process handle
+     * transfer yet); the runner drained stdout itself. P6c: becomes
+     * agent-readable after a one-shot read-only handle transfer. See
+     * docs/AGENT_RPC_WIRE.md ("stdout_handle semantics"). */
+    unsigned int   stdout_handle;
     unsigned int   reserved;         /* 0                                    */
 } tool_result_t;
 

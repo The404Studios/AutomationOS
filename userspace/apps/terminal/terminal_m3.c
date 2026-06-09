@@ -601,6 +601,14 @@ static void env_set(const char *name, const char *value) {
 #define LINE_MAX  256
 static char line_buf[LINE_MAX];
 static int  line_len;
+static int  line_cursor;     /* TERMINAL-0 T2: caret position within line_buf (0..line_len) */
+#ifndef KEY_LEFT
+#define KEY_LEFT   105
+#define KEY_RIGHT  106
+#define KEY_HOME   102
+#define KEY_END    107
+#define KEY_DELETE 111
+#endif
 
 /* History navigation state: how many steps back we've scrolled (-1 = off). */
 static int hist_nav;   /* starts at -1 (not navigating) */
@@ -3126,13 +3134,27 @@ static void shell_execute(const char *line) {
 }
 
 /*
- * Erase the currently typed line from the display (back to the prompt end).
- * We step backwards over line_len characters and grid_backspace() each one.
+ * TERMINAL-0 T2: redraw the current input line (prompt + line_buf) on the head
+ * scrollback line, with the cursor at line_cursor. The command buffer
+ * (line_buf/line_len/line_cursor) is the SOURCE OF TRUTH; we re-render the whole
+ * line on each edit -- simple + correct for a small software-rendered terminal,
+ * and mid-line edits can never leave ghost characters behind in the scrollback.
+ * The input is written straight into the head cells (no wrap) and clipped to the
+ * visible width; line_buf still holds the full command for Enter.
  */
-static void erase_input_line(void) {
-    for (int i = 0; i < line_len; i++)
-        grid_backspace();
-    line_len = 0;
+static void redraw_input_line(void) {
+    cur_col = 0;
+    sb_clear_line(sb_head);
+    shell_prompt();                 /* draws the prompt on the head line */
+    int prompt_len = cur_col;       /* prompt width in columns           */
+    int s = sb_slot(sb_head);
+    for (int i = 0; i < line_len && (prompt_len + i) < g_cols; i++) {
+        sb[s][prompt_len + i] = line_buf[i];
+        sb_color[s][prompt_len + i] = CLR_DEFAULT;
+    }
+    cur_col = prompt_len + line_cursor;
+    if (cur_col >= g_cols) cur_col = g_cols - 1;
+    if (cur_col < 0) cur_col = 0;
 }
 
 /* =========================================================================
@@ -3374,8 +3396,9 @@ void _start(void) {
     grid_puts_color("Type 'help' for commands, Tab to complete, "
                     "Up/Down for history.\n\n", CLR_BANNER);
     shell_prompt();
-    line_len  = 0;
-    hist_nav  = -1;   /* not currently navigating history */
+    line_len    = 0;
+    line_cursor = 0;  /* TERMINAL-0 T2: caret at the start of an empty line */
+    hist_nav    = -1; /* not currently navigating history */
 
     render(win, stride_px);
 
@@ -3454,7 +3477,7 @@ void _start(void) {
             /* Ctrl+C: cancel the current input line and show a fresh prompt. */
             if (ctrl_down && keycode == KEY_C) {
                 grid_puts("^C\n");
-                line_len = 0;
+                line_len = 0; line_cursor = 0;
                 hist_nav = -1;
                 shell_prompt();
                 dirty = 1;
@@ -3463,53 +3486,73 @@ void _start(void) {
             /* Ctrl+L: clear the screen and redraw prompt + current input. */
             if (ctrl_down && keycode == KEY_L) {
                 grid_clear();
-                shell_prompt();
-                for (int i = 0; i < line_len; i++) grid_putchar(line_buf[i]);
+                redraw_input_line();
                 dirty = 1;
                 continue;
             }
 
+            /* TERMINAL-0 T2: intra-line cursor movement + editing. line_buf /
+             * line_len / line_cursor are the source of truth; each edit redraws
+             * the whole input line so mid-line edits never leave ghosts. */
+            if (keycode == KEY_LEFT) {
+                if (line_cursor > 0) { line_cursor--; redraw_input_line(); dirty = 1; }
+                continue;
+            }
+            if (keycode == KEY_RIGHT) {
+                if (line_cursor < line_len) { line_cursor++; redraw_input_line(); dirty = 1; }
+                continue;
+            }
+            if (keycode == KEY_HOME) {
+                if (line_cursor != 0) { line_cursor = 0; redraw_input_line(); dirty = 1; }
+                continue;
+            }
+            if (keycode == KEY_END) {
+                if (line_cursor != line_len) { line_cursor = line_len; redraw_input_line(); dirty = 1; }
+                continue;
+            }
+            if (keycode == KEY_DELETE) {            /* forward-delete at the cursor */
+                if (line_cursor < line_len) {
+                    for (int i = line_cursor; i < line_len - 1; i++) line_buf[i] = line_buf[i + 1];
+                    line_len--;
+                    hist_nav = -1;
+                    redraw_input_line();
+                    dirty = 1;
+                }
+                continue;
+            }
+
             if (keycode == KEY_UP) {
-                /*
-                 * Up-arrow: scroll back through history.
-                 * hist_nav starts at -1 (not navigating); first press → 0
-                 * (most recent entry).  Clamp at the oldest available entry.
-                 */
+                /* Up-arrow: recall an older history entry (caret to end). */
                 int next_nav = hist_nav + 1;
                 int available = hist_count < HIST_MAX ? hist_count : HIST_MAX;
                 if (next_nav >= available) next_nav = available - 1;
                 if (next_nav < 0) { /* nothing in history */ continue; }
                 const char *entry = hist_get(next_nav);
                 if (!entry) continue;
-                /* Erase current input and replace with the recalled entry. */
-                erase_input_line();
-                int n = k_strlcpy(line_buf, entry, LINE_MAX);
-                line_len = n;
-                for (int i = 0; i < n; i++) grid_putchar(line_buf[i]);
+                line_len = k_strlcpy(line_buf, entry, LINE_MAX);
+                line_cursor = line_len;
                 hist_nav = next_nav;
+                redraw_input_line();
                 dirty = 1;
 
             } else if (keycode == KEY_DOWN) {
-                /*
-                 * Down-arrow: scroll forward (towards current input).
-                 * If we reach hist_nav == -1 the line is cleared.
-                 */
-                if (hist_nav < 0) continue;   /* already at current */
+                /* Down-arrow: forward through history; hist_nav==-1 => blank. */
+                if (hist_nav < 0) continue;
                 hist_nav--;
-                erase_input_line();
                 if (hist_nav >= 0) {
                     const char *entry = hist_get(hist_nav);
-                    if (entry) {
-                        int n = k_strlcpy(line_buf, entry, LINE_MAX);
-                        line_len = n;
-                        for (int i = 0; i < n; i++) grid_putchar(line_buf[i]);
-                    }
+                    line_len = entry ? k_strlcpy(line_buf, entry, LINE_MAX) : 0;
+                } else {
+                    line_len = 0;
                 }
-                /* hist_nav == -1 → blank line (already line_len == 0) */
+                line_cursor = line_len;
+                redraw_input_line();
                 dirty = 1;
 
             } else if (keycode == KEY_ENTER) {
-                print("[TERM] key 10\n");          /* '\n' == 10 */
+#ifdef TERM_DEBUG_KEYS
+                print("[TERM] key 10\n");
+#endif
                 line_buf[line_len] = '\0';
                 grid_putchar('\n');                /* finish the input line  */
                 hist_push(line_buf);               /* push to history        */
@@ -3520,20 +3563,24 @@ void _start(void) {
                  * loop) -- so output appears BEFORE the next prompt, not after. */
                 if (g_child_ch > 0) g_await_child = 1;
                 else                shell_prompt();  /* builtin/no child: prompt now */
-                line_len = 0;
+                line_len = 0; line_cursor = 0;
                 dirty = 1;
             } else if (keycode == KEY_TAB) {
-                /* Tab completion. */
+                /* Tab completion (draws its own line); land the caret at the end. */
                 if (tab_complete()) {
                     hist_nav = -1;
+                    line_cursor = line_len;
                     dirty = 1;
                 }
             } else if (keycode == KEY_BACKSPACE) {
-                if (line_len > 0) {
-                    print("[TERM] key 8\n");        /* BS == 8 */
-                    line_len--;
-                    grid_backspace();
-                    hist_nav = -1;                 /* any edit resets recall  */
+                if (line_cursor > 0) {
+#ifdef TERM_DEBUG_KEYS
+                    print("[TERM] key 8\n");
+#endif
+                    for (int i = line_cursor - 1; i < line_len - 1; i++) line_buf[i] = line_buf[i + 1];
+                    line_len--; line_cursor--;
+                    hist_nav = -1;
+                    redraw_input_line();
                     dirty = 1;
                 }
             } else {
@@ -3544,12 +3591,15 @@ void _start(void) {
                 km.shift_r = 0;
                 char ascii = keymap_resolve((uint8_t)keycode, 1, &km);
                 if (ascii && line_len < LINE_MAX - 1) {
-                    print("[TERM] key ");
-                    print_char(ascii);
-                    print("\n");
-                    line_buf[line_len++] = ascii;
-                    grid_putchar(ascii);           /* echo */
-                    hist_nav = -1;                 /* any edit resets recall  */
+#ifdef TERM_DEBUG_KEYS
+                    print("[TERM] key "); print_char(ascii); print("\n");
+#endif
+                    /* insert at the cursor (mid-line aware), then redraw */
+                    for (int i = line_len; i > line_cursor; i--) line_buf[i] = line_buf[i - 1];
+                    line_buf[line_cursor] = ascii;
+                    line_len++; line_cursor++;
+                    hist_nav = -1;
+                    redraw_input_line();
                     dirty = 1;
                 }
                 /* Unmapped keycodes / full line are silently ignored. */

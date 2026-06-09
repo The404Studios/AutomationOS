@@ -64,6 +64,28 @@ checkpoints:
       smoke_proves_claim: true          # screenshot shows old lines preserved + a scrolled viewport
       raw_pointers_or_truncation: none  # ring indices via sb_slot (logical % 256); view clamped each render
     verdict: pass
+  - id: T2
+    title: clean line editing -- intra-line cursor + redraw-current-line (one input model)
+    files: [userspace/apps/terminal/terminal_m3.c]
+    tests: [build_test/shot.sh]
+    result: "build_all clean; SCREENSHOT (screenshots/t2check.png) shows a multi-line self-check -- the three acceptance cases (abc<<X=aXbc, abc Home X=Xabc, abc <Del=ab) run through the SAME edit primitives the key handlers use and print PASS lines to scrollback (visible on the term's left edge; a single short line gets occluded by the auto-opened apps); final clean build (t2final.png) with the temp self-check removed = no-regression desktop"
+    design:
+      - one input model: line_buf/line_len/line_cursor are the SOURCE OF TRUTH (the command buffer,
+        separate from the scrollback display). erase_input_line + char-by-char echo -> redraw_input_line()
+        which re-renders prompt + line_buf on the head line each edit (no scrollback ghosts).
+      - added: Left/Right (clamp), Home/End, Backspace-at-cursor, Delete-at-cursor (KEY_DELETE),
+        insert-at-cursor (mid-line memmove). History/Tab/Ctrl-L now route through redraw_input_line.
+      - killed the per-keystroke print("[TERM] key ...") serial spam -> behind #ifdef TERM_DEBUG_KEYS
+        (default OFF).
+    review:
+      default_build_changed: false      # terminal-only; T0 (output-before-prompt) + T1 (scrollback) intact
+      all_waits_bounded: true           # redraw is bounded by g_cols; no new loops in the hot path
+      touches_userspace: true
+      touches_kernel: false
+      preserves_known_good_t410: true
+      smoke_proves_claim: true          # screenshot shows a correct mid-line insert result (aXbc)
+      raw_pointers_or_truncation: none  # line_buf bounded LINE_MAX-1; redraw clips to g_cols
+    verdict: pass
 next_checkpoints:
-  - T2 line-editing cleanup | T3 minimal ANSI/VT (SGR color first) | T4 delete dead terminal code
+  - T3 minimal ANSI/VT (SGR color first) | T4 delete dead terminal code
 ```

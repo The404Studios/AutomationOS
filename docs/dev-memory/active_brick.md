@@ -16,8 +16,13 @@
   (256-line `sb[][]` ring; `cur_row` → `sb_head`/`sb_view`/`sb_follow` viewport; `grid_putchar` is the
   ONE append path; PageUp/PageDown scroll, PageDown re-follows). SCREENSHOT-verified (`t0demo.png`,
   `t1demo.png` — a scrolled-back viewport holds lines the old discard grid lost); build_all clean;
-  desktop. record: `docs/dev-memory/bricks/TERMINAL-0.md`. **Next: T2** (line-editing cleanup:
-  `cursor_pos` + Left/Right/Home/End/Del; kill the per-keystroke `[TERM] key` serial spam).
+  desktop. **T2: clean line editing** — `line_cursor` + redraw-current-line (`redraw_input_line`);
+  Left/Right/Home/End/Backspace/Delete/insert all cursor-aware; `[TERM] key` spam gated behind
+  `TERM_DEBUG_KEYS` (default off). Screenshot-verified (`t2check.png`: a multi-line self-check runs
+  the three acceptance cases through the SAME edit primitives → PASS lines in scrollback; `t2final.png`
+  = clean build with the temp self-check removed).
+  record: `docs/dev-memory/bricks/TERMINAL-0.md`. **Next: T3** (minimal ANSI/VT — SGR color first;
+  the `grid_color`/`g_cur_color` substrate already exists), then T4 (delete the dead terminal code).
 
 ## CHANNEL-0 — FROZEN / COMPLETE (P0–P4, pushed to origin)
 - **branch:** `brick/channel-0` (PUSHED, commit `1dd5107`) · **spec:** `docs/superpowers/specs/2026-06-08-channel-0-design.md`

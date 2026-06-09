@@ -82,7 +82,8 @@ enum layout_box_kind {
     LB_BLOCK = 0,    /* block container                            */
     LB_INLINE,       /* inline element (span, a, b, ...)           */
     LB_TEXT,         /* anonymous text segment (one word + space)  */
-    LB_LINE          /* anonymous line box inside a block          */
+    LB_LINE,         /* anonymous line box inside a block          */
+    LB_IMAGE         /* <img>: atomic inline box; renderer blits   */
 };
 
 typedef struct layout_box {
@@ -93,6 +94,23 @@ typedef struct layout_box {
     css_computed style;                       /* computed style for this box */
     struct layout_box *first_child, *next_sibling;
 } layout_box;
+
+/* <img> intrinsic-dimension provider (BROWSER2-IMG-0).
+ *
+ * Layout itself never fetches or decodes images. The embedder (browser2)
+ * registers a provider; for each <img> element the engine asks it for the
+ * decoded intrinsic size. Provider returns 1 and fills *w/*h (px) when the
+ * image is decoded, 0 when unknown/failed -- then the engine emits a small
+ * fixed-size placeholder box instead. The resulting box is ATOMIC INLINE
+ * (participates in line flow like a sized word; no scaling) and its width
+ * is clamped to the content width, so an oversized image can never widen
+ * the line. No provider registered = every <img> is a placeholder box. */
+typedef int (*layout_img_dims_fn)(const struct dom_node *img, int *w, int *h);
+void layout_set_img_dims_provider(layout_img_dims_fn fn);
+
+/* Placeholder box size used when the provider has no dimensions. */
+#define LAYOUT_IMG_PLACEHOLDER_W 48
+#define LAYOUT_IMG_PLACEHOLDER_H 32
 
 /* Compute a layout tree for the document. Viewport width is in px and is
  * used as the initial content width for <html>/<body>. Height grows from

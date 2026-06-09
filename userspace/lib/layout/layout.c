@@ -42,6 +42,18 @@ static int is_ws(int c)
 static int imax(int a, int b) { return a > b ? a : b; }
 
 /* ------------------------------------------------------------------ */
+/* <img> intrinsic-dimension provider (BROWSER2-IMG-0).                 */
+/* Registered by the embedder; layout never fetches/decodes itself.    */
+/* ------------------------------------------------------------------ */
+
+static layout_img_dims_fn g_img_dims = 0;
+
+void layout_set_img_dims_provider(layout_img_dims_fn fn)
+{
+    g_img_dims = fn;
+}
+
+/* ------------------------------------------------------------------ */
 /* Box allocation.                                                      */
 /* ------------------------------------------------------------------ */
 
@@ -375,6 +387,28 @@ static void emit_inline_subtree(ctx *C, const struct dom_node *n,
     css_compute(C->sheet, n, &cs);
 
     if (cs.display == CSS_DISP_NONE) return;
+
+    /* Special-case <img> (BROWSER2-IMG-0): an ATOMIC inline box, sized from
+     * the embedder's dims provider (decoded intrinsic size) or the fixed
+     * placeholder when unknown. Handled BEFORE the block/inline split so an
+     * author display:block can never turn it into an empty block. Width is
+     * clamped to the content width (bounded); the renderer clips the blit to
+     * the box, so an oversized image can never overflow a line or the page. */
+    if (n->tag && n->tag[0] == 'i' && strcmp(n->tag, "img") == 0) {
+        layout_box *im = box_new(LB_IMAGE, n);
+        if (!im) return;
+        im->style = cs;
+        int iw = 0, ih = 0;
+        if (!g_img_dims || !g_img_dims(n, &iw, &ih) || iw <= 0 || ih <= 0) {
+            iw = LAYOUT_IMG_PLACEHOLDER_W;
+            ih = LAYOUT_IMG_PLACEHOLDER_H;
+        }
+        if (S->max_w > 0 && iw > S->max_w) iw = S->max_w;   /* bounded */
+        im->w = iw;
+        im->h = ih;
+        inline_add(S, block, im, parent_style);
+        return;
+    }
 
     if (cs.display == CSS_DISP_BLOCK) {
         /* A block inside an inline context terminates the current line and

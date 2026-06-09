@@ -386,6 +386,11 @@ void _start(void) {
     spawn("sbin/layouttest");
     spawn("sbin/webtest");
     spawn("sbin/browser2");
+    // BROWSER2-IMG-0: a second bounded browser2 run on the built-in
+    // about:imgtest page (local PNG/GIF/BMP fixtures + a missing source +
+    // a wider-than-viewport image). Prints "BROWSER2-IMG: PASS png=1 gif=1
+    // bmp=1 missing_safe=1 bounded=1" after its first paint and exits.
+    spawn_args("sbin/browser2", "about:imgtest");
     // webapitest: pure JS web-API selftest (timers/fetch/storage/console/url);
     // prints "WEBAPITEST: PASS" and exits.
     spawn("sbin/webapitest");

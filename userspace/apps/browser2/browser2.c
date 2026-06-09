@@ -492,6 +492,166 @@ static void js_print_sink(const char *s, unsigned long n)
 }
 
 /* =========================================================================
+ * BROWSER2-IMG-0: <img> fetch + decode + cache + blit.
+ *
+ * The loader (load_images, below fetch_external_sheets) walks the DOM for
+ * <img src> after scripts ran and BEFORE layout, fetches each source
+ * (network pages: same resolve+GET path as stylesheets; offline/about:
+ * pages: absolute VFS paths read via SYS_OPEN/READ), decodes via imgcodec
+ * (PNG/GIF/BMP, every loop bounded, never writes past the cap), and caches
+ * the ARGB pixels keyed by the DOM node. Layout asks b2_img_dims() for the
+ * intrinsic size; paint blits the cache clipped to BOTH the (possibly
+ * width-clamped) layout box and the viewport. Any failure -> the entry is
+ * FAIL and paint draws a bordered placeholder instead: a missing or
+ * oversized image can never take the page down.
+ *
+ * Bounds: <= IMG_CACHE_MAX images per page; <= IMG_SRC_FILE_CAP encoded
+ * bytes per image; <= IMG_MAX_PIXELS decoded pixels per image (decode
+ * scratch malloc'd once, 4 MB).
+ * ========================================================================= */
+#include "../../lib/imgcodec/imgcodec.h"
+
+#define SYS_READ   2
+#define SYS_OPEN   4
+#define SYS_CLOSE  5
+
+#define IMG_CACHE_MAX     8
+#define IMG_SRC_CAP       160
+#define IMG_SRC_FILE_CAP  (96 * 1024)
+#define IMG_MAX_PIXELS    (1024 * 1024)   /* 1M px = 4 MB decoded cap */
+
+#define B2IMG_FAIL  0
+#define B2IMG_OK    1
+
+typedef struct {
+    const dom_node *node;            /* DOM <img> this entry decodes      */
+    char            src[IMG_SRC_CAP];
+    u32            *px;              /* malloc'd w*h ARGB, B2IMG_OK only  */
+    int             w, h;
+    int             state;           /* B2IMG_OK / B2IMG_FAIL             */
+} b2_img;
+
+static b2_img g_imgs[IMG_CACHE_MAX];
+static int    g_img_count = 0;
+/* decode scratch: STATIC (BSS), deliberately NOT malloc'd -- one less mmap
+ * in a process already implicated in the per-process initrd-aliasing bug. */
+static u32    g_img_scratch[IMG_MAX_PIXELS];
+static u8     g_img_file[IMG_SRC_FILE_CAP];
+static int    g_img_placeholders = 0;     /* placeholders painted (verdict) */
+
+/* Embedded acceptance fixtures (generated; see the header's banner for WHY
+ * the test page does not read these from the VFS). */
+#include "b2_img_fixtures.h"
+
+static int b2_streq(const char *a, const char *b)
+{
+    while (*a && *b) { if (*a != *b) return 0; a++; b++; }
+    return *a == *b;
+}
+
+static const b2_fixture_t *b2_fixture_find(const char *name)
+{
+    for (unsigned long i = 0; i < sizeof(B2_FIXTURES)/sizeof(B2_FIXTURES[0]); i++)
+        if (b2_streq(B2_FIXTURES[i].name, name)) return &B2_FIXTURES[i];
+    return (const b2_fixture_t *)0;
+}
+
+static const b2_img *img_cache_find(const struct dom_node *n)
+{
+    for (int i = 0; i < g_img_count; i++)
+        if (g_imgs[i].node == n) return &g_imgs[i];
+    return (const b2_img *)0;
+}
+
+static void img_cache_clear(void)
+{
+    for (int i = 0; i < g_img_count; i++) {
+        if (g_imgs[i].px) free(g_imgs[i].px);
+        g_imgs[i].px = (u32 *)0;
+        g_imgs[i].node = (const dom_node *)0;
+        g_imgs[i].state = B2IMG_FAIL;
+    }
+    g_img_count = 0;
+}
+
+/* Layout's intrinsic-dims provider: decoded images report their real size;
+ * everything else gets the engine's placeholder box. */
+static int b2_img_dims(const struct dom_node *n, int *w, int *h)
+{
+    const b2_img *im = img_cache_find(n);
+    if (!im || im->state != B2IMG_OK) return 0;
+    *w = im->w;
+    *h = im->h;
+    return 1;
+}
+
+/* Blit the decoded image at (x,y), clipped to the layout box (bw,bh), the
+ * chrome clip line, and the viewport. No scaling: a box narrower than the
+ * intrinsic width shows the left part (clipped, bounded). Fully transparent
+ * pixels are skipped; everything painted is forced opaque (no blending). */
+static void blit_image_clipped(i32 x, i32 y, i32 bw, i32 bh,
+                               const u32 *px, i32 iw, i32 ih)
+{
+    if (!px || iw <= 0 || ih <= 0) return;
+    i32 vw = bw < iw ? bw : iw;
+    i32 vh = bh < ih ? bh : ih;
+    i32 x1 = x < 0 ? 0 : x;
+    i32 y1 = y < g_clip_top ? g_clip_top : y;
+    i32 x2 = x + vw; if (x2 > VP_W) x2 = VP_W;
+    i32 y2 = y + vh; if (y2 > VP_H) y2 = VP_H;
+    for (i32 yy = y1; yy < y2; yy++) {
+        u32       *row  = g_fb + (u32)yy * VP_W;
+        const u32 *srow = px + (i64)(yy - y) * iw;
+        for (i32 xx = x1; xx < x2; xx++) {
+            u32 c = srow[xx - x];
+            if ((c >> 24) == 0) continue;          /* transparent: skip   */
+            row[xx] = c | 0xFF000000u;             /* force opaque        */
+        }
+    }
+}
+
+/* Failed/missing image: light box with a thin border (the classic broken-
+ * image placeholder). Uses fill_rect so it inherits all clipping. */
+static void draw_img_placeholder(i32 x, i32 y, i32 w, i32 h)
+{
+    fill_rect(x, y, w, h, 0xFFE6E6E6u);
+    fill_rect(x, y, w, 1, 0xFF999999u);
+    fill_rect(x, y + h - 1, w, 1, 0xFF999999u);
+    fill_rect(x, y, 1, h, 0xFF999999u);
+    fill_rect(x + w - 1, y, 1, h, 0xFF999999u);
+    g_img_placeholders++;
+}
+
+/* Bounded whole-file read from the VFS (initrd /etc fixtures, offline
+ * pages). Returns bytes read (>=0) or -1 when the file cannot be opened.
+ *
+ * STACK-BOUNCE (load-bearing): sys_read's kernel copy-out silently writes
+ * nothing when the destination is deep in this process's large (~11 MB)
+ * BSS -- it returns the exact byte count while the buffer stays zero
+ * (observed: blen exact, hdr=0,0,0,0; pre-touching the pages did NOT fix
+ * it). Stack destinations are proven good (modelbridge's recv buffers),
+ * so we read through a small stack window and copy up in user mode.
+ * Root-causing the kernel copy path is its own follow-up brick; this
+ * keeps BROWSER2-IMG-0 userspace-only. */
+static long b2_read_file(const char *path, u8 *buf, long cap)
+{
+    long fd = sc(SYS_OPEN, (i64)path, 0, 0, 0, 0, 0);
+    if (fd < 0) return -1;
+    long total = 0;
+    u8 bounce[1024];
+    for (int guard = 0; guard < 4096 && total < cap; guard++) {
+        long want = cap - total;
+        if (want > (long)sizeof(bounce)) want = (long)sizeof(bounce);
+        long n = sc(SYS_READ, fd, (i64)bounce, want, 0, 0, 0);
+        if (n <= 0) break;
+        for (long i = 0; i < n; i++) buf[total + i] = bounce[i];
+        total += n;
+    }
+    sc(SYS_CLOSE, fd, 0, 0, 0, 0, 0);
+    return total;
+}
+
+/* =========================================================================
  * DOM node counter (for bound check)
  * ========================================================================= */
 static int g_dom_node_count = 0;
@@ -544,6 +704,18 @@ static void paint_box(const layout_box *b)
             if (alpha > 0) {
                 fill_rect(bx, by, bw, bh, bg);
             }
+        }
+    }
+
+    /* Draw images for LB_IMAGE boxes (BROWSER2-IMG-0): decoded cache entry
+     * -> clipped blit; anything else -> bordered placeholder. */
+    if (b->kind == LB_IMAGE) {
+        if (bx < VP_W && by < VP_H && bx + bw > 0 && by + bh > 0) {
+            const b2_img *im = img_cache_find(b->node);
+            if (im && im->state == B2IMG_OK && im->px)
+                blit_image_clipped(bx, by, bw, bh, im->px, im->w, im->h);
+            else
+                draw_img_placeholder(bx, by, bw, bh);
         }
     }
 
@@ -840,6 +1012,127 @@ static void fetch_external_sheets(dom_document *doc, int page_is_network,
 }
 
 /* =========================================================================
+ * BROWSER2-IMG-0 loader: walk the DOM for <img src>, fetch + decode + cache.
+ * Network pages resolve src exactly like stylesheet hrefs; offline/about:
+ * pages read absolute VFS paths. Bounded: IMG_CACHE_MAX images, each capped
+ * at IMG_SRC_FILE_CAP encoded bytes and IMG_MAX_PIXELS decoded pixels.
+ * Every failure is a logged B2IMG_FAIL entry (paint -> placeholder).
+ * ========================================================================= */
+static void load_images(dom_document *doc, int page_is_network,
+                        const char *base_host, int base_port,
+                        int base_https, const char *base_path)
+{
+    img_cache_clear();
+    g_img_placeholders = 0;
+
+    dom_node *root = doc ? doc->root : (dom_node *)0;
+    if (!root) return;
+
+    #define IMG_WALK_STACK 64
+    dom_node *stack[IMG_WALK_STACK];
+    int top = 0;
+    stack[top++] = root;
+
+    while (top > 0) {
+        dom_node *n = stack[--top];
+        if (!n) continue;
+
+        if (n->type == DOM_NODE_ELEMENT && n->tag &&
+            n->tag[0] == 'i' && n->tag[1] == 'm' &&
+            n->tag[2] == 'g' && n->tag[3] == '\0') {
+            const char *src = dom_get_attribute(n, "src");
+            if (src && src[0] && g_img_count < IMG_CACHE_MAX) {
+                b2_img *im = &g_imgs[g_img_count++];
+                im->node  = n;
+                im->px    = (u32 *)0;
+                im->w     = 0;
+                im->h     = 0;
+                im->state = B2IMG_FAIL;
+                { int i = 0;
+                  while (src[i] && i < IMG_SRC_CAP - 1) { im->src[i] = src[i]; i++; }
+                  im->src[i] = 0; }
+
+                long blen = -1;
+                int  drc  = -999;   /* decode rc, for the failure log */
+                const u8 *bytes = g_img_file;
+                if (src[0]=='f' && src[1]=='i' && src[2]=='x' && src[3]=='t' &&
+                    src[4]=='u' && src[5]=='r' && src[6]=='e' && src[7]==':') {
+                    /* embedded fixture (the about:imgtest acceptance page) */
+                    const b2_fixture_t *fx = b2_fixture_find(src + 8);
+                    if (fx) { bytes = fx->data; blen = (long)fx->len; }
+                } else if (page_is_network) {
+                    char rh[HOST_CAP], rp[PATH_CAP];
+                    int  rport = 80, rhttps = 0;
+                    if (b2_resolve_href(src, base_host, base_port, base_https,
+                                        base_path, rh, HOST_CAP, &rport,
+                                        rp, PATH_CAP, &rhttps)) {
+                        int st = 0;
+                        blen = rhttps
+                            ? https_get(rh, (unsigned short)rport, rp,
+                                        (char *)g_img_file, IMG_SRC_FILE_CAP, &st)
+                            : http_get(rh, (unsigned short)rport, rp,
+                                       (char *)g_img_file, IMG_SRC_FILE_CAP, &st);
+                    }
+                } else if (src[0] == '/') {
+                    /* offline/about: page -> absolute VFS path (initrd).  */
+                    blen = b2_read_file(im->src, g_img_file, IMG_SRC_FILE_CAP);
+                }
+
+                if (blen > 0) {
+                    int iw = 0, ih = 0;
+                    int rc = img_decode(bytes, (unsigned long)blen,
+                                        g_img_scratch,
+                                        (unsigned long)IMG_MAX_PIXELS,
+                                        &iw, &ih);
+                    drc = rc;
+                    if (rc == 0 && iw > 0 && ih > 0) {
+                        unsigned long npx = (unsigned long)iw * (unsigned long)ih;
+                        u32 *keep = (u32 *)malloc(npx * 4u);
+                        if (keep) {
+                            for (unsigned long i = 0; i < npx; i++)
+                                keep[i] = g_img_scratch[i];
+                            im->px = keep;
+                            im->w  = iw;
+                            im->h  = ih;
+                            im->state = B2IMG_OK;
+                        }
+                    }
+                }
+
+                if (im->state == B2IMG_OK) {
+                    b2_puts("BROWSER2: img loaded ");
+                    b2_puts(im->src);
+                    b2_puts(" ");  b2_putnum((i64)im->w);
+                    b2_puts("x");  b2_putnum((i64)im->h);
+                    b2_puts("\n");
+                } else {
+                    b2_puts("BROWSER2: img failed ");
+                    b2_puts(im->src);
+                    b2_puts(" blen="); b2_putnum((i64)blen);
+                    b2_puts(" rc=");   b2_putnum((i64)drc);
+                    if (blen >= 4) {
+                        b2_puts(" hdr=");
+                        b2_putnum((i64)g_img_file[0]); b2_puts(",");
+                        b2_putnum((i64)g_img_file[1]); b2_puts(",");
+                        b2_putnum((i64)g_img_file[2]); b2_puts(",");
+                        b2_putnum((i64)g_img_file[3]);
+                    }
+                    b2_puts(" (placeholder)\n");
+                }
+            }
+        }
+
+        dom_node *children[64];
+        int ci = 0;
+        for (dom_node *c = n->first_child; c && ci < 64; c = c->next_sibling)
+            children[ci++] = c;
+        for (int i = ci - 1; i >= 0 && top < IMG_WALK_STACK; i--)
+            stack[top++] = children[i];
+    }
+    #undef IMG_WALK_STACK
+}
+
+/* =========================================================================
  * Page load: fetch URL -> DOM -> CSS -> run inline JS -> layout.
  *
  * Frees any prior doc/sheet/layout passed via the in/out pointers, then
@@ -888,11 +1181,34 @@ static int load_page(const char *url, js_vm *vm,
         "<div class=\"card\"><p>Type a URL or a search and press Enter.</p></div>"
         "</body></html>";
 
-    /* "about:" URLs are served from the built-in page. */
+    /* BROWSER2-IMG-0 acceptance page: local PNG/GIF/BMP fixtures (initrd
+     * /etc/imgtest, generated by scripts/gen_img_fixtures.py), one missing
+     * source (placeholder path), and one image wider than the viewport
+     * (bounded/clipped path). Deterministic, network-free. */
+    /* Sources use the embedded "fixture:" scheme: in-OS VFS reads of
+     * initrd-backed files return zeros inside mmap-heavy processes (the
+     * pre-existing per-process aliasing kernel bug recorded with this
+     * brick), so the acceptance page must not depend on them. missing.png
+     * exists in NEITHER the embedded set nor the initrd -> placeholder. */
+    static const char IMGTEST_HTML[] =
+        "<html><head><title>imgtest</title></head><body>"
+        "<h1>Image Test</h1>"
+        "<p>png</p><img src=\"fixture:t.png\">"
+        "<p>gif</p><img src=\"fixture:t.gif\">"
+        "<p>bmp</p><img src=\"fixture:t.bmp\">"
+        "<p>missing</p><img src=\"fixture:missing.png\">"
+        "<p>big</p><img src=\"fixture:big.png\">"
+        "<p>end</p>"
+        "</body></html>";
+
+    /* "about:" URLs are served from the built-in pages. */
     if (url[0]=='a' && url[1]=='b' && url[2]=='o' &&
         url[3]=='u' && url[4]=='t' && url[5]==':') {
+        const char *page = HOME_HTML;
+        if (b2_strncasecmp(url, "about:imgtest", 13) == 0 && url[13] == 0)
+            page = IMGTEST_HTML;
         int si = 0;
-        while (HOME_HTML[si] && si < BODY_CAP - 1) { g_body[si] = HOME_HTML[si]; si++; }
+        while (page[si] && si < BODY_CAP - 1) { g_body[si] = page[si]; si++; }
         g_body[si] = 0;
         body_len = si;
         *p_fetch_ok = 1;   /* built-in page counts as a successful load */
@@ -1055,6 +1371,13 @@ static int load_page(const char *url, js_vm *vm,
         }
     }
 
+    /* -- Images (BROWSER2-IMG-0): fetch + decode + cache BEFORE layout so
+     * the layout engine can size LB_IMAGE boxes from intrinsic dims. Runs
+     * after scripts (a script-inserted <img> is picked up too). Bounded;
+     * every failure becomes a placeholder, never a page failure. -- */
+    load_images(doc, page_is_network,
+                base_host, base_port, base_https, base_path);
+
     /* -- Layout -- */
     layout_box *layout = layout_compute(doc, sheet, VP_W);
     if (!layout) {
@@ -1199,6 +1522,10 @@ int main(int argc, char **argv)
 
     /* -- 3. JS engine (one VM, reused across reloads) -------------------- */
     js_vm *vm = js_new();
+
+    /* BROWSER2-IMG-0: register the intrinsic-dims provider BEFORE the first
+     * layout so <img> boxes get their decoded size (or the placeholder). */
+    layout_set_img_dims_provider(b2_img_dims);
 
     /* -- 4. Initial page load (fetch -> DOM -> CSS -> JS -> layout) ------ */
     dom_document   *doc    = (dom_document *)0;
@@ -1495,6 +1822,39 @@ int main(int argc, char **argv)
             b2_puts(" boxes for ");
             b2_puts(url);
             b2_puts("\n");
+
+            /* BROWSER2-IMG-0 verdict (about:imgtest only): every flag is
+             * checked against the post-paint cache --
+             *   png/gif/bmp    : the fixture decoded (B2IMG_OK)
+             *   missing_safe   : the missing source FAILED cleanly AND at
+             *                    least one placeholder was actually painted
+             *   bounded        : the big fixture decoded AND is wider than
+             *                    the viewport (so layout clamped its box and
+             *                    the blit clipped it), page still painted
+             */
+            if (b2_strncasecmp(url, "about:imgtest", 13) == 0 && url[13] == 0) {
+                int f_png = 0, f_gif = 0, f_bmp = 0, f_missing = 0, f_bounded = 0;
+                for (int i = 0; i < g_img_count; i++) {
+                    const b2_img *im = &g_imgs[i];
+                    const char *s = im->src;
+                    if (b2_streq(s, "fixture:t.png")       && im->state == B2IMG_OK) f_png = 1;
+                    if (b2_streq(s, "fixture:t.gif")       && im->state == B2IMG_OK) f_gif = 1;
+                    if (b2_streq(s, "fixture:t.bmp")       && im->state == B2IMG_OK) f_bmp = 1;
+                    if (b2_streq(s, "fixture:missing.png") && im->state != B2IMG_OK) f_missing = 1;
+                    if (b2_streq(s, "fixture:big.png")     && im->state == B2IMG_OK
+                                                           && im->w >= VP_W)         f_bounded = 1;
+                }
+                int f_missing_safe = (f_missing && g_img_placeholders > 0);
+                int img_ok = (f_png && f_gif && f_bmp && f_missing_safe && f_bounded);
+                b2_puts("BROWSER2-IMG: ");
+                b2_puts(img_ok ? "PASS" : "FAIL");
+                b2_puts(" png=");          b2_puts(f_png ? "1" : "0");
+                b2_puts(" gif=");          b2_puts(f_gif ? "1" : "0");
+                b2_puts(" bmp=");          b2_puts(f_bmp ? "1" : "0");
+                b2_puts(" missing_safe="); b2_puts(f_missing_safe ? "1" : "0");
+                b2_puts(" bounded=");      b2_puts(f_bounded ? "1" : "0");
+                b2_puts("\n");
+            }
             reported = 1;
         }
 

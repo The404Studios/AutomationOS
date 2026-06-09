@@ -313,6 +313,11 @@ cc userspace/apps/js/js.c /tmp/js.o; $LD /tmp/crt0.o /tmp/js.o $JS_OBJS /tmp/lst
 # disjoint additions over the existing tree -- the legacy `browser` stays.
 # ----------------------------------------------------------------------------
 echo "[all] browser wave: DOM/HTML/CSS/Layout libs + selftests..."
+# BROWSER2-IMG-0: generate the embedded fixture header BEFORE browser2 compiles
+# (the same bytes also go into the initrd during staging, below; the embedded
+# copies exist because in-OS VFS reads of initrd-backed files return zeros in
+# mmap-heavy processes -- the per-process aliasing kernel bug, own brick).
+python3 scripts/gen_img_fixtures.py /tmp/imgfx_hdr userspace/apps/browser2/b2_img_fixtures.h
 cc userspace/libc/malloc.c              /tmp/lmalloc.o
 cc userspace/libc/syscall.c             /tmp/lsyscall.o
 cc userspace/lib/dom/dom.c              /tmp/dom.o
@@ -353,10 +358,12 @@ $LD /tmp/crt0.o /tmp/webtest.o $WEB_OBJS $JS_OBJS $JS_WEB_OBJS $HTTPS_OBJS -o /t
 # browser2: GUI browser that renders DOM + runs <script> tags (full pipeline + HTTPS + wl/font).
 # browser2_ui.o / browser2_anim.o: the chrome/toolbar UI + tab-strip animation
 # helpers (split out so the render core stays focused); both link into browser2.
+# BROWSER2-IMG-0: + the imgcodec decoders (PNG/GIF/BMP) for <img> rendering
+# (inflate comes from $HTTPS_OBJS' deflate.o -- do NOT add it twice).
 cc userspace/apps/browser2/browser2.c       /tmp/browser2.o
 cc userspace/apps/browser2/browser2_ui.c    /tmp/browser2_ui.o
 cc userspace/apps/browser2/browser2_anim.c  /tmp/browser2_anim.o
-$LD /tmp/crt0.o /tmp/browser2.o $WEB_OBJS $JS_OBJS $JS_WEB_OBJS $HTTPS_OBJS /tmp/wlc.o /tmp/bf.o /tmp/browser2_ui.o /tmp/browser2_anim.o -o /tmp/browser2.elf
+$LD /tmp/crt0.o /tmp/browser2.o $WEB_OBJS $JS_OBJS $JS_WEB_OBJS $HTTPS_OBJS /tmp/img_bmp.o /tmp/img_png.o /tmp/img_gif.o /tmp/img_codec.o /tmp/wlc.o /tmp/bf.o /tmp/browser2_ui.o /tmp/browser2_anim.o -o /tmp/browser2.elf
 # webapitest: pure JS web-API selftest (timers/fetch/storage/console/url). Links
 # the same web+JS+HTTPS object set as webtest (js_fetch.o references http/https).
 cc userspace/apps/webapitest/webapitest.c /tmp/webapitest.o
@@ -579,6 +586,9 @@ cp /tmp/chainhost.elf /tmp/ird/sbin/chainhost
 cp /tmp/modelbridge.elf /tmp/ird/sbin/modelbridge
 # TOOLSET-0 test fixture: a small file with KNOWN content (15 bytes) for read_file/stat.
 mkdir -p /tmp/ird/etc && printf 'TOOLSET-0-FILE\n' > /tmp/ird/etc/toolset0.txt
+# BROWSER2-IMG-0 fixtures: deterministic PNG/GIF/BMP (+ a wider-than-viewport
+# big.png) for the about:imgtest acceptance page; missing.png stays missing.
+python3 scripts/gen_img_fixtures.py /tmp/ird/etc/imgtest
 cp /tmp/floattest.elf /tmp/ird/sbin/floattest
 cp /tmp/sleeptest.elf /tmp/ird/sbin/sleeptest
 # prioritytest -> /sbin (init spawns it after the boot storm drains). Proves

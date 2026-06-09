@@ -131,6 +131,11 @@ static int ed_in_string_or_comment(struct Ide* a) {
 static void ed_ac_refresh(struct Ide* a) {
     a->editor.ac_navigated = 0;   /* typing re-opens/narrows: re-arm Enter=newline */
     if (!g_autocomplete) { a->editor.ac_active = 0; a->editor.ac_count = 0; return; }
+    /* IDE-REPAIR-0 I2: while a snippet's ${N} tab-stops are live, Tab/Enter
+     * belong to FIELD NAVIGATION. Re-opening the popup here made Tab accept a
+     * completion instead of jumping fields, deleting the field text and
+     * breaking the snippet. Suppress completion until the snippet settles. */
+    if (a->editor.snippet_active) { a->editor.ac_active = 0; a->editor.ac_count = 0; return; }
     ac_extract_prefix(a);
     if (ed_in_string_or_comment(a)) { a->editor.ac_active = 0; a->editor.ac_count = 0; return; }
     complete_refresh(a);

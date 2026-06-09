@@ -2,7 +2,26 @@
 
 > Warm memory. Refresh per checkpoint. One active brick at a time.
 
-## MODEL-BRIDGE-0 (ACTIVE) — replace the stub seam with an external model transport
+## BROWSER2-IMG-0 (ACTIVE) — `<img>` rendering in browser2 from code already in-tree
+- **branch:** `brick/browser2-img-0` (off the frozen `brick/model-bridge-0` HEAD) · **record:**
+  `bricks/BROWSER2-IMG-0.md` (to write)
+- **why (user's call):** highest visible return for the least architectural risk. The 5-agent audit
+  found `<img>` never renders even though `userspace/lib/imgcodec/{png,gif,bmp}.c` decoders, the
+  HTTP/TLS fetch, and the layout/paint pipeline all already exist in-tree. "AutomationOS can browse
+  real pages better" — without touching dangerous hardware init.
+- **scope (user-set, narrow):** HTML `<img>` support ONLY — fetch the image resource, sniff the type,
+  decode via imgcodec, create an `LB_IMAGE` layout box, paint the bitmap during the render pass,
+  fallback placeholder on failure. **HARD NO's:** no CSS overhaul, no JS, no forms, no JPEG (unless
+  already trivial), no network-stack rewrite, no engine replacement.
+- **acceptance:** local test page with PNG/GIF/BMP `<img>` → browser2 renders text + images; missing
+  image → placeholder/clean failure; large image bounded/clipped, no panic; desktop clean; 0 panic.
+  Proof: `BROWSER2-IMG: PASS png=1 gif=1 bmp=1 missing_safe=1 bounded=1`.
+- **after this (user-set order):** net-stack Phase 1 → E1000-PCH-0 → TOOL-AUTH-0 / TOOL-RESULT-0 →
+  real llama.cpp model bridge. Native Wi-Fi stays PARKED (travel-router client-bridge + hardened
+  wired NIC is the route).
+- **status:** OPEN.
+
+## MODEL-BRIDGE-0 — FROZEN / COMPLETE (pushed to origin `ceeb886`) — the seam fed by an external model transport
 - **branch:** `brick/model-bridge-0` (off the frozen `brick/chainlayer-host-0` HEAD `7553849`) · **record:**
   `bricks/MODEL-BRIDGE-0.md` (to write)
 - **why:** CHAINLAYER-HOST-0 proved the model↔host↔tool↔model plumbing with a deterministic stub at the
@@ -28,9 +47,12 @@
   `MODELBRIDGE: PASS select_parse=1 policy_ok=1 read_exact=1 answer_exact=1 malformed_model_rejected=1
   bad_tool_rejected=1` + the stub's log shows all four exchanges crossed the wire; whole rail green
   (CHAINHOST/TOOLSET/AGENTHOST/TOOLRUN/RPCTEST/[CHAN]); kernel unchanged; `mbcheck.png` clean, 0 panic.
-  Verify: `build_test/modelbridge_verify.sh`. record: `bricks/MODEL-BRIDGE-0.md`. Committed local,
-  awaiting review/push OK. **Next (user gate):** MODEL-LOOP-0 (first bounded multi-step loop) · swap
-  the stub for a real llama.cpp/GGUF server on the same port · multi-line observation framing.
+  Verify: `build_test/modelbridge_verify.sh`. record: `bricks/MODEL-BRIDGE-0.md`. Pushed (`ceeb886`,
+  ls-remote verified).
+- **user verdict on freeze:** approved; the verify script staying IN the feat commit is deliberate —
+  "this brick's proof depends on a host-side TCP stub, so the harness is part of the milestone, not
+  disposable scratch." Later (after BROWSER2-IMG-0 + net Phase 1 + E1000-PCH-0): TOOL-AUTH-0 /
+  TOOL-RESULT-0 · the real llama.cpp/GGUF bridge behind the same port · MODEL-LOOP-0.
 
 ## CHAINLAYER-HOST-0 — FROZEN / COMPLETE (pushed to origin `7553849`) — the first full chainlayer host milestone
 - **branch:** `brick/chainlayer-host-0` (off the frozen `brick/toolset-0` HEAD `6ff7be0`) · **record:**

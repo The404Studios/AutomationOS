@@ -2,8 +2,20 @@
 
 > Warm memory. Refresh per checkpoint. One active brick at a time.
 
-## CHANNEL-0 — capability-backed shared-ring channel primitive
-- **branch:** `brick/channel-0` (off `t410-recovery`) · **spec:** `docs/superpowers/specs/2026-06-08-channel-0-design.md`
+## TERMINAL-0 (ACTIVE) — make CHANNEL-0 console output human-stable
+- **branch:** `brick/terminal-0` (off `brick/channel-0`) · **spec:** `docs/superpowers/specs/2026-06-09-terminal-0-design.md`
+- **why:** CHANNEL-0 P4 made external output appear, but messy (after-prompt, no scrollback, half-built
+  line editing, escapes-as-boxes). Make it human-stable BEFORE the typed agent rail (AGENT-RPC-0).
+- **checkpoints (one commit each):** **T0** output-before-next-prompt (waitpid-lite: defer the prompt
+  until the bound child exits, poll `SYS_WAITPID` WNOHANG each frame, bounded await) ← do first ·
+  T1 scrollback ring · T2 line-editing cleanup (cursor_pos + Left/Right/Home/End/Del, kill `[TERM] key`
+  spam) · T3 minimal ANSI/VT (SGR color first — `grid_color[][]` substrate exists) · T4 delete ~3000
+  lines dead terminal code. ALL userspace (`terminal_m3.c`); does NOT touch the kernel primitive.
+- **status:** branch + spec created; T0 next. Acceptance: free output before prompt; echo/cc clean;
+  scrollback preserves output; builtins work; P1–P4 CHANNEL-0 selftests pass; desktop + 0 panic.
+
+## CHANNEL-0 — FROZEN / COMPLETE (P0–P4, pushed to origin)
+- **branch:** `brick/channel-0` (PUSHED, commit `1dd5107`) · **spec:** `docs/superpowers/specs/2026-06-08-channel-0-design.md`
 - **record:** [`bricks/CHANNEL-0.md`](bricks/CHANNEL-0.md)
 - **goal:** one kernel primitive (handle → shared rings) = our StdIO model + the structured-tool rail.
 - **build order:** P0 handle table · P1 ring + `ch_*` syscalls + self-test · P2 spawn binds child

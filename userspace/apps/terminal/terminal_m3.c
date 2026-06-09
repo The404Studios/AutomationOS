@@ -418,6 +418,96 @@ static void grid_backspace(void) {
     }
 }
 
+/* =========================================================================
+ *  TERMINAL-0 T3: minimal ANSI/VT SGR colour parser
+ *
+ *  ANSI is not output -- it is state mutation. This parser sits BEFORE
+ *  grid_putchar: printable bytes are written with the current SGR colour, and
+ *  SGR escape sequences mutate that colour instead of leaking into scrollback
+ *  as visible junk. Scope is deliberately tiny: foreground colour only --
+ *  ESC[0m reset, ESC[30-37m / ESC[90-97m colours, ESC[39m default, ESC[1m
+ *  bold/bright. No cursor movement, no clear-screen, no alternate screen.
+ *  The CSI parameter buffer is bounded (overflow safely resets to TEXT).
+ * ========================================================================= */
+enum { ANSI_TEXT, ANSI_ESC, ANSI_CSI };
+static int  g_ansi_state = ANSI_TEXT;
+static char g_ansi_buf[32];              /* CSI parameter bytes (bounded)     */
+static int  g_ansi_len;
+static u32  g_ansi_color = FG_COLOR;     /* current SGR foreground            */
+static int  g_ansi_bold;                 /* bold/bright flag                  */
+
+/* 8-colour palettes (ARGB), index 0..7 = black..white. Tuned for the dark bg
+ * (FG_COLOR on BG_COLOR): "black" is a visible grey, not pure 0. */
+static const u32 ansi_pal[8] = {
+    0xFF606060u, 0xFFE05050u, 0xFF50C878u, 0xFFE0C050u,   /* blk red grn yel */
+    0xFF6090E0u, 0xFFC060C0u, 0xFF50C0C0u, 0xFFD8E0E8u,   /* blu mag cyn wht */
+};
+static const u32 ansi_pal_bright[8] = {
+    0xFF909090u, 0xFFFF7878u, 0xFF80F0A0u, 0xFFFFE878u,   /* bright variants */
+    0xFF90B8FFu, 0xFFE890E8u, 0xFF90E8E8u, 0xFFFFFFFFu,
+};
+
+/* Apply the collected SGR parameters (g_ansi_buf[0..g_ansi_len)) to g_ansi_color. */
+static void ansi_apply_sgr(void) {
+    if (g_ansi_len == 0) { g_ansi_color = FG_COLOR; g_ansi_bold = 0; return; } /* bare ESC[m == reset */
+    int i = 0;
+    while (i < g_ansi_len) {
+        int val = 0, have = 0;
+        while (i < g_ansi_len && g_ansi_buf[i] >= '0' && g_ansi_buf[i] <= '9') {
+            val = val * 10 + (g_ansi_buf[i] - '0'); have = 1; i++;
+            if (val > 100000) val = 100000;             /* clamp -- no overflow */
+        }
+        if (i < g_ansi_len && g_ansi_buf[i] == ';') i++; /* skip separator      */
+        if (!have) { val = 0; }                          /* empty param == 0    */
+        if (val == 0)            { g_ansi_color = FG_COLOR; g_ansi_bold = 0; }
+        else if (val == 1)       { g_ansi_bold = 1;        /* retro-brighten a base colour set earlier */
+            for (int k = 0; k < 8; k++) if (g_ansi_color == ansi_pal[k]) { g_ansi_color = ansi_pal_bright[k]; break; } }
+        else if (val == 39)      { g_ansi_color = FG_COLOR; }
+        else if (val >= 30 && val <= 37) g_ansi_color = g_ansi_bold ? ansi_pal_bright[val - 30] : ansi_pal[val - 30];
+        else if (val >= 90 && val <= 97) g_ansi_color = ansi_pal_bright[val - 90];
+        /* any other code (backgrounds, 999, cursor params, ...) is ignored */
+    }
+}
+
+/* Feed one byte through the parser. */
+static void ansi_consume(char c) {
+    switch (g_ansi_state) {
+    case ANSI_ESC:
+        if (c == '[') { g_ansi_state = ANSI_CSI; g_ansi_len = 0; }
+        else g_ansi_state = ANSI_TEXT;        /* not a CSI -- discard ESC + this byte */
+        return;
+    case ANSI_CSI:
+        if ((c >= '0' && c <= '9') || c == ';') {
+            if (g_ansi_len < (int)sizeof(g_ansi_buf)) g_ansi_buf[g_ansi_len++] = c;
+            else g_ansi_state = ANSI_TEXT;     /* overflow -- bounded reset       */
+        } else if (c >= 0x40 && c <= 0x7E) {   /* final byte                      */
+            if (c == 'm') ansi_apply_sgr();    /* only SGR is in scope            */
+            g_ansi_state = ANSI_TEXT;
+        } else {
+            g_ansi_state = ANSI_TEXT;          /* stray control byte -- abort     */
+            if (c == '\n' || c == '\t') { g_cur_color = g_ansi_color; grid_putchar(c); }
+        }
+        return;
+    default: /* ANSI_TEXT */
+        if (c == 0x1B) { g_ansi_state = ANSI_ESC; return; }   /* ESC */
+        g_cur_color = g_ansi_color;
+        grid_putchar(c);
+        return;
+    }
+}
+
+/* Write a run of (possibly ANSI-bearing) bytes -- the one sink for child/tool
+ * output. Escapes mutate colour state; printables land in the grid coloured. */
+static void term_write(const char *buf, int n) {
+    for (int i = 0; i < n; i++) ansi_consume(buf[i]);
+}
+
+/* Reset the parser + colour state to default (call between commands so a child
+ * that left colour set can't bleed into the next command's output). */
+static void ansi_reset(void) {
+    g_ansi_state = ANSI_TEXT; g_ansi_len = 0; g_ansi_color = FG_COLOR; g_ansi_bold = 0;
+}
+
 /* Write a NUL-terminated string through the grid, honouring '\n' and '\t'. */
 static void grid_puts(const char *s) {
     for (; *s; s++) grid_putchar(*s);
@@ -3615,7 +3705,7 @@ void _start(void) {
             char cbuf[512];
             int drained = 0, n;
             while (drained < 4096 && (n = ch_read(g_child_ch, cbuf, sizeof(cbuf))) > 0) {
-                for (int i = 0; i < n; i++) grid_putchar(cbuf[i]);
+                term_write(cbuf, n);          /* T3: ANSI-aware sink (colour, no junk) */
                 drained += n;
                 dirty = 1;
             }
@@ -3629,9 +3719,10 @@ void _start(void) {
                     /* final drain of the now-dead child's ring (bounded by the
                      * ring capacity -- the child writes no more) so no tail is lost */
                     while ((n = ch_read(g_child_ch, cbuf, sizeof(cbuf))) > 0)
-                        for (int i = 0; i < n; i++) grid_putchar(cbuf[i]);
+                        term_write(cbuf, n);  /* T3: ANSI-aware sink (colour, no junk) */
                     ch_close(g_child_ch);
                     g_child_ch = 0; g_child_pid = 0; g_await_child = 0;
+                    ansi_reset();            /* T3: next command starts at default colour */
                     shell_prompt();          /* the deferred prompt -- AFTER the output */
                     dirty = 1;
                 }

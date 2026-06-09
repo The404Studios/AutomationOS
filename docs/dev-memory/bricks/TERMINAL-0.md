@@ -86,6 +86,34 @@ checkpoints:
       smoke_proves_claim: true          # screenshot shows a correct mid-line insert result (aXbc)
       raw_pointers_or_truncation: none  # line_buf bounded LINE_MAX-1; redraw clips to g_cols
     verdict: pass
+  - id: T3
+    title: minimal ANSI/VT SGR colour -- a thin parser BEFORE grid_putchar (ANSI = state mutation)
+    files: [userspace/apps/terminal/terminal_m3.c]
+    tests: [build_test/shot.sh]
+    result: "build_all clean; SCREENSHOT (screenshots/t3check.png) shows a term_write() demo -- 'red' renders red, 'green' green, 'red-then-bold' (ESC[31;1m) bright red, 'unknown-seq-ok' (ESC[999m) in DEFAULT colour with no junk; NO escape bytes appear as text. final clean build (t3final.png) with the temp demo removed = no-regression desktop"
+    design:
+      - ANSI is not output, it is state mutation: a 3-state parser (ANSI_TEXT/ESC/CSI) sits BEFORE
+        grid_putchar. printable byte -> g_cur_color = g_ansi_color; grid_putchar(c). SGR 'm' final
+        -> ansi_apply_sgr() mutates g_ansi_color. escape bytes never enter scrollback as junk.
+      - scope is colour ONLY: ESC[0m reset, ESC[30-37m / ESC[90-97m fg, ESC[39m default, ESC[1m bold
+        (retro-brightens a base colour so ESC[31;1m and ESC[1;31m both = bright red). NO cursor move,
+        NO clear-screen, NO alt-screen, NO control chaos. maps onto the existing g_cur_color/sb_color
+        u32 substrate via two 8-entry palettes (base + bright), tuned for the dark bg.
+      - bounded: the CSI param buffer is 32 bytes; overflow resets the parser to TEXT (no unbounded
+        parse). unknown final bytes / codes (ESC[999m, cursor params, backgrounds) are ignored safely.
+      - one sink: the child-output drain (both the per-frame drain and the post-exit final drain) now
+        routes through term_write() instead of raw grid_putchar; ansi_reset() runs when the child exits
+        so colour can't bleed into the next command. builtins/prompt keep their explicit grid_puts_color
+        (no ANSI), so the prompt stays default and line editing is unchanged.
+    review:
+      default_build_changed: false      # only child output now ANSI-parsed; builtins/prompt unchanged
+      all_waits_bounded: true           # CSI buffer 32B, overflow->reset; parser is O(1)/byte
+      touches_userspace: true
+      touches_kernel: false
+      preserves_known_good_t410: true
+      smoke_proves_claim: true          # screenshot: coloured words render, escapes gone, ESC[999m sane
+      raw_pointers_or_truncation: none  # g_ansi_buf bounded 32; palette indices range-checked (30-37/90-97)
+    verdict: pass
 next_checkpoints:
-  - T3 minimal ANSI/VT (SGR color first) | T4 delete dead terminal code
+  - T4 delete dead terminal code (the ~3,000 lines now superseded by the T0-T3 active path)
 ```

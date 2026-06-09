@@ -5343,8 +5343,16 @@ void _start(void) {
     /* M8: initial scan of /Desktop so compiled programs show as icons */
     desk_scan();
 
-    /* M8: welcome notification toast */
-    toast_show("AutomationOS M8 — right dock ready", 3500);
+    /* M8: the welcome toast is REMOVED (was: toast_show("AutomationOS M8 —
+     * right dock ready", 3500)). On the T410 it presented as the top-right
+     * "flashing square with changing text": the box never left the screen
+     * (expiry only takes effect when a post-expiry recomposite is actually
+     * PRESENTED -- an idle desktop never presents that frame, so the last
+     * presented frame keeps the toast forever) and per-second clock repaints
+     * made its fade alpha jump around. The em-dash also rendered as garbage
+     * glyphs (multi-byte UTF-8 through the 8x16 ASCII font). The toast
+     * machinery (toast_show/render_toast) stays for future notifications;
+     * any future caller must also fix the present-on-expiry gap. */
 
 #ifdef SELFHEAL
     /* Attach + publish the liveness heartbeat before the loop starts beating it. */

@@ -94,13 +94,36 @@ static int is_empty_block(const void* block) {
 
 /**
  * Initialize initrd subsystem
+ *
+ * INITRD-ALIAS-0: `addr` arrives as the initrd's PHYSICAL address (the boot
+ * rescue copy at 16 MiB). The old code kept it verbatim and read the initrd
+ * through the LOW IDENTITY map -- but user ELF images load at VA 0x800000
+ * and a big image (browser2 grew past 15 MB of BSS) extends past VA 16 MiB,
+ * so the loader's private zero-filled pages SHADOW the initrd identity
+ * range in that process's page tables. Every kernel read of initrd-backed
+ * data (vfs inode->data, initrd_get_file -> ELF loads) performed on that
+ * process's CR3 then returns the process's own zeroes: exact byte counts,
+ * all-zero content (the BROWSER2-IMG-0 zero-read bug).
+ *
+ * Fix: hold the DIRECT-MAP alias instead (PML4[256], supervisor-only,
+ * shared BY REFERENCE into every CR3, never split, never user-shadowable).
+ * Everything downstream -- tar parsing, zero-copy inode->data pointers,
+ * initrd_get_file -- inherits the safe address. The PMM keeps reserving
+ * the raw PHYSICAL range (kernel.c passes boot_info->initrd_addr there
+ * unchanged), so frames are protected AND the mapping is unshadowable.
+ * Single-core safe: pure VA selection at boot, no hardware touched.
  */
 void initrd_init(uint64_t addr, uint64_t size) {
-    initrd_addr = addr;
+    if (addr && addr < DIRECT_MAP_SPAN) {
+        initrd_addr = (uint64_t)PHYS_TO_DIRECT(addr);
+    } else {
+        initrd_addr = addr;   /* out of direct-map span: keep as-is (boots) */
+    }
     initrd_size = size;
     initrd_mounted = 0;
 
-    kprintf("[INITRD] Initrd at 0x%016lx, size %lu bytes\n", addr, size);
+    kprintf("[INITRD] Initrd phys 0x%016lx -> direct-map 0x%016lx, size %lu bytes\n",
+            addr, initrd_addr, size);
 }
 
 /**

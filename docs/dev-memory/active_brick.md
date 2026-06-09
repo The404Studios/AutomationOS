@@ -2,7 +2,21 @@
 
 > Warm memory. Refresh per checkpoint. One active brick at a time.
 
-## AGENT-RPC-0 (ACTIVE) — the typed-tool rail on top of CHANNEL-0 (the chainlayer2 north star)
+## AGENT-HOST-0 (ACTIVE) — make a tiny agent actually RIDE the AGENT-RPC-0 rail
+- **branch:** `brick/agent-host-0` (off the frozen `brick/agent-rpc-0` HEAD `9460446`) · **record:**
+  [`bricks/AGENT-HOST-0.md`](bricks/AGENT-HOST-0.md)
+- **why:** the kernel/user IPC rail is finished (CHANNEL-0 + AGENT-RPC-0). The open question is no longer
+  "can the OS do more plumbing?" but "can an agent issue `TOOL_RUN`, get `TOOL_RESULT`, accept the
+  `stdout_token`, read the EXACT stdout, and make a DECISION?" — the first real "AI-OS" milestone.
+- **scope (one host loop):** a userspace `agent_host` drives one full round trip — send `TOOL_RUN{path,
+  argv}` → receive `TOOL_RESULT` → accept `stdout_token` → read stdout → render a STRUCTURED verdict
+  (`path_ok` / `argv_ok` / `stdout_exact` / `exit`) → plus a malformed `TOOL_RUN` is rejected. **HARD
+  NO's:** no networking, no model inference, no async batching, no complex tool registry.
+- **acceptance:** `AGENTHOST: PASS path_ok=1 argv_ok=1 stdout_exact=1 exit=0` (runs `echoargs` with an
+  argv vector, reads exact stdout via the P6c capability) + `malformed_rejected=1`; desktop 0 panic.
+- **status:** STARTING.
+
+## AGENT-RPC-0 — FROZEN / COMPLETE (P6a–P6d, pushed to origin `9460446`) — the typed-tool rail
 - **branch:** `brick/agent-rpc-0` (off the published `brick/terminal-0` HEAD `47a2bc0`) · **spec (P5/P6):**
   `docs/superpowers/specs/2026-06-08-channel-0-design.md` · **record:** [`bricks/AGENT-RPC-0.md`](bricks/AGENT-RPC-0.md)
 - **why:** now that the console is human-stable (TERMINAL-0), give the agent a TYPED rail — framed

@@ -7,7 +7,7 @@
 
 ```yaml
 brick: AGENT-RPC-0
-status: in-progress
+status: complete   # P6a schema -> P6b path-only runner -> P6c stdout capability -> P6d argv vector. PUSHED 9460446. The typed tool rail.
 branch: brick/agent-rpc-0
 base: brick/terminal-0            # off the published TERMINAL-0 HEAD (47a2bc0); CHANNEL-0 substrate included
 request: >

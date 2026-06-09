@@ -408,16 +408,6 @@ static void grid_putchar(char ch) {
     if (cur_col >= g_cols) grid_newline();
 }
 
-/* Erase the character left of the cursor on the current (head) line. */
-static void grid_backspace(void) {
-    if (cur_col > 0) {
-        cur_col--;
-        int s = sb_slot(sb_head);
-        sb[s][cur_col] = ' ';
-        sb_color[s][cur_col] = CLR_DEFAULT;
-    }
-}
-
 /* =========================================================================
  *  TERMINAL-0 T3: minimal ANSI/VT SGR colour parser
  *

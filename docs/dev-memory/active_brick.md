@@ -50,8 +50,12 @@
   `ro=1`); ACK handshake so the runner outlives the accept. Renamed `stdout_handle→stdout_token`. Serial
   `TOOLRUN: PASS … agent_read=17 exact=1 ro=1 dblaccept_deny=1 bogus_deny=1` + `RUNNER: PASS grant=1
   ctrl_deny=1 inv_deny=1 norights_deny=1 wrongpid_deny=1 enospc=1`. All prior selftests green;
-  `p6cfinal.png` clean, 0 panic. **Next: P6d** — argv (NUL-separated, validated; no shell). P6c committed
-  local, awaiting review/push.
+  `p6cfinal.png` clean, 0 panic. **P6c PUSHED** (`47ee247`, ls-remote verified) and **FROZEN as the
+  capability/security checkpoint** — the grant/accept primitive (CH_BYTE-only, READ-only, MASTER-end,
+  to_pid-bound, one-shot, bounded, death-swept) is locked; nothing downstream should loosen it.
+  **Next: P6d** — argv as NUL-separated bytes, bounded + validated, NO shell, NO PATH lookup, path stays
+  explicit. Law: **argv is a vector, not a command line.** Separate ABI/parsing brick (kept off the
+  capability brick so a parsing failure can't be confused with a capability failure).
 
 ## TERMINAL-0 — FROZEN / COMPLETE (T0–T4, pushed to origin `935f54f`) — CHANNEL-0 console output human-stable
 - **branch:** `brick/terminal-0` (off `brick/channel-0`), **PUSHED** `git push origin brick/terminal-0`

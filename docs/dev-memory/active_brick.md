@@ -15,8 +15,17 @@
 - **acceptance:** agenthost lists a dir · stats a file · reads a small file EXACTLY · runs echoargs ·
   malformed tool request rejected · oversize read rejected · path-traversal rejected (explicit policy) ·
   desktop 0 panic.
-- **status:** DESIGN (presenting the architecture for sign-off, then implement).
-- **then:** CHAINLAYER-HOST-0 — a local/API model chooses among these typed tools.
+- **status:** **LANDED (`bb9bbdf`).** Tools = small sandboxed programs over the rail: `sbin/tool_read`
+  (stat-first; `>256 B` → reject, else exact bytes), `sbin/tool_ls` (opendir/readdir≤32, no recursion),
+  `sbin/tool_stat` (`size=<n> type=<f|d>`), + `echoargs`/run. Trust surface = `sbin/toolset_host`:
+  name-whitelist (`resolve_tool`) + path policy (`bad_path`: reject empty/`..`) → dispatch only a known
+  program; stdout returns via the P6c capability, read exactly. Serial `TOOLSET: PASS ls=1 stat=1
+  read_exact=1 run=1 unknown_rejected=1 malformed_rejected=1 oversize_rejected=1 traversal_rejected=1`
+  (fixture `/etc/toolset0.txt`, 15 B). `SYS_READDIR` returns 0=entry (found+fixed). No kernel change;
+  whole rail green; `tsfinal.png` clean, 0 panic. Policy = traversal-denial NOT a jail (→ TOOL-AUTH-0);
+  plain-text results (→ TOOL-RESULT-0). record: `bricks/TOOLSET-0.md`. NOT pushed (awaiting review).
+- **then:** **CHAINLAYER-HOST-0** — a local/API model chooses among these typed tools (the chainlayer2
+  host agent). Later: TOOL-AUTH-0 (root allowlists / per-tool authority) · TOOL-RESULT-0 (typed results).
 
 ## AGENT-HOST-0 — FROZEN / COMPLETE (pushed to origin `19e96c3`) — the first agent riding the rail
 - **branch:** `brick/agent-host-0` (off the frozen `brick/agent-rpc-0` HEAD `9460446`) · **record:**

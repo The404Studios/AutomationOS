@@ -18,6 +18,7 @@
 #define SYS_CH_RECVMSG 103
 #define SYS_CH_GRANT   104
 #define SYS_CH_ACCEPT  105
+#define SYS_SPAWN_EX_ARGV 106
 
 /* ch_create flags */
 #define CH_BYTE       0x0001u
@@ -69,6 +70,17 @@ static inline int ch_close(int h) {
  */
 static inline long spawn_ex(const char *path, const char *args, int stdin_h, int stdout_h, int stderr_h) {
     return _ch_sc(SYS_SPAWN_EX, (long)path, (long)args, (long)stdin_h, (long)stdout_h, (long)stderr_h, 0);
+}
+/*
+ * spawn_ex_argv(path, argv_buf, argv_len, ...): AGENT-RPC-0 P6d explicit VECTOR
+ * spawn. argv_buf holds argv[1..] as NUL-separated bytes (length argv_len); each
+ * entry is passed to the child INTACT (no whitespace split, no shell). argv[0] is
+ * the explicit `path`. argv_len 0 => no extra args (== spawn_ex with "").
+ */
+static inline long spawn_ex_argv(const char *path, const void *argv_buf, unsigned argv_len,
+                                 int stdin_h, int stdout_h, int stderr_h) {
+    return _ch_sc(SYS_SPAWN_EX_ARGV, (long)path, (long)argv_buf, (long)argv_len,
+                  (long)stdin_h, (long)stdout_h, (long)stderr_h);
 }
 
 /* ---- CHANNEL-0 P5b: typed message packets (CH_MSG channels) ----

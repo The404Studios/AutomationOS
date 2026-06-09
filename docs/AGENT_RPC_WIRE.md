@@ -40,8 +40,18 @@ msg_packet_t { type, flags, len, request_id }  +  payload[len]
 | `path_len` | u32            | used bytes of `path[]`, `1..TOOL_PATH_MAX-1`        |
 | `args_len` | u32            | used bytes of `args[]`, `0..TOOL_ARGS_MAX-1`        |
 | `reserved` | u32            | 0                                                  |
-| `path`     | char[120]      | tool path, NUL-terminated within the buffer        |
-| `args`     | char[256]      | space-separated args string, NUL-terminated        |
+| `path`     | char[120]      | tool path, NUL-terminated within the buffer (this is `argv[0]`) |
+| `args`     | char[256]      | **P6d: `argv[1..]` as a NUL-separated VECTOR** — `"e0\0e1\0…\0"` (see below) |
+
+**`args` is a vector, not a command line (P6d).** Each entry is a separate
+`argv` element passed to the tool **intact** — there is no whitespace split, no
+shell, no PATH lookup. `path` is always `argv[0]`; `args` carries the *extra*
+entries `argv[1..]` only (never `argv[0]`, so there is no duplicated path state).
+A multi-word entry (`"hello world"`) stays one arg; shell metacharacters
+(`;|&$`) ride through as literal bytes. The runner spawns the tool with
+`SYS_SPAWN_EX_ARGV(path, args, args_len, …)` — a **dedicated** syscall, distinct
+from the legacy command-line `SYS_SPAWN_EX`, so the boundary is loud in the
+syscall table.
 
 ### `TOOL_RESULT` (`type = 0x0102`, payload = `tool_result_t`, 16 bytes)
 
@@ -87,6 +97,21 @@ A receiver rejects a payload unless **all** hold:
 
 Encoding rejects an over-long `path`/`args` with `AR_E_TOOLONG`.
 
+### argv-vector rules (`argv_validate`, P6d)
+
+When `args` is used as the `argv[1..]` vector, the runner additionally requires:
+
+| case | result |
+|---|---|
+| `args_len == 0` | `AR_OK` — no extra args (path-only still works) |
+| `args_len >= TOOL_ARGS_MAX` | `AR_E_FIELD` (over cap) |
+| `args[args_len-1] != 0` | `AR_E_NUL` (missing final NUL) |
+| an empty entry (`\0\0` / leading `\0`) | `AR_E_EMPTYARG` |
+| more than `TOOL_ARGV_MAX` entries | `AR_E_FIELD` (too many args) |
+| shell metacharacters in an entry | **accepted** — passed as literal bytes, never interpreted |
+
+The law: **argv is a vector, not a command line.**
+
 ## Status
 
 - **P6a — DONE:** schema + `tool_run_encode/validate`, `tool_result_encode/validate`,
@@ -108,7 +133,14 @@ Encoding rejects an over-long `path`/`args` with `AR_E_TOOLONG`.
   `RUNNER: PASS grant=1 ctrl_deny=1 inv_deny=1 norights_deny=1 wrongpid_deny=1
   enospc=1`. Grants from/to a dead process are swept (no leaked refs). NOT general
   fd passing.
-- **P6d — NEXT:** argv — `args` as NUL-separated argv bytes, validated (reject
-  empty `arg0`, missing final NUL, malformed empty entries). Still no shell. Kept
-  separate from P6c so an ABI/parsing failure can't be confused with a capability
-  failure.
+- **P6d — DONE:** argv as a VECTOR. `args` = NUL-separated `argv[1..]`; a
+  **dedicated** `SYS_SPAWN_EX_ARGV(path, argv_buf, argv_len, stdin, stdout, stderr)`
+  spawns the tool with `argv[0]=path` and each `args` entry **intact** (split only
+  on NUL — no whitespace split, no shell, no PATH lookup). `argv_validate` enforces
+  the matrix above. Proof `sbin/toolrun` + `sbin/echoargs`: `TOOL_RUN{path=
+  "sbin/echoargs", args="hello world\0a;b|c\0"}` → serial `TOOLRUN: PASS …
+  agent_read=32 exact=1 vector=1 …` (the multi-word arg stayed one arg + the
+  metacharacters are literal), plus `RPCTEST … argv(zero=1,ok=1,nonul=1,empty=1,
+  many=1,cap=1)`. `SYS_SPAWN`/`SYS_SPAWN_EX` unchanged. (P6c capability and P6d
+  parsing were deliberately separate bricks so a capability failure and an
+  ABI/parsing failure can never be confused.)

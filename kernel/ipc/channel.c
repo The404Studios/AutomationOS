@@ -383,18 +383,12 @@ void channel_install_spawn_stdio(struct process* child) {
     }
 }
 
-/*
- * sys_spawn_ex(path, args, stdin_h, stdout_h, stderr_h) -- additive spawn that
- * binds the child's fd0/fd1/fd2 to channels. The handles are the PARENT's master
- * handles (must hold CH_R_TRANSFER); the child receives the SLAVE end with
- * narrowed rights (stdin READ, stdout/stderr WRITE) -- the master end is never
- * leaked into the child. A 0 handle leaves that fd unbound (serial/ps2 fallback,
- * unchanged). SYS_SPAWN itself is untouched.
- */
-int64_t sys_spawn_ex(uint64_t path, uint64_t args, uint64_t stdin_h, uint64_t stdout_h, uint64_t stderr_h, uint64_t a6) {
-    (void)a6;
-    process_t* cur = process_get_current();
-    uint64_t hin[3] = { stdin_h, stdout_h, stderr_h };
+/* Stage g_exec_stdio[] from the parent's master handles (each must hold
+ * CH_R_TRANSFER); the child receives the SLAVE end with narrowed rights (stdin
+ * READ, stdout/stderr WRITE). Returns 0, or a negative errno after rolling back
+ * any refs already taken. Shared by sys_spawn_ex and sys_spawn_ex_argv. */
+static int stage_spawn_stdio(process_t* cur, uint64_t in_h, uint64_t out_h, uint64_t err_h) {
+    uint64_t hin[3] = { in_h, out_h, err_h };
     for (int fd = 0; fd < 3; fd++) {
         g_exec_stdio[fd].ch = (channel_t*)0;
         g_exec_stdio[fd].end = CH_END_SLAVE;
@@ -410,13 +404,63 @@ int64_t sys_spawn_ex(uint64_t path, uint64_t args, uint64_t stdin_h, uint64_t st
         g_exec_stdio[fd].ch = ch;
         g_exec_stdio[fd].rights = (fd == 0) ? CH_R_READ : CH_R_WRITE;
     }
-    /* delegate to the normal spawn; on success elf_load_and_exec consumes the
-     * bindings (channel_install_spawn_stdio), transferring the refs to the child. */
-    extern int64_t sys_spawn(uint64_t,uint64_t,uint64_t,uint64_t,uint64_t,uint64_t);
-    int64_t pid = sys_spawn(path, args, 0, 0, 0, 0);
-    /* spawn failed before install -> release the refs we staged (no leak) */
+    return 0;
+}
+/* Release any stdio refs still staged (spawn failed before install -> no leak). */
+static void clear_spawn_stdio(void) {
     for (int fd = 0; fd < 3; fd++)
         if (g_exec_stdio[fd].ch) { channel_unref(g_exec_stdio[fd].ch); g_exec_stdio[fd].ch = (channel_t*)0; }
+}
+
+/*
+ * sys_spawn_ex(path, args, stdin_h, stdout_h, stderr_h) -- additive spawn that
+ * binds the child's fd0/fd1/fd2 to channels. `args` is the legacy command-line
+ * string (whitespace-split into argv). The handles are the PARENT's master
+ * handles (must hold CH_R_TRANSFER); the child receives the SLAVE end with
+ * narrowed rights. SYS_SPAWN itself is untouched.
+ */
+int64_t sys_spawn_ex(uint64_t path, uint64_t args, uint64_t stdin_h, uint64_t stdout_h, uint64_t stderr_h, uint64_t a6) {
+    (void)a6;
+    process_t* cur = process_get_current();
+    int rc = stage_spawn_stdio(cur, stdin_h, stdout_h, stderr_h);
+    if (rc != 0) return rc;
+    extern int64_t sys_spawn(uint64_t,uint64_t,uint64_t,uint64_t,uint64_t,uint64_t);
+    int64_t pid = sys_spawn(path, args, 0, 0, 0, 0);       /* legacy string args */
+    clear_spawn_stdio();
+    return pid;
+}
+
+/*
+ * sys_spawn_ex_argv(path, argv_buf, argv_len, stdin_h, stdout_h, stderr_h) --
+ * AGENT-RPC-0 P6d: the EXPLICIT VECTOR spawn. argv_buf holds argv[1..] as
+ * NUL-separated bytes (length argv_len); each entry is kept intact (no whitespace
+ * split, no shell, no PATH lookup) and argv[0] is the explicit `path`. A SEPARATE
+ * syscall (not an overload of sys_spawn_ex) so the vector ABI is loud in the
+ * table: command-line spawn != argv-vector spawn. SYS_SPAWN/SYS_SPAWN_EX unchanged.
+ */
+int64_t sys_spawn_ex_argv(uint64_t path, uint64_t argv_buf, uint64_t argv_len,
+                          uint64_t stdin_h, uint64_t stdout_h, uint64_t stderr_h) {
+    process_t* cur = process_get_current();
+    extern char g_exec_spawn_argv[256];
+    extern int  g_exec_spawn_argv_len;
+    g_exec_spawn_argv_len = 0;
+    uint32_t n = (uint32_t)argv_len;
+    if (n > 0) {
+        if (n > 255) return E2BIG;                         /* bounded vector buffer */
+        /* copy the NUL-bearing vector NOW, under the caller's CR3 (before sys_spawn
+         * switches to the kernel CR3 for the initrd lookup). */
+        if (copy_from_user(g_exec_spawn_argv, (const void*)argv_buf, n) != COPY_SUCCESS)
+            return EFAULT;
+        g_exec_spawn_argv_len = (int)n;
+    }
+    int rc = stage_spawn_stdio(cur, stdin_h, stdout_h, stderr_h);
+    if (rc != 0) { g_exec_spawn_argv_len = 0; return rc; }
+    extern int64_t sys_spawn(uint64_t,uint64_t,uint64_t,uint64_t,uint64_t,uint64_t);
+    int64_t pid = sys_spawn(path, 0, 0, 0, 0, 0);          /* NO string args -> exec uses the vector */
+    clear_spawn_stdio();
+    /* Always clear: on success exec already consumed the vector; on failure (or the
+     * rare no-stack-frame fallback) it must NOT leak into the next normal spawn. */
+    g_exec_spawn_argv_len = 0;
     return pid;
 }
 

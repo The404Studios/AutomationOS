@@ -26,6 +26,7 @@
 /* Bounded inline buffers so a whole packet stays well under one ring page. */
 #define TOOL_PATH_MAX 120
 #define TOOL_ARGS_MAX 256
+#define TOOL_ARGV_MAX 16    /* P6d: max entries in argv[1..] (the extra-args vector) */
 
 /* Per-message flags (reserved now; P6b will define real ones). */
 #define TOOL_F_NONE  0x0000u
@@ -69,6 +70,7 @@ typedef struct tool_result {
 #define AR_E_LEN     (-3)   /* payload length != sizeof(struct)  */
 #define AR_E_FIELD   (-4)   /* a length field is out of range    */
 #define AR_E_NUL     (-5)   /* path/args not NUL-terminated      */
+#define AR_E_EMPTYARG (-6)  /* P6d: an empty argv entry (\0\0)   */
 
 /* ---- tiny freestanding helpers (no libc) ---- */
 static unsigned ar_slen_(const char* s){ unsigned n=0; while(s&&s[n]) n++; return n; }
@@ -103,6 +105,46 @@ static int tool_run_validate(const tool_run_t* t, unsigned payload_len) {
     if (t->args_len >= TOOL_ARGS_MAX)             return AR_E_FIELD;
     if (t->path[t->path_len] != 0)                return AR_E_NUL;
     if (t->args[t->args_len] != 0)                return AR_E_NUL;
+    return AR_OK;
+}
+
+/* ---- P6d: argv as a VECTOR (the args field = NUL-separated argv[1..]) ----
+ * argv[0] is always the explicit `path`; the args buffer holds the EXTRA entries
+ * only -- never arg0 (no duplicated path state). Build N entries into out->args
+ * as "e0\0e1\0...\0" and set args_len (incl. all NULs). Each entry must be
+ * non-empty; the whole thing must fit TOOL_ARGS_MAX. Returns AR_OK / AR_E_*. */
+static int tool_run_set_argv(tool_run_t* out, const char* const* entries, int n) {
+    if (!out) return AR_E_FIELD;
+    if (n > TOOL_ARGV_MAX) return AR_E_FIELD;
+    unsigned pos = 0;
+    for (int i = 0; i < n; i++) {
+        unsigned l = ar_slen_(entries[i]);
+        if (l == 0) return AR_E_EMPTYARG;                 /* no empty argv entries */
+        if (pos + l + 1 > TOOL_ARGS_MAX) return AR_E_TOOLONG;
+        ar_copy_(out->args + pos, entries[i], l); pos += l;
+        out->args[pos++] = 0;                              /* NUL separator (incl. the last) */
+    }
+    out->args_len = pos;                                   /* total bytes, includes all NULs */
+    return AR_OK;
+}
+
+/* Validate the args field as argv[1..] (P6d). args_len==0 is valid (no extra
+ * args / path-only). Otherwise: within cap, NUL-terminated, no empty entry, and
+ * at most TOOL_ARGV_MAX entries. Shell metacharacters are NOT inspected -- they
+ * ride through as literal bytes (argv is a vector, not a command line). */
+static int argv_validate(const tool_run_t* t) {
+    if (!t) return AR_E_FIELD;
+    if (t->args_len == 0) return AR_OK;                    /* no extra args */
+    if (t->args_len >= TOOL_ARGS_MAX)         return AR_E_FIELD;  /* over cap        */
+    if (t->args[t->args_len - 1] != 0)        return AR_E_NUL;    /* missing final NUL */
+    unsigned i = 0, count = 0;
+    while (i < t->args_len) {
+        unsigned s = i;
+        while (i < t->args_len && t->args[i] != 0) i++;    /* one entry [s, i) */
+        if (i == s) return AR_E_EMPTYARG;                  /* empty entry (\0\0 / leading \0) */
+        i++;                                               /* skip the NUL separator */
+        if (++count > TOOL_ARGV_MAX) return AR_E_FIELD;    /* too many args */
+    }
     return AR_OK;
 }
 

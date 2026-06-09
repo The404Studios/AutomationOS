@@ -30,8 +30,11 @@
 #define MSG_ACK   0x0ACu
 #define RUN_REQ_ID 0xC0FFEE
 
-static const char MARKER[] = "AGENT-RPC-0-PROOF";   /* 17 bytes, must match echoproof */
-#define MARKER_LEN 17
+/* P6d: echoargs prints argv[0..] one per line. With path="sbin/echoargs" and the
+ * argv vector ["hello world","a;b|c"], argv[0]="sbin/echoargs" + the two extra
+ * entries -> this EXACT 32-byte echo (a multi-word arg + metacharacters intact). */
+static const char EXPECT[] = "sbin/echoargs\nhello world\na;b|c\n";
+#define EXPECT_LEN 32
 
 static unsigned slen(const char* s){ unsigned n=0; while(s&&s[n]) n++; return n; }
 static void outfd(int fd, const char* s){
@@ -48,6 +51,13 @@ static void decfd(int fd, long v){
 static void yield(void){ _ch_sc(SYS_YIELD,0,0,0,0,0,0); }
 static long getpid(void){ return _ch_sc(SYS_GETPID,0,0,0,0,0,0); }
 static int eqn(const char* a, const char* b, unsigned n){ for(unsigned i=0;i<n;i++) if(a[i]!=b[i]) return 0; return 1; }
+/* substring search in a length-bounded buffer (the buffer is not NUL-terminated) */
+static int contains(const char* hay, unsigned hn, const char* needle){
+    unsigned nn = slen(needle);
+    if (nn == 0 || nn > hn) return 0;
+    for (unsigned i = 0; i + nn <= hn; i++) if (eqn(hay + i, needle, nn)) return 1;
+    return 0;
+}
 static unsigned parse_pid(const char* s){ /* "r:<pid>" -> pid */
     unsigned v=0; while(*s && *s!=':') s++; if(*s==':') s++;
     while(*s>='0'&&*s<='9'){ v=v*10+(unsigned)(*s-'0'); s++; } return v;
@@ -63,14 +73,19 @@ static int runner_mode(unsigned agent_pid) {
         outfd(2,"RUNNER: FAIL recvmsg\n"); return 1;
     }
     if (!got){ outfd(2,"RUNNER: FAIL no-request\n"); return 1; }
+    /* P6d: path + an argv VECTOR. tool_run_validate covers path/len/cap/NUL;
+     * argv_validate covers the argv[1..] structure (final NUL, no empty entries,
+     * <= TOOL_ARGV_MAX). args_len==0 is allowed (path-only). reserved must be 0. */
     if (hdr.type!=MSG_TOOL_RUN || hdr.len!=sizeof(tool_run_t) ||
-        tool_run_validate(&tr,hdr.len)!=AR_OK || tr.args_len!=0 || tr.reserved!=0){
+        tool_run_validate(&tr,hdr.len)!=AR_OK || argv_validate(&tr)!=AR_OK || tr.reserved!=0){
         outfd(2,"RUNNER: FAIL validate\n"); return 1;
     }
 
     int out = ch_create(CH_BYTE, CH_PAGE);
     if (out<=0){ outfd(2,"RUNNER: FAIL ch_create\n"); return 1; }
-    long tpid = spawn_ex(tr.path, "", 0, out, 0);          /* tool stdout -> out (slave) */
+    /* explicit VECTOR spawn: argv[0]=tr.path, argv[1..]=tr.args (NUL-separated,
+     * intact -- no whitespace split, no shell). stdout -> out (slave end). */
+    long tpid = spawn_ex_argv(tr.path, tr.args, tr.args_len, 0, out, 0);
     if (tpid<=0){ outfd(2,"RUNNER: FAIL spawn\n"); ch_close(out); return 1; }
 
     /* wait for the tool to finish writing -- do NOT drain (the agent reads it) */
@@ -134,7 +149,11 @@ static int agent_mode(void) {
     long pid = spawn_ex("sbin/toolrun", arg, ctrl, ctrl, 0);
     if (pid<=0){ outfd(1,"TOOLRUN: FAIL spawn-runner\n"); ch_close(ctrl); return 1; }
 
-    tool_run_t tr; tool_run_encode(&tr, "sbin/echoproof", "");   /* PATH ONLY (args_len=0) */
+    /* P6d: path + an argv VECTOR (argv[1..]) -- a multi-word arg and shell
+     * metacharacters, to prove they survive intact (not split, not interpreted). */
+    tool_run_t tr; tool_run_encode(&tr, "sbin/echoargs", "");
+    const char* av[2] = { "hello world", "a;b|c" };
+    tool_run_set_argv(&tr, av, 2);
     ch_msg_hdr hdr; hdr.type=MSG_TOOL_RUN; hdr.flags=0; hdr.len=sizeof(tr); hdr.request_id=RUN_REQ_ID;
     int sent = (ch_sendmsg(ctrl,&hdr,&tr) == (int)(sizeof(ch_msg_hdr)+sizeof(tr)));
 
@@ -144,20 +163,24 @@ static int agent_mode(void) {
     int rid_ok  = got && rh.request_id==RUN_REQ_ID;
     int valid   = got && rh.len==sizeof(tool_result_t) && tool_result_validate(&res,rh.len)==AR_OK;
 
-    int accept_ok=0, agent_read=0, exact=0, ro=0, dbl_deny=0, bogus_deny=0;
+    int accept_ok=0, agent_read=0, exact=0, vector=0, ro=0, dbl_deny=0, bogus_deny=0;
     if (valid){
         int rh_handle = ch_accept((int)res.stdout_token);     /* token -> read-only handle */
         accept_ok = (rh_handle > 0);
         if (accept_ok){
-            char buf[64]; int total=0, n;
+            char buf[80]; int total=0, n;
             for (long i=0;i<2000000;i++){
                 n = ch_read(rh_handle, buf+total, (unsigned long)(sizeof(buf)-total));
-                if (n>0){ total+=n; if(total>=MARKER_LEN) break; continue; }
+                if (n>0){ total+=n; if(total>=EXPECT_LEN) break; continue; }
                 yield();
                 if (i>4) break;                                /* bytes are pre-buffered */
             }
             agent_read = total;
-            exact = (total==MARKER_LEN && eqn(buf, MARKER, MARKER_LEN));
+            exact = (total==EXPECT_LEN && eqn(buf, EXPECT, EXPECT_LEN));
+            /* the argv VECTOR survived: the multi-word arg stayed ONE line and the
+             * metacharacters are literal (independent of the full byte-exact match) */
+            vector = (contains(buf, (unsigned)total, "hello world\n") &&
+                      contains(buf, (unsigned)total, "a;b|c\n"));
             ro  = (ch_write(rh_handle, "x", 1) < 0);            /* read-only: write denied  */
             dbl_deny   = (ch_accept((int)res.stdout_token) == CH_EBADF);   /* one-shot consumed */
             bogus_deny = (ch_accept(200) == CH_EBADF);          /* slot out of range        */
@@ -169,7 +192,7 @@ static int agent_mode(void) {
     ch_msg_hdr ack; ack.type=MSG_ACK; ack.flags=0; ack.len=0; ack.request_id=RUN_REQ_ID;
     ch_sendmsg(ctrl, &ack, (const void*)0);
 
-    int ok = (sent && got && type_ok && rid_ok && valid && accept_ok && exact && ro && dbl_deny && bogus_deny);
+    int ok = (sent && got && type_ok && rid_ok && valid && accept_ok && exact && vector && ro && dbl_deny && bogus_deny);
     outfd(1,"TOOLRUN: "); outfd(1, ok?"PASS":"FAIL");
     outfd(1," sent=");       outfd(1, sent?"1":"0");
     outfd(1," result=");     outfd(1, got?"1":"0");
@@ -179,6 +202,7 @@ static int agent_mode(void) {
     outfd(1," accept=");     outfd(1, accept_ok?"1":"0");
     outfd(1," agent_read="); decfd(1, agent_read);
     outfd(1," exact=");      outfd(1, exact?"1":"0");
+    outfd(1," vector=");     outfd(1, vector?"1":"0");
     outfd(1," ro=");         outfd(1, ro?"1":"0");
     outfd(1," dblaccept_deny="); outfd(1, dbl_deny?"1":"0");
     outfd(1," bogus_deny=");     outfd(1, bogus_deny?"1":"0");

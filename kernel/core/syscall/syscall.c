@@ -235,6 +235,9 @@ void syscall_init(void) {
         extern int64_t sys_ch_accept(uint64_t,uint64_t,uint64_t,uint64_t,uint64_t,uint64_t);
         syscall_table[SYS_CH_GRANT]  = sys_ch_grant;
         syscall_table[SYS_CH_ACCEPT] = sys_ch_accept;
+        // P6d: explicit argv-vector spawn (separate from the command-line SYS_SPAWN_EX).
+        extern int64_t sys_spawn_ex_argv(uint64_t,uint64_t,uint64_t,uint64_t,uint64_t,uint64_t);
+        syscall_table[SYS_SPAWN_EX_ARGV] = sys_spawn_ex_argv;
     }
 
 #if defined(SMP_FOUNDATION) && !defined(SMP_SCHED_DISPATCH)

@@ -135,6 +135,9 @@ cc userspace/apps/toolrun/toolrun.c /tmp/toolrun.o; $LD /tmp/crt0.o /tmp/toolrun
 # echoproof: deterministic 17-byte stdout for the P6c capability proof (spawned
 # by the toolrun runner; the agent byte-compares the exact bytes it reads).
 cc userspace/apps/echoproof/echoproof.c /tmp/echoproof.o; $LD /tmp/crt0.o /tmp/echoproof.o -o /tmp/echoproof.elf
+# echoargs: prints its argv (one entry per line) for the P6d vector proof (spawned
+# by the toolrun runner via SYS_SPAWN_EX_ARGV; the agent verifies argv arrived intact).
+cc userspace/apps/echoargs/echoargs.c /tmp/echoargs.o; $LD /tmp/crt0.o /tmp/echoargs.o -o /tmp/echoargs.elf
 # floattest: proves ring-3 float/SSE at runtime (scalar + 2x2 matmul + reduction).
 cc userspace/apps/floattest/floattest.c /tmp/floattest.o; $LD /tmp/crt0.o /tmp/floattest.o -o /tmp/floattest.elf
 # sleeptest: proves SYS_SLEEP is a real, ms-granularity, BLOCKING sleep (measures
@@ -500,7 +503,7 @@ $LD /tmp/crt0.o /tmp/cc.o \
     -o /tmp/cc.elf
 
 echo "[all] canary check (all must be 0):"
-for e in comp init filemanager calculator clock sysinfo settings sysmon uidemo dateapp applauncher taskman terminal editor snake paint synth tetris game2048 sheet notes calendar stopwatch mines piano dashboard welcome bench breakout pong invaders procmon soundtest solitaire aiconsole screenshot stress musicplayer ide bubbletd zombietd pacman clockapp forktest threadtest reaploop matmuljobs aibroker sed awk tar pkg make meminfo argvtest msgtest rpctest toolrun echoproof floattest sleeptest prioritytest matbench tensortest cpuburn blk ps kill free uptime find diff cmp tee wcx xargs gzip cc nettest sockettest cpu1offload smpstress wget netman browser cryptotest libtest ping nc netinfo netscan tcping dig httpget pktmon httpd traceroute arp grep head tail sort uniq cut tr nl du touch basename dirname uname hostname whoami date less hexdump lspci tlsprobe certtool dhcpc autodhcp apidemo js futextest epolltest sendfiletest perftest batchtest domtest htmltest csstest layouttest webtest browser2 webapitest cube3d ray chess asteroids sudoku photos startmenu controlcenter gametest; do
+for e in comp init filemanager calculator clock sysinfo settings sysmon uidemo dateapp applauncher taskman terminal editor snake paint synth tetris game2048 sheet notes calendar stopwatch mines piano dashboard welcome bench breakout pong invaders procmon soundtest solitaire aiconsole screenshot stress musicplayer ide bubbletd zombietd pacman clockapp forktest threadtest reaploop matmuljobs aibroker sed awk tar pkg make meminfo argvtest msgtest rpctest toolrun echoproof echoargs floattest sleeptest prioritytest matbench tensortest cpuburn blk ps kill free uptime find diff cmp tee wcx xargs gzip cc nettest sockettest cpu1offload smpstress wget netman browser cryptotest libtest ping nc netinfo netscan tcping dig httpget pktmon httpd traceroute arp grep head tail sort uniq cut tr nl du touch basename dirname uname hostname whoami date less hexdump lspci tlsprobe certtool dhcpc autodhcp apidemo js futextest epolltest sendfiletest perftest batchtest domtest htmltest csstest layouttest webtest browser2 webapitest cube3d ray chess asteroids sudoku photos startmenu controlcenter gametest; do
     n=$(objdump -d /tmp/$e.elf 2>/dev/null | grep -c "fs:0x28" || true)
     echo "  $e=$n"
 done
@@ -543,6 +546,8 @@ cp /tmp/rpctest.elf /tmp/ird/sbin/rpctest
 cp /tmp/toolrun.elf /tmp/ird/sbin/toolrun
 # echoproof -> /sbin (spawned by the toolrun runner; P6c deterministic stdout).
 cp /tmp/echoproof.elf /tmp/ird/sbin/echoproof
+# echoargs -> /sbin (spawned by the toolrun runner; P6d argv-vector echo).
+cp /tmp/echoargs.elf /tmp/ird/sbin/echoargs
 cp /tmp/floattest.elf /tmp/ird/sbin/floattest
 cp /tmp/sleeptest.elf /tmp/ird/sbin/sleeptest
 # prioritytest -> /sbin (init spawns it after the boot storm drains). Proves

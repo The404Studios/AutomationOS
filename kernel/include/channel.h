@@ -126,5 +126,7 @@ int64_t sys_ch_recvmsg(uint64_t handle, uint64_t hdr, uint64_t payload, uint64_t
  * grant_id (>0); accept(grant_id) -> a read-only local handle for the target pid. */
 int64_t sys_ch_grant (uint64_t handle, uint64_t to_pid, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6);
 int64_t sys_ch_accept(uint64_t grant_id, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6);
+/* P6d: explicit argv-vector spawn (argv_buf = NUL-separated argv[1..]; argv[0]=path). */
+int64_t sys_spawn_ex_argv(uint64_t path, uint64_t argv_buf, uint64_t argv_len, uint64_t stdin_h, uint64_t stdout_h, uint64_t stderr_h);
 
 #endif /* CHANNEL_H */

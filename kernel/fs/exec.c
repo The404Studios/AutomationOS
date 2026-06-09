@@ -232,6 +232,15 @@ static void elf_cleanup_failed_load(process_t* proc) {
  * BSS-zeroed, so the very first (init) load with no spawn sees "" -> argv=[name]. */
 char g_exec_spawn_args[256];
 
+/* AGENT-RPC-0 P6d: an explicit argv VECTOR for the next exec, set by
+ * SYS_SPAWN_EX_ARGV. When g_exec_spawn_argv_len > 0, g_exec_spawn_argv holds the
+ * extra entries argv[1..] as NUL-separated bytes (each entry kept intact -- split
+ * ONLY on NUL, never on whitespace), and the legacy whitespace-split of
+ * g_exec_spawn_args is bypassed. argv[0] is always the explicit `name` (path).
+ * Consumed (length zeroed) when the argv frame is built. */
+char g_exec_spawn_argv[256];
+int  g_exec_spawn_argv_len;
+
 int elf_load_and_exec(void* elf_data, size_t elf_size, const char* name) {
     if (!elf_data || elf_size == 0 || !name) {
         EXEC_LOG("[EXEC] Invalid parameters to elf_load_and_exec\n");
@@ -721,8 +730,26 @@ int elf_load_and_exec(void* elf_data, size_t elf_size, const char* name) {
                 argv_uva[argc++] = u; cur = u;
             }
         }
-        /* argv[1..] = whitespace-separated tokens of g_exec_spawn_args. */
-        {
+        /* argv[1..]: P6d -- if an explicit argv VECTOR was staged, split ONLY on
+         * NUL (each entry intact: multi-word args + shell metacharacters survive
+         * as literal bytes). Otherwise, the legacy whitespace-split of the
+         * command-line string. The two are mutually exclusive (SYS_SPAWN_EX_ARGV
+         * stages the vector AND leaves g_exec_spawn_args empty). */
+        if (g_exec_spawn_argv_len > 0) {
+            const char* a = g_exec_spawn_argv;
+            int n = g_exec_spawn_argv_len, i = 0;
+            while (i < n && argc < EXEC_MAX_ARGS) {
+                int s = i;
+                while (i < n && a[i] != '\0') i++;          /* one entry [s, i)        */
+                uint64_t l = (uint64_t)(i - s);
+                uint64_t u = (cur - (l + 1)) & ~0x7ULL;
+                if (u <= pfloor + (uint64_t)(argc + 4) * 8) break;
+                for (uint64_t k = 0; k < l; k++) U2P(u)[k] = a[s + k];
+                U2P(u)[l] = '\0';
+                argv_uva[argc++] = u; cur = u;
+                i++;                                        /* skip the NUL separator  */
+            }
+        } else {
             const char* a = g_exec_spawn_args;
             int i = 0;
             while (a[i] && argc < EXEC_MAX_ARGS) {
@@ -749,6 +776,7 @@ int elf_load_and_exec(void* elf_data, size_t elf_size, const char* name) {
         stack_ptr = frame_uva;
         #undef U2P
         g_exec_spawn_args[0] = '\0';   // consume: don't leak args to the next spawn
+        g_exec_spawn_argv_len = 0;     // consume the P6d vector too
         EXEC_LOG("[EXEC] Stack setup complete, RSP=0x%016lx argc=%d argv0=\"%s\"\n",
                 stack_ptr, argc, name);
     } else {

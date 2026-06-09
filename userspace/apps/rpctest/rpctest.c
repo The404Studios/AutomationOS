@@ -57,7 +57,25 @@ int main(void) {
     tool_result_t bad_r = res; bad_r.version = 99;
     int rej_res = (tool_result_validate(&bad_r, sizeof(bad_r)) == AR_E_VERSION);
 
-    ok = ok && rej_len && rej_ver && rej_fld && rej_enc && rej_res;
+    /* P6d: argv (NUL-separated argv[1..]) validation matrix */
+    tool_run_t av; tool_run_encode(&av, "sbin/echoargs", "");
+    int av_zero = (argv_validate(&av) == AR_OK);                /* args_len==0 -> OK (path-only) */
+    const char* two[2] = { "hello world", "a;b|c" };
+    int av_build = (tool_run_set_argv(&av, two, 2) == AR_OK);
+    int av_ok = (argv_validate(&av) == AR_OK);                  /* a valid vector */
+    tool_run_t av_nn = av; av_nn.args[av_nn.args_len - 1] = 'X'; /* clobber the final NUL */
+    int av_nonul = (argv_validate(&av_nn) == AR_E_NUL);        /* missing final NUL -> reject */
+    tool_run_t av_e; tool_run_encode(&av_e, "x", "");
+    av_e.args[0] = 'a'; av_e.args[1] = 0; av_e.args[2] = 0; av_e.args_len = 3;  /* "a\0\0" */
+    int av_empty = (argv_validate(&av_e) == AR_E_EMPTYARG);    /* empty entry -> reject */
+    tool_run_t av_m; tool_run_encode(&av_m, "x", "");
+    { int p = 0; for (int k = 0; k < TOOL_ARGV_MAX + 1; k++) { av_m.args[p++] = 'a'; av_m.args[p++] = 0; } av_m.args_len = p; }
+    int av_many = (argv_validate(&av_m) == AR_E_FIELD);        /* too many args -> reject */
+    tool_run_t av_c = av; av_c.args_len = TOOL_ARGS_MAX;        /* >= cap */
+    int av_cap = (argv_validate(&av_c) == AR_E_FIELD);         /* over cap -> reject */
+    int argv_all = (av_zero && av_build && av_ok && av_nonul && av_empty && av_many && av_cap);
+
+    ok = ok && rej_len && rej_ver && rej_fld && rej_enc && rej_res && argv_all;
 
     out("RPCTEST: "); out(ok ? "PASS" : "FAIL");
     out(" v=");       putdec(AGENT_RPC_VERSION);
@@ -68,6 +86,12 @@ int main(void) {
     out(",fld=");     out(rej_fld?"1":"0");
     out(",enc=");     out(rej_enc?"1":"0");
     out(",resver=");  out(rej_res?"1":"0");
+    out(") argv(zero="); out(av_zero?"1":"0");
+    out(",ok=");      out(av_ok?"1":"0");
+    out(",nonul=");   out(av_nonul?"1":"0");
+    out(",empty=");   out(av_empty?"1":"0");
+    out(",many=");    out(av_many?"1":"0");
+    out(",cap=");     out(av_cap?"1":"0");
     out(")\n");
     return ok ? 0 : 1;
 }

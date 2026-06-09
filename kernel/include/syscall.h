@@ -114,6 +114,7 @@
 #define SYS_CH_RECVMSG 103  // CHANNEL-0 P5b: receive one framed packet from a CH_MSG channel
 #define SYS_CH_GRANT   104  // AGENT-RPC-0 P6c: grant a one-shot read-only CH_BYTE capability to a pid
 #define SYS_CH_ACCEPT  105  // AGENT-RPC-0 P6c: accept a grant -> a read-only local handle
+#define SYS_SPAWN_EX_ARGV 106 // AGENT-RPC-0 P6d: spawn with an explicit argv VECTOR (NUL-separated argv[1..])
 #define SYS_VMA_TEST    200 // VMA red-black tree testing and benchmarking
 
 // ---- SMP coprocessor offload (GATED: only registered under SMP_FOUNDATION) ----

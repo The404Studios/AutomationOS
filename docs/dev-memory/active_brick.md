@@ -2,7 +2,26 @@
 
 > Warm memory. Refresh per checkpoint. One active brick at a time.
 
-## TOOLSET-0 (ACTIVE) — give the agent a small, safe, structured tool surface
+## CHAINLAYER-HOST-0 (ACTIVE) — the OS-side rail meets the chainlayer2 brain
+- **branch:** `brick/chainlayer-host-0` (off the frozen `brick/toolset-0` HEAD `6ff7be0`) · **record:**
+  `bricks/CHAINLAYER-HOST-0.md` (to write)
+- **why:** all the OS-side foundation is done (CHANNEL-0 → TERMINAL-0 → AGENT-RPC-0 → AGENT-HOST-0 →
+  TOOLSET-0). The next proof is the full agent step: **a model chooses a tool → host validates → tool
+  runs safely → model sees the result → model makes the next decision.**
+- **scope (tiny):** one model backend, one prompt, one tool-selection JSON shape, one or two tools, one
+  final decision. **HARD NO's:** no autonomous loops, no write/delete tools, no networking, no recursive
+  planning, no self-modifying code, no tool-registry explosion.
+- **KEY DESIGN NOTE:** there is no LLM inside this freestanding OS; per the chainlayer2 strategy the brain
+  is EXTERNAL (llama.cpp/GGUF). So the in-OS brick's "model" is a **deterministic stub** standing in at the
+  same interface — it proves the model↔host↔tool↔model PLUMBING (tool-selection JSON → host policy →
+  dispatch → exact result → answer), NOT the intelligence. The real model plugs into the same seam later.
+- **acceptance (deterministic prompt "What is inside /etc/toolset0.txt?"):** model selects
+  `read_file("/etc/toolset0.txt")` → host validates name+path → `tool_read` runs → host reads the
+  `stdout_token` → model answers `TOOLSET-0-FILE`. Proof: `CHAINHOST: PASS selected_tool=read_file
+  policy_ok=1 read_exact=1 model_answer_exact=1 rejected_bad_tool=1`; desktop 0 panic.
+- **status:** DESIGN (flagging the stub-model approach for sign-off, then implement).
+
+## TOOLSET-0 — FROZEN / COMPLETE (pushed to origin `6ff7be0`) — safe structured tool surface
 - **branch:** `brick/toolset-0` (off the frozen `brick/agent-host-0` HEAD `19e96c3`) · **record:**
   `bricks/TOOLSET-0.md` (to write)
 - **why:** before plugging a real model into the rail, harden a tiny tool SURFACE with stable schemas.

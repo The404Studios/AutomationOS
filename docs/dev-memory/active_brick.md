@@ -25,7 +25,27 @@
   browser_file_img=1 zero_bug_gone=1`.
 - **after this (user-set order):** net-stack Phase 1 → E1000-PCH-0; ALSO retest the T410 desktop
   regression with the malloc fix (prime suspect for the stray color-shifting window).
-- **status:** OPEN (root-cause first: initrd virtual placement vs the user mmap/SHM VA allocator).
+- **status:** **LANDED (fix `9dad3ac` + test `1588c2a`, committed local, awaiting review/push).**
+  ROOT CAUSE (refined): not mmap at all — **BIG ELF IMAGES**. User images load at VA 0x800000 inside
+  the identity region as private per-process pages; browser2's image grew to memsz ~35 MB (spans VA
+  8..44 MiB), REPLACING the identity PTEs over the initrd's VA 16..21.3 MiB in its own page tables —
+  kernel reads of inode->data on that CR3 returned browser2's OWN pages (first zero BSS, later live
+  data: the pre-fix probe read literal big.png pixels, hdr=180,110,60,255 — the alias photographed).
+  Anon mmaps land at 4 GiB (harmless). FIX = one seam: `initrd_init` converts the physical address
+  to its DIRECT-MAP alias (`PHYS_TO_DIRECT`, PML4[256], supervisor-only, never-split, shared into
+  every CR3); pmm keeps reserving the raw phys range. VERIFIED FAILING-THEN-PASSING: with the fix
+  stashed the new regression pair FAILs (`INITRD-ALIAS: FAIL ... mmapheavy_read=0 same_bytes=0
+  zero_bug_gone=0`, `BROWSER2-IMG-FILE: FAIL`); with it, boot prints `Initrd phys 0x1000000 ->
+  direct-map 0xffff800001000000` and the composite acceptance hits exactly: `INITRD-ALIAS: PASS
+  pristine_read=1 mmapheavy_read=1 same_bytes=1 browser_file_img=1 zero_bug_gone=1`. Pair =
+  `sbin/initrdp` (tiny control) + `sbin/initrdalias` (16 MiB VOLATILE pad — dead-store-elimination
+  ate the first, non-volatile pad: memsz=0x100, false PASS, caught by objdump) + browser2's 6th
+  `<img src="/etc/imgtest/t.png">` on its own `BROWSER2-IMG-FILE` line (frozen flags untouched).
+  GOTCHA RECORDED: kernel bricks need `quick_build.sh` BEFORE `build_all.sh` (build_all only
+  packages the prebuilt `build/kernel.elf` — the first "post-fix" boot ran the OLD kernel).
+  Residual exposure class documented in the record (other low-identity-VA reads inside a big
+  image's span; initrd was the only zero-copy long-lived consumer found). Rail + browser pipeline
+  green both runs; `iacheck2.png` clean; 0 panic. record: `bricks/INITRD-ALIAS-0.md`.
 
 ## BROWSER2-IMG-0 — FROZEN / COMPLETE (pushed to origin `a5a9267`) — `<img>` rendering in browser2 from code already in-tree
 - **branch:** `brick/browser2-img-0` (off the frozen `brick/model-bridge-0` HEAD) · **record:**

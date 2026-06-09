@@ -305,6 +305,12 @@ void _start(void) {
     print("[INIT] Spawning sockettest...\n");
     spawn("sbin/sockettest");
 
+    // MODEL-BRIDGE-0: the model seam fed by an EXTERNAL endpoint (10.0.2.2:8431).
+    // Bounded probes: SKIPs cleanly when networking or the endpoint is absent;
+    // with the host-side model stub up it prints MODELBRIDGE: PASS.
+    print("[INIT] Spawning modelbridge...\n");
+    spawn("sbin/modelbridge");
+
     // cpu1offload: userspace -> CPU1 matmul offload probe. On the SMP kernel it
     // offloads an int matmul to CPU1 (the trusted coprocessor) via SYS_CPU1_OFFLOAD
     // and prints "CPU1OFFLOAD: PASS ... by_apic=1"; on the DEFAULT (single-core)

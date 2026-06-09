@@ -222,6 +222,12 @@ void _start(void) {
     print("[INIT] Spawning toolrun...\n");
     spawn("sbin/toolrun");
 
+    // AGENT-HOST-0: the first agent riding the AGENT-RPC-0 rail -- issue TOOL_RUN,
+    // read the tool's exact stdout via the capability, render a structured verdict,
+    // reject a malformed call. Prints AGENTHOST: PASS.
+    print("[INIT] Spawning agenthost...\n");
+    spawn("sbin/agenthost");
+
     // ring-3 float/SSE probe: proves SSE is enabled + context-switched for user
     // tasks (scalar float, a 2x2 float matmul, a reduction). Prints FLOATTEST: PASS.
     print("[INIT] Spawning floattest...\n");

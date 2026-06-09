@@ -28,8 +28,9 @@
 #define TOOL_ARGS_MAX 256
 #define TOOL_ARGV_MAX 16    /* P6d: max entries in argv[1..] (the extra-args vector) */
 
-/* Per-message flags (reserved now; P6b will define real ones). */
+/* Per-message flags. */
 #define TOOL_F_NONE  0x0000u
+#define TOOL_F_ERR   0x0001u   /* TOOL_RESULT: the runner rejected/failed the call (stdout_token=0) */
 
 /* TOOL_RUN payload: "run this tool with these args". Fixed size; path and args
  * are NUL-terminated within their buffers and bounded by *_len (the length does

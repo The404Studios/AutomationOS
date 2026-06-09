@@ -2,7 +2,23 @@
 
 > Warm memory. Refresh per checkpoint. One active brick at a time.
 
-## AGENT-HOST-0 (ACTIVE) — make a tiny agent actually RIDE the AGENT-RPC-0 rail
+## TOOLSET-0 (ACTIVE) — give the agent a small, safe, structured tool surface
+- **branch:** `brick/toolset-0` (off the frozen `brick/agent-host-0` HEAD `19e96c3`) · **record:**
+  `bricks/TOOLSET-0.md` (to write)
+- **why:** before plugging a real model into the rail, harden a tiny tool SURFACE with stable schemas.
+  The model should drive safe typed tools, not arbitrary process execution.
+- **scope:** `tool.run` (path+argv, exists) · `tool.echoargs` (proven) · **`tool.read_file`** (bounded
+  read, explicit path, size cap) · **`tool.list_dir`** (bounded entries, NO recursion) · **`tool.stat`**
+  (file metadata). Enforce: a tool whitelist (named tools, not arbitrary paths), an explicit path-traversal
+  policy (reject `..`/escapes), and size/entry caps. **HARD NO's:** no shell, no networking, no model
+  inference, no recursive fs walk, no write/delete tools.
+- **acceptance:** agenthost lists a dir · stats a file · reads a small file EXACTLY · runs echoargs ·
+  malformed tool request rejected · oversize read rejected · path-traversal rejected (explicit policy) ·
+  desktop 0 panic.
+- **status:** DESIGN (presenting the architecture for sign-off, then implement).
+- **then:** CHAINLAYER-HOST-0 — a local/API model chooses among these typed tools.
+
+## AGENT-HOST-0 — FROZEN / COMPLETE (pushed to origin `19e96c3`) — the first agent riding the rail
 - **branch:** `brick/agent-host-0` (off the frozen `brick/agent-rpc-0` HEAD `9460446`) · **record:**
   [`bricks/AGENT-HOST-0.md`](bricks/AGENT-HOST-0.md)
 - **why:** the kernel/user IPC rail is finished (CHANNEL-0 + AGENT-RPC-0). The open question is no longer

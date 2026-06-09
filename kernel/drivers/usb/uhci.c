@@ -145,7 +145,13 @@ typedef struct uhci_qh {
  * ------------------------------------------------------------------ */
 #define UHCI_NUM_PORTS      2
 #define UHCI_MAX_HID        4
-#define SETUP_TIMEOUT_SPINS 2000000
+/* Per-control-transfer completion timeout, in uhci_udelay-equivalent spins
+ * (~1us each via inb(0x80), tick-INDEPENDENT so it bounds even with IF=0). A
+ * healthy device completes a control transfer in microseconds; this is only the
+ * stuck/absent-device cap. 2,000,000 (~2s) x the ~6 enumeration transfers was a
+ * ~12s worst-case boot stall when USB is enabled; 250,000 (~250ms, still 250x the
+ * normal completion) bounds it to ~1.5s -- USB-MOUSE-0 loop-law hardening. */
+#define SETUP_TIMEOUT_SPINS 250000
 
 typedef struct {
     usb_device_descriptor_t devdesc;

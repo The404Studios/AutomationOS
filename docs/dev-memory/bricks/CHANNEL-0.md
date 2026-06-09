@@ -86,8 +86,29 @@ checkpoints:
       smoke_proves_claim: partial        # no-regression proven at boot; the BOUND path is observable at P4 (needs a reader)
       raw_pointers_or_truncation: none   # bounded 512B read buffer; rights-checked handles; heap_buf freed
     verdict: pass
+  - id: P4
+    title: terminal holds the master, spawns externals bound to a channel, drains master -> grid (THE VISIBLE WIN)
+    files:
+      - userspace/lib/channel.h                       # new: ch_create/read/write/wait/close + spawn_ex wrappers
+      - userspace/apps/terminal/terminal_m3.c         # spawn_bound() + try_external/try_spawn_image route through it + per-frame drain
+    tests: [build_test/channel_p4.sh, build_test/shot.sh]
+    result: "build_all clean; SCREENSHOT shows /bin/free output IN the terminal grid (child->write(1)->channel->drain->grid); [CHAN] + p2 selftests PASS; desktop reached; 0 panic"
+    design:
+      - terminal is the holder + renderer; kernel is the dumb ring; child is the slave writer (model preserved)
+      - spawn_bound: ch_create(CH_BYTE) -> spawn_ex(path,args,0,ch,ch) -> track {ch,pid}; fallback to plain spawn
+      - bounded drain (<=4KB/frame, 512B reads) in the main loop so a noisy child can't freeze the single-core GUI
+      - non-blocking, no job control / Ctrl-C / pipes / colors / VT upgrades (deferred)
+    review:
+      default_build_changed: false      # unbound programs unchanged; terminal opens + builtins render normally
+      all_waits_bounded: true           # bounded per-frame drain; non-blocking ch_read
+      touches_userspace: true           # this IS the terminal-integration brick
+      preserves_known_good_t410: true
+      smoke_proves_claim: true          # screenshot = human-visible proof; build_all + boot = no-regression
+      raw_pointers_or_truncation: none
+    verdict: pass
+status_note: "P0-P4 = CHANNEL-0 core complete (kernel substrate + the visible terminal win)."
 next_checkpoints:
-  - P4: terminal holds the master, spawns externals via SYS_SPAWN_EX bound to a channel, drains master -> grid (the visible win)
+  - P3.5 blocking ch_wait (wait_object) | P5 typed CH_MSG message channels | P6 AGENT-RPC-0 | TERMINAL-0 polish
   - P4: terminal_m3.c ch_create + spawn-bound + drain master into the grid; SYS_WAITPID for $?
 deferred:
   - P5 typed msg_packet_t channels · P6 AGENT-RPC-0 (TOOL_RUN/TOOL_RESULT) · P7 async batch · P8 NIC rings

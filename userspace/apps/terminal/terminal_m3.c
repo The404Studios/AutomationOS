@@ -57,6 +57,7 @@
 #include "../../lib/font/bitfont.h"
 #include "../../lib/keymap/keymap.h"   /* shared US-QWERTY: caps-lock + shift + symbols */
 #include "sh_git.h"
+#include "../../lib/channel.h"   /* CHANNEL-0 P4: bound child stdio -> grid */
 
 /* ---- syscall numbers (must match kernel/include/syscall.h) ---- */
 #define SYS_READ          2
@@ -2270,6 +2271,27 @@ static void cmd_sh(const char *args, const char *verb) {
  * 256-byte buffer so the kernel's copy_from_user can't read past the source.
  * Returns 1 if a process was spawned, 0 if the image was not found. */
 static char spawn_args_buf[256];
+
+/* CHANNEL-0 P4: the active bound child's master channel handle (0 = none) + pid.
+ * One bound child at a time: spawning a new external retires the previous one. */
+static int  g_child_ch  = 0;
+static long g_child_pid = 0;
+
+/* Spawn an external bound to a fresh channel so its stdout/stderr flow into the
+ * terminal grid (drained in the main loop) instead of vanishing to serial. The
+ * terminal is the master holder; the kernel installs the child's slave end.
+ * Falls back to a plain spawn if channels aren't available. */
+static long spawn_bound(const char *path, const char *args) {
+    int ch = ch_create(CH_BYTE, CH_PAGE);
+    if (ch <= 0)
+        return sc(SYS_SPAWN, (long)path, (long)args, 0, 0, 0, 0);   /* no channel: plain spawn */
+    if (g_child_ch > 0) { ch_close(g_child_ch); g_child_ch = 0; }   /* retire the previous one */
+    long pid = spawn_ex(path, args, 0, ch, ch);                     /* stdout + stderr -> channel */
+    if (pid > 0) { g_child_ch = ch; g_child_pid = pid; }
+    else         { ch_close(ch); }                                  /* spawn failed: free channel */
+    return pid;
+}
+
 static int try_external(const char *cmd, const char *args) {
     for (int i = 0; i < (int)sizeof(spawn_path); i++) spawn_path[i] = '\0';
     const char *pre = "/bin/";
@@ -2280,7 +2302,7 @@ static int try_external(const char *cmd, const char *args) {
     for (int i = 0; i < (int)sizeof(spawn_args_buf); i++) spawn_args_buf[i] = '\0';
     if (args) k_strlcpy(spawn_args_buf, args, sizeof(spawn_args_buf));
 
-    long pid = sc(SYS_SPAWN, (long)spawn_path, (long)spawn_args_buf, 0, 0, 0, 0);
+    long pid = spawn_bound(spawn_path, spawn_args_buf);   /* CHANNEL-0 P4: output -> grid */
     if (pid <= 0) { g_last_status = 127; return 0; }   /* not found / failed */
     g_last_status = 0;                                  /* launched OK */
     grid_puts("spawned '");
@@ -2305,7 +2327,7 @@ static int try_spawn_image(const char *image, const char *args) {
     for (int i = 0; i < (int)sizeof(spawn_args_buf); i++) spawn_args_buf[i] = '\0';
     if (args) k_strlcpy(spawn_args_buf, args, sizeof(spawn_args_buf));
 
-    long pid = sc(SYS_SPAWN, (long)spawn_path, (long)spawn_args_buf, 0, 0, 0, 0);
+    long pid = spawn_bound(spawn_path, spawn_args_buf);   /* CHANNEL-0 P4: output -> grid */
     if (pid <= 0) { g_last_status = 127; return 0; }
     g_last_status = 0;
     grid_puts("spawned '");
@@ -3485,6 +3507,18 @@ void _start(void) {
                     dirty = 1;
                 }
                 /* Unmapped keycodes / full line are silently ignored. */
+            }
+        }
+
+        /* CHANNEL-0 P4: drain a bound child's stdout/stderr into the grid,
+         * bounded per frame (<=4KB) so a noisy child cannot freeze the GUI. */
+        if (g_child_ch > 0) {
+            char cbuf[512];
+            int drained = 0, n;
+            while (drained < 4096 && (n = ch_read(g_child_ch, cbuf, sizeof(cbuf))) > 0) {
+                for (int i = 0; i < n; i++) grid_putchar(cbuf[i]);
+                drained += n;
+                dirty = 1;
             }
         }
 

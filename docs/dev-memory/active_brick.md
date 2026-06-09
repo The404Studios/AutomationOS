@@ -8,14 +8,16 @@
 - **goal:** one kernel primitive (handle → shared rings) = our StdIO model + the structured-tool rail.
 - **build order:** P0 handle table · P1 ring + `ch_*` syscalls + self-test · P2 spawn binds child
   stdio · P3 sys_write/read route fd0/1/2 · P4 terminal holds master, externals' output in the grid.
-- **status:** **P0/P1/P2/P3 landed.** P0/P1 (`41a1c0a`): primitive + 5 syscalls. P2 (`2d745b9`):
-  **`SYS_SPAWN_EX` (101)** binds a child's fd0/1/2 to channels (slave end, narrowed rights, additive).
-  P3: **`sys_write` fd1/2 + `sys_read` fd0 route to the bound channel** (`stdio_chan[fd]`) before the
-  serial/ps2 fallback — **non-blocking** (full→partial, empty→0), rights-checked, return = bytes
-  (sys_write) / >0|0|<0 (sys_read); unbound = unchanged (every existing program still boots clean).
-  **Next: P4 (the visible win)** — the terminal holds the master, spawns externals via `SYS_SPAWN_EX`
-  bound to a channel, and drains the master into the grid → `sed`/`cc`/`make` output appears in the
-  terminal instead of vanishing to serial. P4 is userspace (terminal_m3.c + a userspace ch_* wrapper).
+- **status:** **P0–P4 LANDED — the visible win works.** P0/P1 (`41a1c0a`) primitive + syscalls;
+  P2 (`2d745b9`) `SYS_SPAWN_EX` binds child stdio; P3 (`3d46209`) `sys_write`/`sys_read` route the
+  bound stdio; **P4: the terminal `ch_create`s a channel, spawns externals via `spawn_ex` bound to
+  it, and drains the master into the grid (bounded ≤4 KB/frame).** SCREENSHOT-VERIFIED: `/bin/free`'s
+  output appears in the terminal grid (child → write(1) → channel → drain → grid) instead of vanishing
+  to serial; selftests PASS, desktop, 0 panic, default build unchanged. The kernel substrate (P0–P3)
+  + the terminal holder (P4) = CHANNEL-0's core goal done. userspace wrapper: `userspace/lib/channel.h`.
+- **next (CHANNEL-0 follow-ons, separate bricks):** P3.5 blocking `ch_wait` (wait_object) · P5 typed
+  `CH_MSG`/`msg_packet_t` message channels · P6 AGENT-RPC-0 (`TOOL_RUN`/`TOOL_RESULT`) · TERMINAL-0
+  polish (output-before-prompt, mid-line editing, scrollback, VT/ANSI parser, dead-code deletion).
 
 ## Parked / adjacent
 - `brick/usb-ehci-0` — EHCI driver, **E1/E2 landed** (routing ledger); E3 (routing decision) next.

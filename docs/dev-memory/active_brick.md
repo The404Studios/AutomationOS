@@ -2,7 +2,25 @@
 
 > Warm memory. Refresh per checkpoint. One active brick at a time.
 
-## CHAINLAYER-HOST-0 (ACTIVE) — the OS-side rail meets the chainlayer2 brain
+## MODEL-BRIDGE-0 (ACTIVE) — replace the stub seam with an external model transport
+- **branch:** `brick/model-bridge-0` (off the frozen `brick/chainlayer-host-0` HEAD `7553849`) · **record:**
+  `bricks/MODEL-BRIDGE-0.md` (to write)
+- **why:** CHAINLAYER-HOST-0 proved the model↔host↔tool↔model plumbing with a deterministic stub at the
+  seam. The next proof: the SAME seam fed by an EXTERNAL model endpoint — the model as hostile/untrusted
+  text from day one, replacing the fake brain without rewriting the OS-side trust surface.
+- **scope (user-set):** host sends the prompt to an external model endpoint → receives text →
+  strict-parses `{"tool":"read_file","path":"/etc/toolset0.txt"}` → rejects malformed model output →
+  dispatches through the EXISTING policy (same parser, same TOOLSET-0 whitelist, same read-only tools) →
+  sends the observation back → receives the final answer. One prompt, one tool, one answer. For the first
+  pass the "external model" is a host-side bridge/server STUB returning deterministic model text over an
+  existing transport; llama.cpp swaps in later. **HARD NO's:** no loops, no tool expansion, no write
+  tools, no shell.
+- **acceptance:** `MODELBRIDGE: PASS select_parse=1 policy_ok=1 read_exact=1 answer_exact=1
+  malformed_model_rejected=1 bad_tool_rejected=1`; rail still green; desktop 0 panic.
+- **status:** OPEN (design: transport choice from what already exists — QEMU slirp guest→10.0.2.2 TCP vs
+  serial; then implement).
+
+## CHAINLAYER-HOST-0 — FROZEN / COMPLETE (pushed to origin `7553849`) — the first full chainlayer host milestone
 - **branch:** `brick/chainlayer-host-0` (off the frozen `brick/toolset-0` HEAD `6ff7be0`) · **record:**
   [`bricks/CHAINLAYER-HOST-0.md`](bricks/CHAINLAYER-HOST-0.md)
 - **why:** all the OS-side foundation is done (CHANNEL-0 → TERMINAL-0 → AGENT-RPC-0 → AGENT-HOST-0 →
@@ -25,8 +43,11 @@
   path policy, all BEFORE dispatch; tool runs via the self-spawn runner; stdout read exactly via the P6c
   token. Serial `CHAINHOST: PASS selected_tool=read_file policy_ok=1 read_exact=1 model_answer_exact=1
   rejected_bad_tool=1` FIRST TRY (rejected_bad_tool = unknown tool AND traversal AND shape-violation
-  `'} rm -rf'` all dead at the gate). Whole rail green, kernel unchanged, desktop clean 0 panic.
-  record: `bricks/CHAINLAYER-HOST-0.md`. NOT pushed (awaiting review).
+  with a trailing shell suffix, all dead at the gate). Whole rail green, kernel unchanged, desktop clean
+  0 panic. record: [`bricks/CHAINLAYER-HOST-0.md`](bricks/CHAINLAYER-HOST-0.md). Pushed (`7553849`).
+- **user verdict on freeze:** "the right milestone boundary because it proves the whole rail with a
+  deterministic stub, while being honest that it does not yet prove intelligence... the model is treated
+  correctly: untrusted text, never authority." → next = MODEL-BRIDGE-0, not autonomy.
 
 ## TOOLSET-0 — FROZEN / COMPLETE (pushed to origin `6ff7be0`) — safe structured tool surface
 - **branch:** `brick/toolset-0` (off the frozen `brick/agent-host-0` HEAD `19e96c3`) · **record:**

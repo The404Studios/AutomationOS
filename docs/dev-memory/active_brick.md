@@ -2,8 +2,9 @@
 
 > Warm memory. Refresh per checkpoint. One active brick at a time.
 
-## TERMINAL-0 (COMPLETE — clean milestone, worth pushing) — make CHANNEL-0 console output human-stable
-- **branch:** `brick/terminal-0` (off `brick/channel-0`) · **spec:** `docs/superpowers/specs/2026-06-09-terminal-0-design.md`
+## TERMINAL-0 — FROZEN / COMPLETE (T0–T4, pushed to origin `935f54f`) — CHANNEL-0 console output human-stable
+- **branch:** `brick/terminal-0` (off `brick/channel-0`), **PUSHED** `git push origin brick/terminal-0`
+  verified via `ls-remote` (remote == local HEAD `935f54f`) · **spec:** `docs/superpowers/specs/2026-06-09-terminal-0-design.md`
 - **why:** CHANNEL-0 P4 made external output appear, but messy (after-prompt, no scrollback, half-built
   line editing, escapes-as-boxes). Make it human-stable BEFORE the typed agent rail (AGENT-RPC-0).
 - **checkpoints (one commit each):** **T0** output-before-next-prompt (waitpid-lite: defer the prompt
@@ -31,10 +32,11 @@
   dead dir Makefiles/README) and the `grid_backspace` orphan: **5,241 lines deleted** with a
   BYTE-IDENTICAL ISO (38281216) + identical screenshot (`t4check.png`) proving nothing live was removed.
   Kept: sh_git.c (live shell), font_integration.c/.h (verify-script refs). record:
-  `docs/dev-memory/bricks/TERMINAL-0.md`. **TERMINAL-0 COMPLETE** — the rail is human-stable end to end
-  (output-before-prompt → scrollback → line editing → ANSI colour); `brick/terminal-0` is a clean
-  milestone worth pushing. **Next brick (user's call):** AGENT-RPC-0 / CHANNEL-0 P5 (typed `CH_MSG`),
-  or resume `brick/usb-ehci-0` E3, or the latency/real-hardware track.
+  `docs/dev-memory/bricks/TERMINAL-0.md`. **TERMINAL-0 FROZEN + PUSHED** — the rail is human-stable end
+  to end (output-before-prompt → scrollback → line editing → ANSI colour), and `brick/terminal-0` is
+  published on origin. **Next brick (chosen): AGENT-RPC-0 / CHANNEL-0 P5** — the human console can now
+  display long output, colour, errors, and logs cleanly, so it's ready to host the typed agent rail
+  (the chainlayer2 north star). Parked alternatives: `brick/usb-ehci-0` E3, latency/perf track.
 
 ## CHANNEL-0 — FROZEN / COMPLETE (P0–P4, pushed to origin)
 - **branch:** `brick/channel-0` (PUSHED, commit `1dd5107`) · **spec:** `docs/superpowers/specs/2026-06-08-channel-0-design.md`

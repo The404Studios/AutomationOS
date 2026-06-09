@@ -2,7 +2,20 @@
 
 > Warm memory. Refresh per checkpoint. One active brick at a time.
 
-## INITRD-ALIAS-0 (ACTIVE) — kill the kernel file-read alias bug before building on it
+## T410-RETEST (ACTIVE, user-physical) — both heap/aliasing fixes on the real 2010 hardware
+- **what:** flash + boot `automationos-t410-bothfixes.iso` (T410_SAFE=1 SCHED_DEBUG=0 kernel +
+  DESKTOP_MINIMAL=1 SELFHEAL=1 userspace — the proven T410 profile) carrying BOTH suspects' fixes:
+  the malloc tcache three-state fix (`8a0aafc`) and the initrd direct-map fix (`9dad3ac`).
+- **hypothesis to test:** the stray color-shifting window + erratic titlebars
+  (DESKTOP-PROJECT-REGRESSION-0) were cross-linked-heap / aliased-memory symptoms. If the desktop
+  comes up clean, the real cause is found and that brick closes.
+- **then:** NET-STACK-PHASE-1 (SOCK_MAX 16→64 · TCP SYN queue · UDP queue 8→32 · TCP OOO 1→4 slots,
+  per the audit's quick-win tier) → E1000-PCH-0.
+- **parked (user-approved, later):** **KERNEL-DIRECTMAP-AUDIT-0** — find any kernel subsystem still
+  reading long-lived physical/kernel buffers through low identity VAs under arbitrary process CR3;
+  move those to direct-map/kernel-only mappings. (The residual exposure class from INITRD-ALIAS-0.)
+
+## INITRD-ALIAS-0 — FROZEN / COMPLETE (pushed to origin `d9a0e2e`) — kill the kernel file-read alias bug before building on it
 - **branch:** `brick/initrd-alias-0` (off the frozen `brick/browser2-img-0` HEAD) · **record:**
   `bricks/INITRD-ALIAS-0.md` (to write)
 - **why (user's call, ahead of net Phase 1):** kernel CORRECTNESS bug — "initrd file content is
@@ -46,6 +59,11 @@
   Residual exposure class documented in the record (other low-identity-VA reads inside a big
   image's span; initrd was the only zero-copy long-lived consumer found). Rail + browser pipeline
   green both runs; `iacheck2.png` clean; 0 panic. record: `bricks/INITRD-ALIAS-0.md`.
+- **user verdict on freeze:** approved — "not optional polish — it killed a real kernel
+  address-space correctness bug... the failing-then-passing verifier discipline is exactly what
+  makes it trustworthy"; the direct map is "the right seam"; keep all three commits unsquashed
+  (fix → proof → memory = the forensic chain). Pushed (`d9a0e2e`, ls-remote verified).
+  KERNEL-DIRECTMAP-AUDIT-0 queued for later, NOT now.
 
 ## BROWSER2-IMG-0 — FROZEN / COMPLETE (pushed to origin `a5a9267`) — `<img>` rendering in browser2 from code already in-tree
 - **branch:** `brick/browser2-img-0` (off the frozen `brick/model-bridge-0` HEAD) · **record:**

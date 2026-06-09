@@ -2274,8 +2274,12 @@ static char spawn_args_buf[256];
 
 /* CHANNEL-0 P4: the active bound child's master channel handle (0 = none) + pid.
  * One bound child at a time: spawning a new external retires the previous one. */
-static int  g_child_ch  = 0;
-static long g_child_pid = 0;
+static int  g_child_ch    = 0;
+static long g_child_pid   = 0;
+static int  g_await_child = 0;   /* TERMINAL-0 T0: prompt deferred until the bound child exits + drains */
+#ifndef SYS_WAITPID
+#define SYS_WAITPID 6
+#endif
 
 /* Spawn an external bound to a fresh channel so its stdout/stderr flow into the
  * terminal grid (drained in the main loop) instead of vanishing to serial. The
@@ -3473,7 +3477,11 @@ void _start(void) {
                 hist_push(line_buf);               /* push to history        */
                 hist_nav = -1;                     /* reset navigation       */
                 shell_execute(line_buf);           /* run it                 */
-                shell_prompt();                    /* next prompt            */
+                /* TERMINAL-0 T0: if it spawned a bound external, DEFER the prompt
+                 * until the child exits + its output drains (handled in the main
+                 * loop) -- so output appears BEFORE the next prompt, not after. */
+                if (g_child_ch > 0) g_await_child = 1;
+                else                shell_prompt();  /* builtin/no child: prompt now */
                 line_len = 0;
                 dirty = 1;
             } else if (keycode == KEY_TAB) {
@@ -3510,8 +3518,11 @@ void _start(void) {
             }
         }
 
-        /* CHANNEL-0 P4: drain a bound child's stdout/stderr into the grid,
-         * bounded per frame (<=4KB) so a noisy child cannot freeze the GUI. */
+        /* CHANNEL-0 P4 drain + TERMINAL-0 T0 prompt ordering: drain a bound
+         * child's output into the grid (bounded <=4KB / 8 reads per frame so a
+         * noisy child can't freeze the single-core GUI). Once the child has
+         * EXITED and its output is drained, print the deferred prompt -- so
+         * output always appears BEFORE the next prompt, not after it. */
         if (g_child_ch > 0) {
             char cbuf[512];
             int drained = 0, n;
@@ -3519,6 +3530,23 @@ void _start(void) {
                 for (int i = 0; i < n; i++) grid_putchar(cbuf[i]);
                 drained += n;
                 dirty = 1;
+            }
+            if (g_await_child) {
+                /* waitpid-lite: WNOHANG (=1) -- non-blocking, never parks the GUI.
+                 * w==0 -> child still running (keep the prompt deferred); else it
+                 * exited (pid>0) or is already gone (ECHILD<0). */
+                int st;
+                long w = sc(SYS_WAITPID, g_child_pid, (long)&st, 1, 0, 0, 0);
+                if (w != 0) {
+                    /* final drain of the now-dead child's ring (bounded by the
+                     * ring capacity -- the child writes no more) so no tail is lost */
+                    while ((n = ch_read(g_child_ch, cbuf, sizeof(cbuf))) > 0)
+                        for (int i = 0; i < n; i++) grid_putchar(cbuf[i]);
+                    ch_close(g_child_ch);
+                    g_child_ch = 0; g_child_pid = 0; g_await_child = 0;
+                    shell_prompt();          /* the deferred prompt -- AFTER the output */
+                    dirty = 1;
+                }
             }
         }
 

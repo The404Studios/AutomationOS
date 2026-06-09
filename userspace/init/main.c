@@ -228,6 +228,11 @@ void _start(void) {
     print("[INIT] Spawning agenthost...\n");
     spawn("sbin/agenthost");
 
+    // TOOLSET-0: the safe whitelisted tool surface (read_file/list_dir/stat/run)
+    // with a host-side path policy. Prints TOOLSET: PASS.
+    print("[INIT] Spawning toolset_host...\n");
+    spawn("sbin/toolset_host");
+
     // ring-3 float/SSE probe: proves SSE is enabled + context-switched for user
     // tasks (scalar float, a 2x2 float matmul, a reduction). Prints FLOATTEST: PASS.
     print("[INIT] Spawning floattest...\n");

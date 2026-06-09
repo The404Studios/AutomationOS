@@ -142,6 +142,12 @@ cc userspace/apps/echoargs/echoargs.c /tmp/echoargs.o; $LD /tmp/crt0.o /tmp/echo
 # host loop: TOOL_RUN -> TOOL_RESULT -> accept stdout_token -> read exact stdout ->
 # structured verdict; plus a malformed TOOL_RUN is rejected. Prints AGENTHOST: PASS.
 cc userspace/apps/agenthost/agenthost.c /tmp/agenthost.o; $LD /tmp/crt0.o /tmp/agenthost.o -o /tmp/agenthost.elf
+# TOOLSET-0: small sandboxed tools (read_file/list_dir/stat) + the host that drives
+# a safe whitelisted tool surface over the rail (sbin/toolset_host).
+cc userspace/apps/tool_read/tool_read.c   /tmp/tool_read.o;   $LD /tmp/crt0.o /tmp/tool_read.o   -o /tmp/tool_read.elf
+cc userspace/apps/tool_ls/tool_ls.c       /tmp/tool_ls.o;     $LD /tmp/crt0.o /tmp/tool_ls.o     -o /tmp/tool_ls.elf
+cc userspace/apps/tool_stat/tool_stat.c   /tmp/tool_stat.o;   $LD /tmp/crt0.o /tmp/tool_stat.o   -o /tmp/tool_stat.elf
+cc userspace/apps/toolset_host/toolset_host.c /tmp/toolset_host.o; $LD /tmp/crt0.o /tmp/toolset_host.o -o /tmp/toolset_host.elf
 # floattest: proves ring-3 float/SSE at runtime (scalar + 2x2 matmul + reduction).
 cc userspace/apps/floattest/floattest.c /tmp/floattest.o; $LD /tmp/crt0.o /tmp/floattest.o -o /tmp/floattest.elf
 # sleeptest: proves SYS_SLEEP is a real, ms-granularity, BLOCKING sleep (measures
@@ -507,7 +513,7 @@ $LD /tmp/crt0.o /tmp/cc.o \
     -o /tmp/cc.elf
 
 echo "[all] canary check (all must be 0):"
-for e in comp init filemanager calculator clock sysinfo settings sysmon uidemo dateapp applauncher taskman terminal editor snake paint synth tetris game2048 sheet notes calendar stopwatch mines piano dashboard welcome bench breakout pong invaders procmon soundtest solitaire aiconsole screenshot stress musicplayer ide bubbletd zombietd pacman clockapp forktest threadtest reaploop matmuljobs aibroker sed awk tar pkg make meminfo argvtest msgtest rpctest toolrun echoproof echoargs agenthost floattest sleeptest prioritytest matbench tensortest cpuburn blk ps kill free uptime find diff cmp tee wcx xargs gzip cc nettest sockettest cpu1offload smpstress wget netman browser cryptotest libtest ping nc netinfo netscan tcping dig httpget pktmon httpd traceroute arp grep head tail sort uniq cut tr nl du touch basename dirname uname hostname whoami date less hexdump lspci tlsprobe certtool dhcpc autodhcp apidemo js futextest epolltest sendfiletest perftest batchtest domtest htmltest csstest layouttest webtest browser2 webapitest cube3d ray chess asteroids sudoku photos startmenu controlcenter gametest; do
+for e in comp init filemanager calculator clock sysinfo settings sysmon uidemo dateapp applauncher taskman terminal editor snake paint synth tetris game2048 sheet notes calendar stopwatch mines piano dashboard welcome bench breakout pong invaders procmon soundtest solitaire aiconsole screenshot stress musicplayer ide bubbletd zombietd pacman clockapp forktest threadtest reaploop matmuljobs aibroker sed awk tar pkg make meminfo argvtest msgtest rpctest toolrun echoproof echoargs agenthost tool_read tool_ls tool_stat toolset_host floattest sleeptest prioritytest matbench tensortest cpuburn blk ps kill free uptime find diff cmp tee wcx xargs gzip cc nettest sockettest cpu1offload smpstress wget netman browser cryptotest libtest ping nc netinfo netscan tcping dig httpget pktmon httpd traceroute arp grep head tail sort uniq cut tr nl du touch basename dirname uname hostname whoami date less hexdump lspci tlsprobe certtool dhcpc autodhcp apidemo js futextest epolltest sendfiletest perftest batchtest domtest htmltest csstest layouttest webtest browser2 webapitest cube3d ray chess asteroids sudoku photos startmenu controlcenter gametest; do
     n=$(objdump -d /tmp/$e.elf 2>/dev/null | grep -c "fs:0x28" || true)
     echo "  $e=$n"
 done
@@ -554,6 +560,13 @@ cp /tmp/echoproof.elf /tmp/ird/sbin/echoproof
 cp /tmp/echoargs.elf /tmp/ird/sbin/echoargs
 # agenthost -> /sbin (init spawns it; AGENT-HOST-0 the first agent riding the rail).
 cp /tmp/agenthost.elf /tmp/ird/sbin/agenthost
+# TOOLSET-0 -> /sbin (toolset_host spawned by init; the tools spawned by its runner).
+cp /tmp/tool_read.elf /tmp/ird/sbin/tool_read
+cp /tmp/tool_ls.elf   /tmp/ird/sbin/tool_ls
+cp /tmp/tool_stat.elf /tmp/ird/sbin/tool_stat
+cp /tmp/toolset_host.elf /tmp/ird/sbin/toolset_host
+# TOOLSET-0 test fixture: a small file with KNOWN content (15 bytes) for read_file/stat.
+mkdir -p /tmp/ird/etc && printf 'TOOLSET-0-FILE\n' > /tmp/ird/etc/toolset0.txt
 cp /tmp/floattest.elf /tmp/ird/sbin/floattest
 cp /tmp/sleeptest.elf /tmp/ird/sbin/sleeptest
 # prioritytest -> /sbin (init spawns it after the boot storm drains). Proves

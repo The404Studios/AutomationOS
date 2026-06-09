@@ -58,9 +58,46 @@ checkpoints:
       smoke_proves_claim: true          # boot selftest exercises write/read/EAGAIN/EMSGSIZE end-to-end
       raw_pointers_or_truncation: none  # bounded by ring cap; oversize rejected (EMSGSIZE) not truncated
     verdict: pass
+  - id: P5b
+    title: expose CH_MSG packets to userspace via dedicated SYS_CH_SENDMSG/RECVMSG (byte channels stay pure)
+    commits: [2a06157]
+    files:
+      - kernel/include/syscall.h          # SYS_CH_SENDMSG=102, SYS_CH_RECVMSG=103
+      - kernel/include/channel.h          # sys_ch_sendmsg/recvmsg protos
+      - kernel/ipc/channel.c              # the two handlers (copy-in/out, CH_MAX_IO cap, errno propagation)
+      - kernel/core/syscall/syscall.c     # register 102/103
+      - userspace/lib/channel.h           # ch_sendmsg/ch_recvmsg + ch_msg_hdr (mirrors msg_packet_t) + CH_EAGAIN/CH_EMSGSIZE
+      - userspace/apps/msgtest/msgtest.c  # NEW self-spawning userspace round-trip proof (crt0-linked)
+      - scripts/build_all.sh              # compile + stage sbin/msgtest
+      - userspace/init/main.c             # init spawns sbin/msgtest at boot
+    tests: [build_test/p5_verify.sh]
+    result: >
+      quick_build clean (kernel 495304 B); 88 sbin entries (msgtest added); serial
+      'MSGTEST: PASS eagain=1 emsgsize=1 send=1 roundtrip=1 reply=PONG rid=0x1234abcd' -- a real
+      userspace CH_MSG round-trip (parent->child->parent) PLUS EAGAIN + EMSGSIZE proven across the
+      syscall boundary; the P1 byte + p2 binding + p5 framing selftests still PASS (CH_BYTE unchanged);
+      desktop screenshot (p5bcheck.png) == t4final.png, 0 panic
+    design:
+      - DEDICATED packet syscalls (user's call): byte channels keep sys_ch_write/read = stream
+        semantics forever; CH_MSG gets explicit SENDMSG/RECVMSG so later agent bugs are auditable.
+      - sendmsg: copy 16-byte header in, reject len > CH_MAX_IO (64 KiB) with EMSGSIZE before any
+        payload access, copy payload in, channel_write_msg (atomic; EMSGSIZE/EAGAIN/total). recvmsg:
+        read exactly one packet into kernel buffers, copy header+payload out; EAGAIN if none queued,
+        EMSGSIZE if the user buffer is too small (message left intact). Both rights-checked (WRITE/READ).
+      - userspace proof is a real program, not a kernel selftest: msgtest self-spawns (parent holds the
+        master, the child's fd0(READ)+fd1(WRITE) are the channel slave end at the deterministic handles
+        1/2); the child stays SILENT (its fd1 IS the channel). Genuine cross-process round-trip.
+    review:
+      default_build_changed: false      # CH_BYTE syscalls untouched; byte/binding/framing selftests pass
+      all_waits_bounded: true           # msgtest poll loops are bounded + yield; no kernel blocking added
+      hardware_init_gated: n/a
+      touches_userspace: true           # new sbin/msgtest + lib wrappers + init spawn (the userspace surface)
+      preserves_known_good_t410: true
+      smoke_proves_claim: true          # MSGTEST: PASS in serial = userspace round-trip + EAGAIN + EMSGSIZE
+      raw_pointers_or_truncation: none  # copy_from/to_user bounded; CH_MAX_IO cap; oversize->EMSGSIZE
+    verdict: pass
 next_checkpoints:
-  - P5b syscall surface for CH_MSG (frame-aware sys_ch_write/read or SYS_CH_SENDMSG/RECVMSG) + userspace wrapper
-  - P6 AGENT-RPC-0 typed tool calls (TOOL_RUN/TOOL_RESULT) + the agent runtime
+  - P6 AGENT-RPC-0 typed tool calls (TOOL_RUN/TOOL_RESULT) + the agent runtime, on the msg rail
 deferred:
   - P7 async submission/completion batch · P8 NIC RX/TX as channels
 ```

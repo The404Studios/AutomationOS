@@ -17,7 +17,16 @@
   `channel_selftest_p5()` at boot: serial `[CHAN] p5 msg selftest PASS (w=30 r=14 rid_ok=1
   empty=EAGAIN:1 oversize=EMSGSIZE:1 payload='/bin/cc main.c')`; P1/p2 selftests still PASS (default
   CH_BYTE path unchanged); ISO byte-identical to TERMINAL-0; `p5final.png` == `t4final.png` (0 panic).
-  **Next: P5b** (the syscall surface for CH_MSG). NOT pushed (new brick, awaiting user OK).
+  **P5b (`2a06157`): the syscall surface.** Dedicated **`SYS_CH_SENDMSG` (102) / `SYS_CH_RECVMSG`
+  (103)** — byte channels keep `sys_ch_write/read` (pure stream semantics) forever; CH_MSG gets
+  explicit packet syscalls (auditable). Handlers copy header+payload across the user boundary,
+  cap at `CH_MAX_IO` (64 KiB→`EMSGSIZE`), propagate `EAGAIN`/`EMSGSIZE`. Userspace proof = a real
+  self-spawning program `sbin/msgtest` (parent holds master; child fd0(READ)+fd1(WRITE) = slave end;
+  child silent since its fd1 IS the channel): serial `MSGTEST: PASS eagain=1 emsgsize=1 send=1
+  roundtrip=1 reply='PONG' rid=0x1234abcd` — a genuine cross-process userspace round-trip + EAGAIN +
+  EMSGSIZE. CH_BYTE unchanged (P1/p2/p5 selftests pass, terminal renders, `p5bcheck.png` clean, 0
+  panic). **Next: P6** (TOOL_RUN/TOOL_RESULT + agent runtime on the msg rail). `gitignore` anchored
+  (`decf0f9`). NOT pushed (new brick, awaiting user OK).
 
 ## TERMINAL-0 — FROZEN / COMPLETE (T0–T4, pushed to origin `935f54f`) — CHANNEL-0 console output human-stable
 - **branch:** `brick/terminal-0` (off `brick/channel-0`), **PUSHED** `git push origin brick/terminal-0`

@@ -212,6 +212,11 @@ void _start(void) {
     print("[INIT] Spawning msgtest...\n");
     spawn("sbin/msgtest");
 
+    // AGENT-RPC-0 P6a: encode/decode/validate the TOOL_RUN/TOOL_RESULT wire
+    // schema (no channels, no dispatch). Prints RPCTEST: PASS to serial.
+    print("[INIT] Spawning rpctest...\n");
+    spawn("sbin/rpctest");
+
     // ring-3 float/SSE probe: proves SSE is enabled + context-switched for user
     // tasks (scalar float, a 2x2 float matmul, a reduction). Prints FLOATTEST: PASS.
     print("[INIT] Spawning floattest...\n");

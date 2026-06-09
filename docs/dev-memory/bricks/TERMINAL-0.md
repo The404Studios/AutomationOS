@@ -6,7 +6,7 @@
 
 ```yaml
 brick: TERMINAL-0
-status: in-progress
+status: complete
 branch: brick/terminal-0
 base: brick/channel-0
 request: >
@@ -114,6 +114,37 @@ checkpoints:
       smoke_proves_claim: true          # screenshot: coloured words render, escapes gone, ESC[999m sane
       raw_pointers_or_truncation: none  # g_ansi_buf bounded 32; palette indices range-checked (30-37/90-97)
     verdict: pass
-next_checkpoints:
-  - T4 delete dead terminal code (the ~3,000 lines now superseded by the T0-T3 active path)
+  - id: T4
+    title: deletion surgery -- remove the superseded old terminal app + a leftover orphan (no behaviour change)
+    files: [userspace/apps/terminal/*  (deletions only)]
+    tests: [build_test/shot.sh]
+    commits: [T4a 6aa9ce2, T4b f3c8958]
+    result: "5241 lines deleted across 13 files; build_all clean with a BYTE-IDENTICAL ISO (38281216) proving the removed code contributed nothing to the artifact; SCREENSHOT (screenshots/t4check.png) = desktop + terminal render identically to t3final.png, 0 panic"
+    design:
+      - deletion ONLY -- not a refactor, not a clean-up-while-there. every deletion passed the 3-part
+        test: (1) grep proves no live callsite, (2) build proves no reference, (3) screenshot proves no
+        visual regression.
+      - T4a (6aa9ce2): the OLD terminal app was a self-contained island -- terminal.c (the lone main())
+        + renderer.c/buffer.c/tabs.c/pty_impl.c/vt_parser.c/profiles.c/utils.c, all #include terminal.h.
+        The active build (build_all.sh:397-399) compiles ONLY terminal_m3.c + sh_git.c, so the island
+        was never compiled or linked; nothing outside it includes terminal.h or references its symbols.
+        Also removed the dir Makefile/Makefile.font-integrated/README.md (they build/document ONLY the
+        island; none reference terminal_m3). = 5231 lines.
+      - T4b (f3c8958): grid_backspace() -- the old fixed-grid erase helper, superseded by the T2
+        line_buf/line_cursor + redraw_input_line model; 0 callers (static; nettool.c's same-named static
+        is separate and untouched). = 10 lines.
+    review:
+      default_build_changed: false      # byte-identical ISO; active app unchanged
+      all_waits_bounded: true           # N/A -- deletions only, no new code paths
+      touches_userspace: true           # terminal-only deletions
+      touches_kernel: false
+      preserves_known_good_t410: true
+      smoke_proves_claim: true          # byte-identical ISO + identical screenshot = nothing live removed
+      raw_pointers_or_truncation: none
+      out_of_scope_kept: [sh_git.c (live shell), font_integration.c/.h (verify-font-integration.sh refs)]
+    verdict: pass
+done: >
+  TERMINAL-0 is COMPLETE. The CHANNEL-0 child-output rail is now human-stable end to end:
+  output-before-prompt (T0) -> scrollback ring (T1) -> clean line editing (T2) -> ANSI SGR colour (T3),
+  with the dead old-terminal weight removed (T4). brick/terminal-0 is a clean milestone worth pushing.
 ```

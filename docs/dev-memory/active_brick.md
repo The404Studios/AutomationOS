@@ -2,7 +2,7 @@
 
 > Warm memory. Refresh per checkpoint. One active brick at a time.
 
-## TERMINAL-0 (ACTIVE) — make CHANNEL-0 console output human-stable
+## TERMINAL-0 (COMPLETE — clean milestone, worth pushing) — make CHANNEL-0 console output human-stable
 - **branch:** `brick/terminal-0` (off `brick/channel-0`) · **spec:** `docs/superpowers/specs/2026-06-09-terminal-0-design.md`
 - **why:** CHANNEL-0 P4 made external output appear, but messy (after-prompt, no scrollback, half-built
   line editing, escapes-as-boxes). Make it human-stable BEFORE the typed agent rail (AGENT-RPC-0).
@@ -26,8 +26,15 @@
   `31;1`==`1;31`); 32-byte CSI buffer, overflow→TEXT; child drain routes through `term_write()` +
   `ansi_reset()` on child-exit; builtins/prompt keep explicit colour (no ANSI). Screenshot-verified
   (`t3check.png`: red/green/bright-red render, `ESC[999m` sane in default, NO escape junk; `t3final.png`
-  clean). record: `docs/dev-memory/bricks/TERMINAL-0.md`. **Next: T4** — delete the ~3,000 lines of dead
-  terminal code now superseded by the proven T0–T3 active path (output, scrollback, editing, colour).
+  clean). **T4 (`6aa9ce2` + `f3c8958`): deletion surgery** — removed the superseded OLD terminal app
+  island (terminal.c[main] + renderer/buffer/tabs/pty_impl/vt_parser/profiles/utils + terminal.h + the
+  dead dir Makefiles/README) and the `grid_backspace` orphan: **5,241 lines deleted** with a
+  BYTE-IDENTICAL ISO (38281216) + identical screenshot (`t4check.png`) proving nothing live was removed.
+  Kept: sh_git.c (live shell), font_integration.c/.h (verify-script refs). record:
+  `docs/dev-memory/bricks/TERMINAL-0.md`. **TERMINAL-0 COMPLETE** — the rail is human-stable end to end
+  (output-before-prompt → scrollback → line editing → ANSI colour); `brick/terminal-0` is a clean
+  milestone worth pushing. **Next brick (user's call):** AGENT-RPC-0 / CHANNEL-0 P5 (typed `CH_MSG`),
+  or resume `brick/usb-ehci-0` E3, or the latency/real-hardware track.
 
 ## CHANNEL-0 — FROZEN / COMPLETE (P0–P4, pushed to origin)
 - **branch:** `brick/channel-0` (PUSHED, commit `1dd5107`) · **spec:** `docs/superpowers/specs/2026-06-08-channel-0-design.md`

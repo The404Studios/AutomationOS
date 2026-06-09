@@ -11,12 +11,12 @@
   T1 scrollback ring · T2 line-editing cleanup (cursor_pos + Left/Right/Home/End/Del, kill `[TERM] key`
   spam) · T3 minimal ANSI/VT (SGR color first — `grid_color[][]` substrate exists) · T4 delete ~3000
   lines dead terminal code. ALL userspace (`terminal_m3.c`); does NOT touch the kernel primitive.
-- **status:** **T0 + T1 LANDED.** T0 (`3eac1bb`): defer the prompt for a bound child + waitpid-lite
+- **status:** **T0 + T1 + T2 LANDED.** T0 (`3eac1bb`): defer the prompt for a bound child + waitpid-lite
   (`SYS_WAITPID` WNOHANG=1, non-blocking) → prompt prints AFTER the output. T1: **scrollback ring**
   (256-line `sb[][]` ring; `cur_row` → `sb_head`/`sb_view`/`sb_follow` viewport; `grid_putchar` is the
   ONE append path; PageUp/PageDown scroll, PageDown re-follows). SCREENSHOT-verified (`t0demo.png`,
   `t1demo.png` — a scrolled-back viewport holds lines the old discard grid lost); build_all clean;
-  desktop. **T2: clean line editing** — `line_cursor` + redraw-current-line (`redraw_input_line`);
+  desktop. **T2 (`97faa0c`): clean line editing** — `line_cursor` + redraw-current-line (`redraw_input_line`);
   Left/Right/Home/End/Backspace/Delete/insert all cursor-aware; `[TERM] key` spam gated behind
   `TERM_DEBUG_KEYS` (default off). Screenshot-verified (`t2check.png`: a multi-line self-check runs
   the three acceptance cases through the SAME edit primitives → PASS lines in scrollback; `t2final.png`

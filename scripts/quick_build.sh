@@ -54,6 +54,21 @@ if [ "${DISK_PERSIST:-0}" = "1" ]; then
     echo "*** DISK_PERSIST build: AHCI/SATA + diskfs durable persistence ENABLED ***"
 fi
 
+# ─────────────────────────────────────────────────────────────────────────────
+# OPT-IN USB HID boot mouse (USB-MOUSE-0). GATED behind USB_UHCI=1. DEFAULT OFF.
+#   USB_UHCI=1 bash scripts/quick_build.sh
+# Compiles the dormant usb_core/uhci/hid sources (link-tested) and defines
+# -DUSB_UHCI so kernel.c can #ifdef-gate the (separate, later) usb_init() call.
+# When UNSET the USB sources are NOT compiled and no -DUSB_UHCI is defined, so the
+# default kernel is byte-for-byte unchanged and never touches USB hardware at boot
+# -- the T410-safe default. USB init must pass the loop-correctness laws (bounded
+# controller/transfer waits) before it is ever called on real hardware.
+# ─────────────────────────────────────────────────────────────────────────────
+if [ "${USB_UHCI:-0}" = "1" ]; then
+    CFLAGS="$CFLAGS -DUSB_UHCI"
+    echo "*** USB_UHCI build: usb_core+uhci+hid compiled (boot init still gated in kernel.c) ***"
+fi
+
 # Assembler flags. Empty by default so the cooperative build is byte-for-byte
 # unchanged.
 NASMFLAGS=""
@@ -393,6 +408,15 @@ compile kernel/ipc/msgqueue.c                 c_msgqueue
 compile kernel/drivers/input/input.c          c_input
 compile kernel/drivers/input/evdev.c          c_evdev
 compile kernel/drivers/input/dev_input.c      c_dev_input
+# USB-MOUSE-0 (GATED by USB_UHCI=1): dormant usb_core/uhci/hid, compiled here so a
+# default build is byte-for-byte unchanged. hid.c injects pointer/key events via
+# the SAME input_report_*/input_sync path as ps2mouse.c -> the compositor needs no
+# new input path. Boot init (usb_init) is NOT called yet -- compile/link only.
+if [ "${USB_UHCI:-0}" = "1" ]; then
+    compile kernel/drivers/usb/usb_core.c     c_usb_core
+    compile kernel/drivers/usb/uhci.c         c_uhci
+    compile kernel/drivers/usb/hid.c          c_hid
+fi
 compile kernel/core/signal/kill.c             c_kill
 compile kernel/core/sched/nice.c              c_nice
 compile kernel/drivers/pty/pty.c              c_pty

@@ -9,7 +9,7 @@
  * balance between readability and chrome density on a 1024x768 panel. The user
  * can Ctrl+wheel / Ctrl+=/- to rescale live; the whole layout reflows from
  * this cell because every panel derives geometry from GFX_FW/GFX_FH. */
-int g_ui_pct = 130, g_gfx_fw = 10, g_gfx_fh = 20;
+int g_ui_pct = 100, g_gfx_fw = 8, g_gfx_fh = 16;   /* default scale 100% (8x16 cell): 130% overflowed boxes on small screens (T410). Settings/Ctrl+-/wheel adjust + persist. */
 
 /* ---- IDE behaviour knobs (Settings panel; VIZ-6 / Ctrl+,) ----
  * Runtime variables (formerly compile-time #defines) so every toggle/slider in

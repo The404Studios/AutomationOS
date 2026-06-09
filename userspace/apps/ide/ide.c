@@ -2120,7 +2120,7 @@ static int handle_ctrl_chord(Ide* a, int keycode) {
         gfx_set_scale(g_ui_pct - 25);
         return 1;
     case KEY_0:               /* Ctrl+0 : reset the IDE text zoom to the default */
-        gfx_set_scale(130);
+        gfx_set_scale(100);
         return 1;
     case KEY_B:               /* Ctrl+B: build the open file */
         /* Build what's on screen: flush unsaved editor edits to disk first so

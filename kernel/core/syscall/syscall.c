@@ -201,6 +201,24 @@ void syscall_init(void) {
     syscall_table[SYS_EPOLL_CTL]    = sys_epoll_ctl;
     syscall_table[SYS_EPOLL_WAIT]   = sys_epoll_wait;
 
+    // CHANNEL-0: capability-backed shared-ring channels (kernel/ipc/channel.c).
+    // Additive -- every existing program is byte-for-byte unchanged (unregistered
+    // numbers return ENOTSUP; nothing binds a channel until a process opts in).
+    {
+        extern int64_t sys_ch_create(uint64_t,uint64_t,uint64_t,uint64_t,uint64_t,uint64_t);
+        extern int64_t sys_ch_write (uint64_t,uint64_t,uint64_t,uint64_t,uint64_t,uint64_t);
+        extern int64_t sys_ch_read  (uint64_t,uint64_t,uint64_t,uint64_t,uint64_t,uint64_t);
+        extern int64_t sys_ch_wait  (uint64_t,uint64_t,uint64_t,uint64_t,uint64_t,uint64_t);
+        extern int64_t sys_ch_close (uint64_t,uint64_t,uint64_t,uint64_t,uint64_t,uint64_t);
+        syscall_table[SYS_CH_CREATE] = sys_ch_create;
+        syscall_table[SYS_CH_WRITE]  = sys_ch_write;
+        syscall_table[SYS_CH_READ]   = sys_ch_read;
+        syscall_table[SYS_CH_WAIT]   = sys_ch_wait;
+        syscall_table[SYS_CH_CLOSE]  = sys_ch_close;
+        extern void channel_selftest(void);
+        channel_selftest();
+    }
+
 #if defined(SMP_FOUNDATION) && !defined(SMP_SCHED_DISPATCH)
     // SMP coprocessor offload (the userspace -> CPU1 bridge). Registered ONLY for
     // the coprocessor SMP build; the DEFAULT kernel leaves this slot NULL, so the

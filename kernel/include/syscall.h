@@ -104,6 +104,11 @@
 #define SYS_BATTERY     93  // EC battery status (ec_battery_status_t subset: 4 bytes)
 #define SYS_PERSIST_READ  94 // read a named diskfs file into a user buffer  (handlers.c)
 #define SYS_PERSIST_WRITE 95 // write a user buffer to a named diskfs file   (handlers.c)
+#define SYS_CH_CREATE   96  // CHANNEL-0: create a shared-ring channel -> handle
+#define SYS_CH_WRITE    97  // CHANNEL-0: write bytes to a channel handle
+#define SYS_CH_READ     98  // CHANNEL-0: read bytes from a channel handle
+#define SYS_CH_WAIT     99  // CHANNEL-0: poll readiness (CH_READABLE/WRITABLE/CLOSED)
+#define SYS_CH_CLOSE   100  // CHANNEL-0: close/release a channel handle
 #define SYS_VMA_TEST    200 // VMA red-black tree testing and benchmarking
 
 // ---- SMP coprocessor offload (GATED: only registered under SMP_FOUNDATION) ----

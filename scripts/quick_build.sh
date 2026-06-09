@@ -417,6 +417,7 @@ if [ "${USB_UHCI:-0}" = "1" ]; then
     compile kernel/drivers/usb/uhci.c         c_uhci
     compile kernel/drivers/usb/hid.c          c_hid
 fi
+compile kernel/ipc/channel.c                  c_channel
 compile kernel/core/signal/kill.c             c_kill
 compile kernel/core/sched/nice.c              c_nice
 compile kernel/drivers/pty/pty.c              c_pty

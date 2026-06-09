@@ -215,6 +215,15 @@ typedef struct process {
     // avoid a circular include of vfs.h from sched.h.
     struct vfs_file* fd_table[1024 /* == VFS_MAX_FDS */];
 
+    // CHANNEL-0: capability handle table (shared-ring channels). Handle is a
+    // process-local index (1..CH_MAX_HANDLES-1; 0 = "none") -> {channel, end
+    // (master/slave), rights}. Zeroed by the memset in process_create /
+    // thread_create. stdio_chan[fd] = the handle bound to fd0/1/2 (0 = unbound
+    // -> serial/ps2 as before). Cleaned up by channel_cleanup_process() at
+    // teardown. After the CPU context, so appending here is layout-safe.
+    struct { void* ch; uint8_t end; uint32_t rights; } ch_handles[32 /* == CH_MAX_HANDLES */];
+    uint8_t stdio_chan[3];
+
     // Blocking waitpid(): a parent with no terminated child sleeps on this queue;
     // a child's sys_exit() wakes it. Pointer (lazily kmalloc'd on first wait) so
     // process_t need not see the full wait_queue_t definition (which appears

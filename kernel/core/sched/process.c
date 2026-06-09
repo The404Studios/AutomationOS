@@ -719,6 +719,11 @@ void process_unref(process_t* proc) {
         extern void vfs_close_all_fds(struct process* proc);
         vfs_close_all_fds(proc);
 
+        // CHANNEL-0: release any channel handles the process still held so their
+        // shared rings + refcounts don't leak (mirrors vfs_close_all_fds).
+        extern void channel_cleanup_process(struct process* proc);
+        channel_cleanup_process(proc);
+
         // Close any sockets the process had open (owner_pid match). Without
         // this, a process that exits without explicit sock_close() leaks its
         // socket descriptors forever (and, for TCP, leaves half-open

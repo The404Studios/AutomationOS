@@ -2,6 +2,23 @@
 
 > Warm memory. Refresh per checkpoint. One active brick at a time.
 
+## AGENT-RPC-0 (ACTIVE) — the typed-tool rail on top of CHANNEL-0 (the chainlayer2 north star)
+- **branch:** `brick/agent-rpc-0` (off the published `brick/terminal-0` HEAD `47a2bc0`) · **spec (P5/P6):**
+  `docs/superpowers/specs/2026-06-08-channel-0-design.md` · **record:** [`bricks/AGENT-RPC-0.md`](bricks/AGENT-RPC-0.md)
+- **why:** now that the console is human-stable (TERMINAL-0), give the agent a TYPED rail — framed
+  `CH_MSG` packets → `TOOL_RUN`/`TOOL_RESULT` — so it never scrapes terminal text.
+- **checkpoints (one commit each):** **P5a** kernel `CH_MSG` framing + boot selftest ← done ·
+  P5b syscall surface (frame-aware `sys_ch_write/read` or `SYS_CH_SENDMSG/RECVMSG`) + userspace wrapper ·
+  P6 `TOOL_RUN`/`TOOL_RESULT` + the agent runtime. Substrate-before-surface; additive (CH_BYTE untouched).
+- **status:** **P5a LANDED (substrate).** `msg_packet_t {type,flags,len,request_id}` framed on the
+  existing SPSC rings; `channel_write_msg`/`channel_read_msg` are **message-atomic** (whole frame or
+  nothing; one packet per read; header peeked so an undersized buffer gets `EMSGSIZE` with the message
+  intact). Hard boundary: header+len > ring cap → **`EMSGSIZE` (-90, new)**, NOT EAGAIN. Proven by
+  `channel_selftest_p5()` at boot: serial `[CHAN] p5 msg selftest PASS (w=30 r=14 rid_ok=1
+  empty=EAGAIN:1 oversize=EMSGSIZE:1 payload='/bin/cc main.c')`; P1/p2 selftests still PASS (default
+  CH_BYTE path unchanged); ISO byte-identical to TERMINAL-0; `p5final.png` == `t4final.png` (0 panic).
+  **Next: P5b** (the syscall surface for CH_MSG). NOT pushed (new brick, awaiting user OK).
+
 ## TERMINAL-0 — FROZEN / COMPLETE (T0–T4, pushed to origin `935f54f`) — CHANNEL-0 console output human-stable
 - **branch:** `brick/terminal-0` (off `brick/channel-0`), **PUSHED** `git push origin brick/terminal-0`
   verified via `ls-remote` (remote == local HEAD `935f54f`) · **spec:** `docs/superpowers/specs/2026-06-09-terminal-0-design.md`

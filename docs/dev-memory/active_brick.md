@@ -32,9 +32,18 @@
   explicit `AR_E_*` codes; doc `docs/AGENT_RPC_WIRE.md`. The CH_MSG payload IS one struct; the kernel
   ring stays opaque (schema = userspace policy). Proven by `sbin/rpctest` (encode→validate + every
   rejection): serial `RPCTEST: PASS v=1 run_sz=392 res_sz=16 rej(len=1,ver=1,fld=1,enc=1,resver=1)`;
-  no kernel change; MSGTEST + selftests still green; `p6afinal.png` clean. **STOPPED for review.**
-  **Next: P6b** — the minimal runner: recv `TOOL_RUN` → spawn the tool with stdout bound to a byte
-  channel → send `TOOL_RESULT { exit_code, stdout_handle }`. P6a NOT yet pushed (committed local).
+  no kernel change; MSGTEST + selftests still green; `p6afinal.png` clean. **P6a PUSHED** (`52da0c8`,
+  ls-remote verified). **P6b (`f12cecc`): path-only TOOL_RUN runner — DISPATCH.** Self-spawning
+  `sbin/toolrun`: agent sends a path-only `TOOL_RUN {/bin/free, args_len=0}` over a `CH_MSG` ctrl →
+  runner validates (rejects args!=0/reserved!=0) + spawns `/bin/free` with stdout bound to a `CH_BYTE`
+  channel → runner **drains 183 B of stdout** (the "stdout read") → `TOOL_RESULT {exit_code=0,
+  stdout_handle}` returned + validated. Serial `RUNNER: PASS ... stdout_bytes=183` + `TOOLRUN: PASS
+  sent=1 result=1 type=1 rid=1 valid=1 handle_nz=1`. All hard-no's held (no shell/parser/PATH/env/
+  stdin/stderr/concurrency). **TRUST-BOUNDARY NOTE:** no up-transfer in CHANNEL-0, so the RUNNER reads
+  stdout; `stdout_handle` is the runner's token; agent-side cross-process stdout-read is P6c. No kernel
+  change; RPCTEST/MSGTEST/[CHAN] green; `p6bcheck.png` clean, 0 panic. **Next: P6c** — argv
+  (NUL-separated, validated) + cross-process stdout delivery to the agent. P6b committed local, awaiting
+  review/push.
 
 ## TERMINAL-0 — FROZEN / COMPLETE (T0–T4, pushed to origin `935f54f`) — CHANNEL-0 console output human-stable
 - **branch:** `brick/terminal-0` (off `brick/channel-0`), **PUSHED** `git push origin brick/terminal-0`

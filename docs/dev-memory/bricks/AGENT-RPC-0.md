@@ -132,8 +132,46 @@ checkpoints:
       smoke_proves_claim: true          # RPCTEST: PASS = encode/validate round-trip + all 5 rejections
       raw_pointers_or_truncation: none  # bounded path[120]/args[256]; lengths validated; over-long rejected
     verdict: pass
+  - id: P6b
+    title: path-only TOOL_RUN runner -- agent -> runner -> tool (/bin/free) -> stdout read -> TOOL_RESULT
+    commits: [f12cecc]
+    files:
+      - userspace/apps/toolrun/toolrun.c  # NEW self-spawning agent+runner proof (crt0-linked)
+      - scripts/build_all.sh              # compile + stage sbin/toolrun
+      - userspace/init/main.c             # init spawns sbin/toolrun
+    tests: [build_test/p6b_verify.sh]
+    result: >
+      build_all clean (kernel unchanged); serial 'RUNNER: PASS path=/bin/free exit=0 stdout_bytes=183
+      handle=3 sent=1' + 'TOOLRUN: PASS sent=1 result=1 type=1 rid=1 valid=1 handle_nz=1 exit=0' -- the
+      full chain: agent sends a path-only TOOL_RUN -> runner validates + spawns /bin/free w/ stdout
+      bound to a CH_BYTE channel -> runner drains 183 B of stdout (the 'stdout read') -> TOOL_RESULT
+      { exit_code=0, stdout_handle } returned + validated by the agent. RPCTEST/MSGTEST/[CHAN] still
+      PASS; p6bcheck.png clean, 0 panic.
+    design:
+      - PATH ONLY (user's call): the runner rejects args_len != 0 (args are P6c) and reserved != 0.
+        No shell, no arg parser, no PATH lookup (path used verbatim), no env, no stdin, no stderr
+        capture, one run, only the stdout byte channel inherited, no streaming, no privilege expansion.
+      - topology: self-spawn (parent=agent, child=runner over a shared CH_MSG ctrl, like msgtest); the
+        runner spawns the tool (a grandchild) with stdout bound to a CH_BYTE channel the runner created.
+      - TRUST-BOUNDARY NOTE: CHANNEL-0 only transfers handles parent->child (spawn_ex, narrowed rights),
+        no up-transfer -> the RUNNER reads the child's stdout (the achievable 'stdout read');
+        TOOL_RESULT.stdout_handle is the runner's handle (a non-zero reference token). Agent-side
+        stdout-read-via-handle (cross-process deref) is deferred to P6c with args. (NOT faked.)
+      - GOTCHA avoided: the runner's fd1 IS the ctrl channel, so its diagnostics go to fd2 (unbound ->
+        serial), never fd1; the agent (unbound stdio) prints the verdict to fd1. Both out() helpers
+        capture the syscall "=a" output (the rpctest stale-rax lesson).
+    review:
+      default_build_changed: false      # userspace-only; kernel byte-identical; all prior selftests pass
+      all_waits_bounded: true           # bounded poll+yield loops (recv, waitpid-WNOHANG+drain, send)
+      hardware_init_gated: n/a
+      touches_userspace: true
+      touches_kernel: false
+      preserves_known_good_t410: true
+      smoke_proves_claim: true          # RUNNER+TOOLRUN PASS = the typed dispatch chain executed
+      raw_pointers_or_truncation: none  # typed recv buffers (tool_run_t/tool_result_t); bounded drain
+    verdict: pass
 next_checkpoints:
-  - P6b minimal runner: recv TOOL_RUN -> spawn the tool w/ stdout bound to a byte channel -> send TOOL_RESULT { exit_code, stdout_handle }
+  - P6c argv (NUL-separated argv bytes, validated) + cross-process stdout delivery to the agent (handle transfer)
 deferred:
   - P7 async submission/completion batch · P8 NIC RX/TX as channels
 ```

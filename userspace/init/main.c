@@ -217,6 +217,11 @@ void _start(void) {
     print("[INIT] Spawning rpctest...\n");
     spawn("sbin/rpctest");
 
+    // AGENT-RPC-0 P6b: path-only TOOL_RUN runner. agent -> runner -> /bin/free
+    // (stdout bound to a byte channel) -> TOOL_RESULT. Prints TOOLRUN/RUNNER PASS.
+    print("[INIT] Spawning toolrun...\n");
+    spawn("sbin/toolrun");
+
     // ring-3 float/SSE probe: proves SSE is enabled + context-switched for user
     // tasks (scalar float, a 2x2 float matmul, a reduction). Prints FLOATTEST: PASS.
     print("[INIT] Spawning floattest...\n");

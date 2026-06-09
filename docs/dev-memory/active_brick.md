@@ -17,8 +17,20 @@
   tools, no shell.
 - **acceptance:** `MODELBRIDGE: PASS select_parse=1 policy_ok=1 read_exact=1 answer_exact=1
   malformed_model_rejected=1 bad_tool_rejected=1`; rail still green; desktop 0 panic.
-- **status:** OPEN (design: transport choice from what already exists — QEMU slirp guest→10.0.2.2 TCP vs
-  serial; then implement).
+- **status:** **LANDED.** Transport = TCP over the existing socket syscalls (slirp guest→10.0.2.2:8431;
+  serial rejected — kernel-debug write-only, no userspace read path; TCP = zero kernel changes and the
+  same transport llama.cpp uses later). `sbin/modelbridge`: the ONLY changed seam bodies — model_select/
+  model_answer became `model_exchange()` (one request per connection, `"SELECT <prompt>\n"` /
+  `"ANSWER <observation>\n"`, one line back, bounded everything); parser/whitelist/path-policy/runner
+  byte-for-byte CHAINLAYER-HOST-0. `scripts/model_server_stub.py` = the external endpoint, SCRIPTED TO
+  ATTACK (chatty unparseable reply + valid-shape `delete_file`) so the gate is proven against real
+  remote bytes. Bounded net/endpoint probes → `SKIP` exit 0 keeps the default boot clean. Serial
+  `MODELBRIDGE: PASS select_parse=1 policy_ok=1 read_exact=1 answer_exact=1 malformed_model_rejected=1
+  bad_tool_rejected=1` + the stub's log shows all four exchanges crossed the wire; whole rail green
+  (CHAINHOST/TOOLSET/AGENTHOST/TOOLRUN/RPCTEST/[CHAN]); kernel unchanged; `mbcheck.png` clean, 0 panic.
+  Verify: `build_test/modelbridge_verify.sh`. record: `bricks/MODEL-BRIDGE-0.md`. Committed local,
+  awaiting review/push OK. **Next (user gate):** MODEL-LOOP-0 (first bounded multi-step loop) · swap
+  the stub for a real llama.cpp/GGUF server on the same port · multi-line observation framing.
 
 ## CHAINLAYER-HOST-0 — FROZEN / COMPLETE (pushed to origin `7553849`) — the first full chainlayer host milestone
 - **branch:** `brick/chainlayer-host-0` (off the frozen `brick/toolset-0` HEAD `6ff7be0`) · **record:**

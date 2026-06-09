@@ -244,9 +244,20 @@ static inline blk_hdr_t* _payload_blk(void *p) {
     return (blk_hdr_t*)((unsigned char*)p - sizeof(blk_hdr_t));
 }
 
-// Coalesce block h with consecutive free neighbours (forward only).
+// Block `free` states. The three-state split is LOAD-BEARING: a block parked
+// in the tcache must NOT look free to the arena walker, or the same memory
+// gets handed out twice (tcache pop + arena first-fit/split) and the heap
+// cross-links -- the c70ee87 regression that corrupted every DOM/layout-heavy
+// app. Only BLK_ARENA_FREE blocks may be allocated, split, or coalesced.
+#define BLK_IN_USE      0u
+#define BLK_ARENA_FREE  1u
+#define BLK_IN_TCACHE   2u
+
+// Coalesce block h with consecutive ARENA-FREE neighbours (forward only).
+// A BLK_IN_TCACHE neighbour must never be absorbed: its payload is still
+// live in the cache and will be handed out by a later _tcache_get.
 static void _coalesce_fwd(blk_hdr_t *h) {
-    while (h->next && h->next->free && h->next->magic == BLOCK_MAGIC) {
+    while (h->next && h->next->free == BLK_ARENA_FREE && h->next->magic == BLOCK_MAGIC) {
         h->size += sizeof(blk_hdr_t) + h->next->size;
         h->next  = h->next->next;
     }
@@ -267,7 +278,7 @@ static blk_hdr_t* _arena_init_blocks(unsigned char *mem, unsigned long capacity)
 static void* _alloc_from_list(blk_hdr_t *list, unsigned long size) {
     blk_hdr_t *cur = list;
     while (cur) {
-        if (cur->free && cur->size >= size) {
+        if (cur->free == BLK_ARENA_FREE && cur->size >= size) {
             // Split if there's enough room for a new header plus MIN_SPLIT bytes.
             if (cur->size >= size + sizeof(blk_hdr_t) + MIN_SPLIT) {
                 blk_hdr_t *nxt = (blk_hdr_t*)((unsigned char*)_blk_payload(cur) + size);
@@ -297,7 +308,7 @@ static void _free_in_list(blk_hdr_t *list_head, blk_hdr_t *h) {
         while (prev && prev->next != h) {
             prev = prev->next;
         }
-        if (prev && prev->free) {
+        if (prev && prev->free == BLK_ARENA_FREE) {
             _coalesce_fwd(prev);
         }
     }
@@ -415,13 +426,15 @@ void free(void* ptr) {
 
     blk_hdr_t *h = _payload_blk(ptr);
     if (h->magic != BLOCK_MAGIC) return;  // corrupt pointer guard
-    if (h->free) return;                  // double-free detection
-
-    h->free = 1;  // mark freed BEFORE caching or returning to arena
+    if (h->free) return;                  // double-free detection (1 or 2)
 
     // ────────────────────────────────────────────────────────────────────────
     // FAST PATH: try to cache in tcache (no syscall!)
+    // BLK_IN_TCACHE (not ARENA_FREE): the arena walker must keep treating
+    // this block as occupied while its payload sits in the cache, or it
+    // gets allocated twice. Double-free detection still works (free != 0).
     // ────────────────────────────────────────────────────────────────────────
+    h->free = BLK_IN_TCACHE;
     if (_tcache_put(ptr, h->size) == 0) {
 #ifdef MALLOC_STATS
         _tcache_frees++;

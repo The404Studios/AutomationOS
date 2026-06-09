@@ -1174,6 +1174,19 @@ void kernel_main(void* raw_info) {
         uhci_init();
     }
 #endif
+#ifdef EHCI_USB
+    /* USB-EHCI-0 (gated, default OFF): the T410's Ibex Peak PCH is EHCI-only, so
+     * a real USB mouse there needs an EHCI driver (uhci.c finds no controller).
+     * ehci.c is self-contained and injects via the SAME input_report_* and
+     * input_sync path. E1: ehci_init() is an inert skeleton (no MMIO access);
+     * E2/E3 add PCI discovery, BIOS handoff, reset, and the port-routing ledger
+     * (which DECIDES whether the mouse is even on an EHCI/RMH path). Safe:
+     * bounded, returns cleanly with no controller. Driven by ehci_poll(). */
+    {
+        extern int ehci_init(void);
+        ehci_init();
+    }
+#endif
     BOOT_LOG("[KERNEL] Keyboard + mouse initialized\n");
     boot_mark("keyboard/mouse ok");
 

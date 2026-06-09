@@ -69,6 +69,20 @@ if [ "${USB_UHCI:-0}" = "1" ]; then
     echo "*** USB_UHCI build: usb_core+uhci+hid compiled (boot init still gated in kernel.c) ***"
 fi
 
+# ─────────────────────────────────────────────────────────────────────────────
+# OPT-IN USB HID boot mouse over EHCI (USB-EHCI-0). GATED behind EHCI_USB=1.
+# DEFAULT OFF.  The T410's Ibex Peak PCH is EHCI-only (no UHCI), so a real USB
+# mouse there needs this driver.  Compiles kernel/drivers/usb/ehci.c and defines
+# -DEHCI_USB so kernel.c/pit.c can #ifdef-gate ehci_init()/ehci_poll().  When
+# UNSET, ehci.c is NOT compiled and -DEHCI_USB is absent -> the default kernel is
+# byte-for-byte unchanged and never touches USB hardware.  E1 = gate + inert
+# skeleton; controller bring-up + BIOS handoff + the routing ledger land in E2/E3.
+# ─────────────────────────────────────────────────────────────────────────────
+if [ "${EHCI_USB:-0}" = "1" ]; then
+    CFLAGS="$CFLAGS -DEHCI_USB"
+    echo "*** EHCI_USB build: ehci.c compiled (E1 skeleton; boot init gated in kernel.c) ***"
+fi
+
 # Assembler flags. Empty by default so the cooperative build is byte-for-byte
 # unchanged.
 NASMFLAGS=""
@@ -416,6 +430,12 @@ if [ "${USB_UHCI:-0}" = "1" ]; then
     compile kernel/drivers/usb/usb_core.c     c_usb_core
     compile kernel/drivers/usb/uhci.c         c_uhci
     compile kernel/drivers/usb/hid.c          c_hid
+fi
+# USB-EHCI-0 (GATED by EHCI_USB=1): EHCI host controller for the T410's EHCI-only
+# PCH. Self-contained; injects via the SAME input_report_* and input_sync path.
+# E1 = inert skeleton (no MMIO). Default build unchanged (not compiled when unset).
+if [ "${EHCI_USB:-0}" = "1" ]; then
+    compile kernel/drivers/usb/ehci.c         c_ehci
 fi
 compile kernel/core/signal/kill.c             c_kill
 compile kernel/core/sched/nice.c              c_nice

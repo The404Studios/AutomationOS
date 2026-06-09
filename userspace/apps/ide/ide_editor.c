@@ -1455,9 +1455,16 @@ void ide_editor_render(struct Ide* a, Canvas* cv, Rect r) {
                 if (cx >= code_right) break;
                 char cch = src[lstart + i];
                 if (cch == '\t') cch = ' ';
-                if (cch >= 32 && cch < 127)
-                    gfx_text_clip(cv, cx, ry, src + lstart + i,
+                if (cch >= 32 && cch < 127) {
+                    /* IDE-REPAIR-0 I1: draw ONE glyph. `src` is the flat,
+                     * NOT-NUL-terminated source buffer; passing the interior
+                     * pointer made gfx_text_clip render the entire buffer
+                     * suffix from every row (the diagonal line-bleed that
+                     * broke typing). A 1-char NUL'd local stops at the cell. */
+                    char glyph[2]; glyph[0] = cch; glyph[1] = 0;
+                    gfx_text_clip(cv, cx, ry, glyph,
                                   ed_class_color(cls[i]), code_x, code_clip_w);
+                }
             }
         }
 

@@ -429,7 +429,12 @@ void panel_code(Ide* a, Canvas* cv, Rect r) {
                     if (cx >= code_right) break;
                     if (ch != '\t' && (unsigned char)ch >= 0x20 &&
                         (unsigned char)ch < 0x7F) {
-                        gfx_text_clip(cv, cx, ry, src + lstart + i,
+                        /* IDE-REPAIR-0 I1: ONE glyph per cell -- `src` is the
+                         * un-terminated flat buffer; the interior pointer made
+                         * gfx_text_clip draw the whole buffer suffix per row
+                         * (same line-bleed as ide_editor.c). */
+                        char glyph[2]; glyph[0] = ch; glyph[1] = 0;
+                        gfx_text_clip(cv, cx, ry, glyph,
                                       cv_class_color(cls[i]),
                                       code_x, code_clip_w);
                         if (cx + GFX_FW > text_right) text_right = cx + GFX_FW;

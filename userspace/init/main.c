@@ -233,6 +233,11 @@ void _start(void) {
     print("[INIT] Spawning toolset_host...\n");
     spawn("sbin/toolset_host");
 
+    // CHAINLAYER-HOST-0: model-in-the-loop -- a (stub) model chooses a tool as
+    // JSON, the host validates + runs it, the model answers. Prints CHAINHOST: PASS.
+    print("[INIT] Spawning chainhost...\n");
+    spawn("sbin/chainhost");
+
     // ring-3 float/SSE probe: proves SSE is enabled + context-switched for user
     // tasks (scalar float, a 2x2 float matmul, a reduction). Prints FLOATTEST: PASS.
     print("[INIT] Spawning floattest...\n");

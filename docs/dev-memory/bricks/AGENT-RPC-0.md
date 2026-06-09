@@ -96,8 +96,44 @@ checkpoints:
       smoke_proves_claim: true          # MSGTEST: PASS in serial = userspace round-trip + EAGAIN + EMSGSIZE
       raw_pointers_or_truncation: none  # copy_from/to_user bounded; CH_MAX_IO cap; oversize->EMSGSIZE
     verdict: pass
+  - id: P6a
+    title: define the TOOL_RUN/TOOL_RESULT wire schema (schema only -- lock the contract before dispatch)
+    commits: [9178d89]
+    files:
+      - userspace/lib/agent_rpc.h         # NEW shared header: type IDs, version, packed payloads, encode/validate
+      - userspace/apps/rpctest/rpctest.c  # NEW encode/decode/validate selftest (schema only; no channels)
+      - docs/AGENT_RPC_WIRE.md            # NEW authoritative wire-contract doc
+      - scripts/build_all.sh              # compile + stage sbin/rpctest
+      - userspace/init/main.c             # init spawns sbin/rpctest
+    tests: [build_test/p6a_verify.sh]
+    result: >
+      build_all clean (kernel unchanged); serial 'RPCTEST: PASS v=1 run_sz=392 res_sz=16
+      rej(len=1,ver=1,fld=1,enc=1,resver=1)' -- both structs encode->validate round-trip and EVERY
+      rejection path fires (bad length/version/field, over-long encode, result version). P5b MSGTEST +
+      P1/p2/p5 selftests still PASS; p6afinal.png clean, 0 panic.
+    design:
+      - SCHEMA ONLY (user's call): lock the wire contract before any dispatch (spawn/fd passing is where
+        the risk starts). No spawn, no fd passing, no stdout channel -- that is P6b.
+      - the payload of a CH_MSG packet IS one fixed-size struct; msg_packet_t.type selects it
+        (MSG_TOOL_RUN 0x0101 / MSG_TOOL_RESULT 0x0102). tool_run_t = 392 B (version/flags/path_len/
+        args_len/reserved + path[120] + args[256]); tool_result_t = 16 B (stdout_handle always 0 in P6a).
+      - versioned + validated: receivers reject unknown version (forward-safety) and any length/field/NUL
+        violation, with explicit AR_E_* codes. The schema is pure userspace policy; the kernel ring is opaque.
+      - GOTCHA fixed: rpctest's hand-rolled out() omitted the syscall "=a" output, so gcc cached a stale
+        rax (clobbered by syscall) and a later write ran as a stray sys_open. Capture the return. (The
+        schema logic was correct first try -- RPCTEST: PASS printed even through the garbled tail.)
+    review:
+      default_build_changed: false      # userspace-only; kernel byte-identical; all prior selftests pass
+      all_waits_bounded: true           # pure in-memory encode/validate; no loops beyond bounded copies
+      hardware_init_gated: n/a
+      touches_userspace: true
+      touches_kernel: false             # the wire schema is userspace policy; the ring is opaque
+      preserves_known_good_t410: true
+      smoke_proves_claim: true          # RPCTEST: PASS = encode/validate round-trip + all 5 rejections
+      raw_pointers_or_truncation: none  # bounded path[120]/args[256]; lengths validated; over-long rejected
+    verdict: pass
 next_checkpoints:
-  - P6 AGENT-RPC-0 typed tool calls (TOOL_RUN/TOOL_RESULT) + the agent runtime, on the msg rail
+  - P6b minimal runner: recv TOOL_RUN -> spawn the tool w/ stdout bound to a byte channel -> send TOOL_RESULT { exit_code, stdout_handle }
 deferred:
   - P7 async submission/completion batch · P8 NIC RX/TX as channels
 ```

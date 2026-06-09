@@ -25,8 +25,16 @@
   child silent since its fd1 IS the channel): serial `MSGTEST: PASS eagain=1 emsgsize=1 send=1
   roundtrip=1 reply='PONG' rid=0x1234abcd` — a genuine cross-process userspace round-trip + EAGAIN +
   EMSGSIZE. CH_BYTE unchanged (P1/p2/p5 selftests pass, terminal renders, `p5bcheck.png` clean, 0
-  panic). **Next: P6** (TOOL_RUN/TOOL_RESULT + agent runtime on the msg rail). `gitignore` anchored
-  (`decf0f9`). NOT pushed (new brick, awaiting user OK).
+  panic). `gitignore` anchored (`decf0f9`). **P5a+P5b PUSHED** (`2fe28f4`, ls-remote verified).
+  **P6a (`9178d89`): the wire schema (schema-only).** `userspace/lib/agent_rpc.h` — type IDs
+  `MSG_TOOL_RUN` (0x0101)/`MSG_TOOL_RESULT` (0x0102), `AGENT_RPC_VERSION`=1, fixed-size packed
+  `tool_run_t` (392 B)/`tool_result_t` (16 B; `stdout_handle`=0 until P6b), encode/validate with
+  explicit `AR_E_*` codes; doc `docs/AGENT_RPC_WIRE.md`. The CH_MSG payload IS one struct; the kernel
+  ring stays opaque (schema = userspace policy). Proven by `sbin/rpctest` (encode→validate + every
+  rejection): serial `RPCTEST: PASS v=1 run_sz=392 res_sz=16 rej(len=1,ver=1,fld=1,enc=1,resver=1)`;
+  no kernel change; MSGTEST + selftests still green; `p6afinal.png` clean. **STOPPED for review.**
+  **Next: P6b** — the minimal runner: recv `TOOL_RUN` → spawn the tool with stdout bound to a byte
+  channel → send `TOOL_RESULT { exit_code, stdout_handle }`. P6a NOT yet pushed (committed local).
 
 ## TERMINAL-0 — FROZEN / COMPLETE (T0–T4, pushed to origin `935f54f`) — CHANNEL-0 console output human-stable
 - **branch:** `brick/terminal-0` (off `brick/channel-0`), **PUSHED** `git push origin brick/terminal-0`

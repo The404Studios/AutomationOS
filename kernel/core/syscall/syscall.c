@@ -222,6 +222,9 @@ void syscall_init(void) {
         syscall_table[SYS_SPAWN_EX] = sys_spawn_ex;
         extern void channel_selftest_p2(void);
         channel_selftest_p2();
+        // P5: typed CH_MSG message framing (substrate only; no syscall/agent yet).
+        extern void channel_selftest_p5(void);
+        channel_selftest_p5();
     }
 
 #if defined(SMP_FOUNDATION) && !defined(SMP_SCHED_DISPATCH)

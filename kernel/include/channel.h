@@ -62,6 +62,20 @@ typedef struct channel {
     int       closed;
 } channel_t;
 
+/* ---- CHANNEL-0 P5: typed message framing (CH_MSG channels) ----
+ * A message = this fixed 16-byte header, immediately followed on the ring by
+ * `len` payload bytes. Writes are message-atomic (the whole frame commits or
+ * nothing); reads return exactly one whole message. Byte channels (CH_BYTE,
+ * all of TERMINAL-0) are untouched -- they keep using channel_write/read.
+ * (No padding: 2+2+4+8 = 16, naturally aligned -- raw bytes round-trip the ring.)
+ */
+typedef struct msg_packet {
+    uint16_t type;        /* message type (P6/AGENT-RPC-0 assigns TOOL_RUN, ...) */
+    uint16_t flags;       /* per-message flags                                   */
+    uint32_t len;         /* payload length in bytes (follows the header)        */
+    uint64_t request_id;  /* correlate request <-> response                      */
+} msg_packet_t;
+
 /* ---- kernel API (used by the ch_* syscalls and by stdio/spawn routing) ---- */
 channel_t* channel_alloc(uint32_t flags, uint32_t capacity);
 void       channel_ref(channel_t* ch);
@@ -69,6 +83,16 @@ void       channel_unref(channel_t* ch);
 int        channel_write(channel_t* ch, int end, const uint8_t* data, uint32_t len);
 int        channel_read(channel_t* ch, int end, uint8_t* data, uint32_t len);
 uint32_t   channel_available(channel_t* ch, int end);  /* bytes this end can read */
+
+/* P5 message framing (CH_MSG only). channel_write_msg: commits header+payload
+ * atomically; returns total framed bytes written (>0), or EMSGSIZE if
+ * header+len can never fit the ring, EAGAIN if it momentarily won't fit, EINVAL
+ * on misuse. channel_read_msg: returns ONE whole message -- fills *hdr + up to
+ * payload_cap payload bytes, returns the payload length (>=0; 0 = valid empty
+ * message), EAGAIN if no complete message is queued, EMSGSIZE if the caller's
+ * buffer is smaller than the message (left intact to retry), EINVAL on misuse. */
+int        channel_write_msg(channel_t* ch, int end, const msg_packet_t* hdr, const uint8_t* payload);
+int        channel_read_msg (channel_t* ch, int end, msg_packet_t* hdr, uint8_t* payload, uint32_t payload_cap);
 
 /* per-process handle table */
 int        process_alloc_handle(struct process* p, channel_t* ch, int end, uint32_t rights);
@@ -79,6 +103,7 @@ void       channel_cleanup_process(struct process* p);
 /* boot self-test (P1): create a channel, write via slave, read via master */
 void       channel_selftest(void);
 void       channel_selftest_p2(void);                          /* P2 binding/rights test */
+void       channel_selftest_p5(void);                          /* P5 CH_MSG framing test */
 
 /* P2: install parent-supplied stdio channels into a freshly-built child (slave
  * end, narrowed rights). Called from elf_load_and_exec(); no-op for plain spawn. */

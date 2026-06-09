@@ -90,6 +90,47 @@ uint32_t channel_available(channel_t* ch, int end) {
     return r->head - r->tail;
 }
 
+/* ---- CHANNEL-0 P5: message-atomic framing on CH_MSG channels ----
+ * The frame is [16-byte msg_packet_t header][len payload bytes] in the same
+ * SPSC ring, routed by end exactly like the byte path. A write places all bytes
+ * then bumps head ONCE, so a consumer never sees a partial frame (and it is
+ * SMP-safe in shape, not just cooperative-safe). A read peeks the header first
+ * so an undersized-buffer caller gets EMSGSIZE with the message left intact. */
+int channel_write_msg(channel_t* ch, int end, const msg_packet_t* hdr, const uint8_t* payload) {
+    if (!ch || !hdr) return EINVAL;
+    if (!(ch->flags & CH_MSG)) return EINVAL;              /* byte channels use channel_write */
+    if (hdr->len && !payload) return EINVAL;
+    uint32_t hsz   = (uint32_t)sizeof(msg_packet_t);
+    uint32_t total = hsz + hdr->len;
+    if (total < hsz) return EMSGSIZE;                      /* len overflow (wrap) -> too long */
+    ch_ring_t* r = (end == CH_END_SLAVE) ? &ch->to_master : &ch->to_slave;
+    if (total > r->cap) return EMSGSIZE;                   /* can NEVER fit this ring (hard) */
+    uint32_t freeb = r->cap - (r->head - r->tail);
+    if (total > freeb) return EAGAIN;                      /* momentarily full -> atomic, no partial */
+    const uint8_t* hb = (const uint8_t*)hdr;
+    for (uint32_t i = 0; i < hsz; i++)      r->buf[(r->head + i)        & r->mask] = hb[i];
+    for (uint32_t j = 0; j < hdr->len; j++) r->buf[(r->head + hsz + j)  & r->mask] = payload[j];
+    r->head += total;                                      /* single commit: frame appears atomically */
+    return (int)total;
+}
+int channel_read_msg(channel_t* ch, int end, msg_packet_t* hdr, uint8_t* payload, uint32_t payload_cap) {
+    if (!ch || !hdr) return EINVAL;
+    if (!(ch->flags & CH_MSG)) return EINVAL;
+    if (payload_cap && !payload) return EINVAL;
+    ch_ring_t* r = (end == CH_END_MASTER) ? &ch->to_master : &ch->to_slave;
+    uint32_t hsz  = (uint32_t)sizeof(msg_packet_t);
+    uint32_t used = r->head - r->tail;
+    if (used < hsz) return EAGAIN;                         /* no complete header -> no message */
+    uint8_t* hb = (uint8_t*)hdr;                           /* peek header (do NOT consume yet) */
+    for (uint32_t i = 0; i < hsz; i++) hb[i] = r->buf[(r->tail + i) & r->mask];
+    if (used < hsz + hdr->len) return EAGAIN;              /* defensive: atomic writes prevent this */
+    if (hdr->len > payload_cap) return EMSGSIZE;           /* buffer too small -> leave msg intact */
+    r->tail += hsz;                                        /* commit: consume header ... */
+    for (uint32_t j = 0; j < hdr->len; j++) payload[j] = r->buf[(r->tail + j) & r->mask];
+    r->tail += hdr->len;                                   /* ... then payload */
+    return (int)hdr->len;                                  /* payload bytes delivered (0 = empty msg) */
+}
+
 /* ---- per-process handle table (handle 0 reserved = "none") ---- */
 int process_alloc_handle(struct process* p, channel_t* ch, int end, uint32_t rights) {
     if (!p || !ch) return -1;
@@ -289,4 +330,41 @@ void channel_selftest_p2(void) {
             ok ? "PASS" : "FAIL", hm, hs, gsr == (channel_t*)0, gbad == (channel_t*)0);
     channel_cleanup_process(fake);   /* unref both handles -> channel freed */
     kfree(fake);
+}
+
+/* ===== CHANNEL-0 P5 self-test: prove CH_MSG framing end-to-end (substrate) =====
+ * Writes one typed packet on the slave end, reads it whole on the master end,
+ * then exercises the two boundaries: an empty ring reads back EAGAIN, and a
+ * frame larger than the ring is rejected with EMSGSIZE (not EAGAIN). No syscall
+ * surface and no TOOL_RUN dispatch yet -- that is P5b / P6. */
+void channel_selftest_p5(void) {
+    channel_t* ch = channel_alloc(CH_MSG, CH_PAGE);
+    if (!ch) { kprintf("[CHAN] p5 msg selftest FAIL: alloc\n"); return; }
+    const char pl[] = "/bin/cc main.c";              /* sizeof-1 = exact payload length */
+    uint32_t pllen  = (uint32_t)(sizeof(pl) - 1);    /* = 14 */
+    msg_packet_t hdr; memset(&hdr, 0, sizeof(hdr));
+    hdr.type = 0x55; hdr.flags = 0; hdr.len = pllen; hdr.request_id = 0xABCD1234ULL;
+
+    int w = channel_write_msg(ch, CH_END_SLAVE, &hdr, (const uint8_t*)pl);   /* child -> holder */
+
+    msg_packet_t got; memset(&got, 0, sizeof(got));
+    uint8_t buf[64]; memset(buf, 0, sizeof(buf));
+    int r = channel_read_msg(ch, CH_END_MASTER, &got, buf, sizeof(buf));     /* holder reads it */
+
+    msg_packet_t g2; uint8_t b2[8];
+    int empty = channel_read_msg(ch, CH_END_MASTER, &g2, b2, sizeof(b2));    /* nothing left -> EAGAIN */
+
+    msg_packet_t big; memset(&big, 0, sizeof(big));
+    big.len = ch->to_master.cap + 1;                                         /* frame > ring cap */
+    int over = channel_write_msg(ch, CH_END_SLAVE, &big, (const uint8_t*)pl);/* -> EMSGSIZE (size checked first) */
+
+    int ok = (w == (int)(sizeof(msg_packet_t) + pllen) &&
+              r == (int)pllen &&
+              got.type == 0x55 && got.len == pllen && got.request_id == 0xABCD1234ULL &&
+              buf[0]=='/' && buf[1]=='b' && buf[2]=='i' && buf[3]=='n' &&
+              empty == EAGAIN && over == EMSGSIZE);
+    kprintf("[CHAN] p5 msg selftest %s (w=%d r=%d rid_ok=%d empty=EAGAIN:%d oversize=EMSGSIZE:%d payload='%s')\n",
+            ok ? "PASS" : "FAIL", w, r, got.request_id == 0xABCD1234ULL,
+            empty == EAGAIN, over == EMSGSIZE, (char*)buf);
+    channel_unref(ch);
 }

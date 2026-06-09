@@ -53,6 +53,7 @@
 #define ENOTEMPTY   (-39)   /* Directory not empty */
 #define ENODATA     (-61)   /* No data available */
 #define EOVERFLOW   (-75)   /* Value too large for data type */
+#define EMSGSIZE    (-90)   /* Message too long (CHANNEL-0 CH_MSG: header+len > ring cap) */
 #define EOPNOTSUPP  (-95)   /* Operation not supported */
 #define ENOTSUP     EOPNOTSUPP  /* alias */
 #define EAPFAULT    (-200)  /* Application processor fault */

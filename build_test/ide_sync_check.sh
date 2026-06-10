@@ -62,11 +62,18 @@ shot("/tmp/%s_lego.png" % out)
 key(["right"])
 key(["ret"])
 shot("/tmp/%s_jump.png" % out)
+# IDE-XFILE-0b: select the incoming CALLER satellite (the only node LEFT of
+# the reads column -- game_main, defined in a SIBLING file) and follow it.
+# The cross-file jump must OPEN that sibling and land the selection + caret
+# on the caller: breadcrumb flips file and FN.
+key(["left"])
+key(["ret"])
+shot("/tmp/%s_xjump.png" % out)
 key(["2"])
 shot("/tmp/%s_insp.png" % out)
 PY
 sleep 1; kill $QPID 2>/dev/null
-for p in ${OUT}_ed ${OUT}_lego ${OUT}_jump ${OUT}_insp; do
+for p in ${OUT}_ed ${OUT}_lego ${OUT}_jump ${OUT}_xjump ${OUT}_insp; do
   [ -f /tmp/$p.png ] && { mkdir -p screenshots; cp -f /tmp/$p.png screenshots/$p.png; echo "SAVED screenshots/$p.png ($(stat -c%s screenshots/$p.png) B)"; }
 done
 echo "=== crashes? ==="; grep -niE "PANIC|CPU EXCEPTION|Terminating faulting" "$LOG" | head -3; echo "(done)"

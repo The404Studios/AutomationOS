@@ -269,6 +269,9 @@ void ide_sel_from_caret(Ide* a, int pane);
 /* IDE-SYNC-0 S2/S3: focus func_idx AND land the shared editor caret on its
  * definition line (the reverse edges: map/inspector click -> editor jump). */
 void ide_sel_jump(Ide* a, int func_idx, int pane);
+/* IDE-XFILE-0b: open the SIBLING file (basename fbase) holding fname, then
+ * jump the selection + caret to it (no-op if the open fails). */
+void ide_sel_jump_xfile(Ide* a, const char* fname, const char* fbase);
 /* IDE-CONTEXT-0: build the "project > file" where-am-I prefix into out[cap].
  * project = a->project.name when a project is open, else basename(a->root);
  * file = basename(a->cur_file) or "(no file)". Callers append " > <fn>" so the

@@ -684,6 +684,31 @@ static void ide_parse_project_model(Ide* a) {
     model_parse_append(&a->model, a->src, a->src_len, a->cur_file);
 }
 
+/* IDE-XFILE-0b: follow a symbol that lives in a SIBLING file. Opens that
+ * sibling (which rebuilds the whole-directory model and flips cur_file),
+ * then re-finds the function by name+file -- indices and the caller's
+ * pointers into the OLD model die at reopen, so both inputs are copied
+ * to locals first. fbase is a basename (the Func.file convention). */
+void ide_sel_jump_xfile(Ide* a, const char* fname, const char* fbase) {
+    char nm[M_NAME], fb[M_NAME];
+    if (!a || !fname || !fname[0] || !fbase || !fbase[0]) return;
+    ide_strlcpy(nm, fname, M_NAME);
+    ide_strlcpy(fb, fbase, M_NAME);
+    if (!ide_streq(fb, a->model.cur_file)) {
+        char dir[IDE_PATH], full[IDE_PATH];
+        ide_dirname(dir, IDE_PATH, a->cur_file);
+        path_join(full, IDE_PATH, dir, fb);
+        ide_open_file(a, full);
+        if (!ide_streq(a->model.cur_file, fb)) return;   /* open failed */
+    }
+    for (int j = 0; j < a->model.nfuncs && j < M_MAXFUNCS; j++) {
+        if (!ide_streq(a->model.funcs[j].name, nm)) continue;
+        if (!ide_streq(a->model.funcs[j].file, a->model.cur_file)) continue;
+        ide_sel_jump(a, j, PANE_MAP);
+        return;
+    }
+}
+
 /* Re-scan the tree (collapsed folders not recursed into) and restore the
  * selection by path, since hiding/showing children shifts indices. */
 void rebuild_visible_entries(Ide* a) {

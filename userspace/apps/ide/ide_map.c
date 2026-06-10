@@ -881,21 +881,24 @@ static void map_sat_follow(Ide* a, MapSat* s)
     switch (s->kind) {
     case MK_CALL:
         if (s->fname[0]) {
+            int any = -1;
             for (j = 0; j < a->model.nfuncs && j < M_MAXFUNCS; j++) {
-                if (map_streq(a->model.funcs[j].name, s->fname)) {
-                    /* IDE-XFILE-0a: the model is now whole-directory, so a
-                     * name match may live in a SIBLING file. Following it
-                     * would silently desync the editor (still showing the
-                     * old file) from the focus. No-op until 0b adds the
-                     * open-then-jump path (ide_sel_jump_xfile). */
-                    if (!map_streq(a->model.funcs[j].file, a->model.cur_file))
-                        return;
+                if (!map_streq(a->model.funcs[j].name, s->fname)) continue;
+                if (map_streq(a->model.funcs[j].file, a->model.cur_file)) {
                     /* IDE-SYNC-0 S2: a map follow also lands the editor
                      * caret on the function (prev_focus kept inside). */
                     ide_sel_jump(a, j, PANE_MAP);
                     return;
                 }
+                /* sibling-file match: remember the first, but keep scanning
+                 * so a same-file definition wins a static-name collision. */
+                if (any < 0) any = j;
             }
+            /* IDE-XFILE-0b: the callee lives in a SIBLING file -- open it
+             * and jump there (the model rebuilds; inputs copied inside). */
+            if (any >= 0)
+                ide_sel_jump_xfile(a, a->model.funcs[any].name,
+                                      a->model.funcs[any].file);
         }
         break;
     case MK_READ:
@@ -905,23 +908,31 @@ static void map_sat_follow(Ide* a, MapSat* s)
          *   WRITE port -> jump to a function that READS it (a consumer).
          * Skip the currently-focused function so the move is always visible. */
         if (s->fname[0]) {
-            for (j = 0; j < a->model.nfuncs && j < M_MAXFUNCS; j++) {
-                Func* g = &a->model.funcs[j];
-                int k, nref, hit = 0;
-                if (j == a->focus_func) continue;
-                /* IDE-XFILE-0a: only follow same-file producers/consumers;
-                 * cross-file jumps need the 0b open-then-jump path. */
-                if (!map_streq(g->file, a->model.cur_file)) continue;
-                if (s->kind == MK_READ) {
-                    nref = g->nwrites; if (nref > M_MAXREFS) nref = M_MAXREFS;
-                    for (k = 0; k < nref; k++)
-                        if (g->writes[k][0] && map_streq(g->writes[k], s->fname)) { hit = 1; break; }
-                } else {
-                    nref = g->nreads;  if (nref > M_MAXREFS) nref = M_MAXREFS;
-                    for (k = 0; k < nref; k++)
-                        if (g->reads[k][0] && map_streq(g->reads[k], s->fname)) { hit = 1; break; }
+            /* IDE-XFILE-0b: pass 0 prefers a same-file producer/consumer
+             * (no file switch); pass 1 falls back to a sibling file via
+             * the open-then-jump path. */
+            int pass;
+            for (pass = 0; pass < 2; pass++) {
+                for (j = 0; j < a->model.nfuncs && j < M_MAXFUNCS; j++) {
+                    Func* g = &a->model.funcs[j];
+                    int k, nref, hit = 0;
+                    int same = map_streq(g->file, a->model.cur_file);
+                    if (j == a->focus_func) continue;
+                    if (pass == 0 ? !same : same) continue;
+                    if (s->kind == MK_READ) {
+                        nref = g->nwrites; if (nref > M_MAXREFS) nref = M_MAXREFS;
+                        for (k = 0; k < nref; k++)
+                            if (g->writes[k][0] && map_streq(g->writes[k], s->fname)) { hit = 1; break; }
+                    } else {
+                        nref = g->nreads;  if (nref > M_MAXREFS) nref = M_MAXREFS;
+                        for (k = 0; k < nref; k++)
+                            if (g->reads[k][0] && map_streq(g->reads[k], s->fname)) { hit = 1; break; }
+                    }
+                    if (!hit) continue;
+                    if (same) ide_sel_jump(a, j, PANE_MAP);            /* S2 */
+                    else      ide_sel_jump_xfile(a, g->name, g->file); /* 0b */
+                    return;
                 }
-                if (hit) { ide_sel_jump(a, j, PANE_MAP); return; }   /* S2 */
             }
         }
         break;

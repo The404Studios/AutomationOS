@@ -34,7 +34,7 @@
 #define MAP_PORT_H     17            /* one port row inside central card   */
 #define MAP_SAT_W      154           /* satellite card width               */
 #define MAP_SATHDR_H   6             /* satellite accent header band       */
-#define MAP_SAT_H      32            /* satellite card height (1-line)     */
+#define MAP_SAT_H      46            /* satellite card height (2-line: label + type/ports) -- VIZ1-PARITY-0 */
 #define MAP_SAT_H2     46            /* satellite card height (2-line)     */
 #define MAP_SAT_VGAP   12            /* vertical gap between satellites    */
 #define MAP_COL_GAP    44            /* gap from central card to a column  */
@@ -117,6 +117,36 @@ static int map_fit_str(int fit, char* out)
 static void map_dot(Canvas* cv, int cx, int cy, uint32_t col)
 {
     gfx_round(cv, cx - 3, cy - 3, 7, 7, 3, col);
+}
+
+/* VIZ1-PARITY-0: square connector stud where a wire meets a card border (the
+ * LEGO "plug"). Drawn in the edge pass so the card later overpaints its inner
+ * half -> the stud pokes cleanly out of the border. */
+static void map_stud(Canvas* cv, int x, int y, uint32_t col)
+{
+    gfx_fill(cv, x - 3, y - 3, 6, 6, col);
+    gfx_stroke(cv, x - 3, y - 3, 6, 6, TH_BG);
+}
+
+/* VIZ1-PARITY-0: declared type of a global by name ("" if unknown). */
+static const char* map_global_type(Model* m, const char* name)
+{
+    int i;
+    if (!m || !name || !name[0]) return "";
+    for (i = 0; i < m->nglobals && i < M_MAXGLOBALS; i++)
+        if (map_streq(m->globals[i].name, name)) return m->globals[i].type;
+    return "";
+}
+
+/* VIZ1-PARITY-0: port count of a function by name (-1 = not in the model,
+ * i.e. an external call). */
+static int map_func_nports(Model* m, const char* name)
+{
+    int i;
+    if (!m || !name || !name[0]) return -1;
+    for (i = 0; i < m->nfuncs && i < M_MAXFUNCS; i++)
+        if (map_streq(m->funcs[i].name, name)) return m->funcs[i].nports;
+    return -1;
 }
 
 /* Soft drop shadow: a translucent rounded rect offset down-and-right. Drawn
@@ -227,6 +257,7 @@ typedef struct {
     int      warn;            /* 1 = draw orange multi-writer warning dot */
     int      fit;             /* MK_ABSENT: fit-if-added score 0..100    */
     char     label[80];       /* primary card label                      */
+    char     sub[56];         /* VIZ1-PARITY-0: second line (Type/Ports) */
     char     fname[M_NAME];   /* for MK_CALL: the called function name   */
 } MapSat;
 
@@ -262,6 +293,7 @@ static MapSat* map_sat_push(Rect rc, MapKind kind, uint32_t accent,
     s->warn   = 0;
     s->fit    = 0;
     s->label[0] = '\0';
+    s->sub[0]   = '\0';
     s->fname[0] = '\0';
     if (label) map_cpy(s->label, label, (int)sizeof(s->label));
     if (fname) map_cpy(s->fname, fname, M_NAME);
@@ -477,9 +509,9 @@ void panel_map(Ide* a, Canvas* cv, Rect r)
     int radius      = map_scale(MAP_RADIUS, zoom);
 
     int card_h = cardhdr_h + ROW_H /* "Ports (N)" line */
-               + nports * port_h + PAD * 2;
-    if (card_h < cardhdr_h + ROW_H + PAD * 2)
-        card_h = cardhdr_h + ROW_H + PAD * 2;
+               + nports * port_h + GFX_FH + PAD * 3;   /* + IDA-style close hint (VIZ1-PARITY-0) */
+    if (card_h < cardhdr_h + ROW_H + GFX_FH + PAD * 3)
+        card_h = cardhdr_h + ROW_H + GFX_FH + PAD * 3;
 
     int cx = body.x + (body.w - card_w) / 2 - 30 + a->map_ox;
     int cy = body.y + (body.h - card_h) / 2 + a->map_oy;
@@ -541,7 +573,10 @@ void panel_map(Ide* a, Canvas* cv, Rect r)
             /* wire reaches the satellite at its RIGHT edge. Stash the BARE global
              * name in fname so a click can navigate by dependency (jump to a
              * function that WRITES this global -- the producer). */
-            map_sat_push(sc, MK_READ, TH_CYAN, card_left, ay, 0, buf, f->reads[i]);
+            { MapSat* s = map_sat_push(sc, MK_READ, TH_CYAN, card_left, ay, 0, buf, f->reads[i]);
+              const char* ty = map_global_type(m, f->reads[i]);     /* VIZ1-PARITY-0 */
+              if (s && ty[0]) { map_cpy(s->sub, "Type: ", sizeof(s->sub));
+                                map_cat(s->sub, ty, sizeof(s->sub)); } }
             sy += sat_h + sat_vgap;
         }
     }
@@ -575,7 +610,11 @@ void panel_map(Ide* a, Canvas* cv, Rect r)
             map_cat(buf, g->name, sizeof(buf));
             map_cat(buf, "() ->", sizeof(buf));       /* "-> " calls into us */
             /* wire reaches the central card's LEFT edge at the header line */
-            map_sat_push(sc, MK_CALL, TH_BLUE, card_left, hdr_anchor, 0, buf, g->name);
+            { MapSat* s = map_sat_push(sc, MK_CALL, TH_BLUE, card_left, hdr_anchor, 0, buf, g->name);
+              if (s) { char nb[12]; int nn = ide_itoa(g->nports, nb); nb[nn] = 0;  /* VIZ1-PARITY-0 */
+                       map_cpy(s->sub, "Ports (", sizeof(s->sub));
+                       map_cat(s->sub, nb, sizeof(s->sub));
+                       map_cat(s->sub, ")", sizeof(s->sub)); } }
             sy += sat_h + sat_vgap;
         }
     }
@@ -617,6 +656,9 @@ void panel_map(Ide* a, Canvas* cv, Rect r)
             MapSat* s = map_sat_push(sc, MK_WRITE, TH_GREEN, card_right, wy,
                                      0, buf, f->writes[i]);
             if (s) s->warn = multi;
+            { const char* ty = map_global_type(m, f->writes[i]);    /* VIZ1-PARITY-0 */
+              if (s && ty[0]) { map_cpy(s->sub, "Type: ", sizeof(s->sub));
+                                map_cat(s->sub, ty, sizeof(s->sub)); } }
             sy += sat_h + sat_vgap;
         }
 
@@ -626,8 +668,16 @@ void panel_map(Ide* a, Canvas* cv, Rect r)
             buf[0] = '\0';
             map_cat(buf, f->calls[i][0] ? f->calls[i] : "fn", sizeof(buf));
             map_cat(buf, "()", sizeof(buf));
-            map_sat_push(sc, MK_CALL, TH_YELLOW, card_right, cy_anchor,
+            { MapSat* s = map_sat_push(sc, MK_CALL, TH_YELLOW, card_right, cy_anchor,
                          0, buf, f->calls[i]);
+              int np = map_func_nports(m, f->calls[i]);             /* VIZ1-PARITY-0 */
+              if (s) {
+                  if (np >= 0) { char nb[12]; int nn = ide_itoa(np, nb); nb[nn] = 0;
+                                 map_cpy(s->sub, "Ports (", sizeof(s->sub));
+                                 map_cat(s->sub, nb, sizeof(s->sub));
+                                 map_cat(s->sub, ")", sizeof(s->sub)); }
+                  else map_cpy(s->sub, "(extern)", sizeof(s->sub));
+              } }
             sy += sat_h + sat_vgap;
         }
     }
@@ -658,6 +708,11 @@ void panel_map(Ide* a, Canvas* cv, Rect r)
         int sx = sat_left ? s->r.x : s->r.x + s->r.w;  /* satellite anchor x */
         int sy = s->r.y + s->r.h / 2;
         map_edge(cv, s->ax, s->ay, sx, sy, s->accent, s->dashed);
+        /* VIZ1-PARITY-0: square connector studs at both wire endpoints; the
+         * cards (passes 2b/2c) overpaint the inner half so each stud pokes
+         * out of the border -- the mockup's LEGO plug look. */
+        map_stud(cv, s->ax, s->ay, s->accent);
+        map_stud(cv, sx,    sy,    s->accent);
     }
 
     /* ----------------------------------------------------------------------
@@ -736,6 +791,11 @@ void panel_map(Ide* a, Canvas* cv, Rect r)
         }
     }
 
+    /* VIZ1-PARITY-0: IDA-style close hint along the card's bottom edge. */
+    gfx_text_clip(cv, cx + PAD, cy + card_h - GFX_FH - PAD,
+                  "CLICK TO CLOSE (IDA STYLE)", TH_TEXT_FAINT,
+                  cx + PAD, card_w - 2 * PAD);
+
     /* ----------------------------------------------------------------------
      * PASS 2c -- draw every satellite card on top.
      * -------------------------------------------------------------------- */
@@ -769,22 +829,37 @@ void panel_map(Ide* a, Canvas* cv, Rect r)
             continue;
         }
 
-        /* solid card with accent header band */
+        /* solid card with accent header band.
+         * VIZ1-PARITY-0: two-line layout -- primary label top-aligned, the
+         * sub line (Type: <t> / Ports (N) / (extern)) dimmed below it. */
         map_card(cv, sc.x, sc.y, sc.w, sc.h, sathdr_h, TH_PANEL2, s->accent);
+        ty = sc.y + sathdr_h + 3;
         map_dot(cv, sc.x + PAD + 3, ty + GFX_FH / 2, s->accent);
         gfx_text_clip(cv, sc.x + PAD + 12, ty, s->label, TH_TEXT,
                       sc.x + PAD, sc.w - 2 * PAD - 8);
+        if (s->sub[0])
+            gfx_text_clip(cv, sc.x + PAD + 12, ty + GFX_FH + 1, s->sub,
+                          TH_TEXT_DIM, sc.x + PAD, sc.w - 2 * PAD - 8);
 
         if (s->warn)   /* multi-writer warning marker (orange) in the corner */
             map_dot(cv, sc.x + sc.w - PAD - 2, sc.y + sathdr_h + PAD,
                     TH_ORANGE);
     }
 
-    /* ---- footer legend (faint) ---- */
+    /* ---- footer legend: colored swatch chips (VIZ1-PARITY-0) ---- */
     {
-        const char* hint = "cyan read  green write  yellow call  red absent";
-        gfx_text_clip(cv, body.x + PAD, body.y + body.h - GFX_FH - 2,
-                      hint, TH_TEXT_FAINT, body.x + PAD, body.w - 2 * PAD);
+        static const uint32_t lc[4] = { TH_CYAN, TH_GREEN, TH_YELLOW, TH_RED };
+        static const char* const lt[4] = { "read", "write", "call", "absent" };
+        int lx = body.x + PAD;
+        int ly = body.y + body.h - GFX_FH - 2;
+        int k, sw = GFX_FH - 4;
+        for (k = 0; k < 4; k++) {
+            gfx_fill  (cv, lx, ly + 2, sw, sw, lc[k]);
+            gfx_stroke(cv, lx, ly + 2, sw, sw, TH_BORDER_LT);
+            lx += sw + 5;
+            gfx_text_clip(cv, lx, ly, lt[k], TH_TEXT_DIM, body.x + PAD, body.w - 2 * PAD);
+            lx += gfx_textw(lt[k]) + 14;
+        }
     }
 }
 

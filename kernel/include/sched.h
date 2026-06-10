@@ -452,6 +452,15 @@ void process_unref(process_t* proc);    // Decrement reference count (frees if 0
 void process_on_terminate(process_t* child);  // wake parent's waitpid + drain own wait queue
 process_t* process_get_by_pid(uint32_t pid);
 process_t* process_get_by_name(const char* needle);  // Find first live process by name substring (ref'd)
+
+// SMP-F3-6: THE placement seam (docs/SCHEDULER_POLICY_LAYER.md). Answers
+// "which CPU should this task run on?" -- hard legality, then pin/role, then
+// the home-CPU0 stub (no balancing until F3-7). ADVISORY: the mandatory F3-2
+// enqueue gate in scheduler_add_process_to_cpu stays the backstop. Defined
+// only under SMP_SCHED && SMP_SCHED_DISPATCH (the only builds where placement
+// has more than one answer).
+uint32_t scheduler_choose_cpu(process_t* p);
+void scheduler_choosecpu_selftest(void);
 // Inlined: process_get_current is on the syscall dispatch hot path (called for
 // every SYS_GETPID, SYS_YIELD, and the table-lookup fallback). A cross-TU
 // function call costs ~5 cycles; inlining a global-load is a single MOV.

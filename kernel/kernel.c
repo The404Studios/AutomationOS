@@ -1331,6 +1331,10 @@ void kernel_main(void* raw_info) {
                                 tlb_shootdown_selftest();
                             }
 #endif
+                            /* SMP-F3-6: prove THE placement seam's branches
+                             * (legality clamps, pin wins, role, home stub)
+                             * before any seam-routed placement below runs. */
+                            scheduler_choosecpu_selftest();
                             /* Brick F2: pin ONE ring-0 kernel test thread to CPU1.
                              * CPU1's ap_scheduler_loop context-switches into it on
                              * the next tick. Spin briefly on the BSP, then read
@@ -1457,7 +1461,18 @@ void kernel_main(void* raw_info) {
                                     g_g1_enq_tsc = rdtsc();   /* perf.h inline */
                                 }
 #endif
-                                scheduler_add_process_to_cpu(h, 1);
+                                /* F3-6: the one real ring-3 placement goes
+                                 * through THE seam -- its pin+mask resolve
+                                 * to CPU1 in scheduler_choose_cpu, and the
+                                 * CPU1HELLO ladder still passing IS the live
+                                 * proof the seam chose correctly. */
+                                {
+                                    uint32_t h_target = scheduler_choose_cpu(h);
+                                    scheduler_add_process_to_cpu(h, h_target);
+                                    kprintf("[SMP] F3-6: cpu1hello placed via "
+                                            "scheduler_choose_cpu -> cpu%u\n",
+                                            h_target);
+                                }
                                 kprintf("[SMP] F3-5: cpu1hello PID %d pinned + "
                                         "enqueued on CPU1\n", hpid);
                                 process_unref(h);

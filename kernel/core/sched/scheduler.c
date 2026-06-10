@@ -816,19 +816,124 @@ void scheduler_add_process_to_cpu(process_t* proc, uint32_t cpu) {
 }
 #endif /* SMP_SCHED */
 
+#if defined(SMP_SCHED) && defined(SMP_SCHED_DISPATCH)
+// ===========================================================================
+// SMP-F3-6: scheduler_choose_cpu() -- THE placement seam.
+// ===========================================================================
+// docs/SCHEDULER_POLICY_LAYER.md made real: a task asks "which CPU should I
+// run on?" HERE, and nowhere else. Layers, strict order:
+//   1. HARD LEGALITY (never skipped): declared allowed_cpus ∩ online reality.
+//      An empty intersection or an off-mask pin is an ILLEGAL request --
+//      CLAMPED loudly to a legal CPU, never returned illegal, never wedged.
+//   2. ROLE/PIN (law 2, pinning beats balancing): a legal pin wins; a task
+//      whose legal mask is CPU1-only goes to CPU1 even unpinned (the doc's
+//      cpu1-only role branch). Generic field reads -- NEVER name-based.
+//   3. PRESSURE/BALANCING -- DELIBERATE STUB: home CPU0, no balancing, no
+//      migration. F3-7 inserts one branch here; no caller changes. Default
+//      tasks (CPU0 mask, no pin) land here == exactly today's behavior.
+//   4. The untouched MLFQ on the chosen CPU picks the TASK (wrap, never
+//      replace).
+// ADVISORY by design: the mandatory F3-2 enqueue gate in
+// scheduler_add_process_to_cpu remains the backstop, so even a buggy future
+// policy cannot enqueue off-mask (legality is structural, not polite).
+uint32_t scheduler_choose_cpu(process_t* p) {
+    if (!p) return 0;
+
+    /* ---- layer 1: hard legality ---------------------------------------- */
+    /* CPU0 is always online; CPU1 joins the legal set only while
+     * cpu1_is_online() (law 7: a dead/quarantined CPU drops out -- liveness
+     * is today's only quarantine input). */
+    extern int cpu1_is_online(void);
+    uint64_t online = 1ULL | (cpu1_is_online() ? (1ULL << 1) : 0ULL);
+    uint64_t legal  = p->allowed_cpus & online;
+    if (legal == 0) {
+        /* The F3-2 memset trap (mask=0) or an all-offline mask. */
+        kprintf("[SCHEDULER] CHOOSECPU: pid=%d '%s' mask=0x%llx has no legal "
+                "online cpu -- CLAMPED to CPU0\n",
+                p->pid, p->name, (unsigned long long)p->allowed_cpus);
+        return 0;
+    }
+
+    /* ---- layer 2: pin/role (pin wins when legal) ------------------------ */
+    if (p->pinned_cpu != CPU_NONE) {
+        if (p->pinned_cpu < 64 && ((legal >> p->pinned_cpu) & 1ULL)) {
+            return p->pinned_cpu;
+        }
+        kprintf("[SCHEDULER] CHOOSECPU: pid=%d '%s' pinned_cpu=%u not in legal "
+                "mask 0x%llx -- pin CLAMPED to first legal cpu\n",
+                p->pid, p->name, p->pinned_cpu, (unsigned long long)legal);
+        /* fall through: the role/home steps below return a legal cpu */
+    }
+    if (((legal >> 1) & 1ULL) && !((legal >> 0) & 1ULL)) {
+        return 1;                  /* CPU1-only mask -> CPU1 (role branch) */
+    }
+
+    /* ---- layer 3: pressure/balancing -- STUB ----------------------------- */
+    return 0;                      /* home CPU0; NO balancing, NO migration */
+}
+
+// SMP-F3-6 selftest: synthetic shells exercise every seam branch (the
+// affinity-selftest pattern -- the boot queues hold too few shapes to be a
+// non-vacuous proof, so the predicate is tested directly). One static shell
+// (process_t is too big for the stack); only the fields the seam reads are
+// set per case.
+void scheduler_choosecpu_selftest(void) {
+    static process_t t;            /* zeroed .bss shell */
+    t.pid = 9999;
+    t.name[0] = 'c'; t.name[1] = 'c'; t.name[2] = 't'; t.name[3] = 0;
+
+    /* 1. pinned CPU1 task chooses CPU1 */
+    t.allowed_cpus = (1ULL << 1); t.pinned_cpu = 1;
+    int pinned_cpu1 = (scheduler_choose_cpu(&t) == 1);
+
+    /* 2. normal/default task chooses home CPU0 */
+    t.allowed_cpus = (1ULL << 0); t.pinned_cpu = CPU_NONE;
+    int default_cpu0 = (scheduler_choose_cpu(&t) == 0);
+
+    /* 3. illegal pin (off-mask) is clamped to a legal cpu, loudly */
+    t.allowed_cpus = (1ULL << 0); t.pinned_cpu = 1;
+    int illegal_clamped = (scheduler_choose_cpu(&t) == 0);
+
+    /* 4. the F3-2 zero-mask trap is clamped to CPU0, loudly */
+    t.allowed_cpus = 0; t.pinned_cpu = CPU_NONE;
+    int nomask_clamped = (scheduler_choose_cpu(&t) == 0);
+
+    /* 5. multi-CPU mask, unpinned: HOME, no balancing/migration (layer-3
+     * stub) -- the "no migration unless explicitly allowed" proof */
+    t.allowed_cpus = (1ULL << 0) | (1ULL << 1); t.pinned_cpu = CPU_NONE;
+    int multimask_home = (scheduler_choose_cpu(&t) == 0);
+
+    /* 6. CPU1-only mask, unpinned: the role branch routes to CPU1 (when
+     * CPU1 is online; on a single-core boot legality clamps it to CPU0 --
+     * accept either as the legal answer for that reality) */
+    extern int cpu1_is_online(void);
+    t.allowed_cpus = (1ULL << 1); t.pinned_cpu = CPU_NONE;
+    uint32_t r6 = scheduler_choose_cpu(&t);
+    int cpu1only_role = cpu1_is_online() ? (r6 == 1) : (r6 == 0);
+
+    int pass = pinned_cpu1 && default_cpu0 && illegal_clamped &&
+               nomask_clamped && multimask_home && cpu1only_role;
+    kprintf("CHOOSECPU: %s pinned_cpu1=%d default_cpu0=%d illegal_clamped=%d "
+            "nomask_clamped=%d multimask_home=%d cpu1only_role=%d\n",
+            pass ? "PASS" : "FAIL",
+            pinned_cpu1, default_cpu0, illegal_clamped,
+            nomask_clamped, multimask_home, cpu1only_role);
+}
+#endif /* SMP_SCHED && SMP_SCHED_DISPATCH */
+
 // F3-5: HOME-ROUTED wake enqueue. Wake-side code (waitqueue signal/timer) used
 // the this_cpu()-based scheduler_add_process(), which is correct only when the
 // WAKER and the WOKEN share a CPU. On the AP that breaks catastrophically: a
 // CPU1 sys_exit waking its CPU0 parent (init, blocked in waitpid) would enqueue
 // the parent on cpus[1] -- CPU1 would then run init while CPU0 still owns it.
-// Route the woken task to ITS home: its pin if pinned, else CPU0 (the GENERAL
-// home until the choose_cpu policy lands). On non-DISPATCH builds cpu_id()==0
-// and tasks are CPU0-affine, so this compiles to the old behavior.
+// F3-6: the woken task's home is now answered by THE seam (was: an inline
+// pin-or-CPU0 ternary -- identical result for every task shape that exists
+// today, now through the audited legality/role path). On non-DISPATCH builds
+// cpu_id()==0 and tasks are CPU0-affine, so this compiles to the old behavior.
 void scheduler_add_process_home(process_t* proc) {
     if (!proc) return;
 #if defined(SMP_SCHED) && defined(SMP_SCHED_DISPATCH)
-    uint32_t home = (proc->pinned_cpu != CPU_NONE) ? proc->pinned_cpu : 0;
-    scheduler_add_process_to_cpu(proc, home);
+    scheduler_add_process_to_cpu(proc, scheduler_choose_cpu(proc));
 #else
     scheduler_add_process(proc);
 #endif
@@ -1133,7 +1238,9 @@ void ap_spawn_test_kthread(void) {
             process_unref(ini);
         }
     }
-    scheduler_add_process_to_cpu(t, 1);        // pin to CPU1
+    // F3-6: the kthread placement goes through THE seam (the F3-3 panel's
+    // "one decider" requirement) -- its pin+mask resolve to CPU1 there.
+    scheduler_add_process_to_cpu(t, scheduler_choose_cpu(t));
     kprintf("[SMP] Brick F2: pinned AP test kthread PID %d to CPU1 (kernel stack=%p)\n",
             t->pid, (void*)t->kernel_stack);
 }

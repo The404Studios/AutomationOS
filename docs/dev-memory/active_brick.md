@@ -2,7 +2,24 @@
 
 > Warm memory. Refresh per checkpoint. One active brick at a time.
 
-## SMP-G1 IPI-WAKE — LANDED (commit `e30d2fd`, branch `brick/smp-g1-ipi-wake`, awaiting review/push) — CPU1 wakes from IPI, 10 ms tick floor → 143 µs
+## SMP-G2 TLBSHOOT-MIN — OPEN (branch `brick/smp-g2-tlbshoot-min`, off frozen `brick/smp-g1-ipi-wake`) — shared kernel mappings safe before the desktop leans on both CPUs
+- **user-set scope (minimal-correct, NO general migration):** link/use the stash-mined TLB IPI
+  handler only under SMP_IPI · bounded ack-counted KERNEL-range flush · local invlpg remains
+  enough for pinned user address spaces · cross-CPU flush ONLY for kernel/global mapping
+  changes · TLB_INVARIANT validator · document the pin/no-migration assumption LOUDLY.
+- **acceptance (user-set):** `TLBSHOOT: PASS kernel_flush=1 acked=1 bounded=1 invariant=1` +
+  the negative proof `TLBSHOOT_NEG: PASS no_user_crossflush_needed_under_pinning=1`.
+- **HARD NO's (user-set):** no general per-mm shootdown · no unpinned migration · no
+  fork-on-CPU1 · no desktop split · no global PREEMPT · no scheduler rewrite · **no blocking
+  while holding rq/heap/scheduler/fs locks — LAW 16** (never wait for TLB ACKs under those
+  locks; TSC-bounded waits from lock-free context only).
+- **context:** existing IPI_TLB_FLUSH (0x51) / IPI_TLB_FLUSH_ALL (0x55) gates are registered
+  since G0; the legacy ipi_tlb_flush_all wait is UNBOUNDED (fix per law 16); tlb_uni.c provides
+  the local handlers; the stash-mined ipi_tlb_flush_page_handler asm is the recorded G2/G3
+  harvest (stash@{0}, archive-never-pop).
+- **next after:** G3 (per-page/precision shootdown) or the wider scheduler policy rungs.
+
+## SMP-G1 IPI-WAKE — FROZEN / COMPLETE (pushed `bb5c378`, ls-remote verified; user: "a real performance milestone... CPU1 is no longer 'eventually responsive'; it is interrupt-woken") — 10 ms tick floor → 143 µs
 - **THE EXACT ACCEPTANCE HIT (first boot):** `IPIWAKE: PASS enqueue_to_cpu1=1
   first_instruction_lt_1ms=1 no_lost_wake=1` — ping ladder acks=32/32 max=143 µs (vs the
   10,000 µs tick floor this brick kills); the REAL cpu1hello enqueue rode the new IPI kick,
@@ -25,7 +42,14 @@
   code in tree (every change #ifdef SMP_IPI, including the `enqueued` local).
 - **boundary held:** no TLB shootdown · no desktop split · no global PREEMPT · no stealing · no
   broad rewrite (loop diff = the cli/check/sti;hlt pattern + proof plumbing).
-- **next after:** G2/G3 (TLB shootdown family — the stash-mined ipi_tlb_flush_page_handler asm).
+- **user verdict on freeze:** "a real performance milestone, not just plumbing... the important
+  boundary stayed clean: IPI handler only sets need_resched, no schedule() from interrupt
+  context, foreign enqueue sends IPI after rq_lock drops, idle loop uses cli → check →
+  sti;hlt. That is the correct shape. The IPI wakes CPU1; the scheduler still runs from the
+  safe idle/scheduler path. The self-caught shadow-zone failure is also strong evidence...
+  the G0 laws are already doing useful work." Both commits kept unsquashed. The G2 lock law
+  recorded as **LAW 16** in [`hardware_laws.md`](hardware_laws.md).
+- **next:** SMP-G2 TLBSHOOT-MIN (open above).
 
 ## SMP-G0 IPI-LINK — FROZEN / COMPLETE (pushed `609d704`, ls-remote verified; user: "That is a clean brick... exactly why G0 had to exist before G1") — BSP interrupts CPU1, CPU1 handles it safely
 - **THE EXACT ACCEPTANCE HIT (first try):** `IPILINK: PASS ipi_resched=1 cpu1_count=1` + the full

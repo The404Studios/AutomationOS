@@ -67,6 +67,16 @@ signal: a model that internalizes these is *useful* on this OS; one that doesn't
     map check in the brick's smoke, not assumed from a linker-script comment (linker.ld's
     "0x200000 user base" was stale; the live base is 0x800000 per userspace.ld). Size such arrays
     for the real machine model, not MAX_CPUS=256.
+16. **Never wait for TLB-shootdown ACKs while holding scheduler, runqueue, heap, or filesystem
+    locks (user-set at SMP-G2).** An ack wait is a cross-CPU rendezvous: the target must take the
+    IPI and run its handler. If the waiter holds a lock the target needs (or the target is
+    spinning on a lock the waiter holds), the wait deadlocks both cores — and an IF=0 wait can't
+    even take its own interrupts. Shootdown waits are entered ONLY from lock-free context and
+    are TSC-bounded (a lost ack times out loudly, never hangs). Enforceable runtime checks:
+    `IF==1` asserted at wait entry (catches the cli'd-context class outright — NOTE plain
+    spin_lock does NOT cli in this kernel, so this is necessary-not-sufficient), plus the
+    bounded timeout itself (a deadlock degrades to a loud timeout, never a hang). Full
+    lock-freedom remains a review-checklist discipline at every call site.
 
 ## Reviewer checklist (a stricter role that can say "no")
 

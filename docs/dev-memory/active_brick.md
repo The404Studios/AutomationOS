@@ -2,7 +2,24 @@
 
 > Warm memory. Refresh per checkpoint. One active brick at a time.
 
-## SMP-F3-6 CHOOSECPU — LANDED (commit `6508778`, branch `brick/smp-f3-6-choosecpu`, awaiting review/push) — THE placement seam, one decider
+## SMP-PROFILE-0 — OPEN (branch `brick/smp-profile-0`, off frozen `brick/smp-f3-6-choosecpu`) — typed intent before anything moves
+- **user-set scope:** introduce `sched_profile_t` / sched_class types (NORMAL / BATCH /
+  PINNED_RT or equivalent) · add the `scheduler_submit_task` funnel if the doc requires it (it
+  does — the named pipeline: legal mask → choose_cpu → legality assert → enqueue sink) · NO
+  behavior change by default · choose_cpu READS the profile but still routes NORMAL home CPU0 ·
+  BATCH exists as DATA, not active migration.
+- **acceptance (user-set):** `SMPPROFILE: PASS normal_home=1 batch_declared=1 pinned_rt_legal=1
+  submit_funnel=1 no_behavior_change=1`.
+- **HARD NO's (user-set):** no actual migration · no work stealing · no desktop split · no
+  per-mm shootdown · no global PREEMPT.
+- **CONTROLLED MIGRATION PARKED (user-set at the F3-6 freeze):** "the moment normal processes
+  can actually migrate across CPUs, TLBSHOOT_NEG's
+  no_user_crossflush_needed_under_pinning=1 becomes fragile. Layer 3 can stay a home-CPU0 stub
+  until the profile/type system and syscall safety are stronger."
+- **the user's roadmap after this:** SMP-H1 BKL-LITE → SMP-F3-7 BATCH-CLASS / controlled CPU1
+  placement → DESKTOP-SPLIT.
+
+## SMP-F3-6 CHOOSECPU — FROZEN / COMPLETE (pushed `e740175`, ls-remote verified; user: "the right seam brick... CPU placement is no longer scattered across hand placements... exactly the right SMP safety shape") — THE placement seam, one decider
 - **THE EXACT ACCEPTANCE HIT (first boot, kernel-printed):** `CHOOSECPU: PASS pinned_cpu1=1
   default_cpu0=1 illegal_clamped=1 nomask_clamped=1 multimask_home=1 cpu1only_role=1` + the
   live proof `[SMP] F3-6: cpu1hello placed via scheduler_choose_cpu -> cpu1` + the ENTIRE

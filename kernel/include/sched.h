@@ -505,6 +505,15 @@ extern volatile int scheduler_in_switch;
 void cpu_set_current_thread(process_t* proc);
 // F3-4: the inverse resolver -- this_cpu()->current_thread (per-CPU "current").
 process_t* cpu_get_current_thread(void);
+// F3-5: HOME-ROUTED wake enqueue -- the woken task goes to ITS cpu (pin, else
+// CPU0), never the WAKER's. The wake-side replacement for scheduler_add_process
+// (which is this_cpu()-based and cross-CPU-unsafe from the AP).
+void scheduler_add_process_home(process_t* proc);
+#if defined(SMP_SCHED) && defined(SMP_SCHED_DISPATCH)
+// F3-5: the AP-safe cooperative scheduler (yield + the dying path) -- exposed
+// for the CPU1 syscall routing in schedule()/sys_yield and the F2 kthread.
+void ap_cooperative_schedule(void);
+#endif
 
 // Scheduler
 void scheduler_init(void);

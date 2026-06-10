@@ -1054,6 +1054,16 @@ int64_t sys_yield(uint64_t arg1, uint64_t arg2, uint64_t arg3,
                   uint64_t arg4, uint64_t arg5, uint64_t arg6) {
     (void)arg1; (void)arg2; (void)arg3; (void)arg4; (void)arg5; (void)arg6;
 
+#if defined(SMP_SCHED) && defined(SMP_SCHED_DISPATCH)
+    // F3-5: a CPU1 yield must take the AP-safe path. The BSP body below calls
+    // process_set_current(next) -- a GLOBAL write that would clobber CPU0's
+    // notion of "current" if executed on the AP.
+    if (cpu_id() != 0) {
+        ap_cooperative_schedule();
+        return ESUCCESS;
+    }
+#endif
+
     process_t* current = process_get_current();
     if (!current) {
         kprintf("[SYSCALL] sys_yield: No current process\n");

@@ -130,6 +130,15 @@ typedef struct cpu {
                                 // runs when no other processes are ready. It
                                 // halts with interrupts enabled (sti; hlt) to
                                 // consume zero CPU. Created by scheduler_init().
+    process_t*  pending_unref;  // F3-5: a dead task's RUNNING ref, handed off by
+                                // the AP dying path and dropped by the SUCCESSOR
+                                // (schedule_tail-style). The ref outliving the
+                                // switch is what keeps the dead task's kernel
+                                // stack + CR3 alive until this CPU is off them --
+                                // CPU0's reaper can run CONCURRENTLY on SMP, so
+                                // the BSP's pre-switch drop (KILL-FIX-002, whose
+                                // safety argument is uniprocessor-only) is NOT
+                                // safe here.
     // The O(1) MLFQ runqueue state, relocated AS-IS from the old file-scope
     // globals (active_rq / expired_rq / ready_count). ONE runqueue (cpu[0]'s) is
     // used exactly as before -- genuinely separate per-CPU runqueues with their
@@ -787,6 +796,24 @@ void scheduler_add_process_to_cpu(process_t* proc, uint32_t cpu) {
 }
 #endif /* SMP_SCHED */
 
+// F3-5: HOME-ROUTED wake enqueue. Wake-side code (waitqueue signal/timer) used
+// the this_cpu()-based scheduler_add_process(), which is correct only when the
+// WAKER and the WOKEN share a CPU. On the AP that breaks catastrophically: a
+// CPU1 sys_exit waking its CPU0 parent (init, blocked in waitpid) would enqueue
+// the parent on cpus[1] -- CPU1 would then run init while CPU0 still owns it.
+// Route the woken task to ITS home: its pin if pinned, else CPU0 (the GENERAL
+// home until the choose_cpu policy lands). On non-DISPATCH builds cpu_id()==0
+// and tasks are CPU0-affine, so this compiles to the old behavior.
+void scheduler_add_process_home(process_t* proc) {
+    if (!proc) return;
+#if defined(SMP_SCHED) && defined(SMP_SCHED_DISPATCH)
+    uint32_t home = (proc->pinned_cpu != CPU_NONE) ? proc->pinned_cpu : 0;
+    scheduler_add_process_to_cpu(proc, home);
+#else
+    scheduler_add_process(proc);
+#endif
+}
+
 #if defined(SMP_SCHED) && defined(SMP_SCHED_DISPATCH)
 // ===========================================================================
 // AP-SAFE SCHEDULER (Brick F) — CPU1 SCHEDULER-MODE dispatch
@@ -837,15 +864,42 @@ void ap_schedule_from_irq(interrupt_frame_t* frame) {
 // scheduler_add_process() are this_cpu()-based so they act on cpus[1]'s runqueue.
 void ap_cooperative_schedule(void) {
     cpu_t* cpu = this_cpu();                  // CPU1 (cpu_id()==1)
+
+    // F3-5: schedule_tail-style deferred drop. We are executing on a LIVE
+    // thread's stack (idle or a requeued thread), so the previously-dead
+    // thread's kernel stack + CR3 are no longer in use on THIS cpu -- its
+    // running ref can finally go. Dropping it any earlier (the BSP's
+    // KILL-FIX-002 pre-switch drop) is uniprocessor-only reasoning: on SMP,
+    // CPU0's reaper can run concurrently and would free the PCB/stack/CR3
+    // while CPU1 still executes on them.
+    if (cpu->pending_unref) {
+        process_t* dead = cpu->pending_unref;
+        cpu->pending_unref = NULL;
+        process_unref(dead);
+        kprintf("[SMP] F3-5: dead task's running ref dropped by successor "
+                "(cpu1_idle=%d)\n",
+                (cpu->current_thread == cpu->idle_thread) ? 1 : 0);
+    }
+
     process_t* current = cpu->current_thread; // idle (initially)
+    // F3-5: a TERMINATED current (sys_exit on CPU1, or the F2 kthread
+    // retiring) must NEVER be resumed -- the old early-return below would
+    // walk straight back into the dead task's context.
+    int dying = (current != cpu->idle_thread &&
+                 current->state == PROCESS_TERMINATED);
+
     process_t* next = scheduler_pick_next();  // this_cpu()-based -> cpus[1].rq
-    if (next == cpu->idle_thread || next == current) {
+    if (!dying && (next == cpu->idle_thread || next == current)) {
         return;  // nothing else runnable (pick_next gives idle on an empty rq; it
                  // transfers NO ref for the idle fallback, so nothing to release).
     }
+    if (dying && next == current) {
+        next = cpu->idle_thread;              // paranoia: never re-pick the dead
+    }
 
     // Requeue the outgoing thread ONLY if it is a runnable non-idle process that
-    // voluntarily yielded (state still RUNNING). The idle fallback is never queued.
+    // voluntarily yielded (state still RUNNING). The idle fallback is never queued
+    // and a TERMINATED current is skipped here by its state.
     if (current != cpu->idle_thread && current->state == PROCESS_RUNNING) {
         scheduler_add_process(current);       // this_cpu()==cpus[1] -> cpus[1].rq
         // LEAK-FIX: drop the outgoing process's old "running" ref. The queue now
@@ -854,8 +908,33 @@ void ap_cooperative_schedule(void) {
         process_unref(current);
     }
 
+    if (dying) {
+        // F3-5 EXIT PATH (policy law 8). The dead task keeps its RUNNING ref --
+        // handed to the successor via pending_unref (dropped at the top of this
+        // function on the next pass, when this CPU is provably off the dead
+        // stack/CR3). context_switch_asm restores the successor's CR3 from its
+        // saved context, so CPU1 leaves the dying address space AT the switch;
+        // teardown (reap on CPU0) can only free that CR3 after the ref drops.
+        current->resume_mode = RESUME_CRETURN;   // saved ctx is never used again
+        cpu->pending_unref   = current;
+
+        // F3-5g: first-CPU1-kfree checkpoint -- prove heap_lock is safe from a
+        // real CPU1 teardown context. One-shot.
+        static int cpu1_kfree_probed = 0;
+        if (!cpu1_kfree_probed) {
+            cpu1_kfree_probed = 1;
+            void* p = kmalloc(64);
+            if (p) {
+                kfree(p);
+                kprintf("[SMP] F3-5: first CPU1 kmalloc/kfree OK\n");
+            } else {
+                kprintf("[SMP] F3-5: first CPU1 kmalloc FAILED\n");
+            }
+        }
+    }
+
     cpu_set_current_thread(next);             // cpus[1].current_thread = next (per-CPU)
-    next->state = PROCESS_RUNNING;
+    if (next != cpu->idle_thread) next->state = PROCESS_RUNNING;
 
     // Point CPU1's TSS.RSP0 + SYSCALL kernel stack at `next`'s kernel stack (no-op
     // for a pure ring-0 kernel thread, required once `next` is a ring-3 process).
@@ -873,6 +952,22 @@ void ap_cooperative_schedule(void) {
     // its context and `ret`s into `next`. Control returns here only when `current`
     // is later switched back in (e.g. `next` yields/blocks/exits).
     context_switch_asm(current, next);
+
+    // F3-5 transition marker: this line executes in the RESUMED thread's
+    // context. The first few resumes narrate the CPU1 lifecycle on serial
+    // (idle -> kthread -> cpu1hello -> kthread -> idle) -- the evidence trail
+    // for the exit-path audit. One-shot bounded; DISPATCH builds only.
+    {
+        static volatile int resume_logged = 0;
+        if (resume_logged < 6) {
+            resume_logged++;
+            cpu_t* c = this_cpu();
+            kprintf("[SMP] F3-5: cpu1 resume #%d current='%s'\n",
+                    resume_logged,
+                    (c->current_thread && c->current_thread->name[0])
+                        ? c->current_thread->name : "?");
+        }
+    }
 }
 
 // ap_enter_scheduler() — ap_main's one-way entry into SCHEDULER mode (fix D1). Jumps
@@ -920,10 +1015,34 @@ static void ap_test_kthread_fn(void) {
         else
             ap_current_probe_result = 2;            // FAIL
     }
+    // F3-5: the kthread now YIELDS periodically (so the pinned ring-3 cpu1hello
+    // can share CPU1 cooperatively) and RETIRES after the F2 verify window is
+    // long past -- through the SAME dying path a user exit takes, so CPU1
+    // genuinely returns to idle (the acceptance's cpu1_idle=1). The retire
+    // threshold (60M) is ~8x the BSP's F2 verify window, so the delta proof
+    // is untouched.
     for (;;) {
         ap_kthread_counter++;
         __asm__ volatile("pause");
+        if ((ap_kthread_counter & 0x3FF) == 0) {
+            ap_cooperative_schedule();              // cooperative yield on CPU1
+        }
+        if (ap_kthread_counter >= 60000000ULL) break;
     }
+    {
+        // Retire exactly like sys_exit does (minus the ring-3 entry): mark
+        // TERMINATED, wake/reparent via process_on_terminate (home-routed
+        // wakes), drop off any queue, then take the dying path -- which hands
+        // the running ref to the successor and switches away forever.
+        process_t* me = process_get_current();
+        me->exit_status = 0;
+        me->state = PROCESS_TERMINATED;
+        process_on_terminate(me);
+        scheduler_remove_process(me);               // no-op for off-queue current
+        kprintf("[SMP] F3-5: F2 kthread retiring through the AP dying path\n");
+        ap_cooperative_schedule();                  // never returns
+    }
+    for (;;) { __asm__ volatile("hlt"); }           // unreachable
 }
 
 // Called ONCE by the BSP (after scheduler_init_secondary_cpu, so cpus[1] is ready
@@ -946,6 +1065,19 @@ void ap_spawn_test_kthread(void) {
     // enqueue. Raw bit op -- smp.h/cpumask_test is intentionally not included here.
     t->allowed_cpus   = (uint64_t)1 << 1;      // CPU1 only
     t->pinned_cpu     = 1;                      // pinned to CPU1
+    // F3-5: the kthread now RETIRES (see ap_test_kthread_fn) -- give it init as
+    // the reaping parent so its zombie is harvested like any other child, and
+    // a priority BELOW user default (100) so the pinned ring-3 cpu1hello wins
+    // the strict-priority pick while both are alive.
+    t->priority = 120;
+    {
+        process_t* ini = process_get_by_pid(1);
+        if (ini) {
+            t->parent_pid = 1;
+            t->parent_seq = ini->create_seq;
+            process_unref(ini);
+        }
+    }
     scheduler_add_process_to_cpu(t, 1);        // pin to CPU1
     kprintf("[SMP] Brick F2: pinned AP test kthread PID %d to CPU1 (kernel stack=%p)\n",
             t->pid, (void*)t->kernel_stack);
@@ -970,7 +1102,17 @@ void ap_scheduler_loop(void) {
     ap_dbg_stage = 3;
     for (;;) {
         ap_cooperative_schedule();
-        __asm__ volatile("hlt");
+        // F3-5 FIX: `sti; hlt` (the canonical idle idiom, same as the BSP's
+        // idle thread), NOT a bare hlt. A bare hlt inherits IF from whatever
+        // path resumed idle -- context_switch_asm restores idle's SAVED
+        // rflags, and if any lock section had IF clear at idle's original
+        // switch-out, the restored IF=0 turns this hlt into a PERMANENT park
+        // (the LAPIC tick can never wake it). Observed as a flaky never-runs-
+        // again idle after the F3-5 dying handoff: the pending running-ref
+        // was never dropped and the dead task's PCB never freed. sti;hlt is
+        // atomic wrt interrupts (an interrupt after sti is taken at the hlt
+        // boundary and wakes it), so the next tick ALWAYS resumes the loop.
+        __asm__ volatile("sti; hlt");
     }
 }
 #endif // SMP_SCHED && SMP_SCHED_DISPATCH
@@ -2014,6 +2156,17 @@ void cooperative_switch_to(process_t* from, process_t* next) {
 }
 
 void schedule(void) {
+#if defined(SMP_SCHED) && defined(SMP_SCHED_DISPATCH)
+    // F3-5: a CPU1 syscall that reschedules (sys_exit -> schedule()) must take
+    // the AP-safe path -- the BSP body below writes the GLOBAL current via
+    // process_set_current and ends with PIC-era assumptions. ap_cooperative_
+    // schedule handles yield (requeue+switch) and exit (the dying path) on
+    // cpus[1] without ever touching CPU0's state.
+    if (cpu_id() != 0) {
+        ap_cooperative_schedule();
+        return;
+    }
+#endif
     // Called from timer interrupt (scheduler tick)
 #ifdef PERF_CONTEXT_SWITCH
     uint64_t schedule_start = rdtsc();

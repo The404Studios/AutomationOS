@@ -1317,6 +1317,7 @@ void kernel_main(void* raw_info) {
                                             ap_current_probe_result);
                                 }
                             }
+
 #endif
                         } else {
                             BOOT_LOG("[SMP] Brick D: CPU1 slot init FAILED (CPU1 stays coprocessor)\n");
@@ -1357,6 +1358,51 @@ void kernel_main(void* raw_info) {
                     syscall_msr_init();
                     BOOT_LOG("[KERNEL] SYSCALL/SYSRET MSRs programmed\n");
                     boot_mark("syscall MSR ok");
+
+#if defined(SMP_SCHED) && defined(SMP_SCHED_DISPATCH)
+                    /* F3-5: spawn cpu1hello -- the FIRST ring-3 process on
+                     * CPU1. MUST be enqueued only NOW: CPU1 dispatches within
+                     * a tick of the enqueue, and a CPU1 syscall needs the
+                     * GLOBAL dispatch table that syscall_init() (above) just
+                     * registered. The first attempt enqueued it back at the
+                     * F2 block -- before syscall_init -- and every cpu1hello
+                     * syscall no-op'd: writes vanished, sys_exit RETURNED,
+                     * and crt0's hlt guard took a CPL3 #GP. Load it normally
+                     * (the BSP scheduler still hasn't started, so the CPU0
+                     * enqueue is inert), then dequeue, set init as the
+                     * reaping parent + the CPU1 pin, and enqueue on cpus[1]. */
+                    {
+                        uint64_t h_size = 0;
+                        void* h_data = initrd_get_file("sbin/cpu1hello", &h_size);
+                        if (h_data && h_size > 0) {
+                            int hpid = elf_load_and_exec(h_data, h_size,
+                                                         "cpu1hello");
+                            process_t* h = (hpid > 0)
+                                         ? process_get_by_pid(hpid) : NULL;
+                            if (h) {
+                                scheduler_remove_process(h);
+                                process_t* ini = process_get_by_pid(1);
+                                if (ini) {
+                                    h->parent_pid = 1;
+                                    h->parent_seq = ini->create_seq;
+                                    process_unref(ini);
+                                }
+                                h->allowed_cpus = (uint64_t)1 << 1;
+                                h->pinned_cpu   = 1;
+                                scheduler_add_process_to_cpu(h, 1);
+                                kprintf("[SMP] F3-5: cpu1hello PID %d pinned + "
+                                        "enqueued on CPU1\n", hpid);
+                                process_unref(h);
+                            } else {
+                                kprintf("[SMP] F3-5: cpu1hello load FAILED (%d)\n",
+                                        hpid);
+                            }
+                        } else {
+                            kprintf("[SMP] F3-5: sbin/cpu1hello not in initrd -- "
+                                    "skipped\n");
+                        }
+                    }
+#endif
 
                     /* Start scheduler (will enable interrupts after TSS.RSP0 is set) */
                     boot_mark("starting services (scheduler)");

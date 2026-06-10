@@ -2,7 +2,13 @@
 
 > Warm memory. Refresh per checkpoint. One active brick at a time.
 
-## NET-P1-0 — LANDED (6 commits local on `brick/net-p1-0`, QEMU green; T410 ladder pending) — track 1 of the roadmap
+## NET-P1-0 — FROZEN / COMPLETE (pushed `e00ee9d`, ls-remote verified) — track 1 of the roadmap, QEMU side done
+- **user verdict:** "a major milestone... it did exactly what the rig was supposed to do — catch real
+  stack violations before hardware day." The 5 smoke mismatches confirmed NOT a blocker (all NET-P1
+  markers pass, default boots, diff scope net-only, 0 panic) → parked as **SMOKE-PROFILE-0**
+  (normalize BOOT_QUIET / SMP-only marker expectations; no kernel behavior change).
+- **NEW HARDWARE LAW (user-set):** *for the T410, no CTRL_RST unless the ME/shared-MDIO semaphore
+  (SWFLAG) is acquired* — recorded in `hardware_laws.md`.
 - **the roadmap:** user-approved 3-track plan (networking → SMP two-core → GT218 native modesetting)
   + permissive-only porting; plan file + [`bricks/NET-P1-0.md`](bricks/NET-P1-0.md) carry the details.
 - **landed:** A0 rig (`1e226c6`, inject+capture, NETRIG PASS) → A SYN side-table (`3965242`, SYNs stop

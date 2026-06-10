@@ -30,6 +30,14 @@ signal: a model that internalizes these is *useful* on this OS; one that doesn't
    (agent finders have a real false-positive rate). "Green" means a build + boot actually passed.
 10. **No raw pointers / path truncations.** Untrusted input (paths, parser bytes, lengths) is
     bounds-checked; identity is the full VFS path, never a truncated display label.
+11. **No CTRL_RST without SWFLAG (the ME-shared-MDIO law, user-set at NET-P1-0).** On PCH NICs
+    (the T410's 82577LM family) the MAC/PHY MDIO link is SHARED with the Management Engine; a
+    reset issued without holding the SW/FW semaphore (`EXTCNF_CTRL.SWFLAG`) can hardware-stall
+    the bus — unrecoverable in software, immune to iteration caps. If the semaphore cannot be
+    acquired, ABORT cleanly and let the (re-runnable, post-desktop) trigger retry later. More
+    generally: any device whose bus is shared with firmware gets its risky init DEFERRED out of
+    boot behind a runtime trigger, with a serial marker before every risky touch
+    (last-line-wins diagnosis).
 
 ## Reviewer checklist (a stricter role that can say "no")
 

@@ -8,7 +8,8 @@
 
 ```yaml
 brick: NET-P1-0
-status: complete (QEMU side); T410 ladder = hardware validation pending
+status: FROZEN / pushed e00ee9d (user: "a major milestone... it did exactly what the rig
+        was supposed to do"); T410 ladder = hardware validation pending
 branch: brick/net-p1-0
 base: brick/selfheal-fix-0 (bd3c597)
 request: >

@@ -293,9 +293,36 @@ int kprintf(const char* format, ...) {
 
     __builtin_va_end(args);
 
+#ifdef SMP_BATCH
+    /* SMP-F3-7: cross-CPU serial LINE lock. With BATCH-class work live on
+     * CPU1, both CPUs kprintf concurrently and the per-byte UART interleave
+     * SHREDS whole lines ("[INIT] Process 16 exited with status [SYSCALL]
+     * sys_stat...") -- which destroyed acceptance evidence (the batchdemo
+     * reap line) before it destroyed anything else. Each formatted line is
+     * already ONE buffer; serializing the single serial_write below makes
+     * lines atomic across CPUs. BOUNDED + best-effort: a same-CPU IRQ that
+     * kprintfs while this CPU holds the lock must not self-deadlock, so on
+     * spin exhaustion we proceed UNSERIALIZED (= today's behavior, a
+     * shredded line) rather than hang. Gated so every non-BATCH build keeps
+     * byte-identical printf.c code. */
+    {
+        static volatile uint32_t kprintf_line_lock = 0;
+        uint64_t spins = 0;
+        int got = 1;
+        while (__atomic_test_and_set(&kprintf_line_lock, __ATOMIC_ACQUIRE)) {
+            if (++spins > 3000000ULL) { got = 0; break; }
+            __asm__ volatile("pause" ::: "memory");
+        }
+        if (b.pos > 0)
+            serial_write(b.buf, b.pos);
+        if (got)
+            __atomic_clear(&kprintf_line_lock, __ATOMIC_RELEASE);
+    }
+#else
     /* Single batched write — one LSR poll loop amortised over the whole line */
     if (b.pos > 0)
         serial_write(b.buf, b.pos);
+#endif
 
     return count;
 }

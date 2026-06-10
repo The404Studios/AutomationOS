@@ -104,6 +104,15 @@ volatile uint64_t g_g1_enq_tsc       = 0;   // BSP: rdtsc at cpu1hello enqueue
 volatile int      g_g1_enq_pid       = 0;   // BSP: the enqueued pid to match
 volatile uint64_t g_g1_dispatch_tsc  = 0;   // CPU1: rdtsc at first dispatch of that pid
 
+#ifdef SMP_BATCH
+/* SMP-F3-7: the same enqueue->first-dispatch stamp pair for the batchdemo
+ * placement -- proving the BATCH foreign enqueue rode the G1 IPI kick (a
+ * sub-ms dispatch is IPI-woken; the tick floor is 10 ms). Same law-15 home. */
+volatile uint64_t g_f37_enq_tsc      = 0;   // BSP: rdtsc at batchdemo enqueue
+volatile int      g_f37_enq_pid      = 0;   // BSP: the enqueued pid to match
+volatile uint64_t g_f37_dispatch_tsc = 0;   // CPU1: rdtsc at first dispatch
+#endif
+
 // Function call queue (per-CPU)
 // Stores call requests BY VALUE so they do NOT depend on the sender's stack
 // lifetime. This is what makes wait==false (fire-and-forget) safe: the sender

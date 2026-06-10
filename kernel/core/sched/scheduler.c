@@ -878,7 +878,22 @@ uint32_t scheduler_choose_cpu(process_t* p) {
         return 1;                  /* CPU1-only mask -> CPU1 (role branch) */
     }
 
-    /* ---- layer 3: pressure/balancing -- STUB ----------------------------- */
+    /* ---- layer 3: pressure/balancing ------------------------------------- */
+#ifdef SMP_BATCH
+    /* SMP-F3-7: THE one batch branch (the policy doc's "F3-7 inserts one
+     * branch here; no caller changes" promise, now due). A BATCH-class task
+     * whose LEGAL mask includes CPU1 routes to the PINNED_WORKER core --
+     * law 5: batch fills idle capacity without touching GENERAL latency.
+     * PLACEMENT only, never migration: this decides where a task is
+     * enqueued; nothing already queued or running moves. No load measurement
+     * yet (pressure counters are F3-9) -- BATCH simply prefers the worker
+     * core whenever that is legal. NORMAL falls through to home; the
+     * legality walls (layer 1 above + the funnel re-assert + the F3-2
+     * enqueue gate) bound this branch on every side. */
+    if (p->sched.sched_class == SCHED_CLASS_BATCH && ((legal >> 1) & 1ULL)) {
+        return 1;
+    }
+#endif
     return 0;                      /* home CPU0; NO balancing, NO migration */
 }
 
@@ -992,13 +1007,25 @@ void scheduler_profile_selftest(void) {
     t.allowed_cpus = (1ULL << 0); t.pinned_cpu = CPU_NONE;
     int normal_home = (scheduler_choose_cpu(&t) == 0);
 
-    /* 2. BATCH exists as DATA: the class declares + reads back, and even
-     * with a multi-CPU legal mask it still routes home (data, not active
-     * migration -- layer 3 is a stub) */
+    /* 2. BATCH declares + reads back. The routing expectation flips WITH
+     * the F3-7 gate: under SMP_BATCH a multi-CPU-mask BATCH task routes to
+     * the worker core (when online); without it, BATCH is data-only and
+     * routes home. The printed CORE line stays identical either way so
+     * frozen smokes keep grepping true. */
     t.sched.sched_class = SCHED_CLASS_BATCH;
     t.allowed_cpus = (1ULL << 0) | (1ULL << 1); t.pinned_cpu = CPU_NONE;
-    int batch_declared = (t.sched.sched_class == SCHED_CLASS_BATCH) &&
-                         (scheduler_choose_cpu(&t) == 0);
+    int batch_declared;
+#ifdef SMP_BATCH
+    {
+        extern int cpu1_is_online(void);
+        uint32_t rb = scheduler_choose_cpu(&t);
+        batch_declared = (t.sched.sched_class == SCHED_CLASS_BATCH) &&
+                         (cpu1_is_online() ? (rb == 1) : (rb == 0));
+    }
+#else
+    batch_declared = (t.sched.sched_class == SCHED_CLASS_BATCH) &&
+                     (scheduler_choose_cpu(&t) == 0);
+#endif
 
     /* 3. PINNED_RT with a legal pin is honored (the class names what the
      * pin already enforced) */
@@ -1028,6 +1055,54 @@ void scheduler_profile_selftest(void) {
             pass ? "PASS" : "FAIL",
             normal_home, batch_declared, pinned_rt_legal, no_behavior_change);
 }
+
+#ifdef SMP_BATCH
+// SMP-F3-7 selftest: the batch branch routes EXACTLY as specified and the
+// legality walls still bound it. Synthetic shells (the house pattern).
+void scheduler_batchclass_selftest(void) {
+    extern int cpu1_is_online(void);
+    static process_t t;
+    t.pid = 9997;
+    t.name[0] = 'b'; t.name[1] = 'c'; t.name[2] = 't'; t.name[3] = 0;
+    int up = cpu1_is_online();
+
+    /* 1. BATCH + legal multi-CPU mask -> CPU1 (the new branch; on a
+     * single-core boot legality keeps it home -- accept that reality) */
+    t.sched.sched_class = SCHED_CLASS_BATCH;
+    t.allowed_cpus = (1ULL << 0) | (1ULL << 1); t.pinned_cpu = CPU_NONE;
+    uint32_t r1 = scheduler_choose_cpu(&t);
+    int batch_cpu1 = up ? (r1 == 1) : (r1 == 0);
+
+    /* 2. BATCH may NOT escape its mask: CPU0-only BATCH stays home (the
+     * layer-1 wall bounds the branch) */
+    t.allowed_cpus = (1ULL << 0); t.pinned_cpu = CPU_NONE;
+    int batch_mask_respected = (scheduler_choose_cpu(&t) == 0);
+
+    /* 3. NORMAL multimask remains home CPU0 (no accidental balancing) */
+    t.sched.sched_class = SCHED_CLASS_NORMAL;
+    t.allowed_cpus = (1ULL << 0) | (1ULL << 1); t.pinned_cpu = CPU_NONE;
+    int normal_cpu0 = (scheduler_choose_cpu(&t) == 0);
+
+    /* 4. PINNED_RT still obeys its explicit pin (layer 2 outranks 3) */
+    t.sched.sched_class = SCHED_CLASS_PINNED_RT;
+    t.allowed_cpus = (1ULL << 1); t.pinned_cpu = 1;
+    uint32_t r4 = scheduler_choose_cpu(&t);
+    int pinned_rt_cpu1 = up ? (r4 == 1) : (r4 == 0);
+
+    /* 5. illegal stays clamped: BATCH with a zero mask -> CPU0, loudly */
+    t.sched.sched_class = SCHED_CLASS_BATCH;
+    t.allowed_cpus = 0; t.pinned_cpu = CPU_NONE;
+    int illegal_clamped = (scheduler_choose_cpu(&t) == 0);
+
+    int pass = batch_cpu1 && batch_mask_respected && normal_cpu0 &&
+               pinned_rt_cpu1 && illegal_clamped;
+    kprintf("BATCHCLASS-CORE: %s batch_cpu1=%d batch_mask_respected=%d "
+            "normal_cpu0=%d pinned_rt_cpu1=%d illegal_clamped=%d\n",
+            pass ? "PASS" : "FAIL",
+            batch_cpu1, batch_mask_respected, normal_cpu0,
+            pinned_rt_cpu1, illegal_clamped);
+}
+#endif /* SMP_BATCH */
 #endif /* SMP_SCHED && SMP_SCHED_DISPATCH */
 
 // F3-5: HOME-ROUTED wake enqueue. Wake-side code (waitqueue signal/timer) used
@@ -1212,6 +1287,22 @@ void ap_cooperative_schedule(void) {
                 (unsigned long)((g_g1_dispatch_tsc - g_g1_enq_tsc) / 3000ULL),
                 next->pid);
     }
+#ifdef SMP_BATCH
+    // SMP-F3-7: the same one-shot for the batchdemo placement -- sub-ms
+    // proves the BATCH foreign enqueue's G1 IPI kick woke CPU1 (ipi_wake=1).
+    {
+        extern volatile uint64_t g_f37_enq_tsc;
+        extern volatile int      g_f37_enq_pid;
+        extern volatile uint64_t g_f37_dispatch_tsc;
+        if (g_f37_enq_tsc && !g_f37_dispatch_tsc && next->pid == g_f37_enq_pid) {
+            g_f37_dispatch_tsc = rdtsc();
+            kprintf("[SMP] F3-7: batchdemo enqueue->dispatch latency=%lu us "
+                    "(pid=%d)\n",
+                    (unsigned long)((g_f37_dispatch_tsc - g_f37_enq_tsc) / 3000ULL),
+                    next->pid);
+        }
+    }
+#endif
 #endif
 
     // Fix D6: prime `next`'s FPU state (context_switch_asm fxrstor's it directly,

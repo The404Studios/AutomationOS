@@ -225,6 +225,24 @@ if [ "${SMP:-0}" = "1" ]; then
         SMP_BKL_SOURCES="1"
         echo "*** SMP_BKL build: the BKL-LITE outer kernel lock armed (SMP-H1) ***"
     fi
+
+    # =========================================================================
+    # SMP_BATCH (SMP-F3-7 BATCH-CLASS) -- sub-gate, REQUIRES SMP=1. Lights the
+    # layer-3 batch branch in scheduler_choose_cpu: a BATCH-class task whose
+    # legal mask includes CPU1 routes to the PINNED_WORKER core (law 5: batch
+    # fills idle capacity). NORMAL stays home CPU0; PINNED_RT obeys its pin;
+    # the funnel + enqueue legality walls and the G1 IPI kick are unchanged
+    # and mandatory. kernel.c additionally spawns the batchdemo acceptance
+    # task (class=BATCH, mask CPU0|CPU1, unpinned -> the seam must choose
+    # CPU1). When UNSET: no -DSMP_BATCH, BATCH remains data-only (the
+    # PROFILE-0 world), every other build byte-for-byte unchanged. The
+    # acceptance profile is the FULL stack:
+    #   SMP=1 SMP_SCHED=1 SMP_SCHED_DISPATCH=1 SMP_IPI=1 SMP_BKL=1 SMP_BATCH=1
+    # =========================================================================
+    if [ "${SMP_BATCH:-0}" = "1" ]; then
+        CFLAGS="$CFLAGS -DSMP_BATCH"
+        echo "*** SMP_BATCH build: BATCH-class CPU1 routing live (SMP-F3-7) ***"
+    fi
 fi
 
 # =============================================================================

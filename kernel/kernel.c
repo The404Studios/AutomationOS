@@ -1339,6 +1339,14 @@ void kernel_main(void* raw_info) {
                              * seam reads it, and nothing routes differently
                              * because of it (BATCH = data, not migration). */
                             scheduler_profile_selftest();
+#ifdef SMP_BATCH
+                            /* SMP-F3-7: the batch branch routes exactly as
+                             * specified, bounded by the legality walls. */
+                            {
+                                extern void scheduler_batchclass_selftest(void);
+                                scheduler_batchclass_selftest();
+                            }
+#endif
                             /* Brick F2: pin ONE ring-0 kernel test thread to CPU1.
                              * CPU1's ap_scheduler_loop context-switches into it on
                              * the next tick. Spin briefly on the BSP, then read
@@ -1491,6 +1499,56 @@ void kernel_main(void* raw_info) {
                                     "skipped\n");
                         }
                     }
+#ifdef SMP_BATCH
+                    /* SMP-F3-7 acceptance: the first ORDINARY workload on
+                     * CPU1. Deliberately NOT pinned and NOT special-cased:
+                     * class=BATCH + a multi-CPU legal mask, and the seam's
+                     * batch branch (not this call site) decides CPU1. The
+                     * G1 IPI kick wakes the core; the enqueue->dispatch
+                     * stamp proves it (sub-ms = IPI, not the 10 ms tick).
+                     * ORDER MATTERS: this spawns BEFORE the SMP_BKL storms
+                     * below -- the wake-latency proof needs a near-idle
+                     * CPU1; the first run spawned it after the 60 s CPU1
+                     * storm and measured 578 ms of STORM-SHARING, then
+                     * starved past the QEMU window (the ordering find). */
+                    {
+                        uint64_t d_size = 0;
+                        void* d_data = initrd_get_file("sbin/batchdemo", &d_size);
+                        if (d_data && d_size > 0) {
+                            int dpid = elf_load_and_exec(d_data, d_size,
+                                                         "batchdemo");
+                            process_t* dm = (dpid > 0)
+                                          ? process_get_by_pid(dpid) : NULL;
+                            if (dm) {
+                                scheduler_remove_process(dm);
+                                process_t* ini = process_get_by_pid(1);
+                                if (ini) {
+                                    dm->parent_pid = 1;
+                                    dm->parent_seq = ini->create_seq;
+                                    process_unref(ini);
+                                }
+                                dm->allowed_cpus = ((uint64_t)1 << 0) |
+                                                   ((uint64_t)1 << 1);
+                                dm->pinned_cpu   = CPU_NONE;     /* NOT pinned */
+                                dm->sched.sched_class = SCHED_CLASS_BATCH;
+                                {
+                                    extern volatile uint64_t g_f37_enq_tsc;
+                                    extern volatile int      g_f37_enq_pid;
+                                    g_f37_enq_pid = dpid;
+                                    g_f37_enq_tsc = rdtsc();
+                                }
+                                uint32_t d_target = scheduler_submit_task(dm);
+                                kprintf("[SMP] F3-7: batchdemo PID %d "
+                                        "class=BATCH unpinned -> the seam "
+                                        "chose cpu%u\n", dpid, d_target);
+                                process_unref(dm);
+                            }
+                        } else {
+                            kprintf("[SMP] F3-7: sbin/batchdemo not in initrd "
+                                    "-- skipped (rebuild initrd)\n");
+                        }
+                    }
+#endif
 #ifdef SMP_BKL
                     /* SMP-H1 BKL-LITE acceptance: TWO 60 s syscall storms,
                      * one pinned to CPU1 (the cpu1hello placement pattern),

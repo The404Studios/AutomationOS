@@ -306,6 +306,10 @@ cc userspace/tests/cpu1hello.c /tmp/cpu1hello.o; $LD /tmp/crt0.o /tmp/cpu1hello.
 # bklstorm: SMP-H1 60s two-CPU syscall storm. Shipped always (tiny);
 # only the SMP_BKL kernel ever spawns it (one pinned CPU1 + one CPU0).
 cc userspace/tests/bklstorm.c /tmp/bklstorm.o; $LD /tmp/crt0.o /tmp/bklstorm.o -o /tmp/bklstorm.elf
+# batchdemo: SMP-F3-7 first ordinary BATCH-class workload on CPU1. Shipped
+# always (tiny); only the SMP_BATCH kernel ever spawns it (unpinned, the
+# choose_cpu batch branch routes it).
+cc userspace/tests/batchdemo.c /tmp/batchdemo.o; $LD /tmp/crt0.o /tmp/batchdemo.o -o /tmp/batchdemo.elf
 # apidemo: fetch http(s) URL + pretty-print JSON (crt0+main; HTTPS + json).
 cc userspace/apps/apidemo/apidemo.c /tmp/apidemo.o; $LD /tmp/crt0.o /tmp/apidemo.o /tmp/json.o $HTTPS_OBJS -o /tmp/apidemo.elf
 
@@ -636,6 +640,8 @@ cp /tmp/nicup.elf /tmp/ird/bin/nicup
 cp /tmp/cpu1hello.elf /tmp/ird/sbin/cpu1hello
 # bklstorm -> /sbin (SMP-H1; inert unless the SMP_BKL kernel spawns it).
 cp /tmp/bklstorm.elf /tmp/ird/sbin/bklstorm
+# batchdemo -> /sbin (SMP-F3-7; inert unless the SMP_BATCH kernel spawns it).
+cp /tmp/batchdemo.elf /tmp/ird/sbin/batchdemo
 # cpu1offload -> /sbin (init spawns it at boot; prints PASS on SMP, SKIP on default).
 cp /tmp/cpu1offload.elf /tmp/ird/sbin/cpu1offload
 # smpstress -> /sbin (init spawns it; PASS on SMP after thousands of CPU1 jobs, SKIP on default).

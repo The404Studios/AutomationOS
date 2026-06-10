@@ -315,10 +315,18 @@ void kernel_panic(const char* message) {
         while (1) { cli(); hlt(); }
     }
 
-#ifdef SMP_FOUNDATION
+#if defined(SMP_FOUNDATION) && defined(SMP_IPI)
     // Halt all other CPUs so they stop executing while we dump state.
     // ipi_stop_all_cpus sends IPI_STOP to every core except this one;
     // the handler on the remote core enters a cli/hlt loop.
+    //
+    // SMP-R0 NOTE: gated on SMP_IPI (not just SMP_FOUNDATION) because the IPI
+    // subsystem (kernel/arch/x86_64/ipi*.c) is NOT in quick_build's compile
+    // list yet -- the bare SMP_FOUNDATION gate (added in c70ee87) made every
+    // SMP=1 build LINK-FAIL on this undefined symbol, unnoticed because SMP
+    // builds are rare. SMP-G0 (IPI-LINK) compiles ipi.c, defines SMP_IPI, and
+    // re-enables this. Until then a panicking BSP doesn't stop CPU1 -- the
+    // pre-c70ee87 behavior (CPU1 is a bounded coprocessor; acceptable).
     {
         extern void ipi_stop_all_cpus(void);
         ipi_stop_all_cpus();

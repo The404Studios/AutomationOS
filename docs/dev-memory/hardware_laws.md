@@ -38,6 +38,13 @@ signal: a model that internalizes these is *useful* on this OS; one that doesn't
     generally: any device whose bus is shared with firmware gets its risky init DEFERRED out of
     boot behind a runtime trigger, with a serial marker before every risky touch
     (last-line-wins diagnosis).
+12. **An idle loop's `hlt` must explicitly enable interrupts: `sti; hlt` (user-set at SMP-F3-5).**
+    Never rely on inherited IF. A bare `hlt` inherits whatever IF the last context switch restored;
+    if that context ran with interrupts off (idle's restored rflags), the CPU parks PERMANENTLY —
+    no timer, no IPI, nothing wakes it. The bug class is invisible until a CPU actually re-enters
+    the idle `hlt` path (all of F2 era never did), then flaky-fatal. `sti; hlt` is the safe pair on
+    x86: `sti` enables interrupts only after the *next* instruction completes, so no wake can slip
+    into the gap before the `hlt`.
 
 ## Reviewer checklist (a stricter role that can say "no")
 

@@ -2,7 +2,20 @@
 
 > Warm memory. Refresh per checkpoint. One active brick at a time.
 
-## SMP-F3-5 — LANDED (commit `ca1378a`, branch `brick/smp-f3-5`, awaiting review/push) — cpu1hello
+## SMP-G0 IPI-LINK — OPEN (branch `brick/smp-g0-ipi-link`, off frozen `brick/smp-f3-5`) — can BSP send one bounded, known-vector IPI to CPU1?
+- **user-set scope (exactly narrow):** compile the dormant `ipi.c` into the SMP_SCHED build ·
+  call `ipi_init()` · verify vector constants do not collide · verify the link map does not create
+  >=0x200000 shadow hazards · send ONE `IPI_RESCHEDULE` to CPU1 · CPU1 increments a counter.
+- **acceptance (user-set):** `IPILINK: PASS ipi_resched=1 cpu1_count=1` (short form `IPILINK: PASS`).
+- **HARD NO's (user-set):** no wake scheduling yet · no TLB shootdown · no desktop split · no global
+  PREEMPT · no stealing. G0 is ONLY: BSP sends a bounded, known-vector IPI to CPU1 and CPU1 handles
+  it without destabilizing the desktop.
+- **context:** `SMP_IPI` gate already exists (the SMP-R0 link fix expects it: panic's
+  ipi_stop_all_cpus is gated on `SMP_FOUNDATION && SMP_IPI` — G0 defines it when ipi.c actually
+  links). stash-mined harvest available later: ipi_tlb_flush_page_handler asm (G2/G3 material).
+- **next after:** SMP-G1 IPI-WAKE (kills the tick-poll wake latency).
+
+## SMP-F3-5 — FROZEN / COMPLETE (pushed `aed03ee`, ls-remote verified; user: "Strong go... the first truly serious SMP milestone") — cpu1hello
 - **THE EXACT ACCEPTANCE HIT:** `CPU1HELLO: PASS markers=5 exit=42 reaped=1 cpu1_idle=1
   desktop_alive=1` + F2 delta>0 + APCURRENT PASS + 0 invariant + 0 panic (`cpu1_smoke.sh`, -smp 2).
   Record: [`bricks/SMP-F3-5.md`](bricks/SMP-F3-5.md). Law 8's five audits all green: per-CPU current
@@ -18,7 +31,17 @@
   loop's hlt must never rely on inherited IF.
 - **boundary held:** no IPI / desktop split / stealing / global PREEMPT / policy expansion;
   BLOCKED-on-CPU1 explicitly parked.
-- **next:** SMP-G0 IPI-LINK → G1 IPI-WAKE (kills the tick-poll wake latency).
+- **user verdict on freeze:** "the dangerous boundary held: CPU1 ring-3 task exits → TERMINATED
+  task is never resumed → parent wake routed home → CPU1 switches off dead CR3/stack →
+  pending_unref drops only after the successor is running → init reaps exit(42). That is exactly
+  the corruption class we were worried about... the pending_unref successor-drop model is the
+  right SMP shape." Both commits kept unsquashed (feat `ca1378a` + record `aed03ee` — "the record
+  matters because this was a boundary proof, not just a feature"). The sti;hlt find promoted to
+  **LAW 12** in [`hardware_laws.md`](hardware_laws.md). BRANCH-NAME NORMALIZATION: the commits
+  had landed on `brick/smp-r0` locally; `brick/smp-f3-5` was fast-forwarded onto them and THAT
+  name pushed (freeze record, acceptance proof, and the next branch all name the same thing;
+  `origin/brick/smp-r0` stays at its own freeze `7be017d` — the recovery base).
+- **next:** SMP-G0 IPI-LINK (open above) → G1 IPI-WAKE (kills the tick-poll wake latency).
 
 ## SMP-F3-5 (original opening note) — superseded by the LANDED entry above
 - **user-set scope:** first tiny static ring-3 ELF pinned to CPU1; **cooperative dispatch only**;

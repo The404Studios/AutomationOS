@@ -184,6 +184,8 @@ static void tab_save_active(Ide* a) {
         g_tab_src[i][j] = a->src[j];
 }
 
+static void ide_parse_project_model(Ide* a);   /* IDE-XFILE-0 (defined below) */
+
 static void tab_restore(Ide* a, int idx) {
     if (idx < 0 || idx >= IDE_MAX_TABS || !a->tabs[idx].used) return;
     int len = a->tabs[idx].src_len;
@@ -197,7 +199,7 @@ static void tab_restore(Ide* a, int idx) {
     a->prev_focus = a->tabs[idx].prev_focus;
     ide_strlcpy(a->cur_file, a->tabs[idx].path, IDE_PATH);
     a->tab_active = idx;
-    model_parse(&a->model, a->src, a->src_len, a->cur_file);
+    ide_parse_project_model(a);              /* IDE-XFILE-0: whole-dir model */
     if (a->model.nfuncs > 0) {
         if (a->focus_func >= a->model.nfuncs) a->focus_func = 0;
         a->model.focus = a->focus_func;
@@ -372,7 +374,7 @@ void ide_open_file(Ide* a, const char* path) {
 
     ide_strlcpy(a->cur_file, path, IDE_PATH);
 
-    model_parse(&a->model, a->src, a->src_len, path);
+    ide_parse_project_model(a);              /* IDE-XFILE-0: whole-dir model */
     /* Default focus = overview (all elements visible as LEGO tiles).
      * The user clicks a function tile to drill into the dependency graph. */
     a->model.focus = -1;
@@ -462,6 +464,9 @@ void ide_sel_from_caret(Ide* a, int pane) {
     int sym  = -1;
     for (int i = 0; i < a->model.nfuncs; i++) {
         const Func* f = &a->model.funcs[i];
+        /* IDE-XFILE-0: the model now holds the whole directory -- the caret
+         * resolves only against functions of the CURRENT file. */
+        if (!ide_streq(f->file, a->model.cur_file)) continue;
         if (line + 1 >= f->line_start && line + 1 <= f->line_end) { sym = i; break; }
     }
     a->sel.pane   = pane;
@@ -633,6 +638,50 @@ void ide_toggle_collapsed(Ide* a, const char* path) {
     }
     if (a->n_collapsed < IDE_MAXCOLLAPSE)
         ide_strlcpy(a->collapsed_paths[a->n_collapsed++], path, IDE_PATH);
+}
+
+/* ===========================================================================
+ * IDE-XFILE-0: the minimal cross-file model.
+ * Parse every .c sibling of the open file into ONE model so the map and
+ * inspector externalize the WHOLE directory, not one file. The OPEN file is
+ * parsed LAST so model.cur_file/total_lines describe it (the current-file
+ * filters compare Func.file against model.cur_file). Bounded: at most
+ * IDE_XFILE_MAXFILES siblings, stop appending when funcs hit the model cap.
+ * ==========================================================================*/
+#define IDE_XFILE_MAXFILES 24
+static char g_xfile_scratch[IDE_SRC_CAP];   /* sibling source scratch (NOT a->src) */
+
+/* dirname of a path into out[cap] (everything up to the last '/'). */
+static void ide_dirname(char* out, int cap, const char* path) {
+    ide_strlcpy(out, path, cap);
+    int n = ide_strlen(out), cut = -1;
+    for (int i = 0; i < n; i++) if (out[i] == '/') cut = i;
+    if (cut <= 0) { out[0] = '/'; out[1] = 0; } else out[cut] = 0;
+}
+
+static void ide_parse_project_model(Ide* a) {
+    model_reset(&a->model);
+    char dir[IDE_PATH];
+    ide_dirname(dir, IDE_PATH, a->cur_file);
+    const char* openbase = tab_basename(a->cur_file);
+
+    static IdeDirent ents[IDE_XFILE_MAXFILES];   /* static: stack-cliff lesson */
+    int got = ide_list_dir(dir, ents, IDE_XFILE_MAXFILES);
+    int parsed = 0;
+    for (int i = 0; i < got && parsed < IDE_XFILE_MAXFILES; i++) {
+        if (ents[i].type == IDE_DT_DIR) continue;
+        if (!ends_with_dot_c(ents[i].name)) continue;     /* .c siblings only */
+        if (ide_streq(ents[i].name, openbase)) continue;  /* open file last   */
+        if (a->model.nfuncs >= M_MAXFUNCS) break;         /* cap guard        */
+        char full[IDE_PATH];
+        path_join(full, IDE_PATH, dir, ents[i].name);
+        int n = ide_read_file(full, g_xfile_scratch, IDE_SRC_CAP);
+        if (n < 0) n = 0;
+        model_parse_append(&a->model, g_xfile_scratch, n, full);
+        parsed++;
+    }
+    /* the OPEN file LAST, from the live editor buffer (not re-read). */
+    model_parse_append(&a->model, a->src, a->src_len, a->cur_file);
 }
 
 /* Re-scan the tree (collapsed folders not recursed into) and restore the
@@ -2702,7 +2751,7 @@ static void handle_key(Ide* a, int keycode, int pressed) {
         break;
     case KEY_G:
         if (a->model.nactions > 0 && gen_apply_action(a, 0)) {
-            model_parse(&a->model, a->src, a->src_len, a->cur_file);
+            ide_parse_project_model(a);      /* IDE-XFILE-0: whole-dir model */
             ide_set_focus(a, a->focus_func);
         }
         break;

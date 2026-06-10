@@ -460,10 +460,10 @@ static void mp_parse_asm(Model* m, const char* src, int len){
 /* ----------------------------------------------------------------------- */
 /* entry point                                                             */
 /* ----------------------------------------------------------------------- */
-void model_parse(Model* m, const char* src, int len, const char* filename) {
+/* IDE-XFILE-0: the reset half of the old fused reset+parse. Callers that
+ * build a MULTI-FILE model reset once, then model_parse_append() per file. */
+void model_reset(Model* m) {
     if (!m) return;
-
-    /* 1. reset model */
     m->nfuncs    = 0;
     m->nglobals  = 0;
     m->nincludes = 0;
@@ -479,6 +479,17 @@ void model_parse(Model* m, const char* src, int len, const char* filename) {
     m->analyzed  = 0;
     m->lexed     = 0;
     m->parsed    = 0;
+    m->total_lines = 0;
+}
+
+/* IDE-XFILE-0: parse ONE file's source INTO m without clearing prior files.
+ * The transient parse state (token buffer + AST arena) is reset per call by
+ * parser_init/parse_translation_unit, so only the Model accumulates. Sets
+ * cur_file=basename and total_lines for THIS file -- last caller wins, so a
+ * multi-file driver parses the OPEN file last. Body = the old model_parse
+ * minus the reset; NO new parser features. */
+void model_parse_append(Model* m, const char* src, int len, const char* filename) {
+    if (!m) return;
 
     /* line count = number of '\n' + 1 (empty buffer -> 1 line) */
     int lines = 1;
@@ -533,5 +544,12 @@ void model_parse(Model* m, const char* src, int len, const char* filename) {
     /* 5. status */
     m->parsed = 1;
     /* NOTE: model_analyze() is called by the caller next; do not call here.
-     * focus was reset to -1 above; the caller sets it afterward. */
+     * focus was reset by model_reset(); the caller sets it afterward. */
+}
+
+/* The legacy fused entry point: single-file reset+parse, byte-for-byte the
+ * old behavior (every existing caller keeps working unchanged). */
+void model_parse(Model* m, const char* src, int len, const char* filename) {
+    model_reset(m);
+    model_parse_append(m, src, len, filename);
 }

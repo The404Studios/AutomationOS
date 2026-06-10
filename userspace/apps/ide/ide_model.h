@@ -157,5 +157,10 @@ typedef struct {
  * ===========================================================================*/
 void model_parse(Model* m, const char* src, int len, const char* filename);
 void model_analyze(Model* m);
+/* IDE-XFILE-0: the split halves of model_parse, for MULTI-FILE models --
+ * reset once, then append each file (cur_file/total_lines = last appended,
+ * so drivers parse the OPEN file last). model_parse == reset + one append. */
+void model_reset(Model* m);
+void model_parse_append(Model* m, const char* src, int len, const char* filename);
 
 #endif /* IDE_MODEL_H */

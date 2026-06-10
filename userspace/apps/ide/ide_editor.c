@@ -386,6 +386,9 @@ static void ed_model_lines_shift(struct Ide* a, int at_off, int delta) {
         if (a->src[i] == '\n') at_line++;
     for (int i = 0; i < a->model.nfuncs; i++) {
         Func* f = &a->model.funcs[i];
+        /* IDE-XFILE-0: only the EDITED file's line ranges shift -- the model
+         * holds the whole directory; other files' ranges are unaffected. */
+        if (!ide_streq(f->file, a->model.cur_file)) continue;
         /* line_start/line_end are 1-based.
          *   function entirely below the edit line -> both ends shift
          *   edit line inside the body            -> the body grows/shrinks */

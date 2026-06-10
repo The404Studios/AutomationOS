@@ -131,6 +131,7 @@ void panel_funcs(Ide* a, Canvas* cv, Rect r) {
     /* ---- open (non-closed) functions ---- */
     for (int i = 0; i < nf; i++) {
         Func* f = &a->model.funcs[i];
+        if (!ide_streq(f->file, a->model.cur_file)) continue;  /* IDE-XFILE-0 */
         if (f->closed) continue;
 
         int ry = y;
@@ -202,6 +203,7 @@ void panel_funcs(Ide* a, Canvas* cv, Rect r) {
 
     for (int i = 0; i < nf; i++) {
         Func* f = &a->model.funcs[i];
+        if (!ide_streq(f->file, a->model.cur_file)) continue;  /* IDE-XFILE-0 */
         if (!f->closed) continue;
 
         int inner = r.w - 2 * PAD - 2 * FN_CHIP_PADX - plus_w;
@@ -247,6 +249,7 @@ int panel_funcs_click(Ide* a, Rect r, int mx, int my) {
     /* ---- open function rows ---- */
     for (int i = 0; i < nf; i++) {
         Func* f = &a->model.funcs[i];
+        if (!ide_streq(f->file, a->model.cur_file)) continue;  /* IDE-XFILE-0 */
         if (f->closed) continue;
 
         int ry = y;
@@ -278,6 +281,7 @@ int panel_funcs_click(Ide* a, Rect r, int mx, int my) {
 
     for (int i = 0; i < nf; i++) {
         Func* f = &a->model.funcs[i];
+        if (!ide_streq(f->file, a->model.cur_file)) continue;  /* IDE-XFILE-0 */
         if (!f->closed) continue;
 
         int inner = r.w - 2 * PAD - 2 * FN_CHIP_PADX - plus_w;

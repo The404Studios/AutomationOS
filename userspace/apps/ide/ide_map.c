@@ -883,6 +883,13 @@ static void map_sat_follow(Ide* a, MapSat* s)
         if (s->fname[0]) {
             for (j = 0; j < a->model.nfuncs && j < M_MAXFUNCS; j++) {
                 if (map_streq(a->model.funcs[j].name, s->fname)) {
+                    /* IDE-XFILE-0a: the model is now whole-directory, so a
+                     * name match may live in a SIBLING file. Following it
+                     * would silently desync the editor (still showing the
+                     * old file) from the focus. No-op until 0b adds the
+                     * open-then-jump path (ide_sel_jump_xfile). */
+                    if (!map_streq(a->model.funcs[j].file, a->model.cur_file))
+                        return;
                     /* IDE-SYNC-0 S2: a map follow also lands the editor
                      * caret on the function (prev_focus kept inside). */
                     ide_sel_jump(a, j, PANE_MAP);
@@ -902,6 +909,9 @@ static void map_sat_follow(Ide* a, MapSat* s)
                 Func* g = &a->model.funcs[j];
                 int k, nref, hit = 0;
                 if (j == a->focus_func) continue;
+                /* IDE-XFILE-0a: only follow same-file producers/consumers;
+                 * cross-file jumps need the 0b open-then-jump path. */
+                if (!map_streq(g->file, a->model.cur_file)) continue;
                 if (s->kind == MK_READ) {
                     nref = g->nwrites; if (nref > M_MAXREFS) nref = M_MAXREFS;
                     for (k = 0; k < nref; k++)

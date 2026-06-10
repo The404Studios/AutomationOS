@@ -2,22 +2,33 @@
 
 > Warm memory. Refresh per checkpoint. One active brick at a time.
 
-## SMP-PROFILE-0 — OPEN (branch `brick/smp-profile-0`, off frozen `brick/smp-f3-6-choosecpu`) — typed intent before anything moves
-- **user-set scope:** introduce `sched_profile_t` / sched_class types (NORMAL / BATCH /
-  PINNED_RT or equivalent) · add the `scheduler_submit_task` funnel if the doc requires it (it
-  does — the named pipeline: legal mask → choose_cpu → legality assert → enqueue sink) · NO
-  behavior change by default · choose_cpu READS the profile but still routes NORMAL home CPU0 ·
-  BATCH exists as DATA, not active migration.
-- **acceptance (user-set):** `SMPPROFILE: PASS normal_home=1 batch_declared=1 pinned_rt_legal=1
-  submit_funnel=1 no_behavior_change=1`.
-- **HARD NO's (user-set):** no actual migration · no work stealing · no desktop split · no
-  per-mm shootdown · no global PREEMPT.
+## SMP-PROFILE-0 — LANDED (commit `203d22d`, branch `brick/smp-profile-0`, awaiting review/push) — typed intent landed, nothing moved
+- **THE EXACT ACCEPTANCE HIT (first boot):** `SMPPROFILE: PASS normal_home=1 batch_declared=1
+  pinned_rt_legal=1 submit_funnel=1 no_behavior_change=1` (smoke-assembled from the
+  kernel-printed `SMPPROFILE-CORE: PASS` synthetic proof + the live funnel markers) + the
+  ENTIRE ladder green. **The live evidence is the picture itself:** `[SCHED] submit:` showed
+  ap_ktest class=2→cpu1 · cpu1hello class=2→cpu1 · forktest class=0→cpu0 · matmuljobs
+  class=0→cpu0 — typed intent on real traffic, zero routing change. Record:
+  [`bricks/SMP-PROFILE-0.md`](bricks/SMP-PROFILE-0.md) · proof `scripts/smpprofile_smoke.sh`.
+- **what landed:** `sched_class_t` (NORMAL=0 memset-correct / BATCH=1 DATA-ONLY / PINNED_RT=2 /
+  INTERACTIVE+RECOVERY reserved for laws 4/6) · `cpu_role_t` + scheduler_cpu_role (CPU0=GENERAL,
+  CPU1=PINNED_WORKER) · `p->sched` at END of process_t, **GATED on SMP_SCHED_DISPATCH** so
+  non-dispatch layouts are byte-identical (default kernel hash-equal `6f99ed9f`) ·
+  `scheduler_submit_task()` = the named funnel (choose_cpu → legality RE-ASSERT → enqueue sink;
+  two independent legality walls) · choose_cpu reads the class (one real check: PINNED_RT
+  declared without a pin = loud declaration-bug warning) · all three consumers funnel-routed.
+- **deliberately deferred (recorded, not snuck):** relocating the loose F3-2 fields
+  (allowed_cpus/pinned_cpu) into p->sched — touches every ctor/validator/seam site; its own
+  future checkpoint.
+- **HARD NO's held:** no actual migration · no stealing · no desktop split · no per-mm
+  shootdown (G3 parked behind the G2 pin audit) · no global PREEMPT.
 - **CONTROLLED MIGRATION PARKED (user-set at the F3-6 freeze):** "the moment normal processes
   can actually migrate across CPUs, TLBSHOOT_NEG's
   no_user_crossflush_needed_under_pinning=1 becomes fragile. Layer 3 can stay a home-CPU0 stub
   until the profile/type system and syscall safety are stronger."
 - **the user's roadmap after this:** SMP-H1 BKL-LITE → SMP-F3-7 BATCH-CLASS / controlled CPU1
-  placement → DESKTOP-SPLIT.
+  placement → DESKTOP-SPLIT. (F3-7's pieces are now all staged: BATCH-as-data, the role table,
+  the funnel's re-assert, the G1 IPI kick, the F3-3a two-lock discipline.)
 
 ## SMP-F3-6 CHOOSECPU — FROZEN / COMPLETE (pushed `e740175`, ls-remote verified; user: "the right seam brick... CPU placement is no longer scattered across hand placements... exactly the right SMP safety shape") — THE placement seam, one decider
 - **THE EXACT ACCEPTANCE HIT (first boot, kernel-printed):** `CHOOSECPU: PASS pinned_cpu1=1

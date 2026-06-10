@@ -2,7 +2,26 @@
 
 > Warm memory. Refresh per checkpoint. One active brick at a time.
 
-## SMP-F3-7 BATCH-CLASS — LANDED (commit `4f859c0`, branch `brick/smp-f3-7-batchclass`, awaiting review/push) — ordinary work runs on CPU1 under typed intent
+## SMP-RUNMASK-0 — OPEN (branch `brick/smp-runmask-0`, off frozen `brick/smp-f3-7-batchclass`) — fix the audit before the desktop depends on it
+- **why (user):** "DESKTOP-SPLIT will lean hard on the audit. The audit needs to be correct
+  before the desktop starts depending on it. The old heuristic (multi-CPU allowed mask =
+  danger) is now too crude. The real invariant is: address space ACTUALLY RAN on more than one
+  CPU = danger." Standalone micro-brick, NOT buried in DESKTOP-SPLIT.
+- **user-set scope:** add `p->ran_on_cpus` under SMP_SCHED_DISPATCH · set the bit on every
+  ACTUAL dispatch/switch-in · replace/extend tlb_pinning_audit (declared multi-mask OK; actual
+  multi-CPU execution of the same address space FAILS loudly) · batchdemo (mask CPU0|CPU1, ran
+  only on CPU1) passes · a synthetic forced cross-CPU same-mm case FAILS the audit · no
+  scheduler policy change · no desktop split.
+- **acceptance (user-set):** `RUNMASK: PASS declared_multimask_ok=1 actual_single_cpu=1
+  forced_crosscpu_detected=1 tlb_neg_valid=1`.
+- **design notes (work the hazards):** threads share an mm — the true unit is the ADDRESS
+  SPACE, so the audit aggregates ran_on_cpus per CR3, not per PCB · batchdemo EXITS in <1 s, so
+  live-walk audits miss it — record (allowed, ran) at exit-time for multimask processes ·
+  the forced case is PLANTED on a live PCB (set both bits, audit must detect, restore) — never
+  actually run one mm on two CPUs · field + hooks gated SMP_RUNMASK so every frozen profile
+  stays byte-identical (the field rides at the END of process_t with p->sched).
+
+## SMP-F3-7 BATCH-CLASS — FROZEN / COMPLETE (pushed `f260177`, ls-remote verified; user: "the first brick where CPU1 is useful for a normal workload class, not just a pinned proof task... The serial line lock is especially worth keeping — SMP proofs depend on readable logs") — ordinary work runs on CPU1 under typed intent
 - **THE EXACT ACCEPTANCE HIT (4th run; 3 failures root-caused en route):** `BATCHCLASS: PASS
   batch_cpu1=1 normal_cpu0=1 pinned_rt_cpu1=1 illegal_clamped=1 ipi_wake=1 bkl_safe=1` —
   batchdemo (class=BATCH, mask CPU0|CPU1, NOT pinned, NOT special-cased): "the seam chose

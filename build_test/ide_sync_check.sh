@@ -45,22 +45,28 @@ def shot(name):
     time.sleep(0.8)
     cmd({"execute":"screendump","arguments":{"filename":name,"format":"png"}})
 
-# move the caret into a function first (down x14 = into tower_init's body),
-# proving caret->symbol tracking, then screenshot the editor workspace
-for _ in range(14): key(["down"], hold=0.03)
+# move the caret into tower_tick's body (down x27), proving caret->symbol
+# tracking, then screenshot the editor workspace
+for _ in range(27): key(["down"], hold=0.03)
 shot("/tmp/%s_ed.png" % out)
 # LEGO workspace: Ctrl+, lands in WS_LEGO (settings tab), then '1' = VIZ_MAP
 # and '2' = VIZ_INSPECTOR -- the map central card + inspector must show the
-# function the EDITOR caret was in (tower_init), and the status-bar breadcrumb
-# must read FN tower_init.
+# function the EDITOR caret was in (tower_tick), and the status-bar breadcrumb
+# must read FN tower_tick.
 key(["ctrl","comma"])
 key(["1"])
 shot("/tmp/%s_lego.png" % out)
+# S2: keyboard-select a map satellite (arrow) and FOLLOW it (Enter) -- the
+# central card, the breadcrumb FN, and the Ln must all jump to the called
+# function (map click -> editor jump, via the same map_sat_follow path).
+key(["right"])
+key(["ret"])
+shot("/tmp/%s_jump.png" % out)
 key(["2"])
 shot("/tmp/%s_insp.png" % out)
 PY
 sleep 1; kill $QPID 2>/dev/null
-for p in ${OUT}_ed ${OUT}_lego ${OUT}_insp; do
+for p in ${OUT}_ed ${OUT}_lego ${OUT}_jump ${OUT}_insp; do
   [ -f /tmp/$p.png ] && { mkdir -p screenshots; cp -f /tmp/$p.png screenshots/$p.png; echo "SAVED screenshots/$p.png ($(stat -c%s screenshots/$p.png) B)"; }
 done
 echo "=== crashes? ==="; grep -niE "PANIC|CPU EXCEPTION|Terminating faulting" "$LOG" | head -3; echo "(done)"

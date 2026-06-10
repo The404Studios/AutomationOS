@@ -791,8 +791,9 @@ static void map_sat_follow(Ide* a, MapSat* s)
         if (s->fname[0]) {
             for (j = 0; j < a->model.nfuncs && j < M_MAXFUNCS; j++) {
                 if (map_streq(a->model.funcs[j].name, s->fname)) {
-                    a->prev_focus = a->focus_func;   /* remember for Backspace = back */
-                    ide_set_focus(a, j);
+                    /* IDE-SYNC-0 S2: a map follow also lands the editor
+                     * caret on the function (prev_focus kept inside). */
+                    ide_sel_jump(a, j, PANE_MAP);
                     return;
                 }
             }
@@ -818,7 +819,7 @@ static void map_sat_follow(Ide* a, MapSat* s)
                     for (k = 0; k < nref; k++)
                         if (g->reads[k][0] && map_streq(g->reads[k], s->fname)) { hit = 1; break; }
                 }
-                if (hit) { a->prev_focus = a->focus_func; ide_set_focus(a, j); return; }
+                if (hit) { ide_sel_jump(a, j, PANE_MAP); return; }   /* S2 */
             }
         }
         break;

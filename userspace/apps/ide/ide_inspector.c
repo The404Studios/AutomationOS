@@ -617,6 +617,44 @@ int panel_inspector_click(Ide* a, Rect r, int mx, int my) {
         return 1;
     }
 
+    /* IDE-SYNC-0 S3: CONNECTIONS rows are clickable -- jump the editor (and
+     * THE selection) to the row's other-end function: prefer `to`, fall back
+     * to `from`. Replays insp_body_conns() row geometry. */
+    if (a->insp_tab == 3) {
+        Rect b = insp_body_rect(r);
+        if (b.h > 0 && rect_hit(b, mx, my)) {
+            int top = b.y + ROW_H - a->inspector_scroll;
+            int nc = a->model.nconns;
+            if (nc > M_MAXCONNS) nc = M_MAXCONNS;
+            for (int i = 0; i < nc; i++) {
+                int ry = top + i * ROW_H;
+                if (my >= ry && my < ry + ROW_H) {
+                    Conn* c = &a->model.conns[i];
+                    int tgt = -1;
+                    for (int j = 0; j < a->model.nfuncs; j++)
+                        if (ide_streq(a->model.funcs[j].name, c->to)) { tgt = j; break; }
+                    if (tgt < 0)
+                        for (int j = 0; j < a->model.nfuncs; j++)
+                            if (ide_streq(a->model.funcs[j].name, c->from)) { tgt = j; break; }
+                    if (tgt >= 0) ide_sel_jump(a, tgt, PANE_INSPECTOR);
+                    return 1;
+                }
+            }
+        }
+        return 1;
+    }
+
+    /* IDE-SYNC-0 S3: a PORTS row click lands the editor caret on the focused
+     * function's definition (ports belong to the focused function). */
+    if (a->insp_tab == 2) {
+        Rect b = insp_body_rect(r);
+        if (b.h > 0 && rect_hit(b, mx, my) && a->focus_func >= 0) {
+            ide_sel_jump(a, a->focus_func, PANE_INSPECTOR);
+            return 1;
+        }
+        return 1;
+    }
+
     /* DETAILS: [APPLY] buttons. Replay the same body layout to find which
      * action row (if any) was clicked. */
     if (a->insp_tab == 4) {

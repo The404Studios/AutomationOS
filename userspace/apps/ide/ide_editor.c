@@ -375,6 +375,30 @@ static void undo_clear(void) { undo_n = 0; undo_redo = 0; undo_grp = 0; undo_las
 
 /* Insert one byte at offset `off`, shifting the tail up. Returns 1 on success
  * (room available), 0 if the buffer is full. */
+/* IDE-SYNC-0 S4: a newline insert/delete shifts every line below it, so the
+ * parser's recorded per-function line ranges (the caret->symbol mapping AND
+ * the jump targets) must shift too, or sync drifts until the next re-parse.
+ * `at_off` is the byte offset of the newline; `delta` is +1 (insert) / -1
+ * (delete). Cheap: one pass over funcs[]. */
+static void ed_model_lines_shift(struct Ide* a, int at_off, int delta) {
+    int at_line = 0;                       /* 0-based line containing at_off */
+    for (int i = 0; i < at_off && i < a->src_len; i++)
+        if (a->src[i] == '\n') at_line++;
+    for (int i = 0; i < a->model.nfuncs; i++) {
+        Func* f = &a->model.funcs[i];
+        /* line_start/line_end are 1-based.
+         *   function entirely below the edit line -> both ends shift
+         *   edit line inside the body            -> the body grows/shrinks */
+        if (f->line_start - 1 > at_line) {
+            f->line_start += delta;
+            f->line_end   += delta;
+        } else if (f->line_end - 1 >= at_line) {
+            f->line_end += delta;
+        }
+        if (f->line_end < f->line_start) f->line_end = f->line_start;
+    }
+}
+
 static int ed_insert_byte(struct Ide* a, int off, char ch) {
     if (a->src_len + 1 > IDE_SRC_CAP) return 0;
     if (off < 0) off = 0;
@@ -384,6 +408,7 @@ static int ed_insert_byte(struct Ide* a, int off, char ch) {
     a->src_len++;
     a->editor.dirty = 1;
     undo_record_insert((unsigned int)off, ch);
+    if (ch == '\n') ed_model_lines_shift(a, off, +1);   /* IDE-SYNC-0 S4 */
     return 1;
 }
 
@@ -391,9 +416,11 @@ static int ed_insert_byte(struct Ide* a, int off, char ch) {
 static void ed_delete_byte(struct Ide* a, int off) {
     if (off < 0 || off >= a->src_len) return;
     undo_record_delete((unsigned int)off, a->src[off]);
+    int was_nl = (a->src[off] == '\n');
     for (int i = off; i < a->src_len - 1; i++) a->src[i] = a->src[i + 1];
     a->src_len--;
     a->editor.dirty = 1;
+    if (was_nl) ed_model_lines_shift(a, off, -1);       /* IDE-SYNC-0 S4 */
 }
 
 /* ===========================================================================

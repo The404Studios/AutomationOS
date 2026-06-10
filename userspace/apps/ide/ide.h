@@ -266,6 +266,9 @@ void ide_set_focus(Ide* a, int func_idx);
  * THE selection model (a->sel). `pane` records who moved the caret. */
 void ide_sel_reset(Ide* a);
 void ide_sel_from_caret(Ide* a, int pane);
+/* IDE-SYNC-0 S2/S3: focus func_idx AND land the shared editor caret on its
+ * definition line (the reverse edges: map/inspector click -> editor jump). */
+void ide_sel_jump(Ide* a, int func_idx, int pane);
 /* Open the "New Project" templates modal (Ctrl+N / topbar [+ NEW] button).
  * Public so chrome in ide_chrome.c can trigger it too. Implemented in ide.c. */
 void ide_new_project(Ide* a);

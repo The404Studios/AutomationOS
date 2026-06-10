@@ -471,6 +471,32 @@ void ide_sel_from_caret(Ide* a, int pane) {
         ide_set_focus(a, sym);
 }
 
+/* IDE-SYNC-0 S2/S3: jump THE selection -- and the shared editor caret -- to a
+ * function's definition line. The reverse edges of the loop: map satellite
+ * follows and inspector row clicks land the editor at the symbol (the editor
+ * render auto-scrolls to the caret, the codeview follows focus). */
+void ide_sel_jump(Ide* a, int func_idx, int pane) {
+    if (!a) return;
+    if (func_idx < 0 || func_idx >= a->model.nfuncs) return;
+    a->prev_focus = a->focus_func;     /* Backspace = back keeps working */
+    ide_set_focus(a, func_idx);
+    {
+        const Func* f = &a->model.funcs[func_idx];
+        int line = f->line_start - 1;  /* 1-based parse range -> 0-based caret */
+        extern int ed_line_count(const char* src, int len);
+        int total = ed_line_count(a->src, a->src_len);
+        if (line >= total) line = total - 1;
+        if (line < 0) line = 0;
+        a->editor.caret_line = line;
+        a->editor.caret_col  = 0;
+        a->editor.want_col   = 0;
+    }
+    a->sel.pane   = pane;
+    a->sel.line   = a->editor.caret_line;
+    a->sel.symbol = a->focus_func;
+    a->sel.node   = a->map_selected;
+}
+
 /* ===========================================================================
  * Project scan: recursively flatten a->root into a->entries[].
  *

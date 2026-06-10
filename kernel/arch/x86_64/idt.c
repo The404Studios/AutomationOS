@@ -115,6 +115,18 @@ void idt_set_gate(uint8_t num, uint64_t handler, uint16_t selector, uint8_t flag
     idt[num].zero = 0;
 }
 
+#ifdef SMP_IPI
+// Is an IDT gate already claimed? (non-zero handler offset). SMP-G0: ipi_init
+// verifies each IPI vector is FREE before claiming it -- a silent idt_set_gate
+// over a live vector (the original IPI block sat dead-on the CPU1 LAPIC timer
+// gate at 0x40) kills the prior owner with no diagnostic. Gated so every
+// non-SMP_IPI build (default AND the frozen F3-5 SMP config) stays
+// byte-for-byte unchanged.
+int idt_gate_present(uint8_t num) {
+    return (idt[num].offset_low | idt[num].offset_mid | idt[num].offset_high) != 0;
+}
+#endif
+
 // Route the fault vectors that must NOT run on a possibly-corrupt kernel stack
 // onto IST1: #DF (8) and NMI (2). Without this a kernel-stack overflow that
 // triggers #DF would re-fault pushing the #DF frame onto the same broken stack

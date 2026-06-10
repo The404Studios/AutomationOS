@@ -27,8 +27,23 @@ typedef struct ipi_call {
     bool wait;                          // Wait for completion?
 } ipi_call_t;
 
+// Bounded per-CPU array size for the IPI subsystem (SMP-G0). smp.h's MAX_CPUS
+// is 256, which would put ~120 KB of IPI queues/stats into the packed .bss --
+// pure pressure on the < 0x200000 user-shadow boundary (linker.ld: user ELFs
+// link at 0x200000 and shadow any kernel global above it under their CR3; the
+// IPI queues are touched from IPI handlers that run under ARBITRARY CR3, so
+// they MUST stay in the packed low .bss). 8 matches the scheduler's own local
+// MAX_CPUS; the live machine model is 2 (BSP + AP1).
+#define IPI_MAX_CPUS 8
+
 // IPI initialization
 void ipi_init(void);
+
+// SMP-G0 IPI-LINK acceptance: BSP sends one IPI_RESCHEDULE to CPU1, CPU1's
+// handler increments its counter, BSP bounded-polls and prints
+// "IPILINK: PASS ipi_resched=1 cpu1_count=1" (or FAIL). Call on the BSP only,
+// after CPU1 is online and taking interrupts (post Brick E/F2).
+void ipi_link_selftest(void);
 
 // Send IPI to specific CPU
 void ipi_send(uint32_t cpu, uint32_t vector);
@@ -79,7 +94,7 @@ typedef struct {
     uint64_t stop_received;
 } ipi_stats_t;
 
-extern ipi_stats_t ipi_stats[MAX_CPUS];
+extern ipi_stats_t ipi_stats[IPI_MAX_CPUS];
 
 void ipi_print_stats(void);
 

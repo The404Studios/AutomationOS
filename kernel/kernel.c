@@ -488,6 +488,22 @@ void kernel_main(void* raw_info) {
                 (unsigned long)hz);
     }
 
+#ifdef SMP_IPI
+    /* SMP-G0 IPI-LINK (GATED, SMP=1 SMP_IPI=1 builds only): claim the IPI IDT
+     * vectors (0x50-0x55) and arm the send paths. MUST run here -- after
+     * lapic_init() (ipi_init captures the BSP APIC id and the gates' targets
+     * EOI the LAPIC) and BEFORE try_start_cpu1() (the IDT is shared with the
+     * AP, so every IPI gate exists before CPU1 is alive enough to take one).
+     * ipi_init refuses (loud serial FATAL, subsystem stays disarmed) if any
+     * vector is already claimed. Nothing SENDS an IPI yet: the one
+     * IPI_RESCHEDULE proof fires from the G0 selftest after the F2 checkpoint,
+     * and kernel_panic's ipi_stop_all_cpus is gated availability (SMP-R0). */
+    {
+        extern void ipi_init(void);
+        ipi_init();
+    }
+#endif
+
 #ifdef SMP_SCHED
     /* Brick B: install the per-CPU TSS array + both GDT TSS descriptors NOW, BEFORE
      * try_start_cpu1() -- the AP's ap_main() does `ltr 0x38` (gdt_ap_load_tss) as
@@ -840,6 +856,20 @@ void kernel_main(void* raw_info) {
                         ">0 proves CPU1 ran the pinned kernel thread)\n",
                         c1, c2, c2 - c1);
             }
+#ifdef SMP_IPI
+            /* SMP-G0 IPI-LINK acceptance: BSP sends ONE IPI_RESCHEDULE to CPU1,
+             * CPU1's handler counts it + EOIs, BSP bounded-polls (~100 ms) and
+             * prints "IPILINK: PASS ipi_resched=1 cpu1_count=1". Placed HERE
+             * because Brick E/F2 just proved CPU1 is taking interrupts (IF=1),
+             * and the BSP is still in its serial-safe pre-desktop window. The
+             * handler takes NO scheduling action -- IPI-wake is SMP-G1. Gated
+             * on SMP_SCHED_DISPATCH (enclosing #ifdef) because only the real
+             * cpu_id() makes CPU1's handler count into ipi_stats[1]. */
+            {
+                extern void ipi_link_selftest(void);
+                ipi_link_selftest();
+            }
+#endif
 #endif
 #endif
         }

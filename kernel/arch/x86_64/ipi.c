@@ -11,14 +11,66 @@
 
 #include "../../include/ipi.h"
 #include "../../include/lapic.h"
+#include "../../include/lapic_constants.h"   /* AP_LAPIC_TIMER_VECTOR, SPURIOUS_VECTOR */
 #include "../../include/smp.h"
 #include "../../include/kernel.h"
 #include "../../include/x86_64.h"
 #include "../../include/spinlock.h"
 #include "../../include/tlb.h"
+#include "../../include/perf.h"              /* rdtsc (static inline) -- the bounded selftest wait */
+
+/* ===========================================================================
+ * SMP-G0 VECTOR-COLLISION CHECKS (explicit, compile-time -- never assumptions).
+ * The IDT vector landscape this kernel actually claims:
+ *   0x00-0x1F  CPU exceptions          (idt.c isr0-31)
+ *   0x20-0x2F  remapped PIC IRQs       (idt.c irq0-15; 0x20 = the BSP tick)
+ *   0x40       CPU1 LAPIC timer        (AP_LAPIC_TIMER_VECTOR, Brick E)
+ *   0xFF       LAPIC spurious          (SPURIOUS_VECTOR + ap_spurious_isr)
+ * The original IPI block sat at 0x40 -- DEAD ON the AP timer gate. Any future
+ * renumber that re-collides fails THIS build, not a 2 AM debug session.
+ * =========================================================================== */
+_Static_assert(IPI_RESCHEDULE > 0x2F && IPI_AP_PANIC < 0xFF,
+               "IPI vector block must sit above exceptions+PIC and below spurious");
+_Static_assert(IPI_RESCHEDULE   < IPI_TLB_FLUSH     && IPI_TLB_FLUSH     < IPI_FUNCTION_CALL &&
+               IPI_FUNCTION_CALL < IPI_STOP         && IPI_STOP          < IPI_TEST &&
+               IPI_TEST          < IPI_TLB_FLUSH_ALL && IPI_TLB_FLUSH_ALL < IPI_AP_PANIC,
+               "IPI vectors must be strictly increasing (distinct)");
+_Static_assert(AP_LAPIC_TIMER_VECTOR < IPI_RESCHEDULE || AP_LAPIC_TIMER_VECTOR > IPI_AP_PANIC,
+               "IPI vector block collides with the CPU1 LAPIC timer vector");
+_Static_assert(LAPIC_TIMER_VECTOR < IPI_RESCHEDULE || LAPIC_TIMER_VECTOR > IPI_AP_PANIC,
+               "IPI vector block collides with the default LAPIC timer vector");
+_Static_assert(SPURIOUS_VECTOR < IPI_RESCHEDULE || SPURIOUS_VECTOR > IPI_AP_PANIC,
+               "IPI vector block collides with the LAPIC spurious vector");
+
+/* ===========================================================================
+ * SMP-G0 CPU-MODEL SEAM. This file was salvage written against smp.c's model
+ * (smp_num_cpus / percpu_data[].apic_id / cpu_is_online) -- smp.c is NOT in
+ * the build. The live tree's model (ap_boot.c) is: 2 logical CPUs, CPU1's
+ * APIC id captured from the MADT in try_start_cpu1(), liveness via
+ * cpu1_is_online(). Resolve everything through that seam. Critically,
+ * percpu_data[] DOES link (ap_boot.c defines a minimal array for the health
+ * monitor) but its .apic_id is NEVER FILLED -- the old percpu_data-based
+ * cpu_to_apic_id would have returned 0 for CPU1 and sent every "CPU1" IPI to
+ * the BSP ITSELF. Wrong-target, not link-fail: the worst kind.
+ * =========================================================================== */
+extern int      cpu1_is_online(void);       /* ap_boot.c: AP up + not offlined   */
+extern uint32_t smp_cpu1_apic_id(void);     /* ap_boot.c: CPU1 hw APIC id (G0)   */
+
+static uint32_t ipi_bsp_apic_id = 0;        /* captured in ipi_init (BSP context) */
+static int      ipi_ready       = 0;        /* gates claimed + vectors verified   */
+
+static uint32_t ipi_ncpus(void) {
+    return cpu1_is_online() ? 2u : 1u;
+}
+
+static bool ipi_cpu_online(uint32_t cpu) {
+    if (cpu == 0) return true;
+    if (cpu == 1) return cpu1_is_online() != 0;
+    return false;
+}
 
 // IPI statistics
-ipi_stats_t ipi_stats[MAX_CPUS];
+ipi_stats_t ipi_stats[IPI_MAX_CPUS];
 
 // Function call queue (per-CPU)
 // Stores call requests BY VALUE so they do NOT depend on the sender's stack
@@ -38,28 +90,33 @@ typedef struct ipi_call_entry {
     void*      data;       // Argument
     uint32_t*  done_ptr;   // &sender->done_count (wait==true) or NULL (wait==false)
 } ipi_call_entry_t;
-static ipi_call_entry_t call_queue[MAX_CPUS][IPI_CALL_QUEUE_SIZE];
-static uint32_t call_queue_head[MAX_CPUS];  // Protected by call_queue_lock
-static uint32_t call_queue_tail[MAX_CPUS];  // Protected by call_queue_lock
-static spinlock_t call_queue_lock[MAX_CPUS];
+static ipi_call_entry_t call_queue[IPI_MAX_CPUS][IPI_CALL_QUEUE_SIZE];
+static uint32_t call_queue_head[IPI_MAX_CPUS];  // Protected by call_queue_lock
+static uint32_t call_queue_tail[IPI_MAX_CPUS];  // Protected by call_queue_lock
+static spinlock_t call_queue_lock[IPI_MAX_CPUS];
 
 // TLB flush state
 static volatile uint32_t tlb_flush_all_count = 0;
 static volatile uint32_t tlb_flush_ack_count = 0;
 static spinlock_t tlb_flush_lock;
 
-// Initialize IPI subsystem
+// Initialize IPI subsystem. BSP context, after lapic_init(), BEFORE
+// try_start_cpu1() -- the IDT is shared, so the gates must exist before CPU1
+// is alive enough to ever receive one of these vectors.
 void ipi_init(void) {
     kprintf("[IPI] Initializing inter-processor interrupts...\n");
 
     // Initialize call queues
-    for (uint32_t cpu = 0; cpu < MAX_CPUS; cpu++) {
+    for (uint32_t cpu = 0; cpu < IPI_MAX_CPUS; cpu++) {
         call_queue_head[cpu] = 0;
         call_queue_tail[cpu] = 0;
         spin_lock_init(&call_queue_lock[cpu]);
     }
 
     spin_lock_init(&tlb_flush_lock);
+
+    // We run on the BSP here: capture its hardware APIC id for cpu_to_apic_id.
+    ipi_bsp_apic_id = lapic_get_id();
 
     // Register IPI handlers with IDT
     // Forward declarations for ASM handlers and IDT gate setter
@@ -69,6 +126,23 @@ void ipi_init(void) {
     extern void ipi_stop_handler(void);
     extern void ipi_tlb_flush_all_handler(void);
     extern void idt_set_gate(uint8_t num, uint64_t handler, uint16_t selector, uint8_t flags);
+    extern int  idt_gate_present(uint8_t num);
+
+    // RUNTIME collision check (the compile-time asserts above cover the KNOWN
+    // claimants; this catches any future runtime registration we don't know
+    // about). Refuse to claim an occupied gate -- a silent overwrite is how
+    // the original 0x40 block would have killed CPU1's timer.
+    static const uint8_t ipi_vectors[] = {
+        IPI_RESCHEDULE, IPI_TLB_FLUSH, IPI_FUNCTION_CALL,
+        IPI_STOP, IPI_TLB_FLUSH_ALL
+    };
+    for (uint32_t i = 0; i < sizeof(ipi_vectors); i++) {
+        if (idt_gate_present(ipi_vectors[i])) {
+            kprintf("[IPI] FATAL: IDT vector 0x%x already claimed -- IPI "
+                    "subsystem NOT initialized (collision)\n", ipi_vectors[i]);
+            return;                       /* ipi_ready stays 0; senders no-op */
+        }
+    }
 
     // IDT_GATE_INTERRUPT = 0x8E (present, ring 0, 64-bit interrupt gate)
     idt_set_gate(IPI_RESCHEDULE, (uint64_t)ipi_reschedule_handler, 0x08, 0x8E);
@@ -77,33 +151,41 @@ void ipi_init(void) {
     idt_set_gate(IPI_STOP, (uint64_t)ipi_stop_handler, 0x08, 0x8E);
     idt_set_gate(IPI_TLB_FLUSH_ALL, (uint64_t)ipi_tlb_flush_all_handler, 0x08, 0x8E);
 
-    kprintf("[IPI] IPI handlers registered in IDT (vectors 0x%x-0x%x)\n",
-            IPI_RESCHEDULE, IPI_TLB_FLUSH_ALL);
+    ipi_ready = 1;
+    kprintf("[IPI] IPI handlers registered in IDT (vectors 0x%x-0x%x, bsp_apic=%u)\n",
+            IPI_RESCHEDULE, IPI_TLB_FLUSH_ALL, ipi_bsp_apic_id);
     kprintf("[IPI] IPI subsystem initialized\n");
 }
 
-// Convert CPU ID to APIC ID
+// Convert CPU ID to APIC ID via the live ap_boot.c seam (NOT percpu_data --
+// see the seam note at the top of this file).
 static uint32_t cpu_to_apic_id(uint32_t cpu) {
-    if (cpu >= __atomic_load_n(&smp_num_cpus, __ATOMIC_ACQUIRE)) {
-        return 0xFF;  // Invalid
-    }
-    return percpu_data[cpu].apic_id;
+    if (cpu == 0) return ipi_bsp_apic_id;
+    if (cpu == 1) return smp_cpu1_apic_id();   /* 0xFFFFFFFF until captured */
+    return 0xFFFFFFFFu;  // Invalid
 }
 
 // Send IPI to specific CPU
 void ipi_send(uint32_t cpu, uint32_t vector) {
-    if (cpu >= __atomic_load_n(&smp_num_cpus, __ATOMIC_ACQUIRE)) {
+    if (!ipi_ready) {
+        return;       /* gates never claimed (collision/init skipped) -- no-op */
+    }
+    if (cpu >= ipi_ncpus()) {
         kprintf("[IPI] Invalid CPU: %u\n", cpu);
         return;
     }
 
     uint32_t apic_id = cpu_to_apic_id(cpu);
+    if (apic_id == 0xFFFFFFFFu) {
+        kprintf("[IPI] CPU %u has no captured APIC id -- IPI dropped\n", cpu);
+        return;
+    }
     lapic_send_ipi(apic_id, vector);
 }
 
 // Send IPI to multiple CPUs
 void ipi_send_mask(cpumask_t mask, uint32_t vector) {
-    uint32_t ncpus = __atomic_load_n(&smp_num_cpus, __ATOMIC_ACQUIRE);
+    uint32_t ncpus = ipi_ncpus();
     for (uint32_t cpu = 0; cpu < ncpus; cpu++) {
         if (cpumask_test(mask, cpu)) {
             ipi_send(cpu, vector);
@@ -113,17 +195,23 @@ void ipi_send_mask(cpumask_t mask, uint32_t vector) {
 
 // Send IPI to all CPUs except self
 void ipi_send_all_but_self(uint32_t vector) {
+    if (!ipi_ready) {
+        return;       /* no gates claimed -> a broadcast would #GP the targets */
+    }
     lapic_send_ipi_all_but_self(vector);
 }
 
 // Send IPI to all CPUs including self
 void ipi_send_all(uint32_t vector) {
+    if (!ipi_ready) {
+        return;
+    }
     lapic_send_ipi_all(vector);
 }
 
 // TLB flush all CPUs
 void ipi_tlb_flush_all(void) {
-    if (__atomic_load_n(&smp_num_cpus, __ATOMIC_ACQUIRE) <= 1) {
+    if (ipi_ncpus() <= 1) {
         // Single CPU, just flush local TLB
         __asm__ volatile("mov %%cr3, %%rax; mov %%rax, %%cr3" ::: "rax", "memory");
         return;
@@ -136,7 +224,7 @@ void ipi_tlb_flush_all(void) {
 
     // Reset acknowledgment counter
     tlb_flush_ack_count = 0;
-    tlb_flush_all_count = __atomic_load_n(&smp_num_online, __ATOMIC_ACQUIRE) - 1;  // All CPUs except self
+    tlb_flush_all_count = ipi_ncpus() - 1;  // All CPUs except self
 
     // Flush local TLB
     __asm__ volatile("mov %%cr3, %%rax; mov %%rax, %%cr3" ::: "rax", "memory");
@@ -161,7 +249,7 @@ void ipi_tlb_flush_mm(void* mm) {
 
 // TLB flush for specific page
 void ipi_tlb_flush_page(void* addr) {
-    if (__atomic_load_n(&smp_num_cpus, __ATOMIC_ACQUIRE) <= 1) {
+    if (ipi_ncpus() <= 1) {
         // Single CPU, just flush local TLB entry
         __asm__ volatile("invlpg (%0)" : : "r"(addr) : "memory");
         return;
@@ -211,7 +299,7 @@ static bool dequeue_call(uint32_t cpu, ipi_call_entry_t* out) {
 
 // Call function on specific CPU
 int ipi_call_function(uint32_t cpu, ipi_func_t func, void* data, bool wait) {
-    if (cpu >= __atomic_load_n(&smp_num_cpus, __ATOMIC_ACQUIRE)) {
+    if (cpu >= ipi_ncpus()) {
         return -1;
     }
 
@@ -284,7 +372,7 @@ int ipi_call_function_many(cpumask_t mask, ipi_func_t func, void* data, bool wai
     uint32_t* done_ptr = wait ? &call.done_count : NULL;
 
     // Enqueue on all target CPUs
-    uint32_t ncpus = __atomic_load_n(&smp_num_cpus, __ATOMIC_ACQUIRE);
+    uint32_t ncpus = ipi_ncpus();
     for (uint32_t cpu = 0; cpu < ncpus; cpu++) {
         if (cpumask_test(mask, cpu)) {
             if (cpu == cpu_id()) {
@@ -327,9 +415,9 @@ int ipi_call_function_many(cpumask_t mask, ipi_func_t func, void* data, bool wai
 int ipi_call_function_all(ipi_func_t func, void* data, bool wait) {
     cpumask_t mask = CPUMASK_NONE;
 
-    uint32_t ncpus = __atomic_load_n(&smp_num_cpus, __ATOMIC_ACQUIRE);
+    uint32_t ncpus = ipi_ncpus();
     for (uint32_t cpu = 0; cpu < ncpus; cpu++) {
-        if (cpu_is_online(cpu)) {
+        if (ipi_cpu_online(cpu)) {
             cpumask_set(&mask, cpu);
         }
     }
@@ -339,7 +427,7 @@ int ipi_call_function_all(ipi_func_t func, void* data, bool wait) {
 
 // Request reschedule on specific CPU
 void ipi_reschedule(uint32_t cpu) {
-    if (cpu >= __atomic_load_n(&smp_num_cpus, __ATOMIC_ACQUIRE) || cpu == cpu_id()) {
+    if (cpu >= ipi_ncpus() || cpu == cpu_id()) {
         return;
     }
 
@@ -351,7 +439,7 @@ void ipi_reschedule(uint32_t cpu) {
 
 // Stop specific CPU
 void ipi_stop_cpu(uint32_t cpu) {
-    if (cpu >= __atomic_load_n(&smp_num_cpus, __ATOMIC_ACQUIRE) || cpu == cpu_id()) {
+    if (cpu >= ipi_ncpus() || cpu == cpu_id()) {
         return;
     }
 
@@ -450,13 +538,62 @@ void ipi_handle_stop(void) {
     }
 }
 
+/* ===========================================================================
+ * SMP-G0 IPI-LINK acceptance: the smallest possible proof that the BSP can
+ * interrupt CPU1 and CPU1 can handle it safely.
+ *   BSP: ipi_reschedule(1) -> ONE IPI_RESCHEDULE
+ *   CPU1: ipi_reschedule_handler (asm) -> ipi_handle_reschedule (C) ->
+ *         reschedule_received++ + LAPIC EOI + iretq. NO scheduling action --
+ *         wake-by-IPI is SMP-G1, explicitly out of scope here.
+ * BSP context only, after CPU1 is online and taking interrupts (Brick E
+ * proved the timer; F3-5 proved sti;hlt parking -- either state takes this).
+ * Bounded TSC wait (~100 ms, the try_start_cpu1 convention); a dead CPU1
+ * means FAIL on serial, never a hang.
+ * =========================================================================== */
+void ipi_link_selftest(void) {
+    if (!ipi_ready) {
+        kprintf("IPILINK: FAIL ipi_resched=0 cpu1_count=0 (init refused/skipped)\n");
+        return;
+    }
+    if (!ipi_cpu_online(1)) {
+        kprintf("IPILINK: SKIP (CPU1 offline -- single-core boot)\n");
+        return;
+    }
+
+    uint64_t rx_before   = __atomic_load_n(&ipi_stats[1].reschedule_received, __ATOMIC_ACQUIRE);
+    uint64_t sent_before = ipi_stats[0].reschedule_sent;
+
+    ipi_reschedule(1);
+
+    int sent = (ipi_stats[0].reschedule_sent == sent_before + 1);
+
+    /* Bounded wait: ~100 ms TSC deadline (3 GHz estimate -- only the BOUND
+     * matters, not the exact frequency). */
+    uint64_t start    = rdtsc();
+    uint64_t deadline = 100000ULL * 3000ULL;
+    uint64_t rx_now   = rx_before;
+    while ((rx_now = __atomic_load_n(&ipi_stats[1].reschedule_received,
+                                     __ATOMIC_ACQUIRE)) == rx_before) {
+        if ((rdtsc() - start) >= deadline) break;
+        __asm__ volatile("pause" ::: "memory");
+    }
+
+    if (sent && rx_now > rx_before) {
+        kprintf("IPILINK: PASS ipi_resched=1 cpu1_count=1\n");
+    } else {
+        kprintf("IPILINK: FAIL ipi_resched=%d cpu1_count=%lu (rx %lu -> %lu)\n",
+                sent, (unsigned long)(rx_now - rx_before),
+                (unsigned long)rx_before, (unsigned long)rx_now);
+    }
+}
+
 // Print IPI statistics
 void ipi_print_stats(void) {
     kprintf("\n=== IPI Statistics ===\n");
 
-    uint32_t ncpus = __atomic_load_n(&smp_num_cpus, __ATOMIC_ACQUIRE);
+    uint32_t ncpus = ipi_ncpus();
     for (uint32_t cpu = 0; cpu < ncpus; cpu++) {
-        if (!cpu_is_online(cpu)) continue;
+        if (!ipi_cpu_online(cpu)) continue;
 
         ipi_stats_t* stats = &ipi_stats[cpu];
 

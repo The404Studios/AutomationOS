@@ -130,6 +130,7 @@ fi
 # we write a SEPARATE output so the normal build/kernel.elf is never touched.
 # =============================================================================
 SMP_SOURCES=""
+SMP_IPI_SOURCES=""
 if [ "${SMP:-0}" = "1" ]; then
     CFLAGS="$CFLAGS -DSMP_FOUNDATION"
     KERNEL_OUT="build/kernel-smp.elf"
@@ -183,6 +184,28 @@ if [ "${SMP:-0}" = "1" ]; then
             NASMFLAGS="$NASMFLAGS -DSMP_SCHED_DISPATCH"
             echo "*** SMP_SCHED_DISPATCH: CPU1 in SCHEDULER mode (AP ring-3 dispatch) ***"
         fi
+    fi
+
+    # =========================================================================
+    # SMP_IPI (SMP-G0 IPI-LINK) -- sub-gate, REQUIRES SMP=1. Compiles the
+    # (previously dormant) kernel/arch/x86_64/ipi.c + ipi_handlers.asm and
+    # defines -DSMP_IPI. THE DESIGN RULE (user-set at G0): SMP_IPI means the
+    # IPI code is LINKED, INITIALIZED, AND PROVEN -- not merely that a dormant
+    # file exists. Defining it makes "SMP_FOUNDATION && SMP_IPI" actually true:
+    #   - kernel.c calls ipi_init() (IDT vectors 0x50-0x55 claimed AFTER an
+    #     explicit free-check; the old 0x40 block collided with the CPU1 LAPIC
+    #     timer gate) and runs the IPILINK selftest after the F2 checkpoint.
+    #   - kernel_panic's ipi_stop_all_cpus re-arms (the SMP-R0 link fix gated
+    #     it on this macro precisely so it could only return with ipi.c linked).
+    # When UNSET: ipi.c is not compiled, no -DSMP_IPI, every SMP build is
+    # byte-for-byte the F3-5 configuration. NASMFLAGS untouched (the handler
+    # stubs have no %ifdef). Build:
+    #   SMP=1 SMP_SCHED=1 SMP_SCHED_DISPATCH=1 SMP_IPI=1 bash scripts/quick_build.sh
+    # =========================================================================
+    if [ "${SMP_IPI:-0}" = "1" ]; then
+        CFLAGS="$CFLAGS -DSMP_IPI"
+        SMP_IPI_SOURCES="1"
+        echo "*** SMP_IPI build: ipi.c + ipi_handlers.asm linked (SMP-G0 IPI-LINK) ***"
     fi
 fi
 
@@ -272,6 +295,12 @@ assemble kernel/arch/x86_64/usermode.asm     asm_usermode
 if [ -n "$SMP_SOURCES" ]; then
     assemble kernel/arch/x86_64/ap_trampoline.asm asm_ap_trampoline
 fi
+# SMP-G0 (GATED by SMP=1 SMP_IPI=1): the IPI IDT entry stubs (push-GPRs ->
+# C handler -> iretq). Only in the SMP_IPI link, so every other build is
+# byte-for-byte unchanged.
+if [ -n "$SMP_IPI_SOURCES" ]; then
+    assemble kernel/arch/x86_64/ipi_handlers.asm asm_ipi_handlers
+fi
 
 echo ""
 echo "[2/3] Compiling kernel..."
@@ -320,6 +349,13 @@ if [ -n "$SMP_SOURCES" ]; then
     # health_monitor_record_alloc/free() for kref/ownership, and health_monitor_report()
     # for diagnostics. Only built in SMP kernel.
     compile kernel/core/health_monitor.c    c_health_monitor
+    # SMP-G0 (GATED by SMP_IPI=1): the IPI subsystem, adapted to the ap_boot.c
+    # CPU-model seam (cpu1_is_online / smp_cpu1_apic_id; NOT smp.c's
+    # percpu_data, whose .apic_id is never filled). NOTE: ipi_fixed.c is an
+    # older duplicate-symbol variant and must NEVER be added alongside this.
+    if [ -n "$SMP_IPI_SOURCES" ]; then
+        compile kernel/arch/x86_64/ipi.c     c_ipi
+    fi
 fi
 compile kernel/drivers/serial.c              c_serial
 compile kernel/drivers/pit.c                 c_pit

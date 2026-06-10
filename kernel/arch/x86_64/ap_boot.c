@@ -1368,6 +1368,16 @@ void cpu1_job_init(void)
  * id so the AP never starts, to PROVE the BSP degrades safely (timeout ->
  * continue single-core). Off by default.
  */
+#ifdef SMP_IPI
+/* SMP-G0: CPU1's hardware APIC id for the IPI subsystem (ipi.c's
+ * cpu_to_apic_id seam; read via smp_cpu1_apic_id() below). Captured in
+ * try_start_cpu1() from the MADT, before the SIPI. 0xFFFFFFFF = not
+ * captured yet (single-core boot, or try_start_cpu1 never ran) -- ipi_send
+ * drops the IPI on that sentinel instead of targeting a garbage APIC id.
+ * Gated so non-SMP_IPI SMP builds stay byte-for-byte the F3-5 configuration. */
+static volatile uint32_t g_cpu1_apic_id = 0xFFFFFFFFu;
+#endif
+
 int try_start_cpu1(void)
 {
     /* CPU 1 = the second enabled processor in the MADT (index 1). */
@@ -1377,6 +1387,14 @@ int try_start_cpu1(void)
         return 0;
     }
     uint32_t aid = (uint32_t)ap_apic;
+
+#ifdef SMP_IPI
+    /* SMP-G0: publish CPU1's hardware APIC id for the IPI subsystem
+     * (smp_cpu1_apic_id below). The SMP_SCHED-gated g_ap1_apic_id store stays
+     * separate: it is cpu_id()'s sentinel-based switch and its ordering
+     * contract is Brick A's. */
+    __atomic_store_n(&g_cpu1_apic_id, aid, __ATOMIC_RELEASE);
+#endif
 
 #ifdef SMP_SCHED
     /* Brick A: publish CPU1's hardware xAPIC id so cpu_id() can map it -> logical
@@ -1441,6 +1459,13 @@ int cpu1_is_online(void)
     return (__atomic_load_n(&ap1_online, __ATOMIC_ACQUIRE) != 0 &&
             __atomic_load_n(&cpu1_offline, __ATOMIC_ACQUIRE) == 0);
 }
+
+#ifdef SMP_IPI
+uint32_t smp_cpu1_apic_id(void)
+{
+    return __atomic_load_n(&g_cpu1_apic_id, __ATOMIC_ACQUIRE);
+}
+#endif
 
 /* ============================================================================
  * SMP Infrastructure for Health Monitor

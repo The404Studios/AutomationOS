@@ -2,24 +2,35 @@
 
 > Warm memory. Refresh per checkpoint. One active brick at a time.
 
-## SMP-F3-6 CHOOSECPU — OPEN (branch `brick/smp-f3-6-choosecpu`, off frozen `brick/smp-g2-tlbshoot-min`) — back on the scheduler policy ladder
-- **user-set scope:** add the `scheduler_choose_cpu()` seam · LEGALITY FIRST · then role/home
-  CPU policy · default behavior no-op for unpinned tasks · the mandatory gates (the F3-2
-  enqueue gate in scheduler_add_process_to_cpu) remain the backstop.
-- **acceptance (user-set):** `CHOOSECPU: PASS` — pinned CPU1 task chooses CPU1 · normal/default
-  task chooses home CPU0 · illegal CPU target rejected/clamped · no migration unless explicitly
-  allowed · F3-5 cpu1hello still passes · G1/G2 smokes still pass · desktop 0 panic.
-- **HARD NO's (user-set):** no desktop split · no work stealing · no general migration · no
-  global PREEMPT · no per-mm shootdown.
-- **design source:** docs/SCHEDULER_POLICY_LAYER.md — the seam spec (legality/pin → cpu1-only
-  branch → home CPU0, NO balancing), the 4 layers, the 7+1 laws, the submit-task pipeline.
-  NAMING NOTE: the policy doc's own "F3-6" row (sched_profile_t types + the named
-  scheduler_submit_task funnel) stays FUTURE; this brick lands the SEAM (the doc's F3-3 spec)
-  under the user's F3-6 name. Layers 1–2 live, 3 = return CPU0 stub, 4 (MLFQ) untouched.
-- **SMP-G3 PARKED (user-set):** general per-mm shootdown only when the pin model breaks — i.e.
-  when any of these stops being true: no process has a multi-CPU execution mask · no unpinned
-  migration · no fork-on-CPU1/shared-mm execution. **The G2 tlb_pinning_audit is the forcing
-  function** — it fails the smoke the day the model changes.
+## SMP-F3-6 CHOOSECPU — LANDED (commit `6508778`, branch `brick/smp-f3-6-choosecpu`, awaiting review/push) — THE placement seam, one decider
+- **THE EXACT ACCEPTANCE HIT (first boot, kernel-printed):** `CHOOSECPU: PASS pinned_cpu1=1
+  default_cpu0=1 illegal_clamped=1 nomask_clamped=1 multimask_home=1 cpu1only_role=1` + the
+  live proof `[SMP] F3-6: cpu1hello placed via scheduler_choose_cpu -> cpu1` + the ENTIRE
+  ladder green (TLBSHOOT+NEG · IPIWAKE 32/32 · IPILINK · F2 · APCURRENT · CPU1HELLO exit/reap ·
+  0 sched+tlb invariant · 0 panic). Record: [`bricks/SMP-F3-6.md`](bricks/SMP-F3-6.md) · proof
+  `scripts/choosecpu_smoke.sh`.
+- **the seam (SCHEDULER_POLICY_LAYER made real):** (1) hard legality, never skipped —
+  allowed_cpus ∩ online (CPU1 via cpu1_is_online = law 7's liveness input); empty mask /
+  off-mask pin = CLAMPED loudly, never an illegal return; (2) pin/role — legal pin wins,
+  CPU1-only mask → CPU1 even unpinned, never name-based; (3) pressure — DELIBERATE home-CPU0
+  STUB (F3-7 inserts one branch, no caller changes); (4) MLFQ untouched. ADVISORY: the F3-2
+  enqueue gate stays the mandatory backstop.
+- **one decider (the F3-3 panel requirement):** F2 kthread spawn + cpu1hello placement + every
+  home-routed wake (scheduler_add_process_home's inline ternary replaced) all route through the
+  seam; the F3-5 ladder still passing IS the proof of behavioral identity.
+- **byte-identity:** DEFAULT kernel.elf hash-identical (`6f99ed9f`); the dispatch profile
+  changes BY DESIGN (first dispatch-path brick since F3-5; the regression ladder is its gate).
+- **NAMING NOTE:** the policy doc's own "F3-6" row (sched_profile_t types +
+  scheduler_submit_task funnel) stays FUTURE; this brick = the SEAM (the doc's F3-3 spec) under
+  the user's F3-6 name.
+- **boundary held:** no desktop split · no stealing · no general migration (the stub cannot
+  move anything) · no PREEMPT · no per-mm shootdown.
+- **SMP-G3 PARKED (user-set):** general per-mm shootdown only when the pin model breaks (any
+  multi-CPU execution mask · unpinned migration · fork-on-CPU1/shared-mm). **The G2
+  tlb_pinning_audit is the forcing function** — it fails the smoke the day the model changes.
+- **next after:** F3-7 controlled migration (layer 3 live, one branch in the stub; G1's IPI
+  kick + F3-3a's ascending two-lock discipline are already in place) or the doc's typed F3-6
+  row (sched_profile_t + scheduler_submit_task).
 
 ## SMP-G2 TLBSHOOT-MIN — FROZEN / COMPLETE (pushed `5931e4c`, ls-remote verified; user: "another real boundary brick... exactly the kind of SMP bug that looks green until memory corruption appears later") — kernel-range shootdown proven, pin model audited
 - **THE EXACT ACCEPTANCE HIT (first boot, kernel-printed):** `TLBSHOOT: PASS kernel_flush=1

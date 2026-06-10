@@ -2,18 +2,36 @@
 
 > Warm memory. Refresh per checkpoint. One active brick at a time.
 
-## SMP-G0 IPI-LINK — OPEN (branch `brick/smp-g0-ipi-link`, off frozen `brick/smp-f3-5`) — can BSP send one bounded, known-vector IPI to CPU1?
-- **user-set scope (exactly narrow):** compile the dormant `ipi.c` into the SMP_SCHED build ·
-  call `ipi_init()` · verify vector constants do not collide · verify the link map does not create
-  >=0x200000 shadow hazards · send ONE `IPI_RESCHEDULE` to CPU1 · CPU1 increments a counter.
-- **acceptance (user-set):** `IPILINK: PASS ipi_resched=1 cpu1_count=1` (short form `IPILINK: PASS`).
-- **HARD NO's (user-set):** no wake scheduling yet · no TLB shootdown · no desktop split · no global
-  PREEMPT · no stealing. G0 is ONLY: BSP sends a bounded, known-vector IPI to CPU1 and CPU1 handles
-  it without destabilizing the desktop.
-- **context:** `SMP_IPI` gate already exists (the SMP-R0 link fix expects it: panic's
-  ipi_stop_all_cpus is gated on `SMP_FOUNDATION && SMP_IPI` — G0 defines it when ipi.c actually
-  links). stash-mined harvest available later: ipi_tlb_flush_page_handler asm (G2/G3 material).
-- **next after:** SMP-G1 IPI-WAKE (kills the tick-poll wake latency).
+## SMP-G0 IPI-LINK — LANDED (commit `ea45305`, branch `brick/smp-g0-ipi-link`, awaiting review/push) — BSP interrupts CPU1, CPU1 handles it safely
+- **THE EXACT ACCEPTANCE HIT (first try):** `IPILINK: PASS ipi_resched=1 cpu1_count=1` + the full
+  F3-5 regression ladder green (F2 delta>0, APCURRENT PASS, cpu1hello marks=5/exit=42/reaped,
+  0 invariant, 0 panic) under `scripts/ipilink_smoke.sh` (-smp 2). Record:
+  [`bricks/SMP-G0.md`](bricks/SMP-G0.md).
+- **user-set scope (exactly narrow, held):** compile the dormant `ipi.c` into the SMP_SCHED build ·
+  `ipi_init()` · vector-collision check · link-map shadow-hazard check · ONE `IPI_RESCHEDULE` to
+  CPU1 · CPU1 increments a counter. **DESIGN RULE (user-set):** SMP_IPI means LINKED + INITIALIZED
+  + PROVEN — `SMP_FOUNDATION && SMP_IPI` (panic's ipi_stop_all_cpus) is now actually satisfiable.
+- **BOTH predicted dangers were real:** (1) `IPI_RESCHEDULE=0x40` sat DEAD ON the Brick E CPU1
+  LAPIC timer gate (AP_LAPIC_TIMER_VECTOR=0x40) — an unmodified ipi_init would have silently
+  overwritten it and killed CPU1's tick; block renumbered 0x50–0x56 + _Static_asserts + a runtime
+  `idt_gate_present()` free-check before any claim (occupied ⇒ loud FATAL, subsystem disarmed).
+  (2) IPI state is touched under arbitrary CR3 ⇒ arrays sized IPI_MAX_CPUS=8 (not MAX_CPUS=256,
+  ~120 KB saved) + an nm hard gate `< 0x200000` in the smoke (landed 0x19bd60–0x19cbc0).
+- **third trap (unpredicted):** ipi.c's percpu_data-based cpu_to_apic_id LINKS (health-monitor
+  array) but `.apic_id` is never filled — every "CPU1" IPI would have targeted APIC 0 = the BSP
+  ITSELF (wrong-target, not link-fail). Adapted to the ap_boot.c seam: `smp_cpu1_apic_id()`
+  (MADT capture, 0xFFFFFFFF sentinel ⇒ IPI dropped) + `cpu1_is_online()`.
+- **EN-ROUTE FIND (stale doc):** the LIVE user link base is **0x800000** (`userspace.ld`) —
+  linker.ld's "0x200000 user-ELF load base" comment predates the move, so packed .bss ending at
+  0x25d000 is NOT a real shadow hazard today; the smoke's stricter 0x200000 gate kept anyway.
+- **byte-identity proven (laws 2/8):** default `6f99ed9f` + F3-5 SMP `ad072cc6` hash-equal from
+  HEAD and from this tree (all non-ipi.c edits #ifdef SMP_IPI). Gotcha re-confirmed: a Windows
+  git stash round-trip CRLF-flips sources — `sed -i 's/\r$//'` before WSL builds, and check
+  `git diff --stat` for full-file flips before trusting a commit.
+- **boundary held:** no wake scheduling (the handler's schedule() stays TODO — that IS G1), no TLB
+  shootdown sends, no desktop split, no PREEMPT, no stealing.
+- **next:** SMP-G1 IPI-WAKE (the reschedule handler actually wakes CPU1's scheduler; kills the
+  tick-poll wake latency). The handler seam is in place.
 
 ## SMP-F3-5 — FROZEN / COMPLETE (pushed `aed03ee`, ls-remote verified; user: "Strong go... the first truly serious SMP milestone") — cpu1hello
 - **THE EXACT ACCEPTANCE HIT:** `CPU1HELLO: PASS markers=5 exit=42 reaped=1 cpu1_idle=1

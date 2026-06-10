@@ -2,7 +2,7 @@
 
 > Warm memory. Refresh per checkpoint. One active brick at a time.
 
-## SELFHEAL-FIX-0 — LANDED (committed local on `brick/selfheal-fix-0`, awaiting review/push) — recovery now restores the desktop
+## SELFHEAL-FIX-0 — FROZEN / COMPLETE (pushed `0023943`, ls-remote verified; user: "ok perfect!") — recovery now restores the desktop
 - **user report:** wave-2 works on the T410 BUT "the self healing is not working" → "run 7 agents and fix the self heal".
 - **record:** [`bricks/SELFHEAL-FIX-0.md`](bricks/SELFHEAL-FIX-0.md) · **branch:** `brick/selfheal-fix-0` (off `brick/ide-xfile-0` `4766b1d`).
 - **7-agent verdict:** the recovery CHAIN was sound (detect/overlay/kill/respawn/re-arm all clean) — the hole

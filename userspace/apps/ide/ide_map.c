@@ -353,7 +353,15 @@ void panel_map(Ide* a, Canvas* cv, Rect r)
         if (cols < 1) cols = 1;
 
         int tile_idx = 0;
-        int scroll_y = a->map_oy;  /* reuse map pan for scrolling */
+        /* MAP-STABLE-0: overview tiles form a fixed grid -- tile_idx walks the
+         * model in fixed section order (includes->macros->records->globals->
+         * protos->funcs), each section in source-array order, so a given
+         * element keeps the SAME grid cell while the file (and window width)
+         * are unchanged. scroll_y reuses map_oy, which ide_set_focus() zeroes
+         * on every focus transition, so the overview always opens at the top
+         * row and never inherits a focused-view pan. (Globals carry no source
+         * line, so a cross-section line sort is intentionally not attempted.) */
+        int scroll_y = a->map_oy;
 
         /* Helper macro to place a tile and record it in the satellite table.
          * kind = MK_CALL for function tiles (navigable), MK_READ otherwise. */
@@ -498,6 +506,15 @@ void panel_map(Ide* a, Canvas* cv, Rect r)
      *   LEFT column   : read globals (cyan)
      *   RIGHT column  : write globals (green) then called functions (yellow)
      *   FAR-RIGHT col : absent ports (dashed red)
+     *
+     * MAP-STABLE-0 ORDER CONTRACT: within every column, satellites follow
+     * their model-array index order (f->reads / m->funcs / f->writes /
+     * f->calls / f->ports). That order is PARSE ORDER = SOURCE ORDER (the
+     * parser appends first-occurrence-deduped; ide_semantic builds ports in
+     * a fixed order). It is NOT a hash and never depends on focus/visit
+     * history, so a given function always lays out identically frame-to-
+     * frame and visit-to-visit (aphantasia spatial-consistency law). Do not
+     * introduce a sort on a mutable key here.
      * -------------------------------------------------------------------- */
     int left_x  = card_left - col_gap - sat_w;
     int right_x = card_right + col_gap;

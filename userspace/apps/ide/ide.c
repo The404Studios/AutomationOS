@@ -405,6 +405,17 @@ void ide_set_focus(Ide* a, int func_idx) {
     if (!a) return;
     a->flow_step_focus = -1;          /* a focus change clears any runtime-flow trace */
     a->map_selected    = -1;          /* ...and any map-node selection (satellites change) */
+    /* MAP-STABLE-0: re-center the map deterministically on every focus change.
+     * The pan offset is incidental drag state, not per-focus memory, so each
+     * visit to a function shows it in the SAME place (the aphantasia spatial-
+     * consistency law). This also zeroes the FILE OVERVIEW scroll, which
+     * reuses map_oy, so the overview always opens at the top grid row -- and
+     * the two views can no longer bleed pan into each other. Zoom untouched
+     * (map_zoom is a global view preference, currently pinned at 100%).
+     * Panning still sticks while the caret stays inside one function: the
+     * caret-sync only calls here on a function CROSSING. */
+    a->map_ox = 0;
+    a->map_oy = 0;
     int n = a->model.nfuncs;
     if (n <= 0) {                     /* nothing to focus                  */
         a->focus_func  = -1;

@@ -2,7 +2,26 @@
 
 > Warm memory. Refresh per checkpoint. One active brick at a time.
 
-## SMP-G2 TLBSHOOT-MIN — LANDED (commit `9f1f621`, branch `brick/smp-g2-tlbshoot-min`, awaiting review/push) — kernel-range shootdown proven, pin model audited
+## SMP-F3-6 CHOOSECPU — OPEN (branch `brick/smp-f3-6-choosecpu`, off frozen `brick/smp-g2-tlbshoot-min`) — back on the scheduler policy ladder
+- **user-set scope:** add the `scheduler_choose_cpu()` seam · LEGALITY FIRST · then role/home
+  CPU policy · default behavior no-op for unpinned tasks · the mandatory gates (the F3-2
+  enqueue gate in scheduler_add_process_to_cpu) remain the backstop.
+- **acceptance (user-set):** `CHOOSECPU: PASS` — pinned CPU1 task chooses CPU1 · normal/default
+  task chooses home CPU0 · illegal CPU target rejected/clamped · no migration unless explicitly
+  allowed · F3-5 cpu1hello still passes · G1/G2 smokes still pass · desktop 0 panic.
+- **HARD NO's (user-set):** no desktop split · no work stealing · no general migration · no
+  global PREEMPT · no per-mm shootdown.
+- **design source:** docs/SCHEDULER_POLICY_LAYER.md — the seam spec (legality/pin → cpu1-only
+  branch → home CPU0, NO balancing), the 4 layers, the 7+1 laws, the submit-task pipeline.
+  NAMING NOTE: the policy doc's own "F3-6" row (sched_profile_t types + the named
+  scheduler_submit_task funnel) stays FUTURE; this brick lands the SEAM (the doc's F3-3 spec)
+  under the user's F3-6 name. Layers 1–2 live, 3 = return CPU0 stub, 4 (MLFQ) untouched.
+- **SMP-G3 PARKED (user-set):** general per-mm shootdown only when the pin model breaks — i.e.
+  when any of these stops being true: no process has a multi-CPU execution mask · no unpinned
+  migration · no fork-on-CPU1/shared-mm execution. **The G2 tlb_pinning_audit is the forcing
+  function** — it fails the smoke the day the model changes.
+
+## SMP-G2 TLBSHOOT-MIN — FROZEN / COMPLETE (pushed `5931e4c`, ls-remote verified; user: "another real boundary brick... exactly the kind of SMP bug that looks green until memory corruption appears later") — kernel-range shootdown proven, pin model audited
 - **THE EXACT ACCEPTANCE HIT (first boot, kernel-printed):** `TLBSHOOT: PASS kernel_flush=1
   acked=1 bounded=1 invariant=1 (latency_us=382)` + `TLBSHOOT_NEG: PASS
   no_user_crossflush_needed_under_pinning=1 (procs_checked=3 multi_cpu_masks=0)` + 0
@@ -27,8 +46,15 @@
   untouched this brick.
 - **boundary held:** no per-mm shootdown · no unpinned migration · no fork-on-CPU1 · no desktop
   split · no PREEMPT · no scheduler rewrite · no blocking under rq/heap/scheduler/fs locks.
-- **next after:** G3 (precision/per-mm when the pin audit fires) or the scheduler policy rungs
-  (choose_cpu seam) now that kernel mappings are shootdown-safe.
+- **user verdict on freeze:** "another real boundary brick. It fixed a dangerous false-safety
+  condition: remote CPU acked the TLB shootdown but did not actually flush... exactly the kind
+  of SMP bug that looks green until memory corruption appears later. The negative proof is
+  important — you did not overbuild general per-mm shootdown before the scheduler model
+  actually needs it." Both commits kept unsquashed (the record preserves: the 0x51 false-ack
+  hole · the bounded ack wait · the pin/no-migration assumption · the TLB_INVARIANT validator ·
+  the __builtin_popcountll freestanding trap). **G3 PARKED** — the audit is the forcing
+  function.
+- **next:** SMP-F3-6 CHOOSECPU (open above).
 
 ## SMP-G1 IPI-WAKE — FROZEN / COMPLETE (pushed `bb5c378`, ls-remote verified; user: "a real performance milestone... CPU1 is no longer 'eventually responsive'; it is interrupt-woken") — 10 ms tick floor → 143 µs
 - **THE EXACT ACCEPTANCE HIT (first boot):** `IPIWAKE: PASS enqueue_to_cpu1=1

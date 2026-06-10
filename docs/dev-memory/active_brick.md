@@ -2,7 +2,18 @@
 
 > Warm memory. Refresh per checkpoint. One active brick at a time.
 
-## SMP-R0 — LANDED (commits `2bfeecc` + `67422d0` local on `brick/smp-r0`, awaiting review/push) — F3-4 recovered + the SMP build links again
+## SMP-F3-5 — OPEN (the high-risk isolated CPU1 ring-3 brick) — cpu1hello
+- **user-set scope:** first tiny static ring-3 ELF pinned to CPU1; **cooperative dispatch only**;
+  no global PREEMPT, no work stealing, no desktop split, no IPI yet; **audit the sys_exit path on
+  the AP** (the running-ref `process_unref(dead)` fix + reap + CR3-restore land WITH this brick per
+  faf7444's verifier-mandated split).
+- **acceptance (user-set):** `CPU1HELLO: PASS markers=<n> exit=42 reaped=1 cpu1_idle=1 desktop_alive=1`.
+- **THE HARD INVARIANT (user-set at the R0 freeze):** *CPU1 may not run ring-3 until
+  `process_get_current()`, `sys_exit`, CR3 restore, parent wake, and kfree teardown are
+  CPU-local/audited.* (Also recorded in docs/SCHEDULER_POLICY_LAYER.md.)
+- smoke-grading drift stays in SMOKE-PROFILE-0 — fixed inside F3-5 only if it blocks the proof.
+
+## SMP-R0 — FROZEN / COMPLETE (pushed `e8bae00`, ls-remote verified; commits kept separate per the user — the forensic chain: recover F3-4 → fix the silent SMP link hazard → docs) — F3-4 recovered + the SMP build links again
 - **record:** [`bricks/SMP-R0.md`](bricks/SMP-R0.md) · branch off `brick/net-p1-0` (8b446aa).
 - **F3-4 recovered:** cherry-pick `faf7444` (never merge), adapted to this tree's INLINED
   process_get_current — per-CPU routing only under SMP_SCHED_DISPATCH, default keeps the single-MOV

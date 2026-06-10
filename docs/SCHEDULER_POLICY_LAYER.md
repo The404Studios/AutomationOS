@@ -90,6 +90,11 @@ scheduler_choose_cpu(p):
 6. **Recovery outranks normal** — watchdog/self-heal gets CPU so a wedged system recovers.
 7. **No CPU trusted blindly** — a CPU failing its invariants (raised
    `g_sched_invariant_violations`, stalled heartbeat) is quarantined out of the legal set.
+8. **The CPU1 ring-3 gate (user-set at the SMP-R0 freeze, 2026-06-10)** — *CPU1 may not
+   run ring-3 until `process_get_current()`, `sys_exit`, CR3 restore, parent wake, and
+   kfree teardown are CPU-local/audited.* F3-4 (`APCURRENT: PASS`, frozen at `e8bae00`)
+   proved the first; the cpu1hello brick (SMP-F3-5) must land the remaining four WITH its
+   proof — never before it, never assumed.
 
 F3-3 actively obeys 1/2/3/7 and reserves 4/5/6 as no-ops it must not violate. Law 7 is
 *why* the race-free validator is part of F3-3: an adaptive scheduler that cannot trust a CPU

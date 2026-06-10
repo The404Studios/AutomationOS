@@ -157,6 +157,7 @@ static char ide_keycode_ascii(int kc, int shift) {
 /* ---- inspector tab indices (see Ide.insp_tab in ide.h) ---- */
 #define INSP_SYNTAX   0
 #define INSP_DETAILS  4
+#define INSP_LIB      5   /* "complex library" palette -- RIGHT-sidebar only */
 
 /* ---- map pan step (pixels per arrow press / drag is 1:1) ---- */
 #define MAP_PAN_STEP (g_map_pan_step < 1 ? 1 : g_map_pan_step)   /* Settings knob */
@@ -1304,8 +1305,20 @@ static void render_center_top(Ide* a, Canvas* cv) {
         /* Interactive inspector: render whatever sub-tab the user selected
          * (SYN/CAT/PORT/CONN/INFO). Previously this force-set INSP_SYNTAX every
          * frame which -- together with the matching force in the click router --
-         * made the sub-tabs impossible to switch (every click was reverted). */
-        panel_inspector(a, cv, a->r_map);
+         * made the sub-tabs impossible to switch (every click was reverted).
+         *
+         * IDE-REPAIR-0 I3 -- EXCEPT LIB: the "complex library" is a palette
+         * that belongs ONLY in the RIGHT inspector sidebar (render() draws it
+         * into r_inspector). Drawing it here too duplicated the full-width
+         * snippet list across the center, over the node-detail area. When LIB
+         * is active, show the node-detail (SYNTAX) view in the center. */
+        if (a->insp_tab == INSP_LIB) {
+            a->insp_tab = INSP_SYNTAX;
+            panel_inspector(a, cv, a->r_map);
+            a->insp_tab = INSP_LIB;
+        } else {
+            panel_inspector(a, cv, a->r_map);
+        }
         break;
     case VIZ_RUNTIME:
         panel_runtime(a, cv, a->r_map);
@@ -1892,12 +1905,22 @@ static void render_editor(Ide* a, Canvas* cv) {
  * with the pixels on screen, then restored). */
 static void route_center_top_click(Ide* a, int mx, int my) {
     switch (a->viz) {
-    case VIZ_INSPECTOR:
+    case VIZ_INSPECTOR: {
         /* Let the inspector's own click handler switch its sub-tab / select a
          * row. (No more force-to-SYNTAX + restore, which silently ate the
-         * SYN/CAT/PORT/CONN/INFO tab clicks the user reported.) */
+         * SYN/CAT/PORT/CONN/INFO tab clicks the user reported.)
+         *
+         * IDE-REPAIR-0 I3: mirror render_center_top() -- the center never
+         * shows the LIB palette, so while LIB is active hit-test the center
+         * against the SYNTAX view, NOT the LIB row list (otherwise clicking
+         * the AST text would insert a snippet at the caret). A click on the
+         * tab strip still selects any tab, including LIB. */
+        int was_lib = (a->insp_tab == INSP_LIB);
+        if (was_lib) a->insp_tab = INSP_SYNTAX;
         panel_inspector_click(a, a->r_map, mx, my);
+        if (was_lib && a->insp_tab == INSP_SYNTAX) a->insp_tab = INSP_LIB; /* no tab clicked */
         break;
+    }
     case VIZ_ACTIONS:
     case VIZ_POTENTIALS: {
         /* ACTIONS/POTENTIALS are the DETAILS view; force DETAILS only for the

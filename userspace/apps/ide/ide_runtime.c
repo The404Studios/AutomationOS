@@ -36,6 +36,11 @@
 #define RT_SPARK_H    16               /* sparkline max bar height            */
 #define RT_MAXWARN    3                /* warnings shown                      */
 #define RT_ABSENT_FILL 0x33E2574Au     /* dim red fill for absent gates       */
+/* IDE-REPAIR-0 I3: below this rect height, render the COMPACT one-line summary
+ * (the persistent bottom strip = RUNTIME_H = 5*GFX_FH). At/above it, render the
+ * DETAILED three-section view (the VIZ-3 center tab gets the tall r_map). This
+ * is what keeps the strip from duplicating / crowding the detailed tab. */
+#define RT_DETAIL_MINH (6 * GFX_FH)
 
 /* ---- flow-step hit-test table -----------------------------------------------
  * Rebuilt every time the flow strip is drawn (the persistent bottom strip is
@@ -431,6 +436,82 @@ static void rt_draw_warnings(Ide* a, Canvas* cv, int x, int y, int w, int h) {
     }
 }
 
+/* ---- COMPACT summary: the persistent bottom strip (one line) ----------------
+ * IDE-REPAIR-0 I3: the strip used to render the SAME three detailed sections
+ * as the VIZ-3 tab (duplication) crammed into 5 text rows (the bleed against
+ * the code view). One summary line fits the strip; the detail lives in VIZ-3.
+ * Compact mode never writes rt_hits, so the VIZ-3 center's pill hit-tests
+ * keep the CENTER geometry (the strip used to clobber it every frame). */
+static void rt_draw_compact(Ide* a, Canvas* cv, Rect r) {
+    Model* m = &a->model;
+    int ty = r.y + (r.h - GFX_FH) / 2;
+    if (ty < r.y + PAD) ty = r.y + PAD;
+    int clip_x = r.x + PAD;
+    int clip_w = r.w - 2 * PAD;
+    if (clip_w <= 0) return;
+    int x = clip_x;
+    char num[12];
+    int n;
+
+    /* FLOW(<focus>): N steps */
+    const char* fname = (m->focus >= 0 && m->focus < m->nfuncs)
+                        ? m->funcs[m->focus].name : "-";
+    int nflow = m->nflow;
+    if (nflow > M_MAXFLOW) nflow = M_MAXFLOW;
+    if (nflow < 0) nflow = 0;
+    int absent = 0;
+    for (int i = 0; i < nflow; i++) if (m->flow[i].absent) absent++;
+
+    char buf[96]; int p = 0;
+    rt_append(buf, (int)sizeof(buf), &p, "FLOW(");
+    rt_append(buf, (int)sizeof(buf), &p, fname);
+    rt_append(buf, (int)sizeof(buf), &p, "): ");
+    n = ide_itoa(nflow, num); num[n] = 0;
+    rt_append(buf, (int)sizeof(buf), &p, num);
+    rt_append(buf, (int)sizeof(buf), &p, " steps");
+    gfx_text_clip(cv, x, ty, buf, TH_TEXT_DIM, clip_x, clip_w);
+    x += gfx_textw(buf) + 2 * GFX_FW;
+
+    /* k missing / flow OK */
+    if (nflow > 0) {
+        if (absent > 0) {
+            char mb[40]; int q = 0;
+            n = ide_itoa(absent, num); num[n] = 0;
+            rt_append(mb, (int)sizeof(mb), &q, num);
+            rt_append(mb, (int)sizeof(mb), &q, " missing");
+            gfx_text_clip(cv, x, ty, mb, TH_ORANGE, clip_x, clip_w);
+            x += gfx_textw(mb) + 2 * GFX_FW;
+        } else {
+            gfx_text_clip(cv, x, ty, "flow OK", TH_GREEN, clip_x, clip_w);
+            x += gfx_textw("flow OK") + 2 * GFX_FW;
+        }
+    }
+
+    /* COH n% + band label */
+    int coh = rt_clamp(m->coherence, 0, 100);
+    uint32_t band; const char* label;
+    if (coh >= 80)      { band = TH_GREEN;  label = "High";   }
+    else if (coh >= 50) { band = TH_YELLOW; label = "Medium"; }
+    else                { band = TH_RED;    label = "Low";    }
+    gfx_text_clip(cv, x, ty, "COH", TH_TEXT_DIM, clip_x, clip_w);
+    x += gfx_textw("COH") + GFX_FW;
+    { char cb[8]; n = ide_itoa(coh, cb);
+      if (n < (int)sizeof(cb) - 1) { cb[n++] = '%'; cb[n] = 0; }
+      gfx_text_clip(cv, x, ty, cb, band, clip_x, clip_w);
+      x += n * GFX_FW + GFX_FW; }
+    gfx_text_clip(cv, x, ty, label, TH_TEXT_DIM, clip_x, clip_w);
+    x += gfx_textw(label) + 2 * GFX_FW;
+
+    /* WARN n */
+    int nrisks = m->nrisks; if (nrisks < 0) nrisks = 0;
+    if (nrisks > 0) {
+        gfx_text_clip(cv, x, ty, "WARN", TH_ORANGE, clip_x, clip_w);
+        x += gfx_textw("WARN") + GFX_FW;
+        n = ide_itoa(nrisks, num); num[n] = 0;
+        gfx_text_clip(cv, x, ty, num, TH_ORANGE, clip_x, clip_w);
+    }
+}
+
 /* ===========================================================================
  * Entry point.
  * ===========================================================================*/
@@ -441,6 +522,11 @@ void panel_runtime(Ide* a, Canvas* cv, Rect r) {
     gfx_fill(cv, r.x, r.y, r.w, r.h, TH_PANEL2);
     /* a hairline top edge to seat the strip against the editor above it */
     gfx_hline(cv, r.x, r.y, r.w, TH_BORDER);
+
+    /* IDE-REPAIR-0 I3: short rect = the persistent bottom strip -> one compact
+     * summary line, so it never duplicates the detailed VIZ-3 tab nor
+     * overflows its 5 rows. Tall rect (the VIZ-3 center) = the detail view. */
+    if (r.h < RT_DETAIL_MINH) { rt_draw_compact(a, cv, r); return; }
 
     /* three horizontal sections (fractions of r.w) */
     int flow_w = (r.w * 55) / 100;

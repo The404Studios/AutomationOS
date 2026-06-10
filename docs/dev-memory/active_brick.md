@@ -2,7 +2,24 @@
 
 > Warm memory. Refresh per checkpoint. One active brick at a time.
 
-## SMP-H1 BKL-LITE — LANDED (commit `d921238`, branch `brick/smp-h1-bkl-lite`, awaiting review/push) — the safety wall held under a 60s two-CPU storm
+## SMP-F3-7 BATCH-CLASS — OPEN (branch `brick/smp-f3-7-batchclass`, off frozen `brick/smp-h1-bkl-lite`) — CPU1 becomes useful for ordinary workload classes
+- **why (user):** "the first brick where CPU1 starts becoming useful for ordinary workload
+  classes, but still under typed intent and safety gates."
+- **user-set scope:** activate BATCH class routing · BATCH + legal multi-CPU mask MAY choose
+  CPU1 · NORMAL remains home CPU0 · PINNED_RT still obeys its explicit pin · the submit funnel
+  + enqueue legality walls remain MANDATORY · the G1 IPI kick wakes CPU1 after the foreign
+  enqueue · the BKL wall protects marked syscall paths.
+- **acceptance (user-set):** `BATCHCLASS: PASS batch_cpu1=1 normal_cpu0=1 pinned_rt_cpu1=1
+  illegal_clamped=1 ipi_wake=1 bkl_safe=1`.
+- **HARD NO's (user-set):** no work stealing · no desktop split yet · no unpinned arbitrary
+  migration · no general per-mm shootdown · no global PREEMPT.
+- **design note:** this is the policy doc's "F3-7 inserts one branch in the layer-3 stub; no
+  caller changes" promise coming due — BATCH+legal-CPU1 → the PINNED_WORKER core (law 5: batch
+  fills idle), everything else unchanged. PROFILE-0's batch-routes-home selftest expectation
+  flips WITH the new gate (the CORE line stays identical so frozen smokes keep passing).
+  Gated SMP_BATCH=1; acceptance profile = the full stack (+SMP_IPI +SMP_BKL).
+
+## SMP-H1 BKL-LITE — FROZEN / COMPLETE (pushed `ad40be1`, ls-remote verified; user: "the bridge from 'CPU1 can run code' to 'CPU1 can safely run useful code'") — the safety wall held under a 60s two-CPU storm
 - **THE EXACT ACCEPTANCE HIT (first boot):** `BKL: PASS syscall_storm=1 duration=60s cpu0=1
   cpu1=1 corruption=0 deadlock=0 panic=0` — CPU1 storm 157,757 iters (nearly dedicated) + CPU0
   storm 4,544 iters (sharing the whole desktop), both errors=0 secs=60; `[BKL] engaged:
@@ -28,8 +45,14 @@
   convention).
 - **HARD NO's held:** no desktop split · no stealing · no BATCH migration · no per-mm
   shootdown · no global PREEMPT · no fine-grained VFS rewrite.
-- **next:** SMP-F3-7 BATCH-CLASS / controlled CPU1 placement (the wall makes it non-reckless)
-  → DESKTOP-SPLIT.
+- **user verdict on freeze:** "the correct safety wall... The important part is not just 'lock
+  exists.' It is that the storm proved: both CPUs entered marked syscall paths, real contention
+  serialized correctly, shared-memory churn stayed clean, desktop stayed alive, no watchdog
+  trips, no invariant violations. That is the bridge from 'CPU1 can run code' to 'CPU1 can
+  safely run useful code.'" Both commits kept unsquashed. The load-bearing rule promoted to
+  **LAW 17** in [`hardware_laws.md`](hardware_laws.md): BKL-marked syscalls must not block or
+  schedule away while holding the BKL.
+- **next:** SMP-F3-7 BATCH-CLASS (open above).
 
 ## SMP-PROFILE-0 — FROZEN / COMPLETE (pushed `8851b9a`, ls-remote verified; user: "the right bridge... the scheduler now knows WHY something is being placed, not just where") — typed intent landed, nothing moved
 - **THE EXACT ACCEPTANCE HIT (first boot):** `SMPPROFILE: PASS normal_home=1 batch_declared=1

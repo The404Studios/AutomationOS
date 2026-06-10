@@ -77,6 +77,16 @@ signal: a model that internalizes these is *useful* on this OS; one that doesn't
     spin_lock does NOT cli in this kernel, so this is necessary-not-sufficient), plus the
     bounded timeout itself (a deadlock degrades to a loud timeout, never a hang). Full
     lock-freedom remains a review-checklist discipline at every call site.
+17. **BKL-marked syscalls must not block or schedule away while holding the BKL (user-set at
+    SMP-H1).** Syscalls run IF=0 on a cooperative kernel: a marked syscall that
+    context-switches away leaves the BKL owned by a parked task, and the other CPU's spinners
+    wedge forever (the Linux-2.0 release-on-block problem, refused rather than solved in v1).
+    Marking discipline: FS / IPC / non-blocking-NET / process-management danger paths only;
+    wait/sleep/msgrcv/recv/accept/connect/futex/thread_join/ch_wait stay UNMARKED. Audit every
+    new marking for hidden schedule paths (sys_execve aliases spawn = returns; sys_kill defers
+    the switch). The bounded-spin watchdog (~2 s, loud one-shot, never unlocked-proceed) turns
+    a future violation into a visible failure instead of a silent hang. Release-on-block is
+    the sanctioned future path to marking blockers — never "it probably won't contend."
 
 ## Reviewer checklist (a stricter role that can say "no")
 

@@ -2,13 +2,54 @@
 
 > Warm memory. Refresh per checkpoint. One active brick at a time.
 
-## T410-RETEST (ACTIVE, user-physical) — both heap/aliasing fixes on the real 2010 hardware
+## IDE-REPAIR-0 (ACTIVE) — four checkpointed fixes, no rewrite
+- **branch:** `brick/ide-repair-0` (off `brick/desktop-toast-0`, which carries the toast removal
+  `438e0c6`) · **record:** `bricks/IDE-REPAIR-0.md` (to write)
+- **why (user, with T410 photos):** the IDE is "extremely bugged": UX/UI overlapping panels, the
+  ability to code broken (autocomplete + line rendering), structure doesn't match the design mockup;
+  plus the desktop-wide "weird text" (`sbin/compositor` as the panel title) and the debug box.
+- **checkpoints (user-set, ONE COMMIT + CLEAN BUILD + SCREENSHOT EACH, in order):**
+  - **I0** debug/title cleanup: no startup toast (already removed on the base branch) · no compositor
+    debug overlay by default · no raw `sbin/compositor` path as the panel/titlebar text — real app
+    names · all debug text behind a compile flag · ASCII-only visible strings (the 8x16 font has no
+    UTF-8). Commit: `fix(desktop): hide debug overlays and normalize app titles`.
+  - **I1** editor text rendering: hard clip rect; each row stops at ITS line end (the diagonal
+    suffix-bleed is THE "can't code" bug); consistent line height; caret->pixel exact; scroll
+    clamped. Acceptance: 10 clean lines typed, Backspace/Enter sane, save/build callable.
+  - **I2** autocomplete boundaries: popup = a LAYER (clipped, never overwrites text); buffer gets
+    typed chars; Tab/Enter accept = insert exactly ONCE; Esc closes; arrows only navigate when open.
+  - **I3** panel layout vs the mockup: LIB list only in the right sidebar; runtime/coherence/
+    warnings NOT duplicated (compact persistent strip + detail only inside VIZ-3); every section
+    clipped to its rect.
+- **HARD NO's:** no full IDE rewrite; no compiler-semantics changes unless save/build breaks; every
+  draw path gets a clip rect; every visible debug string gated or removed.
+- **diagnosis:** 5 read-only agents fanned out (editor render / autocomplete / inspector layout /
+  runtime duplication / title text) — fixes applied serially I0→I3 from their findings.
+- **status:** **LANDED — all four checkpoints committed local, awaiting review/push.**
+  I0 `7991d5b` (THE sbin/compositor text + flashing square = the SCHED_DEBUG timer-ISR liveness
+  heartbeat, default-ON in quick_build → now DEFAULT OFF, opt-in; panel/titlebar path-guards;
+  "Semantic IDE") · I1 `1a17c1d` (one-glyph-per-cell: the editor+codeview passed interior pointers
+  into the un-NUL'd source buffer to gfx_text_clip → every row drew the whole buffer suffix — THE
+  can't-code bug, render-only, buffer was always correct) · I2 `20da381` (suppress completion while
+  snippet ${N} fields are live so Tab navigates fields) · I3 `4009e8e` (LIB palette sidebar-only
+  via insp_tab save/restore + mirrored click router; panel_runtime branches on rect height: compact
+  one-line strip vs detailed VIZ-3 view; rt_hits no longer clobbered). Per-checkpoint clean builds +
+  screenshots (i0check/i2check/i3check.png); editor proven pixel-clean in QEMU; LEGO-mode visuals +
+  typing/snippet flows = the T410 hands-on list. record: `bricks/IDE-REPAIR-0.md`.
+
+## T410-RETEST (PARTIAL — heap fixes verified, desktop artifacts root-caused) — both heap/aliasing fixes on the real 2010 hardware
 - **what:** flash + boot `automationos-t410-bothfixes.iso` (T410_SAFE=1 SCHED_DEBUG=0 kernel +
   DESKTOP_MINIMAL=1 SELFHEAL=1 userspace — the proven T410 profile) carrying BOTH suspects' fixes:
   the malloc tcache three-state fix (`8a0aafc`) and the initrd direct-map fix (`9dad3ac`).
 - **hypothesis to test:** the stray color-shifting window + erratic titlebars
   (DESKTOP-PROJECT-REGRESSION-0) were cross-linked-heap / aliased-memory symptoms. If the desktop
   comes up clean, the real cause is found and that brick closes.
+- **result so far:** the T410 BOOTS to desktop with both fixes; the remaining top-right "flashing
+  square + text" was root-caused as the compositor's never-expiring WELCOME TOAST (expiry frame is
+  never presented on an idle desktop; per-second clock repaints jitter its fade alpha; the em-dash
+  renders as UTF-8 garbage through the ASCII font) — REMOVED in `438e0c6` on `brick/desktop-toast-0`;
+  `automationos-t410-bothfixes.iso` rebuilt clean. The `sbin/compositor` panel-title text + the IDE's
+  brokenness moved into IDE-REPAIR-0 (above).
 - **then:** NET-STACK-PHASE-1 (SOCK_MAX 16→64 · TCP SYN queue · UDP queue 8→32 · TCP OOO 1→4 slots,
   per the audit's quick-win tier) → E1000-PCH-0.
 - **parked (user-approved, later):** **KERNEL-DIRECTMAP-AUDIT-0** — find any kernel subsystem still

@@ -2,7 +2,19 @@
 
 > Warm memory. Refresh per checkpoint. One active brick at a time.
 
-## IDE-REPAIR-0 (ACTIVE) — four checkpointed fixes, no rewrite
+## IDE-APHANTASIA (NORTH STAR, user-set 2026-06-09) — who this IDE is FOR
+- **the user:** "we are building this ide for people who have aphantasia." The Semantic LEGO map /
+  inspector tables / runtime flow ARE the mental image aphantasic programmers cannot form internally
+  — a prosthetic working memory, not decoration. EVERY IDE brick filters through:
+  nothing lives only in the user's head · always-visible context (where am I, what's connected,
+  what changed) · verbal/symbolic representations in sync with the spatial map (tables + EXPLAIN
+  narratives matter as much as boxes-and-edges) · STABLE map layout (same function = same place) ·
+  tight code↔map↔inspector synchronization.
+- **candidate next bricks (user picks):** IDE-SYNC-0 (bidirectional caret↔map↔inspector follow) ·
+  IDE-CONTEXT-0 (persistent breadcrumb/where-am-I strip) · map layout pinning/stability ·
+  VIZ-1 mockup parity (port-labeled edges, dashed-red ABSENT gate cards) · richer EXPLAIN.
+
+## IDE-REPAIR-0 — FROZEN / COMPLETE (pushed, T410-CONFIRMED "it works") — four checkpointed fixes, no rewrite
 - **branch:** `brick/ide-repair-0` (off `brick/desktop-toast-0`, which carries the toast removal
   `438e0c6`) · **record:** `bricks/IDE-REPAIR-0.md` (to write)
 - **why (user, with T410 photos):** the IDE is "extremely bugged": UX/UI overlapping panels, the

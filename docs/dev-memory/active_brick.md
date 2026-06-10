@@ -2,7 +2,27 @@
 
 > Warm memory. Refresh per checkpoint. One active brick at a time.
 
-## SMP-PROFILE-0 — LANDED (commit `203d22d`, branch `brick/smp-profile-0`, awaiting review/push) — typed intent landed, nothing moved
+## SMP-H1 BKL-LITE — OPEN (branch `brick/smp-h1-bkl-lite`, off frozen `brick/smp-profile-0`) — the Linux-2.0-style safety wall before BATCH work touches CPU1
+- **why (user):** "once BATCH starts putting ordinary work on CPU1, syscalls become the danger
+  surface. The Big Kernel Lock-lite gives you an honest Linux-2.0-style safety wall before you
+  let more real userspace run concurrently... the safety brick that lets F3-7 become useful
+  instead of reckless."
+- **user-set scope:** ONE owner-recursive outer kernel lock · acquired in the syscall
+  dispatcher for MARKED unsafe syscall groups · cover FS / net / IPC / process-management
+  danger paths · do NOT wrap yield / exit / futex fast paths unless proven needed · verify
+  heap/futex/rq locks still behave under 2-CPU stress.
+- **acceptance (user-set):** `BKL: PASS syscall_storm=1 duration=60s cpu0=1 cpu1=1
+  corruption=0 deadlock=0 panic=0`.
+- **HARD NO's (user-set):** no desktop split · no work stealing · no BATCH migration yet · no
+  general per-mm shootdown · no global PREEMPT · no fine-grained VFS rewrite.
+- **KNOWN DESIGN HAZARD (work it, don't discover it):** syscalls run IF=0 and the kernel is
+  cooperative — a marked syscall that BLOCKS (context-switches away) while holding the BKL
+  wedges the other CPU's spinners forever (Linux 2.0 solved this with release-on-block). The
+  honest v1: mark ONLY non-blocking syscall paths, document the exclusion loudly, and put a
+  bounded-spin watchdog in bkl_acquire (a wedge degrades to a loud diagnostic, never a silent
+  hang).
+
+## SMP-PROFILE-0 — FROZEN / COMPLETE (pushed `8851b9a`, ls-remote verified; user: "the right bridge... the scheduler now knows WHY something is being placed, not just where") — typed intent landed, nothing moved
 - **THE EXACT ACCEPTANCE HIT (first boot):** `SMPPROFILE: PASS normal_home=1 batch_declared=1
   pinned_rt_legal=1 submit_funnel=1 no_behavior_change=1` (smoke-assembled from the
   kernel-printed `SMPPROFILE-CORE: PASS` synthetic proof + the live funnel markers) + the

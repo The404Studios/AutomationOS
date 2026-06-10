@@ -34,11 +34,18 @@ timeout 60 qemu-system-x86_64 -cdrom build/automationos.iso -m 512 \
 sleep 2
 
 echo "=== result ==="
-grep -F "NETRIG:" "$LOG" || { echo "NETRIG marker MISSING (see $LOG)"; exit 1; }
-if grep -qF "NETRIG: PASS loopback=1 cap=1" "$LOG"; then
-    if grep -qiE "PANIC|CPU EXCEPTION|TRIPLE FAULT" "$LOG"; then
-        echo "KERNEL FAULT during boot"; exit 1
-    fi
+grep -E "NETRIG:|NETP1[A-Z]:" "$LOG" || { echo "rig markers MISSING (see $LOG)"; exit 1; }
+P=1
+grep -qF "NETRIG: PASS loopback=1 cap=1" "$LOG" || P=0
+# Per-brick markers: only assert the ones that exist in this build's serial
+# (each NET-P1 brick adds its own PASS line; a FAIL on any present marker fails).
+if grep -qF "NETP1A:" "$LOG"; then
+    grep -qF "NETP1A: SYNQ PASS" "$LOG" || P=0
+fi
+if grep -qiE "PANIC|CPU EXCEPTION|TRIPLE FAULT" "$LOG"; then
+    echo "KERNEL FAULT during boot"; P=0
+fi
+if [ "$P" = "1" ]; then
     echo "NETRIG CHECK: PASS"
     # restore a default (rig-free) kernel.elf so later builds aren't contaminated
     bash scripts/quick_build.sh > /tmp/netrig_def2.log 2>&1

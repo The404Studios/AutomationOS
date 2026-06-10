@@ -38,8 +38,8 @@ void sock_testrig_inject_ipv4(const uint8_t* ip_start, uint16_t ip_avail);
 /* ------------------------------------------------------------------ */
 /* TX capture ring                                                     */
 /* ------------------------------------------------------------------ */
-#define RIG_CAP_MAX   8     /* captured segments per test step          */
-#define RIG_CAP_BYTES 256   /* head bytes kept per segment (hdrs + some) */
+#define RIG_CAP_MAX   32    /* captured segments per test step          */
+#define RIG_CAP_BYTES 64    /* head bytes kept per segment (headers)    */
 
 typedef struct {
     uint32_t dst_ip;        /* host order                               */
@@ -181,13 +181,79 @@ void net_testrig_selftest(void) {
                        /*seq*/1001, /*ack*/0, TCP_RST, 0, NULL, 0);
     }
 
-    g_rig_active = 0;
     /* Boot-time rig, pre-userspace: a full table reset wipes the test
      * listener + the RST'd child in one stroke (sock_init is re-callable). */
     sock_init();
 
     kprintf("NETRIG: %s loopback=%d cap=%d\n",
             (loopback && cap) ? "PASS" : "FAIL", loopback, cap);
+
+    /* ---------------------------------------------------------------- */
+    /* NET-P1-A: the SYN side-table proof. 24 SYNs from distinct peer    */
+    /* ports hit one listener (backlog 4). EVERY SYN must get a SYN-ACK  */
+    /* (half-opens cost table entries, not sockets), and only the 4      */
+    /* promoted handshakes may consume sock_t slots.                     */
+    /* ---------------------------------------------------------------- */
+    {
+        int syns = 24, synacks = 0, established = 0, sockused = 0;
+
+        int l = sock_socket(SOCK_STREAM);
+        if (l >= 0 && sock_bind(l, 47002) == 0 && sock_listen(l, 4) == 0) {
+            g_cap_n = 0;
+            for (int i = 0; i < syns; i++) {
+                rig_inject_tcp(peer_ip, (uint16_t)(40001 + i), my_ip, 47002,
+                               /*seq*/ 5000u + (uint32_t)i * 100u, /*ack*/ 0,
+                               TCP_SYN, 4096, NULL, 0);
+            }
+            for (int i = 0; i < g_cap_n; i++) {
+                const tcp_hdr_t* th = (const tcp_hdr_t*)g_cap[i].seg;
+                if (g_cap[i].proto == IPPROTO_TCP &&
+                    th->flags == (TCP_SYN | TCP_ACK)) synacks++;
+            }
+
+            /* Promote the first 4: ACK each with the ISN read back from its
+             * captured SYN-ACK (the rig sees exactly what the peer would). */
+            for (int i = 0; i < 4; i++) {
+                uint16_t want_port = (uint16_t)(40001 + i);
+                for (int c = 0; c < g_cap_n; c++) {
+                    const tcp_hdr_t* th = (const tcp_hdr_t*)g_cap[c].seg;
+                    if (g_cap[c].proto == IPPROTO_TCP &&
+                        th->flags == (TCP_SYN | TCP_ACK) &&
+                        net_ntohs(th->dst_port) == want_port) {
+                        uint32_t isn = net_ntohl(th->seq);
+                        rig_inject_tcp(peer_ip, want_port, my_ip, 47002,
+                                       /*seq*/ 5001u + (uint32_t)i * 100u,
+                                       /*ack*/ isn + 1, TCP_ACK, 4096,
+                                       NULL, 0);
+                        break;
+                    }
+                }
+            }
+
+            /* Count promotions: accept() drains the queue; the table shows
+             * the children's slots. */
+            for (int i = 0; i < 4; i++) {
+                int fd = sock_accept(l);
+                if (fd >= 0) established++;
+            }
+            sock_t* base = sock_table_base();
+            if (base) {
+                for (int i = 0; i < SOCK_MAX; i++) {
+                    if (base[i].used && base[i].type == SOCK_STREAM &&
+                        base[i].state == TCP_ESTABLISHED &&
+                        base[i].local_port == 47002) sockused++;
+                }
+            }
+        }
+
+        sock_init();   /* wipe the test listener + children */
+        kprintf("NETP1A: SYNQ %s syns=%d synacks=%d established=%d sockused=%d\n",
+                (synacks == syns && established == 4 && sockused == 4)
+                    ? "PASS" : "FAIL",
+                syns, synacks, established, sockused);
+    }
+
+    g_rig_active = 0;
 }
 
 #else  /* !NET_SELFTEST */

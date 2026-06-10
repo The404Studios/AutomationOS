@@ -198,6 +198,9 @@ int  tcp_close(sock_t* s);
 void tcp_input(uint32_t src_ip, uint32_t dst_ip,
                const uint8_t* seg, uint16_t seg_len);
 void tcp_tick(sock_t* s);   /* called from sock_poll for retransmit/timers */
+/* NET-P1-A: half-open SYN side-table timers (SYN-ACK retransmit, TTL expiry,
+ * orphan cleanup). Called once per sock_poll(). */
+void tcp_synq_tick(void);
 
 /* ------------------------------------------------------------------ */
 /* Public BSD-ish socket API (socket.c).                               */

@@ -225,6 +225,203 @@ static void tcp_send_ack(sock_t* s) {
     tcp_xmit(s, TCP_ACK, s->snd_nxt, s->rcv_nxt, NULL, 0);
 }
 
+/* ------------------------------------------------------------------ */
+/* NET-P1-A: half-open SYN side-table                                   */
+/* ------------------------------------------------------------------ */
+/*
+ * Passive open used to allocate a FULL sock_t (~45 KB: 32 KB rx ring + UDP
+ * queue + retransmit slot) for every incoming SYN, so a burst of half-opens
+ * drained the 16-slot shared table and starved ALL networking; SYNs past the
+ * backlog were silently dropped. Half-open state is tiny -- hold it in this
+ * compact side-table instead and promote to a real socket only when the
+ * final ACK of the handshake arrives (straight to ESTABLISHED + the accept
+ * queue). The listener's backlog now bounds ESTABLISHED-but-unaccepted
+ * children at promote time; half-opens are bounded by the table itself
+ * (evict-oldest on overflow -- the evicted peer just retransmits its SYN).
+ * SYN-ACK retransmit runs from the table via tcp_synq_tick() (sock_poll).
+ */
+#define TCP_SYNQ_MAX        32       /* half-open capacity (~1 KB total)    */
+#define TCP_SYNQ_RETRY_MS   1000     /* SYN-ACK retransmit cadence          */
+#define TCP_SYNQ_MAX_RETRY  4        /* give up re-SYN-ACKing after this    */
+#define TCP_SYNQ_TTL_MS     16000    /* drop half-opens older than this     */
+#define TCP_SYNQ_WND        32768    /* window advertised in the SYN-ACK    */
+
+typedef struct {
+    bool     valid;
+    uint32_t src_ip;       /* the peer                                     */
+    uint16_t src_port;
+    uint16_t local_port;   /* the listener's port                          */
+    uint32_t isn;          /* OUR initial seq (the SYN-ACK's seq)          */
+    uint32_t rcv_nxt;      /* peer's SYN seq + 1                           */
+    uint16_t peer_wnd;     /* peer's window from the SYN                   */
+    uint64_t born_ms;      /* age (TTL + evict-oldest)                     */
+    uint64_t last_tx_ms;   /* last SYN-ACK transmit                        */
+    uint8_t  retries;
+} tcp_synq_ent_t;
+
+static tcp_synq_ent_t tcp_synq[TCP_SYNQ_MAX];
+
+/* Build + send one socket-less TCP control segment (the side-table has no
+ * sock_t to hang tcp_xmit() off). No payload, no retransmit arming here. */
+static int tcp_xmit_raw(uint32_t remote_ip, uint16_t local_port,
+                        uint16_t remote_port, uint8_t flags,
+                        uint32_t seq, uint32_t ack, uint16_t window) {
+    uint8_t seg[sizeof(tcp_hdr_t)];
+    tcp_hdr_t* th = (tcp_hdr_t*)seg;
+    memset(th, 0, sizeof(*th));
+    th->src_port = net_htons(local_port);
+    th->dst_port = net_htons(remote_port);
+    th->seq      = net_htonl(seq);
+    th->ack      = net_htonl(ack);
+    th->data_off = (uint8_t)((sizeof(tcp_hdr_t) / 4) << 4);
+    th->flags    = flags;
+    th->window   = net_htons(window);
+    th->checksum = net_htons(net_transport_checksum(net_get_ip(), remote_ip,
+                                                    IPPROTO_TCP, seg,
+                                                    sizeof(tcp_hdr_t)));
+    return ip_tx(remote_ip, IPPROTO_TCP, seg, sizeof(tcp_hdr_t));
+}
+
+static tcp_synq_ent_t* synq_find(uint32_t src_ip, uint16_t src_port,
+                                 uint16_t local_port) {
+    for (int i = 0; i < TCP_SYNQ_MAX; i++) {
+        tcp_synq_ent_t* e = &tcp_synq[i];
+        if (e->valid && e->src_ip == src_ip && e->src_port == src_port &&
+            e->local_port == local_port)
+            return e;
+    }
+    return NULL;
+}
+
+/* A SYN arrived at a LISTEN socket: record (or refresh) the half-open in the
+ * side-table and answer with a SYN-ACK. No sock_t is consumed. */
+static void synq_on_syn(sock_t* listener, uint32_t src_ip, uint16_t src_port,
+                        uint32_t seq, uint16_t peer_wnd) {
+    /* Retransmitted SYN for an existing half-open: re-answer with the SAME
+     * ISN (the peer may have missed our first SYN-ACK). */
+    tcp_synq_ent_t* e = synq_find(src_ip, src_port, listener->local_port);
+    if (!e) {
+        /* New half-open: free slot, else evict the OLDEST (that peer simply
+         * retransmits its SYN later -- correct TCP behavior under load). */
+        tcp_synq_ent_t* oldest = &tcp_synq[0];
+        for (int i = 0; i < TCP_SYNQ_MAX; i++) {
+            if (!tcp_synq[i].valid) { e = &tcp_synq[i]; break; }
+            if (tcp_synq[i].born_ms < oldest->born_ms) oldest = &tcp_synq[i];
+        }
+        if (!e) e = oldest;
+        e->valid      = true;
+        e->src_ip     = src_ip;
+        e->src_port   = src_port;
+        e->local_port = listener->local_port;
+        e->isn        = gen_isn();
+        e->rcv_nxt    = seq + 1;          /* their SYN consumes one seq */
+        e->born_ms    = now_ms();
+        e->retries    = 0;
+    }
+    e->peer_wnd   = peer_wnd;
+    e->last_tx_ms = now_ms();
+    tcp_xmit_raw(src_ip, e->local_port, src_port, TCP_SYN | TCP_ACK,
+                 e->isn, e->rcv_nxt, TCP_SYNQ_WND);
+}
+
+/* The final handshake ACK arrived at the LISTEN socket: promote the matching
+ * half-open into a real ESTABLISHED child on the accept queue. This is the
+ * ONLY place passive open consumes a sock_t. */
+static void synq_on_ack(sock_t* listener, uint32_t src_ip, uint16_t src_port,
+                        uint32_t ack, uint16_t peer_wnd) {
+    tcp_synq_ent_t* e = synq_find(src_ip, src_port, listener->local_port);
+    if (!e) return;                              /* stray ACK: ignore       */
+    if (ack != e->isn + 1) return;               /* doesn't ack our SYN-ACK */
+
+    sock_t* base = sock_table_base();
+    if (!base) { e->valid = false; return; }
+
+    /* The backlog bounds ESTABLISHED-but-unaccepted children (half-opens no
+     * longer consume sockets, so this is now its true RFC meaning). */
+    int pending = 0;
+    for (int i = 0; i < SOCK_MAX; i++)
+        if (base[i].used && base[i].parent == listener) pending++;
+    int blcap = listener->backlog;
+    if (blcap <= 0) blcap = 1;
+    if (blcap > SOCK_MAX) blcap = SOCK_MAX;
+
+    sock_t* child = NULL;
+    int child_idx = -1;
+    if (pending < blcap) {
+        for (int i = 0; i < SOCK_MAX; i++) {
+            if (!base[i].used) { child = &base[i]; child_idx = i; break; }
+        }
+    }
+    if (!child) {
+        /* Backlog full or socket table exhausted: the peer believes it is
+         * ESTABLISHED, so an honest RST beats silently eating its data. */
+        tcp_xmit_raw(src_ip, e->local_port, src_port, TCP_RST,
+                     e->isn + 1, e->rcv_nxt, 0);
+        e->valid = false;
+        return;
+    }
+
+    memset(child, 0, sizeof(*child));
+    child->used        = true;
+    child->type        = SOCK_STREAM;
+    child->local_ip    = listener->local_ip;
+    child->local_port  = listener->local_port;
+    child->remote_ip   = src_ip;
+    child->remote_port = src_port;
+    child->parent      = listener;
+    child->owner_pid   = listener->owner_pid;
+    child->snd_wnd     = peer_wnd;
+    child->rcv_nxt     = e->rcv_nxt;
+    child->snd_una     = e->isn + 1;             /* our SYN-ACK is acked    */
+    child->snd_nxt     = e->isn + 1;
+    child->state       = TCP_ESTABLISHED;
+    child->reset       = false;
+
+    tcp_ooo[child_idx].valid  = false;
+    tcp_rt_count[child_idx]   = 0;
+    tcp_rt_rto_ms[child_idx]  = TCP_RTO_INIT_MS;
+
+    /* Accept queue (same push the old SYN_RCVD promotion used). */
+    child->accept_next      = listener->accept_queue;
+    listener->accept_queue  = child;
+
+    e->valid = false;
+}
+
+/* Locate a live listener for a side-table entry's port (NULL if it closed). */
+static sock_t* synq_listener(uint16_t local_port) {
+    sock_t* base = sock_table_base();
+    if (!base) return NULL;
+    for (int i = 0; i < SOCK_MAX; i++) {
+        if (base[i].used && base[i].type == SOCK_STREAM &&
+            base[i].state == TCP_LISTEN && base[i].local_port == local_port)
+            return &base[i];
+    }
+    return NULL;
+}
+
+/* Run the side-table timers: SYN-ACK retransmit (bounded), TTL expiry, and
+ * orphan cleanup when a listener closes. Called once per sock_poll(). */
+void tcp_synq_tick(void) {
+    uint64_t now = now_ms();
+    for (int i = 0; i < TCP_SYNQ_MAX; i++) {
+        tcp_synq_ent_t* e = &tcp_synq[i];
+        if (!e->valid) continue;
+        if (now - e->born_ms >= TCP_SYNQ_TTL_MS ||
+            e->retries >= TCP_SYNQ_MAX_RETRY ||
+            synq_listener(e->local_port) == NULL) {
+            e->valid = false;
+            continue;
+        }
+        if (now - e->last_tx_ms >= TCP_SYNQ_RETRY_MS) {
+            e->retries++;
+            e->last_tx_ms = now;
+            tcp_xmit_raw(e->src_ip, e->local_port, e->src_port,
+                         TCP_SYN | TCP_ACK, e->isn, e->rcv_nxt, TCP_SYNQ_WND);
+        }
+    }
+}
+
 /* Append in-order stream bytes into the socket RX ring. Returns the number of
  * bytes actually stored (< n if the ring filled). Callers MUST advance rcv_nxt
  * by the returned count only -- advancing by the full n would ACK bytes we
@@ -558,70 +755,16 @@ void tcp_input(uint32_t src_ip, uint32_t dst_ip,
 
     switch (s->state) {
     case TCP_LISTEN:
-        /* Server-side: handle incoming SYN for passive connection. */
+        /* NET-P1-A: passive open runs through the half-open SYN side-table.
+         * A SYN records ~32 B of state + answers SYN-ACK (NO sock_t burned);
+         * the final handshake ACK promotes the entry into an ESTABLISHED
+         * child on the accept queue -- the only point a socket is consumed.
+         * A SYN flood now exhausts a 1 KB table (evict-oldest) instead of
+         * starving every socket in the system. */
         if (flags & TCP_SYN) {
-            /* Allocate a new child socket for this connection. */
-            sock_t* base = sock_table_base();
-            if (!base) return;
-
-            /* Enforce the listener's backlog before allocating. Count children
-             * still belonging to this listener (SYN_RCVD handshakes + queued
-             * established-but-unaccepted ones; accepted children have
-             * parent==NULL). Without this a SYN flood drains the shared 16-slot
-             * socket table and starves ALL networking process-wide. Dropping
-             * the SYN here lets a legitimate peer retransmit later. */
-            int pending = 0;
-            for (int i = 0; i < SOCK_MAX; i++)
-                if (base[i].used && base[i].parent == s) pending++;
-            int blcap = s->backlog;
-            if (blcap <= 0) blcap = 1;
-            if (blcap > SOCK_MAX) blcap = SOCK_MAX;
-            if (pending >= blcap) return;  /* backlog full: drop SYN */
-
-            sock_t* child = NULL;
-            int child_idx = -1;
-            for (int i = 0; i < SOCK_MAX; i++) {
-                if (!base[i].used) {
-                    child = &base[i];
-                    child_idx = i;
-                    break;
-                }
-            }
-            if (!child) return;  /* No free sockets */
-
-            /* Initialize the child socket. */
-            memset(child, 0, sizeof(*child));
-            child->used       = true;
-            child->type       = SOCK_STREAM;
-            child->local_ip   = s->local_ip;
-            child->local_port = s->local_port;
-            child->remote_ip  = src_ip;
-            child->remote_port = src_port;
-            child->parent     = s;
-            child->snd_wnd    = net_ntohs(th->window);
-            /* BUG-FIX (socket leak): inherit the listener's owner_pid so
-             * sock_cleanup_process can reclaim this child if the owning
-             * process dies without closing its sockets. The old code left
-             * owner_pid == 0 (from memset), so process-death cleanup never
-             * found accepted children. */
-            child->owner_pid  = s->owner_pid;
-
-            /* Initialize TCP state machine. */
-            child->rcv_nxt    = seq + 1;      /* SYN consumes one seq */
-            uint32_t isn      = gen_isn();
-            child->snd_una    = isn;
-            child->snd_nxt    = isn + 1;      /* SYN-ACK will consume one seq */
-            child->state      = TCP_SYN_RCVD;
-            child->reset      = false;
-
-            /* Initialize retransmit machinery for the child. */
-            tcp_ooo[child_idx].valid = false;
-            tcp_rt_count[child_idx]  = 0;
-            tcp_rt_rto_ms[child_idx] = TCP_RTO_INIT_MS;
-
-            /* Send SYN-ACK to complete the 3-way handshake. */
-            tcp_xmit(child, TCP_SYN | TCP_ACK, isn, child->rcv_nxt, NULL, 0);
-            tcp_arm_retransmit(child, TCP_SYN | TCP_ACK, isn, NULL, 0);
+            synq_on_syn(s, src_ip, src_port, seq, net_ntohs(th->window));
+        } else if (flags & TCP_ACK) {
+            synq_on_ack(s, src_ip, src_port, ack, net_ntohs(th->window));
         }
         return;
 

@@ -385,6 +385,8 @@ int sock_poll(void) {
             tcp_tick(&g_socks[i]);
         }
     }
+    /* NET-P1-A: half-open side-table timers (SYN-ACK retransmit + expiry). */
+    tcp_synq_tick();
     return frames;
 }
 

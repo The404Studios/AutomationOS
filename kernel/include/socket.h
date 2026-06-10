@@ -201,6 +201,9 @@ void tcp_tick(sock_t* s);   /* called from sock_poll for retransmit/timers */
 /* NET-P1-A: half-open SYN side-table timers (SYN-ACK retransmit, TTL expiry,
  * orphan cleanup). Called once per sock_poll(). */
 void tcp_synq_tick(void);
+/* NET-P1-B: allocate + zero the heap-backed per-socket OOO buffers
+ * ([SOCK_MAX][4] reassembly slots). Idempotent; called from sock_init(). */
+void tcp_buffers_init(void);
 
 /* ------------------------------------------------------------------ */
 /* Public BSD-ish socket API (socket.c).                               */

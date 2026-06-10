@@ -406,6 +406,9 @@ void sock_init(void) {
     memset(g_socks, 0, sizeof(sock_t) * SOCK_MAX);
     g_inited = true;
     g_next_port = 49152;
+    /* NET-P1-B: the per-socket OOO reassembly buffers live on the heap for
+     * the same .bss/initrd reason this table does. Re-init zeroes them. */
+    tcp_buffers_init();
 }
 
 int sock_socket(int type) {

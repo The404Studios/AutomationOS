@@ -253,6 +253,60 @@ void net_testrig_selftest(void) {
                 syns, synacks, established, sockused);
     }
 
+    /* ---------------------------------------------------------------- */
+    /* NET-P1-B: 4-slot OOO reassembly. Establish a connection, deliver  */
+    /* segments #2,#3,#4 first (three gaps buffered), then #1 -- the     */
+    /* drain must hand back all 4*1460 = 5840 bytes in order.            */
+    /* ---------------------------------------------------------------- */
+    {
+        int reassembled = 0;
+        static uint8_t pat[4 * TCP_MSS];     /* per-segment byte pattern  */
+        static uint8_t got[4 * TCP_MSS];
+        for (int i = 0; i < 4 * TCP_MSS; i++)
+            pat[i] = (uint8_t)(0xA0 + (i / TCP_MSS));
+
+        int fd = -1;
+        int l = sock_socket(SOCK_STREAM);
+        if (l >= 0 && sock_bind(l, 47003) == 0 && sock_listen(l, 2) == 0) {
+            /* Handshake: SYN -> read ISN from the captured SYN-ACK -> ACK. */
+            g_cap_n = 0;
+            rig_inject_tcp(peer_ip, 41000, my_ip, 47003,
+                           7000, 0, TCP_SYN, 4096, NULL, 0);
+            if (g_cap_n >= 1) {
+                const tcp_hdr_t* th = (const tcp_hdr_t*)g_cap[0].seg;
+                uint32_t isn = net_ntohl(th->seq);
+                rig_inject_tcp(peer_ip, 41000, my_ip, 47003,
+                               7001, isn + 1, TCP_ACK, 4096, NULL, 0);
+                fd = sock_accept(l);
+            }
+        }
+        if (fd >= 0) {
+            /* Peer stream starts at seq 7001. Deliver out of order:
+             * #2, #3, #4 (all buffered as gaps), then #1 (drain-merges). */
+            uint32_t base = 7001;
+            for (int i = 1; i < 4; i++)
+                rig_inject_tcp(peer_ip, 41000, my_ip, 47003,
+                               base + (uint32_t)i * TCP_MSS, 0,
+                               TCP_ACK | TCP_PSH, 4096,
+                               pat + i * TCP_MSS, TCP_MSS);
+            rig_inject_tcp(peer_ip, 41000, my_ip, 47003,
+                           base, 0, TCP_ACK | TCP_PSH, 4096, pat, TCP_MSS);
+
+            int n;
+            while (reassembled < 4 * TCP_MSS &&
+                   (n = sock_recv(fd, got + reassembled,
+                                  (uint32_t)(4 * TCP_MSS - reassembled))) > 0)
+                reassembled += n;
+            if (reassembled == 4 * TCP_MSS &&
+                memcmp(got, pat, 4 * TCP_MSS) != 0)
+                reassembled = -1;             /* right count, wrong bytes */
+        }
+
+        sock_init();
+        kprintf("NETP1B: OOO %s slots=4 reassembled=%d\n",
+                (reassembled == 4 * TCP_MSS) ? "PASS" : "FAIL", reassembled);
+    }
+
     g_rig_active = 0;
 }
 

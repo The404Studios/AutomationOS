@@ -42,6 +42,9 @@ grep -qF "NETRIG: PASS loopback=1 cap=1" "$LOG" || P=0
 if grep -qF "NETP1A:" "$LOG"; then
     grep -qF "NETP1A: SYNQ PASS" "$LOG" || P=0
 fi
+if grep -qF "NETP1B:" "$LOG"; then
+    grep -qF "NETP1B: OOO PASS slots=4 reassembled=5840" "$LOG" || P=0
+fi
 if grep -qiE "PANIC|CPU EXCEPTION|TRIPLE FAULT" "$LOG"; then
     echo "KERNEL FAULT during boot"; P=0
 fi

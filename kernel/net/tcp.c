@@ -62,6 +62,7 @@
 #include "../include/kernel.h"
 #include "../include/string.h"
 #include "../include/drivers.h"   /* timer_get_ticks_ms */
+#include "../include/mem.h"       /* kmalloc (heap-backed OOO side-table)  */
 
 /* ------------------------------------------------------------------ */
 /* Timeouts and retransmit parameters                                  */
@@ -91,15 +92,19 @@ static inline bool SEQ32_GT(uint32_t a, uint32_t b) {
 /* Out-of-order segment side-table                                      */
 /* ------------------------------------------------------------------ */
 /*
- * sock_t has no OOO buffer.  We cannot edit socket.h, so we keep one
- * OOO slot per socket index in a static side-table.  One slot handles
- * the most common case: the server reorders or retransmits a single
- * segment.  If the integrator adds an ooo[] array to sock_t this table
- * should be dropped and sock_t's array used instead.
+ * NET-P1-B: a 4-DEEP out-of-order buffer per socket (was a single slot, so
+ * any reordering of 2+ segments stalled RX until the peer retransmitted).
+ * sock_t stays untouched; the buffer is a side-table indexed by socket slot.
  *
- * TCP_OOO_SLOTS must equal SOCK_MAX.
+ * HEAP-BACKED, not .bss: 16 sockets x 4 slots x ~1.5 KB is ~94 KB -- a
+ * static array that size risks pushing kernel .bss into the GRUB-placed
+ * initrd (the exact reason the socket table itself moved to kmalloc; see
+ * socket.c). Allocated once via tcp_buffers_init() from sock_init(). If the
+ * allocation ever fails the stack degrades CORRECTLY: OOO segments are
+ * simply dropped and the peer retransmits them in order.
  */
-#define TCP_OOO_SLOTS   SOCK_MAX      /* one entry per possible socket      */
+#define TCP_OOO_SLOTS   SOCK_MAX      /* rows: one per possible socket      */
+#define TCP_OOO_DEPTH   4             /* slots per socket (NET-P1-B)        */
 
 typedef struct {
     bool     valid;
@@ -108,7 +113,27 @@ typedef struct {
     uint8_t  data[TCP_MSS];           /* payload (capped at MSS)            */
 } tcp_ooo_slot_t;
 
-static tcp_ooo_slot_t tcp_ooo[TCP_OOO_SLOTS];
+static tcp_ooo_slot_t (*tcp_ooo)[TCP_OOO_DEPTH] = NULL;   /* [SOCK_MAX][4] */
+
+/* Allocate + zero the OOO side-table (idempotent; re-call re-zeroes). */
+void tcp_buffers_init(void) {
+    if (tcp_ooo == NULL) {
+        tcp_ooo = (tcp_ooo_slot_t(*)[TCP_OOO_DEPTH])
+            kmalloc(sizeof(tcp_ooo_slot_t) * TCP_OOO_SLOTS * TCP_OOO_DEPTH);
+        if (tcp_ooo == NULL) {
+            kprintf("[TCP] ooo buffer alloc failed: degrading to no-OOO\n");
+            return;
+        }
+    }
+    memset(tcp_ooo, 0,
+           sizeof(tcp_ooo_slot_t) * TCP_OOO_SLOTS * TCP_OOO_DEPTH);
+}
+
+/* Invalidate every OOO slot belonging to socket index `idx`. */
+static void tcp_ooo_clear(int idx) {
+    if (!tcp_ooo) return;
+    for (int k = 0; k < TCP_OOO_DEPTH; k++) tcp_ooo[idx][k].valid = false;
+}
 
 /*
  * Per-socket retransmit retry counter.  sock_t only has rt_done (bool).
@@ -377,7 +402,7 @@ static void synq_on_ack(sock_t* listener, uint32_t src_ip, uint16_t src_port,
     child->state       = TCP_ESTABLISHED;
     child->reset       = false;
 
-    tcp_ooo[child_idx].valid  = false;
+    tcp_ooo_clear(child_idx);
     tcp_rt_count[child_idx]   = 0;
     tcp_rt_rto_ms[child_idx]  = TCP_RTO_INIT_MS;
 
@@ -475,20 +500,40 @@ static uint32_t rx_ring_pop(sock_t* s, uint8_t* dst, uint32_t want) {
  * CHANGED: new function to support OOO assembly.
  */
 static void tcp_ooo_drain(sock_t* s) {
+    if (!tcp_ooo) return;
     int idx = sock_index(s);
-    tcp_ooo_slot_t* slot = &tcp_ooo[idx];
 
-    /* Keep flushing as long as the saved segment becomes in-order. */
-    while (slot->valid && slot->seq == s->rcv_nxt) {
-        /* Only consume the slot if the WHOLE segment fits. Partially pushing it
-         * and clearing the slot would drop the tail forever while advancing
-         * rcv_nxt past it (an ACK lie). If it can't fit yet, leave it valid and
-         * retry after the app drains the ring. */
-        uint16_t freeb = (uint16_t)(SOCK_RXBUF_SIZE - s->rx_used);
-        if (slot->len > freeb) break;
-        s->rcv_nxt += rx_ring_push(s, slot->data, slot->len);
-        slot->valid = false;
-        /* No more slots; a real implementation would loop over an array. */
+    /* NET-P1-B: keep sweeping the 4-slot row until a full pass makes no
+     * progress. Each pass: discard stale slots, merge the slot whose data
+     * meets rcv_nxt (trimming any duplicate prefix). */
+    bool progress = true;
+    while (progress) {
+        progress = false;
+        for (int k = 0; k < TCP_OOO_DEPTH; k++) {
+            tcp_ooo_slot_t* slot = &tcp_ooo[idx][k];
+            if (!slot->valid) continue;
+
+            uint32_t seg_end = slot->seq + slot->len;
+            if (SEQ32_GEQ(s->rcv_nxt, seg_end)) {
+                /* Entirely duplicate by now: free the slot. */
+                slot->valid = false;
+                continue;
+            }
+            if (SEQ32_GT(slot->seq, s->rcv_nxt)) continue;  /* still a gap */
+
+            /* slot->seq <= rcv_nxt < seg_end: trim any duplicate prefix. */
+            uint32_t trim = s->rcv_nxt - slot->seq;
+            uint16_t len  = (uint16_t)(slot->len - trim);
+            /* Only consume the slot if the WHOLE remainder fits. Partially
+             * pushing and clearing would drop the tail forever while
+             * advancing rcv_nxt past it (an ACK lie). Retry after the app
+             * drains the ring. */
+            uint16_t freeb = (uint16_t)(SOCK_RXBUF_SIZE - s->rx_used);
+            if (len > freeb) return;
+            s->rcv_nxt += rx_ring_push(s, slot->data + trim, len);
+            slot->valid = false;
+            progress = true;
+        }
     }
 }
 
@@ -503,9 +548,9 @@ int tcp_connect(sock_t* s, uint32_t dst_ip, uint16_t dst_port) {
     s->local_ip    = net_get_ip();
     if (s->local_port == 0) s->local_port = sock_alloc_port();
 
-    /* Initialise OOO slot and retry counters for this socket. */
+    /* Initialise OOO slots and retry counters for this socket. */
     int idx = sock_index(s);
-    tcp_ooo[idx].valid      = false;
+    tcp_ooo_clear(idx);
     tcp_rt_count[idx]       = 0;
     tcp_rt_rto_ms[idx]      = TCP_RTO_INIT_MS;
 
@@ -681,9 +726,8 @@ int tcp_recv(sock_t* s, void* buf, uint16_t len) {
 int tcp_close(sock_t* s) {
     if (s->state == TCP_CLOSED) return SOCK_OK;
 
-    /* Clear OOO side-table slot on close. */
-    int idx = sock_index(s);
-    tcp_ooo[idx].valid = false;
+    /* Clear OOO side-table slots on close. */
+    tcp_ooo_clear(sock_index(s));
 
     if (s->state == TCP_ESTABLISHED || s->state == TCP_CLOSE_WAIT) {
         uint32_t seq = s->snd_nxt;
@@ -861,19 +905,34 @@ void tcp_input(uint32_t src_ip, uint32_t dst_ip,
                 tcp_send_ack(s);
 
             } else if (SEQ32_GT(seq, s->rcv_nxt)) {
-                /* --- Out-of-order segment: save in side-table slot --- */
-                int idx = sock_index(s);
-                tcp_ooo_slot_t* slot = &tcp_ooo[idx];
-
-                /* Only save if the slot is empty or this segment is
-                 * closer to rcv_nxt (prefer earlier segments). */
-                if (!slot->valid || SEQ32_GT(slot->seq, seq)) {
-                    uint16_t save_len = payload_len;
-                    if (save_len > TCP_MSS) save_len = TCP_MSS;
-                    slot->valid = true;
-                    slot->seq   = seq;
-                    slot->len   = save_len;
-                    memcpy(slot->data, payload, save_len);
+                /* --- Out-of-order segment: save in the 4-slot row --- */
+                /* NET-P1-B: dedupe by seq, take a free slot, else evict the
+                 * slot FARTHEST from rcv_nxt if this segment is nearer
+                 * (earlier data fills the gap sooner). No buffer (alloc
+                 * failed at boot) degrades to drop + re-ACK: correct, the
+                 * peer retransmits in order. */
+                if (tcp_ooo) {
+                    int idx = sock_index(s);
+                    tcp_ooo_slot_t* dst = NULL;
+                    tcp_ooo_slot_t* far = NULL;
+                    bool dup = false;
+                    for (int k = 0; k < TCP_OOO_DEPTH; k++) {
+                        tcp_ooo_slot_t* slot = &tcp_ooo[idx][k];
+                        if (slot->valid && slot->seq == seq) { dup = true; break; }
+                        if (!slot->valid) { if (!dst) dst = slot; continue; }
+                        if (!far || SEQ32_GT(slot->seq, far->seq)) far = slot;
+                    }
+                    if (!dup) {
+                        if (!dst && far && SEQ32_GT(far->seq, seq)) dst = far;
+                        if (dst) {
+                            uint16_t save_len = payload_len;
+                            if (save_len > TCP_MSS) save_len = TCP_MSS;
+                            dst->valid = true;
+                            dst->seq   = seq;
+                            dst->len   = save_len;
+                            memcpy(dst->data, payload, save_len);
+                        }
+                    }
                 }
                 /* ACK our current position to prompt the server to
                  * fill the gap or retransmit the missing segment. */

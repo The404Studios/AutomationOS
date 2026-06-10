@@ -45,12 +45,17 @@ typedef unsigned long size_t;
 #define SIGKILL    9
 #define SIGTERM   15
 
-/* ---- tuning ---- */
+/* ---- tuning ----
+ * Sized for the SLOWEST target (the single-core 2010 T410, ~70 procs at boot):
+ * a respawned compositor there can take several seconds to reach its frame
+ * loop, so the resume window is generous -- a too-tight window prints FAIL on
+ * a recovery that was actually succeeding, and a too-tight breaker turns the
+ * second real freeze into "stays frozen forever". */
 #define POLL_MS             250   /* heartbeat sample cadence                       */
 #define STALL_MS           2500   /* counter unchanged this long => FROZEN          */
-#define RESUME_TIMEOUT_MS  5000   /* after kill, wait this long for the resume      */
-#define ATTACH_RETRIES       40   /* wait up to ~10s for init to create the segment */
-#define BREAKER_WINDOW    60000   /* circuit-breaker sliding window (ms)            */
+#define RESUME_TIMEOUT_MS 10000   /* after kill, wait this long for the resume      */
+#define ATTACH_RETRIES       80   /* wait up to ~20s for init to create the segment */
+#define BREAKER_WINDOW    90000   /* circuit-breaker sliding window (ms)            */
 #define BREAKER_MAX           3   /* > this many recoveries in the window => storm  */
 #define OVERLAY_MS         2000   /* recovery animation duration                    */
 

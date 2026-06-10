@@ -18,6 +18,7 @@
 #include "../../include/spinlock.h"
 #include "../../include/tlb.h"
 #include "../../include/perf.h"              /* rdtsc (static inline) -- the bounded selftest wait */
+#include "../../include/sched.h"             /* SMP-G2: process_t walk for tlb_pinning audit */
 
 /* ===========================================================================
  * SMP-G0 VECTOR-COLLISION CHECKS (explicit, compile-time -- never assumptions).
@@ -29,17 +30,18 @@
  * The original IPI block sat at 0x40 -- DEAD ON the AP timer gate. Any future
  * renumber that re-collides fails THIS build, not a 2 AM debug session.
  * =========================================================================== */
-_Static_assert(IPI_RESCHEDULE > 0x2F && IPI_AP_PANIC < 0xFF,
+_Static_assert(IPI_RESCHEDULE > 0x2F && IPI_TLB_FLUSH_PAGE < 0xFF,
                "IPI vector block must sit above exceptions+PIC and below spurious");
 _Static_assert(IPI_RESCHEDULE   < IPI_TLB_FLUSH     && IPI_TLB_FLUSH     < IPI_FUNCTION_CALL &&
                IPI_FUNCTION_CALL < IPI_STOP         && IPI_STOP          < IPI_TEST &&
-               IPI_TEST          < IPI_TLB_FLUSH_ALL && IPI_TLB_FLUSH_ALL < IPI_AP_PANIC,
+               IPI_TEST          < IPI_TLB_FLUSH_ALL && IPI_TLB_FLUSH_ALL < IPI_AP_PANIC &&
+               IPI_AP_PANIC      < IPI_TLB_FLUSH_PAGE,
                "IPI vectors must be strictly increasing (distinct)");
-_Static_assert(AP_LAPIC_TIMER_VECTOR < IPI_RESCHEDULE || AP_LAPIC_TIMER_VECTOR > IPI_AP_PANIC,
+_Static_assert(AP_LAPIC_TIMER_VECTOR < IPI_RESCHEDULE || AP_LAPIC_TIMER_VECTOR > IPI_TLB_FLUSH_PAGE,
                "IPI vector block collides with the CPU1 LAPIC timer vector");
-_Static_assert(LAPIC_TIMER_VECTOR < IPI_RESCHEDULE || LAPIC_TIMER_VECTOR > IPI_AP_PANIC,
+_Static_assert(LAPIC_TIMER_VECTOR < IPI_RESCHEDULE || LAPIC_TIMER_VECTOR > IPI_TLB_FLUSH_PAGE,
                "IPI vector block collides with the default LAPIC timer vector");
-_Static_assert(SPURIOUS_VECTOR < IPI_RESCHEDULE || SPURIOUS_VECTOR > IPI_AP_PANIC,
+_Static_assert(SPURIOUS_VECTOR < IPI_RESCHEDULE || SPURIOUS_VECTOR > IPI_TLB_FLUSH_PAGE,
                "IPI vector block collides with the LAPIC spurious vector");
 
 /* ===========================================================================
@@ -130,6 +132,18 @@ static volatile uint32_t tlb_flush_all_count = 0;
 static volatile uint32_t tlb_flush_ack_count = 0;
 static spinlock_t tlb_flush_lock;
 
+/* SMP-G2 shootdown state (the machinery itself lives lower in this file;
+ * the state sits here, in the packed low .bss with the rest of the IPI
+ * data, because the 0x57 handler reads it under arbitrary CR3 -- law 15). */
+#define TLBSHOOT_MAX_PAGES   64        /* > this (or 0) -> full-flush fallback */
+#define TLBSHOOT_WAIT_US     50000ULL  /* 50 ms TSC-bounded ack wait */
+static volatile uint64_t tlbshoot_addr   = 0;   /* request block: page-aligned VA */
+static volatile uint64_t tlbshoot_npages = 0;   /* request block: page count      */
+static volatile uint32_t tlbshoot_ack    = 0;   /* remote handler increments      */
+static spinlock_t        tlbshoot_lock;         /* dedicated in-flight serializer */
+volatile uint32_t g_tlb_invariant_violations = 0;
+void tlb_invariant_violation(const char* what);
+
 // Initialize IPI subsystem. BSP context, after lapic_init(), BEFORE
 // try_start_cpu1() -- the IDT is shared, so the gates must exist before CPU1
 // is alive enough to ever receive one of these vectors.
@@ -144,6 +158,7 @@ void ipi_init(void) {
     }
 
     spin_lock_init(&tlb_flush_lock);
+    spin_lock_init(&tlbshoot_lock);          /* SMP-G2 shootdown serializer */
 
     // We run on the BSP here: capture its hardware APIC id for cpu_to_apic_id.
     ipi_bsp_apic_id = lapic_get_id();
@@ -155,6 +170,7 @@ void ipi_init(void) {
     extern void ipi_function_call_handler(void);
     extern void ipi_stop_handler(void);
     extern void ipi_tlb_flush_all_handler(void);
+    extern void ipi_tlb_flush_page_handler(void);
     extern void idt_set_gate(uint8_t num, uint64_t handler, uint16_t selector, uint8_t flags);
     extern int  idt_gate_present(uint8_t num);
 
@@ -164,7 +180,7 @@ void ipi_init(void) {
     // the original 0x40 block would have killed CPU1's timer.
     static const uint8_t ipi_vectors[] = {
         IPI_RESCHEDULE, IPI_TLB_FLUSH, IPI_FUNCTION_CALL,
-        IPI_STOP, IPI_TLB_FLUSH_ALL
+        IPI_STOP, IPI_TLB_FLUSH_ALL, IPI_TLB_FLUSH_PAGE
     };
     for (uint32_t i = 0; i < sizeof(ipi_vectors); i++) {
         if (idt_gate_present(ipi_vectors[i])) {
@@ -180,10 +196,11 @@ void ipi_init(void) {
     idt_set_gate(IPI_FUNCTION_CALL, (uint64_t)ipi_function_call_handler, 0x08, 0x8E);
     idt_set_gate(IPI_STOP, (uint64_t)ipi_stop_handler, 0x08, 0x8E);
     idt_set_gate(IPI_TLB_FLUSH_ALL, (uint64_t)ipi_tlb_flush_all_handler, 0x08, 0x8E);
+    idt_set_gate(IPI_TLB_FLUSH_PAGE, (uint64_t)ipi_tlb_flush_page_handler, 0x08, 0x8E);
 
     ipi_ready = 1;
     kprintf("[IPI] IPI handlers registered in IDT (vectors 0x%x-0x%x, bsp_apic=%u)\n",
-            IPI_RESCHEDULE, IPI_TLB_FLUSH_ALL, ipi_bsp_apic_id);
+            IPI_RESCHEDULE, IPI_TLB_FLUSH_PAGE, ipi_bsp_apic_id);
     kprintf("[IPI] IPI subsystem initialized\n");
 }
 
@@ -262,10 +279,23 @@ void ipi_tlb_flush_all(void) {
     // Send IPI to all other CPUs
     ipi_send_all_but_self(IPI_TLB_FLUSH);
 
-    // Wait for all CPUs to acknowledge
-    while (__atomic_load_n(&tlb_flush_ack_count, __ATOMIC_ACQUIRE) <
-           tlb_flush_all_count) {
-        __asm__ volatile("pause");
+    // Wait for all CPUs to acknowledge. SMP-G2 / LAW 16: the original wait
+    // here was UNBOUNDED (a dead/parked CPU = permanent hang). TSC-bounded;
+    // a timeout is a loud TLB_INVARIANT violation, never a hang. NOTE
+    // tlb_flush_lock is the shootdown's own dedicated serializer -- holding
+    // it across the wait is the design; law 16 forbids waiting under
+    // SCHEDULER/RQ/HEAP/FS locks, which this path must never be called with.
+    {
+        extern void tlb_invariant_violation(const char* what);
+        uint64_t s = rdtsc();
+        while (__atomic_load_n(&tlb_flush_ack_count, __ATOMIC_ACQUIRE) <
+               tlb_flush_all_count) {
+            if ((rdtsc() - s) >= 50000ULL * 3000ULL) {   /* 50 ms */
+                tlb_invariant_violation("ipi_tlb_flush_all ack timeout");
+                break;
+            }
+            __asm__ volatile("pause");
+        }
     }
 
     spin_unlock(&tlb_flush_lock);
@@ -501,13 +531,19 @@ void ipi_handle_reschedule(void) {
     lapic_eoi();
 }
 
-// IPI handler: TLB flush (redirects to lazy TLB subsystem)
+// IPI handler: TLB flush
 void ipi_handle_tlb_flush(void) {
     uint32_t cpu = cpu_id();
     ipi_stats[cpu].tlb_flush_received++;
 
-    // Use lazy TLB flush handler (flushes pending TLB entries)
-    tlb_handle_ipi_flush();
+    // SMP-G2 FALSE-ACK FIX: the linked TLB layer is tlb_uni.c, whose
+    // tlb_handle_ipi_flush() is a single-CPU NO-OP ("no IPIs on a single
+    // CPU") -- the original code here would have ACKED WITHOUT FLUSHING,
+    // the worst possible shootdown bug (the sender believes the remote TLB
+    // is clean). Full local flush (CR3 reload) is always correct; precision
+    // is IPI_TLB_FLUSH_PAGE's job. The lazy tlb.c layer replaces this when
+    // it is actually compiled (a later brick).
+    write_cr3(read_cr3());
 
     // Acknowledge (for old-style synchronous flush API compatibility)
     __atomic_add_fetch(&tlb_flush_ack_count, 1, __ATOMIC_RELEASE);
@@ -521,8 +557,9 @@ void ipi_handle_tlb_flush_all(void) {
     uint32_t cpu = cpu_id();
     ipi_stats[cpu].tlb_flush_received++;
 
-    // Flush ALL PCIDs unconditionally (bypass lazy state)
-    tlb_handle_ipi_flush_all_contexts();
+    // tlb_uni.c's tlb_handle_ipi_flush_all_contexts is the same NO-OP class
+    // (see the FALSE-ACK FIX above); flush ALL contexts locally for real.
+    tlb_flush_all_contexts_local();
 
     // Acknowledge for synchronous wait
     __atomic_add_fetch(&tlb_flush_ack_count, 1, __ATOMIC_RELEASE);
@@ -619,6 +656,213 @@ void ipi_link_selftest(void) {
         kprintf("IPILINK: FAIL ipi_resched=%d cpu1_count=%lu (rx %lu -> %lu)\n",
                 sent, (unsigned long)(rx_now - rx_before),
                 (unsigned long)rx_before, (unsigned long)rx_now);
+    }
+}
+
+/* ===========================================================================
+ * SMP-G2 TLBSHOOT-MIN -- bounded, ack-counted KERNEL-range shootdown.
+ * ===========================================================================
+ * THE PIN/NO-MIGRATION ASSUMPTION (LOUD, load-bearing -- read before G3+):
+ *
+ *   EVERY task in this kernel runs on exactly ONE cpu, forever. process_create
+ *   and thread_create default allowed_cpus to CPU0-only (F3-2); the only CPU1
+ *   residents are explicitly pinned there (pinned_cpu=1, mask=CPU1-only); fork
+ *   inherits nothing (CPU0 default); there is NO migration primitive.
+ *
+ *   THEREFORE a USER address space is only ever loaded on its task's one CPU,
+ *   and a user-mapping change needs ONLY a local invlpg on that CPU -- no
+ *   cross-CPU shootdown exists for user ranges, BY CONSTRUCTION. The
+ *   tlb_pinning_audit() below is the runtime gate on that construction: if a
+ *   future brick widens any task's mask past one CPU, the audit FAILS the
+ *   smoke and forces the general per-mm shootdown work BEFORE the assumption
+ *   silently rots.
+ *
+ *   KERNEL/global mappings are the opposite: shared into every CR3, cached by
+ *   every core's TLB, so a kernel-mapping change DOES need the cross-CPU flush
+ *   below. That asymmetry -- user=local, kernel=cross -- is the entire G2
+ *   model.
+ *
+ * LAW 16 (the lock law): the ack wait runs ONLY from lock-free context --
+ * never under scheduler/rq/heap/fs locks. Enforced here by (a) an IF==1
+ * entry check (necessary-not-sufficient: plain spin_lock doesn't cli, so
+ * call-site review still matters), and (b) the TSC-bounded wait (a deadlock
+ * degrades to a loud timeout, never a hang). tlbshoot_lock is the
+ * shootdown's own dedicated serializer; holding IT across the wait is the
+ * design.
+ *
+ * (State -- the request block, lock, and violation counter -- is defined up
+ * top with the rest of the IPI .bss; constants TLBSHOOT_MAX_PAGES /
+ * TLBSHOOT_WAIT_US likewise.)
+ * =========================================================================== */
+
+/* TLB_INVARIANT validator: LOG+COUNT, never panic (the F3-0 validator
+ * discipline -- a false positive must not brick boot). */
+void tlb_invariant_violation(const char* what) {
+    g_tlb_invariant_violations++;
+    kprintf("[TLB_INVARIANT] VIOLATION: %s (count=%u)\n",
+            what, g_tlb_invariant_violations);
+}
+
+/* IPI handler: bounded kernel-range invlpg (the stash-mined SMP-R0 harvest,
+ * now live at vector 0x57). Runs on the TARGET cpu under WHATEVER CR3 it
+ * holds -- safe because the flushed range is a KERNEL range, present in every
+ * address space (and invlpg of a non-cached VA is a no-op). Full CR3 reload
+ * fallback for oversized/zero requests is always correct. */
+void ipi_handle_tlb_flush_page(void) {
+    uint32_t cpu = cpu_id();
+    ipi_stats[cpu].tlb_flush_received++;
+
+    uint64_t va = tlbshoot_addr;
+    uint64_t n  = tlbshoot_npages;
+    if (n == 0 || n > TLBSHOOT_MAX_PAGES) {
+        write_cr3(read_cr3());                 /* full flush -- always correct */
+    } else {
+        for (uint64_t i = 0; i < n; i++) {
+            __asm__ volatile("invlpg (%0)"
+                             :: "r"((void*)(va + i * 4096ULL)) : "memory");
+        }
+    }
+
+    __atomic_add_fetch(&tlbshoot_ack, 1, __ATOMIC_RELEASE);
+    lapic_eoi();
+}
+
+/* Flush a KERNEL-range mapping change everywhere it can be cached: local
+ * invlpg + a bounded, ack-counted IPI_TLB_FLUSH_PAGE to CPU1. Returns 0 on
+ * full success, -1 if the remote side could not be confirmed (timeout /
+ * law-16 refusal) -- the LOCAL flush always happens regardless.
+ * Call from lock-free, IF=1 context ONLY (law 16). */
+int ipi_tlb_flush_kernel_range(void* addr, uint64_t npages) {
+    uint64_t va = (uint64_t)addr & ~0xFFFULL;
+
+    /* 1. LOCAL flush first -- unconditional, bounded, always correct. */
+    if (npages == 0 || npages > TLBSHOOT_MAX_PAGES) {
+        write_cr3(read_cr3());
+    } else {
+        for (uint64_t i = 0; i < npages; i++) {
+            __asm__ volatile("invlpg (%0)"
+                             :: "r"((void*)(va + i * 4096ULL)) : "memory");
+        }
+    }
+
+    /* 2. Remote flush only when a remote actually exists and IPIs are armed.
+     * G2 model: kernel-mapping mutation is a BSP activity (CPU1 runs pinned
+     * workloads); a CPU1 caller would need the mirror-image send. */
+    if (!ipi_ready || !cpu1_is_online() || cpu_id() != 0) {
+        return 0;
+    }
+
+    /* 3. LAW 16 entry check: an ack wait with IF=0 can deadlock (the IPI we
+     * are about to wait on may be blocked behind US). Refuse the wait; the
+     * local flush stands, the violation is loud, the caller learns. */
+    uint64_t rf;
+    __asm__ volatile("pushfq; pop %0" : "=r"(rf));
+    if (!(rf & 0x200)) {
+        tlb_invariant_violation("kernel-range shootdown ack wait entered with IF=0 (law 16)");
+        return -1;
+    }
+
+    /* 4. Serialize the single in-flight request block, publish, kick, wait
+     * BOUNDED. Spinners on tlbshoot_lock also hold no other locks (law 16
+     * call-site contract), so the serializer cannot invert anything. */
+    spin_lock(&tlbshoot_lock);
+    tlbshoot_addr   = va;
+    tlbshoot_npages = npages;
+    __atomic_store_n(&tlbshoot_ack, 0, __ATOMIC_RELEASE);
+
+    ipi_send(1, IPI_TLB_FLUSH_PAGE);
+
+    int rc = 0;
+    uint64_t s = rdtsc();
+    while (__atomic_load_n(&tlbshoot_ack, __ATOMIC_ACQUIRE) == 0) {
+        if ((rdtsc() - s) >= TLBSHOOT_WAIT_US * 3000ULL) {
+            tlb_invariant_violation("kernel-range shootdown ack timeout (lost ack)");
+            rc = -1;
+            break;
+        }
+        __asm__ volatile("pause" ::: "memory");
+    }
+    if (rc == 0 &&
+        __atomic_load_n(&tlbshoot_ack, __ATOMIC_ACQUIRE) > 1) {
+        tlb_invariant_violation("kernel-range shootdown ack overrun (>1 acker, 2-cpu system)");
+        rc = -1;
+    }
+    spin_unlock(&tlbshoot_lock);
+    return rc;
+}
+
+/* ===========================================================================
+ * SMP-G2 acceptance: tlb_shootdown_selftest() -- BSP context, CPU1 online.
+ * Drives ONE real kernel-range shootdown end to end and prints the gate:
+ *   TLBSHOOT: PASS kernel_flush=1 acked=1 bounded=1 invariant=1
+ * then audits the pin model and prints the negative proof:
+ *   TLBSHOOT_NEG: PASS no_user_crossflush_needed_under_pinning=1
+ * =========================================================================== */
+static uint8_t tlbshoot_testpage[4096] __attribute__((aligned(4096)));
+
+void tlb_shootdown_selftest(void) {
+    if (!ipi_ready || !cpu1_is_online()) {
+        kprintf("TLBSHOOT: SKIP (cpu1 offline or IPI disarmed)\n");
+        return;
+    }
+
+    /* The boot path may run cli'd here; the law-16 check would (correctly)
+     * refuse the wait. The selftest's job is to prove the SHOOTDOWN, so give
+     * it the legal context it demands and restore the caller's IF after. */
+    uint64_t rf;
+    __asm__ volatile("pushfq; pop %0" : "=r"(rf));
+    if (!(rf & 0x200)) __asm__ volatile("sti");
+
+    uint32_t v0  = g_tlb_invariant_violations;
+    uint64_t rx0 = __atomic_load_n(&ipi_stats[1].tlb_flush_received, __ATOMIC_ACQUIRE);
+
+    uint64_t t0 = rdtsc();
+    int rc = ipi_tlb_flush_kernel_range(tlbshoot_testpage, 1);
+    uint64_t us = (rdtsc() - t0) / 3000ULL;
+
+    uint64_t rx1 = __atomic_load_n(&ipi_stats[1].tlb_flush_received, __ATOMIC_ACQUIRE);
+
+    int kernel_flush = (rc == 0);
+    int acked        = (rx1 == rx0 + 1);           /* CPU1's handler really ran */
+    int bounded      = (us < TLBSHOOT_WAIT_US);    /* well under the 50 ms cap  */
+    int invariant    = (g_tlb_invariant_violations == v0);
+
+    if (!(rf & 0x200)) __asm__ volatile("cli");
+
+    kprintf("TLBSHOOT: %s kernel_flush=%d acked=%d bounded=%d invariant=%d (latency_us=%lu)\n",
+            (kernel_flush && acked && bounded && invariant) ? "PASS" : "FAIL",
+            kernel_flush, acked, bounded, invariant, (unsigned long)us);
+
+    /* -------- the negative proof: the pin model makes user cross-flush
+     * unnecessary. Walk every live process; ANY multi-CPU affinity mask
+     * breaks the assumption and FAILS this gate (the loud forcing function
+     * for the future per-mm shootdown work). Ctor defaults keep later
+     * spawns single-CPU (F3-2: process_create/thread_create set CPU0-only;
+     * fork inherits nothing). 256 == process.c's MAX_PROCESSES. -------- */
+    {
+        /* process_get_by_pid / process_unref come from sched.h (included). */
+        int checked = 0, multi = 0;
+        for (uint32_t pid = 1; pid < 256; pid++) {
+            process_t* p = process_get_by_pid(pid);
+            if (!p) continue;
+            checked++;
+            uint64_t m = p->allowed_cpus;
+            /* manual popcount: freestanding -O0 turns the builtin into a
+             * libgcc __popcountdi2 call, which is not linked */
+            int bits = 0;
+            for (uint64_t mm = m; mm; mm &= (mm - 1)) bits++;
+            if (bits > 1) {
+                multi++;
+                kprintf("[TLB_INVARIANT] pin audit: pid=%d '%s' has MULTI-CPU "
+                        "mask 0x%llx -- user cross-flush now REQUIRED\n",
+                        p->pid, p->name, (unsigned long long)m);
+            }
+            process_unref(p);
+        }
+        kprintf("TLBSHOOT_NEG: %s no_user_crossflush_needed_under_pinning=%d "
+                "(procs_checked=%d multi_cpu_masks=%d)\n",
+                (multi == 0 && checked > 0) ? "PASS" : "FAIL",
+                (multi == 0 && checked > 0) ? 1 : 0, checked, multi);
     }
 }
 

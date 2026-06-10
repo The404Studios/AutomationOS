@@ -108,6 +108,9 @@
 #define IPI_TEST                0x54  // Test IPI
 #define IPI_TLB_FLUSH_ALL       0x55  // TLB flush all contexts (PCID recycle)
 #define IPI_AP_PANIC            0x56  // AP panic notification
+#define IPI_TLB_FLUSH_PAGE      0x57  // SMP-G2: bounded kernel-range invlpg shootdown
+                                      // (the stash-mined SMP-R0 harvest, renumbered
+                                      // from its pre-G0 0x47 into this block)
 
 // LAPIC initialization
 void lapic_init(void);

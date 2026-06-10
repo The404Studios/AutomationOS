@@ -1320,6 +1320,16 @@ void kernel_main(void* raw_info) {
                                 extern void ipiwake_ping_selftest(void);
                                 ipiwake_ping_selftest();
                             }
+                            /* SMP-G2: one real kernel-range shootdown end to
+                             * end (local invlpg + acked IPI_TLB_FLUSH_PAGE to
+                             * the still-idle CPU1) + the pin-model audit that
+                             * proves user ranges need no cross-flush. Same
+                             * window as the pings: CPU1 hlt-parked, BSP
+                             * serial-safe. */
+                            {
+                                extern void tlb_shootdown_selftest(void);
+                                tlb_shootdown_selftest();
+                            }
 #endif
                             /* Brick F2: pin ONE ring-0 kernel test thread to CPU1.
                              * CPU1's ap_scheduler_loop context-switches into it on

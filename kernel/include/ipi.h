@@ -81,6 +81,16 @@ void ipi_handle_reschedule(void);
 void ipi_handle_tlb_flush(void);
 void ipi_handle_function_call(void);
 void ipi_handle_stop(void);
+void ipi_handle_tlb_flush_page(void);   // SMP-G2: bounded kernel-range invlpg
+
+// SMP-G2 TLBSHOOT-MIN: bounded, ack-counted KERNEL-range shootdown (local
+// invlpg + IPI_TLB_FLUSH_PAGE to CPU1). User ranges need only a LOCAL invlpg
+// under the pin/no-migration model -- see the loud assumption block in ipi.c.
+// Call from lock-free, IF=1 context ONLY (law 16). Returns 0 = remote
+// confirmed, -1 = remote unconfirmed (timeout/refusal; local flush done).
+int ipi_tlb_flush_kernel_range(void* addr, uint64_t npages);
+void tlb_shootdown_selftest(void);      // prints TLBSHOOT + TLBSHOOT_NEG gates
+extern volatile uint32_t g_tlb_invariant_violations;
 
 // IPI statistics
 typedef struct {

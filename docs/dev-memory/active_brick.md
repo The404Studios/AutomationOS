@@ -2,20 +2,29 @@
 
 > Warm memory. Refresh per checkpoint. One active brick at a time.
 
-## SMP-G1 IPI-WAKE — OPEN (branch `brick/smp-g1-ipi-wake`, off frozen `brick/smp-g0-ipi-link`) — CPU1 wakes from IPI instead of tick polling
-- **user verdict opening it:** "the first brick that can actually make CPU1 responsiveness FASTER
-  instead of merely proven."
-- **user-set scope:** IPI handler sets per-CPU need_resched · enqueue-to-idle-CPU sends IPI ·
-  close the lost-wakeup race (`cli` → check runqueue/need_resched → `sti; hlt`) · CPU1 wakes from
-  IPI instead of waiting for tick polling.
-- **acceptance (user-set):** `IPIWAKE: PASS enqueue_to_cpu1=1 first_instruction_lt_1ms=1
-  no_lost_wake=1`.
-- **HARD NO's (user-set):** no TLB shootdown · no desktop split · no global PREEMPT · no work
-  stealing · no broad scheduler rewrite.
-- **context:** the G0 handler seam is in place (ipi_handle_reschedule counts + EOIs, schedule()
-  deliberately TODO); CPU1's LAPIC timer (100 Hz = 10 ms worst-case wake) is the latency being
-  killed; the F3-5 `sti; hlt` park in ap_scheduler_loop is where the race closes (law 12: the
-  sti shadow covers the hlt, so an IPI pending from the cli'd check window still wakes it).
+## SMP-G1 IPI-WAKE — LANDED (commit `e30d2fd`, branch `brick/smp-g1-ipi-wake`, awaiting review/push) — CPU1 wakes from IPI, 10 ms tick floor → 143 µs
+- **THE EXACT ACCEPTANCE HIT (first boot):** `IPIWAKE: PASS enqueue_to_cpu1=1
+  first_instruction_lt_1ms=1 no_lost_wake=1` — ping ladder acks=32/32 max=143 µs (vs the
+  10,000 µs tick floor this brick kills); the REAL cpu1hello enqueue rode the new IPI kick,
+  enqueue→first-dispatch 280 µs end-to-end; IPILINK + the whole F3-5 ladder still green, 0
+  invariant, 0 panic. Record: [`bricks/SMP-G1.md`](bricks/SMP-G1.md) · proof
+  `scripts/ipiwake_smoke.sh`.
+- **the wake path (all #ifdef SMP_IPI):** handler sets `ipi_need_resched[cpu]` (its ONLY
+  scheduling action) · `scheduler_add_process_to_cpu` kicks the target with IPI_RESCHEDULE
+  after the rq_lock drops (real foreign enqueues only) · `ap_scheduler_loop` closes the
+  LOST-WAKEUP race: `cli` → check rq/need_resched (handler can't interleave) → `sti; hlt`
+  (law 12's sti shadow delivers a pending IPI at the hlt boundary — nothing slips the gap).
+- **proof design:** the pings run in the ONE window where CPU1 is genuinely hlt-parked on an
+  empty rq (post `scheduler_init_secondary_cpu`, pre kthread spawn); ticks CANNOT ack (only the
+  IPI handler sets the flag) so 32/32 sub-ms acks = IPI wakes, not tick rescues.
+- **THE GATE WORKED ON ITS AUTHOR:** the g_g1_* proof globals first lived in scheduler.c →
+  landed 0x23c000 → the smoke's nm gate FAILED the build (law 15: they're read from CPU1
+  contexts that can hold a user CR3 — the AP dying path runs ap_cooperative_schedule under the
+  dead task's address space). Moved to ipi.c's low .bss (0x19bf60+).
+- **byte-identity (laws 2/8):** default `6f99ed9f` + F3-5 SMP `ad072cc6` hash-equal with all G1
+  code in tree (every change #ifdef SMP_IPI, including the `enqueued` local).
+- **boundary held:** no TLB shootdown · no desktop split · no global PREEMPT · no stealing · no
+  broad rewrite (loop diff = the cli/check/sti;hlt pattern + proof plumbing).
 - **next after:** G2/G3 (TLB shootdown family — the stash-mined ipi_tlb_flush_page_handler asm).
 
 ## SMP-G0 IPI-LINK — FROZEN / COMPLETE (pushed `609d704`, ls-remote verified; user: "That is a clean brick... exactly why G0 had to exist before G1") — BSP interrupts CPU1, CPU1 handles it safely

@@ -2,6 +2,25 @@
 
 > Warm memory. Refresh per checkpoint. One active brick at a time.
 
+## SMP-R0 — LANDED (commits `2bfeecc` + `67422d0` local on `brick/smp-r0`, awaiting review/push) — F3-4 recovered + the SMP build links again
+- **record:** [`bricks/SMP-R0.md`](bricks/SMP-R0.md) · branch off `brick/net-p1-0` (8b446aa).
+- **F3-4 recovered:** cherry-pick `faf7444` (never merge), adapted to this tree's INLINED
+  process_get_current — per-CPU routing only under SMP_SCHED_DISPATCH, default keeps the single-MOV
+  hot path. **PROOF: `cpu1_smoke.sh` PASS — Brick F2 VERIFY delta=8,063,148 + `APCURRENT: PASS` +
+  0 invariant + 0 panic** (the AP per-cpu "current" boundary, live on CPU1).
+- **EN-ROUTE FIND: every SMP=1 build link-broken since `c70ee87`** (June 8: panic.c gained an
+  ipi_stop_all_cpus call under bare SMP_FOUNDATION; no ipi*.c is compiled; quick_build exits 0 on
+  link failure — grep logs, never trust rc). Fixed: gate on SMP_FOUNDATION && **SMP_IPI** (G0 defines
+  it when ipi.c actually links).
+- **stash@{0} MINED (archive, never pop):** futex = fully landed; HEAD's ipi.c supersedes; harvest
+  items recorded → ipi_tlb_flush_page_handler asm (for G2/G3) + the optimised SYSCALL_BODY
+  (callee-saved-skip; optional perf brick).
+- **smp_smoke drift:** foundation substantively GREEN (CPU1 up, dual-CPU matmul verify OK 1.94×)
+  but the script grades SMP_SCHED-only markers its own SMP=1 build can never print → folded into
+  SMOKE-PROFILE-0.
+- **next:** SMP-F3-5 `cpu1hello` (first ring-3 on CPU1; exit-path AP audit + running-ref unref fix
+  land WITH it per faf7444's verifier-mandated split) → SMP-G0 IPI-LINK.
+
 ## NET-P1-0 — FROZEN / COMPLETE (pushed `e00ee9d`, ls-remote verified) — track 1 of the roadmap, QEMU side done
 - **user verdict:** "a major milestone... it did exactly what the rig was supposed to do — catch real
   stack violations before hardware day." The 5 smoke mismatches confirmed NOT a blocker (all NET-P1

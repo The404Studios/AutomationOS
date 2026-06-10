@@ -61,6 +61,10 @@ _Static_assert(sizeof(uapi_net_info_t) == NET_INFO_ABI_SIZE,
 #define NET_CONFIG_FLAG_UP     (1u << 0)
 #define NET_CONFIG_FLAG_DOWN   (1u << 1)
 #define NET_CONFIG_FLAG_DHCP   (1u << 2)
+/* E1000-PCH-0B: trigger a DEFERRED NIC bring-up (the T410 82577LM defers its
+ * ME-shared-MDIO init out of boot; this completes it post-desktop). Works
+ * while net is DOWN; clean ENOTSUP no-op when nothing was deferred. */
+#define NET_CONFIG_FLAG_NIC_BRINGUP (1u << 3)
 
 typedef struct {
     char     ifname[16];        /* target interface name               */

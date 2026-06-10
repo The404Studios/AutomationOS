@@ -124,7 +124,6 @@ int64_t sys_net_config(uint64_t req_ptr, uint64_t a2, uint64_t a3,
                        uint64_t a4, uint64_t a5, uint64_t a6) {
     (void)a2; (void)a3; (void)a4; (void)a5; (void)a6;
 
-    if (!net_up()) return ENOTSUP;
     if (req_ptr == 0) return EINVAL;
 
     uapi_net_config_t req;
@@ -133,6 +132,21 @@ int64_t sys_net_config(uint64_t req_ptr, uint64_t a2, uint64_t a3,
 
     /* Ensure ifname is NUL-terminated. */
     req.ifname[NETIF_NAME_MAX - 1] = '\0';
+
+    /* E1000-PCH-0B: the deferred-NIC trigger MUST work while net is DOWN --
+     * that is its whole point (the T410's PCH NIC defers its risky bring-up
+     * out of boot; nicup invokes it from the running desktop). On a machine
+     * with nothing deferred (QEMU classic NIC already up, or no NIC) this is
+     * a clean diagnostic no-op. */
+    if (req.flags & NET_CONFIG_FLAG_NIC_BRINGUP) {
+        extern int net_attach_late(void);
+        int r = net_attach_late();
+        if (r != 0) return (r == -2) ? ENOTSUP : EIO;
+        /* fall through: the rest of the request (IP/flags) applies to the
+         * freshly registered interface. */
+    }
+
+    if (!net_up()) return ENOTSUP;
 
     netif_t* nif = netif_get(req.ifname);
     if (!nif) {

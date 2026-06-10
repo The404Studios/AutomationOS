@@ -119,6 +119,16 @@ int  e1000_init(void);
  */
 bool e1000_present(void);
 
+/*
+ * e1000_pch_deferred_bringup() -- E1000-PCH-0B: complete the risky half of a
+ * PCH (82577LM-class) bring-up that e1000_init() deferred at boot (CTRL_RST
+ * under SWFLAG, PHY MDIO dance, DMA rings). Invoked post-desktop via the
+ * SYS_NET_CONFIG NIC_BRINGUP flag (the nicup tool); re-runnable -- every
+ * abort leaves the NIC link-down and the machine healthy.
+ * Returns 0 = NIC up, -1 = aborted (retry later), -2 = nothing deferred.
+ */
+int  e1000_pch_deferred_bringup(void);
+
 /* ------------------------------------------------------------------ */
 /* MAC address                                                         */
 /* ------------------------------------------------------------------ */

@@ -297,6 +297,9 @@ $LD /tmp/libtest.o /tmp/json.o /tmp/dhcp.o \
 cc userspace/apps/dhcpc/dhcpc.c /tmp/dhcpc.o; $LD /tmp/crt0.o /tmp/dhcpc.o /tmp/dhcp.o -o /tmp/dhcpc.elf
 # autodhcp: auto-DHCP on boot -- sleeps 2s, checks link, runs DHCP if up.
 cc userspace/apps/autodhcp/autodhcp.c /tmp/autodhcp.o; $LD /tmp/crt0.o /tmp/autodhcp.o /tmp/dhcp.o -o /tmp/autodhcp.elf
+# nicup: E1000-PCH-0B post-desktop trigger for the deferred T410 NIC bring-up.
+# Clean no-op on QEMU/non-PCH machines; tiny, shipped always.
+cc userspace/apps/nicup/nicup.c /tmp/nicup.o; $LD /tmp/crt0.o /tmp/nicup.o -o /tmp/nicup.elf
 # apidemo: fetch http(s) URL + pretty-print JSON (crt0+main; HTTPS + json).
 cc userspace/apps/apidemo/apidemo.c /tmp/apidemo.o; $LD /tmp/crt0.o /tmp/apidemo.o /tmp/json.o $HTTPS_OBJS -o /tmp/apidemo.elf
 
@@ -621,6 +624,8 @@ cp /tmp/nettest.elf /tmp/ird/sbin/nettest
 cp /tmp/sockettest.elf /tmp/ird/sbin/sockettest
 # autodhcp -> /sbin (init spawns it at boot; sleeps 2s, checks link, auto-DHCP if up).
 cp /tmp/autodhcp.elf /tmp/ird/sbin/autodhcp
+# nicup -> /bin (operator-run trigger for the deferred PCH NIC bring-up; QEMU no-op).
+cp /tmp/nicup.elf /tmp/ird/bin/nicup
 # cpu1offload -> /sbin (init spawns it at boot; prints PASS on SMP, SKIP on default).
 cp /tmp/cpu1offload.elf /tmp/ird/sbin/cpu1offload
 # smpstress -> /sbin (init spawns it; PASS on SMP after thousands of CPU1 jobs, SKIP on default).

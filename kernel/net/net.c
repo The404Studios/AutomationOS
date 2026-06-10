@@ -764,6 +764,55 @@ int net_init(void) {
     return 0;
 }
 
+/*
+ * E1000-PCH-0B: attach the network stack to a NIC that came up AFTER boot.
+ *
+ * The T410's 82577LM defers its risky ME-shared-MDIO bring-up out of boot
+ * (E1000-PCH-0A); when the operator triggers it (nicup -> SYS_NET_CONFIG
+ * NIC_BRINGUP) this completes the stack side: backend selection, MAC, the
+ * static fallback config, routes, and the eth0 netif registration that
+ * net_init() does on the boot path. NO ARP settle loop here -- the caller
+ * runs post-desktop and dhcpc/ping perform their own capped resolves.
+ * Idempotent: returns 0 if the stack is already up.
+ */
+int net_attach_late(void) {
+    if (net.up) return 0;
+
+    extern int e1000_pch_deferred_bringup(void);
+    int r = e1000_pch_deferred_bringup();
+    if (r != 0) return r;                    /* -1 aborted / -2 not deferred */
+    if (e1000_get_mac(net.mac) != 0) return -1;
+    g_nic = NIC_E1000;
+
+    /* Static fallback config (a real LAN replaces this via dhcpc ->
+     * SYS_NET_CONFIG immediately after). */
+    net.ip      = NET_QEMU_GUEST;
+    net.gateway = NET_QEMU_GATEWAY;
+    net.up      = true;
+
+    extern void route_init(void);
+    route_init();
+
+    {
+        netif_t eth0;
+        memset(&eth0, 0, sizeof(eth0));
+        memcpy(eth0.name, "eth0", 5);
+        memcpy(eth0.mac, net.mac, ETH_ALEN);
+        eth0.ip      = net.ip;
+        eth0.netmask = 0xFFFFFF00u;
+        eth0.gateway = net.gateway;
+        eth0.dns     = NET_QEMU_DNS;
+        eth0.up      = true;
+        eth0.tx      = e1000_tx;
+        eth0.rx_poll = e1000_rx_poll;
+        eth0.get_mac = e1000_get_mac;
+        netif_register(&eth0);               /* no-op if eth0 already exists */
+    }
+
+    kprintf("[NET] late-attach: eth0 up (deferred PCH bring-up complete)\n");
+    return 0;
+}
+
 /* ------------------------------------------------------------------ */
 /* Public ICMP error API                                               */
 /* ------------------------------------------------------------------ */

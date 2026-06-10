@@ -293,6 +293,10 @@ static struct {
     uint8_t          phy_addr;  /* MDIO address of the PHY (PCH parts) */
     bool             is_pch;    /* true => 82577LM-class bring-up used */
     bool             link_up;   /* last observed MAC link state        */
+    /* E1000-PCH-0A: boot did the SAFE probe only (BAR map, bus-master,
+     * FWSM/STATUS/MAC reads); the risky ME-shared-MDIO bring-up (CTRL_RST,
+     * PHY dance, rings) waits for an explicit post-desktop trigger. */
+    bool             bringup_deferred;
 } e1000;
 
 /* ------------------------------------------------------------------ */
@@ -585,18 +589,27 @@ static int e1000_pch_mac_reset(void) {
      *    We cannot tell exactly when it is idle, but a fixed delay here is far
      *    better than resetting the MAC under it. */
     uint32_t fwsm = mmio_read32(E1000_FWSM);
+    kprintf("E1000PCH: FWSM=0x%08x me=%s\n", fwsm,
+            (fwsm & FWSM_FW_VALID) ? "present" : "absent");
     if (fwsm & FWSM_FW_VALID) {
-        kprintf("[E1000] PCH: ME firmware active (FWSM=0x%08x), yielding...\n", fwsm);
         e1000_delay(2000000);  /* ~10-20 ms on real HW: let ME finish */
     }
 
-    /* 3. Acquire SWFLAG so the ME stays off the MDIO bus during reset. */
+    /* 3. Acquire SWFLAG so the ME stays off the MDIO bus during reset.
+     * E1000-PCH-0C: if we can NOT get the semaphore, ABORT -- never issue
+     * CTRL_RST without it. The old "proceed anyway" was exactly the wedge
+     * path: a reset under an active ME MDIO transaction is the bus stall
+     * that hung the T410. The trigger tool is re-runnable; failing here
+     * costs a retry, not the machine. */
     if (!e1000_acquire_swflag()) {
-        kprintf("[E1000] PCH: SWFLAG acq failed before MAC reset (ME busy)\n");
-        /* Proceed anyway -- the reset may still work if ME is idle. */
+        kprintf("E1000PCH: ABORT swflag=0 (ME busy) -- no CTRL_RST issued; re-run nicup\n");
+        return -1;
     }
+    kprintf("E1000PCH: SWFLAG acquired\n");
 
-    /* 4. Issue device reset. */
+    /* 4. Issue device reset (marker BEFORE the touch: if the bus stalls
+     * here, the last serial line names the exact access). */
+    kprintf("E1000PCH: touch CTRL_RST...\n");
     uint32_t ctrl = mmio_read32(E1000_CTRL);
     mmio_write32(E1000_CTRL, ctrl | CTRL_RST);
 
@@ -616,9 +629,10 @@ static int e1000_pch_mac_reset(void) {
     (void)mmio_read32(E1000_ICR);
 
     if (mmio_read32(E1000_CTRL) & CTRL_RST) {
-        kprintf("[E1000] PCH: MAC reset did not clear -- hardware stuck\n");
+        kprintf("E1000PCH: ABORT mac reset did not clear -- hardware stuck\n");
         return -1;
     }
+    kprintf("E1000PCH: MAC reset ok\n");
     return 0;
 }
 
@@ -642,9 +656,10 @@ static int e1000_pch_mac_reset(void) {
  */
 static int e1000_pch_phy_bringup(void) {
     if (!e1000_acquire_swflag()) {
-        kprintf("[E1000] PCH: SW/FW MDIO flag timeout (ME busy?) -- link skipped\n");
+        kprintf("E1000PCH: ABORT swflag=0 (phy bring-up; ME busy) -- re-run nicup\n");
         return -1;
     }
+    kprintf("E1000PCH: SWFLAG acquired (phy)\n");
 
     /* Scan for the PHY on MDIO addresses 1 and 2 (the 82577LM is usually at 1). */
     uint8_t  phy = 0;
@@ -661,7 +676,7 @@ static int e1000_pch_phy_bringup(void) {
     }
     uint16_t id2 = e1000_phy_read(phy, MII_PHYID2);
     e1000.phy_addr = phy;
-    kprintf("[E1000] PCH: PHY @ mdio %u id=%04x:%04x\n", phy, id1, id2);
+    kprintf("E1000PCH: PHYID p=%u id=%04x:%04x\n", phy, id1, id2);
 
     /* Soft reset (clause-22 BMCR.reset); bounded wait for the bit to self-clear.
      * PHY reset completes in <1ms per spec and each e1000_phy_read is already
@@ -695,6 +710,7 @@ static int e1000_pch_phy_bringup(void) {
     bmcr = e1000_phy_read(phy, MII_BMCR);
     bmcr |= BMCR_ANENABLE | BMCR_ANRESTART;
     e1000_phy_write(phy, MII_BMCR, bmcr);
+    kprintf("E1000PCH: ANEG restarted\n");
 
     e1000_release_swflag();
 
@@ -725,9 +741,8 @@ static int e1000_pch_phy_bringup(void) {
         }
         e1000_delay(5000);
     }
-    kprintf("[E1000] PCH: link %s after auto-neg\n", e1000.link_up ? "UP" : "DOWN");
-
-    /* If link is up, log the negotiated speed/duplex from STATUS. */
+    /* The ladder's link marker (speed/duplex when up; DOWN is not a failure
+     * -- no cable / slow partner; nicup can be re-run). */
     if (e1000.link_up) {
         uint32_t st = mmio_read32(E1000_STATUS);
         const char* speed = "unknown";
@@ -737,8 +752,10 @@ static int e1000_pch_phy_bringup(void) {
             case 2: speed = "1000M"; break;
             case 3: speed = "1000M"; break;
         }
-        kprintf("[E1000] PCH: negotiated %s %s-duplex\n",
+        kprintf("E1000PCH: LINK UP %s %s\n",
                 speed, (st & (1u << 0)) ? "full" : "half");
+    } else {
+        kprintf("E1000PCH: LINK DOWN (cable? partner? re-run nicup)\n");
     }
     return 0;
 }
@@ -931,12 +948,24 @@ int e1000_init(void) {
                     dev->device_id);
             return -1;
         }
-        kprintf("[E1000] PCH NIC 0x%04x -- ME-safe bring-up (PCH_NIC enabled)\n",
-                dev->device_id);
-        if (e1000_pch_mac_reset() != 0) {
-            kprintf("[E1000] PCH MAC reset failed -- declining NIC\n");
-            return -1;
-        }
+        /* E1000-PCH-0A: even with the gate ON, boot performs ONLY the safe
+         * probe (everything above this point: PCI match, BAR0 map, bus-master
+         * + the plain-MMIO FWSM/STATUS/MAC reads below). The ME-shared-MDIO
+         * bring-up (CTRL_RST under SWFLAG, PHY dance, DMA rings) is DEFERRED
+         * to an explicit post-desktop trigger (nicup -> SYS_NET_CONFIG
+         * NIC_BRINGUP -> e1000_pch_deferred_bringup). A bus stall then costs
+         * a re-run with a live desktop + serial, never the boot. */
+        kprintf("E1000PCH: PROBE ok devid=%04x\n", dev->device_id);
+        kprintf("E1000PCH: FWSM=0x%08x STATUS=0x%08x (safe reads)\n",
+                mmio_read32(E1000_FWSM), mmio_read32(E1000_STATUS));
+        e1000_read_mac();
+        if (!e1000_mac_is_valid()) e1000_pch_read_mac_from_nvm();
+        kprintf("E1000PCH: MAC %02x:%02x:%02x:%02x:%02x:%02x\n",
+                e1000.mac[0], e1000.mac[1], e1000.mac[2],
+                e1000.mac[3], e1000.mac[4], e1000.mac[5]);
+        e1000.bringup_deferred = true;
+        kprintf("E1000PCH: bring-up DEFERRED (run nicup after the desktop is up)\n");
+        return -1;   /* boot continues NIC-less; the trigger completes later */
     } else {
         /* Classic reset: mask IRQs, pulse CTRL_RST, wait for clear. */
         mmio_write32(E1000_IMC, 0xFFFFFFFF);
@@ -1007,6 +1036,44 @@ int e1000_init(void) {
 
 bool e1000_present(void) {
     return e1000.present;
+}
+
+/* E1000-PCH-0B: complete a DEFERRED PCH bring-up (the risky half e1000_init
+ * skipped at boot). Invoked post-desktop via SYS_NET_CONFIG's NIC_BRINGUP
+ * flag (the nicup tool) -- never at boot. Re-runnable: every abort path
+ * leaves the NIC link-down but the machine healthy, so the operator can
+ * retry after the ME goes idle. Returns 0 = NIC fully up (rings live,
+ * e1000_present() true; link state in e1000_link_up()), -1 = aborted,
+ * -2 = nothing was deferred (not a PCH part / not probed). */
+int e1000_pch_deferred_bringup(void) {
+    if (e1000.present) return 0;                       /* already done      */
+    if (!e1000.bringup_deferred || !e1000.mmio) return -2;
+
+    kprintf("E1000PCH: TRIGGER ok deferred-bringup invoked\n");
+
+    if (e1000_pch_mac_reset() != 0) return -1;         /* markers inside    */
+    e1000_pch_phy_bringup();                           /* link may be down  */
+
+    /* Clear the multicast table (avoid spurious filtering). */
+    for (uint32_t i = 0; i < 128; i++) mmio_write32(E1000_MTA + i * 4, 0);
+
+    /* Re-read the MAC: a PCH software reset can leave RAL0/RAH0 empty. */
+    e1000_read_mac();
+    if (!e1000_mac_is_valid()) {
+        kprintf("E1000PCH: RAL0/RAH0 empty after reset, reading NVM\n");
+        e1000_pch_read_mac_from_nvm();
+    }
+
+    if (e1000_setup_rx() != 0 || e1000_setup_tx() != 0) {
+        kprintf("E1000PCH: ABORT ring setup failed (out of memory)\n");
+        return -1;
+    }
+    mmio_write32(E1000_IMC, 0xFFFFFFFF);               /* poll-mode only    */
+
+    e1000.present          = true;
+    e1000.bringup_deferred = false;
+    kprintf("E1000PCH: BRINGUP done link=%s\n", e1000.link_up ? "up" : "down");
+    return 0;
 }
 
 /*

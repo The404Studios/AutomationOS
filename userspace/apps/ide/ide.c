@@ -418,6 +418,10 @@ void ide_set_focus(Ide* a, int func_idx) {
     a->focus_func  = func_idx;
     a->model.focus = func_idx;
     model_analyze(&a->model);
+    /* IDE-SYNC-0 S1: every focus write lands in THE selection model too, so
+     * map/runtime/inspector-driven focus changes and caret-driven ones agree. */
+    a->sel.symbol = a->focus_func;
+    a->sel.node   = a->map_selected;
 }
 
 /* ===========================================================================
@@ -458,6 +462,13 @@ void ide_sel_from_caret(Ide* a, int pane) {
         while (a->cur_file[i] && i < IDE_PATH - 1) { a->sel.file[i] = a->cur_file[i]; i++; }
         a->sel.file[i] = 0;
     }
+    /* IDE-SYNC-0 S1: the map's central card and the inspector detail FOLLOW
+     * the caret -- refocus only when the enclosing function actually changed
+     * (one model_analyze per crossing; none while moving within a function).
+     * Between functions (sym == -1) the last focus is kept so the map doesn't
+     * blank out while the caret crosses whitespace. */
+    if (sym >= 0 && sym != a->focus_func)
+        ide_set_focus(a, sym);
 }
 
 /* ===========================================================================

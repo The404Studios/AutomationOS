@@ -2,7 +2,25 @@
 
 > Warm memory. Refresh per checkpoint. One active brick at a time.
 
-## SMP-F3-5 — OPEN (the high-risk isolated CPU1 ring-3 brick) — cpu1hello
+## SMP-F3-5 — LANDED (commit `ca1378a`, branch `brick/smp-f3-5`, awaiting review/push) — cpu1hello
+- **THE EXACT ACCEPTANCE HIT:** `CPU1HELLO: PASS markers=5 exit=42 reaped=1 cpu1_idle=1
+  desktop_alive=1` + F2 delta>0 + APCURRENT PASS + 0 invariant + 0 panic (`cpu1_smoke.sh`, -smp 2).
+  Record: [`bricks/SMP-F3-5.md`](bricks/SMP-F3-5.md). Law 8's five audits all green: per-CPU current
+  (F3-4) · AP sys_exit via the dying path (never resume a TERMINATED current) · CR3 leaves at the
+  switch · HOME-routed parent wake (`scheduler_add_process_home`) · teardown gated on the
+  successor's `pending_unref` drop (the running ref IS the stack/CR3 protection on SMP) + the
+  first-CPU1-kfree checkpoint.
+- **three en-route finds (failing-run-first each):** the spawn-vs-syscall_init ordering race (whose
+  crash accidentally proved the acceptable-failure ladder: exception reported, BSP survived,
+  desktop alive) · a harness PID-regex bug · **THE keeper: a bare `hlt` in ap_scheduler_loop
+  inheriting IF=0 from idle's restored rflags = flaky permanent park** (invisible all F2 era —
+  CPU1 never hlt'ed after first dispatch) → fixed with the canonical `sti; hlt`. Rule: an idle
+  loop's hlt must never rely on inherited IF.
+- **boundary held:** no IPI / desktop split / stealing / global PREEMPT / policy expansion;
+  BLOCKED-on-CPU1 explicitly parked.
+- **next:** SMP-G0 IPI-LINK → G1 IPI-WAKE (kills the tick-poll wake latency).
+
+## SMP-F3-5 (original opening note) — superseded by the LANDED entry above
 - **user-set scope:** first tiny static ring-3 ELF pinned to CPU1; **cooperative dispatch only**;
   no global PREEMPT, no work stealing, no desktop split, no IPI yet; **audit the sys_exit path on
   the AP** (the running-ref `process_unref(dead)` fix + reap + CR3-restore land WITH this brick per

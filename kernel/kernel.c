@@ -1307,6 +1307,20 @@ void kernel_main(void* raw_info) {
                         if (scheduler_init_secondary_cpu(1, ap_apic_id)) {
                             BOOT_LOG("[SMP] Brick D: CPU1 scheduler slot initialized\n");
 #ifdef SMP_SCHED_DISPATCH
+#ifdef SMP_IPI
+                            /* SMP-G1: the no-lost-wake ping proof MUST run HERE --
+                             * after CPU1's scheduler slot is live but BEFORE the F2
+                             * kthread spawn, the only window where CPU1 is
+                             * genuinely hlt-parked on an EMPTY runqueue (the exact
+                             * state the cli/check/sti;hlt close protects). 32
+                             * IPI pings, each acked by the idle loop's cli'd
+                             * check; ticks cannot ack, so every ack = an IPI woke
+                             * the hlt. */
+                            {
+                                extern void ipiwake_ping_selftest(void);
+                                ipiwake_ping_selftest();
+                            }
+#endif
                             /* Brick F2: pin ONE ring-0 kernel test thread to CPU1.
                              * CPU1's ap_scheduler_loop context-switches into it on
                              * the next tick. Spin briefly on the BSP, then read
@@ -1419,6 +1433,20 @@ void kernel_main(void* raw_info) {
                                 }
                                 h->allowed_cpus = (uint64_t)1 << 1;
                                 h->pinned_cpu   = 1;
+#ifdef SMP_IPI
+                                /* SMP-G1: stamp THIS enqueue. The add below now
+                                 * sends an IPI_RESCHEDULE (the G1 enqueue->kick
+                                 * path); CPU1's first switch into this pid stamps
+                                 * dispatch_tsc and prints the latency -- the
+                                 * end-to-end enqueue_to_cpu1 + first-dispatch
+                                 * proof through the REAL scheduler path. */
+                                {
+                                    extern volatile uint64_t g_g1_enq_tsc;
+                                    extern volatile int      g_g1_enq_pid;
+                                    g_g1_enq_pid = hpid;
+                                    g_g1_enq_tsc = rdtsc();   /* perf.h inline */
+                                }
+#endif
                                 scheduler_add_process_to_cpu(h, 1);
                                 kprintf("[SMP] F3-5: cpu1hello PID %d pinned + "
                                         "enqueued on CPU1\n", hpid);

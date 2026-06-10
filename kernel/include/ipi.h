@@ -96,6 +96,11 @@ typedef struct {
 
 extern ipi_stats_t ipi_stats[IPI_MAX_CPUS];
 
+// SMP-G1: per-CPU wake flag (set by the IPI_RESCHEDULE handler on the target
+// CPU; consumed by that CPU's idle loop inside its cli'd check window).
+extern volatile uint32_t ipi_need_resched[IPI_MAX_CPUS];
+uint32_t ipi_consume_need_resched(void);   // call with interrupts DISABLED
+
 void ipi_print_stats(void);
 
 #endif // IPI_H

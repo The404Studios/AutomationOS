@@ -782,6 +782,9 @@ void scheduler_add_process_to_cpu(process_t* proc, uint32_t cpu) {
     // race-clean. F3-1: this is a cross-CPU enqueue (BSP -> cpus[cpu]); it acquires
     // the FOREIGN target cpu's rq_lock (NOT this_cpu()'s). Exactly ONE lock is held
     // and it never nests, so it cannot form an ABBA cycle with scheduler_shutdown.
+#ifdef SMP_IPI
+    int enqueued = 0;     /* SMP_IPI-gated so non-IPI SMP builds stay byte-identical */
+#endif
     spin_lock(&cpus[cpu].rq_lock);
     if (!proc->on_queue) {
         process_ref(proc);                   // queue holds a ref (UAF guard)
@@ -791,8 +794,25 @@ void scheduler_add_process_to_cpu(process_t* proc, uint32_t cpu) {
         int priority = process_get_priority(proc);
         runqueue_enqueue(cpus[cpu].rq_expired, proc, priority);
         cpus[cpu].ready_count++;
+#ifdef SMP_IPI
+        enqueued = 1;
+#endif
     }
     spin_unlock(&cpus[cpu].rq_lock);
+
+#ifdef SMP_IPI
+    // SMP-G1: kick the target CPU so a hlt-parked idle loop dispatches NOW
+    // instead of on its next 10 ms LAPIC tick. Sent AFTER the rq_lock drops
+    // (never signal while holding a lock) and only for a REAL foreign enqueue
+    // (idempotent re-adds don't spam the ICR). A busy target just consumes the
+    // flag and re-loops -- a spurious kick is harmless by design.
+    // ipi_reschedule itself no-ops for self/offline/not-armed targets, so
+    // every other path through this function is unchanged.
+    if (enqueued && cpu != cpu_id()) {
+        extern void ipi_reschedule(uint32_t target_cpu);
+        ipi_reschedule(cpu);
+    }
+#endif
 }
 #endif /* SMP_SCHED */
 
@@ -862,6 +882,27 @@ void ap_schedule_from_irq(interrupt_frame_t* frame) {
 // AP-safety: cpu_set_current_thread() writes ONLY cpus[1].current_thread (NEVER the
 // global current_process — that would clobber the BSP). scheduler_pick_next()/
 // scheduler_add_process() are this_cpu()-based so they act on cpus[1]'s runqueue.
+#ifdef SMP_IPI
+// ===========================================================================
+// SMP-G1 IPI-WAKE instrumentation (proof plumbing, SMP_IPI builds only)
+// ===========================================================================
+// Ping pair: the BSP's ipiwake_ping_selftest writes req (its send TSC) and the
+// AP idle loop's cli'd check writes ack (its consume TSC) -- proving each IPI
+// woke the hlt-parked loop, with latency = ack - req. Enqueue pair: kernel.c
+// stamps enq_tsc/enq_pid at the REAL cpu1hello enqueue; the first CPU1 switch
+// into that pid stamps dispatch_tsc -- the end-to-end enqueue->first-dispatch
+// latency through the live scheduler path. Single writer per field per phase;
+// plain volatiles (x86-TSO + the consumers poll). DEFINED in ipi.c (low packed
+// .bss -- law 15: read from CPU1 contexts that can hold a user CR3; the smoke's
+// nm gate caught the original scheduler.c placement at 0x23c000 > 0x200000).
+extern volatile uint64_t g_g1_ping_req;       // BSP: rdtsc at IPI send (0 = idle)
+extern volatile uint64_t g_g1_ping_ack;       // CPU1: rdtsc at flag consume
+extern volatile uint64_t g_g1_enq_tsc;        // BSP: rdtsc at cpu1hello enqueue
+extern volatile int      g_g1_enq_pid;        // BSP: the enqueued pid to match
+extern volatile uint64_t g_g1_dispatch_tsc;   // CPU1: rdtsc at first dispatch of that pid
+extern uint32_t ipi_consume_need_resched(void);   // ipi.c (call with IF=0)
+#endif
+
 void ap_cooperative_schedule(void) {
     cpu_t* cpu = this_cpu();                  // CPU1 (cpu_id()==1)
 
@@ -942,6 +983,20 @@ void ap_cooperative_schedule(void) {
         uint64_t kstack = ((uint64_t)next->kernel_stack + KERNEL_STACK_SIZE) & ~0xFULL;
         tss_set_kernel_stack(kstack);         // cpu_id()==1 -> tss_array[1]/kernel_rsp_save_arr[1]
     }
+
+#ifdef SMP_IPI
+    // SMP-G1: one-shot enqueue->first-dispatch latency for the instrumented
+    // enqueue (kernel.c stamps enq_tsc/enq_pid at the real cpu1hello
+    // scheduler_add_process_to_cpu). This line runs ON CPU1 at the moment it
+    // commits to switching into that task -- the task's literal first
+    // instruction follows within the context_switch_asm tail.
+    if (g_g1_enq_tsc && !g_g1_dispatch_tsc && next->pid == g_g1_enq_pid) {
+        g_g1_dispatch_tsc = rdtsc();
+        kprintf("[SMP] G1: enqueue->dispatch latency=%lu us (pid=%d)\n",
+                (unsigned long)((g_g1_dispatch_tsc - g_g1_enq_tsc) / 3000ULL),
+                next->pid);
+    }
+#endif
 
     // Fix D6: prime `next`'s FPU state (context_switch_asm fxrstor's it directly,
     // bypassing context_switch()'s template priming) so a fresh process's MXCSR is
@@ -1112,9 +1167,91 @@ void ap_scheduler_loop(void) {
         // was never dropped and the dead task's PCB never freed. sti;hlt is
         // atomic wrt interrupts (an interrupt after sti is taken at the hlt
         // boundary and wakes it), so the next tick ALWAYS resumes the loop.
+#ifdef SMP_IPI
+        // SMP-G1 LOST-WAKEUP CLOSE. Without this, an IPI_RESCHEDULE landing
+        // between ap_cooperative_schedule's empty pick and the hlt below is
+        // ABSORBED (handler runs, sets the flag, iretq resumes... straight
+        // into hlt) and the runnable task waits for the next 10 ms tick --
+        // exactly the latency G1 exists to kill. The canonical close:
+        //   cli                      -- any in-flight IPI is now held PENDING
+        //   check rq / need_resched  -- the handler cannot interleave here
+        //   sti; hlt                 -- a pending IPI is delivered at the hlt
+        //                               boundary (law 12's sti shadow) and
+        //                               WAKES it; nothing can slip the gap
+        // ready_count is read without the rq_lock: a stale miss is covered by
+        // the enqueuer's IPI (sent after its unlock), which is pending here
+        // and wakes the hlt. A stale hit just re-loops once. Never blocks.
+        __asm__ volatile("cli");
+        uint32_t kicked = ipi_consume_need_resched();
+        if (kicked && g_g1_ping_req && !g_g1_ping_ack) {
+            g_g1_ping_ack = rdtsc();   // G1 ping ack (proof plumbing; one-shot
+                                       // per ping -- the BSP re-arms req)
+        }
+        if (kicked || this_cpu()->ready_count > 0) {
+            __asm__ volatile("sti");   // work exists: dispatch on the next pass
+            continue;
+        }
         __asm__ volatile("sti; hlt");
+#else
+        __asm__ volatile("sti; hlt");
+#endif
     }
 }
+
+#ifdef SMP_IPI
+// ===========================================================================
+// SMP-G1 acceptance driver: ipiwake_ping_selftest() -- BSP context.
+// ===========================================================================
+// Runs in the window where CPU1's scheduler loop is up (ap_dbg_stage==3) but
+// its runqueue is still EMPTY (before ap_spawn_test_kthread), so CPU1 is
+// genuinely hlt-parked between 100 Hz ticks -- the exact state the lost-wakeup
+// close protects. 32 pings: write req=rdtsc, IPI_RESCHEDULE to CPU1, bounded-
+// poll (100 ms) for the loop's ack. EVERY ack proves an IPI woke the hlt (a
+// tick-mediated wake cannot ack: ticks don't set need_resched); an ack under
+// 1 ms is ~10x faster than the best-case tick rescue. All 32 answered =
+// no_lost_wake. Serial-safe (pre-desktop BSP window, CPU1 prints nothing).
+void ipiwake_ping_selftest(void) {
+    extern volatile uint64_t ap_dbg_stage;
+    extern void ipi_reschedule(uint32_t target_cpu);
+    extern int  cpu1_is_online(void);
+
+    if (!cpu1_is_online()) {
+        kprintf("[SMP] G1: ping SKIP (cpu1 offline)\n");
+        return;
+    }
+    // Bounded wait (~200 ms TSC) for CPU1 to enter the scheduler loop.
+    uint64_t t0 = rdtsc();
+    while (ap_dbg_stage != 3 && (rdtsc() - t0) < 200000ULL * 3000ULL) {
+        __asm__ volatile("pause");
+    }
+    if (ap_dbg_stage != 3) {
+        kprintf("[SMP] G1: ping SKIP (cpu1 scheduler loop not up)\n");
+        return;
+    }
+
+    uint32_t acks = 0;
+    uint64_t max_us = 0;
+    for (int i = 0; i < 32; i++) {
+        g_g1_ping_ack = 0;
+        g_g1_ping_req = rdtsc();
+        ipi_reschedule(1);
+        // Bounded poll: 100 ms TSC deadline per ping (a lost wake would only
+        // be rescued by the NEXT enqueue's IPI in real use; here it = FAIL).
+        uint64_t s = rdtsc();
+        while (!g_g1_ping_ack && (rdtsc() - s) < 100000ULL * 3000ULL) {
+            __asm__ volatile("pause");
+        }
+        if (g_g1_ping_ack) {
+            acks++;
+            uint64_t us = (g_g1_ping_ack - g_g1_ping_req) / 3000ULL;
+            if (us > max_us) max_us = us;
+        }
+        g_g1_ping_req = 0;
+    }
+    kprintf("[SMP] G1: ping summary acks=%u/32 max_latency_us=%lu\n",
+            acks, (unsigned long)max_us);
+}
+#endif /* SMP_IPI */
 #endif // SMP_SCHED && SMP_SCHED_DISPATCH
 
 // ===========================================================================

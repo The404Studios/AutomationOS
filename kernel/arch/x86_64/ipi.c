@@ -72,6 +72,36 @@ static bool ipi_cpu_online(uint32_t cpu) {
 // IPI statistics
 ipi_stats_t ipi_stats[IPI_MAX_CPUS];
 
+/* SMP-G1: per-CPU need_resched -- the wake flag between the IPI_RESCHEDULE
+ * handler (producer, on the target CPU) and that CPU's idle loop (consumer,
+ * in its cli'd check window). One writer per slot per side, plain volatile
+ * stores; the cli window is what makes consume atomic vs the handler. Lives
+ * in ipi.c's packed low .bss (law 15: handler data under arbitrary CR3). */
+volatile uint32_t ipi_need_resched[IPI_MAX_CPUS];
+
+/* Consume THIS cpu's need_resched flag. MUST be called with interrupts
+ * disabled (the idle loop's cli'd check) so the handler cannot interleave
+ * between the read and the clear. Returns the pre-clear value. */
+uint32_t ipi_consume_need_resched(void) {
+    uint32_t cpu = cpu_id();
+    uint32_t v = ipi_need_resched[cpu];
+    ipi_need_resched[cpu] = 0;
+    return v;
+}
+
+/* SMP-G1 proof-plumbing globals. DEFINED HERE (not scheduler.c) deliberately:
+ * ipi.c's objects link into the LOW packed .bss (~0x19b000), below the strict
+ * 0x200000 gate; scheduler.c's land at ~0x23c000. These fields are read from
+ * CPU1 contexts that can hold a USER CR3 (the AP dying path runs
+ * ap_cooperative_schedule under the dead task's address space), so they obey
+ * law 15 like the rest of the IPI state. The ipiwake smoke's nm gate CAUGHT
+ * this exact placement when they first lived in scheduler.c. */
+volatile uint64_t g_g1_ping_req      = 0;   // BSP: rdtsc at IPI send (0 = idle)
+volatile uint64_t g_g1_ping_ack      = 0;   // CPU1: rdtsc at flag consume
+volatile uint64_t g_g1_enq_tsc       = 0;   // BSP: rdtsc at cpu1hello enqueue
+volatile int      g_g1_enq_pid       = 0;   // BSP: the enqueued pid to match
+volatile uint64_t g_g1_dispatch_tsc  = 0;   // CPU1: rdtsc at first dispatch of that pid
+
 // Function call queue (per-CPU)
 // Stores call requests BY VALUE so they do NOT depend on the sender's stack
 // lifetime. This is what makes wait==false (fire-and-forget) safe: the sender
@@ -459,11 +489,16 @@ void ipi_handle_reschedule(void) {
     uint32_t cpu = cpu_id();
     ipi_stats[cpu].reschedule_received++;
 
+    /* SMP-G1: the handler's ONLY scheduling action is setting the per-CPU
+     * wake flag. The interrupted context decides what to do with it: the AP
+     * idle loop's cli'd check consumes it and skips the hlt (the lost-wakeup
+     * close). NO schedule() call from interrupt context here -- dispatch
+     * stays in ap_cooperative_schedule / the timer path (no rewrite, per the
+     * G1 hard no's). */
+    ipi_need_resched[cpu] = 1;
+
     // Send EOI
     lapic_eoi();
-
-    // TODO: Call scheduler to reschedule
-    // schedule();
 }
 
 // IPI handler: TLB flush (redirects to lazy TLB subsystem)

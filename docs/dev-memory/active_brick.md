@@ -2,7 +2,28 @@
 
 > Warm memory. Refresh per checkpoint. One active brick at a time.
 
-## IDE-WAVE-2 — LANDED (all four bricks committed local, awaiting review/push) — four parallel designs, serial implementation
+## SELFHEAL-FIX-0 — LANDED (committed local on `brick/selfheal-fix-0`, awaiting review/push) — recovery now restores the desktop
+- **user report:** wave-2 works on the T410 BUT "the self healing is not working" → "run 7 agents and fix the self heal".
+- **record:** [`bricks/SELFHEAL-FIX-0.md`](bricks/SELFHEAL-FIX-0.md) · **branch:** `brick/selfheal-fix-0` (off `brick/ide-xfile-0` `4766b1d`).
+- **7-agent verdict:** the recovery CHAIN was sound (detect/overlay/kill/respawn/re-arm all clean) — the hole
+  was the OUTCOME: the respawned compositor zeroes `g_windows` and no client re-register protocol existed →
+  every open window vanished → empty desktop = "not working". The original smoke asserted markers only,
+  never desktop CONTENTS.
+- **fix (H0 `2a071f3`):** SELFHEAL v2 — a 16-entry window registry in the spare bytes of the SAME init-owned
+  heartbeat page; compositor mirrors it (create/destroy + per-second); a respawn rebuilds windows by
+  re-attaching client buffers via shm_id (dead client ⇒ dead segment ⇒ failed shmat = the liveness test),
+  ORIGINAL win_ids preserved so client handles stay valid. Zero client changes.
+- **tuning (H1 `00354ef`):** RESUME_TIMEOUT 5→10 s, ATTACH ~10→20 s, BREAKER window 60→90 s (single-core T410).
+- **proof:** `build_test/selfheal_t410_check.sh` (exact T410 profile + forced blocking freeze) failing-then-
+  passing: baseline `restored_windows=0` + bare-desktop screenshot (the user's symptom, `shfix_base_recovered.png`)
+  → fixed `SELFHEAL-FIX: PASS recovery=1 restored_windows=4 no_storm=1 no_fault=1` + all four windows back
+  (`shfix_recovered.png`); + 100 s shipping-build no-false-trip soak.
+- **flash:** `automationos-t410-selfheal.iso` (T410_SAFE kernel + DESKTOP_MINIMAL+SELFHEAL userspace, no freeze hook).
+- **known limits (documented, parked):** cooperative kernel can't detect a ring-3 tight-loop freeze
+  (FREEZE_MODE=1 = SKIP; PREEMPT hard-spin gap tracked separately) · kernel IF=0 spin kills everything
+  (iteration-cap law) · a non-compositor spinner gets the wrong remedy (DESKTOP_MINIMAL removed that storm).
+
+## IDE-WAVE-2 — FROZEN / COMPLETE (all four branches PUSHED, T410-CONFIRMED "it works") (all four bricks committed local, awaiting review/push) — four parallel designs, serial implementation
 - **user verdict on IDE-SYNC-0:** "perfect its working good" (T410 hands-on) → pushed + frozen.
 - **record:** [`bricks/IDE-WAVE-2.md`](bricks/IDE-WAVE-2.md) · **branch chain (off `brick/ide-sync-0`
   `0f321fe`):** `brick/ide-context-0` → `brick/map-stable-0` → `brick/viz1-parity-0` →

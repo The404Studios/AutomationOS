@@ -1015,6 +1015,16 @@ void kernel_main(void* raw_info) {
     extern void sock_init(void);
     sock_init();
 
+#ifdef NET_SELFTEST
+    // NET-P1-A0: the deterministic in-kernel net test rig proof. Runs once,
+    // pre-userspace, prints the NETRIG marker, and fully resets the socket
+    // table on its way out. Compiled only under NET_SELFTEST=1 builds.
+    {
+        extern void net_testrig_selftest(void);
+        net_testrig_selftest();
+    }
+#endif
+
     // CMOS real-time clock: logs the wall-clock boot time and backs SYS_TIME.
     extern void rtc_init(void);
     rtc_init();

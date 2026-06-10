@@ -212,6 +212,18 @@ static int ip_send_fragment(uint8_t dmac[ETH_ALEN], uint32_t dst_ip,
 int ip_tx(uint32_t dst_ip, uint8_t proto, const void* seg, uint16_t seg_len) {
     static uint16_t ip_id = 1;
 
+#ifdef NET_SELFTEST
+    /* NET-P1-A0: while the in-kernel test rig is live it swallows every
+     * outbound segment here -- BEFORE net_up()/ARP/the NIC are touched --
+     * so selftests can assert on exactly what the stack tried to send with
+     * zero hardware dependency. Inactive rig = zero behavior change. */
+    {
+        extern int net_testrig_tx_tap(uint32_t dst, uint8_t proto,
+                                      const void* seg, uint16_t len);
+        if (net_testrig_tx_tap(dst_ip, proto, seg, seg_len)) return 0;
+    }
+#endif
+
     if (!net_up()) return -1;
 
     /* Resolve next-hop MAC (use routing table if available). */
@@ -340,6 +352,15 @@ static void ipv4_demux(const uint8_t* ip_start, uint16_t ip_avail) {
         tcp_input(src, dst, seg, seg_len);
     }
 }
+
+#ifdef NET_SELFTEST
+/* NET-P1-A0: raw IPv4 injection seam for the in-kernel test rig
+ * (kernel/net/net_testrig.c) -- hands a crafted packet to the SAME demux
+ * the NIC path uses, so rig-tested behavior is real-path behavior. */
+void sock_testrig_inject_ipv4(const uint8_t* ip_start, uint16_t ip_avail) {
+    ipv4_demux(ip_start, ip_avail);
+}
+#endif
 
 int sock_poll(void) {
     if (!net_up() || !g_socks) return 0;

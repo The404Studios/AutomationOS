@@ -45,6 +45,21 @@ if [ "${PCH_NIC:-0}" = "1" ]; then
 fi
 
 # ─────────────────────────────────────────────────────────────────────────────
+# OPT-IN: the NET-P1-A0 in-kernel network test rig.
+#   NET_SELFTEST=1 bash scripts/quick_build.sh
+# DEFAULT OFF. Compiles kernel/net/net_testrig.c (a capturing ip_tx tap + raw
+# IPv4 injection into ipv4_demux) and runs the NETRIG boot selftest after
+# sock_init(). With it unset the rig TU compiles EMPTY and ip_tx carries no
+# tap, so default kernel behavior is unchanged. The rig is how every NET-P1
+# brick (SYN side-table, OOO reassembly, persist probes) proves itself
+# deterministically -- no slirp timing, no NIC, no hardware.
+# ─────────────────────────────────────────────────────────────────────────────
+if [ "${NET_SELFTEST:-0}" = "1" ]; then
+    CFLAGS="$CFLAGS -DNET_SELFTEST"
+    echo "*** NET_SELFTEST build: in-kernel net test rig (NETRIG) ENABLED ***"
+fi
+
+# ─────────────────────────────────────────────────────────────────────────────
 # OPT-IN: durable on-disk persistence (AHCI/SATA + diskfs at boot).
 #   DISK_PERSIST=1 bash scripts/quick_build.sh
 # DEFAULT OFF. ahci_init() pokes real SATA-controller MMIO at boot, a documented
@@ -357,6 +372,8 @@ compile kernel/net/netsyscall.c              c_netsyscall
 compile kernel/net/socket.c                  c_socket
 compile kernel/net/udp.c                      c_udp
 compile kernel/net/tcp.c                      c_tcp
+# NET-P1-A0 test rig: compiles EMPTY unless -DNET_SELFTEST (NET_SELFTEST=1).
+compile kernel/net/net_testrig.c             c_net_testrig
 # NOTE: the staged HDA/e1000/NVMe/ACPI drivers remain intentionally NOT compiled
 # in. Their large static DMA buffers bloat the kernel .bss past 0x1d8000 — where
 # GRUB places the initrd (GRUB sizes free space from the kernel's FILE sections;

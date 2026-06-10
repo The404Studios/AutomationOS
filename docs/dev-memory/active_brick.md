@@ -2,7 +2,19 @@
 
 > Warm memory. Refresh per checkpoint. One active brick at a time.
 
-## IDE-SYNC-0 (ACTIVE) — the core prosthetic loop: ONE selection model, three panes
+## IDE-WAVE-2 (ACTIVE) — four parallel designs, serial implementation
+- **user verdict on IDE-SYNC-0:** "perfect its working good" (T410 hands-on) → pushed + frozen.
+- **in flight:** 4 read-only design agents, one per next brick:
+  IDE-CONTEXT-0 (persistent project>file>FN breadcrumb in BOTH workspaces + what-changed indicator) ·
+  MAP-STABLE-0 (deterministic layout: same function = same place) ·
+  VIZ1-PARITY-0 (mockup gaps: satellite cards, connector studs, close-hint, legend chip) ·
+  IDE-XFILE-0 (the minimal cross-file model: whole-project map; map follows stop no-oping on
+  out-of-file targets; jump opens the target file).
+- **implementation order:** user-set CONTEXT → STABLE → PARITY, with XFILE slotted by its scope
+  assessment (likely its own multi-checkpoint brick). One commit + clean build + screenshot per
+  checkpoint, same discipline as IDE-REPAIR-0/SYNC-0.
+
+## IDE-SYNC-0 — FROZEN / COMPLETE (pushed `16b2a01`, T410-CONFIRMED "perfect its working good") — the core prosthetic loop: ONE selection model, three panes
 - **branch:** `brick/ide-sync-0` (off the frozen `brick/ide-repair-0` HEAD `90e6da4`) · **record:**
   `bricks/IDE-SYNC-0.md` (to write)
 - **why (user):** "Until that loop is tight, the map is only a picture. Once it syncs both ways, it

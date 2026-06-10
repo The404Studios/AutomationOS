@@ -2,22 +2,33 @@
 
 > Warm memory. Refresh per checkpoint. One active brick at a time.
 
-## SMP-G2 TLBSHOOT-MIN — OPEN (branch `brick/smp-g2-tlbshoot-min`, off frozen `brick/smp-g1-ipi-wake`) — shared kernel mappings safe before the desktop leans on both CPUs
-- **user-set scope (minimal-correct, NO general migration):** link/use the stash-mined TLB IPI
-  handler only under SMP_IPI · bounded ack-counted KERNEL-range flush · local invlpg remains
-  enough for pinned user address spaces · cross-CPU flush ONLY for kernel/global mapping
-  changes · TLB_INVARIANT validator · document the pin/no-migration assumption LOUDLY.
-- **acceptance (user-set):** `TLBSHOOT: PASS kernel_flush=1 acked=1 bounded=1 invariant=1` +
-  the negative proof `TLBSHOOT_NEG: PASS no_user_crossflush_needed_under_pinning=1`.
-- **HARD NO's (user-set):** no general per-mm shootdown · no unpinned migration · no
-  fork-on-CPU1 · no desktop split · no global PREEMPT · no scheduler rewrite · **no blocking
-  while holding rq/heap/scheduler/fs locks — LAW 16** (never wait for TLB ACKs under those
-  locks; TSC-bounded waits from lock-free context only).
-- **context:** existing IPI_TLB_FLUSH (0x51) / IPI_TLB_FLUSH_ALL (0x55) gates are registered
-  since G0; the legacy ipi_tlb_flush_all wait is UNBOUNDED (fix per law 16); tlb_uni.c provides
-  the local handlers; the stash-mined ipi_tlb_flush_page_handler asm is the recorded G2/G3
-  harvest (stash@{0}, archive-never-pop).
-- **next after:** G3 (per-page/precision shootdown) or the wider scheduler policy rungs.
+## SMP-G2 TLBSHOOT-MIN — LANDED (commit `9f1f621`, branch `brick/smp-g2-tlbshoot-min`, awaiting review/push) — kernel-range shootdown proven, pin model audited
+- **THE EXACT ACCEPTANCE HIT (first boot, kernel-printed):** `TLBSHOOT: PASS kernel_flush=1
+  acked=1 bounded=1 invariant=1 (latency_us=382)` + `TLBSHOOT_NEG: PASS
+  no_user_crossflush_needed_under_pinning=1 (procs_checked=3 multi_cpu_masks=0)` + 0
+  [TLB_INVARIANT] + the whole G1+G0+F3-5 ladder green. Record:
+  [`bricks/SMP-G2.md`](bricks/SMP-G2.md) · proof `scripts/tlbshoot_smoke.sh`.
+- **the G2 model (the LOUD assumption block in ipi.c):** user=local, kernel=cross. Every task is
+  single-CPU by construction (F3-2 ctor defaults + explicit pins, no migration primitive) ⇒ user
+  mappings need only local invlpg; kernel/global mappings get `ipi_tlb_flush_kernel_range()` =
+  local invlpg (full-flush fallback >64 pages) + IPI_TLB_FLUSH_PAGE (**vector 0x57**, the
+  stash-mined SMP-R0 harvest renumbered into the checked block) + TSC-bounded 50 ms ack wait.
+  `tlb_pinning_audit` walks every live process — ANY multi-CPU mask FAILS the NEG gate (the
+  forcing function for per-mm shootdown before the assumption rots).
+- **LAW 16 at the wait:** IF==1 entry check (necessary-not-sufficient — plain spin_lock doesn't
+  cli) + bounded timeout (deadlock degrades to a loud violation, never a hang); TLB_INVARIANT
+  validator = LOG+COUNT never panic.
+- **EN-ROUTE FIND — a FALSE-ACK hole closed:** the G0-registered 0x51 handler called tlb_uni.c's
+  tlb_handle_ipi_flush, a single-CPU NO-OP — a remote CPU would have ACKED WITHOUT FLUSHING (the
+  worst shootdown failure: sender believes the remote TLB is clean). 0x51/0x55 now do a real
+  local full flush; ipi_tlb_flush_all's UNBOUNDED wait also bounded. Plus the toolchain reflex:
+  freestanding -O0 turns `__builtin_popcountll` into an unlinked libgcc call — manual bit loop.
+- **byte-identity (laws 2/8):** default `6f99ed9f` + F3-5 SMP `ad072cc6` hash-equal; scheduler.c
+  untouched this brick.
+- **boundary held:** no per-mm shootdown · no unpinned migration · no fork-on-CPU1 · no desktop
+  split · no PREEMPT · no scheduler rewrite · no blocking under rq/heap/scheduler/fs locks.
+- **next after:** G3 (precision/per-mm when the pin audit fires) or the scheduler policy rungs
+  (choose_cpu seam) now that kernel mappings are shootdown-safe.
 
 ## SMP-G1 IPI-WAKE — FROZEN / COMPLETE (pushed `bb5c378`, ls-remote verified; user: "a real performance milestone... CPU1 is no longer 'eventually responsive'; it is interrupt-woken") — 10 ms tick floor → 143 µs
 - **THE EXACT ACCEPTANCE HIT (first boot):** `IPIWAKE: PASS enqueue_to_cpu1=1

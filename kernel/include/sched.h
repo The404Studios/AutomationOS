@@ -65,6 +65,38 @@ typedef enum {
 // the numeric coincidence at 0xFFFFFFFF is harmless). #ifndef-guarded defensively.
 #ifndef CPU_NONE
 #define CPU_NONE  UINT32_MAX   /* pinned_cpu sentinel: task is NOT pinned */
+
+// ===========================================================================
+// SMP-PROFILE-0: the typed scheduling intent (docs/SCHEDULER_POLICY_LAYER.md).
+// ===========================================================================
+// sched_class_t: WHAT a task is, declared as data instead of inferred from
+// hand placements. PROFILE-0 lands the TYPES and the reads; no class changes
+// behavior yet (NORMAL and BATCH both route home CPU0; PINNED_RT's pin was
+// already honored via pinned_cpu). The ordering is deliberate:
+//   - NORMAL = 0 so a memset-zeroed PCB defaults correctly (the F3-2 lesson).
+//   - INTERACTIVE / RECOVERY are RESERVED for laws 4/6 (latency protection,
+//     recovery-outranks-normal); declared now so the enum never reshuffles.
+typedef enum {
+    SCHED_CLASS_NORMAL      = 0,   // default; home CPU0
+    SCHED_CLASS_BATCH       = 1,   // PROFILE-0: data only -- routes home like
+                                   // NORMAL until F3-7 lights layer 3
+    SCHED_CLASS_PINNED_RT   = 2,   // explicitly pinned worker (cpu1hello, the
+                                   // F2 kthread); the pin is the law-2 input
+    SCHED_CLASS_INTERACTIVE = 3,   // RESERVED (law 4) -- no consumer yet
+    SCHED_CLASS_RECOVERY    = 4,   // RESERVED (law 6) -- no consumer yet
+} sched_class_t;
+
+// cpu_role_t: WHAT a CPU is for (the other half of layer 2's class x role).
+typedef enum {
+    CPU_ROLE_GENERAL       = 0,    // CPU0: desktop, syscalls, everything
+    CPU_ROLE_PINNED_WORKER = 1,    // CPU1: explicitly placed workloads only
+} cpu_role_t;
+
+// The per-task profile embedded in process_t (gated, end-of-struct). Loose
+// F3-2 fields (allowed_cpus/pinned_cpu) are NOT relocated in PROFILE-0.
+typedef struct {
+    sched_class_t sched_class;     // memset(0) == SCHED_CLASS_NORMAL
+} sched_profile_t;
 #endif
 
 // ---------------------------------------------------------------------------
@@ -407,6 +439,20 @@ typedef struct process {
     // this, sending SIGCONT to any BLOCKED process would incorrectly wake it.
     // memset-zeroed by process_create()/thread_create().
     int stopped_by_signal;
+
+#if defined(SMP_SCHED) && defined(SMP_SCHED_DISPATCH)
+    // SMP-PROFILE-0: the typed scheduling intent (SCHEDULER_POLICY_LAYER's
+    // sched_profile_t row). AT THE END of the struct (the F3-1 new-field law)
+    // and GATED so non-dispatch builds keep a byte-identical process_t layout.
+    // memset(0) => sched_class == SCHED_CLASS_NORMAL, DELIBERATELY (the F3-2
+    // memset-trap lesson: the zero default must be the correct default).
+    // PROFILE-0 is data + observation only: choose_cpu reads the class but
+    // NORMAL and BATCH both still route home CPU0; nothing migrates. The
+    // F3-2 loose fields (allowed_cpus/pinned_cpu above) deliberately STAY
+    // loose this brick -- relocating them into p->sched touches every ctor/
+    // validator/seam site and is its own future checkpoint.
+    sched_profile_t sched;
+#endif
 } process_t;
 
 // Global pointer to current process (for PE loader and other subsystems)
@@ -461,6 +507,15 @@ process_t* process_get_by_name(const char* needle);  // Find first live process 
 // has more than one answer).
 uint32_t scheduler_choose_cpu(process_t* p);
 void scheduler_choosecpu_selftest(void);
+
+// SMP-PROFILE-0: THE named placement funnel (the policy doc's submit-task
+// pipeline): legal mask -> scheduler_choose_cpu -> legality re-assert (policy
+// cannot escape legality) -> scheduler_add_process_to_cpu (the proven, gated
+// enqueue sink). Returns the CPU the task was placed on. Every placement that
+// used choose_cpu directly now goes through here -- one NAMED funnel.
+uint32_t scheduler_submit_task(process_t* p);
+void scheduler_profile_selftest(void);
+cpu_role_t scheduler_cpu_role(uint32_t cpu);
 // Inlined: process_get_current is on the syscall dispatch hot path (called for
 // every SYS_GETPID, SYS_YIELD, and the table-lookup fallback). A cross-TU
 // function call costs ~5 cycles; inlining a global-load is a single MOV.

@@ -1335,6 +1335,10 @@ void kernel_main(void* raw_info) {
                              * (legality clamps, pin wins, role, home stub)
                              * before any seam-routed placement below runs. */
                             scheduler_choosecpu_selftest();
+                            /* SMP-PROFILE-0: the typed profile exists, the
+                             * seam reads it, and nothing routes differently
+                             * because of it (BATCH = data, not migration). */
+                            scheduler_profile_selftest();
                             /* Brick F2: pin ONE ring-0 kernel test thread to CPU1.
                              * CPU1's ap_scheduler_loop context-switches into it on
                              * the next tick. Spin briefly on the BSP, then read
@@ -1462,13 +1466,15 @@ void kernel_main(void* raw_info) {
                                 }
 #endif
                                 /* F3-6: the one real ring-3 placement goes
-                                 * through THE seam -- its pin+mask resolve
-                                 * to CPU1 in scheduler_choose_cpu, and the
-                                 * CPU1HELLO ladder still passing IS the live
-                                 * proof the seam chose correctly. */
+                                 * through THE seam; PROFILE-0: declared
+                                 * PINNED_RT and submitted via the NAMED
+                                 * funnel. The CPU1HELLO ladder still passing
+                                 * IS the live proof the typed path places
+                                 * identically. (The F3-6 marker line is kept
+                                 * verbatim -- choosecpu_smoke.sh greps it.) */
                                 {
-                                    uint32_t h_target = scheduler_choose_cpu(h);
-                                    scheduler_add_process_to_cpu(h, h_target);
+                                    h->sched.sched_class = SCHED_CLASS_PINNED_RT;
+                                    uint32_t h_target = scheduler_submit_task(h);
                                     kprintf("[SMP] F3-6: cpu1hello placed via "
                                             "scheduler_choose_cpu -> cpu%u\n",
                                             h_target);

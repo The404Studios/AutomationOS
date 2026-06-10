@@ -855,6 +855,16 @@ uint32_t scheduler_choose_cpu(process_t* p) {
     }
 
     /* ---- layer 2: pin/role (pin wins when legal) ------------------------ */
+    /* SMP-PROFILE-0: the seam now READS the typed class. Observation only:
+     * NORMAL and BATCH route identically (home CPU0 below) until F3-7 lights
+     * layer 3; PINNED_RT's placement input was always the pin itself. The one
+     * real check the read buys today: a task DECLARED PINNED_RT without an
+     * actual pin is a declaration bug -- say so loudly (no behavior change;
+     * it still routes like its mask says). */
+    if (p->sched.sched_class == SCHED_CLASS_PINNED_RT && p->pinned_cpu == CPU_NONE) {
+        kprintf("[SCHEDULER] CHOOSECPU: pid=%d '%s' declared PINNED_RT but has "
+                "no pin -- declaration bug (routing by mask)\n", p->pid, p->name);
+    }
     if (p->pinned_cpu != CPU_NONE) {
         if (p->pinned_cpu < 64 && ((legal >> p->pinned_cpu) & 1ULL)) {
             return p->pinned_cpu;
@@ -870,6 +880,52 @@ uint32_t scheduler_choose_cpu(process_t* p) {
 
     /* ---- layer 3: pressure/balancing -- STUB ----------------------------- */
     return 0;                      /* home CPU0; NO balancing, NO migration */
+}
+
+// SMP-PROFILE-0: the CPU-role table (layer 2's other half). Static intent,
+// not discovered state: CPU0 is the general-purpose core (desktop, syscalls),
+// CPU1 takes explicitly placed work only. F3-7's balancer consults this so
+// BATCH spillover can target PINNED_WORKER cores without touching GENERAL.
+cpu_role_t scheduler_cpu_role(uint32_t cpu) {
+    return (cpu == 1) ? CPU_ROLE_PINNED_WORKER : CPU_ROLE_GENERAL;
+}
+
+// SMP-PROFILE-0: THE named placement funnel (the policy doc's pipeline,
+// previously run "by hand" at each call site):
+//   1. target = scheduler_choose_cpu(p)        // layers 1-3 (legality inside)
+//   2. re-assert legality                      // policy cannot escape layer 1
+//   3. scheduler_add_process_to_cpu(p, target) // the proven, gated enqueue sink
+// The re-assert can never fire while choose_cpu honors its own legality
+// contract -- it exists so a FUTURE buggy layer-3 balancer is caught here,
+// loudly, before the (also mandatory) enqueue gate refuses it. One-shot
+// narration for the first few submissions; the wake path calls this at
+// frequency and must stay serial-quiet.
+uint32_t scheduler_submit_task(process_t* p) {
+    if (!p) return 0;
+
+    uint32_t target = scheduler_choose_cpu(p);
+
+    extern int cpu1_is_online(void);
+    uint64_t online = 1ULL | (cpu1_is_online() ? (1ULL << 1) : 0ULL);
+    uint64_t legal  = p->allowed_cpus & online;
+    if (legal != 0 && target < 64 && ((legal >> target) & 1ULL) == 0) {
+        kprintf("[SCHEDULER] SUBMIT: policy escaped legality (pid=%d target=%u "
+                "legal=0x%llx) -- CLAMPED to CPU0\n",
+                p->pid, target, (unsigned long long)legal);
+        target = 0;
+    }
+
+    {
+        static volatile int submit_logged = 0;
+        if (submit_logged < 4) {
+            submit_logged++;
+            kprintf("[SCHED] submit: pid=%d '%s' class=%d -> cpu%u\n",
+                    p->pid, p->name, (int)p->sched.sched_class, target);
+        }
+    }
+
+    scheduler_add_process_to_cpu(p, target);
+    return target;
 }
 
 // SMP-F3-6 selftest: synthetic shells exercise every seam branch (the
@@ -919,6 +975,59 @@ void scheduler_choosecpu_selftest(void) {
             pinned_cpu1, default_cpu0, illegal_clamped,
             nomask_clamped, multimask_home, cpu1only_role);
 }
+
+// SMP-PROFILE-0 selftest: the typed profile exists, the seam reads it, and
+// NOTHING behaves differently because of it. Synthetic shells (the
+// choosecpu-selftest pattern). The submit_funnel flag is NOT asserted here:
+// a synthetic shell must never enter a real runqueue, so the funnel is
+// proven by the LIVE placements (kthread + cpu1hello route through
+// scheduler_submit_task; the smoke greps their '[SCHED] submit:' lines).
+void scheduler_profile_selftest(void) {
+    static process_t t;
+    t.pid = 9998;
+    t.name[0] = 'p'; t.name[1] = 'f'; t.name[2] = 't'; t.name[3] = 0;
+
+    /* 1. NORMAL (the memset default, class 0) routes home CPU0 */
+    t.sched.sched_class = SCHED_CLASS_NORMAL;
+    t.allowed_cpus = (1ULL << 0); t.pinned_cpu = CPU_NONE;
+    int normal_home = (scheduler_choose_cpu(&t) == 0);
+
+    /* 2. BATCH exists as DATA: the class declares + reads back, and even
+     * with a multi-CPU legal mask it still routes home (data, not active
+     * migration -- layer 3 is a stub) */
+    t.sched.sched_class = SCHED_CLASS_BATCH;
+    t.allowed_cpus = (1ULL << 0) | (1ULL << 1); t.pinned_cpu = CPU_NONE;
+    int batch_declared = (t.sched.sched_class == SCHED_CLASS_BATCH) &&
+                         (scheduler_choose_cpu(&t) == 0);
+
+    /* 3. PINNED_RT with a legal pin is honored (the class names what the
+     * pin already enforced) */
+    t.sched.sched_class = SCHED_CLASS_PINNED_RT;
+    t.allowed_cpus = (1ULL << 1); t.pinned_cpu = 1;
+    extern int cpu1_is_online(void);
+    uint32_t r3 = scheduler_choose_cpu(&t);
+    int pinned_rt_legal = cpu1_is_online() ? (r3 == 1) : (r3 == 0);
+
+    /* 4. no behavior change: every class answers exactly what the classless
+     * F3-6 seam answered for the same mask/pin shape (NORMAL multimask ->
+     * home; BATCH single-CPU0 -> home; PINNED_RT off-mask pin -> clamped) */
+    t.sched.sched_class = SCHED_CLASS_NORMAL;
+    t.allowed_cpus = (1ULL << 0) | (1ULL << 1); t.pinned_cpu = CPU_NONE;
+    int nb1 = (scheduler_choose_cpu(&t) == 0);
+    t.sched.sched_class = SCHED_CLASS_BATCH;
+    t.allowed_cpus = (1ULL << 0); t.pinned_cpu = CPU_NONE;
+    int nb2 = (scheduler_choose_cpu(&t) == 0);
+    t.sched.sched_class = SCHED_CLASS_PINNED_RT;
+    t.allowed_cpus = (1ULL << 0); t.pinned_cpu = 1;     /* off-mask pin */
+    int nb3 = (scheduler_choose_cpu(&t) == 0);          /* clamped, loudly */
+    int no_behavior_change = nb1 && nb2 && nb3;
+
+    int pass = normal_home && batch_declared && pinned_rt_legal && no_behavior_change;
+    kprintf("SMPPROFILE-CORE: %s normal_home=%d batch_declared=%d "
+            "pinned_rt_legal=%d no_behavior_change=%d\n",
+            pass ? "PASS" : "FAIL",
+            normal_home, batch_declared, pinned_rt_legal, no_behavior_change);
+}
 #endif /* SMP_SCHED && SMP_SCHED_DISPATCH */
 
 // F3-5: HOME-ROUTED wake enqueue. Wake-side code (waitqueue signal/timer) used
@@ -933,7 +1042,9 @@ void scheduler_choosecpu_selftest(void) {
 void scheduler_add_process_home(process_t* proc) {
     if (!proc) return;
 #if defined(SMP_SCHED) && defined(SMP_SCHED_DISPATCH)
-    scheduler_add_process_to_cpu(proc, scheduler_choose_cpu(proc));
+    /* PROFILE-0: through the NAMED funnel (choose + legality re-assert +
+     * the gated sink), not the bare choose+add pair. */
+    scheduler_submit_task(proc);
 #else
     scheduler_add_process(proc);
 #endif
@@ -1238,9 +1349,11 @@ void ap_spawn_test_kthread(void) {
             process_unref(ini);
         }
     }
-    // F3-6: the kthread placement goes through THE seam (the F3-3 panel's
-    // "one decider" requirement) -- its pin+mask resolve to CPU1 there.
-    scheduler_add_process_to_cpu(t, scheduler_choose_cpu(t));
+    // PROFILE-0: declare what this task IS (the class names what the pin
+    // already enforced), then place through the NAMED funnel (F3-6's "one
+    // decider", now with the legality re-assert).
+    t->sched.sched_class = SCHED_CLASS_PINNED_RT;
+    scheduler_submit_task(t);
     kprintf("[SMP] Brick F2: pinned AP test kthread PID %d to CPU1 (kernel stack=%p)\n",
             t->pid, (void*)t->kernel_stack);
 }

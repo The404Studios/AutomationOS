@@ -2,17 +2,31 @@
 
 > Warm memory. Refresh per checkpoint. One active brick at a time.
 
-## IDE-WAVE-2 (ACTIVE) — four parallel designs, serial implementation
+## IDE-WAVE-2 — LANDED (all four bricks committed local, awaiting review/push) — four parallel designs, serial implementation
 - **user verdict on IDE-SYNC-0:** "perfect its working good" (T410 hands-on) → pushed + frozen.
-- **in flight:** 4 read-only design agents, one per next brick:
-  IDE-CONTEXT-0 (persistent project>file>FN breadcrumb in BOTH workspaces + what-changed indicator) ·
-  MAP-STABLE-0 (deterministic layout: same function = same place) ·
-  VIZ1-PARITY-0 (mockup gaps: satellite cards, connector studs, close-hint, legend chip) ·
-  IDE-XFILE-0 (the minimal cross-file model: whole-project map; map follows stop no-oping on
-  out-of-file targets; jump opens the target file).
-- **implementation order:** user-set CONTEXT → STABLE → PARITY, with XFILE slotted by its scope
-  assessment (likely its own multi-checkpoint brick). One commit + clean build + screenshot per
-  checkpoint, same discipline as IDE-REPAIR-0/SYNC-0.
+- **record:** [`bricks/IDE-WAVE-2.md`](bricks/IDE-WAVE-2.md) · **branch chain (off `brick/ide-sync-0`
+  `0f321fe`):** `brick/ide-context-0` → `brick/map-stable-0` → `brick/viz1-parity-0` →
+  `brick/ide-xfile-0` (each off the previous HEAD; all LOCAL, push on the user's word).
+- **IDE-CONTEXT-0** (`06f7787` + `9502f2d`): ONE breadcrumb spine ("project > file > FN Ln l,c")
+  in BOTH workspaces' status bars + the edits-since-save what-changed star (choke-point wiring).
+  EN ROUTE: the BLANK-IDE bug = scan_dir's 18 KB-per-level stack dirent buffer crossing the ~64 KB
+  mapped user stack → sys_readdir copy_to_user EFAULT read as end-of-dir; fix = static buffer.
+  RULE: no large stack locals in recursive userspace code (2nd hit of this family).
+- **MAP-STABLE-0** (`c68c310`): layout was already deterministic; the real bug was shared pan
+  (map_ox/oy) surviving focus changes → reset in ide_set_focus + order-contract comments.
+- **VIZ1-PARITY-0** (`5859843`): 2-line satellite cards (Type:/Ports(N)/(extern)), connector
+  studs, CLICK-TO-CLOSE hint, legend chips — `viz1_lego.png` matches the user's mockup.
+- **IDE-XFILE-0** (0a `334fb52` + 0b `7dbd819`): model_parse split (reset+append) →
+  ide_parse_project_model parses every sibling .c then the OPEN file LAST; editor-coupled views
+  filter to cur_file; map resolves siblings + shows INCOMING cross-file callers; 0b
+  `ide_sel_jump_xfile` (copy-inputs-then-reopen — pointers into the model DIE at reopen) makes a
+  cross-file follow OPEN the sibling and land the caret. PROOF `xfile0b2_xjump.png`: follow
+  game_main() from tower_tick's map → breadcrumb flips to "src > main.c > game_main Ln 12,1",
+  every pane rebuilt in sync. HARNESS FINDING: the old right+ret jump step had always no-oped
+  (g_enemies READ, no producer); added the left+ret xjump step that exercises the real follow.
+- **deferred (XFILE design):** globals-file mislabel (extern-first dedupe) · static-name
+  collisions · recursive subdirs · .asm siblings.
+- **next:** T410 hands-on (mouse paths) → push all four branches → net-stack Phase 1 → E1000-PCH-0.
 
 ## IDE-SYNC-0 — FROZEN / COMPLETE (pushed `16b2a01`, T410-CONFIRMED "perfect its working good") — the core prosthetic loop: ONE selection model, three panes
 - **branch:** `brick/ide-sync-0` (off the frozen `brick/ide-repair-0` HEAD `90e6da4`) · **record:**

@@ -529,11 +529,20 @@ static void scan_dir(Ide* a, const char* dir, int depth) {
     if (a->nentries >= IDE_MAXENT) return;
     if (depth > 16) return;           /* hard guard against cycles         */
 
-    /* Local scratch -- one chunk of dirents for this level. We read the whole
+    /* Scratch -- one chunk of dirents for this level. We read the whole
      * directory once, record the rows, then recurse into the subdirs in a
-     * second pass (so a level's files/dirs are listed together). */
+     * second pass (so a level's files/dirs are listed together).
+     *
+     * STATIC IS LOAD-BEARING: this is ~18 KB (64 x 280 B). As a stack local,
+     * depth-1/2 recursion pushed the buffer past the ~64 KB mapped user
+     * stack; sys_readdir's copy_to_user then hit the unmapped page, returned
+     * EFAULT, and ide_list_dir read it as end-of-directory -- SILENT empty
+     * subdir listings (dirs-only explorer, startup auto-open dead), flipping
+     * with unrelated frame-layout shifts across builds. Static is safe here
+     * because pass 1 fully drains `ents` into a->entries BEFORE pass 2
+     * recurses -- the buffer is dead across the recursive call. */
     enum { LVL_MAX = 64 };
-    IdeDirent ents[LVL_MAX];
+    static IdeDirent ents[LVL_MAX];
     int got = ide_list_dir(dir, ents, LVL_MAX);
     if (got < 0) return;
 

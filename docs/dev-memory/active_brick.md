@@ -2,22 +2,37 @@
 
 > Warm memory. Refresh per checkpoint. One active brick at a time.
 
-## SMP-F3-7 BATCH-CLASS — OPEN (branch `brick/smp-f3-7-batchclass`, off frozen `brick/smp-h1-bkl-lite`) — CPU1 becomes useful for ordinary workload classes
-- **why (user):** "the first brick where CPU1 starts becoming useful for ordinary workload
-  classes, but still under typed intent and safety gates."
-- **user-set scope:** activate BATCH class routing · BATCH + legal multi-CPU mask MAY choose
-  CPU1 · NORMAL remains home CPU0 · PINNED_RT still obeys its explicit pin · the submit funnel
-  + enqueue legality walls remain MANDATORY · the G1 IPI kick wakes CPU1 after the foreign
-  enqueue · the BKL wall protects marked syscall paths.
-- **acceptance (user-set):** `BATCHCLASS: PASS batch_cpu1=1 normal_cpu0=1 pinned_rt_cpu1=1
-  illegal_clamped=1 ipi_wake=1 bkl_safe=1`.
-- **HARD NO's (user-set):** no work stealing · no desktop split yet · no unpinned arbitrary
-  migration · no general per-mm shootdown · no global PREEMPT.
-- **design note:** this is the policy doc's "F3-7 inserts one branch in the layer-3 stub; no
-  caller changes" promise coming due — BATCH+legal-CPU1 → the PINNED_WORKER core (law 5: batch
-  fills idle), everything else unchanged. PROFILE-0's batch-routes-home selftest expectation
-  flips WITH the new gate (the CORE line stays identical so frozen smokes keep passing).
-  Gated SMP_BATCH=1; acceptance profile = the full stack (+SMP_IPI +SMP_BKL).
+## SMP-F3-7 BATCH-CLASS — LANDED (commit `4f859c0`, branch `brick/smp-f3-7-batchclass`, awaiting review/push) — ordinary work runs on CPU1 under typed intent
+- **THE EXACT ACCEPTANCE HIT (4th run; 3 failures root-caused en route):** `BATCHCLASS: PASS
+  batch_cpu1=1 normal_cpu0=1 pinned_rt_cpu1=1 illegal_clamped=1 ipi_wake=1 bkl_safe=1` —
+  batchdemo (class=BATCH, mask CPU0|CPU1, NOT pinned, NOT special-cased): "the seam chose
+  cpu1", dispatched 2000 µs after enqueue (tick floor 10 ms), 48 BKL-marked FS reads ON CPU1
+  (engaged, 0 warnings), exit 7, init-reaped; + BATCHCLASS-CORE all-5 synthetic; + the ENTIRE
+  ladder incl. both 60 s storms. Record: [`bricks/SMP-F3-7.md`](bricks/SMP-F3-7.md) · proof
+  `scripts/batchclass_smoke.sh`.
+- **the one branch (the doc's promise due):** choose_cpu layer 3 under SMP_BATCH —
+  BATCH+legal-CPU1 → PINNED_WORKER (law 5). PLACEMENT only, enqueue-time, deterministic;
+  nothing queued/running moves. PROFILE-0's batch selftest expectation flips WITH the gate
+  (CORE line identical → frozen smokes keep passing).
+- **the three en-route finds:** (1) SPAWN ORDER — batchdemo after the 60 s CPU1 storm measured
+  578 ms of storm-sharing then starved; moved before the storms. (2) THRESHOLD HONESTY — 2 ms
+  vs a busy CPU1 is cooperative hand-off, not wake failure; bound = the 10 ms tick floor, idle
+  rigor delegated to the G1 ping gate (same boot). (3) **CROSS-CPU SERIAL SHREDDING (the
+  keeper)** — storm-volume CPU1 prints shredded BSP lines per-byte, destroying acceptance
+  evidence NON-DETERMINISTICALLY; fixed with a bounded best-effort serial LINE lock around
+  kprintf's batched serial_write (printf.c, SMP_BATCH-gated; same-CPU IRQ re-entry degrades to
+  one unserialized line, never a hang).
+- **⚠ THE AUDIT GAP (surfaced for the next brick):** batchdemo is the FIRST multi-CPU-mask
+  process — the G2 pin audit would FAIL it post-spawn (it runs pre-spawn today). The REAL
+  invariant (address space only ever LOADED on one CPU) still holds: enqueue-once + sticky
+  deterministic re-choice + no migration primitive. NEXT CHECKPOINT (with/before
+  DESKTOP-SPLIT): evolve the audit to the true invariant — `p->ran_on_cpus |= (1<<cpu)` at
+  dispatch, audit popcount ≤ 1 — so the forcing function fires on actual cross-CPU
+  address-space use, not declared masks.
+- **byte-identity:** default `6f99ed9f`; BKL profile zero-F3-7-code (baseline `1478b7c7`).
+- **HARD NO's held:** no stealing · no desktop split · no unpinned ARBITRARY migration · no
+  per-mm shootdown · no global PREEMPT.
+- **next:** DESKTOP-SPLIT (user ladder), opening with the ran_on_cpus audit evolution.
 
 ## SMP-H1 BKL-LITE — FROZEN / COMPLETE (pushed `ad40be1`, ls-remote verified; user: "the bridge from 'CPU1 can run code' to 'CPU1 can safely run useful code'") — the safety wall held under a 60s two-CPU storm
 - **THE EXACT ACCEPTANCE HIT (first boot):** `BKL: PASS syscall_storm=1 duration=60s cpu0=1

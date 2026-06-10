@@ -2,6 +2,38 @@
 
 > Warm memory. Refresh per checkpoint. One active brick at a time.
 
+## IDE-SYNC-0 (ACTIVE) — the core prosthetic loop: ONE selection model, three panes
+- **branch:** `brick/ide-sync-0` (off the frozen `brick/ide-repair-0` HEAD `90e6da4`) · **record:**
+  `bricks/IDE-SYNC-0.md` (to write)
+- **why (user):** "Until that loop is tight, the map is only a picture. Once it syncs both ways, it
+  becomes external working memory." editor caret → map node → inspector table → explanation panel →
+  back to editor.
+- **DESIGN LAW (the big rule):** ONE active selection model — `active_file / active_line /
+  active_symbol_id / active_node_id / active_panel`. Editor, map, and inspector do NOT invent their
+  own selection state; they all read/write the same model.
+- **checkpoints (user-set):** S0 editor caret → active symbol/node · S1 active symbol → inspector
+  detail (+ map highlight) · S2 map click → editor jump · S3 inspector row click → editor jump ·
+  S4 selection highlight consistent across all three panes, sync survives typing/redraw.
+- **HARD NO's:** no stable-layout work yet, no map redesign, no new visual styles, no new parser
+  unless the existing symbol extraction is unusable.
+- **acceptance:** click in a function → map node highlights + inspector shows it + breadcrumb
+  updates; map node click → editor jumps + inspector updates; inspector row click → editor jumps +
+  map highlights; type/edit → sync survives; no overlap regression; build_all clean; 0 panic.
+- **commits (user-suggested):** S0 `feat(ide): IDE-SYNC-0 S0 track editor caret symbol` · S1
+  `feat(ide): IDE-SYNC-0 S1 sync map and inspector selection` · S2/S3 `feat(ide): IDE-SYNC-0 S2
+  jump editor from map and inspector` · docs record.
+- **after (user order):** IDE-CONTEXT-0 → MAP-STABLE-0 → VIZ1-PARITY-0.
+- **status:** **LANDED — all checkpoints committed local, awaiting review/push.** S0 `337258d`
+  (IdeSel + ide_sel_from_caret hooked after every caret move in both workspaces + the FN/Ln
+  breadcrumb) · S1 `0cc10ff` (caret crossings refocus; ide_set_focus tail-writes THE model —
+  **proven interactively** via QMP key injection: caret into tower_init in the editor → LEGO shows
+  the tower_init central card + INSPECTOR — tower_init + FN tower_init Ln 15,1, `s1b_lego.png`) ·
+  S2/S3/S4 `073898d` (ide_sel_jump: map follows + inspector CONN/PORTS rows land the editor caret
+  on the symbol; newline edits shift the recorded line ranges so sync survives typing;
+  `s2_jump.png` = the full coherence frame, near-mockup). Harness:
+  `build_test/ide_sync_check.sh` (QMP KEYBOARD injection works; mouse rel does NOT reach the
+  compositor — T410 hands-on covers the mouse paths). record: `bricks/IDE-SYNC-0.md`.
+
 ## IDE-APHANTASIA (NORTH STAR, user-set 2026-06-09) — who this IDE is FOR
 - **the user:** "we are building this ide for people who have aphantasia." The Semantic LEGO map /
   inspector tables / runtime flow ARE the mental image aphantasic programmers cannot form internally

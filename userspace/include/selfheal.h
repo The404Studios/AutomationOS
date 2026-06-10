@@ -56,7 +56,7 @@
 #define SELFHEAL_SHM_KEY   0x53480001   /* 'SH' + 0001                            */
 #define SELFHEAL_SHM_SIZE  4096u        /* exactly one page                       */
 #define SELFHEAL_MAGIC     0x53484254u  /* 'SHBT' — set once the page is live     */
-#define SELFHEAL_VERSION   1u
+#define SELFHEAL_VERSION   2u           /* v2: + window registry at offset 256    */
 
 /* Informational compositor state (the liveness decision is purely "did
  * frame_counter advance", not this field). */
@@ -77,5 +77,38 @@ typedef struct sh_heartbeat {
     volatile unsigned long long last_frame_ms;   /* SYS_GET_TICKS_MS at last beat  */
     volatile unsigned long long reserved[4];     /* future use; keeps struct 64 B  */
 } sh_heartbeat_t;
+
+/* ========================= WINDOW REGISTRY (v2) ==============================
+ * The heartbeat uses 64 B of the 4 KiB page; the rest carries a mirror of the
+ * compositor's window table so a RESPAWNED compositor can restore the desktop
+ * instead of coming back empty. (Recovery that loses every open window reads
+ * as "self heal is not working" -- the windows ARE the desktop.)
+ *
+ *   - compositor (only writer): mirrors {win_id, client pid, shm_id, buffer
+ *     extent, frame position, title} after create/destroy and once per second
+ *     (cheap full re-mirror -- covers moves/snaps/closes without hooking every
+ *     mutation site).
+ *   - respawned compositor (reader): walks the registry, re-attaches each
+ *     client's pixel buffer by shm_id, and rebuilds its window table. A DEAD
+ *     client's buffer segment died with it (the client owns it), so a failed
+ *     shmat IS the liveness test -- stale entries skip + clear cleanly.
+ *   - clients: never participate; their win_id handles stay valid because the
+ *     restore re-creates each window under its ORIGINAL win_id.
+ *
+ * Same single-writer discipline as the heartbeat: the registry is only read
+ * once, at respawn, when the writer is dead -- no concurrent reader exists. */
+#define SH_WINREG_OFFSET   256u         /* byte offset of the registry in-page    */
+#define SH_WINREG_MAX      16u          /* mirrors the compositor's MAX_WINDOWS   */
+#define SH_WINREG_TITLE    48u          /* mirrors WL_TITLE_MAX                   */
+
+typedef struct sh_winreg_ent {
+    volatile int          used;         /* 1 = live window mirrored here          */
+    volatile int          win_id;       /* compositor-assigned id (client holds)  */
+    volatile int          client_pid;   /* owner pid (reply-queue key)            */
+    volatile int          shm_id;       /* the client's pixel-buffer segment      */
+    volatile unsigned int buf_w, buf_h; /* IMMUTABLE buffer extent (pixels)       */
+    volatile int          x, y;         /* frame position at last mirror          */
+    char                  title[SH_WINREG_TITLE];
+} sh_winreg_ent_t;                       /* 80 B x 16 = 1280 B; 256+1280 < 4096   */
 
 #endif /* SELFHEAL_H */

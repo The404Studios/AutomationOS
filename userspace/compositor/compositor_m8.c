@@ -363,6 +363,15 @@ static void print_num(long n) {
 /* SYS_SHMAT(19) + SYS_GET_TICKS_MS(40) are already #defined above. */
 
 static volatile sh_heartbeat_t* g_hb = (volatile sh_heartbeat_t*)0;
+/* SELFHEAL v2: the window registry lives in the SAME init-owned page (offset
+ * SH_WINREG_OFFSET) so a respawned compositor can RESTORE the desktop instead
+ * of coming back empty. Mirrored by selfheal_reg_sync (definitions live after
+ * the window table/protocol code they need); read once by
+ * selfheal_restore_windows at respawn. */
+static volatile sh_winreg_ent_t* g_wreg = (volatile sh_winreg_ent_t*)0;
+static int g_sh_respawn = 0;            /* selfheal_init: was_init latch        */
+static void selfheal_reg_sync(void);
+static void selfheal_restore_windows(uint32_t fb_w, uint32_t fb_h);
 #ifdef SELFHEAL_FREEZE
 #ifndef FREEZE_AT_FRAME
 #define FREEZE_AT_FRAME 240        /* ~4s into the loop @ ~60fps */
@@ -387,8 +396,10 @@ static void selfheal_init(void) {
     if (id < 0) { print("[SHELL] SELFHEAL: heartbeat segment missing\n"); return; }
     long p = sc6(SYS_SHMAT, id, 0, 0, 0, 0, 0);                        /* RW attach */
     if (p <= 0) { print("[SHELL] SELFHEAL: heartbeat shmat FAILED\n"); return; }
-    g_hb = (volatile sh_heartbeat_t*)p;
+    g_hb   = (volatile sh_heartbeat_t*)p;
+    g_wreg = (volatile sh_winreg_ent_t*)((char*)p + SH_WINREG_OFFSET);
     unsigned int was_init = (g_hb->magic == SELFHEAL_MAGIC);           /* respawn? */
+    g_sh_respawn = (int)was_init;       /* _start runs the window restore on respawn */
     g_hb->version        = SELFHEAL_VERSION;
     g_hb->compositor_pid = (unsigned int)syscall(SYS_GETPID, 0, 0, 0);
     if (!was_init) g_hb->frame_counter = 0;
@@ -3985,6 +3996,10 @@ static void handle_create(const wl_req_create_t *req) {
     print("[COMP] client connected win="); print_num(win->win_id);
     print(" "); print_num((long)win->w); print("x"); print_num((long)win->h);
     print(" pid="); print_num(win->client_pid); print("\n");
+
+#ifdef SELFHEAL
+    selfheal_reg_sync();                /* mirror the new window for recovery */
+#endif
 }
 
 static void handle_commit(const wl_req_commit_t *req) {
@@ -4075,6 +4090,9 @@ static void destroy_slot(int slot) {
     if (pid > 1) {
         syscall(SYS_KILL, pid, SIGTERM, 0);
     }
+#ifdef SELFHEAL
+    selfheal_reg_sync();                /* drop the window from the recovery mirror */
+#endif
 }
 
 /* Begin the CLOSE animation; the slot is freed when the animation completes
@@ -4151,6 +4169,110 @@ static void handle_resize(const wl_req_resize_t *req) {
     print(" to "); print_num((long)req->w); print("x"); print_num((long)req->h);
     print("\n");
 }
+
+#ifdef SELFHEAL
+/* SELFHEAL v2: mirror the live window table into the registry page (full
+ * re-mirror; 16 entries of plain stores -- cheap enough to run per second).
+ * Windows mid-close are skipped so a recovery never resurrects one. */
+static void selfheal_reg_sync(void) {
+    if (!g_wreg) return;
+    for (int s = 0; s < MAX_WINDOWS && s < (int)SH_WINREG_MAX; s++) {
+        window_t *win = &g_windows[s];
+        volatile sh_winreg_ent_t *e = &g_wreg[s];
+        if (!win->used || win->phase == PH_CLOSING) { e->used = 0; continue; }
+        e->win_id     = win->win_id;
+        e->client_pid = win->client_pid;
+        e->shm_id     = win->shm_id;
+        e->buf_w      = win->buf_w;
+        e->buf_h      = win->buf_h;
+        e->x          = win->x;
+        e->y          = win->y;
+        for (int i = 0; i < WL_TITLE_MAX && i < (int)SH_WINREG_TITLE; i++)
+            e->title[i] = win->title[i];
+        e->title[SH_WINREG_TITLE - 1] = '\0';
+        e->used = 1;                                /* publish LAST */
+    }
+}
+
+/* SELFHEAL v2: a RESPAWNED compositor rebuilds its window table from the
+ * registry the previous instance mirrored. Re-attach each client's pixel
+ * buffer by shm_id: the CLIENT owns that segment, so if the client died the
+ * segment died with it and shmat fails => the failed attach IS the liveness
+ * test; stale entries are cleared. Windows come back under their ORIGINAL
+ * win_id so the clients' handles (and their commit/destroy requests) stay
+ * valid; reply queues re-resolve lazily by pid. */
+static void selfheal_restore_windows(uint32_t fb_w, uint32_t fb_h) {
+    if (!g_wreg) return;
+    int restored = 0;
+    for (int s = 0; s < (int)SH_WINREG_MAX; s++) {
+        volatile sh_winreg_ent_t *e = &g_wreg[s];
+        if (!e->used) continue;
+        if (e->win_id <= 0 || e->shm_id < 0 ||
+            e->buf_w == 0 || e->buf_h == 0) { e->used = 0; continue; }
+
+        long addr = sc6(SYS_SHMAT, (long)e->shm_id, 0, 0, 0, 0, 0);
+        if (addr <= 0) {                            /* client died with its buffer */
+            print("[COMP] SELFHEAL: skip win="); print_num(e->win_id);
+            print(" (client gone)\n");
+            e->used = 0;
+            continue;
+        }
+        /* Same OOB-blit guard as handle_create: the claimed extent must fit
+         * the actual segment (the registry could be stale across a resize). */
+        uint64_t need = (uint64_t)e->buf_w * (uint64_t)e->buf_h * 4u;
+        uint64_t have = shm_segment_size(e->shm_id);
+        if (have == 0 || need > have) {
+            sc6(SYS_SHMDT, addr, 0, 0, 0, 0, 0);
+            e->used = 0;
+            continue;
+        }
+
+        int slot = find_free_slot();
+        if (slot < 0) { sc6(SYS_SHMDT, addr, 0, 0, 0, 0, 0); break; }
+        window_t *win = &g_windows[slot];
+        for (size_t i = 0; i < sizeof(*win); i++) ((char *)win)[i] = 0;
+        win->used       = 1;
+        win->win_id     = e->win_id;                /* ORIGINAL id: client handles live */
+        win->client_pid = e->client_pid;
+        win->reply_qid  = -1;                       /* re-resolve lazily by pid */
+        win->shm_id     = e->shm_id;
+        win->shm_vaddr  = (uint64_t)addr;
+        win->pixels     = (uint32_t *)addr;
+        win->buf_w      = e->buf_w;
+        win->buf_h      = e->buf_h;
+        win->stride     = e->buf_w;                 /* tightly packed, pinned (create rule) */
+        win->w          = e->buf_w > fb_w ? fb_w : e->buf_w;
+        win->h          = e->buf_h > fb_h ? fb_h : e->buf_h;
+        win->x          = e->x;
+        win->y          = e->y;
+        win->dirty      = 1;
+        win->phase      = PH_NONE;
+        win->minimized  = 0;                        /* recovered windows come back visible */
+        win->tb_idx     = -1;
+        win->snap_state = SNAP_NONE;
+        win->fade_alpha    = 0;                     /* fade back in: visible "I'm back" cue */
+        win->fade_start_ms = syscall(SYS_GET_TICKS_MS, 0, 0, 0);
+        for (int i = 0; i < WL_TITLE_MAX && i < (int)SH_WINREG_TITLE; i++)
+            win->title[i] = e->title[i];
+        win->title[WL_TITLE_MAX - 1] = '\0';
+        clamp_window(win);
+        if (win->win_id >= g_next_win_id) g_next_win_id = win->win_id + 1;
+        z_push_front(slot);
+        mru_promote(slot);
+        restored++;
+        print("[COMP] SELFHEAL: restored win="); print_num(win->win_id);
+        print(" pid="); print_num(win->client_pid);
+        print(" "); print_num((long)win->buf_w); print("x"); print_num((long)win->buf_h);
+        print("\n");
+    }
+    if (restored > 0) {
+        g_full_damage_cooldown = FULL_DAMAGE_COOLDOWN_FRAMES;
+        damage_add_full();
+        mark_dirty();
+    }
+    print("[COMP] SELFHEAL: restore done, windows="); print_num(restored); print("\n");
+}
+#endif /* SELFHEAL */
 
 /* Maximum client messages to service per frame.  A malicious/chatty client that
  * floods the inbox could otherwise stall the compositor in this loop forever,
@@ -5368,6 +5490,11 @@ void _start(void) {
 #ifdef SELFHEAL
     /* Attach + publish the liveness heartbeat before the loop starts beating it. */
     selfheal_init();
+    /* v2: on a RESPAWN (cwatchdog recovery or crash), rebuild the window table
+     * from the registry the previous instance mirrored -- recovery that loses
+     * every open window reads as "self heal is not working". Runs before the
+     * frame loop, so queued client commits find their windows again. */
+    if (g_sh_respawn) selfheal_restore_windows(W, H);
 #endif
 
     /* 4b. Probe the CMOS RTC via SYS_GETTIME so the panel clock can show
@@ -5435,6 +5562,12 @@ void _start(void) {
                 refresh_net_status();   /* update network indicator   */
                 refresh_battery();      /* update battery indicator   */
                 mark_dirty();
+#ifdef SELFHEAL
+                /* v2: re-mirror the window table once per second so the
+                 * recovery registry tracks moves/snaps/titles without
+                 * hooking every mutation site. 16 entries of plain stores. */
+                selfheal_reg_sync();
+#endif
             }
         }
 

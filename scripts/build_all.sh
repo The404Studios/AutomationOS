@@ -303,6 +303,9 @@ cc userspace/apps/nicup/nicup.c /tmp/nicup.o; $LD /tmp/crt0.o /tmp/nicup.o -o /t
 # cpu1hello: SMP-F3-5 first-ring-3-on-CPU1 workload. Shipped always (tiny);
 # only the SMP_SCHED_DISPATCH kernel ever spawns it (pinned to CPU1).
 cc userspace/tests/cpu1hello.c /tmp/cpu1hello.o; $LD /tmp/crt0.o /tmp/cpu1hello.o -o /tmp/cpu1hello.elf
+# bklstorm: SMP-H1 60s two-CPU syscall storm. Shipped always (tiny);
+# only the SMP_BKL kernel ever spawns it (one pinned CPU1 + one CPU0).
+cc userspace/tests/bklstorm.c /tmp/bklstorm.o; $LD /tmp/crt0.o /tmp/bklstorm.o -o /tmp/bklstorm.elf
 # apidemo: fetch http(s) URL + pretty-print JSON (crt0+main; HTTPS + json).
 cc userspace/apps/apidemo/apidemo.c /tmp/apidemo.o; $LD /tmp/crt0.o /tmp/apidemo.o /tmp/json.o $HTTPS_OBJS -o /tmp/apidemo.elf
 
@@ -631,6 +634,8 @@ cp /tmp/autodhcp.elf /tmp/ird/sbin/autodhcp
 cp /tmp/nicup.elf /tmp/ird/bin/nicup
 # cpu1hello -> /sbin (SMP-F3-5; inert unless the SMP_SCHED_DISPATCH kernel spawns it).
 cp /tmp/cpu1hello.elf /tmp/ird/sbin/cpu1hello
+# bklstorm -> /sbin (SMP-H1; inert unless the SMP_BKL kernel spawns it).
+cp /tmp/bklstorm.elf /tmp/ird/sbin/bklstorm
 # cpu1offload -> /sbin (init spawns it at boot; prints PASS on SMP, SKIP on default).
 cp /tmp/cpu1offload.elf /tmp/ird/sbin/cpu1offload
 # smpstress -> /sbin (init spawns it; PASS on SMP after thousands of CPU1 jobs, SKIP on default).

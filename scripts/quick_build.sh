@@ -131,6 +131,7 @@ fi
 # =============================================================================
 SMP_SOURCES=""
 SMP_IPI_SOURCES=""
+SMP_BKL_SOURCES=""
 if [ "${SMP:-0}" = "1" ]; then
     CFLAGS="$CFLAGS -DSMP_FOUNDATION"
     KERNEL_OUT="build/kernel-smp.elf"
@@ -206,6 +207,23 @@ if [ "${SMP:-0}" = "1" ]; then
         CFLAGS="$CFLAGS -DSMP_IPI"
         SMP_IPI_SOURCES="1"
         echo "*** SMP_IPI build: ipi.c + ipi_handlers.asm linked (SMP-G0 IPI-LINK) ***"
+    fi
+
+    # =========================================================================
+    # SMP_BKL (SMP-H1 BKL-LITE) -- sub-gate, REQUIRES SMP=1. ONE owner-
+    # recursive outer kernel lock (kernel/core/syscall/bkl.c) acquired in the
+    # syscall dispatcher around the MARKED unsafe groups (FS/net/IPC/proc --
+    # the table + the loud blocking-exclusion doc live in bkl.c). The Linux-
+    # 2.0-style safety wall before BATCH work runs real userspace on CPU1.
+    # kernel.c additionally spawns the two 60s bklstorm instances (CPU1
+    # pinned + CPU0 home) for the acceptance run. When UNSET: bkl.c is not
+    # compiled, no -DSMP_BKL, every other build is byte-for-byte unchanged.
+    # Build: SMP=1 SMP_SCHED=1 SMP_SCHED_DISPATCH=1 SMP_IPI=1 SMP_BKL=1 ...
+    # =========================================================================
+    if [ "${SMP_BKL:-0}" = "1" ]; then
+        CFLAGS="$CFLAGS -DSMP_BKL"
+        SMP_BKL_SOURCES="1"
+        echo "*** SMP_BKL build: the BKL-LITE outer kernel lock armed (SMP-H1) ***"
     fi
 fi
 
@@ -355,6 +373,10 @@ if [ -n "$SMP_SOURCES" ]; then
     # older duplicate-symbol variant and must NEVER be added alongside this.
     if [ -n "$SMP_IPI_SOURCES" ]; then
         compile kernel/arch/x86_64/ipi.c     c_ipi
+    fi
+    # SMP-H1 (GATED by SMP_BKL=1): the BKL-LITE outer kernel lock.
+    if [ -n "$SMP_BKL_SOURCES" ]; then
+        compile kernel/core/syscall/bkl.c    c_bkl
     fi
 fi
 compile kernel/drivers/serial.c              c_serial

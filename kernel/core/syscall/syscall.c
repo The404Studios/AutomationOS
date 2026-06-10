@@ -388,7 +388,32 @@ int64_t syscall_dispatch(uint64_t syscall_num, uint64_t arg1, uint64_t arg2,
     kprintf("[SYSCALL] Dispatching syscall %u\n", (uint32_t)syscall_num);
 #endif
 
+#ifdef SMP_BKL
+    // SMP-H1 BKL-LITE: the marked-unsafe groups (FS/net/IPC/proc -- see the
+    // table + the loud blocking-exclusion doc in bkl.c) take the one outer
+    // kernel lock around the WHOLE handler body. Unmarked syscalls (and the
+    // getpid/ticks/yield fast paths above, which never reach this point) run
+    // exactly as before. Owner-recursive, so a marked handler internally
+    // re-entering a marked path cannot self-deadlock. Falls through (no early
+    // return) so the post-handler diagnostics below stay live for marked
+    // syscalls too.
+    extern int  bkl_is_marked(uint64_t n);
+    extern void bkl_acquire(void);
+    extern void bkl_release(void);
+    int bkl_held = 0;
+    if (bkl_is_marked(syscall_num)) {
+        bkl_acquire();
+        bkl_held = 1;
+    }
+#endif
+
     int64_t result = handler(arg1, arg2, arg3, arg4, arg5, arg6);
+
+#ifdef SMP_BKL
+    if (bkl_held) {
+        bkl_release();
+    }
+#endif
 
 #ifdef SCHED_DEBUG
     // DIAGNOSTIC: report the RESULT of init's first SYS_SPAWN. The entry marker

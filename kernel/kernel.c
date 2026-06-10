@@ -1491,6 +1491,64 @@ void kernel_main(void* raw_info) {
                                     "skipped\n");
                         }
                     }
+#ifdef SMP_BKL
+                    /* SMP-H1 BKL-LITE acceptance: TWO 60 s syscall storms,
+                     * one pinned to CPU1 (the cpu1hello placement pattern),
+                     * one left NORMAL (the funnel homes it to CPU0). Both
+                     * hammer the MARKED groups concurrently; the shm pattern
+                     * verify inside each is the corruption detector and the
+                     * [BKL] engaged counters prove both CPUs executed marked
+                     * paths under the wall. */
+                    {
+                        uint64_t b_size = 0;
+                        void* b_data = initrd_get_file("sbin/bklstorm", &b_size);
+                        if (b_data && b_size > 0) {
+                            /* instance 1: pinned CPU1, PINNED_RT */
+                            int bpid1 = elf_load_and_exec(b_data, b_size,
+                                                          "bklstorm");
+                            process_t* b1 = (bpid1 > 0)
+                                          ? process_get_by_pid(bpid1) : NULL;
+                            if (b1) {
+                                scheduler_remove_process(b1);
+                                process_t* ini = process_get_by_pid(1);
+                                if (ini) {
+                                    b1->parent_pid = 1;
+                                    b1->parent_seq = ini->create_seq;
+                                    process_unref(ini);
+                                }
+                                b1->allowed_cpus = (uint64_t)1 << 1;
+                                b1->pinned_cpu   = 1;
+                                b1->sched.sched_class = SCHED_CLASS_PINNED_RT;
+                                scheduler_submit_task(b1);
+                                kprintf("[SMP] H1: bklstorm PID %d -> CPU1 "
+                                        "(60s marked-syscall storm)\n", bpid1);
+                                process_unref(b1);
+                            }
+                            /* instance 2: untouched defaults = NORMAL,
+                             * CPU0-only mask -> the funnel homes it */
+                            int bpid2 = elf_load_and_exec(b_data, b_size,
+                                                          "bklstorm");
+                            process_t* b2 = (bpid2 > 0)
+                                          ? process_get_by_pid(bpid2) : NULL;
+                            if (b2) {
+                                scheduler_remove_process(b2);
+                                process_t* ini = process_get_by_pid(1);
+                                if (ini) {
+                                    b2->parent_pid = 1;
+                                    b2->parent_seq = ini->create_seq;
+                                    process_unref(ini);
+                                }
+                                scheduler_submit_task(b2);
+                                kprintf("[SMP] H1: bklstorm PID %d -> CPU0 "
+                                        "(60s marked-syscall storm)\n", bpid2);
+                                process_unref(b2);
+                            }
+                        } else {
+                            kprintf("[SMP] H1: sbin/bklstorm not in initrd -- "
+                                    "storm skipped (rebuild initrd)\n");
+                        }
+                    }
+#endif
 #endif
 
                     /* Start scheduler (will enable interrupts after TSS.RSP0 is set) */

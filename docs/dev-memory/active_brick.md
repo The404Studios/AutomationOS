@@ -2,6 +2,23 @@
 
 > Warm memory. Refresh per checkpoint. One active brick at a time.
 
+## NET-P1-0 — LANDED (6 commits local on `brick/net-p1-0`, QEMU green; T410 ladder pending) — track 1 of the roadmap
+- **the roadmap:** user-approved 3-track plan (networking → SMP two-core → GT218 native modesetting)
+  + permissive-only porting; plan file + [`bricks/NET-P1-0.md`](bricks/NET-P1-0.md) carry the details.
+- **landed:** A0 rig (`1e226c6`, inject+capture, NETRIG PASS) → A SYN side-table (`3965242`, SYNs stop
+  burning sockets) → B 4-slot OOO heap-backed (`24100a6`, reassembled=5840) → C/D/E (`30136ae`,
+  persist probe + the TWO rig-caught bugs: dead zero-window clamp, cap-races-clock; UDP 16,
+  SOCK_MAX 32) → E1000-PCH-0A/0B/0C (`14a0bdb`, deferred bring-up + nicup trigger + never-CTRL_RST-
+  without-SWFLAG).
+- **T410 hardware ladder (next hardware day):** flash `automationos-t410-net.iso`, travel-router
+  bridge, run `nicup` in the terminal, read the `E1000PCH:` serial ladder, then dhcpc → ping → httpd.
+  Aborts safe; nicup re-runnable.
+- **known/noted:** smoke_boot.sh has 5 PRE-EXISTING profile-mismatch FAILs (BOOT_QUIET-suppressed +
+  SMP-only markers) — follow-up task open; gateway-ARP pre-resolve marker is boot-flaky (gate on
+  `[NET] up:`).
+- **then (roadmap order):** GPU tier 0 + NV-REF-0 (same hardware day as the NIC ladder if convenient)
+  → SMP-R0 (cherry-pick `faf7444`) → the 9-brick two-core path.
+
 ## SELFHEAL-FIX-0 — FROZEN / COMPLETE (pushed `0023943`, ls-remote verified; user: "ok perfect!") — recovery now restores the desktop
 - **user report:** wave-2 works on the T410 BUT "the self healing is not working" → "run 7 agents and fix the self heal".
 - **record:** [`bricks/SELFHEAL-FIX-0.md`](bricks/SELFHEAL-FIX-0.md) · **branch:** `brick/selfheal-fix-0` (off `brick/ide-xfile-0` `4766b1d`).

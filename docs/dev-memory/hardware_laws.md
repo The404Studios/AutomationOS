@@ -45,6 +45,28 @@ signal: a model that internalizes these is *useful* on this OS; one that doesn't
     the idle `hlt` path (all of F2 era never did), then flaky-fatal. `sti; hlt` is the safe pair on
     x86: `sti` enables interrupts only after the *next* instruction completes, so no wake can slip
     into the gap before the `hlt`.
+13. **IPI vectors must be collision-checked at compile time AND runtime before arming (user-set
+    at SMP-G0).** The IDT vector landscape is a shared, silently-overwritable resource: a second
+    `idt_set_gate` on a live vector kills the prior owner with no diagnostic (the original
+    IPI_RESCHEDULE=0x40 sat dead-on the CPU1 LAPIC timer gate). Every vector block carries
+    `_Static_assert`s against the known claimants (exceptions 0x00-0x1F, PIC 0x20-0x2F, per-CPU
+    timers, spurious 0xFF) AND a runtime `idt_gate_present()` free-check before claiming —
+    occupied ⇒ refuse loudly and stay disarmed, never overwrite.
+14. **IPI target APIC ids must come from the proven MADT/AP-start seam, never from
+    partially-filled per-CPU structs (user-set at SMP-G0).** A struct that LINKS is not a struct
+    that is FILLED: `percpu_data[]` linked (health-monitor definition) but `.apic_id` was never
+    written, so the salvage `cpu_to_apic_id(1)` returned 0 — every "CPU1" IPI would have targeted
+    the BSP ITSELF. Wrong-target beats link-fail as a failure mode because the strict linker
+    can't see it. Resolve CPU→APIC through the seam that demonstrably captured the id
+    (`smp_cpu1_apic_id()` from try_start_cpu1's MADT read), with an explicit
+    not-yet-captured sentinel that DROPS the send.
+15. **Any SMP handler data touched under arbitrary CR3 must pass the shadow-zone/link-map gate
+    (user-set at SMP-G0).** Interrupt/IPI handlers run on whatever address space the target CPU
+    happens to hold, so their state (stats, queues, locks, flags) must sit below the user link
+    base or in the kernel-only direct map — and the placement is PROVEN per build by an nm/link-
+    map check in the brick's smoke, not assumed from a linker-script comment (linker.ld's
+    "0x200000 user base" was stale; the live base is 0x800000 per userspace.ld). Size such arrays
+    for the real machine model, not MAX_CPUS=256.
 
 ## Reviewer checklist (a stricter role that can say "no")
 

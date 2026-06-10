@@ -2,7 +2,23 @@
 
 > Warm memory. Refresh per checkpoint. One active brick at a time.
 
-## SMP-G0 IPI-LINK — LANDED (commit `ea45305`, branch `brick/smp-g0-ipi-link`, awaiting review/push) — BSP interrupts CPU1, CPU1 handles it safely
+## SMP-G1 IPI-WAKE — OPEN (branch `brick/smp-g1-ipi-wake`, off frozen `brick/smp-g0-ipi-link`) — CPU1 wakes from IPI instead of tick polling
+- **user verdict opening it:** "the first brick that can actually make CPU1 responsiveness FASTER
+  instead of merely proven."
+- **user-set scope:** IPI handler sets per-CPU need_resched · enqueue-to-idle-CPU sends IPI ·
+  close the lost-wakeup race (`cli` → check runqueue/need_resched → `sti; hlt`) · CPU1 wakes from
+  IPI instead of waiting for tick polling.
+- **acceptance (user-set):** `IPIWAKE: PASS enqueue_to_cpu1=1 first_instruction_lt_1ms=1
+  no_lost_wake=1`.
+- **HARD NO's (user-set):** no TLB shootdown · no desktop split · no global PREEMPT · no work
+  stealing · no broad scheduler rewrite.
+- **context:** the G0 handler seam is in place (ipi_handle_reschedule counts + EOIs, schedule()
+  deliberately TODO); CPU1's LAPIC timer (100 Hz = 10 ms worst-case wake) is the latency being
+  killed; the F3-5 `sti; hlt` park in ap_scheduler_loop is where the race closes (law 12: the
+  sti shadow covers the hlt, so an IPI pending from the cli'd check window still wakes it).
+- **next after:** G2/G3 (TLB shootdown family — the stash-mined ipi_tlb_flush_page_handler asm).
+
+## SMP-G0 IPI-LINK — FROZEN / COMPLETE (pushed `609d704`, ls-remote verified; user: "That is a clean brick... exactly why G0 had to exist before G1") — BSP interrupts CPU1, CPU1 handles it safely
 - **THE EXACT ACCEPTANCE HIT (first try):** `IPILINK: PASS ipi_resched=1 cpu1_count=1` + the full
   F3-5 regression ladder green (F2 delta>0, APCURRENT PASS, cpu1hello marks=5/exit=42/reaped,
   0 invariant, 0 panic) under `scripts/ipilink_smoke.sh` (-smp 2). Record:
@@ -30,8 +46,16 @@
   `git diff --stat` for full-file flips before trusting a commit.
 - **boundary held:** no wake scheduling (the handler's schedule() stays TODO — that IS G1), no TLB
   shootdown sends, no desktop split, no PREEMPT, no stealing.
-- **next:** SMP-G1 IPI-WAKE (the reschedule handler actually wakes CPU1's scheduler; kills the
-  tick-poll wake latency). The handler seam is in place.
+- **user verdict on freeze:** "This is exactly why G0 had to exist before G1. It found three
+  silent SMP killers before they became scheduler bugs... That is a clean brick." Both commits
+  kept unsquashed ("the vector-collision and wrong-target findings are forensic value"). The
+  three findings promoted to **LAWS 13/14/15** in [`hardware_laws.md`](hardware_laws.md):
+  compile-time+runtime vector collision checks before arming · IPI targets from the proven
+  MADT/AP-start seam, never partially-filled per-CPU structs · arbitrary-CR3 handler data passes
+  the shadow-zone/link-map gate. The design rule stands: SMP_IPI = linked + handlers linked +
+  vectors checked + ipi_init proven, so `SMP_FOUNDATION && SMP_IPI` is "a true condition, not a
+  stale macro fantasy."
+- **next:** SMP-G1 IPI-WAKE (open above).
 
 ## SMP-F3-5 — FROZEN / COMPLETE (pushed `aed03ee`, ls-remote verified; user: "Strong go... the first truly serious SMP milestone") — cpu1hello
 - **THE EXACT ACCEPTANCE HIT:** `CPU1HELLO: PASS markers=5 exit=42 reaped=1 cpu1_idle=1

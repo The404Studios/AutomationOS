@@ -2,25 +2,34 @@
 
 > Warm memory. Refresh per checkpoint. One active brick at a time.
 
-## SMP-H1 BKL-LITE — OPEN (branch `brick/smp-h1-bkl-lite`, off frozen `brick/smp-profile-0`) — the Linux-2.0-style safety wall before BATCH work touches CPU1
-- **why (user):** "once BATCH starts putting ordinary work on CPU1, syscalls become the danger
-  surface. The Big Kernel Lock-lite gives you an honest Linux-2.0-style safety wall before you
-  let more real userspace run concurrently... the safety brick that lets F3-7 become useful
-  instead of reckless."
-- **user-set scope:** ONE owner-recursive outer kernel lock · acquired in the syscall
-  dispatcher for MARKED unsafe syscall groups · cover FS / net / IPC / process-management
-  danger paths · do NOT wrap yield / exit / futex fast paths unless proven needed · verify
-  heap/futex/rq locks still behave under 2-CPU stress.
-- **acceptance (user-set):** `BKL: PASS syscall_storm=1 duration=60s cpu0=1 cpu1=1
-  corruption=0 deadlock=0 panic=0`.
-- **HARD NO's (user-set):** no desktop split · no work stealing · no BATCH migration yet · no
-  general per-mm shootdown · no global PREEMPT · no fine-grained VFS rewrite.
-- **KNOWN DESIGN HAZARD (work it, don't discover it):** syscalls run IF=0 and the kernel is
-  cooperative — a marked syscall that BLOCKS (context-switches away) while holding the BKL
-  wedges the other CPU's spinners forever (Linux 2.0 solved this with release-on-block). The
-  honest v1: mark ONLY non-blocking syscall paths, document the exclusion loudly, and put a
-  bounded-spin watchdog in bkl_acquire (a wedge degrades to a loud diagnostic, never a silent
-  hang).
+## SMP-H1 BKL-LITE — LANDED (commit `d921238`, branch `brick/smp-h1-bkl-lite`, awaiting review/push) — the safety wall held under a 60s two-CPU storm
+- **THE EXACT ACCEPTANCE HIT (first boot):** `BKL: PASS syscall_storm=1 duration=60s cpu0=1
+  cpu1=1 corruption=0 deadlock=0 panic=0` — CPU1 storm 157,757 iters (nearly dedicated) + CPU0
+  storm 4,544 iters (sharing the whole desktop), both errors=0 secs=60; `[BKL] engaged:
+  cpu0_acq=1 cpu1_acq=8 contended=1+0` (both CPUs in marked paths under the wall, a real
+  contention serialized); 0 watchdog/release diagnostics; the ENTIRE ladder green underneath.
+  Record: [`bricks/SMP-H1.md`](bricks/SMP-H1.md) · proof `scripts/bkl_smoke.sh`.
+- **the lock (kernel/core/syscall/bkl.c):** owner-recursive BY CPU (a task can't lose its CPU
+  mid-syscall without blocking, and blocking paths are unmarked by construction); acquired in
+  the dispatcher around whole handler bodies; fast paths (getpid/ticks/yield) never wrapped.
+  Marked: FS · IPC (incl. channels) · NET non-blocking subset · PROC mgmt.
+- **THE LOAD-BEARING EXCLUSION (worked, not discovered):** nothing that can schedule away
+  mid-syscall is marked (exit/waitpid/sleep/yield/read_event/msgrcv/ioctl/recv/accept/connect/
+  futex/thread_join/ch_wait) — a blocked BKL holder = a cross-CPU IF=0 wedge. Audited:
+  sys_execve aliases sys_spawn (returns), sys_kill defers the switch to the scheduler. The 2s
+  bounded-spin WATCHDOG is the tripwire for future violations (loud one-shot, never silent,
+  never unlocked-proceed). Release-on-block = the future path to marking blockers.
+- **storm design notes:** both placements through the PROFILE-0 funnel (real test traffic on
+  the typed path); shm fill/verify churn = corruption detector + heap/slab stress; clipboard
+  deliberately raced; no getcpu syscall exists (the F3-3b SYS_GETCPU=89 plan never landed — 89
+  is NET_CONFIG) so per-CPU participation is proven kernel-side by the BKL counters.
+- **byte-identity:** default `6f99ed9f` hash-equal; non-BKL ladder profile has zero H1 code
+  (baseline recorded: `213d960b`); bklstorm ships in every initrd (inert, the cpu1hello
+  convention).
+- **HARD NO's held:** no desktop split · no stealing · no BATCH migration · no per-mm
+  shootdown · no global PREEMPT · no fine-grained VFS rewrite.
+- **next:** SMP-F3-7 BATCH-CLASS / controlled CPU1 placement (the wall makes it non-reckless)
+  → DESKTOP-SPLIT.
 
 ## SMP-PROFILE-0 — FROZEN / COMPLETE (pushed `8851b9a`, ls-remote verified; user: "the right bridge... the scheduler now knows WHY something is being placed, not just where") — typed intent landed, nothing moved
 - **THE EXACT ACCEPTANCE HIT (first boot):** `SMPPROFILE: PASS normal_home=1 batch_declared=1

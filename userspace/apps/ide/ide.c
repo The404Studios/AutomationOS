@@ -497,6 +497,28 @@ void ide_sel_jump(Ide* a, int func_idx, int pane) {
     a->sel.node   = a->map_selected;
 }
 
+/* IDE-CONTEXT-0: the shared "project > file" breadcrumb spine. The aphantasia
+ * anchor -- "where am I" must never live only in the user's head, so both
+ * workspaces' status bars render this prefix and append the active function. */
+void ide_breadcrumb_prefix(Ide* a, char* out, int cap) {
+    if (!out || cap <= 0) return;
+    int p = 0;
+    const char* proj;
+    if (a->project.active && a->project.name[0]) {
+        proj = a->project.name;
+    } else {
+        proj = a->root;
+        for (const char* s = a->root; *s; s++) if (*s == '/' && s[1]) proj = s + 1;
+    }
+    for (; *proj && p < cap - 1; proj++) out[p++] = *proj;
+    if (p < cap - 4) { out[p++] = ' '; out[p++] = '>'; out[p++] = ' '; }
+    const char* file = a->cur_file[0] ? a->cur_file : "(no file)";
+    const char* base = file;
+    for (const char* s = file; *s; s++) if (*s == '/') base = s + 1;
+    for (; *base && p < cap - 1; base++) out[p++] = *base;
+    out[p] = 0;
+}
+
 /* ===========================================================================
  * Project scan: recursively flatten a->root into a->entries[].
  *
@@ -1580,6 +1602,22 @@ static void editor_status(Ide* a, Canvas* cv, Rect r) {
     int clip_w = r.w - 2 * PAD;
     int compact = (r.w < 80 * GFX_FW);   /* compact at narrow widths */
 
+    /* IDE-CONTEXT-0: persistent where-am-I breadcrumb "proj > file > FN".
+     * The aphantasia anchor: never let "where am I" live only in the head. */
+    if (!compact) {
+        char bc[IDE_PATH + 96];
+        ide_breadcrumb_prefix(a, bc, (int)sizeof(bc));
+        gfx_text_clip(cv, x, ty, bc, TH_TEXT_DIM, clip_x0, clip_w);
+        x += gfx_textw(bc) + GFX_FW;
+        const char* fn = "-";
+        int have_fn = (a->sel.symbol >= 0 && a->sel.symbol < a->model.nfuncs);
+        if (have_fn) fn = a->model.funcs[a->sel.symbol].name;
+        gfx_text_clip(cv, x, ty, ">", TH_TEXT_FAINT, clip_x0, clip_w);
+        x += gfx_textw(">") + GFX_FW;
+        gfx_text_clip(cv, x, ty, fn, have_fn ? TH_BLUE : TH_TEXT_DIM, clip_x0, clip_w);
+        x += gfx_textw(fn) + 2 * GFX_FW;
+    }
+
     /* Ln, Col -- compact: "42:8" */
     {
         char lc[40]; int p = 0;
@@ -1604,8 +1642,9 @@ static void editor_status(Ide* a, Canvas* cv, Rect r) {
         x += gfx_textw(lc) + 2 * GFX_FW;
     }
 
-    /* current file name (basename only for brevity) */
-    if (a->cur_file[0]) {
+    /* current file name (basename only) -- compact only; the breadcrumb above
+     * already carries the file in normal mode. */
+    if (compact && a->cur_file[0]) {
         const char* base = a->cur_file;
         for (const char* p = a->cur_file; *p; p++)
             if (*p == '/') base = p + 1;
@@ -1613,7 +1652,7 @@ static void editor_status(Ide* a, Canvas* cv, Rect r) {
         x += gfx_textw(base) + 2 * GFX_FW;
     }
 
-    /* dirty/saved -- compact: "*" or "-" */
+    /* dirty/saved + IDE-CONTEXT-0 change count -- compact: "*" or "-" */
     if (compact) {
         const char* ind = ide_editor_dirty(a) ? "*" : "-";
         uint32_t col = ide_editor_dirty(a) ? TH_ORANGE : TH_GREEN;
@@ -1622,10 +1661,34 @@ static void editor_status(Ide* a, Canvas* cv, Rect r) {
     } else {
         if (ide_editor_dirty(a)) {
             gfx_text_clip(cv, x, ty, "UNSAVED", TH_ORANGE, clip_x0, clip_w);
-            x += gfx_textw("UNSAVED") + 2 * GFX_FW;
+            x += gfx_textw("UNSAVED") + GFX_FW;
+            /* "~N" edits since last save (byte edits, undo included --
+             * honest: a change COUNT, not a line diff). */
+            char db[20]; int dp = 0;
+            db[dp++] = '~';
+            { char nb[16]; int n = ide_itoa(a->editor.edits_since_save, nb);
+              for (int i = 0; i < n && dp < (int)sizeof(db) - 1; i++) db[dp++] = nb[i]; }
+            db[dp] = 0;
+            gfx_text_clip(cv, x, ty, db, TH_TEXT_DIM, clip_x0, clip_w);
+            x += gfx_textw(db) + 2 * GFX_FW;
         } else {
             gfx_text_clip(cv, x, ty, "SAVED", TH_GREEN, clip_x0, clip_w);
             x += gfx_textw("SAVED") + 2 * GFX_FW;
+        }
+        /* IDE-CONTEXT-0: last build outcome chip "BUILD OK" / "BUILD FAIL N" */
+        if (ide_build_active()) {
+            gfx_text_clip(cv, x, ty, "BUILD", TH_TEXT_DIM, clip_x0, clip_w);
+            x += gfx_textw("BUILD") + GFX_FW;
+            if (ide_build_ok()) {
+                gfx_text_clip(cv, x, ty, "OK", TH_GREEN, clip_x0, clip_w);
+                x += gfx_textw("OK") + 2 * GFX_FW;
+            } else {
+                gfx_text_clip(cv, x, ty, "FAIL", TH_RED, clip_x0, clip_w);
+                x += gfx_textw("FAIL") + GFX_FW;
+                char nb[16]; int n = ide_itoa(ide_build_diag_count(), nb); nb[n] = 0;
+                gfx_text_clip(cv, x, ty, nb, TH_RED, clip_x0, clip_w);
+                x += gfx_textw(nb) + 2 * GFX_FW;
+            }
         }
     }
 

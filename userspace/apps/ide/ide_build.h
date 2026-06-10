@@ -28,6 +28,10 @@ int  panel_build_click(Ide* a, Rect r, int mx, int my);
 void panel_build_scroll(int delta);
 /* 1 if there's a build result to show, else 0. */
 int  ide_build_active(void);
+/* IDE-CONTEXT-0: 1 if the last build succeeded (a result exists AND ok). */
+int  ide_build_ok(void);
+/* IDE-CONTEXT-0: diagnostic count of the last build; 0 if no build yet. */
+int  ide_build_diag_count(void);
 /* Query whether line `ln` (0-based) has a build error on it. Returns the
  * diagnostic severity: 0=none, 1=error, 2=warning. Used by the editor to
  * paint error-line backgrounds. */

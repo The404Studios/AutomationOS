@@ -231,25 +231,21 @@ void panel_status(Ide* a, Canvas* cv, Rect r) {
         x += n * GFX_FW + 2 * GFX_FW;
     }
 
-    /* "FILE: <file>" */
-    gfx_text_clip(cv, x, ty, "FILE:", TH_TEXT_DIM, clip_x, clip_w);
-    x += gfx_textw("FILE:") + GFX_FW;
-    {
-        const char* f = m->cur_file[0] ? m->cur_file : "-";
-        gfx_text_clip(cv, x, ty, f, TH_TEXT_DIM, clip_x, clip_w);
-        x += gfx_textw(f) + 2 * GFX_FW;
-    }
-
-    /* IDE-SYNC-0 breadcrumb: "FN <name>  Ln <l>,<c>" from THE selection model
-     * (a->sel) -- the always-visible "where am I" the aphantasia north star
-     * requires. FN shows the caret's enclosing function (ACCENT when one is
-     * resolved), falling back to "-" between functions. */
+    /* IDE-CONTEXT-0 breadcrumb: "project > file > FN  Ln <l>,<c>" from THE
+     * selection model (a->sel) -- the always-visible "where am I" the
+     * aphantasia north star requires. FN shows the caret's enclosing function
+     * (accent blue when resolved), "-" between functions. (The old standalone
+     * "FILE:" chip is folded into this breadcrumb.) */
     {
         const char* fn = "-";
         if (a->sel.symbol >= 0 && a->sel.symbol < a->model.nfuncs)
             fn = a->model.funcs[a->sel.symbol].name;
-        gfx_text_clip(cv, x, ty, "FN", TH_TEXT_DIM, clip_x, clip_w);
-        x += gfx_textw("FN") + GFX_FW;
+        char bc[IDE_PATH + 96];
+        ide_breadcrumb_prefix(a, bc, (int)sizeof(bc));
+        gfx_text_clip(cv, x, ty, bc, TH_TEXT_DIM, clip_x, clip_w);
+        x += gfx_textw(bc) + GFX_FW;
+        gfx_text_clip(cv, x, ty, ">", TH_TEXT_FAINT, clip_x, clip_w);
+        x += gfx_textw(">") + GFX_FW;
         gfx_text_clip(cv, x, ty, fn,
                       (a->sel.symbol >= 0) ? TH_BLUE : TH_TEXT_DIM,
                       clip_x, clip_w);

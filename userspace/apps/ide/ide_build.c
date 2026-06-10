@@ -341,6 +341,10 @@ int ide_build_active(void) {
     return g_have;
 }
 
+/* IDE-CONTEXT-0: what-changed accessors for the status bars. */
+int ide_build_ok(void)         { return g_have && g_res.ok; }
+int ide_build_diag_count(void) { return g_have ? g_res.ndiags : 0; }
+
 /* ===========================================================================
  * Query APIs for other modules
  * ===========================================================================*/

@@ -407,6 +407,7 @@ static int ed_insert_byte(struct Ide* a, int off, char ch) {
     a->src[off] = ch;
     a->src_len++;
     a->editor.dirty = 1;
+    a->editor.edits_since_save++;                       /* IDE-CONTEXT-0 */
     undo_record_insert((unsigned int)off, ch);
     if (ch == '\n') ed_model_lines_shift(a, off, +1);   /* IDE-SYNC-0 S4 */
     return 1;
@@ -420,6 +421,7 @@ static void ed_delete_byte(struct Ide* a, int off) {
     for (int i = off; i < a->src_len - 1; i++) a->src[i] = a->src[i + 1];
     a->src_len--;
     a->editor.dirty = 1;
+    a->editor.edits_since_save++;                       /* IDE-CONTEXT-0 */
     if (was_nl) ed_model_lines_shift(a, off, -1);       /* IDE-SYNC-0 S4 */
 }
 
@@ -647,6 +649,7 @@ void ide_editor_reset(struct Ide* a) {
     e->top_line = 0;
     e->left_col = 0;
     e->dirty = 0;
+    e->edits_since_save = 0;          /* IDE-CONTEXT-0 */
     e->blink_ms = 0;
     e->sel_anchor_off = -1;
     e->ac_active = 0;
@@ -666,6 +669,7 @@ int ide_editor_save(struct Ide* a) {
     int r = ide_write_file(a->cur_file, a->src, a->src_len);
     if (r == 0) {
         a->editor.dirty = 0;
+        a->editor.edits_since_save = 0;   /* IDE-CONTEXT-0 */
         /* Re-run analysis so the LEGO workspace + status bar reflect edits. */
         model_parse(&a->model, a->src, a->src_len, a->cur_file);
         if (a->model.nfuncs > 0) {

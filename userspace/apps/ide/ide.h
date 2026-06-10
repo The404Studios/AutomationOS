@@ -269,6 +269,11 @@ void ide_sel_from_caret(Ide* a, int pane);
 /* IDE-SYNC-0 S2/S3: focus func_idx AND land the shared editor caret on its
  * definition line (the reverse edges: map/inspector click -> editor jump). */
 void ide_sel_jump(Ide* a, int func_idx, int pane);
+/* IDE-CONTEXT-0: build the "project > file" where-am-I prefix into out[cap].
+ * project = a->project.name when a project is open, else basename(a->root);
+ * file = basename(a->cur_file) or "(no file)". Callers append " > <fn>" so the
+ * editor + LEGO status bars share one breadcrumb spine. Always NUL-terminates. */
+void ide_breadcrumb_prefix(Ide* a, char* out, int cap);
 /* Open the "New Project" templates modal (Ctrl+N / topbar [+ NEW] button).
  * Public so chrome in ide_chrome.c can trigger it too. Implemented in ide.c. */
 void ide_new_project(Ide* a);

@@ -42,6 +42,7 @@ typedef struct {
     int  top_line;         /* first visible line (vertical scroll)       */
     int  left_col;         /* first visible column (horizontal scroll)   */
     int  dirty;            /* 1 if buffer changed since last save        */
+    int  edits_since_save; /* IDE-CONTEXT-0: byte edits since last save  */
     int  focused;          /* 1 if the editor owns keyboard input        */
     int  blink_ms;         /* caret blink phase accumulator              */
     int  sel_anchor_off;   /* reserved for future selection (unused=−1)  */

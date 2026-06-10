@@ -37,9 +37,14 @@
 #define SOCK_DGRAM    2   /* UDP  */
 
 /* Limits. */
-#define SOCK_MAX            16     /* concurrent sockets                  */
+/* NET-P1-E: 16 -> 32. sock_t is ~45 KB (rxbuf-dominated), so 32 is ~1.4 MB
+ * of ONE kmalloc in sock_init -- sized deliberately (64 would be ~2.9 MB of
+ * mostly-wasted rings; half-opens scale through the NET-P1-A SYN side-table,
+ * not this table). sock_init asserts the allocation loudly. */
+#define SOCK_MAX            32     /* concurrent sockets                  */
 #define SOCK_RXBUF_SIZE     32768  /* per-TCP-socket stream RX ring       */
-#define UDP_QUEUE_DEPTH     8      /* per-UDP-socket queued datagrams     */
+/* NET-P1-D: 8 -> 16 (1472 B/slot: +~12 KB per socket; 32 would be waste). */
+#define UDP_QUEUE_DEPTH     16     /* per-UDP-socket queued datagrams     */
 #define UDP_DGRAM_MAX       1472   /* max UDP payload over 1500 MTU       */
 #define TCP_MSS             1460   /* standard MSS for 1500-byte MTU      */
 

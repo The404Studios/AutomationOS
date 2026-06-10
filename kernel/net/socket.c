@@ -397,11 +397,16 @@ void sock_init(void) {
     if (g_socks == NULL) {
         g_socks = (sock_t*)kmalloc(sizeof(sock_t) * SOCK_MAX);
         if (g_socks == NULL) {
-            kprintf("[SOCK] init failed: no memory for socket table (%u bytes)\n",
-                    (unsigned)(sizeof(sock_t) * SOCK_MAX));
+            /* NET-P1-E heap-headroom assert: SOCK_MAX=32 makes this ONE
+             * ~1.4 MB allocation -- if the heap can't carry it, say so
+             * LOUDLY (all networking is dead without the table). */
+            kprintf("[SOCK] init FAILED: no heap for socket table (%u bytes, SOCK_MAX=%u)\n",
+                    (unsigned)(sizeof(sock_t) * SOCK_MAX), (unsigned)SOCK_MAX);
             g_inited = false;
             return;
         }
+        kprintf("[SOCK] table: %u sockets, %u KB\n", (unsigned)SOCK_MAX,
+                (unsigned)((sizeof(sock_t) * SOCK_MAX) / 1024));
     }
     memset(g_socks, 0, sizeof(sock_t) * SOCK_MAX);
     g_inited = true;

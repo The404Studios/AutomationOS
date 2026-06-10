@@ -52,6 +52,23 @@ static rig_cap_t g_cap[RIG_CAP_MAX];
 static int       g_cap_n      = 0;
 static int       g_rig_active = 0;
 
+#define RIG_PEER_IP 0x0A000263u     /* 10.0.2.99 -- the fake test peer */
+
+/* NET-P1-C autoresponder: while armed, the tap PLAYS THE PEER for one
+ * connection -- counts 1-byte persist probes (opens the window after the
+ * 3rd) and ACKs real data segments so sends complete cleanly. Injecting
+ * from inside the tap re-enters tcp_input on the same single-threaded call
+ * stack; pure ACKs produce no TX, so the recursion terminates. */
+static int      g_zw_armed = 0, g_zw_probes = 0;
+static uint16_t g_zw_peer_port, g_zw_local_port;
+static uint32_t g_zw_peer_seq;
+
+static void rig_inject_tcp(uint32_t src_ip, uint16_t src_port,
+                           uint32_t dst_ip, uint16_t dst_port,
+                           uint32_t seq, uint32_t ack, uint8_t flags,
+                           uint16_t window,
+                           const void* payload, uint16_t len);
+
 /* Called from the head of ip_tx(): when the rig is live, record + swallow the
  * segment (return 1 -> ip_tx reports success without touching ARP/the NIC).
  * Inactive rig returns 0 -> the normal transmit path runs unchanged. */
@@ -65,6 +82,31 @@ int net_testrig_tx_tap(uint32_t dst_ip, uint8_t proto,
         c->seg_len = seg_len;
         uint16_t n = (seg_len < RIG_CAP_BYTES) ? seg_len : RIG_CAP_BYTES;
         memcpy(c->seg, seg, n);
+    }
+
+    if (g_zw_armed && proto == IPPROTO_TCP && seg_len >= sizeof(tcp_hdr_t)) {
+        const tcp_hdr_t* th = (const tcp_hdr_t*)seg;
+        uint8_t  ihl  = (uint8_t)((th->data_off >> 4) * 4);
+        uint16_t plen = (seg_len > ihl) ? (uint16_t)(seg_len - ihl) : 0;
+        if (net_ntohs(th->dst_port) == g_zw_peer_port) {
+            if (plen == 1) {
+                /* A zero-window persist probe. Stay shut for two, then
+                 * re-advertise an open window on the third (NOT accepting
+                 * the probe byte: ack = the probe's own seq). */
+                g_zw_probes++;
+                if (g_zw_probes == 3)
+                    rig_inject_tcp(RIG_PEER_IP, g_zw_peer_port,
+                                   net_get_ip(), g_zw_local_port,
+                                   g_zw_peer_seq, net_ntohl(th->seq),
+                                   TCP_ACK, 2048, NULL, 0);
+            } else if (plen > 1) {
+                /* Real data after the window opened: ACK it all. */
+                rig_inject_tcp(RIG_PEER_IP, g_zw_peer_port,
+                               net_get_ip(), g_zw_local_port,
+                               g_zw_peer_seq, net_ntohl(th->seq) + plen,
+                               TCP_ACK, 2048, NULL, 0);
+            }
+        }
     }
     return 1;
 }
@@ -138,7 +180,7 @@ static void rig_inject_tcp(uint32_t src_ip, uint16_t src_port,
 /* ------------------------------------------------------------------ */
 void net_testrig_selftest(void) {
     uint32_t my_ip   = net_get_ip();
-    const uint32_t peer_ip = 0x0A000263;   /* 10.0.2.99 -- a fake test peer */
+    const uint32_t peer_ip = RIG_PEER_IP;
     int loopback = 0, cap = 0;
 
     g_rig_active = 1;
@@ -305,6 +347,88 @@ void net_testrig_selftest(void) {
         sock_init();
         kprintf("NETP1B: OOO %s slots=4 reassembled=%d\n",
                 (reassembled == 4 * TCP_MSS) ? "PASS" : "FAIL", reassembled);
+    }
+
+    /* ---------------------------------------------------------------- */
+    /* NET-P1-C: zero-window persist probe. Establish with the peer      */
+    /* advertising window 0, then sock_send 64 bytes: the persist timer  */
+    /* must emit 1-byte probes (backoff) until the autoresponder opens   */
+    /* the window on the 3rd, then the data flows and gets ACKed.        */
+    /* ---------------------------------------------------------------- */
+    {
+        int probes = 0, delivered = 0;
+        int fd = -1;
+        int l = sock_socket(SOCK_STREAM);
+        if (l >= 0 && sock_bind(l, 47004) == 0 && sock_listen(l, 2) == 0) {
+            g_cap_n = 0;
+            rig_inject_tcp(peer_ip, 42000, my_ip, 47004,
+                           9000, 0, TCP_SYN, 4096, NULL, 0);
+            if (g_cap_n >= 1) {
+                const tcp_hdr_t* th = (const tcp_hdr_t*)g_cap[0].seg;
+                uint32_t isn = net_ntohl(th->seq);
+                /* Final ACK advertises a ZERO window: the child starts
+                 * established but unsendable-to. */
+                rig_inject_tcp(peer_ip, 42000, my_ip, 47004,
+                               9001, isn + 1, TCP_ACK, 0, NULL, 0);
+                fd = sock_accept(l);
+            }
+        }
+        if (fd >= 0) {
+            g_zw_armed      = 1;
+            g_zw_probes     = 0;
+            g_zw_peer_port  = 42000;
+            g_zw_local_port = 47004;
+            g_zw_peer_seq   = 9001;
+            static uint8_t data[64];
+            for (int i = 0; i < 64; i++) data[i] = 'X';
+            int n = sock_send(fd, data, 64);
+            delivered = (n == 64) ? 1 : 0;
+            probes    = g_zw_probes;
+            g_zw_armed = 0;
+        }
+        sock_init();
+        kprintf("NETP1C: ZWND %s probes=%d delivered=%d\n",
+                (probes == 3 && delivered == 1) ? "PASS" : "FAIL",
+                probes, delivered);
+    }
+
+    /* ---------------------------------------------------------------- */
+    /* NET-P1-D: UDP queue depth. Inject exactly UDP_QUEUE_DEPTH         */
+    /* datagrams without draining; every one must be retrievable.        */
+    /* ---------------------------------------------------------------- */
+    {
+        int queued = 0, dropped = 0;
+        int u = sock_socket(SOCK_DGRAM);
+        if (u >= 0 && sock_bind(u, 47005) == 0) {
+            for (int i = 0; i < UDP_QUEUE_DEPTH; i++) {
+                uint8_t b = (uint8_t)i;
+                rig_inject_udp(peer_ip, 7777, my_ip, 47005, &b, 1);
+            }
+            uint8_t buf[4];
+            while (sock_recvfrom(u, buf, sizeof(buf), NULL, NULL) > 0)
+                queued++;
+            dropped = UDP_QUEUE_DEPTH - queued;
+        }
+        sock_init();
+        kprintf("NETP1D: UDPQ %s depth=%d queued=%d dropped=%d\n",
+                (queued == UDP_QUEUE_DEPTH && dropped == 0) ? "PASS" : "FAIL",
+                UDP_QUEUE_DEPTH, queued, dropped);
+    }
+
+    /* ---------------------------------------------------------------- */
+    /* NET-P1-E: SOCK_MAX. All 32 slots must allocate; the 33rd must be  */
+    /* cleanly rejected; the (now ~1.4 MB) table kmalloc must have held. */
+    /* ---------------------------------------------------------------- */
+    {
+        int n = 0;
+        int heapok = (sock_table_base() != NULL) ? 1 : 0;
+        for (int i = 0; i < SOCK_MAX; i++)
+            if (sock_socket(SOCK_DGRAM) >= 0) n++;
+        int extra = sock_socket(SOCK_DGRAM);
+        sock_init();
+        kprintf("NETP1E: SOCKMAX %s n=%d heapok=%d extra_rejected=%d\n",
+                (n == SOCK_MAX && heapok && extra < 0) ? "PASS" : "FAIL",
+                n, heapok, (extra < 0) ? 1 : 0);
     }
 
     g_rig_active = 0;

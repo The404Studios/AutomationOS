@@ -647,11 +647,52 @@ int tcp_send(sock_t* s, const void* data, uint16_t len) {
         /* Determine this segment's size: min(remaining, MSS, peer window). */
         uint16_t chunk = (uint16_t)(len - sent);
         if (chunk > TCP_MSS) chunk = TCP_MSS;
-        /* Respect peer's advertised send window (never send 0-window data). */
-        if (s->snd_wnd > 0 && chunk > s->snd_wnd) chunk = (uint16_t)s->snd_wnd;
+        /* Respect peer's advertised send window (never send 0-window data).
+         * NET-P1-C: the old guard (`snd_wnd > 0 && ...`) skipped the clamp
+         * exactly when the window was ZERO, so the persist branch below was
+         * unreachable and we transmitted INTO a zero window -- the rig's
+         * window-shut peer caught it (probes=0 delivered=1). Every connected
+         * socket carries a real advertised window (sock_socket seeds 1024;
+         * the handshake + every non-RST segment update it), so snd_wnd==0
+         * means the peer genuinely closed its window. */
+        if (chunk > s->snd_wnd) chunk = (uint16_t)s->snd_wnd;
         if (chunk == 0) {
-            /* Peer window is zero: probe with 1-byte segment after a brief poll. */
-            sock_poll();
+            /* NET-P1-C: zero-window PERSIST timer. The old code just spun
+             * sock_poll() here -- no probe and NO BOUND, so a lost window
+             * update deadlocked the send forever inside a syscall (IF=0:
+             * the frozen-tick freeze family). Send a 1-byte probe with
+             * exponential backoff until the peer re-advertises window; the
+             * probe carries the next unsent byte at snd_nxt (snd_nxt is NOT
+             * advanced -- if the peer happens to accept it, the next real
+             * segment resends that byte and the receiver trims the
+             * duplicate prefix). Bounded by wall clock AND the iteration
+             * cap (the load-bearing backstop when ticks are frozen). */
+            uint64_t pstart   = now_ms();
+            uint64_t plast    = 0;
+            uint64_t last_now = pstart;
+            uint32_t pint     = TCP_RTO_INIT_MS;
+            uint32_t frozen   = 0;
+            while (s->snd_wnd == 0) {
+                uint64_t now = now_ms();
+                if (plast == 0 || now - plast >= (uint64_t)pint) {
+                    tcp_xmit(s, TCP_ACK, s->snd_nxt, s->rcv_nxt,
+                             ptr + sent, 1);
+                    plast = now;
+                    pint *= 2;
+                    if (pint > TCP_RTO_MAX_MS) pint = TCP_RTO_MAX_MS;
+                }
+                sock_poll();
+                if (s->reset) return sent ? (int)sent : SOCK_ECONN;
+                if (now - pstart >= TCP_CONNECT_MS)
+                    return sent ? (int)sent : SOCK_ETIMEDOUT;
+                /* Frozen-tick backstop: the cap counts only CONSECUTIVE
+                 * iterations where the millisecond clock did not move, so it
+                 * fires exactly in the IF=0/frozen-PIT condition it guards
+                 * against and never races the wall-clock budget above. */
+                if (now != last_now) { last_now = now; frozen = 0; }
+                else if (++frozen >= 200000)
+                    return sent ? (int)sent : SOCK_ETIMEDOUT;
+            }
             continue;
         }
 

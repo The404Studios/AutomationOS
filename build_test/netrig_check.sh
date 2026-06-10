@@ -45,6 +45,15 @@ fi
 if grep -qF "NETP1B:" "$LOG"; then
     grep -qF "NETP1B: OOO PASS slots=4 reassembled=5840" "$LOG" || P=0
 fi
+if grep -qF "NETP1C:" "$LOG"; then
+    grep -qF "NETP1C: ZWND PASS probes=3 delivered=1" "$LOG" || P=0
+fi
+if grep -qF "NETP1D:" "$LOG"; then
+    grep -qF "NETP1D: UDPQ PASS depth=16 queued=16 dropped=0" "$LOG" || P=0
+fi
+if grep -qF "NETP1E:" "$LOG"; then
+    grep -qF "NETP1E: SOCKMAX PASS n=32 heapok=1 extra_rejected=1" "$LOG" || P=0
+fi
 if grep -qiE "PANIC|CPU EXCEPTION|TRIPLE FAULT" "$LOG"; then
     echo "KERNEL FAULT during boot"; P=0
 fi

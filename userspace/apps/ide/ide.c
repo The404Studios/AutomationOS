@@ -379,6 +379,7 @@ void ide_open_file(Ide* a, const char* path) {
     a->focus_func  = -1;
     a->prev_focus  = -1;
     model_analyze(&a->model);
+    ide_sel_reset(a);                 /* IDE-SYNC-0: new file, fresh selection */
 
     /* Reset per-file view state so we don't keep a stale scroll/pan. */
     a->code_scroll      = 0;
@@ -417,6 +418,46 @@ void ide_set_focus(Ide* a, int func_idx) {
     a->focus_func  = func_idx;
     a->model.focus = func_idx;
     model_analyze(&a->model);
+}
+
+/* ===========================================================================
+ * IDE-SYNC-0: THE unified selection model (a->sel).
+ * One selection, three panes. ide_sel_from_caret() is the caret-side writer;
+ * ide_set_focus() callers (map/runtime/inspector clicks) are the other side.
+ * ===========================================================================*/
+
+void ide_sel_reset(Ide* a) {
+    if (!a) return;
+    int i = 0;
+    while (a->cur_file[i] && i < IDE_PATH - 1) { a->sel.file[i] = a->cur_file[i]; i++; }
+    a->sel.file[i] = 0;
+    a->sel.line    = 0;
+    a->sel.symbol  = -1;
+    a->sel.node    = -1;
+    a->sel.pane    = PANE_EDITOR;
+}
+
+/* Resolve the caret's enclosing function by the parser's recorded line ranges
+ * (Func.line_start/line_end are 1-based; caret_line is 0-based) and write THE
+ * selection model. Cheap (linear over <=M_MAXFUNCS) -- safe to call after
+ * every caret-moving key/click. */
+void ide_sel_from_caret(Ide* a, int pane) {
+    if (!a) return;
+    int line = a->editor.caret_line;
+    int sym  = -1;
+    for (int i = 0; i < a->model.nfuncs; i++) {
+        const Func* f = &a->model.funcs[i];
+        if (line + 1 >= f->line_start && line + 1 <= f->line_end) { sym = i; break; }
+    }
+    a->sel.pane   = pane;
+    a->sel.line   = line;
+    a->sel.symbol = sym;
+    a->sel.node   = a->map_selected;
+    {
+        int i = 0;
+        while (a->cur_file[i] && i < IDE_PATH - 1) { a->sel.file[i] = a->cur_file[i]; i++; }
+        a->sel.file[i] = 0;
+    }
 }
 
 /* ===========================================================================
@@ -1591,6 +1632,7 @@ static void ide_new_file(Ide* a) {
     a->model.focus = -1;
     a->focus_func = -1;
     model_analyze(&a->model);
+    ide_sel_reset(a);                 /* IDE-SYNC-0: fresh selection */
     ide_editor_reset(a);
     a->editor.focused = 1;
     /* Dismiss any open overlay prompts so they don't persist over the new file. */
@@ -1982,6 +2024,7 @@ static void route_click(Ide* a, int mx, int my) {
     if (rect_hit(a->r_code, mx, my)) {
         /* code view is now editable: place the caret + take keyboard focus */
         panel_code_click(a, a->r_code, mx, my, g_shift_down);
+        ide_sel_from_caret(a, PANE_CODEVIEW);   /* IDE-SYNC-0 S0 */
         return;
     }
     /* status: no interactive handler. */
@@ -2055,6 +2098,7 @@ static void route_click_editor(Ide* a, int mx, int my) {
         a->explorer_focused = 0;
         a->editor.focused = 1;
         ide_editor_click(a, a->r_e_editor, mx, my, g_shift_down);
+        ide_sel_from_caret(a, PANE_EDITOR);     /* IDE-SYNC-0 S0 */
         return;
     }
     if (editor_btabs_click(a, a->r_e_btabs, mx, my)) return;
@@ -2401,6 +2445,7 @@ static void handle_key(Ide* a, int keycode, int pressed) {
         if (keycode == KEY_ESC) { a->codeview_focus = 0; return; }
         char ch = ide_keycode_ascii(keycode, g_shift_down);
         ide_editor_key(a, keycode, ch, g_shift_down, 0);
+        ide_sel_from_caret(a, PANE_CODEVIEW);   /* IDE-SYNC-0 S0 */
         /* The autocomplete popup is drawn only by the main editor; suppress it
          * in the code view so an invisible popup can't capture Tab/Enter (v1). */
         a->editor.ac_active = 0;
@@ -2459,8 +2504,10 @@ static void handle_key(Ide* a, int keycode, int pressed) {
         char ch = ide_keycode_ascii(keycode, g_shift_down);
         if (a->term_focus)
             ide_term_key(a, keycode, ch, g_shift_down, 0);
-        else
+        else {
             ide_editor_key(a, keycode, ch, g_shift_down, 0);
+            ide_sel_from_caret(a, PANE_EDITOR); /* IDE-SYNC-0 S0 */
+        }
         return;
     }
 

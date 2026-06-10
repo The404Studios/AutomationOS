@@ -110,12 +110,36 @@ typedef struct {
     int    prev_focus;                 /* saved previous focus               */
 } FileTabMeta;
 
+/* ---- IDE-SYNC-0: THE unified selection model ------------------------------
+ * The aphantasia design law: ONE active selection that the editor, the LEGO
+ * map, and the inspector all read/write -- no pane invents its own selection
+ * state. ide_sel_from_caret() (caret-side) and ide_set_focus() (map/runtime/
+ * inspector-side) are the only writers; everything else reads. */
+typedef enum {
+    PANE_EDITOR = 0,    /* the EDITOR-workspace text editor       */
+    PANE_CODEVIEW,      /* the LEGO-workspace editable code view  */
+    PANE_MAP,           /* the semantic LEGO map                  */
+    PANE_INSPECTOR,     /* the right inspector / its center tab   */
+    PANE_RUNTIME        /* the runtime-flow strip / VIZ-3         */
+} ActivePane;
+
+typedef struct {
+    char file[IDE_PATH];   /* active_file: where the selection lives          */
+    int  line;             /* active_line: 0-based source line                */
+    int  symbol;           /* active_symbol_id: model func index, -1 = none   */
+    int  node;             /* active_node_id: map satellite idx, -1 = central */
+    int  pane;             /* active_panel: which pane last wrote this        */
+} IdeSel;
+
 typedef struct Ide {
     /* project / file */
     char     root[IDE_PATH];        /* project root dir              */
     char     cur_file[IDE_PATH];    /* currently open file           */
     char     src[IDE_SRC_CAP];      /* source of cur_file            */
     int      src_len;
+
+    /* IDE-SYNC-0: the one selection model (see IdeSel above) */
+    IdeSel   sel;
 
     /* analysis */
     Model    model;
@@ -237,6 +261,11 @@ void ide_toggle_collapsed(Ide* a, const char* path);
 void rebuild_visible_entries(Ide* a);
 /* Set the focused function (re-runs analyze for that focus). */
 void ide_set_focus(Ide* a, int func_idx);
+/* IDE-SYNC-0: reset the unified selection (new/changed file -> nothing
+ * selected) and resolve the editor caret to its enclosing function, writing
+ * THE selection model (a->sel). `pane` records who moved the caret. */
+void ide_sel_reset(Ide* a);
+void ide_sel_from_caret(Ide* a, int pane);
 /* Open the "New Project" templates modal (Ctrl+N / topbar [+ NEW] button).
  * Public so chrome in ide_chrome.c can trigger it too. Implemented in ide.c. */
 void ide_new_project(Ide* a);

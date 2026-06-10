@@ -240,6 +240,34 @@ void panel_status(Ide* a, Canvas* cv, Rect r) {
         x += gfx_textw(f) + 2 * GFX_FW;
     }
 
+    /* IDE-SYNC-0 breadcrumb: "FN <name>  Ln <l>,<c>" from THE selection model
+     * (a->sel) -- the always-visible "where am I" the aphantasia north star
+     * requires. FN shows the caret's enclosing function (ACCENT when one is
+     * resolved), falling back to "-" between functions. */
+    {
+        const char* fn = "-";
+        if (a->sel.symbol >= 0 && a->sel.symbol < a->model.nfuncs)
+            fn = a->model.funcs[a->sel.symbol].name;
+        gfx_text_clip(cv, x, ty, "FN", TH_TEXT_DIM, clip_x, clip_w);
+        x += gfx_textw("FN") + GFX_FW;
+        gfx_text_clip(cv, x, ty, fn,
+                      (a->sel.symbol >= 0) ? TH_BLUE : TH_TEXT_DIM,
+                      clip_x, clip_w);
+        x += gfx_textw(fn) + 2 * GFX_FW;
+
+        char pos[24]; int p = 0;
+        char num[12]; int n;
+        pos[p++] = 'L'; pos[p++] = 'n'; pos[p++] = ' ';
+        n = ide_itoa(a->sel.line + 1, num);
+        for (int i = 0; i < n && p < (int)sizeof(pos) - 1; i++) pos[p++] = num[i];
+        pos[p++] = ',';
+        n = ide_itoa(a->editor.caret_col + 1, num);
+        for (int i = 0; i < n && p < (int)sizeof(pos) - 1; i++) pos[p++] = num[i];
+        pos[p] = 0;
+        gfx_text_clip(cv, x, ty, pos, TH_TEXT_DIM, clip_x, clip_w);
+        x += gfx_textw(pos) + 2 * GFX_FW;
+    }
+
     /* Three pipeline dots. */
     x = chr_dot(cv, x, cy, m->lexed,    "LEXED",    clip_x, clip_w) + GFX_FW;
     x = chr_dot(cv, x, cy, m->parsed,   "PARSED",   clip_x, clip_w) + GFX_FW;

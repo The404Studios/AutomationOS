@@ -310,6 +310,10 @@ cc userspace/tests/bklstorm.c /tmp/bklstorm.o; $LD /tmp/crt0.o /tmp/bklstorm.o -
 # always (tiny); only the SMP_BATCH kernel ever spawns it (unpinned, the
 # choose_cpu batch branch routes it).
 cc userspace/tests/batchdemo.c /tmp/batchdemo.o; $LD /tmp/crt0.o /tmp/batchdemo.o -o /tmp/batchdemo.elf
+# threadprobe: SMP-THREAD-INHERIT-0 threaded BATCH workload (parent + 2 worker
+# threads). Shipped always (tiny); only the SMP_THREAD_INHERIT kernel spawns it
+# (BATCH->CPU1; the workers inherit the parent's CPU1 placement).
+cc userspace/tests/threadprobe.c /tmp/threadprobe.o; $LD /tmp/crt0.o /tmp/threadprobe.o -o /tmp/threadprobe.elf
 # apidemo: fetch http(s) URL + pretty-print JSON (crt0+main; HTTPS + json).
 cc userspace/apps/apidemo/apidemo.c /tmp/apidemo.o; $LD /tmp/crt0.o /tmp/apidemo.o /tmp/json.o $HTTPS_OBJS -o /tmp/apidemo.elf
 
@@ -642,6 +646,8 @@ cp /tmp/cpu1hello.elf /tmp/ird/sbin/cpu1hello
 cp /tmp/bklstorm.elf /tmp/ird/sbin/bklstorm
 # batchdemo -> /sbin (SMP-F3-7; inert unless the SMP_BATCH kernel spawns it).
 cp /tmp/batchdemo.elf /tmp/ird/sbin/batchdemo
+# threadprobe -> /sbin (SMP-THREAD-INHERIT-0; inert unless that kernel spawns it).
+cp /tmp/threadprobe.elf /tmp/ird/sbin/threadprobe
 # cpu1offload -> /sbin (init spawns it at boot; prints PASS on SMP, SKIP on default).
 cp /tmp/cpu1offload.elf /tmp/ird/sbin/cpu1offload
 # smpstress -> /sbin (init spawns it; PASS on SMP after thousands of CPU1 jobs, SKIP on default).

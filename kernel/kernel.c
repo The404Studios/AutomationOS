@@ -1356,6 +1356,16 @@ void kernel_main(void* raw_info) {
                                 runmask_selftest();
                             }
 #endif
+#ifdef SMP_THREAD_INHERIT
+                            /* SMP-THREAD-INHERIT-0: prove the inheritance
+                             * predicate (a BATCH-CPU1 parent's thread inherits
+                             * CPU1+BATCH; a NORMAL parent's thread stays CPU0)
+                             * before the threaded probe below relies on it. */
+                            {
+                                extern void threadinherit_selftest(void);
+                                threadinherit_selftest();
+                            }
+#endif
                             /* Brick F2: pin ONE ring-0 kernel test thread to CPU1.
                              * CPU1's ap_scheduler_loop context-switches into it on
                              * the next tick. Spin briefly on the BSP, then read
@@ -1555,6 +1565,51 @@ void kernel_main(void* raw_info) {
                         } else {
                             kprintf("[SMP] F3-7: sbin/batchdemo not in initrd "
                                     "-- skipped (rebuild initrd)\n");
+                        }
+                    }
+#endif
+#ifdef SMP_THREAD_INHERIT
+                    /* SMP-THREAD-INHERIT-0 acceptance: a THREADED BATCH workload
+                     * on CPU1 whose worker threads INHERIT the parent's CPU1
+                     * placement (one address space, one execution CPU). Spawned
+                     * EXACTLY like batchdemo (class=BATCH + a multi-CPU legal
+                     * mask -> the seam's batch branch picks CPU1) -- and pointedly
+                     * NOT added to the sys_spawn allowlist (no_allowlist_expansion).
+                     * scheduler_submit_task records the chosen CPU as the mm's
+                     * home; when threadprobe runs there and creates its 2 worker
+                     * threads, thread_create pins them to that home CPU. The
+                     * [THREADINHERIT] observation + ran_on_cpus ground truth prove
+                     * parent+workers all run CPU1 and the mm never spans two CPUs. */
+                    {
+                        uint64_t tp_size = 0;
+                        void* tp_data = initrd_get_file("sbin/threadprobe", &tp_size);
+                        if (tp_data && tp_size > 0) {
+                            int tppid = elf_load_and_exec(tp_data, tp_size,
+                                                          "threadprobe");
+                            process_t* tp = (tppid > 0)
+                                          ? process_get_by_pid(tppid) : NULL;
+                            if (tp) {
+                                scheduler_remove_process(tp);
+                                process_t* ini = process_get_by_pid(1);
+                                if (ini) {
+                                    tp->parent_pid = 1;
+                                    tp->parent_seq = ini->create_seq;
+                                    process_unref(ini);
+                                }
+                                tp->allowed_cpus = ((uint64_t)1 << 0) |
+                                                   ((uint64_t)1 << 1);
+                                tp->pinned_cpu   = CPU_NONE;     /* the seam decides */
+                                tp->sched.sched_class = SCHED_CLASS_BATCH;
+                                uint32_t tp_target = scheduler_submit_task(tp);
+                                kprintf("[SMP] THREAD-INHERIT: threadprobe PID %d "
+                                        "class=BATCH unpinned -> the seam chose "
+                                        "cpu%u (workers inherit it)\n",
+                                        tppid, tp_target);
+                                process_unref(tp);
+                            }
+                        } else {
+                            kprintf("[SMP] THREAD-INHERIT: sbin/threadprobe not in "
+                                    "initrd -- skipped (rebuild initrd)\n");
                         }
                     }
 #endif

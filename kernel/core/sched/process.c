@@ -326,6 +326,21 @@ process_t* process_create(const char* name, void* entry_point) {
     }
     *proc->as_refcount = 1;
 
+#ifdef SMP_THREAD_INHERIT
+    // SMP-THREAD-INHERIT-0: allocate the SHARED address-space placement descriptor
+    // alongside as_refcount (same lifetime). A normally-created process / fork
+    // child is its own address space -- default HOME CPU0, NORMAL class, no run
+    // history yet. The mm's home_cpu is set to CPU1 only when the AS leader is
+    // routed there (scheduler_submit_task). A NULL mm_place is tolerated by every
+    // reader (the guard everywhere), so a failed alloc does NOT abort the ctor.
+    proc->mm_place = (mm_placement_t*)kmalloc(sizeof(mm_placement_t));
+    if (proc->mm_place) {
+        proc->mm_place->home_cpu    = 0;
+        proc->mm_place->ran_on_cpus = 0;
+        proc->mm_place->sched_class = (uint32_t)SCHED_CLASS_NORMAL;
+    }
+#endif
+
     // A normally-created process is its OWN thread-group leader: tgid == pid.
     // thread_create() overrides tgid to the creator's tgid for threads.
     proc->tgid = pid;
@@ -379,6 +394,34 @@ process_t* process_create(const char* name, void* entry_point) {
 }
 
 // ===========================================================================
+#ifdef SMP_THREAD_INHERIT
+// SMP-THREAD-INHERIT-0: the production inheritance predicate (declared in
+// sched.h). A thread SHARES its parent's address space, so it must run on the
+// SAME CPU as the rest of that address space -- ONE mm, ONE execution CPU --
+// until per-mm TLB shootdown exists (today user mappings are local-flush-only
+// under the pin/no-migration assumption; an mm split across CPU0 and CPU1 would
+// silently break that). So the thread INHERITS the mm's home CPU and PINS to it
+// (allowed_cpus NARROWED to exactly that CPU -- it can neither widen its mask
+// nor choose a different CPU than its siblings) and inherits the mm's class.
+// home_cpu is set when the AS LEADER is placed (scheduler_submit_task); a thread
+// created before that inherits the default home 0 (CPU0) -- exactly today's
+// conservative behavior. Used by BOTH thread_create and the threadinherit
+// selftest, so the proof cannot diverge from the production path.
+void sched_thread_inherit_placement(struct process* parent, struct process* t) {
+    if (!t) return;
+    uint32_t home = 0;                              // safe default: CPU0
+    uint32_t cls  = (uint32_t)SCHED_CLASS_NORMAL;
+    if (parent && parent->mm_place) {
+        home = parent->mm_place->home_cpu;
+        cls  = parent->mm_place->sched_class;
+    }
+    if (home >= 64) home = 0;                        // defensive (mask is 64-wide)
+    t->allowed_cpus      = (uint64_t)1 << home;      // NARROW to the home CPU (never widen)
+    t->pinned_cpu        = home;                     // pin: choose_cpu routes it home
+    t->sched.sched_class = (sched_class_t)cls;       // inherit the mm's class
+}
+#endif
+
 // thread_create — a schedulable task that SHARES the parent's address space
 // ===========================================================================
 // A thread is a process_t that is identical to a forked process EXCEPT:
@@ -462,6 +505,16 @@ process_t* thread_create(process_t* parent, uint64_t entry, uint64_t arg,
     t->context.cr3 = parent->context.cr3;
     t->as_refcount = parent->as_refcount;
     __atomic_add_fetch(t->as_refcount, 1, __ATOMIC_SEQ_CST);
+
+#ifdef SMP_THREAD_INHERIT
+    // SMP-THREAD-INHERIT-0: share the mm placement descriptor (same lifetime as
+    // as_refcount -- freed by the last AS user) and INHERIT the address space's
+    // CPU placement. This OVERRIDES the conservative CPU0-only affinity default
+    // set above: the thread pins to the mm's home CPU so the whole address space
+    // stays on ONE CPU (the TLBSHOOT_NEG pin assumption holds).
+    t->mm_place = parent->mm_place;
+    sched_thread_inherit_placement(parent, t);
+#endif
 
     // Thread group: threads of a process share the parent's tgid.
     t->tgid = parent->tgid;
@@ -801,6 +854,17 @@ void process_unref(process_t* proc) {
                 kfree(proc->as_refcount);
             }
         }
+#ifdef SMP_THREAD_INHERIT
+        // SMP-THREAD-INHERIT-0: the mm placement descriptor shares the AS
+        // lifetime exactly (same last_user test as as_refcount above). Free it
+        // when the last user goes; a non-last thread leaves it for survivors and
+        // only drops its own pointer below. Independent of context.cr3 (kernel
+        // threads have no user CR3 to destroy but still own an mm_place cell).
+        if (last_user && proc->mm_place) {
+            kfree(proc->mm_place);
+        }
+        proc->mm_place = NULL;
+#endif
         // A non-last thread leaves the CR3 and as_refcount intact for the
         // survivors; it must NOT touch either (no vmm_as_release, no free).
         proc->as_refcount = NULL;  // this PCB no longer references the cell
@@ -999,6 +1063,24 @@ void process_set_current(process_t* proc) {
         // through here). ran_on_cpus is the ground truth the TLB pin audit
         // aggregates per CR3: declared masks may lie, this bit cannot.
         proc->ran_on_cpus |= (1u << cpu_id());
+#ifdef SMP_THREAD_INHERIT
+        // SMP-THREAD-INHERIT-0: also fold this dispatch into the SHARED mm
+        // accumulator. ran_on_cpus is per-PCB; mm_place->ran_on_cpus is per
+        // address space (the leader + every thread), so popcount>1 here is a
+        // single address space executing on >1 CPU -- the exact hazard. The
+        // AP path stamps the same in ap_cooperative_schedule.
+        //
+        // ATOMIC (locked OR), unlike the per-PCB stamp above: a single PCB is
+        // never on two CPUs at once, so proc->ran_on_cpus has no concurrent
+        // writer -- but mm_place->ran_on_cpus is SHARED across the address
+        // space and CAN be written by CPU0 and CPU1 simultaneously, which is
+        // PRECISELY the violation this field detects. A plain read-modify-write
+        // could lose the other CPU's bit and HIDE the bug; the detector must be
+        // no weaker than the hazard, so a locked OR.
+        if (proc->mm_place)
+            __atomic_fetch_or(&proc->mm_place->ran_on_cpus,
+                              (1u << cpu_id()), __ATOMIC_SEQ_CST);
+#endif
 #endif
     }
 }

@@ -99,6 +99,35 @@ typedef struct {
 } sched_profile_t;
 #endif
 
+#ifdef SMP_THREAD_INHERIT
+// ===========================================================================
+// SMP-THREAD-INHERIT-0: shared address-space placement (ONE mm = ONE CPU).
+// ===========================================================================
+// There is no mm struct here -- an address space IS context.cr3 + a heap-shared
+// as_refcount (every thread on the same CR3 shares both). mm_placement is the
+// matching SHARED descriptor: allocated fresh in process_create, pointer-copied
+// in thread_create, freed when the LAST AS user dies (the as_refcount==0 test).
+// It carries the address space's HOME CPU (threads inherit it and PIN there --
+// one mm runs on one CPU until per-mm TLB shootdown exists), the LIVE cross-CPU
+// run accumulator (ran_on_cpus OR'd at every dispatch of any thread of the mm;
+// popcount>1 == exactly the hazard the RUNMASK audit guards), and the mm's
+// scheduling class (threads inherit it). Plain uint32_t POD fields (not the
+// enum) so the descriptor stays trivially shareable across CPUs.
+typedef struct mm_placement {
+    uint32_t home_cpu;      // the ONE CPU this address space runs on (default 0 = CPU0)
+    uint32_t ran_on_cpus;   // OR of every CPU any thread of this mm has dispatched on
+    uint32_t sched_class;   // the mm's class; threads inherit it (a sched_class_t value)
+} mm_placement_t;
+
+// Apply address-space placement INHERITANCE to a freshly-created thread `t` from
+// its `parent`: t inherits the mm's home CPU and PINS to it (allowed_cpus =
+// 1<<home, pinned_cpu = home -- NARROWED, never widened) and inherits the mm's
+// class. Defined in process.c (which has no __LINE__ users); the threadinherit
+// selftest in scheduler.c calls the SAME function so the proof cannot diverge
+// from the production path.
+void sched_thread_inherit_placement(struct process* parent, struct process* t);
+#endif
+
 // ---------------------------------------------------------------------------
 // wait_object_t — the single blocking primitive (engine in waitqueue.c).
 // The full STRUCT layout is defined HERE (early) so process_t can embed a
@@ -463,6 +492,14 @@ typedef struct process {
     // Gated separately from p->sched so every pre-RUNMASK profile keeps a
     // byte-identical process_t layout.
     uint32_t ran_on_cpus;
+#ifdef SMP_THREAD_INHERIT
+    // SMP-THREAD-INHERIT-0: the SHARED address-space placement descriptor (see
+    // mm_placement_t above). Pointer SHARED by the AS leader + all its threads
+    // (exactly like as_refcount); NULL-tolerated everywhere (every reader guards
+    // it). At the END (the F3-1 new-field law) and double-gated so every
+    // pre-inherit build keeps a byte-identical process_t layout.
+    struct mm_placement* mm_place;
+#endif
 #endif
 #endif
 } process_t;

@@ -939,6 +939,19 @@ uint32_t scheduler_submit_task(process_t* p) {
         }
     }
 
+#ifdef SMP_THREAD_INHERIT
+    // SMP-THREAD-INHERIT-0: the LEADER's placement IS the address space's home
+    // CPU. Record it so threads created later inherit + pin to this exact CPU
+    // (one mm, one execution CPU). Only the AS leader (is_thread==0) sets the
+    // home -- a thread's own submit must never move the mm out from under its
+    // siblings. Threads do not pass through here anyway (they use
+    // scheduler_add_process), but the guard makes the invariant explicit.
+    if (p->mm_place && !p->is_thread) {
+        p->mm_place->home_cpu    = target;
+        p->mm_place->sched_class = (uint32_t)p->sched.sched_class;
+    }
+#endif
+
     scheduler_add_process_to_cpu(p, target);
     return target;
 }
@@ -1103,6 +1116,50 @@ void scheduler_batchclass_selftest(void) {
             pinned_rt_cpu1, illegal_clamped);
 }
 #endif /* SMP_BATCH */
+
+#ifdef SMP_THREAD_INHERIT
+// SMP-THREAD-INHERIT-0 selftest: exercise the PRODUCTION inheritance predicate
+// (sched_thread_inherit_placement, the SAME function thread_create uses)
+// directly -- the boot queues never hold a BATCH-on-CPU1 threaded shape early
+// enough to be a non-vacuous proof, so we test the predicate on synthetic
+// shells (the affinity/choosecpu-selftest pattern). The two cases that matter:
+//   A. a BATCH address space placed on CPU1 (the matmuljobs shape): its thread
+//      MUST inherit allowed_cpus = CPU1-only + pinned_cpu = 1 + class BATCH
+//      (== one mm, one CPU; == the mechanism matmuljobs needs == ready).
+//   B. a NORMAL address space (home CPU0): its thread stays CPU0 (no regression
+//      for the desktop -- threads keep landing on CPU0).
+// process_t is too big for the stack -> static shells (zero-init by storage).
+void threadinherit_selftest(void) {
+    static process_t pa;          /* synthetic parent (AS leader) */
+    static process_t ch;          /* synthetic child thread       */
+    static mm_placement_t mp;     /* the parent's mm placement     */
+
+    /* case A: BATCH mm placed on CPU1 */
+    mp.home_cpu = 1; mp.ran_on_cpus = 0; mp.sched_class = (uint32_t)SCHED_CLASS_BATCH;
+    pa.mm_place = &mp;
+    sched_thread_inherit_placement(&pa, &ch);
+    int inherit_home  = (ch.pinned_cpu == 1) && (ch.allowed_cpus == (1ULL << 1));
+    int no_widen      = (ch.allowed_cpus == (1ULL << 1));   /* exactly CPU1, no extra bits */
+    int class_inherit = (ch.sched.sched_class == SCHED_CLASS_BATCH);
+
+    /* case B: NORMAL mm at home CPU0 -> thread stays CPU0 */
+    mp.home_cpu = 0; mp.sched_class = (uint32_t)SCHED_CLASS_NORMAL;
+    sched_thread_inherit_placement(&pa, &ch);
+    int normal_home = (ch.pinned_cpu == 0) && (ch.allowed_cpus == (1ULL << 0)) &&
+                      (ch.sched.sched_class == SCHED_CLASS_NORMAL);
+
+    /* matmuljobs_ready == the BATCH-CPU1 inherit mechanism is proven correct;
+     * the brick deliberately does NOT route matmuljobs (that is the next brick,
+     * SMP-MATMUL-BATCH-0). Readiness is the predicate, not the routing. */
+    int matmuljobs_ready = inherit_home && class_inherit;
+
+    int pass = inherit_home && no_widen && class_inherit && normal_home;
+    kprintf("THREADINHERIT-CORE: %s inherit_home=%d no_widen=%d class_inherit=%d "
+            "normal_home=%d matmuljobs_ready=%d\n",
+            pass ? "PASS" : "FAIL", inherit_home, no_widen, class_inherit,
+            normal_home, matmuljobs_ready);
+}
+#endif /* SMP_THREAD_INHERIT */
 #endif /* SMP_SCHED && SMP_SCHED_DISPATCH */
 
 // F3-5: HOME-ROUTED wake enqueue. Wake-side code (waitqueue signal/timer) used
@@ -1273,6 +1330,16 @@ void ap_cooperative_schedule(void) {
     // there sits ABOVE the file's ASSERT_ALWAYS lines and the __LINE__ shift
     // breaks default-build byte-identity (the law-2 discipline).
     next->ran_on_cpus |= (1u << cpu_id());
+#ifdef SMP_THREAD_INHERIT
+    // SMP-THREAD-INHERIT-0: fold CPU1's dispatch into the SHARED mm accumulator
+    // (popcount>1 across the leader + threads == one address space on >1 CPU).
+    // ATOMIC (locked OR): this shared cross-CPU DETECTOR must not lose a bit to
+    // a torn read-modify-write -- the very concurrency it catches would also
+    // corrupt a plain |=. See process_set_current for the full rationale.
+    if (next->mm_place)
+        __atomic_fetch_or(&next->mm_place->ran_on_cpus,
+                          (1u << cpu_id()), __ATOMIC_SEQ_CST);
+#endif
 #endif
     if (next != cpu->idle_thread) next->state = PROCESS_RUNNING;
 

@@ -278,6 +278,28 @@ if [ "${SMP:-0}" = "1" ]; then
         CFLAGS="$CFLAGS -DSMP_DSPLIT"
         echo "*** SMP_DSPLIT build: desktop-split allowlist live (DESKTOP-SPLIT-0) ***"
     fi
+
+    # =========================================================================
+    # SMP_THREAD_INHERIT (SMP-THREAD-INHERIT-0) -- sub-gate, REQUIRES SMP=1
+    # (acceptance profile = the FULL stack + SMP_RUNMASK). Makes SHARED address
+    # spaces safe before more real workload lands on CPU1: a thread SHARES its
+    # parent's CR3, so it must run on the SAME CPU as the rest of that address
+    # space (one mm, one execution CPU) until per-mm TLB shootdown exists. Adds
+    # a shared mm_placement {home_cpu, ran_on_cpus, sched_class} tied to the
+    # as_refcount lifetime; thread_create INHERITS the mm's home CPU and PINS to
+    # it (never widens); dispatch stamps fold into the shared accumulator; a
+    # kernel-spawned threaded BATCH probe (threadprobe) proves parent+workers
+    # all run CPU1. Does NOT expand the sys_spawn allowlist and does NOT route
+    # matmuljobs (the predicate is proven ready; the routing is the next brick).
+    # When UNSET: no -DSMP_THREAD_INHERIT, no new field, threads keep the F3-2
+    # CPU0-only default, every other build byte-for-byte unchanged. Profile:
+    #   SMP=1 SMP_SCHED=1 SMP_SCHED_DISPATCH=1 SMP_IPI=1 SMP_BKL=1 \
+    #   SMP_BATCH=1 SMP_RUNMASK=1 SMP_THREAD_INHERIT=1 bash scripts/quick_build.sh
+    # =========================================================================
+    if [ "${SMP_THREAD_INHERIT:-0}" = "1" ]; then
+        CFLAGS="$CFLAGS -DSMP_THREAD_INHERIT"
+        echo "*** SMP_THREAD_INHERIT build: shared-mm placement inheritance live (SMP-THREAD-INHERIT-0) ***"
+    fi
 fi
 
 # =============================================================================

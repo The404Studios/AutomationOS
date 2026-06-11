@@ -20,21 +20,29 @@
 #include "ide_library.h"          /* the "complex" library shown in the LIB tab */
 #include "ide_editor.h"           /* ide_editor_insert_snippet (click -> insert) */
 #include "ide_config.h"           /* persist Settings knobs on change            */
+#include "ide_marks.h"            /* IDE-FORGE-0: per-symbol marks (MARK tab)     */
+#include "ide_build.h"            /* IDE-FORGE-0: ACTIONS deck backends          */
 
 /* ---- layout constants local to this panel ---- */
 #define INSP_HEADER_H   (ROW_H + 2)   /* "INSPECTOR - <func>" header bar  */
 #define INSP_TAB_H      (ROW_H + 2)   /* tab strip height                 */
-#define INSP_NTABS      6
+#define INSP_NTABS      7
 #define INSP_DOT_W      10            /* gutter for the coloured port dot */
 #define INSP_APPLY_W    56            /* [APPLY] button width             */
 #define INSP_APPLY_H    (ROW_H - 2)   /* [APPLY] button height            */
+
+/* Settings/MARK row geometry (shared by panel_settings + the MARK knob strip
+ * + the ACTIONS deck + the Pulse, so the widget vocabulary is identical). */
+#define SET_ROW_H   (ROW_H + 8)
+#define SET_HEAD_H  (ROW_H + 2)
+#define SET_KNOB_W  8
 
 /* SHORT labels: 5 equal-width cells in RIGHT_W (=27*GFX_FW) give ~48px each at
  * the default scale, so the old full words ("CATEGORY"=8 chars) overflowed and
  * truncated to unreadable fragments. Compact 3-4 char labels fit cleanly at
  * every zoom level. (Hover/active state + the body content disambiguate them.) */
 static const char* const INSP_TAB_LBL[INSP_NTABS] = {
-    "SYN", "CAT", "PORT", "CONN", "INFO", "LIB"
+    "SYN", "CAT", "PORT", "CONN", "INFO", "LIB", "MARK"
 };
 
 /* ---- tiny shared scratch (no libc) ---- */
@@ -516,6 +524,85 @@ static void insp_body_library(Ide* a, Canvas* cv, Rect b) {
     }
 }
 
+/* ---- MARK (tab 6): per-symbol knob strip ----
+ *
+ * The aphantasia "intent per object" board: Done / Star / Isolate / Mute, each
+ * a SET_TOGGLE bound to a SymMark field (persisted on flip). Every knob has a
+ * visible consequence ELSEWHERE (funcs list / watch chips / map LOCKED / WARN
+ * (muted)) -- a knob with no visible consequence is forbidden by the brick law.
+ */
+static const char* const MARK_LBL[4] = {
+    "Done", "Star (watch)", "Isolate", "Mute warnings"
+};
+#define MARK_NROWS 4
+static int g_mark_sel = 0;   /* keyboard-selected MARK row (0..MARK_NROWS-1) */
+
+/* The int* field for MARK row `idx` in a SymMark (matches MARK_LBL order). */
+static int* mark_field_ptr(SymMark* mk, int idx) {
+    if (!mk) return 0;
+    switch (idx) {
+        case 0: return &mk->done;
+        case 1: return &mk->star;
+        case 2: return &mk->isolate;
+        case 3: return &mk->mute;
+        default: return 0;
+    }
+}
+
+/* Extracted from panel_settings (same pixels): the ON/OFF pill + sliding knob +
+ * "ON"/"OFF" label, right-aligned in row body `rowb` at row top `ry` (text
+ * baseline `ty`). Refactor only -- panel_settings calls this, no visual change. */
+static void insp_draw_toggle(Canvas* cv, Rect rowb, int ry, int ty, int on) {
+    int ph = GFX_FH, pw = GFX_FH * 2 + 6;
+    int px = rowb.x + rowb.w - PAD - pw;
+    int py = ry + (SET_ROW_H - ph) / 2;
+    gfx_round(cv, px, py, pw, ph, ph / 2, on ? TH_GREEN : TH_BORDER_LT);
+    int kd = ph - 4;
+    int kx = on ? (px + pw - kd - 2) : (px + 2);
+    gfx_round(cv, kx, py + 2, kd, kd, kd / 2, TH_PANEL);
+    const char* s = on ? "ON" : "OFF";
+    int sw = ide_strlen(s) * GFX_FW;
+    int sx = px - PAD - sw;
+    insp_text(cv, sx, ty, s, on ? TH_GREEN : TH_TEXT_FAINT, sw);
+}
+
+static void insp_body_marks(Ide* a, Canvas* cv, Rect b, Func* f) {
+    SymMark* mk = marks_get(f->name);
+    int y = b.y - a->inspector_scroll;
+    int bot = b.y + b.h;
+
+    /* header "KNOBS - <fname>" in the section-header style */
+    {
+        char hdr[M_NAME + 12];
+        int p = 0;
+        const char* lead = "KNOBS - ";
+        while (lead[p]) { hdr[p] = lead[p]; p++; }
+        for (int i = 0; f->name[i] && p < (int)sizeof(hdr) - 1; i++) hdr[p++] = f->name[i];
+        hdr[p] = 0;
+        if (y + GFX_FH > b.y && y < bot)
+            insp_text(cv, b.x + PAD, y + (SET_HEAD_H - GFX_FH) / 2, hdr, TH_BLUE,
+                      b.w - 2 * PAD);
+        if (y + SET_HEAD_H - 3 > b.y && y < bot)
+            gfx_hline(cv, b.x + PAD, y + SET_HEAD_H - 3, b.w - 2 * PAD, TH_BORDER);
+    }
+    y += SET_HEAD_H;
+
+    for (int i = 0; i < MARK_NROWS; i++) {
+        int ry = y;
+        y += SET_ROW_H;
+        if (ry + SET_ROW_H <= b.y || ry >= bot) continue;   /* cull off-screen */
+        int ty = ry + (SET_ROW_H - GFX_FH) / 2;
+
+        if (i == g_mark_sel)
+            gfx_blend(cv, b.x, ry, b.w, SET_ROW_H,
+                      (0x30u << 24) | (TH_SELECT & 0x00FFFFFFu));
+
+        insp_text(cv, b.x + PAD, ty, MARK_LBL[i], TH_TEXT, (b.w * 3) / 5);
+        int* vp = mark_field_ptr(mk, i);
+        insp_draw_toggle(cv, b, ry, ty, vp ? (*vp != 0) : 0);
+    }
+}
+
 /* ====================================================================== *
  *  panel_inspector                                                       *
  * ====================================================================== */
@@ -576,6 +663,7 @@ void panel_inspector(Ide* a, Canvas* cv, Rect r) {
         case 2: insp_body_ports(a, cv, b, f);     break;
         case 3: insp_body_conns(a, cv, b);        break;
         case 4: insp_body_details(a, cv, b);      break;
+        case 6: insp_body_marks(a, cv, b, f);     break;
         default: insp_body_ports(a, cv, b, f);    break;
     }
 }
@@ -594,6 +682,28 @@ int panel_inspector_click(Ide* a, Rect r, int mx, int my) {
             a->inspector_scroll = 0;
             return 1;
         }
+    }
+
+    /* MARK: flip a knob (Done/Star/Isolate/Mute) on the focused function and
+     * persist -- structurally identical to the Settings toggle branch. Replays
+     * insp_body_marks()'s header + SET_ROW_H pitch. */
+    if (a->insp_tab == 6) {
+        Rect b = insp_body_rect(r);
+        Func* f = insp_focus(a);
+        if (f && b.h > 0 && rect_hit(b, mx, my)) {
+            SymMark* mk = marks_get(f->name);
+            int y = b.y - a->inspector_scroll + SET_HEAD_H;
+            for (int i = 0; i < MARK_NROWS; i++) {
+                int ry = y + i * SET_ROW_H;
+                if (my >= ry && my < ry + SET_ROW_H) {
+                    int* vp = mark_field_ptr(mk, i);
+                    if (vp) { *vp = *vp ? 0 : 1; ide_marks_save(); }
+                    g_mark_sel = i;
+                    break;
+                }
+            }
+        }
+        return 1;
     }
 
     /* LIB: click a complex row to insert it at the editor caret (live re-parse
@@ -732,9 +842,7 @@ static const SetRow g_set_rows[] = {
     { SET_SLIDER, "Pan step (px)",     &g_map_pan_step,   5,  60,  5, 0 },
 };
 #define SET_NROWS   ((int)(sizeof(g_set_rows) / sizeof(g_set_rows[0])))
-#define SET_ROW_H   (ROW_H + 8)
-#define SET_HEAD_H  (ROW_H + 2)
-#define SET_KNOB_W  8
+/* (SET_ROW_H / SET_HEAD_H / SET_KNOB_W are defined up top -- shared widgets.) */
 
 static int g_set_drag = -1;   /* index of the slider being dragged (-1 = none) */
 static int g_set_sel  = 1;    /* keyboard-selected row (skips SET_HEADER rows) */
@@ -801,6 +909,23 @@ static void set_apply_value(const SetRow* row, int v) {
     /* Persisted by the caller on drag-release / toggle-click (not every move). */
 }
 
+/* Extracted from panel_settings (same pixels): the slider track + knob + value
+ * text, right-aligned in row body `rowb` at row top `ry` (text baseline `ty`).
+ * Refactor only -- panel_settings calls this, no visual change. */
+static void insp_draw_slider(Canvas* cv, Rect rowb, int ry, int ty,
+                             int val, int vmin, int vmax) {
+    Rect c = set_ctrl_rect(rowb, ry);
+    Rect track = set_track_rect(c);
+    int tcy = c.y + GFX_FH / 2;
+    gfx_fill(cv, track.x, tcy - 1, track.w, 2, TH_BORDER_LT);
+    int kx = set_knob_x(track, val, vmin, vmax);
+    gfx_round(cv, kx, c.y, SET_KNOB_W, GFX_FH, 2, TH_BLUE);
+    char nb[16]; ide_itoa(val, nb);
+    int vx = track.x + track.w + GFX_FW / 2;
+    if (vx < c.x + c.w)
+        insp_text(cv, vx, ty, nb, TH_TEXT_DIM, c.x + c.w - vx);
+}
+
 void panel_settings(Ide* a, Canvas* cv, Rect r) {
     if (r.w <= 0 || r.h <= 0) return;
 
@@ -859,30 +984,10 @@ void panel_settings(Ide* a, Canvas* cv, Rect r) {
         insp_text(cv, b.x + PAD, ty, row->label, TH_TEXT, (b.w * 3) / 5);
 
         if (row->kind == SET_TOGGLE) {
-            int on = row->var ? (*row->var != 0) : 0;
-            int ph = GFX_FH, pw = GFX_FH * 2 + 6;
-            int px = b.x + b.w - PAD - pw;
-            int py = ry + (SET_ROW_H - ph) / 2;
-            gfx_round(cv, px, py, pw, ph, ph / 2, on ? TH_GREEN : TH_BORDER_LT);
-            int kd = ph - 4;
-            int kx = on ? (px + pw - kd - 2) : (px + 2);
-            gfx_round(cv, kx, py + 2, kd, kd, kd / 2, TH_PANEL);
-            const char* s = on ? "ON" : "OFF";
-            int sw = ide_strlen(s) * GFX_FW;
-            int sx = px - PAD - sw;
-            insp_text(cv, sx, ty, s, on ? TH_GREEN : TH_TEXT_FAINT, sw);
+            insp_draw_toggle(cv, b, ry, ty, row->var ? (*row->var != 0) : 0);
         } else {  /* SET_SLIDER */
-            Rect c = set_ctrl_rect(b, ry);
-            Rect track = set_track_rect(c);
-            int val = row->var ? *row->var : 0;
-            int tcy = c.y + GFX_FH / 2;
-            gfx_fill(cv, track.x, tcy - 1, track.w, 2, TH_BORDER_LT);
-            int kx = set_knob_x(track, val, row->vmin, row->vmax);
-            gfx_round(cv, kx, c.y, SET_KNOB_W, GFX_FH, 2, TH_BLUE);
-            char nb[16]; ide_itoa(val, nb);
-            int vx = track.x + track.w + GFX_FW / 2;
-            if (vx < c.x + c.w)
-                insp_text(cv, vx, ty, nb, TH_TEXT_DIM, c.x + c.w - vx);
+            insp_draw_slider(cv, b, ry, ty, row->var ? *row->var : 0,
+                             row->vmin, row->vmax);
         }
     }
 }
@@ -969,7 +1074,28 @@ int panel_settings_key(Ide* a, int keycode) {
  * sub-tabs (a->insp_tab, wrapping 0..INSP_NTABS-1, reset scroll on change);
  * Up/Down scroll the body. Returns 1 if consumed. */
 int panel_inspector_key(Ide* a, int keycode) {
-    enum { IK_UP = 103, IK_DOWN = 108, IK_LEFT = 105, IK_RIGHT = 106, IK_TAB = 15 };
+    enum { IK_UP = 103, IK_DOWN = 108, IK_LEFT = 105, IK_RIGHT = 106, IK_TAB = 15,
+           IK_ENTER = 28, IK_SPACE = 57 };
+
+    /* MARK tab: Up/Down move the knob cursor, Space/Enter flip + persist. Other
+     * keys (Tab/Left/Right) fall through to the tab-cycling switch below. */
+    if (a->insp_tab == 6) {
+        switch (keycode) {
+        case IK_UP:   if (g_mark_sel > 0) g_mark_sel--; return 1;
+        case IK_DOWN: if (g_mark_sel < MARK_NROWS - 1) g_mark_sel++; return 1;
+        case IK_SPACE:
+        case IK_ENTER: {
+            Func* f = insp_focus(a);
+            if (f) {
+                SymMark* mk = marks_get(f->name);
+                int* vp = mark_field_ptr(mk, g_mark_sel);
+                if (vp) { *vp = *vp ? 0 : 1; ide_marks_save(); }
+            }
+            return 1;
+        }
+        }
+    }
+
     switch (keycode) {
     case IK_TAB:
     case IK_RIGHT:
@@ -989,4 +1115,389 @@ int panel_inspector_key(Ide* a, int keycode) {
         return 1;
     }
     return 0;
+}
+
+/* ====================================================================== *
+ *  IDE-FORGE-0: the ACTIONS deck (VIZ-4) + the Project Pulse (VIZ-5).
+ *
+ *  The deck is the project's one-key task list that REMEMBERS what ran, when,
+ *  and the result -- so an aphantasic user can leave, come back, and the screen
+ *  still says "build passed 12s ago." Each row reuses the Settings widget
+ *  vocabulary (label-left / [APPLY]-style button-right). The Pulse (set by the
+ *  deck's "Open TODO list") shows the !done checklist (see panel_pulse below).
+ * ====================================================================== */
+
+/* set by the deck's "Open TODO list" row; read by panel_pulse (same file). */
+static int g_pulse_todo_filter = 0;
+
+/* short message the most-recent action left behind, copied into the row chip. */
+static char g_act_msg[48];
+
+static void act_puts(char* d, int* p, const char* s) {
+    for (int j = 0; s[j] && *p < 47; j++) d[(*p)++] = s[j];
+    d[*p] = 0;
+}
+static void act_puti(char* d, int* p, int v) {
+    char nb[16]; int n = ide_itoa(v, nb);
+    for (int j = 0; j < n && *p < 47; j++) d[(*p)++] = nb[j];
+    d[*p] = 0;
+}
+
+/* --- the six actions, each backed by an existing call (spec 4.2) --- */
+static int act_build(Ide* a) {
+    ide_do_build(a);
+    int ok = ide_build_ok();
+    int p = 0;
+    act_puts(g_act_msg, &p, ok ? "OK " : "FAIL ");
+    act_puti(g_act_msg, &p, ide_build_time_ms());
+    act_puts(g_act_msg, &p, "ms");
+    return ok;
+}
+static int act_run(Ide* a) {
+    ide_do_run(a);
+    int p = 0; g_act_msg[0] = 0;
+    act_puts(g_act_msg, &p, ide_run_msg());
+    return ide_build_ok();          /* "launchable"; the chip carries the text */
+}
+static int act_gen_all(Ide* a) {
+    int n = 0;
+    /* each apply reparses+reanalyzes so index 0 is always the next missing card;
+     * capped at 16 iterations (bounded-everything law). */
+    while (a->model.nactions > 0 && n < 16) {
+        if (!gen_apply_action(a, 0)) break;
+        n++;
+    }
+    if (n > 0) {                     /* one whole-dir re-parse to refresh the map */
+        ide_parse_project_model(a);
+        ide_set_focus(a, a->focus_func);
+    }
+    int p = 0; act_puti(g_act_msg, &p, n); act_puts(g_act_msg, &p, " generated");
+    return n > 0;
+}
+static int act_save_all(Ide* a) {
+    ide_editor_save(a);              /* flush the active buffer to disk */
+    int p = 0; act_puts(g_act_msg, &p, "saved");
+    return 1;
+}
+static int act_reanalyze(Ide* a) {
+    ide_parse_project_model(a);
+    ide_set_focus(a, a->focus_func);
+    int p = 0; act_puts(g_act_msg, &p, "re-analyzed");
+    return 1;
+}
+static int act_open_todo(Ide* a) {
+    a->viz = VIZ_POTENTIALS;         /* jump to the Pulse */
+    g_pulse_todo_filter = 1;         /* and list the !done functions there */
+    int p = 0; act_puts(g_act_msg, &p, "opened TODO");
+    return 1;
+}
+
+typedef struct {
+    const char* label;
+    char        key;            /* one-key shortcut shown + handled */
+    int       (*run)(Ide*);     /* returns 1=ok, 0=fail */
+    int         last_status;    /* -1 never run, 0 fail, 1 ok */
+    long        last_ms;        /* ide_ticks_ms() at completion (for "Ns ago") */
+    char        last_msg[48];   /* short result text */
+} ActRow;
+static ActRow g_act_rows[] = {
+    { "Build project",      'B', act_build,     -1, 0, "" },
+    { "Run",                'R', act_run,       -1, 0, "" },
+    { "Generate all stubs", 'G', act_gen_all,   -1, 0, "" },
+    { "Save all",           'S', act_save_all,  -1, 0, "" },
+    { "Re-analyze project", 'A', act_reanalyze, -1, 0, "" },
+    { "Open TODO list",     'T', act_open_todo, -1, 0, "" },
+};
+#define ACT_NROWS ((int)(sizeof(g_act_rows) / sizeof(g_act_rows[0])))
+static int g_act_sel = 0;
+
+/* AT set-1 keycode for the row's letter (matches ide.c's KEY_* defines). */
+static int act_keycode(char k) {
+    switch (k) {
+        case 'B': return 48;  case 'R': return 19;  case 'G': return 34;
+        case 'S': return 31;  case 'A': return 30;  case 'T': return 20;
+        default:  return -1;
+    }
+}
+
+/* Run row i and stamp its result (status + timestamp + message). */
+static void act_run_row(Ide* a, int i) {
+    if (i < 0 || i >= ACT_NROWS) return;
+    g_act_msg[0] = 0;
+    int ok = g_act_rows[i].run(a);
+    g_act_rows[i].last_status = ok ? 1 : 0;
+    g_act_rows[i].last_ms     = ide_ticks_ms();
+    int j = 0;
+    for (; g_act_msg[j] && j < (int)sizeof(g_act_rows[i].last_msg) - 1; j++)
+        g_act_rows[i].last_msg[j] = g_act_msg[j];
+    g_act_rows[i].last_msg[j] = 0;
+}
+
+/* deck body rect = panel minus its header bar. */
+static Rect act_body_rect(Rect r) {
+    Rect b; b.x = r.x; b.y = r.y + SET_HEAD_H; b.w = r.w; b.h = r.h - SET_HEAD_H;
+    if (b.h < 0) b.h = 0;
+    return b;
+}
+
+void panel_actions(Ide* a, Canvas* cv, Rect r) {
+    if (r.w <= 0 || r.h <= 0) return;
+    gfx_fill(cv, r.x, r.y, r.w, r.h, TH_PANEL);
+
+    /* header in the Settings header style */
+    gfx_fill(cv, r.x, r.y, r.w, SET_HEAD_H, TH_HEADER);
+    gfx_hline(cv, r.x, r.y + SET_HEAD_H - 1, r.w, TH_BORDER);
+    insp_text(cv, r.x + PAD, r.y + (SET_HEAD_H - GFX_FH) / 2,
+              "ACTIONS - automation deck", TH_TEXT, r.w - 2 * PAD);
+
+    Rect b = act_body_rect(r);
+    if (b.h <= 0) return;
+    long now = ide_ticks_ms();
+
+    for (int i = 0; i < ACT_NROWS; i++) {
+        int ry = b.y + i * SET_ROW_H;
+        if (ry + SET_ROW_H <= b.y || ry >= b.y + b.h) continue;
+        int ty = ry + (SET_ROW_H - GFX_FH) / 2;
+        ActRow* row = &g_act_rows[i];
+
+        if (i == g_act_sel)
+            gfx_blend(cv, b.x, ry, b.w, SET_ROW_H,
+                      (0x30u << 24) | (TH_SELECT & 0x00FFFFFFu));
+
+        /* label (left) */
+        insp_text(cv, b.x + PAD, ty, row->label, TH_TEXT, (b.w * 2) / 5);
+
+        /* [key] hint just after the label */
+        int kx = b.x + PAD + (ide_strlen(row->label) + 1) * GFX_FW;
+        char kb[4]; kb[0] = '['; kb[1] = row->key; kb[2] = ']'; kb[3] = 0;
+        insp_text(cv, kx, ty, kb, TH_BLUE, 3 * GFX_FW);
+
+        /* run button (right) = the [APPLY] button draw, labelled "RUN" */
+        Rect btn = insp_apply_rect(b, ry);
+        gfx_round(cv, btn.x, btn.y, btn.w, btn.h, 4, TH_BLUE);
+        insp_text(cv, btn.x + (btn.w - 3 * GFX_FW) / 2,
+                  btn.y + (btn.h - GFX_FH) / 2, "RUN", TH_BG, btn.w);
+
+        /* result chip (between label and button): status, message, "Ns ago" */
+        int chipx = kx + 4 * GFX_FW;
+        const char* st = row->last_status < 0 ? "-"
+                       : (row->last_status ? "OK" : "FAIL");
+        uint32_t sc = row->last_status < 0 ? TH_TEXT_FAINT
+                    : (row->last_status ? TH_GREEN : TH_RED);
+        insp_text(cv, chipx, ty, st, sc, 5 * GFX_FW);
+        chipx += (ide_strlen(st) + 1) * GFX_FW;
+
+        if (row->last_status >= 0) {
+            if (row->last_msg[0] && chipx < btn.x - PAD) {
+                insp_text(cv, chipx, ty, row->last_msg, TH_TEXT_DIM,
+                          btn.x - PAD - chipx);
+                chipx += (ide_strlen(row->last_msg) + 1) * GFX_FW;
+            }
+            long age = now - row->last_ms;
+            if (age < 0) age = 0;
+            char ab[24]; int p = 0;
+            act_puti(ab, &p, (int)(age / 1000));
+            act_puts(ab, &p, "s ago");
+            int ax = btn.x - PAD - ide_strlen(ab) * GFX_FW;
+            if (ax > chipx)
+                insp_text(cv, ax, ty, ab, TH_TEXT_FAINT, btn.x - PAD - ax);
+        }
+    }
+}
+
+void panel_actions_click(Ide* a, Rect r, int mx, int my) {
+    Rect b = act_body_rect(r);
+    if (b.h <= 0 || !rect_hit(b, mx, my)) return;
+    for (int i = 0; i < ACT_NROWS; i++) {
+        int ry = b.y + i * SET_ROW_H;
+        if (my < ry || my >= ry + SET_ROW_H) continue;
+        g_act_sel = i;                              /* select on any row click */
+        Rect btn = insp_apply_rect(b, ry);
+        if (rect_hit(btn, mx, my)) act_run_row(a, i);   /* run on the button   */
+        return;
+    }
+}
+
+int panel_actions_key(Ide* a, int keycode) {
+    enum { AK_UP = 103, AK_DOWN = 108, AK_ENTER = 28 };
+    /* a row's mnemonic (B/R/G/S/A/T) runs that row directly */
+    for (int i = 0; i < ACT_NROWS; i++) {
+        if (act_keycode(g_act_rows[i].key) == keycode) {
+            g_act_sel = i;
+            act_run_row(a, i);
+            return 1;
+        }
+    }
+    switch (keycode) {
+    case AK_UP:    if (g_act_sel > 0) g_act_sel--; return 1;
+    case AK_DOWN:  if (g_act_sel < ACT_NROWS - 1) g_act_sel++; return 1;
+    case AK_ENTER: act_run_row(a, g_act_sel); return 1;
+    }
+    return 0;
+}
+
+/* ====================================================================== *
+ *  IDE-FORGE-0: the Project Pulse (VIZ-5) -- "how done am I?"
+ *
+ *  Numbers and words, not shapes: total / done / to-do / missing / warnings /
+ *  COH, plus a REAL coherence-history sparkline and a build/run status line.
+ *  When opened via the deck's "Open TODO list", it also lists the !done
+ *  functions as clickable rows. Reuses insp_kv + rt_ring + the marks store.
+ * ====================================================================== */
+
+typedef struct { int y, h, fi; } PulseTodo;
+static PulseTodo g_pulse_todo[M_MAXFUNCS];
+static int       g_pulse_ntodo;
+
+void panel_pulse(Ide* a, Canvas* cv, Rect r) {
+    if (r.w <= 0 || r.h <= 0) return;
+    gfx_fill(cv, r.x, r.y, r.w, r.h, TH_PANEL);
+
+    /* header "PROJECT PULSE - <project > file>" */
+    gfx_fill(cv, r.x, r.y, r.w, SET_HEAD_H, TH_HEADER);
+    gfx_hline(cv, r.x, r.y + SET_HEAD_H - 1, r.w, TH_BORDER);
+    {
+        char bc[IDE_PATH + 40];
+        int p = 0;
+        const char* lead = "PROJECT PULSE - ";
+        while (lead[p]) { bc[p] = lead[p]; p++; }
+        ide_breadcrumb_prefix(a, bc + p, (int)sizeof(bc) - p);
+        insp_text(cv, r.x + PAD, r.y + (SET_HEAD_H - GFX_FH) / 2, bc, TH_TEXT,
+                  r.w - 2 * PAD);
+    }
+
+    Rect b = act_body_rect(r);
+    if (b.h <= 0) return;
+
+    Model* m = &a->model;
+    int total = m->nfuncs; if (total < 0) total = 0;
+    int done  = marks_count_done(m);
+    int todo  = total - done; if (todo < 0) todo = 0;
+
+    /* Missing cards = functions with ANY absent port (project-wide: ports are
+     * built for every function, ide_semantic.c). */
+    int missing = 0;
+    for (int i = 0; i < m->nfuncs && i < M_MAXFUNCS; i++) {
+        Func* f = &m->funcs[i];
+        for (int k = 0; k < f->nports && k < M_MAXPORTS; k++)
+            if (f->ports[k].status == PS_ABSENT) { missing++; break; }
+    }
+
+    /* Warnings are FOCUS-scoped today (honesty note); muting the focused fn
+     * zeroes its warned count. Labelled "(focused fn)" -- project-wide = FUTURE. */
+    int warned = m->nrisks; if (warned < 0) warned = 0;
+    if (a->focus_func >= 0 && a->focus_func < m->nfuncs) {
+        SymMark* fmk = marks_find(m->funcs[a->focus_func].name);
+        if (fmk && fmk->mute) warned = 0;
+    }
+
+    int coh = m->coherence; if (coh < 0) coh = 0; if (coh > 100) coh = 100;
+    uint32_t band; const char* bw;
+    if (coh >= 80)      { band = TH_GREEN;  bw = "High";   }
+    else if (coh >= 50) { band = TH_YELLOW; bw = "Medium"; }
+    else                { band = TH_RED;    bw = "Low";    }
+
+    /* scoreboard (left column, narrowed so insp_kv right-aligns sanely) */
+    Rect sb = b; if (sb.w > 360) sb.w = 360;
+    int y = b.y + PAD;
+    insp_kv(cv, sb, y, "Functions",            total,   0); y += ROW_H;
+    insp_kv(cv, sb, y, "Done",                 done,    0); y += ROW_H;
+    insp_kv(cv, sb, y, "To-do",                todo,    0); y += ROW_H;
+    insp_kv(cv, sb, y, "Missing cards",        missing, 0); y += ROW_H;
+    insp_kv(cv, sb, y, "Warnings (focused fn)",warned,  0); y += ROW_H;
+    insp_kv(cv, sb, y, "Coherence",            coh,     1); y += ROW_H;
+
+    /* COH ring gauge to the right of the scoreboard */
+    {
+        int rad = 36;
+        int rcx = b.x + sb.w + PAD + rad;
+        int rcy = b.y + PAD + rad;
+        if (rcx + rad < b.x + b.w) {
+            rt_ring(cv, rcx, rcy, rad, rad / 3, coh, band, TH_BORDER);
+            char pc[8]; int n = ide_itoa(coh, pc);
+            if (n < (int)sizeof(pc) - 1) { pc[n++] = '%'; pc[n] = 0; }
+            insp_text(cv, rcx - (n * GFX_FW) / 2, rcy - GFX_FH / 2, pc, band,
+                      6 * GFX_FW);
+            int lw = ide_strlen(bw) * GFX_FW;
+            insp_text(cv, rcx - lw / 2, rcy + rad + 4, bw, TH_TEXT_DIM, lw + GFX_FW);
+        }
+    }
+
+    /* build / run status line */
+    int sy = y + PAD;
+    {
+        const char* bs; uint32_t bsc;
+        if (ide_build_ok())          { bs = "BUILD OK";   bsc = TH_GREEN; }
+        else if (ide_build_active()) { bs = "BUILD FAIL"; bsc = TH_RED; }
+        else                         { bs = "BUILD -";    bsc = TH_TEXT_FAINT; }
+        insp_text(cv, b.x + PAD, sy, bs, bsc, sb.w);
+        int bx = b.x + PAD + (ide_strlen(bs) + 1) * GFX_FW;
+        int nd = ide_build_diag_count();
+        if (nd > 0) {
+            char db[24]; int p = 0;
+            db[p++] = '(';
+            { char nb[12]; int nn = ide_itoa(nd, nb);
+              for (int j = 0; j < nn && p < 20; j++) db[p++] = nb[j]; }
+            const char* tail = " diag)";
+            for (int j = 0; tail[j] && p < 23; j++) db[p++] = tail[j];
+            db[p] = 0;
+            insp_text(cv, bx, sy, db, TH_TEXT_DIM, sb.w);
+        }
+        sy += ROW_H;
+        const char* rm = ide_run_msg();
+        if (rm && rm[0]) {
+            insp_text(cv, b.x + PAD, sy, rm, TH_CYAN, b.w - 2 * PAD);
+            sy += ROW_H;
+        }
+    }
+
+    /* real COH trend sparkline */
+    {
+        insp_text(cv, b.x + PAD, sy, "Trend (last 10)", TH_TEXT_FAINT, sb.w);
+        sy += GFX_FH + 2;
+        int base = sy + 16;
+        for (int i = 0; i < 10; i++) {
+            int hv = ide_coh_hist(i);
+            int bh = (hv < 0) ? 2 : (hv * 16) / 100;
+            if (bh < 2) bh = 2;
+            int bxx = b.x + PAD + i * 6;
+            uint32_t bcc = (i == 9) ? band : TH_TEXT_FAINT;
+            gfx_fill(cv, bxx, base - bh, 4, bh, bcc);
+        }
+        sy = base + PAD;
+    }
+
+    /* TODO list (only when the deck's "Open TODO list" set the filter) */
+    g_pulse_ntodo = 0;
+    if (g_pulse_todo_filter) {
+        if (sy + ROW_H <= b.y + b.h)
+            insp_text(cv, b.x + PAD, sy, "TODO (click a function to open):",
+                      TH_TEXT_FAINT, b.w - 2 * PAD);
+        sy += ROW_H;
+        for (int i = 0; i < m->nfuncs && i < M_MAXFUNCS; i++) {
+            SymMark* mk = marks_find(m->funcs[i].name);
+            if (mk && mk->done) continue;            /* only !done functions */
+            if (sy + ROW_H > b.y + b.h) break;
+            insp_text(cv, b.x + 2 * PAD, sy, m->funcs[i].name, TH_TEXT,
+                      b.w - 3 * PAD);
+            if (g_pulse_ntodo < M_MAXFUNCS) {
+                g_pulse_todo[g_pulse_ntodo].y  = sy;
+                g_pulse_todo[g_pulse_ntodo].h  = ROW_H;
+                g_pulse_todo[g_pulse_ntodo].fi = i;
+                g_pulse_ntodo++;
+            }
+            sy += ROW_H;
+        }
+    }
+}
+
+int panel_pulse_click(Ide* a, Rect r, int mx, int my) {
+    if (!rect_hit(r, mx, my)) return 0;
+    for (int i = 0; i < g_pulse_ntodo && i < M_MAXFUNCS; i++) {
+        if (my >= g_pulse_todo[i].y && my < g_pulse_todo[i].y + g_pulse_todo[i].h) {
+            ide_sel_jump(a, g_pulse_todo[i].fi, PANE_INSPECTOR);
+            return 1;
+        }
+    }
+    return 1;   /* consume clicks in the pulse */
 }

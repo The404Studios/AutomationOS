@@ -3977,8 +3977,18 @@ static void handle_create(const wl_req_create_t *req) {
     anim_begin(win, PH_OPENING, ANIM_OPEN_MS, syscall(SYS_GET_TICKS_MS, 0, 0, 0));
 
     /* Damage-scissor: a new window changes z-order + reveals shadows globally;
-     * force full-screen recomposite for a few frames so nothing is clipped. */
-    g_full_damage_cooldown = FULL_DAMAGE_COOLDOWN_FRAMES;
+     * force full-screen recomposite for a few frames so nothing is clipped.
+     *
+     * IDE-FORGE-0 audit fix (the icon-over-titlebar ghost): 3 frames did NOT
+     * outlast the 180 ms OPEN fade -- during the fade the window is
+     * translucent, so wallpaper-layer pixels (desktop icon art) blend into
+     * the framebuffer under the window's footprint; once the cooldown
+     * expired, later client commits damage only their own sub-rects and the
+     * stale icon pixels in the titlebar corner were NEVER re-covered (the
+     * exact stale-glow mechanism documented at the desk-hover handler).
+     * Cover the whole fade + settle: ~180 ms of frames + margin. One-time
+     * cost per window OPEN; zero steady-state cost (T410 budget intact). */
+    g_full_damage_cooldown = 24;   /* > ANIM_OPEN_MS worth of frames + margin */
     damage_add_full();
 
     int32_t qid = client_reply_qid(win);

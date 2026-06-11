@@ -345,6 +345,9 @@ int ide_build_active(void) {
 int ide_build_ok(void)         { return g_have && g_res.ok; }
 int ide_build_diag_count(void) { return g_have ? g_res.ndiags : 0; }
 
+/* IDE-FORGE-0: the last Run message (g_runmsg) for the ACTIONS deck + Pulse. */
+const char* ide_run_msg(void)  { return g_runmsg; }
+
 /* ===========================================================================
  * Query APIs for other modules
  * ===========================================================================*/

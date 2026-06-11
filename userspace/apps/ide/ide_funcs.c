@@ -12,6 +12,7 @@
 #include "ide.h"
 #include "ide_gfx.h"
 #include "ide_theme.h"
+#include "ide_marks.h"   /* IDE-FORGE-0: DONE glyph + STAR-first partition */
 
 /* ---- layout constants local to this panel ---- */
 #define FN_HEADER_H   (ROW_H + 2)   /* "FUNCTIONS (file)" header bar          */
@@ -52,10 +53,34 @@ static int fn_chip_text_w(const char* s, int maxw) {
     return n * GFX_FW;
 }
 
-/* render the small "{}" function glyph centred in the gutter at row top ry. */
-static void fn_draw_glyph(Canvas* cv, int gx, int ry) {
+/* render the function glyph centred in the gutter at row top ry. A function the
+ * user marked DONE shows a green "OK" instead of the blue "{}" -- the visible
+ * consequence of the DONE knob in the FUNCTIONS list (IDE-FORGE-0). */
+static void fn_draw_glyph(Canvas* cv, int gx, int ry, int done) {
     int cy = ry + (ROW_H - GFX_FH) / 2;
-    gfx_text(cv, gx, cy, "{}", TH_BLUE);
+    gfx_text(cv, gx, cy, done ? "OK" : "{}", done ? TH_GREEN : TH_BLUE);
+}
+
+/* IDE-FORGE-0: open (non-closed) funcs of the current file in DISPLAY order --
+ * STARRED first (stable within each group), then the rest. Both the render and
+ * the click hit-test walk this same order so the partition stays consistent.
+ * Returns the count written to order[cap]. */
+static int fn_open_order(Ide* a, int* order, int cap) {
+    int nf = a->model.nfuncs;
+    if (nf > M_MAXFUNCS) nf = M_MAXFUNCS;
+    int n = 0;
+    for (int pass = 0; pass < 2 && n < cap; pass++) {
+        for (int i = 0; i < nf && n < cap; i++) {
+            Func* f = &a->model.funcs[i];
+            if (!ide_streq(f->file, a->model.cur_file)) continue;  /* IDE-XFILE-0 */
+            if (f->closed) continue;
+            SymMark* mk = marks_find(f->name);
+            int starred = (mk && mk->star);
+            if ((pass == 0) != (starred != 0)) continue;   /* pass 0 = starred */
+            order[n++] = i;
+        }
+    }
+    return n;
 }
 
 /* append literal `s` into out[] at *pos (bounded by cap-1); NUL-terminates. */
@@ -128,21 +153,25 @@ void panel_funcs(Ide* a, Canvas* cv, Rect r) {
     int nf = a->model.nfuncs;
     if (nf > M_MAXFUNCS) nf = M_MAXFUNCS;
 
-    /* ---- open (non-closed) functions ---- */
-    for (int i = 0; i < nf; i++) {
+    /* ---- open (non-closed) functions, STARRED first ---- */
+    int order[M_MAXFUNCS];
+    int no = fn_open_order(a, order, M_MAXFUNCS);
+    for (int k = 0; k < no; k++) {
+        int i = order[k];
         Func* f = &a->model.funcs[i];
-        if (!ide_streq(f->file, a->model.cur_file)) continue;  /* IDE-XFILE-0 */
-        if (f->closed) continue;
 
         int ry = y;
         y += ROW_H;
         if (ry + ROW_H <= top || ry >= bot) continue;   /* fully clipped */
 
+        SymMark* mk = marks_find(f->name);
+        int done = (mk && mk->done);
+
         int focused = (i == a->focus_func);
         if (focused)
             gfx_fill(cv, cx0, ry, r.w, ROW_H, TH_SELECT);
 
-        fn_draw_glyph(cv, cx0 + PAD, ry);
+        fn_draw_glyph(cv, cx0 + PAD, ry, done);
 
         int tx = cx0 + PAD + FN_GLYPH_W;
         int ty = ry + (ROW_H - GFX_FH) / 2;
@@ -173,7 +202,8 @@ void panel_funcs(Ide* a, Canvas* cv, Rect r) {
         int namew = rowright - tx;                /* px left for the name     */
         if (namew < 0) namew = 0;
         fn_text_clipped(cv, tx, ty, f->name,
-                        focused ? TH_BLUE : TH_TEXT, namew);
+                        focused ? TH_BLUE : (done ? TH_TEXT_FAINT : TH_TEXT),
+                        namew);
     }
 
     /* ---- divider + "CLOSED FUNCTIONS (IDA STYLE)" subsection ---- */
@@ -246,11 +276,11 @@ int panel_funcs_click(Ide* a, Rect r, int mx, int my) {
     /* clicks inside the header bar are consumed but do nothing */
     if (my < top) return 1;
 
-    /* ---- open function rows ---- */
-    for (int i = 0; i < nf; i++) {
-        Func* f = &a->model.funcs[i];
-        if (!ide_streq(f->file, a->model.cur_file)) continue;  /* IDE-XFILE-0 */
-        if (f->closed) continue;
+    /* ---- open function rows (STARRED first, mirrors panel_funcs) ---- */
+    int order[M_MAXFUNCS];
+    int no = fn_open_order(a, order, M_MAXFUNCS);
+    for (int k = 0; k < no; k++) {
+        int i = order[k];
 
         int ry = y;
         y += ROW_H;

@@ -31,6 +31,7 @@
 #include "ide_term.h"           /* integrated terminal panel                 */
 #include "ide_library.h"        /* "complex" snippet library (disk loader)   */
 #include "ide_config.h"         /* persist Settings knobs (load on init)     */
+#include "ide_marks.h"          /* IDE-FORGE-0: per-symbol marks (load on init) */
 #include "../../lib/wl/wl_client.h"
 
 /* When set (after pressing B in the LEGO workspace), the center-top shows the
@@ -158,6 +159,8 @@ static char ide_keycode_ascii(int kc, int shift) {
 #define INSP_SYNTAX   0
 #define INSP_DETAILS  4
 #define INSP_LIB      5   /* "complex library" palette -- RIGHT-sidebar only */
+#define INSP_MARK     6   /* IDE-FORGE-0 per-symbol knob strip                */
+#define INSP_NTABS_TOTAL 7  /* keep in sync with ide_inspector.c INSP_NTABS   */
 
 /* ---- map pan step (pixels per arrow press / drag is 1:1) ---- */
 #define MAP_PAN_STEP (g_map_pan_step < 1 ? 1 : g_map_pan_step)   /* Settings knob */
@@ -184,7 +187,7 @@ static void tab_save_active(Ide* a) {
         g_tab_src[i][j] = a->src[j];
 }
 
-static void ide_parse_project_model(Ide* a);   /* IDE-XFILE-0 (defined below) */
+void ide_parse_project_model(Ide* a);          /* IDE-XFILE-0 (defined below) */
 
 static void tab_restore(Ide* a, int idx) {
     if (idx < 0 || idx >= IDE_MAX_TABS || !a->tabs[idx].used) return;
@@ -431,6 +434,9 @@ void ide_set_focus(Ide* a, int func_idx) {
     a->focus_func  = func_idx;
     a->model.focus = func_idx;
     model_analyze(&a->model);
+    /* IDE-FORGE-0: record this analysis's coherence into the real history ring
+     * (the Pulse + the VIZ-3 sparkline read it; replaces the fake trend[]). */
+    ide_coh_push(a->model.coherence);
     /* IDE-SYNC-0 S1: every focus write lands in THE selection model too, so
      * map/runtime/inspector-driven focus changes and caret-driven ones agree. */
     a->sel.symbol = a->focus_func;
@@ -469,9 +475,20 @@ void ide_sel_from_caret(Ide* a, int pane) {
         if (!ide_streq(f->file, a->model.cur_file)) continue;
         if (line + 1 >= f->line_start && line + 1 <= f->line_end) { sym = i; break; }
     }
+    /* IDE-FORGE-0 ISOLATE: when the CURRENTLY focused function is isolated, the
+     * map (and the breadcrumb FN) stay PINNED to it even as the caret moves into
+     * other functions -- "keep tower_tick + its missing claim_slot on screen
+     * while I go edit wave_spawn." So the selection symbol stops tracking the
+     * caret and the re-focus below is gated off. */
+    int locked = 0;
+    if (a->focus_func >= 0 && a->focus_func < a->model.nfuncs) {
+        SymMark* cur = marks_find(a->model.funcs[a->focus_func].name);
+        locked = (cur && cur->isolate);
+    }
+
     a->sel.pane   = pane;
     a->sel.line   = line;
-    a->sel.symbol = sym;
+    a->sel.symbol = locked ? a->focus_func : sym;
     a->sel.node   = a->map_selected;
     {
         int i = 0;
@@ -482,8 +499,8 @@ void ide_sel_from_caret(Ide* a, int pane) {
      * the caret -- refocus only when the enclosing function actually changed
      * (one model_analyze per crossing; none while moving within a function).
      * Between functions (sym == -1) the last focus is kept so the map doesn't
-     * blank out while the caret crosses whitespace. */
-    if (sym >= 0 && sym != a->focus_func)
+     * blank out while the caret crosses whitespace. ISOLATE pins it (locked). */
+    if (sym >= 0 && sym != a->focus_func && !locked)
         ide_set_focus(a, sym);
 }
 
@@ -659,7 +676,7 @@ static void ide_dirname(char* out, int cap, const char* path) {
     if (cut <= 0) { out[0] = '/'; out[1] = 0; } else out[cut] = 0;
 }
 
-static void ide_parse_project_model(Ide* a) {
+void ide_parse_project_model(Ide* a) {
     model_reset(&a->model);
     char dir[IDE_PATH];
     ide_dirname(dir, IDE_PATH, a->cur_file);
@@ -1092,6 +1109,7 @@ static void init(Ide* a) {
 
     a->viz = VIZ_MAP;
     a->insp_tab = 2;                  /* PORTS                              */
+    a->side_tab = 4;                  /* INFO -- the sidebar's complement   */
     a->flow_step_focus = -1;          /* no runtime-flow step traced yet     */
     a->map_selected = -1;             /* no map node selected yet            */
     a->map_zoom = 100;                /* 100% zoom initially                 */
@@ -1114,6 +1132,10 @@ static void init(Ide* a) {
      * above) and before the first layout(), so saved zoom/flags take effect with
      * no first-frame flash. Safe + silent if no config file exists yet. */
     ide_config_load();
+    /* IDE-FORGE-0: load the per-symbol marks (done/star/isolate/mute) the same
+     * way. Without this line, marks set in a session vanish on restart; with it,
+     * they survive (reboot-durable on a disk, session-durable otherwise). */
+    ide_marks_load();
 }
 
 /* ===========================================================================
@@ -1518,13 +1540,11 @@ static void render_center_top(Ide* a, Canvas* cv) {
         panel_runtime(a, cv, a->r_map);
         break;
     case VIZ_ACTIONS:
-    case VIZ_POTENTIALS: {
-        int saved = a->insp_tab;
-        a->insp_tab = INSP_DETAILS;           /* risks / recommended actions*/
-        panel_inspector(a, cv, a->r_map);
-        a->insp_tab = saved;
+        panel_actions(a, cv, a->r_map);           /* IDE-FORGE-0 automation deck */
         break;
-    }
+    case VIZ_POTENTIALS:
+        panel_pulse(a, cv, a->r_map);             /* IDE-FORGE-0 project pulse */
+        break;
     case VIZ_SETTINGS:
         panel_settings(a, cv, a->r_map);      /* knobs & switches (VIZ-6)   */
         break;
@@ -1543,7 +1563,19 @@ static void render(Ide* a, Canvas* cv) {
     panel_funcs    (a, cv, a->r_funcs);
     render_center_top(a, cv);                 /* VIZ-routed center-top      */
     panel_code     (a, cv, a->r_code);
-    panel_inspector(a, cv, a->r_inspector);   /* RIGHT inspector: own tab   */
+    /* RIGHT inspector renders its OWN tab. When VIZ-2 is the center (which also
+     * draws the inspector), the sidebar shows a COMPLEMENTARY tab (side_tab) so
+     * the two panes never duplicate (IDE-FORGE-0). */
+    if (a->viz == VIZ_INSPECTOR) {
+        int saved = a->insp_tab;
+        int comp  = a->side_tab;
+        if (comp == saved) comp = (saved + 1) % INSP_NTABS_TOTAL;  /* ensure distinct */
+        a->insp_tab = comp;
+        panel_inspector(a, cv, a->r_inspector);
+        a->insp_tab = saved;
+    } else {
+        panel_inspector(a, cv, a->r_inspector);
+    }
     panel_runtime  (a, cv, a->r_runtime);
     panel_status   (a, cv, a->r_status);
 
@@ -2158,16 +2190,11 @@ static void route_center_top_click(Ide* a, int mx, int my) {
         break;
     }
     case VIZ_ACTIONS:
-    case VIZ_POTENTIALS: {
-        /* ACTIONS/POTENTIALS are the DETAILS view; force DETAILS only for the
-         * duration of the hit-test so the [APPLY] buttons line up, but if the
-         * user clicked a sub-tab honor it (don't blindly revert). */
-        int saved = a->insp_tab;
-        a->insp_tab = INSP_DETAILS;
-        panel_inspector_click(a, a->r_map, mx, my);
-        if (a->insp_tab == INSP_DETAILS) a->insp_tab = saved;  /* no tab clicked */
+        panel_actions_click(a, a->r_map, mx, my);   /* IDE-FORGE-0 deck */
         break;
-    }
+    case VIZ_POTENTIALS:
+        panel_pulse_click(a, a->r_map, mx, my);   /* IDE-FORGE-0 pulse TODO rows */
+        break;
     case VIZ_RUNTIME:
         panel_runtime_click(a, a->r_map, mx, my);
         break;
@@ -2206,7 +2233,17 @@ static void route_click(Ide* a, int mx, int my) {
         return;
     }
     if (rect_hit(a->r_inspector, mx, my)) {
-        panel_inspector_click(a, a->r_inspector, mx, my);
+        /* When VIZ-2 is the center, the sidebar drives its OWN tab (side_tab),
+         * decoupled from the center's insp_tab (IDE-FORGE-0). */
+        if (a->viz == VIZ_INSPECTOR) {
+            int saved = a->insp_tab;
+            a->insp_tab = a->side_tab;
+            panel_inspector_click(a, a->r_inspector, mx, my);
+            a->side_tab = a->insp_tab;     /* capture a tab switch on the sidebar */
+            a->insp_tab = saved;
+        } else {
+            panel_inspector_click(a, a->r_inspector, mx, my);
+        }
         return;
     }
     if (rect_hit(a->r_runtime, mx, my)) {
@@ -2221,7 +2258,11 @@ static void route_click(Ide* a, int mx, int my) {
         ide_sel_from_caret(a, PANE_CODEVIEW);   /* IDE-SYNC-0 S0 */
         return;
     }
-    /* status: no interactive handler. */
+    if (rect_hit(a->r_status, mx, my)) {
+        /* status bar: clicking a WATCH (starred) chip jumps the selection. */
+        panel_status_click(a, a->r_status, mx, my);
+        return;
+    }
 }
 
 /* Hit-test the two workspace tabs in the top bar; switch a->ws if clicked.
@@ -2732,6 +2773,10 @@ static void handle_key(Ide* a, int keycode, int pressed) {
     if (a->viz == VIZ_SETTINGS  && panel_settings_key (a, keycode)) return;
     if (a->viz == VIZ_INSPECTOR && panel_inspector_key(a, keycode)) return;
     if (a->viz == VIZ_RUNTIME   && panel_runtime_key  (a, keycode)) return;
+    /* IDE-FORGE-0: the ACTIONS deck owns B/R/G/S/A/T + arrows while VIZ-4 is
+     * open (runs the row + stamps it); from other tabs the global B/R/G below
+     * still fire. This gate runs before the global switch and returns on use. */
+    if (a->viz == VIZ_ACTIONS   && panel_actions_key (a, keycode)) return;
 
     /* VIZ tab shortcuts '1'..'6' (keycodes 2..7) -> VIZ_MAP..VIZ_SETTINGS. */
     if (keycode >= KEY_1 && keycode <= KEY_1 + (int)VIZ_SETTINGS) {
@@ -2793,6 +2838,10 @@ static void handle_key(Ide* a, int keycode, int pressed) {
         /* if already in overview (focus_func < 0), do nothing */
         break;
     case KEY_G:
+        /* IDE-FORGE-0 (graph spec c): there is NO keyboard selection state for
+         * the DETAILS action rows (they are click-only [APPLY] buttons), so per
+         * the spec's fallback G applies action 0. (When VIZ-4 is open the deck's
+         * own G runs the Generate-all row -- see panel_actions_key.) */
         if (a->model.nactions > 0 && gen_apply_action(a, 0)) {
             ide_parse_project_model(a);      /* IDE-XFILE-0: whole-dir model */
             ide_set_focus(a, a->focus_func);

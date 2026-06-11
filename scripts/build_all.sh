@@ -527,7 +527,7 @@ else
 fi
 
 echo "[all] IDE (Semantic LEGO Map)..."
-IDE_SRCS="ide ide_sys ide_gfx ide_lex ide_ast ide_pcore ide_pdecl ide_pstmt ide_pexpr ide_astprint ide_parse ide_semantic ide_explorer ide_funcs ide_map ide_codeview ide_inspector ide_runtime ide_chrome ide_gen elf_write as_x64 cc_type cc_codegen cc_expr tc_driver ide_build ide_editor ide_term ide_library ide_complete ide_config ide_project"
+IDE_SRCS="ide ide_sys ide_gfx ide_lex ide_ast ide_pcore ide_pdecl ide_pstmt ide_pexpr ide_astprint ide_parse ide_semantic ide_explorer ide_funcs ide_map ide_codeview ide_inspector ide_runtime ide_chrome ide_gen elf_write as_x64 cc_type cc_codegen cc_expr tc_driver ide_build ide_editor ide_term ide_library ide_complete ide_config ide_marks ide_project"
 IDE_OBJS=""
 for s in $IDE_SRCS; do cc userspace/apps/ide/$s.c /tmp/ide_$s.o; IDE_OBJS="$IDE_OBJS /tmp/ide_$s.o"; done
 $LD $IDE_OBJS /tmp/wlc.o /tmp/bf.o /tmp/font2.o /tmp/keymap.o -o /tmp/ide.elf
@@ -697,6 +697,16 @@ mkdir -p /tmp/ird/usr/src/templates/gamestarter /tmp/ird/usr/src/templates/appst
 cp userspace/apps/ide/sample/gamestarter/*    /tmp/ird/usr/src/templates/gamestarter/    2>/dev/null || true
 cp userspace/apps/ide/sample/appstarter/*     /tmp/ird/usr/src/templates/appstarter/     2>/dev/null || true
 cp userspace/apps/ide/sample/servicestarter/* /tmp/ird/usr/src/templates/servicestarter/ 2>/dev/null || true
+# IDE-FORGE-0 complete-application templates (login/todo/guess/clock/calc/
+# kvstore). Every one validated end-to-end through the REAL on-device pipeline
+# (cc_compile -> as_assemble -> elf_write) by a host harness -- they stay
+# inside the proven cc subset (no preprocessor, no arrays, no global
+# initializers, syscall() builtin only). np_clone prefers main.c, so each
+# template stages as <name>/main.c in the + NEW gallery.
+for T in 01_login 02_todo 03_guess 04_clock 05_calc 06_kvstore; do
+    mkdir -p /tmp/ird/usr/src/templates/$T
+    cp userspace/apps/ide/templates/$T.c /tmp/ird/usr/src/templates/$T/main.c 2>/dev/null || true
+done
 mkdir -p /tmp/ird/Desktop
 # Zombie Bastion: a Desktop FOLDER holding the game ELF. The compositor shows
 # /Desktop entries as icons; a folder opens the filemanager, where the .elf can

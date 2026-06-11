@@ -26,6 +26,7 @@
  */
 #include "ide.h"
 #include "ide_theme.h"
+#include "ide_marks.h"   /* IDE-FORGE-0: ISOLATE "LOCKED" header chip */
 
 /* ---- card geometry (pixels) at 100% zoom ---- */
 #define MAP_HEADER_H   (ROW_H + 2)   /* panel title strip                  */
@@ -346,6 +347,24 @@ void panel_map(Ide* a, Canvas* cv, Rect r)
     }
     gfx_text_clip(cv, r.x + PAD, r.y + (MAP_HEADER_H - GFX_FH) / 2,
                   buf, TH_TEXT_DIM, r.x + PAD, r.w - 2 * PAD);
+
+    /* IDE-FORGE-0 ISOLATE: a "LOCKED" chip (right-aligned in the header) when the
+     * focused function is isolated -- the map is pinned and the caret no longer
+     * re-centers it (see ide_sel_from_caret). */
+    if (focus >= 0 && focus < m->nfuncs) {
+        SymMark* fmk = marks_find(m->funcs[focus].name);
+        if (fmk && fmk->isolate) {
+            const char* lk = "LOCKED";
+            int cw = gfx_textw(lk) + 2 * PAD;
+            int lx = r.x + r.w - PAD - cw;
+            int ly = r.y + 2;
+            if (lx > r.x + PAD) {
+                gfx_round(cv, lx, ly, cw, MAP_HEADER_H - 4, 4, TH_PANEL2);
+                gfx_text_clip(cv, lx + PAD, r.y + (MAP_HEADER_H - GFX_FH) / 2,
+                              lk, TH_YELLOW, lx + PAD, cw - 2 * PAD);
+            }
+        }
+    }
 
     /* Body region below the header strip. */
     Rect body;
@@ -739,8 +758,23 @@ void panel_map(Ide* a, Canvas* cv, Rect r)
         }
     }
     map_cat(buf, ")", sizeof(buf));
-    gfx_text_clip(cv, cx + PAD, cy + (cardhdr_h - GFX_FH) / 2,
-                  buf, TH_BG, cx + PAD, card_w - 2 * PAD);
+    /* IDE-FORGE-0 node detail: a "N ln" size chip right-aligned in the header
+     * (Func.line_end - line_start + 1). The signature clips to the room left. */
+    int hy = cy + (cardhdr_h - GFX_FH) / 2;
+    {
+        int lines = f->line_end - f->line_start + 1;
+        if (lines < 1) lines = 1;
+        char lnbuf[16]; int p = 0;
+        { char nb[12]; int nn = ide_itoa(lines, nb); for (int j = 0; j < nn && p < 11; j++) lnbuf[p++] = nb[j]; }
+        lnbuf[p++] = ' '; lnbuf[p++] = 'l'; lnbuf[p++] = 'n'; lnbuf[p] = 0;
+        int lnw = gfx_textw(lnbuf);
+        int sig_clip = card_w - 2 * PAD - lnw - PAD;
+        if (sig_clip < GFX_FW) sig_clip = card_w - 2 * PAD;
+        gfx_text_clip(cv, cx + PAD, hy, buf, TH_BG, cx + PAD, sig_clip);
+        int lx = cx + card_w - PAD - lnw;
+        if (lx > cx + PAD + sig_clip)
+            gfx_text_clip(cv, lx, hy, lnbuf, TH_BG, lx, lnw);
+    }
 
     /* "Ports (N)" sub-heading. */
     int sub_y = cy + cardhdr_h + PAD;
@@ -750,6 +784,36 @@ void panel_map(Ide* a, Canvas* cv, Rect r)
     map_cat(buf, ")", sizeof(buf));
     gfx_text_clip(cv, cx + PAD, sub_y, buf, TH_TEXT_DIM,
                   cx + PAD, card_w - 2 * PAD);
+
+    /* IDE-FORGE-0 node detail: "R<r> W<w> C<c>" fan chip + a red holes badge
+     * ("!<n>" absent ports), right-aligned on the Ports sub-heading line. */
+    {
+        int absent_n = 0;
+        for (i = 0; i < nports; i++)
+            if (f->ports[i].status == PS_ABSENT) absent_n++;
+        char rb[40]; int p = 0;
+        rb[p++] = 'R'; { char nb[12]; int nn = ide_itoa(f->nreads,  nb); for (int j = 0; j < nn && p < 36; j++) rb[p++] = nb[j]; }
+        rb[p++] = ' '; rb[p++] = 'W'; { char nb[12]; int nn = ide_itoa(f->nwrites, nb); for (int j = 0; j < nn && p < 36; j++) rb[p++] = nb[j]; }
+        rb[p++] = ' '; rb[p++] = 'C'; { char nb[12]; int nn = ide_itoa(f->ncalls,  nb); for (int j = 0; j < nn && p < 36; j++) rb[p++] = nb[j]; }
+        rb[p] = 0;
+        int rw = gfx_textw(rb);
+        char hb[16]; hb[0] = 0;
+        int hw = 0;
+        if (absent_n > 0) {
+            int q = 0; hb[q++] = '!';
+            { char nb[12]; int nn = ide_itoa(absent_n, nb); for (int j = 0; j < nn && q < 14; j++) hb[q++] = nb[j]; }
+            hb[q] = 0;
+            hw = gfx_textw(hb) + GFX_FW;
+        }
+        int rx = cx + card_w - PAD - rw - hw;
+        int used = gfx_textw(buf);                 /* "Ports (N)" width */
+        if (rx > cx + PAD + used + GFX_FW) {
+            gfx_text_clip(cv, rx, sub_y, rb, TH_TEXT_FAINT, rx, rw);
+            if (absent_n > 0)
+                gfx_text_clip(cv, rx + rw + GFX_FW, sub_y, hb, TH_RED,
+                              rx + rw + GFX_FW, gfx_textw(hb));
+        }
+    }
 
     /*
      * Port rows: a colored dot (th_port_color), the port name, and the fit as

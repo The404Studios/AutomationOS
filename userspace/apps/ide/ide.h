@@ -160,6 +160,9 @@ typedef struct Ide {
     int      map_ox, map_oy;        /* map pan offset                */
     int      map_zoom;              /* scale x100: 100 = 1.00 (max), 1 = 0.01 (min); clamped 0.01..1.00 */
     int      insp_tab;              /* 0 SYNTAX 1 CATEGORY 2 PORTS 3 CONN 4 DETAILS */
+    int      side_tab;              /* IDE-FORGE-0: the RIGHT sidebar's own tab,
+                                     * kept distinct from insp_tab when VIZ-2 is
+                                     * the center so the two never duplicate.   */
     int      flow_step_focus;       /* runtime-flow: traced step idx (-1 = none)  */
     int      map_selected;          /* semantic map: selected satellite (-1=none) */
 
@@ -228,8 +231,30 @@ void panel_settings_click(Ide* a, Rect r, int mx, int my, int phase);
  * a slider or set a toggle, Space/Enter toggle. Returns 1 if the key was used. */
 int  panel_settings_key  (Ide* a, int keycode);
 void panel_runtime   (Ide* a, Canvas* cv, Rect r);   /* ide_runtime.c  */
+/* IDE-FORGE-0: real COH history (ide_runtime.c). ide_coh_push records one
+ * sample (called after each analyze); ide_coh_hist(i) reads oldest..newest
+ * (i in [0,10), newest at 9), ide_coh_count the number of valid samples. */
+void ide_coh_push(int coh);
+int  ide_coh_hist(int i);
+int  ide_coh_count(void);
+/* Band-coloured ring/arc gauge (ide_runtime.c), reused by the Pulse. */
+void rt_ring(Canvas* cv, int cx, int cy, int rad, int thick,
+             int pct, uint32_t fg, uint32_t track);
+/* IDE-FORGE-0 VIZ-4 automation deck (ide_inspector.c): a one-key task list
+ * (Build/Run/Generate-all/Save-all/Re-analyze/Open-TODO) that REMEMBERS what
+ * ran, when, and the result -- the permanence an aphantasic user needs. */
+void panel_actions      (Ide* a, Canvas* cv, Rect r);
+void panel_actions_click(Ide* a, Rect r, int mx, int my);
+int  panel_actions_key  (Ide* a, int keycode);
+/* IDE-FORGE-0 VIZ-5 project pulse (ide_inspector.c): the "how done am I?"
+ * scoreboard (total/done/missing/warned/build/COH + real COH history). */
+void panel_pulse        (Ide* a, Canvas* cv, Rect r);
+int  panel_pulse_click  (Ide* a, Rect r, int mx, int my);
 void panel_topbar    (Ide* a, Canvas* cv, Rect r);   /* ide_chrome.c   */
 void panel_status    (Ide* a, Canvas* cv, Rect r);   /* ide_chrome.c   */
+/* Status-bar click: jump to a clicked WATCH (starred) chip. Returns 1 if the
+ * click was inside the bar. */
+int  panel_status_click  (Ide* a, Rect r, int mx, int my);   /* ide_chrome.c */
 
 /* ---- click handlers: return 1 if consumed; may mutate *a ---- */
 int  panel_explorer_click (Ide* a, Rect r, int mx, int my);
@@ -261,6 +286,9 @@ void ide_toggle_collapsed(Ide* a, const char* path);
 void rebuild_visible_entries(Ide* a);
 /* Set the focused function (re-runs analyze for that focus). */
 void ide_set_focus(Ide* a, int func_idx);
+/* IDE-XFILE-0: rebuild the whole-directory model (siblings + open file last),
+ * then the caller re-focuses. Public so the ACTIONS deck can Re-analyze. */
+void ide_parse_project_model(Ide* a);
 /* IDE-SYNC-0: reset the unified selection (new/changed file -> nothing
  * selected) and resolve the editor caret to its enclosing function, writing
  * THE selection model (a->sel). `pane` records who moved the caret. */

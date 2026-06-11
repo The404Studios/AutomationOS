@@ -43,5 +43,7 @@ uint32_t ide_build_flash_color(void);
 void     ide_build_tick(int dt_ms);
 /* Return the build duration in milliseconds (0 if no build yet). */
 int  ide_build_time_ms(void);
+/* IDE-FORGE-0: the last Run message text (g_runmsg); empty string if none. */
+const char* ide_run_msg(void);
 
 #endif /* IDE_BUILD_H */

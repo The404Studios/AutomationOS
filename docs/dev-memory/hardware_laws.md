@@ -87,6 +87,22 @@ signal: a model that internalizes these is *useful* on this OS; one that doesn't
     the switch). The bounded-spin watchdog (~2 s, loud one-shot, never unlocked-proceed) turns
     a future violation into a visible failure instead of a silent hang. Release-on-block is
     the sanctioned future path to marking blockers — never "it probably won't contend."
+18. **Declared CPU masks are not proof; TLB pinning safety is based on actual per-CR3 run
+    history (user-set at SMP-RUNMASK-0).** A multi-CPU `allowed_cpus` is a legal declaration
+    (batchdemo); the real TLB hazard is an ADDRESS SPACE that actually EXECUTED on more than
+    one CPU. `p->ran_on_cpus` is stamped at the dispatch chokepoints and the pin audit
+    aggregates it PER CR3 (threads share an mm; kernel-CR3 residents are exempt — that space
+    is G2's shootdown domain). Dying multimask processes are recorded at the exit boundary
+    (short-lived tasks are invisible to live walks). The audit is the DESKTOP-SPLIT forcing
+    function: the day any user address space runs on two CPUs without per-mm shootdown work,
+    the smoke fails loudly. Never weaken it back to declared-mask heuristics.
+19. **Default-compiled files with ASSERT/__LINE__ users may not receive gated insertions above
+    the last __LINE__ site if byte-identity is required (user-set at SMP-RUNMASK-0).** The
+    preprocessor counts lines in FALSE #ifdef branches, so even fully compiled-out code shifts
+    the __LINE__ immediates that ASSERT_ALWAYS embeds below it — the default kernel hash
+    changes with zero semantic delta. Bisect such breaks at the object level (md5 per .o,
+    diff the two builds — minutes, not hours). Insert gated code BELOW a file's last __LINE__
+    user, or hook at a call site in a __LINE__-free file instead.
 
 ## Reviewer checklist (a stricter role that can say "no")
 

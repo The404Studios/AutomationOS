@@ -2,7 +2,25 @@
 
 > Warm memory. Refresh per checkpoint. One active brick at a time.
 
-## SMP-RUNMASK-0 — LANDED (commit `16482d8`, branch `brick/smp-runmask-0`, awaiting review/push) — the audit audits reality
+## DESKTOP-SPLIT-0 — OPEN (branch `brick/desktop-split-0`, off frozen `brick/smp-runmask-0`) — the desktop starts leaning on both CPUs
+- **user-set scope (narrow):** compositor/input/shell stay CPU0 · a BATCH/app ALLOWLIST may run
+  CPU1 · the RUNMASK audit must stay green · TLBSHOOT_NEG must stay green · the BKL storm must
+  stay green · desktop FPS >= baseline · a 30-minute soak: 0 panic, 0 invariant.
+- **the inherited safety net (why this is now possible):** typed BATCH routing (F3-7) + the BKL
+  wall (H1) + the execution-reality audit (RUNMASK-0, law 18) + kernel-range shootdown (G2) +
+  IPI wake (G1). Every wall was built for exactly this brick.
+- **status:** OPEN — awaiting the user's go for implementation.
+
+## COMPOSITOR-ICON-GHOST-0 — PARKED (user-set at the IDE-FORGE freeze) — the remaining outer-titlebar icon residue
+- **scope when picked up:** eliminate the residue (the window-frame area is compositor-drawn,
+  never client-committed, so the last open-fade frames can strand wallpaper-layer icon pixels
+  there) · prove with the IDE-autostart screenshot tour · NO IDE changes · NO compositor
+  redesign. Root cause + candidate fixes recorded in the IDE-FORGE-0 audit (cover the full
+  fade duration; or move icon cell 0 out of the default spawn zone). The FORGE cooldown fix
+  (3→24 frames) already cleaned the tab strip in all 12 regression frames. Do NOT block
+  IDE-FORGE on it (user-set).
+
+## SMP-RUNMASK-0 — FROZEN / COMPLETE (pushed `1199165`, ls-remote verified; user: "the audit now checks actual execution, not just declared CPU masks — exactly what you need before DESKTOP-SPLIT"; findings → LAWS 18+19) — the audit audits reality
 - **THE EXACT ACCEPTANCE HIT:** `RUNMASK: PASS declared_multimask_ok=1 actual_single_cpu=1
   forced_crosscpu_detected=1 tlb_neg_valid=1` — the central evidence is the exit record
   `[RUNMASK] exit record: 'batchdemo' allowed=0x3 ran=0x2 single_cpu=1` (a declared multimask

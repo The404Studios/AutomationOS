@@ -5667,6 +5667,30 @@ void _start(void) {
                 if (g_fps_x10 == 0) g_fps_x10 = inst_fps_x10;
                 else g_fps_x10 += (inst_fps_x10 - g_fps_x10) / 4;  /* IIR a=1/4 */
             }
+
+            /* DESKTOP-SPLIT-0 evidence: surface the already-computed FPS on
+             * serial every ~30s so a smoke can compare a split boot against
+             * a baseline boot ("fps_ge_baseline"). One line per window,
+             * counted on PRESENTED frames only (idle frames don't present,
+             * so the number reflects real compositing work). Negligible
+             * steady-state cost (a counter + one print/30s). */
+            {
+                static long fpswin_start = 0;
+                static long fpswin_frames = 0;
+                fpswin_frames++;
+                if (fpswin_start == 0) fpswin_start = now;
+                if (now - fpswin_start >= 30000) {
+                    print("[COMP] fps window: frames=");
+                    print_num(fpswin_frames);
+                    print(" fps_x10=");
+                    print_num(g_fps_x10);
+                    print(" over_ms=");
+                    print_num(now - fpswin_start);
+                    print("\n");
+                    fpswin_start = now;
+                    fpswin_frames = 0;
+                }
+            }
         }
 
         /* GUI-PERF mouse fix: a heavy composite (e.g. the IDE open -> ~50ms/frame)

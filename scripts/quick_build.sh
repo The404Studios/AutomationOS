@@ -260,6 +260,24 @@ if [ "${SMP:-0}" = "1" ]; then
         CFLAGS="$CFLAGS -DSMP_RUNMASK"
         echo "*** SMP_RUNMASK build: execution-reality pin audit live (SMP-RUNMASK-0) ***"
     fi
+
+    # =========================================================================
+    # SMP_DSPLIT (DESKTOP-SPLIT-0) -- sub-gate, REQUIRES SMP=1 (acceptance
+    # profile = the FULL stack + SMP_RUNMASK). The milestone brick: desktop-
+    # spawned apps on a BORING, EXPLICIT allowlist (batchdemo, bklstorm --
+    # single-threaded only; matmuljobs is EXCLUDED because its worker THREADS
+    # would put one address space on two CPUs, the exact thing law 18
+    # forbids) are declared BATCH + multi-CPU at the sys_spawn seam, so the
+    # choose_cpu batch branch routes them to CPU1. Compositor/input/shell
+    # remain NORMAL/CPU0. A health-monitor one-shot prints the observed
+    # ran_on_cpus reality for the proof. When UNSET: byte-for-byte unchanged.
+    #   SMP=1 SMP_SCHED=1 SMP_SCHED_DISPATCH=1 SMP_IPI=1 SMP_BKL=1 \
+    #   SMP_BATCH=1 SMP_RUNMASK=1 SMP_DSPLIT=1 bash scripts/quick_build.sh
+    # =========================================================================
+    if [ "${SMP_DSPLIT:-0}" = "1" ]; then
+        CFLAGS="$CFLAGS -DSMP_DSPLIT"
+        echo "*** SMP_DSPLIT build: desktop-split allowlist live (DESKTOP-SPLIT-0) ***"
+    fi
 fi
 
 # =============================================================================

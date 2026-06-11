@@ -66,6 +66,42 @@ static void health_monitor_thread(void* arg) {
         /* Sample all CPUs */
         health_monitor_sample();
 
+#if defined(SMP_DSPLIT) && defined(SMP_RUNMASK)
+        /* DESKTOP-SPLIT-0 observation (one-shot, ~60s in = sample 12): print
+         * the OBSERVED ran_on_cpus reality for the proof -- the desktop core
+         * (compositor/init/terminal) must show ran=0x1 (CPU0 only) and at
+         * least one allowlisted BATCH app must have run with bit1 set. Reads
+         * scalar PCB fields via the ref-safe table API; prints once, costs
+         * nothing afterward (the T410 idle budget). */
+        {
+            static int dsplit_reported = 0;
+            static int dsplit_samples  = 0;
+            dsplit_samples++;
+            if (!dsplit_reported && dsplit_samples >= 12) {
+                dsplit_reported = 1;
+                extern process_t* process_get_by_pid(uint32_t pid);
+                extern void process_unref(process_t* proc);
+                int cpu1_users = 0;
+                for (uint32_t pid = 1; pid < 256; pid++) {
+                    process_t* p = process_get_by_pid(pid);
+                    if (!p) continue;
+                    uint32_t ran = p->ran_on_cpus;
+                    int core =
+                        (p->name[0]=='s' && p->name[1]=='b') /* sbin/...    */ ||
+                        p->pid == 1;                          /* init        */
+                    if (ran & 0x2u) cpu1_users++;
+                    if ((ran & 0x2u) || core) {
+                        kprintf("[DSPLIT] observed: pid=%d '%s' ran=0x%x\n",
+                                p->pid, p->name, ran);
+                    }
+                    process_unref(p);
+                }
+                kprintf("[DSPLIT] observation: live procs that ran on CPU1 = %d\n",
+                        cpu1_users);
+            }
+        }
+#endif
+
         /* Detect anomalies */
         bool stalls = health_monitor_detect_stalls();
         bool leaks = health_monitor_detect_leaks();

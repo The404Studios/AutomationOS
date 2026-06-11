@@ -23,23 +23,22 @@
  *       nettest2.o -o nettest2
  *   objdump -d nettest2 | grep fs:0x28        # MUST be empty
  *
- * NOTE: these syscall numbers are PROPOSED (see kernel/include/socket.h). The
- * integrator must add SYS_SOCKET=44 .. SYS_SOCK_POLL=51 and route them to the
- * sys_sock_* handlers in kernel/net/socket.c.
+ * NOTE: these syscall numbers must match kernel/include/syscall.h
+ * (SYS_SOCKET=51 .. SYS_SOCK_POLL=58).
  */
 
-/* ---- proposed syscall numbers ---- */
+/* ---- syscall numbers (must match kernel/include/syscall.h) ---- */
 #define SYS_EXIT       0
 #define SYS_WRITE      3
 #define SYS_YIELD      15
-#define SYS_SOCKET     44
-#define SYS_CONNECT    45
-#define SYS_SEND       46
-#define SYS_RECV       47
-#define SYS_CLOSE_SK   48
-#define SYS_SENDTO     49
-#define SYS_RECVFROM   50
-#define SYS_SOCK_POLL  51
+#define SYS_SOCKET     51
+#define SYS_CONNECT    52
+#define SYS_SEND       53
+#define SYS_RECV       54
+#define SYS_CLOSE_SK   55
+#define SYS_SENDTO     56
+#define SYS_RECVFROM   57
+#define SYS_SOCK_POLL  58
 
 /* ---- socket constants (must match kernel/include/socket.h) ---- */
 #define SOCK_STREAM    1

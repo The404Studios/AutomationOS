@@ -279,8 +279,10 @@ static void load_default_policy(void) {
     mac_rule_t rule;
     memset(&rule, 0, sizeof(rule));
 
-    strcpy(rule.source_domain, MAC_DOMAIN_KERNEL);
-    strcpy(rule.target_domain, "*");  // Wildcard
+    strncpy(rule.source_domain, MAC_DOMAIN_KERNEL, MAX_LABEL_NAME - 1);
+    rule.source_domain[MAX_LABEL_NAME - 1] = '\0';
+    strncpy(rule.target_domain, "*", MAX_LABEL_NAME - 1);  // Wildcard
+    rule.target_domain[MAX_LABEL_NAME - 1] = '\0';
     rule.object_type = OBJ_TYPE_FILE;
     rule.permissions = 0xFFFFFFFF;  // All permissions
     rule.min_level = MLS_LEVEL_UNCLASSIFIED;
@@ -289,24 +291,30 @@ static void load_default_policy(void) {
 
     // User processes can read most files
     memset(&rule, 0, sizeof(rule));
-    strcpy(rule.source_domain, MAC_DOMAIN_USER);
-    strcpy(rule.target_domain, MAC_TYPE_FILE);
+    strncpy(rule.source_domain, MAC_DOMAIN_USER, MAX_LABEL_NAME - 1);
+    rule.source_domain[MAX_LABEL_NAME - 1] = '\0';
+    strncpy(rule.target_domain, MAC_TYPE_FILE, MAX_LABEL_NAME - 1);
+    rule.target_domain[MAX_LABEL_NAME - 1] = '\0';
     rule.object_type = OBJ_TYPE_FILE;
     rule.permissions = MAC_FILE_READ | MAC_FILE_EXECUTE;
     mac_policy_add_rule(&rule);
 
     // User processes can read/write their home directories
     memset(&rule, 0, sizeof(rule));
-    strcpy(rule.source_domain, MAC_DOMAIN_USER);
-    strcpy(rule.target_domain, MAC_TYPE_HOME);
+    strncpy(rule.source_domain, MAC_DOMAIN_USER, MAX_LABEL_NAME - 1);
+    rule.source_domain[MAX_LABEL_NAME - 1] = '\0';
+    strncpy(rule.target_domain, MAC_TYPE_HOME, MAX_LABEL_NAME - 1);
+    rule.target_domain[MAX_LABEL_NAME - 1] = '\0';
     rule.object_type = OBJ_TYPE_FILE;
     rule.permissions = MAC_FILE_READ | MAC_FILE_WRITE | MAC_FILE_CREATE | MAC_FILE_DELETE;
     mac_policy_add_rule(&rule);
 
     // User processes CANNOT read shadow files
     memset(&rule, 0, sizeof(rule));
-    strcpy(rule.source_domain, MAC_DOMAIN_USER);
-    strcpy(rule.target_domain, MAC_TYPE_SHADOW);
+    strncpy(rule.source_domain, MAC_DOMAIN_USER, MAX_LABEL_NAME - 1);
+    rule.source_domain[MAX_LABEL_NAME - 1] = '\0';
+    strncpy(rule.target_domain, MAC_TYPE_SHADOW, MAX_LABEL_NAME - 1);
+    rule.target_domain[MAX_LABEL_NAME - 1] = '\0';
     rule.object_type = OBJ_TYPE_FILE;
     rule.permissions = 0;  // No access
     rule.flags = RULE_FLAG_DENY | RULE_FLAG_AUDIT;
@@ -314,8 +322,10 @@ static void load_default_policy(void) {
 
     // Untrusted domain has minimal access
     memset(&rule, 0, sizeof(rule));
-    strcpy(rule.source_domain, MAC_DOMAIN_UNTRUSTED);
-    strcpy(rule.target_domain, MAC_TYPE_TMP);
+    strncpy(rule.source_domain, MAC_DOMAIN_UNTRUSTED, MAX_LABEL_NAME - 1);
+    rule.source_domain[MAX_LABEL_NAME - 1] = '\0';
+    strncpy(rule.target_domain, MAC_TYPE_TMP, MAX_LABEL_NAME - 1);
+    rule.target_domain[MAX_LABEL_NAME - 1] = '\0';
     rule.object_type = OBJ_TYPE_FILE;
     rule.permissions = MAC_FILE_READ | MAC_FILE_WRITE | MAC_FILE_CREATE;
     mac_policy_add_rule(&rule);
@@ -353,15 +363,19 @@ int mac_transition_add(const mac_transition_t* trans) {
     return MAC_SUCCESS;
 }
 
-// Simple pattern matching for paths (supports * wildcard)
-static bool path_matches_pattern(const char* path, const char* pattern) {
+// Simple pattern matching for paths (supports * wildcard) with depth limit
+#define GLOB_MAX_DEPTH 16
+
+static bool path_matches_pattern_depth(const char* path, const char* pattern, int depth) {
+    if (depth >= GLOB_MAX_DEPTH) return false;
+
     while (*pattern) {
         if (*pattern == '*') {
             pattern++;
             if (!*pattern) return true;
 
             while (*path) {
-                if (path_matches_pattern(path, pattern)) {
+                if (path_matches_pattern_depth(path, pattern, depth + 1)) {
                     return true;
                 }
                 path++;
@@ -376,6 +390,10 @@ static bool path_matches_pattern(const char* path, const char* pattern) {
     }
 
     return *path == '\0';
+}
+
+static bool path_matches_pattern(const char* path, const char* pattern) {
+    return path_matches_pattern_depth(path, pattern, 0);
 }
 
 mac_transition_t* mac_transition_find(const char* source_domain, const char* target_path) {

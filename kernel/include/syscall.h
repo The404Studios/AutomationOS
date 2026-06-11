@@ -92,7 +92,43 @@
 #define SYS_EPOLL_CTL    74 // add/modify/remove watched fds     (kernel/core/syscall/epoll.c)
 #define SYS_EPOLL_WAIT   75 // block until events ready          (kernel/core/syscall/epoll.c)
 #define SYS_BATCH_SUBMIT 82 // batch syscall submission (io_uring-style)
+#define SYS_TRUNCATE    84  // truncate file to specified length
+#define SYS_FTRUNCATE   85  // truncate file via file descriptor
+#define SYS_FSYNC       86  // flush file data to storage
+#define SYS_SYNC        87  // flush all dirty data to storage
+#define SYS_RECOVERY_OVERLAY 88 // draw the self-heal fluid-circle recovery animation
+#define SYS_NET_CONFIG  89  // apply IP/mask/gw/dns to a named interface
+#define SYS_ROUTE_TABLE 90  // dump routing table entries
+#define SYS_ARP_TABLE   91  // dump ARP cache entries
+#define SYS_PCI_LIST    92  // dump PCI device list to user buffer
+#define SYS_BATTERY     93  // EC battery status (ec_battery_status_t subset: 4 bytes)
+#define SYS_PERSIST_READ  94 // read a named diskfs file into a user buffer  (handlers.c)
+#define SYS_PERSIST_WRITE 95 // write a user buffer to a named diskfs file   (handlers.c)
+#define SYS_CH_CREATE   96  // CHANNEL-0: create a shared-ring channel -> handle
+#define SYS_CH_WRITE    97  // CHANNEL-0: write bytes to a channel handle
+#define SYS_CH_READ     98  // CHANNEL-0: read bytes from a channel handle
+#define SYS_CH_WAIT     99  // CHANNEL-0: poll readiness (CH_READABLE/WRITABLE/CLOSED)
+#define SYS_CH_CLOSE   100  // CHANNEL-0: close/release a channel handle
+#define SYS_SPAWN_EX   101  // CHANNEL-0 P2: spawn with fd0/1/2 bound to channel handles
+#define SYS_CH_SENDMSG 102  // CHANNEL-0 P5b: send one framed packet on a CH_MSG channel
+#define SYS_CH_RECVMSG 103  // CHANNEL-0 P5b: receive one framed packet from a CH_MSG channel
+#define SYS_CH_GRANT   104  // AGENT-RPC-0 P6c: grant a one-shot read-only CH_BYTE capability to a pid
+#define SYS_CH_ACCEPT  105  // AGENT-RPC-0 P6c: accept a grant -> a read-only local handle
+#define SYS_SPAWN_EX_ARGV 106 // AGENT-RPC-0 P6d: spawn with an explicit argv VECTOR (NUL-separated argv[1..])
 #define SYS_VMA_TEST    200 // VMA red-black tree testing and benchmarking
+
+// ---- SMP coprocessor offload (GATED: only registered under SMP_FOUNDATION) ----
+// SYS_CPU1_OFFLOAD lets a userspace process hand a kernel-owned compute job (today
+// an integer matrix multiply) to CPU1, the TRUSTED coprocessor. The number is a
+// FIXED, currently-unused slot (83) chosen so it shifts NO existing syscall number
+// and does NOT change MAX_SYSCALLS — the DEFAULT kernel (SMP_FOUNDATION undefined)
+// never registers a handler at this index, so the binary is byte-for-byte
+// unchanged and the syscall returns ENOTSUP (the app then prints SKIP). It is
+// registered + handled ONLY inside #ifdef SMP_FOUNDATION in syscall.c / handlers.c.
+#define SYS_CPU1_OFFLOAD 83 // offload a kernel matmul to CPU1 (trusted coprocessor)
+
+// Job-type selector for SYS_CPU1_OFFLOAD's first argument.
+#define CPU1_JOB_MATMUL  1  // user_arg = { int32 n; int32 A[n*n]; int32 B[n*n]; }
 
 #define MAX_SYSCALLS 256
 
@@ -210,6 +246,14 @@ int64_t sys_rename(uint64_t oldpath, uint64_t newpath, uint64_t arg3,
                    uint64_t arg4, uint64_t arg5, uint64_t arg6);
 int64_t sys_mkdir(uint64_t path, uint64_t mode, uint64_t arg3,
                   uint64_t arg4, uint64_t arg5, uint64_t arg6);
+int64_t sys_truncate(uint64_t path, uint64_t length, uint64_t arg3,
+                     uint64_t arg4, uint64_t arg5, uint64_t arg6);
+int64_t sys_ftruncate(uint64_t fd, uint64_t length, uint64_t arg3,
+                      uint64_t arg4, uint64_t arg5, uint64_t arg6);
+int64_t sys_fsync(uint64_t fd, uint64_t arg2, uint64_t arg3,
+                  uint64_t arg4, uint64_t arg5, uint64_t arg6);
+int64_t sys_sync(uint64_t arg1, uint64_t arg2, uint64_t arg3,
+                 uint64_t arg4, uint64_t arg5, uint64_t arg6);
 
 // Memory / framebuffer / time syscalls (M1 graphics platform)
 int64_t sys_mmap(uint64_t hint, uint64_t len, uint64_t prot, uint64_t flags,
@@ -220,6 +264,8 @@ int64_t sys_fb_acquire(uint64_t out_info, uint64_t arg2, uint64_t arg3,
                        uint64_t arg4, uint64_t arg5, uint64_t arg6);
 int64_t sys_get_ticks_ms(uint64_t arg1, uint64_t arg2, uint64_t arg3,
                          uint64_t arg4, uint64_t arg5, uint64_t arg6);
+int64_t sys_recovery_overlay(uint64_t mode, uint64_t dur_ms, uint64_t arg3,
+                             uint64_t arg4, uint64_t arg5, uint64_t arg6);
 
 // RTC / wall-clock syscalls
 int64_t sys_time(uint64_t arg1, uint64_t arg2, uint64_t arg3,
@@ -256,6 +302,12 @@ int64_t sys_blk_read(uint64_t lba, uint64_t count, uint64_t ubuf,
                      uint64_t arg4, uint64_t arg5, uint64_t arg6);
 int64_t sys_blk_write(uint64_t lba, uint64_t count, uint64_t ubuf,
                       uint64_t arg4, uint64_t arg5, uint64_t arg6);
+
+// Persistent named-file syscalls (diskfs flat files; gate-safe via ahci_present).
+int64_t sys_persist_read(uint64_t name, uint64_t ubuf, uint64_t cap,
+                         uint64_t arg4, uint64_t arg5, uint64_t arg6);
+int64_t sys_persist_write(uint64_t name, uint64_t ubuf, uint64_t len,
+                          uint64_t arg4, uint64_t arg5, uint64_t arg6);
 
 // Futex (fast userspace mutex) syscall
 int64_t sys_futex(uint64_t uaddr, uint64_t op, uint64_t val,
@@ -298,6 +350,24 @@ void epoll_init(void);
 // Performance monitoring syscall
 int64_t sys_perf_report(uint64_t arg1, uint64_t arg2, uint64_t arg3,
                         uint64_t arg4, uint64_t arg5, uint64_t arg6);
+
+// SMP coprocessor offload syscall (defined ONLY under SMP_FOUNDATION in
+// handlers.c; this prototype emits no code, so the default build is unaffected).
+//   sys_cpu1_offload(job_type, user_arg, arg_len, user_res, res_len)
+int64_t sys_cpu1_offload(uint64_t job_type, uint64_t user_arg, uint64_t arg_len,
+                         uint64_t user_res, uint64_t res_len);
+
+// Power management syscalls (ACPI S5 shutdown + reboot)
+int64_t sys_poweroff(uint64_t arg1, uint64_t arg2, uint64_t arg3,
+                     uint64_t arg4, uint64_t arg5, uint64_t arg6);
+int64_t sys_reboot(uint64_t arg1, uint64_t arg2, uint64_t arg3,
+                   uint64_t arg4, uint64_t arg5, uint64_t arg6);
+
+// Battery status (EC embedded controller)
+//   sys_battery(out_ptr, 0, 0) -> 0 on success, <0 on error
+//   out_ptr -> battery_info_user_t { present, state, percent, ac } (4 bytes)
+int64_t sys_battery(uint64_t out, uint64_t arg2, uint64_t arg3,
+                    uint64_t arg4, uint64_t arg5, uint64_t arg6);
 
 // Error codes now live in errno.h (included above) — canonical negative set.
 

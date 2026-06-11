@@ -3,6 +3,39 @@
  */
 #include "ide_gfx.h"
 #include "../../lib/font/bitfont.h"
+#include "../../lib/font2/font2.h"
+
+/* Runtime UI scale (see ide_gfx.h). Default 130% -> 10x20 cell: a good
+ * balance between readability and chrome density on a 1024x768 panel. The user
+ * can Ctrl+wheel / Ctrl+=/- to rescale live; the whole layout reflows from
+ * this cell because every panel derives geometry from GFX_FW/GFX_FH. */
+int g_ui_pct = 100, g_gfx_fw = 8, g_gfx_fh = 16;   /* default scale 100% (8x16 cell): 130% overflowed boxes on small screens (T410). Settings/Ctrl+-/wheel adjust + persist. */
+
+/* ---- IDE behaviour knobs (Settings panel; VIZ-6 / Ctrl+,) ----
+ * Runtime variables (formerly compile-time #defines) so every toggle/slider in
+ * the Settings panel applies LIVE. Defaults are byte-identical to the old
+ * #defines. Co-located with g_ui_pct so all translation units reach them via
+ * the ide_gfx.h externs (no new build unit). See ide_inspector.c for the UI and
+ * ide_config.c (Phase 4) for persistence. */
+int g_tab_width    = 4;    /* soft-tab / tab-stop width in columns (>=1)        */
+int g_blink_ms     = 500;  /* caret blink on/off half-period (ms)               */
+int g_ac_visible   = 8;    /* max autocomplete rows shown (<= AC_MAX_MATCHES)   */
+int g_ac_minpfx    = 2;    /* min typed prefix length before the popup opens    */
+int g_map_pan_step = 20;   /* LEGO map keyboard pan step (px)                   */
+int g_autocomplete = 1;    /* 1 = autocomplete popup enabled                    */
+int g_anno_gutter  = 1;    /* 1 = code-view right-margin semantic annotations   */
+int g_line_numbers = 1;    /* 1 = show the line-number gutter (editor + view)   */
+int g_auto_indent  = 1;    /* 1 = auto-indent new lines to the previous line    */
+int g_live_reparse = 0;    /* 1 = re-parse the model on every edit (experimental)*/
+int g_theme_mode   = 0;    /* 0 = dark (default); persisted now, themed later    */
+
+void gfx_set_scale(int pct) {
+    if (pct < 50) pct = 50;
+    if (pct > 250) pct = 250;
+    g_ui_pct = pct;
+    g_gfx_fw = 8  * pct / 100; if (g_gfx_fw < 1)  g_gfx_fw = 1;  if (g_gfx_fw > 20) g_gfx_fw = 20;
+    g_gfx_fh = 16 * pct / 100; if (g_gfx_fh < 1)  g_gfx_fh = 1;  if (g_gfx_fh > 40) g_gfx_fh = 40;
+}
 
 #define A(c) (((c) >> 24) & 0xFFu)
 #define R(c) (((c) >> 16) & 0xFFu)
@@ -134,7 +167,9 @@ void gfx_dashed(Canvas* c, int x0, int y0, int x1, int y1, uint32_t col, int das
 }
 
 void gfx_text(Canvas* c, int x, int y, const char* s, uint32_t col) {
-    font_draw_string((unsigned int*)c->px, c->stride, c->w, c->h, x, y, s, col | 0xFF000000u);
+    /* Fractional scaled text at the runtime cell size, bounds-clipped to canvas. */
+    font2_draw_cell_clip((unsigned int*)c->px, c->stride, c->w, c->h,
+                         0, c->w, x, y, s, g_gfx_fw, g_gfx_fh, col | 0xFF000000u);
 }
 
 void gfx_text_n(Canvas* c, int x, int y, const char* s, int n, uint32_t col) {
@@ -148,15 +183,11 @@ void gfx_text_n(Canvas* c, int x, int y, const char* s, int n, uint32_t col) {
 
 void gfx_text_clip(Canvas* c, int x, int y, const char* s, uint32_t col,
                    int clip_x, int clip_w) {
-    /* draw char-by-char, skipping any glyph outside [clip_x, clip_x+clip_w) */
-    col |= 0xFF000000u;
-    int cx = x;
-    for (int i = 0; s[i]; i++) {
-        if (cx + GFX_FW > clip_x && cx < clip_x + clip_w)
-            font_draw_char((unsigned int*)c->px, c->stride, c->w, c->h, cx, y, s[i], col);
-        cx += GFX_FW;
-        if (cx >= clip_x + clip_w) break;
-    }
+    /* Scaled text horizontally clipped to [clip_x, clip_x+clip_w) and bounded to
+     * the canvas. font2_draw_cell_clip handles per-pixel clipping internally. */
+    font2_draw_cell_clip((unsigned int*)c->px, c->stride, c->w, c->h,
+                         clip_x, clip_x + clip_w, x, y, s,
+                         g_gfx_fw, g_gfx_fh, col | 0xFF000000u);
 }
 
 int gfx_textw(const char* s) { int n = 0; if (s) while (s[n]) n++; return n * GFX_FW; }

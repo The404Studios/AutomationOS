@@ -34,10 +34,18 @@ typedef struct {
 /**
  * Parse WAV file header
  */
-static int wav_parse_header(const void* wav_data, uint32_t* sample_rate,
+static int wav_parse_header(const void* wav_data, uint32_t wav_size,
+                            uint32_t* sample_rate,
                             uint8_t* bits, uint8_t* channels,
                             const void** audio_data, uint32_t* audio_size) {
     const uint8_t* ptr = (const uint8_t*)wav_data;
+
+    // Need at least the RIFF + fmt headers present before reading them; the
+    // chunk-skip loop below bounds the rest against wav_size.
+    if (wav_size < sizeof(wav_riff_header_t) + sizeof(wav_fmt_chunk_t)) {
+        serial_write("WAV: too small\n", 15);
+        return -1;
+    }
 
     // Read RIFF header
     wav_riff_header_t* riff = (wav_riff_header_t*)ptr;
@@ -89,21 +97,24 @@ static int wav_parse_header(const void* wav_data, uint32_t* sample_rate,
         ptr += (fmt->chunk_size - 16);
     }
 
-    // Find data chunk (may need to skip other chunks)
+    // Find data chunk (may need to skip other chunks). Bound every access
+    // against the real buffer size BEFORE dereferencing, and accumulate the
+    // offset in 64-bit so a hostile chunk_size can't wrap the pointer past the
+    // guard. (Previously: read-then-check against a fixed 1024 with wrappable
+    // pointer math -> OOB read on a crafted/short file.)
     while (1) {
+        uint64_t off = (uint64_t)(ptr - (const uint8_t*)wav_data);
+        if (off + 8 > (uint64_t)wav_size) {
+            serial_write("WAV: Data chunk not found\n", 27);
+            return -1;
+        }
         if (ptr[0] == 'd' && ptr[1] == 'a' && ptr[2] == 't' && ptr[3] == 'a') {
             break;
         }
 
         // Skip this chunk
-        uint32_t chunk_size = *((uint32_t*)(ptr + 4));
-        ptr += 8 + chunk_size;
-
-        // Safety check
-        if ((ptr - (uint8_t*)wav_data) > 1024) {
-            serial_write("WAV: Data chunk not found\n", 27);
-            return -1;
-        }
+        uint32_t chunk_size = *((const uint32_t*)(ptr + 4));
+        ptr += 8 + (uint64_t)chunk_size;
     }
 
     // Read data chunk
@@ -161,7 +172,7 @@ int hda_play_wav(const void* wav_data, uint32_t wav_size) {
     const void* audio_data;
     uint32_t audio_size;
 
-    if (wav_parse_header(wav_data, &sample_rate, &bits_per_sample,
+    if (wav_parse_header(wav_data, wav_size, &sample_rate, &bits_per_sample,
                          &num_channels, &audio_data, &audio_size) != 0) {
         return -1;
     }

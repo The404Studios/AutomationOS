@@ -4,9 +4,28 @@
 #include "string.h"
 #include "syscall.h"
 
-// Simple epoch counter (seconds since 1970-01-01 00:00:00 UTC)
-// In a real implementation, this would be synchronized with the kernel
-static time_t system_time = 0;
+/* SYS_TIME (41) returns seconds since the Unix epoch via the CMOS RTC.
+ * SYS_GET_TICKS_MS (40) returns monotonic milliseconds since boot. */
+#define SYS_TIME         41
+#define SYS_GET_TICKS_MS 40
+
+/* Prototype for the raw 6-arg syscall helper defined in syscall.c.
+ * The symbol is not declared in syscall.h but IS exported from syscall.o,
+ * so we pull it in with an extern rather than duplicating the asm stub. */
+static inline long _time_sc6(long n, long a1, long a2, long a3,
+                              long a4, long a5, long a6) {
+    long ret;
+    register long r10 asm("r10") = a4;
+    register long r8  asm("r8")  = a5;
+    register long r9  asm("r9")  = a6;
+    asm volatile("syscall"
+                 : "=a"(ret)
+                 : "a"(n), "D"(a1), "S"(a2), "d"(a3),
+                   "r"(r10), "r"(r8), "r"(r9)
+                 : "rcx", "r11", "memory");
+    return ret;
+}
+
 static clock_t start_clock = 0;
 
 // Days in each month (non-leap year)
@@ -71,14 +90,10 @@ static int calculate_day_of_year(int year, int month, int day) {
 // BASIC TIME FUNCTIONS
 // ============================================================================
 
-// Get current time
+// Get current wall-clock time (seconds since 1970-01-01 00:00:00 UTC).
+// Calls SYS_TIME (41) which reads the CMOS RTC and converts to epoch seconds.
 time_t time(time_t* tloc) {
-    // In a real implementation, this would query the kernel for current time
-    // For now, return a simulated time based on system ticks
-    // Approximate: assume 100 ticks per second (CLOCKS_PER_SEC)
-
-    // This is a stub - would need a real RTC or kernel time source
-    time_t current_time = system_time;
+    time_t current_time = (time_t)_time_sc6(SYS_TIME, 0, 0, 0, 0, 0, 0);
 
     if (tloc) {
         *tloc = current_time;
@@ -417,13 +432,19 @@ int clock_gettime(int clk_id, struct timespec* tp) {
         return -1;
     }
 
-    // Stub implementation - would need kernel support
     switch (clk_id) {
         case CLOCK_REALTIME:
-        case CLOCK_MONOTONIC:
-            tp->tv_sec = time(NULL);
+            tp->tv_sec = time(NULL);   /* RTC wall-clock via SYS_TIME */
             tp->tv_nsec = 0;
             return 0;
+
+        case CLOCK_MONOTONIC: {
+            /* SYS_GET_TICKS_MS (40) returns monotonic ms since boot. */
+            long ms = _time_sc6(SYS_GET_TICKS_MS, 0, 0, 0, 0, 0, 0);
+            tp->tv_sec  = ms / 1000;
+            tp->tv_nsec = (ms % 1000) * 1000000L;
+            return 0;
+        }
 
         case CLOCK_PROCESS_CPUTIME_ID:
         case CLOCK_THREAD_CPUTIME_ID:

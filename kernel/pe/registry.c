@@ -109,9 +109,13 @@ LONG WINAPI RegOpenKeyExW(
     }
 
     if (lpSubKey && *lpSubKey) {
-        snprintf(full_path, sizeof(full_path), "%s/%s", base_path, subkey);
+        int n = snprintf(full_path, sizeof(full_path), "%s/%s", base_path, subkey);
+        if (n < 0 || (size_t)n >= sizeof(full_path)) {
+            return ERROR_INSUFFICIENT_BUFFER;
+        }
     } else {
-        strncpy(full_path, base_path, sizeof(full_path));
+        strncpy(full_path, base_path, sizeof(full_path) - 1);
+        full_path[sizeof(full_path) - 1] = '\0';
     }
 
     // Create key entry
@@ -165,9 +169,11 @@ LONG WINAPI RegQueryValueExW(
         base_path = key->path;
     }
 
-    // Build value file path
+    // Build value file path (with overflow check)
     char value_path[1024];
-    snprintf(value_path, sizeof(value_path), "%s/%s", base_path, value_name);
+    if (snprintf(value_path, sizeof(value_path), "%s/%s", base_path, value_name) >= (int)sizeof(value_path)) {
+        return ERROR_INSUFFICIENT_BUFFER;
+    }
 
     // Try to read value from file
     int fd = vfs_open(value_path, O_RDONLY, 0);
@@ -225,9 +231,11 @@ LONG WINAPI RegSetValueExW(
         base_path = key->path;
     }
 
-    // Build value file path
+    // Build value file path (with overflow check)
     char value_path[1024];
-    snprintf(value_path, sizeof(value_path), "%s/%s", base_path, value_name);
+    if (snprintf(value_path, sizeof(value_path), "%s/%s", base_path, value_name) >= (int)sizeof(value_path)) {
+        return ERROR_INSUFFICIENT_BUFFER;
+    }
 
     // Create directory if needed
     vfs_mkdir_recursive(base_path, 0755);
@@ -313,9 +321,11 @@ LONG WINAPI RegCreateKeyExW(
         base_path = parent->path;
     }
 
-    // Build full path
+    // Build full path (with overflow check)
     char full_path[1024];
-    snprintf(full_path, sizeof(full_path), "%s/%s", base_path, subkey);
+    if (snprintf(full_path, sizeof(full_path), "%s/%s", base_path, subkey) >= (int)sizeof(full_path)) {
+        return ERROR_INSUFFICIENT_BUFFER;
+    }
 
     // Create directory
     int result = vfs_mkdir_recursive(full_path, 0755);
@@ -347,9 +357,11 @@ LONG WINAPI RegDeleteKeyW(HKEY hKey, LPCWSTR lpSubKey) {
         base_path = parent->path;
     }
 
-    // Build full path
+    // Build full path (with overflow check)
     char full_path[1024];
-    snprintf(full_path, sizeof(full_path), "%s/%s", base_path, subkey);
+    if (snprintf(full_path, sizeof(full_path), "%s/%s", base_path, subkey) >= (int)sizeof(full_path)) {
+        return ERROR_INSUFFICIENT_BUFFER;
+    }
 
     // Delete directory
     if (vfs_rmdir(full_path) < 0) {

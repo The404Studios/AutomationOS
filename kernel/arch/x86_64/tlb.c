@@ -34,6 +34,9 @@ typedef struct {
 
 static percpu_tlb_state_t tlb_state[MAX_CPUS];
 
+// INVPCID capability cache (set once at init, read-only after)
+static bool g_have_invpcid = false;
+
 // TLB flush statistics (per-CPU)
 static struct {
     uint64_t lazy_flushes;              // Lazy flushes performed
@@ -49,6 +52,10 @@ static struct {
 // Initialize TLB subsystem
 void tlb_init(void) {
     kprintf("[TLB] Initializing lazy TLB shootdown...\n");
+
+    // Cache INVPCID capability once at boot
+    g_have_invpcid = cpu_has_invpcid();
+    kprintf("[TLB] INVPCID support: %s\n", g_have_invpcid ? "YES" : "NO");
 
     for (uint32_t cpu = 0; cpu < MAX_CPUS; cpu++) {
         tlb_state[cpu].needs_flush = false;
@@ -250,12 +257,36 @@ void tlb_flush_all_lazy(uint64_t cr3) {
     #endif
 }
 
+// Flush EVERY non-global TLB entry for ALL PCIDs on the current CPU.
+// Required before recycling PCIDs so a reused PCID cannot hit stale lines.
+void tlb_flush_all_contexts_local(void) {
+    if (g_have_invpcid) {
+        // Type 2: invalidate all PCID contexts (excludes global pages).
+        invpcid(INVPCID_TYPE_ALL_CONTEXTS, 0, 0);
+    } else {
+        // Fallback: toggling CR4.PCIDE flushes all non-global TLB entries.
+        uint64_t cr4 = read_cr4();
+        if (cr4 & CR4_PCIDE) {
+            write_cr4(cr4 & ~CR4_PCIDE);  // disable PCID -> flush all
+            write_cr4(cr4);               // re-enable, restore state
+        } else {
+            // PCID not even enabled: a plain CR3 reload is sufficient
+            write_cr3(read_cr3() & ~CR3_NO_FLUSH);
+        }
+    }
+}
+
 // IPI handler for TLB flush (replaces ipi_handle_tlb_flush)
 void tlb_handle_ipi_flush(void) {
     uint32_t cpu = cpu_id();
 
     // Immediately flush pending TLB entries
     tlb_flush_pending();
+}
+
+// IPI handler for TLB flush all contexts (PCID recycle)
+void tlb_handle_ipi_flush_all_contexts(void) {
+    tlb_flush_all_contexts_local();
 }
 
 // Print TLB statistics

@@ -348,6 +348,14 @@ static i32  prev_buttons = 0;
 #define WIN_W        500
 #define WIN_H        560
 
+/* Live clip bounds = the CURRENT window surface (refreshed on WL_EVENT_RESIZE).
+ * The board canvas itself stays a fixed 500x560 -- this is a fixed-canvas app,
+ * so on resize we letterbox: clear the whole new surface and blit the fixed
+ * canvas at (0,0), clamped to the live surface so a SMALLER window can never
+ * overflow the (lib-reallocated) buffer. */
+static i32 g_clip_w = WIN_W;
+static i32 g_clip_h = WIN_H;
+
 #define HEADER_H     60                       /* top header strip */
 #define MARGIN_X     10                       /* left/right margin around grid */
 #define GRID_TOP     (HEADER_H + 10)          /* y of grid top edge */
@@ -398,8 +406,10 @@ static void fill_rect(u32 *buf, u32 stride, i32 x, i32 y, i32 w, i32 h, u32 col)
 {
     i32 x1 = x < 0 ? 0 : x, y1 = y < 0 ? 0 : y;
     i32 x2 = x + w, y2 = y + h;
-    if (x2 > WIN_W) x2 = WIN_W;
-    if (y2 > WIN_H) y2 = WIN_H;
+    /* Clamp to the LIVE surface (refreshed on resize), never the fixed canvas:
+     * a smaller window must not write past the reallocated buffer. */
+    if (x2 > g_clip_w) x2 = g_clip_w;
+    if (y2 > g_clip_h) y2 = g_clip_h;
     for (i32 yy = y1; yy < y2; yy++) {
         u32 *row = buf + (u32)yy * stride;
         for (i32 xx = x1; xx < x2; xx++) row[xx] = col;
@@ -441,11 +451,11 @@ static void draw_big_digit(u32 *buf, u32 stride, i32 cx, i32 cy, char ch, u32 co
             if (glyph[gy * FONT_W + gx] == 0) continue;
             for (int sy = 0; sy < S; sy++) {
                 i32 py = oy + gy * S + sy;
-                if (py < 0 || py >= WIN_H) continue;
+                if (py < 0 || py >= g_clip_h) continue;
                 u32 *row = buf + (u32)py * stride;
                 for (int sx = 0; sx < S; sx++) {
                     i32 px = ox + gx * S + sx;
-                    if (px < 0 || px >= WIN_W) continue;
+                    if (px < 0 || px >= g_clip_w) continue;
                     row[px] = col;
                 }
             }
@@ -522,7 +532,7 @@ static void draw_notes(u32 *buf, u32 stride, int r, int c)
         i32 cx = x0 + sc2 * sub + sub / 2;
         i32 cy = y0 + sr  * sub + sub / 2;
         char ch = (char)('0' + d);
-        font_draw_char(buf, (int)stride, WIN_W, WIN_H,
+        font_draw_char(buf, (int)stride, g_clip_w, g_clip_h,
                        cx - FONT_W / 2, cy - FONT_H / 2, ch, C_NOTE);
     }
 }
@@ -587,7 +597,7 @@ static void draw_button(u32 *buf, u32 stride, i32 x, i32 y, i32 w, i32 h,
     hline(buf, stride, x, y + h - 1, w, 0xFF24323Eu);
     vline(buf, stride, x + w - 1, y, h, 0xFF24323Eu);
     int lw = font_text_width(label);
-    font_draw_string(buf, (int)stride, WIN_W, WIN_H,
+    font_draw_string(buf, (int)stride, g_clip_w, g_clip_h,
                      x + (w - lw) / 2, y + (h - FONT_H) / 2, label, C_WHITE);
 }
 
@@ -613,20 +623,20 @@ static void render_header(u32 *buf, u32 stride, u64 now_ms)
     fill_rect(buf, stride, 0, 0, WIN_W, HEADER_H, C_HEADER);
 
     /* Title. */
-    font_draw_string(buf, (int)stride, WIN_W, WIN_H, 12, 8, "SUDOKU", C_HDR_TEXT);
+    font_draw_string(buf, (int)stride, g_clip_w, g_clip_h, 12, 8, "SUDOKU", C_HDR_TEXT);
 
     /* Timer (mm:ss) under the title. */
     {
         u64 elapsed = g_won ? g_elapsed_ms : (now_ms - g_start_ms);
         char tbuf[8];
         fmt_time(tbuf, elapsed);
-        font_draw_string(buf, (int)stride, WIN_W, WIN_H, 12, 32, tbuf,
+        font_draw_string(buf, (int)stride, g_clip_w, g_clip_h, 12, 32, tbuf,
                          g_won ? C_WIN : C_DIM);
     }
 
     /* Pencil-mode indicator. */
     if (g_notes_mode) {
-        font_draw_string(buf, (int)stride, WIN_W, WIN_H, 78, 32, "PENCIL", 0xFFF1C40Fu);
+        font_draw_string(buf, (int)stride, g_clip_w, g_clip_h, 78, 32, "PENCIL", 0xFFF1C40Fu);
     }
 
     /* Buttons. */
@@ -641,7 +651,7 @@ static void render_header(u32 *buf, u32 stride, u64 now_ms)
         int mw = font_text_width(msg);
         i32 by = GRID_BOTTOM + 6;
         fill_rect(buf, stride, GRID_LEFT, by, 9 * CELL, 24, C_WIN);
-        font_draw_string(buf, (int)stride, WIN_W, WIN_H,
+        font_draw_string(buf, (int)stride, g_clip_w, g_clip_h,
                          GRID_LEFT + (9 * CELL - mw) / 2, by + 4, msg, C_WHITE);
     }
 }
@@ -651,7 +661,10 @@ static void render_header(u32 *buf, u32 stride, u64 now_ms)
  * --------------------------------------------------------------------- */
 static void render_all(u32 *buf, u32 stride, u64 now_ms)
 {
-    fill_rect(buf, stride, 0, 0, WIN_W, WIN_H, C_BG);
+    /* Clear the WHOLE live surface (letterbox margins included) so a window
+     * larger than the fixed 500x560 canvas shows no stale garbage.  fill_rect
+     * clamps to g_clip_w/g_clip_h, so this is bounded to the current buffer. */
+    fill_rect(buf, stride, 0, 0, g_clip_w, g_clip_h, C_BG);
     render_grid(buf, stride);
     render_header(buf, stride, now_ms);
 }
@@ -751,6 +764,8 @@ void _start(void)
     }
 
     u32 stride = win->stride / 4u;
+    g_clip_w = (i32)win->w;          /* live clip = actual surface size */
+    g_clip_h = (i32)win->h;
 
     /* Allocate the board from the static arena. */
     B = (board_t *)kmalloc((u32)sizeof(board_t));
@@ -827,6 +842,15 @@ void _start(void)
                     break;
                 default: break;
                 }
+            } else if (kind == WL_EVENT_RESIZE) {
+                /* The lib has ALREADY reallocated and updated win->{w,h,stride,
+                 * pixels}.  Refresh our cached stride and the live clip bounds so
+                 * every subsequent write is bounded to the new surface, then force
+                 * a full redraw (clears the letterbox margins). */
+                stride   = win->stride / 4u;
+                g_clip_w = (i32)win->w;
+                g_clip_h = (i32)win->h;
+                dirty = 1;
             }
         }
 

@@ -68,37 +68,58 @@ static uint32_t next_shm_id = 1;   // Next segment ID to allocate
 static spinlock_t shm_lock;        // Protects both tables
 
 // ─── Per-process attachment tracking ───────────────────────────────────────
-// Without this, a process that ATTACHES another process's segment and then dies
-// without shmdt() leaves the segment's attach_count permanently inflated, so an
-// IPC_RMID'd segment is never freed (a real leak — #7). We record one
-// (pid, id) entry per successful shmat and drop it on shmdt; on process death
-// shm_cleanup_process() replays the dead pid's entries to decrement attach_count
-// accurately. A small fixed table is fine (compositor + a handful of clients);
-// if it ever fills, attachments simply fall back to the old (leaky) behavior.
-#define SHM_MAX_ATTACHES 128
-typedef struct { uint32_t pid; ipc_id_t id; } shm_attach_rec_t;
-static shm_attach_rec_t shm_attaches[SHM_MAX_ATTACHES];   // pid==0 => empty slot
+// Each process_t has a singly-linked list of shm_attachment_t nodes tracking
+// its active SHM attachments. On shmat() we prepend a node; on shmdt() we
+// remove it; on process death shm_cleanup_process() walks the list to decrement
+// attach_count for each segment. This makes cleanup O(n) where n is the number
+// of attachments THIS process holds (typically 1-5) instead of O(128).
 
-// Caller must hold shm_lock.
-static void shm_attach_record(uint32_t pid, ipc_id_t id) {
-    for (uint32_t i = 0; i < SHM_MAX_ATTACHES; i++) {
-        if (shm_attaches[i].pid == 0) {
-            shm_attaches[i].pid = pid;
-            shm_attaches[i].id  = id;
-            return;
-        }
+// Add an attachment to the process's list. Caller must hold shm_lock.
+// Returns true on success, false if the record could not be allocated -- the caller
+// MUST then NOT increment attach_count (and should roll back the mapping), otherwise
+// shm_cleanup_process (which decrements attach_count only by walking this list) never
+// balances the count and the segment is pinned forever.
+static bool shm_attach_add(process_t* proc, ipc_id_t shm_id, void* virt_addr, size_t size, uint32_t flags) {
+    shm_attachment_t* att = (shm_attachment_t*)kmalloc(sizeof(shm_attachment_t));
+    if (!att) {
+        kprintf("[SHM] WARNING: failed to allocate attachment record for PID %u\n", proc->pid);
+        return false;
     }
-    kprintf("[SHM] attach record table full; PID %u attach of %d untracked\n", pid, id);
+    att->shm_id = shm_id;
+    att->virt_addr = virt_addr;
+    att->size = size;
+    att->flags = flags;
+    att->next = proc->shm_attachments;
+    proc->shm_attachments = att;
+    return true;
 }
 
-// Caller must hold shm_lock. Removes ONE matching (pid,id) record.
-static void shm_attach_unrecord(uint32_t pid, ipc_id_t id) {
-    for (uint32_t i = 0; i < SHM_MAX_ATTACHES; i++) {
-        if (shm_attaches[i].pid == pid && shm_attaches[i].id == id) {
-            shm_attaches[i].pid = 0;
-            return;
+// Remove an attachment from the process's list. Caller must hold shm_lock.
+// Returns true if found and removed, false otherwise.
+static bool shm_attach_remove(process_t* proc, ipc_id_t shm_id) {
+    shm_attachment_t** pp = &proc->shm_attachments;
+    while (*pp) {
+        if ((*pp)->shm_id == shm_id) {
+            shm_attachment_t* victim = *pp;
+            *pp = victim->next;
+            kfree(victim);
+            return true;
         }
+        pp = &(*pp)->next;
     }
+    return false;
+}
+
+// Free all attachments in a process's list. Called by shm_cleanup_process.
+// Caller must hold shm_lock.
+static void shm_attach_free_all(process_t* proc) {
+    shm_attachment_t* att = proc->shm_attachments;
+    while (att) {
+        shm_attachment_t* next = att->next;
+        kfree(att);
+        att = next;
+    }
+    proc->shm_attachments = NULL;
 }
 
 // ─── Internal helpers ─────────────────────────────────────────────────────
@@ -197,7 +218,10 @@ static bool shm_check_permission(shm_segment_t* seg, uint32_t uid, uint32_t gid,
         return true;
     }
     if (gid == seg->creator_gid) {
-        return write ? (seg->mode & IPC_W) != 0 : (seg->mode & IPC_R) != 0;
+        /* GROUP bits are mode>>3 (0020/0040); using the owner bits IPC_W/R here
+         * would grant a group member the OWNER's rights (mode 0640 => group can
+         * WRITE). The 'other' branch below correctly uses >>6. */
+        return write ? (seg->mode & (IPC_W >> 3)) != 0 : (seg->mode & (IPC_R >> 3)) != 0;
     }
     return write ? (seg->mode & (IPC_W >> 6)) != 0 : (seg->mode & (IPC_R >> 6)) != 0;
 }
@@ -255,6 +279,26 @@ int64_t sys_shmget(uint64_t key, uint64_t size, uint64_t shmflg,
 
     sz = ALIGN_UP(sz, PAGE_SIZE);
     uint32_t pages = sz / PAGE_SIZE;
+
+    /* ── OOM guard: reject if the request would exhaust physical memory ───
+     * A non-root process can trivially DoS the system by creating many
+     * large SHM segments until pmm_alloc_page starts returning NULL,
+     * crashing every subsequent kmalloc/page-table alloc. Reject early
+     * if less than 25% of physical memory would remain after this alloc.
+     * Root is exempt (kernel/init SHM allocations during boot must succeed). */
+    if (current->uid != 0) {
+        uint64_t free_mem = pmm_get_free_memory();
+        uint64_t need = (uint64_t)pages * PAGE_SIZE;
+        uint64_t total = pmm_get_total_memory();
+        uint64_t reserve = total / 4;
+        if (free_mem < need + reserve) {
+            kprintf("[SHMGET] Denied: would leave <25%% free memory "
+                    "(free=%lu need=%lu reserve=%lu)\n",
+                    (unsigned long)free_mem, (unsigned long)need,
+                    (unsigned long)reserve);
+            return IPC_ENOMEM;
+        }
+    }
 
     /* ── Phase 1: key/exist check + ID reservation (under lock) ─────────── */
 
@@ -481,6 +525,27 @@ int64_t sys_shmat(uint64_t shmid, uint64_t shmaddr, uint64_t shmflg,
         }
     }
 
+    // Confine EVERY shm mapping to the shared SHM VA window. Pages mapped
+    // outside [SHARED_SHM_VA_START, SHARED_SHM_VA_END) get PTE_OWNED (see
+    // paging_map_page), so paging_destroy_address_space() would free the
+    // segment's SHARED frames at process teardown -- double-freeing them (PMM
+    // free-list corruption / cross-process use-after-free). This rejects:
+    //  - a malicious user-supplied shmaddr outside the window;
+    //  - the NULL-attach formula (SHM_VA_BASE + id*SHM_VA_STRIDE) once id>=160
+    //    runs the base past SHARED_SHM_VA_END;
+    //  - a NULL-attach segment larger than one 16MB slot, which would otherwise
+    //    overlap the next segment's slot (size > stride).
+    {
+        uint64_t shm_end = virt_addr + (uint64_t)seg->size;
+        if (virt_addr < SHARED_SHM_VA_START || shm_end > SHARED_SHM_VA_END ||
+            shm_end < virt_addr || (uint64_t)seg->size > SHM_VA_STRIDE) {
+            spin_unlock(&shm_lock);
+            kprintf("[SHMAT] mapping outside shared SHM window: %p +%lu\n",
+                    (void*)virt_addr, (unsigned long)seg->size);
+            return IPC_EINVAL;
+        }
+    }
+
     // Map into CALLING process's address space (current->context.cr3).
     uint32_t page_flags = PAGE_PRESENT | PAGE_USER;
     if (write) {
@@ -505,9 +570,20 @@ int64_t sys_shmat(uint64_t shmid, uint64_t shmaddr, uint64_t shmflg,
         }
     }
 
+    // Create the per-process attachment record BEFORE bumping attach_count so the two
+    // stay consistent. If the record can't be allocated, roll back the whole mapping
+    // (shared frames -> free_owned=false, same helper as the partial-map rollback
+    // above) and fail. The old code incremented attach_count then ignored a failed
+    // record alloc, so on process death shm_cleanup_process found no record, never
+    // decremented the count, and the segment (pages + struct) leaked permanently.
+    if (!shm_attach_add(current, seg->id, (void*)virt_addr, seg->size, flags)) {
+        vmm_unmap_range_into(cr3, virt_addr, (uint64_t)seg->pages * PAGE_SIZE, false);
+        spin_unlock(&shm_lock);
+        kprintf("[SHMAT] attachment record alloc failed; rolled back\n");
+        return IPC_ENOMEM;
+    }
     seg->attach_count++;
     seg->attach_time = timer_get_ticks();
-    shm_attach_record(current->pid, seg->id);   // for cleanup on process death
 
     spin_unlock(&shm_lock);
 
@@ -601,7 +677,7 @@ int64_t sys_shmdt(uint64_t shmaddr, uint64_t arg2, uint64_t arg3,
     if (seg->attach_count > 0) {
         seg->attach_count--;
     }
-    shm_attach_unrecord(current->pid, seg->id);   // drop the tracking record
+    shm_attach_remove(current, seg->id);   // drop the tracking record
     seg->detach_time = timer_get_ticks();
 
     ipc_id_t seg_id = seg->id;   // save before potential free
@@ -670,8 +746,7 @@ int64_t sys_shmctl(uint64_t shmid, uint64_t cmd, uint64_t buf,
     (void)arg4; (void)arg5; (void)arg6;
     int id = (int)shmid;
     int command = (int)cmd;
-    void* buffer = (void*)buf;
-    (void)buffer;
+    void* buffer = (void*)buf;   /* IPC_STAT out-buffer (struct shmid_ds*) */
     process_t* current = process_get_current();
     if (!current) {
         return IPC_EINVAL;
@@ -745,9 +820,46 @@ int64_t sys_shmctl(uint64_t shmid, uint64_t cmd, uint64_t buf,
             }
             return IPC_SUCCESS;
 
-        case IPC_STAT:
+        case IPC_STAT: {
+            /* Fill the caller's struct shmid_ds. Snapshot every field UNDER the
+             * lock, drop the lock, THEN copy_to_user (which walks the page table
+             * and can fault -- must not run under shm_lock, per this file's
+             * lock-ordering discipline). Layout mirrors userspace struct
+             * shmid_ds (userspace/libc/ipc.h) field-for-field. This was a no-op
+             * stub before, so the segment size never reached userspace -- the
+             * compositor needs it to reject a client buffer extent that exceeds
+             * the actual segment (else it blits past the mapped shm). */
+            struct {
+                unsigned int  shm_perm_uid;
+                unsigned int  shm_perm_gid;
+                unsigned int  shm_perm_mode;
+                unsigned long shm_segsz;
+                unsigned long shm_atime;
+                unsigned long shm_dtime;
+                unsigned long shm_ctime;
+                unsigned int  shm_cpid;
+                unsigned int  shm_lpid;
+                unsigned int  shm_nattch;
+            } st;
+            st.shm_perm_uid  = seg->creator_uid;
+            st.shm_perm_gid  = seg->creator_gid;
+            st.shm_perm_mode = seg->mode;
+            st.shm_segsz     = (unsigned long)seg->size;
+            st.shm_atime     = (unsigned long)seg->attach_time;
+            st.shm_dtime     = (unsigned long)seg->detach_time;
+            st.shm_ctime     = (unsigned long)seg->create_time;
+            st.shm_cpid      = seg->owner_pid;
+            st.shm_lpid      = seg->owner_pid;
+            st.shm_nattch    = seg->attach_count;
             spin_unlock(&shm_lock);
+            if (!buffer) {
+                return IPC_EINVAL;
+            }
+            if (copy_to_user(buffer, &st, sizeof(st)) != COPY_SUCCESS) {
+                return IPC_EFAULT;
+            }
             return IPC_SUCCESS;
+        }
 
         case IPC_SET:
             spin_unlock(&shm_lock);
@@ -811,7 +923,9 @@ typedef struct {
 #define SHM_CLEANUP_MAX 64
 static shm_deferred_free_t cleanup_work[SHM_CLEANUP_MAX];
 
-void shm_cleanup_process(uint32_t pid) {
+void shm_cleanup_process(process_t* proc) {
+    if (!proc) return;
+    uint32_t pid = proc->pid;
     kprintf("[SHM] Cleanup for PID %d\n", pid);
 
     /*
@@ -826,19 +940,31 @@ void shm_cleanup_process(uint32_t pid) {
      */
     uint32_t nfree = 0;
 
+    // proc is passed in by the caller (process_unref teardown). Do NOT re-look it
+    // up via process_get_by_pid(): by the time this runs the PCB has ALREADY been
+    // removed from process_table, so the lookup returned NULL and the entire
+    // cleanup became a silent no-op — every owned shm segment and attachment node
+    // leaked. (And taking a ref during ref_count==0 teardown would recurse on
+    // unref.) The caller owns the sole reference; use proc directly.
     spin_lock(&shm_lock);
 
-    // Pass 0: replay this pid's attachment records so attach_count is accurate
-    // even though the dying process never called shmdt(). Fixes the leak where a
-    // non-owner attacher's death left an IPC_RMID'd segment pinned forever.
-    for (uint32_t a = 0; a < SHM_MAX_ATTACHES; a++) {
-        if (shm_attaches[a].pid != pid) continue;
-        shm_segment_t* seg = shm_find_by_id(shm_attaches[a].id);
+    // Pass 0: walk the process's attachment list and decrement attach_count for
+    // each segment. This is O(n) where n is the number of attachments THIS
+    // process holds (typically 1-5) instead of O(128) scanning the global array.
+    // Fixes the leak where a non-owner attacher's death left an IPC_RMID'd
+    // segment pinned forever.
+    shm_attachment_t* att = proc->shm_attachments;
+    while (att) {
+        shm_segment_t* seg = shm_find_by_id(att->shm_id);
         if (seg && seg->attach_count > 0) {
             seg->attach_count--;
+            kprintf("[SHM] Cleanup PID %d: decremented attach_count for segment %d\n",
+                    pid, att->shm_id);
         }
-        shm_attaches[a].pid = 0;
+        att = att->next;
     }
+    // Free the entire attachment list now that we've processed all entries.
+    shm_attach_free_all(proc);
 
     for (uint32_t i = 0; i < SHM_TABLE_SIZE; i++) {
         shm_segment_t* seg = id_table[i];

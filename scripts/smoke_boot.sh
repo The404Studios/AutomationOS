@@ -40,6 +40,9 @@ MIN_PIDS=4
 # +5 for the new short-lived webapitest probe.
 # +5 for threadtest (4 threads + the main process all exit -> legitimate frees).
 # +5 for matmuljobs (2 worker threads + the main process all exit -> legitimate frees).
+# NOTE: the kernel is built -DPROCESS_QUIET (scripts/quick_build.sh), which SUPPRESSES
+# the "[PROCESS] Freeing process" line, so this count is effectively always 0 and the
+# threshold is moot today; kept as a guard in case PROCESS_QUIET is ever lifted.
 MAX_FREEING=190
 
 # ── Colour helpers ─────────────────────────────────────────────────────────
@@ -81,6 +84,13 @@ maybe_build() {
         header "Step 0: Building kernel + ISO"
         bash "${KERNEL_ROOT}/scripts/quick_build.sh" || {
             printf "ERROR: quick_build.sh failed\n" >&2; exit 1
+        }
+        # Stage the freshly-built kernel into the ISO tree. quick_build.sh writes
+        # build/kernel.elf, but grub-mkrescue below packages iso/boot/kernel.elf --
+        # without this copy, --build silently re-packaged a STALE kernel, so the
+        # smoke test validated whatever was last left in iso/boot/, not the new build.
+        cp "${KERNEL_ROOT}/build/kernel.elf" "${KERNEL_ROOT}/iso/boot/kernel.elf" || {
+            printf "ERROR: failed to stage build/kernel.elf into iso/boot/\n" >&2; exit 1
         }
         if command -v grub-mkrescue &>/dev/null; then
             grub-mkrescue -o "${ISO}" "${KERNEL_ROOT}/iso/" || {
@@ -585,11 +595,11 @@ check_libs() {
 check_coreutils2() {
     # The expanded coreutils each print "<NAME> SELFTEST: PASS" at boot.
     local missing=""
-    for t in GREP HEAD TAIL SORT UNIQ CUT TR NL DU TOUCH BASENAME DIRNAME LESS HEXDUMP; do
+    for t in GREP HEAD TAIL SORT UNIQ CUT TR NL DU TOUCH BASENAME DIRNAME LESS HEXDUMP LSPCI; do
         grep -qF "$t SELFTEST: PASS" "$LOG" || missing="$missing $t"
     done
     if [[ -z "$missing" ]]; then
-        pass "coreutils self-tests pass (grep/head/tail/sort/uniq/cut/tr/nl/du/touch/basename/dirname/less/hexdump)"
+        pass "coreutils self-tests pass (grep/head/tail/sort/uniq/cut/tr/nl/du/touch/basename/dirname/less/hexdump/lspci)"
         return 0
     else
         fail "coreutil self-test(s) missing/failed:${missing}"
@@ -717,6 +727,29 @@ check_matmuljobs() {
     fi
 }
 
+check_smpstress() {
+    # init spawns sbin/smpstress, the 2-CPU dispatch STRESS harness: it drives the CPU1
+    # coprocessor mailbox thousands of times via SYS_CPU1_OFFLOAD, verifying every
+    # result bit-for-bit. On THIS default (single-core) smoke kernel SYS_CPU1_OFFLOAD is
+    # unregistered, so the harness prints "SMPSTRESS: SKIP single CPU" and exits cleanly
+    # -- that is the expected, passing result here (the real PASS is proved separately on
+    # the SMP kernel under `qemu -smp 2`, see scripts/smp_smoke.sh). FAIL means a result
+    # mismatch / timeout / lost wakeup under stress.
+    if grep -qF 'SMPSTRESS: PASS' "$LOG"; then
+        pass "SMP dispatch stress verified ($(grep -F 'SMPSTRESS: PASS' "$LOG" | head -1 | sed 's/^.*SMPSTRESS: PASS //'))"
+        return 0
+    elif grep -qF 'SMPSTRESS: SKIP' "$LOG"; then
+        pass "SMP dispatch stress harness present (SKIP: single-core default kernel)"
+        return 0
+    elif grep -qF 'SMPSTRESS: FAIL' "$LOG"; then
+        fail "SMP dispatch stress broke: $(grep -F 'SMPSTRESS: FAIL' "$LOG" | head -1)"
+        return 1
+    else
+        fail "smpstress did not report (never ran / hung)"
+        return 1
+    fi
+}
+
 check_browser_wave() {
     # 22-agent browser wave: init spawns the per-layer selftests + browser2.
     # Each app prints "<NAME>: PASS" or "<NAME>: FAIL ..." and exits.
@@ -770,6 +803,70 @@ check_no_crash_loop() {
     fi
 }
 
+check_no_pid_exhaustion() {
+    # #9 PID/zombie-leak gate. reaploop (spawned by init) fork+reaps a trivial child
+    # 300x (> MAX_PROCESSES == 256). If reaping leaks the creation ref, the PID pool
+    # exhausts: the kernel logs "No free PID" and reaploop prints REAPLOOP: FAIL. The
+    # claim-based reap + reparent-to-init fix recycles slots, so we require
+    # REAPLOOP: PASS and ZERO "No free PID".
+    if grep -qF 'No free PID' "$LOG"; then
+        fail "PID pool exhausted: kernel logged \"No free PID\" (zombie/PID leak -- reap not recycling slots)"
+        return 1
+    fi
+    if grep -qF 'REAPLOOP: PASS' "$LOG"; then
+        pass "PID recycling verified (reaploop: 300 fork+reap cycles > 256-slot table, no exhaustion)"
+        return 0
+    fi
+    fail "reaploop did not report PASS (REAPLOOP: PASS missing)"
+    return 1
+}
+
+check_pagingalias() {
+    # #20 direct-map coherence gate. paging_init proves the higher-half direct map
+    # (PML4[256]) is STRUCTURALLY INDEPENDENT of the splittable low identity (its
+    # PDPT is a different physical page), so no identity split can perturb it.
+    # Emits "PAGINGALIAS PASS" on every boot (default + SMP).
+    if grep -qF 'PAGINGALIAS PASS' "$LOG"; then
+        pass "Direct-map coherence (PAGINGALIAS): direct map independent of the identity"
+        return 0
+    fi
+    fail "PAGINGALIAS PASS missing — direct-map coherence self-test failed/absent"
+    return 1
+}
+
+check_rqlock() {
+    # F3-1 per-CPU rq_lock topology gate. scheduler_init proves AT REST that every
+    # online cpu's rq_lock is initialized, ready_count == the bounded runqueue walk,
+    # no task is on >1 cpu's runqueue, and every SECONDARY cpu's runqueue is empty
+    # (the offload-only policy). Emits "RQLOCK: PASS" on every boot (default + SMP).
+    # Also require ZERO [SCHED_INVARIANT] lines (the F3-0 guard must not trip under
+    # the per-cpu locks).
+    if grep -qF '[SCHED_INVARIANT]' "$LOG"; then
+        fail "Scheduler invariant violated ([SCHED_INVARIANT] present) — per-cpu rq_lock split tripped a guard"
+        return 1
+    fi
+    if grep -qF 'RQLOCK: PASS' "$LOG"; then
+        pass "Per-CPU rq_lock topology (RQLOCK): init + ready_count==walk + no cross-cpu dup + secondary rq empty"
+        return 0
+    fi
+    fail "RQLOCK: PASS missing — per-cpu rq_lock topology self-test failed/absent"
+    return 1
+}
+
+check_affinity() {
+    # F3-2 CPU affinity model gate. scheduler_affinity_selftest() proves at boot that
+    # the affinity predicate is correct and every ctor default fired (no task carries a
+    # zero allowed_cpus mask -- the memset-trap closure), and the runtime validators
+    # (covered by check_rqlock's [SCHED_INVARIANT] gate) catch any queued task whose
+    # cpu is outside its mask or that is pinned to the wrong cpu. Emits "AFFINITY: PASS".
+    if grep -qF 'AFFINITY: PASS' "$LOG"; then
+        pass "CPU affinity model (AFFINITY): predicate sound + ctor defaults fired + no off-affinity task"
+        return 0
+    fi
+    fail "AFFINITY: PASS missing — affinity self-test failed/absent"
+    return 1
+}
+
 # ── Run all checks, tally results ──────────────────────────────────────────
 run_checks() {
     header "Boot invariant checks"
@@ -785,9 +882,14 @@ run_checks() {
         check_no_page_fault
         check_no_segment_too_large
         check_no_crash_loop
+        check_no_pid_exhaustion
+        check_pagingalias
+        check_rqlock
+        check_affinity
         check_fork_cow
         check_thread
         check_matmuljobs
+        check_smpstress
         check_heap_extend
         check_aibroker
         check_tools

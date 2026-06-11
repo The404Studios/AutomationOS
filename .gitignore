@@ -58,7 +58,9 @@ keys/
 *.pfx
 
 # Session / agent status artifacts (not part of the project source)
-AGENT*.md
+# Anchored to repo root so it only ignores top-level AGENT scratch docs, NOT
+# nested records like docs/dev-memory/bricks/AGENT-RPC-0.md.
+/AGENT*.md
 *_REPORT.md
 *_SUMMARY.md
 *_DELIVER*.md

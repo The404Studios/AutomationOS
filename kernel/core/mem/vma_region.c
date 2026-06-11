@@ -15,6 +15,7 @@
 
 #include "../../include/vma.h"
 #include "../../include/sched.h"
+#include "../../include/x86_64.h"   // read_cr3() — live page-table base for demand faults
 #include "../../include/mem.h"
 #include "../../include/kernel.h"
 #include "../../include/string.h"
@@ -72,6 +73,11 @@ int handle_page_fault(uint64_t fault_addr, uint64_t err_code) {
     if (!v) {
         return 0;   // no mapping covers this address -> genuine segfault
     }
+    // Guard pages are NEVER faulted in -- they exist solely to detect stack
+    // overflow (or other boundary violations). Any access is a fatal fault.
+    if (v->flags & VMA_FLAG_GUARD) {
+        return 0;   // guard page hit -> kill the process
+    }
     if (is_write && !(v->perm & VMA_W)) {
         return 0;   // write to a read-only region -> protection violation
     }
@@ -87,18 +93,21 @@ int handle_page_fault(uint64_t fault_addr, uint64_t err_code) {
     uint64_t page_base  = fault_addr & ~0xFFFULL;
     uint64_t region_off = page_base - v->vaddr;
 
-    // Populate the frame via its identity-mapped physical address.
+    // Populate the frame via the DIRECT MAP. This runs in the page-fault handler
+    // under the FAULTING process's CR3, whose low identity map may not cover a high
+    // `frame` (phys==virt bug family); PHYS_TO_DIRECT() is mapped on any CR3.
+    uint8_t* fdst = (uint8_t*)PHYS_TO_DIRECT(frame);
     if (v->backing == VMA_FILE && v->file_ptr) {
         uint64_t avail    = (region_off < v->file_sz) ? (v->file_sz - region_off) : 0;
         uint64_t copy_len = (avail < PAGE_SIZE) ? avail : PAGE_SIZE;
         if (copy_len) {
-            memcpy(frame, (const uint8_t*)v->file_ptr + v->file_off + region_off, copy_len);
+            memcpy(fdst, (const uint8_t*)v->file_ptr + v->file_off + region_off, copy_len);
         }
         if (copy_len < PAGE_SIZE) {
-            memset((uint8_t*)frame + copy_len, 0, PAGE_SIZE - copy_len);
+            memset(fdst + copy_len, 0, PAGE_SIZE - copy_len);
         }
     } else {
-        memset(frame, 0, PAGE_SIZE);   // anonymous demand-zero
+        memset(fdst, 0, PAGE_SIZE);   // anonymous demand-zero
     }
 
     // Mirror exec.c's W^X policy when faulting a page in on demand so the
@@ -113,8 +122,15 @@ int handle_page_fault(uint64_t fault_addr, uint64_t err_code) {
         flags |= PAGE_NX;
     }
 
-    // Map into the faulting process's address space (its CR3 is live on the CPU).
-    paging_set_target(cur->context.cr3);
+    // Map into the faulting process's address space. The faulting process is the
+    // one CURRENTLY RUNNING on this CPU, so the LIVE CR3 (read_cr3()) is the
+    // authoritative page-table base — use it rather than cur->context.cr3, which
+    // is only guaranteed valid at context-switch time and can be stale/clobbered
+    // mid-syscall (observed: aibroker's context.cr3 held a kernel-heap pointer at
+    // its first deep lazy-stack demand fault, making paging_set_target() compute a
+    // non-canonical active_pml4 -> #GP in paging_map_page). The live CR3 is always
+    // this address space while we are inside its page-fault handler.
+    paging_set_target(read_cr3());
     vmm_map_page((void*)page_base, frame, flags);   // issues invlpg internally
     paging_reset_target();
 

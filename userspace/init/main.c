@@ -12,6 +12,15 @@ typedef unsigned long size_t;
 #define SYS_SPAWN   16
 #define SYS_WAITPID 6
 #define SYS_YIELD   15
+#define SYS_SHMGET  18
+#define SYS_SHMAT   19
+#define SYS_TIME    41
+
+#ifdef SELFHEAL
+/* SELFHEAL: init creates+owns the compositor heartbeat SHM page. selfheal.h is
+ * self-contained (primitive types only), so including it here is collision-free. */
+#include "../include/selfheal.h"
+#endif
 
 static inline long syscall(long n, long a1, long a2, long a3) {
     long ret;
@@ -79,6 +88,33 @@ void _start(void) {
         syscall(SYS_EXIT, 1, 0, 0);
     }
 
+#ifdef SELFHEAL
+    /* SELFHEAL: init (PID 1, immortal) CREATES + OWNS the compositor heartbeat
+     * segment, then zeroes the page (sys_shmget does NOT zero page contents), so
+     * the first compositor instance reads magic==0 and detects a fresh segment.
+     * init owning it is load-bearing: an owner's death implicitly IPC_RMIDs the
+     * segment (kernel/ipc/shm.c:955-988), tombstoning the key and breaking
+     * respawn-resume — see userspace/include/selfheal.h. init keeps it attached
+     * forever so the page can never be freed while the desktop is up. */
+    print("[INIT] SELFHEAL: creating compositor heartbeat segment...\n");
+    {
+        long hb_id = syscall(SYS_SHMGET, (long)SELFHEAL_SHM_KEY,
+                             (long)SELFHEAL_SHM_SIZE, 0x200 /*IPC_CREAT*/ | 0666);
+        if (hb_id < 0) {
+            print("[INIT] SELFHEAL: heartbeat shmget FAILED\n");
+        } else {
+            long hb_addr = syscall(SYS_SHMAT, hb_id, 0, 0);
+            if (hb_addr > 0) {
+                volatile unsigned char* p = (volatile unsigned char*)hb_addr;
+                for (unsigned i = 0; i < SELFHEAL_SHM_SIZE; i++) p[i] = 0;
+                print("[INIT] SELFHEAL: heartbeat segment ready\n");
+            } else {
+                print("[INIT] SELFHEAL: heartbeat shmat FAILED\n");
+            }
+        }
+    }
+#endif
+
     print("[INIT] Spawning compositor...\n");
     int compositor_pid = spawn("sbin/compositor");
     if (compositor_pid > 0) {
@@ -88,6 +124,25 @@ void _start(void) {
     } else {
         print("[INIT] ERROR: Failed to spawn compositor!\n");
     }
+
+    // Auto-DHCP: spawns in the background, sleeps 2s (NIC PHY negotiate),
+    // checks link, runs DHCP if up, applies lease, exits. Non-blocking --
+    // init does not wait for it. If no NIC or DHCP fails, exits silently.
+    print("[INIT] Spawning autodhcp...\n");
+    spawn("sbin/autodhcp");
+
+#ifdef SELFHEAL
+    /* SELFHEAL: the recovery supervisor. It polls the heartbeat and, on a freeze,
+     * fires the recovery overlay + kills the compositor (init respawns it below). */
+    print("[INIT] SELFHEAL: spawning cwatchdog...\n");
+    int cwatchdog_pid = spawn("sbin/cwatchdog");
+    if (cwatchdog_pid > 0) {
+        print("[INIT] cwatchdog started (PID "); print_num(cwatchdog_pid); print(")\n");
+    } else {
+        print("[INIT] ERROR: Failed to spawn cwatchdog!\n");
+    }
+#endif
+
     // M3: spawn a test client that creates a window over the SHM protocol.
     // (No settle delay: both processes are queued and the SysV inbox queue is
     // created with IPC_CREAT by whichever side calls msgget first.)
@@ -113,9 +168,27 @@ void _start(void) {
 
     // NOTE: the right-side dock IS the launcher now, so we no longer auto-open
     // the Applications grid window (it duplicated the dock + covered the desktop).
-    print("[INIT] Spawning date/clock...\n");
-    spawn("sbin/dateapp");
+    // DECLUTTER: dateapp ("Date & Time") is no longer auto-opened either -- it
+    // duplicated the panel clock + the Clock+ app and just added a boot window to
+    // the cascade. It remains launchable from the dock.
+    // spawn("sbin/dateapp");
 
+    // prioritytest's pid (referenced by the reaper loop). Declared here so it is
+    // visible in BOTH the full and DESKTOP_MINIMAL builds; -1 means "never spawned".
+    int prioritytest_pid = -1;
+
+    // ── DESKTOP_MINIMAL boot trim ───────────────────────────────────────────
+    // When built with -DDESKTOP_MINIMAL (the T410 desktop profile), init spawns
+    // ONLY the persistent desktop apps (compositor + terminal + filemanager +
+    // netman + browser + ide) and SKIPS the ~70 self-test programs below. Those
+    // tests are a dev smoke-suite, not part of the desktop: several (cryptotest,
+    // matbench, prioritytest) run long no-yield compute blocks that, on the slow
+    // cooperative T410, hold the CPU for seconds (the boot "lag"), and the rapid
+    // create/destroy churn of ~80 short-lived processes stresses the PCID/address-
+    // space teardown path. Trimming them gives a fast, smooth, low-churn boot and
+    // stops the SELFHEAL watchdog from false-tripping while the storm starves the
+    // compositor. The full self-test boot is still available by omitting the flag.
+#ifndef DESKTOP_MINIMAL
     // fork/CoW correctness probe: runs once, prints FORKTEST RESULT to serial,
     // exits. Verifies fork address-space isolation (eager copy today, CoW next).
     print("[INIT] Spawning forktest...\n");
@@ -132,6 +205,38 @@ void _start(void) {
     // (prints ARGVTEST: PASS with argv[0] = its spawn path).
     print("[INIT] Spawning argvtest...\n");
     spawn_args("sbin/argvtest", "hello world");
+
+    // CHANNEL-0 P5b: userspace CH_MSG send/recv round-trip. The parent creates a
+    // CH_MSG channel, proves EAGAIN+EMSGSIZE, self-spawns a bound child, and
+    // exchanges a framed packet both ways. Prints MSGTEST: PASS to serial.
+    print("[INIT] Spawning msgtest...\n");
+    spawn("sbin/msgtest");
+
+    // AGENT-RPC-0 P6a: encode/decode/validate the TOOL_RUN/TOOL_RESULT wire
+    // schema (no channels, no dispatch). Prints RPCTEST: PASS to serial.
+    print("[INIT] Spawning rpctest...\n");
+    spawn("sbin/rpctest");
+
+    // AGENT-RPC-0 P6b: path-only TOOL_RUN runner. agent -> runner -> /bin/free
+    // (stdout bound to a byte channel) -> TOOL_RESULT. Prints TOOLRUN/RUNNER PASS.
+    print("[INIT] Spawning toolrun...\n");
+    spawn("sbin/toolrun");
+
+    // AGENT-HOST-0: the first agent riding the AGENT-RPC-0 rail -- issue TOOL_RUN,
+    // read the tool's exact stdout via the capability, render a structured verdict,
+    // reject a malformed call. Prints AGENTHOST: PASS.
+    print("[INIT] Spawning agenthost...\n");
+    spawn("sbin/agenthost");
+
+    // TOOLSET-0: the safe whitelisted tool surface (read_file/list_dir/stat/run)
+    // with a host-side path policy. Prints TOOLSET: PASS.
+    print("[INIT] Spawning toolset_host...\n");
+    spawn("sbin/toolset_host");
+
+    // CHAINLAYER-HOST-0: model-in-the-loop -- a (stub) model chooses a tool as
+    // JSON, the host validates + runs it, the model answers. Prints CHAINHOST: PASS.
+    print("[INIT] Spawning chainhost...\n");
+    spawn("sbin/chainhost");
 
     // ring-3 float/SSE probe: proves SSE is enabled + context-switched for user
     // tasks (scalar float, a 2x2 float matmul, a reduction). Prints FLOATTEST: PASS.
@@ -200,6 +305,28 @@ void _start(void) {
     print("[INIT] Spawning sockettest...\n");
     spawn("sbin/sockettest");
 
+    // MODEL-BRIDGE-0: the model seam fed by an EXTERNAL endpoint (10.0.2.2:8431).
+    // Bounded probes: SKIPs cleanly when networking or the endpoint is absent;
+    // with the host-side model stub up it prints MODELBRIDGE: PASS.
+    print("[INIT] Spawning modelbridge...\n");
+    spawn("sbin/modelbridge");
+
+    // cpu1offload: userspace -> CPU1 matmul offload probe. On the SMP kernel it
+    // offloads an int matmul to CPU1 (the trusted coprocessor) via SYS_CPU1_OFFLOAD
+    // and prints "CPU1OFFLOAD: PASS ... by_apic=1"; on the DEFAULT (single-core)
+    // kernel the syscall is unregistered, so it prints "CPU1OFFLOAD: SKIP" and
+    // exits cleanly -- harmless in the default boot.
+    print("[INIT] Spawning cpu1offload...\n");
+    spawn("sbin/cpu1offload");
+
+    // smpstress: the 2-CPU dispatch STRESS harness. Drives the CPU1 coprocessor
+    // mailbox thousands of times and verifies every result -- the proving ground the
+    // SMP scaling work is validated against BEFORE any per-CPU scheduler change. On
+    // the SMP kernel: "SMPSTRESS: PASS jobs=...". On the DEFAULT kernel SYS_CPU1_OFFLOAD
+    // is unregistered, so it prints "SMPSTRESS: SKIP single CPU" and exits cleanly.
+    print("[INIT] Spawning smpstress...\n");
+    spawn("sbin/smpstress");
+
     // wget self-test (URL parse + dotted-quad DNS, no network -> exits).
     spawn("bin/wget");
 
@@ -238,12 +365,17 @@ void _start(void) {
     spawn("bin/basename"); spawn("bin/dirname");
     spawn("bin/uname"); spawn("bin/hostname"); spawn("bin/whoami"); spawn("bin/date");
     spawn("bin/less");  spawn("bin/hexdump");
+    spawn("bin/lspci");
+
+#endif  // !DESKTOP_MINIMAL (self-test storm, part A)
 
     // Network manager + web browser GUIs (open windows; user-facing net apps).
+    // PERSISTENT desktop apps -- spawned in BOTH the full and minimal builds.
     print("[INIT] Spawning netman + browser...\n");
     spawn("sbin/netman");
     spawn("sbin/browser");
 
+#ifndef DESKTOP_MINIMAL
     // Browser wave (22-agent): per-layer selftests + the new DOM-rendering
     // browser2. Each app prints "<NAME>: PASS" or "<NAME>: FAIL <which>" and
     // exits, so smoke can gate the entire web pipeline.
@@ -254,6 +386,19 @@ void _start(void) {
     spawn("sbin/layouttest");
     spawn("sbin/webtest");
     spawn("sbin/browser2");
+    // BROWSER2-IMG-0: a second bounded browser2 run on the built-in
+    // about:imgtest page (local PNG/GIF/BMP fixtures + a missing source +
+    // a wider-than-viewport image). Prints "BROWSER2-IMG: PASS png=1 gif=1
+    // bmp=1 missing_safe=1 bounded=1" after its first paint and exits.
+    spawn_args("sbin/browser2", "about:imgtest");
+
+    // INITRD-ALIAS-0: the big-image (16 MiB pad, spans VA 16 MiB) + mmap-heavy
+    // reader; reads an initrd-backed file on its own shadow-prone CR3,
+    // byte-compares against the embedded fixture, spawns the tiny pristine
+    // control (sbin/initrdp), and prints "INITRD-ALIAS: PASS pristine_read=1
+    // mmapheavy_read=1 same_bytes=1 zero_bug_gone=1".
+    print("[INIT] Spawning initrdalias...\n");
+    spawn("sbin/initrdalias");
     // webapitest: pure JS web-API selftest (timers/fetch/storage/console/url);
     // prints "WEBAPITEST: PASS" and exits.
     spawn("sbin/webapitest");
@@ -276,7 +421,12 @@ void _start(void) {
     // boot-time spawn storm has drained) so the two burners get a clean window
     // rather than fighting dozens of still-spawning boot apps for the CPU.
     print("[INIT] Spawning prioritytest...\n");
-    spawn("sbin/prioritytest");
+    // Capture prioritytest's pid: the PID-recycling proof (reaploop) is launched
+    // only AFTER prioritytest is reaped (in the loop below), so reaploop's fork load
+    // never perturbs the timing-sensitive sleeptest/prioritytest measurements. By
+    // the time prioritytest (the last + slowest timing probe) exits, sleeptest has
+    // long since finished and the boot storm has drained -- a clean, settled system.
+    prioritytest_pid = spawn("sbin/prioritytest");
 
 #ifdef PREEMPT_STRESS
     // ========================================================================
@@ -305,8 +455,45 @@ void _start(void) {
     spawn("sbin/floattest");
     print("[INIT] PREEMPT_STRESS: 6 burners + 3 floattest spawned.\n");
 #endif
+#endif  // !DESKTOP_MINIMAL (self-test storm, part B)
 
     print("[INIT] All services started!\n");
+
+#ifdef GAMETEST_RUN
+    /* Empirical "every app actually runs" harness: spawns each game + key app,
+     * lets it run its init+render loop ~2s, checks it survives, prints
+     * GAMETEST: <name> PASS/FAIL + a final GAMETEST: PASS/FAIL. Only compiled
+     * when init is built with -DGAMETEST_RUN (GAMETEST=1); the normal boot is
+     * unaffected. */
+    print("[INIT] GAMETEST: spawning game/app survival harness...\n");
+    spawn("sbin/gametest");
+#endif
+
+#ifdef IDE_AUTOSTART
+    /* IDE=1 build: open the Semantic LEGO Map IDE last so it lands on TOP of the
+     * default desktop apps (for IDE iteration + screenshots). Normal boot leaves
+     * the IDE launchable from the dock/start-menu instead. */
+    print("[INIT] IDE_AUTOSTART: opening sbin/ide...\n");
+    spawn("sbin/ide");
+#endif
+
+    // PID-recycling proof (#9) is launched from the reaper loop below, exactly once,
+    // when prioritytest is reaped -- by then the boot self-test storm has drained
+    // and the timing-sensitive probes have finished, so reaploop runs on a settled
+    // system (clean PID reuse) without perturbing any measurement.
+    int reaploop_spawned = 0;
+
+    // Compositor restart rate limiter: if the compositor dies 5 times within 30
+    // seconds, stop respawning it (crash loop — something is fundamentally broken;
+    // infinite respawn would just burn PIDs and CPU). Uses SYS_TIME (seconds since
+    // epoch) to track the last 5 death timestamps in a ring.
+    #define COMP_DEATH_LIMIT  5
+    #define COMP_DEATH_WINDOW 30   /* seconds */
+    long comp_death_times[COMP_DEATH_LIMIT];
+    int  comp_death_idx = 0;
+    int  comp_death_count = 0;
+    int  comp_rate_limited = 0;
+    for (int i = 0; i < COMP_DEATH_LIMIT; i++) comp_death_times[i] = 0;
 
     while (1) {
         int status;
@@ -318,10 +505,66 @@ void _start(void) {
             print_num(status);
             print("\n");
 
-            if (pid == compositor_pid) {
-                print("[INIT] Restarting compositor...\n");
-                compositor_pid = spawn("sbin/compositor");
+            // Launch the PID-recycling proof exactly once, when prioritytest (the
+            // last + slowest timing-sensitive boot probe) is reaped. By now the boot
+            // storm has drained and the timing probes have finished, so reaploop
+            // gets a free pool + clean PID reuse and cannot perturb sleeptest/
+            // prioritytest (already done). (#9 zombie/PID-leak proof.)
+            if (pid == prioritytest_pid && !reaploop_spawned) {
+                reaploop_spawned = 1;
+                print("[INIT] Spawning reaploop (PID-recycling proof)...\n");
+                spawn("sbin/reaploop");
             }
+
+            if (pid == compositor_pid) {
+                if (comp_rate_limited) {
+                    print("[INIT] Compositor died again but rate-limited -- NOT restarting\n");
+                } else {
+                    long now = syscall(SYS_TIME, 0, 0, 0);
+                    // Record this death in the ring buffer
+                    comp_death_times[comp_death_idx] = now;
+                    comp_death_idx = (comp_death_idx + 1) % COMP_DEATH_LIMIT;
+                    if (comp_death_count < COMP_DEATH_LIMIT)
+                        comp_death_count++;
+
+                    // Check rate: if we have COMP_DEATH_LIMIT deaths and the
+                    // oldest one in the ring is within COMP_DEATH_WINDOW seconds
+                    // of now, we are crash-looping.
+                    if (comp_death_count >= COMP_DEATH_LIMIT) {
+                        long oldest = comp_death_times[comp_death_idx % COMP_DEATH_LIMIT];
+                        if (now - oldest < COMP_DEATH_WINDOW) {
+                            print("[INIT] Compositor crashed ");
+                            print_num(COMP_DEATH_LIMIT);
+                            print(" times in ");
+                            print_num(COMP_DEATH_WINDOW);
+                            print("s -- HALTING respawn\n");
+                            comp_rate_limited = 1;
+                        }
+                    }
+
+                    if (!comp_rate_limited) {
+                        print("[INIT] Restarting compositor...\n");
+                        compositor_pid = spawn("sbin/compositor");
+                    }
+                }
+            }
+
+#ifdef SELFHEAL
+            if (pid == cwatchdog_pid) {
+                print("[INIT] Restarting cwatchdog...\n");
+                cwatchdog_pid = spawn("sbin/cwatchdog");
+            }
+#endif
+
+            // Yield after each reap so a process woken DURING init's reap burst
+            // (e.g. a sleeper hitting its deadline) is dispatched promptly. The #9
+            // fix makes each reap do REAL teardown (CR3 destroy, free stack/pages) --
+            // previously a no-op (the total leak), so reaps were ~instant. Without
+            // this yield the cooperative reaper monopolizes the CPU through the
+            // ~80-zombie boot drain and inflates other processes' wakeup-dispatch
+            // latency (observed: a 50 ms sleep measured ~480 ms). Spreading the
+            // teardown keeps the desktop + timing-sensitive probes responsive.
+            yield();
         } else {
             yield();
         }

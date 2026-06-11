@@ -187,6 +187,18 @@ static int weekday_of(int year, int month, int day)
 #define COL_CELL_HOV 0xFF1A2E44u   /* subtle hover highlight (unused) */
 
 /* -----------------------------------------------------------------------
+ * Runtime clip bounds.
+ *
+ * The calendar canvas geometry is fixed at WIN_W x WIN_H, but the window may
+ * be resized (Maximize / snap) larger OR smaller. These hold the current
+ * clamp limits = min(canvas, current win->w/h) so every pixel write stays in
+ * bounds of the live buffer even when the window shrinks below the canvas.
+ * Refreshed on create and on every WL_EVENT_RESIZE.
+ * --------------------------------------------------------------------- */
+static i32 g_clip_w = WIN_W;
+static i32 g_clip_h = WIN_H;
+
+/* -----------------------------------------------------------------------
  * Drawing primitives.
  * --------------------------------------------------------------------- */
 
@@ -195,8 +207,8 @@ static void fill_rect(u32 *buf, u32 stride_px,
 {
     i32 x0 = x < 0 ? 0 : x;
     i32 y0 = y < 0 ? 0 : y;
-    i32 x1 = x + w; if (x1 > WIN_W) x1 = WIN_W;
-    i32 y1 = y + h; if (y1 > WIN_H) y1 = WIN_H;
+    i32 x1 = x + w; if (x1 > g_clip_w) x1 = g_clip_w;
+    i32 y1 = y + h; if (y1 > g_clip_h) y1 = g_clip_h;
     if (x0 >= x1 || y0 >= y1) return;
     for (i32 yy = y0; yy < y1; yy++) {
         u32 *row = buf + (u32)yy * stride_px;
@@ -205,11 +217,25 @@ static void fill_rect(u32 *buf, u32 stride_px,
     }
 }
 
+/*
+ * Clear the ENTIRE live window surface to the background colour, bounded to
+ * the CURRENT win->w/win->h using the CURRENT stride. Used after a resize so
+ * the letterbox margins around the fixed canvas hold no stale garbage.
+ */
+static void clear_full_surface(u32 *buf, u32 stride_px, i32 win_w, i32 win_h, u32 col)
+{
+    for (i32 yy = 0; yy < win_h; yy++) {
+        u32 *row = buf + (u32)yy * stride_px;
+        for (i32 xx = 0; xx < win_w; xx++)
+            row[xx] = col;
+    }
+}
+
 static void draw_string_centered(u32 *buf, u32 stride_px,
                                  i32 cx, i32 y, const char *s, u32 col)
 {
     int tw = font_text_width(s);
-    font_draw_string(buf, (int)stride_px, WIN_W, WIN_H,
+    font_draw_string(buf, (int)stride_px, g_clip_w, g_clip_h,
                      cx - tw / 2, y, s, col);
 }
 
@@ -221,7 +247,7 @@ static void draw_left_arrow(u32 *buf, u32 stride_px, i32 cx, i32 cy,
         i32 half = sz - (dy < 0 ? -dy : dy);
         for (i32 dx = -half; dx <= 0; dx++) {
             i32 px = cx + dx, py = cy + dy;
-            if (px >= 0 && px < WIN_W && py >= 0 && py < WIN_H)
+            if (px >= 0 && px < g_clip_w && py >= 0 && py < g_clip_h)
                 buf[(u32)py * stride_px + (u32)px] = col;
         }
     }
@@ -235,7 +261,7 @@ static void draw_right_arrow(u32 *buf, u32 stride_px, i32 cx, i32 cy,
         i32 half = sz - (dy < 0 ? -dy : dy);
         for (i32 dx = 0; dx <= half; dx++) {
             i32 px = cx + dx, py = cy + dy;
-            if (px >= 0 && px < WIN_W && py >= 0 && py < WIN_H)
+            if (px >= 0 && px < g_clip_w && py >= 0 && py < g_clip_h)
                 buf[(u32)py * stride_px + (u32)px] = col;
         }
     }
@@ -342,7 +368,7 @@ static void render(u32 *buf, u32 stride_px,
         i32 ty = cy + (CELL_H - FONT_H) / 2;
 
         u32 text_col = is_today ? COL_TODAY_T : COL_TEXT;
-        font_draw_string(buf, (int)stride_px, WIN_W, WIN_H,
+        font_draw_string(buf, (int)stride_px, g_clip_w, g_clip_h,
                          tx, ty, nbuf, text_col);
     }
 }
@@ -400,13 +426,18 @@ void _start(void)
 
     u32 stride_px = win->stride / 4u;
 
+    /* Clip bounds = min(fixed canvas, current window). Refreshed on resize. */
+    g_clip_w = (i32)win->w < WIN_W ? (i32)win->w : WIN_W;
+    g_clip_h = (i32)win->h < WIN_H ? (i32)win->h : WIN_H;
+
     /* ---- Displayed month (start at today) ---- */
     int view_year  = today_year;
     int view_month = today_month;
 
     /* If fallback was used the year/month above are the fallback values. */
 
-    int dirty = 1;   /* force initial draw */
+    int dirty    = 1;   /* force initial draw */
+    int margins  = 1;   /* clear full surface (letterbox) before next render  */
 
     /* ---- Event loop ---- */
     for (;;) {
@@ -445,10 +476,29 @@ void _start(void)
                         dirty = 1;
                     }
                 }
+            } else if (kind == WL_EVENT_RESIZE) {
+                /*
+                 * The library has ALREADY reallocated the buffer and updated
+                 * win->{w,h,stride,pixels}. Refresh cached stride and clip
+                 * bounds; clear the full new surface so the letterbox margins
+                 * around the fixed canvas are not stale, then redraw.
+                 */
+                stride_px = win->stride / 4u;
+                g_clip_w  = (i32)win->w < WIN_W ? (i32)win->w : WIN_W;
+                g_clip_h  = (i32)win->h < WIN_H ? (i32)win->h : WIN_H;
+                margins   = 1;
+                dirty     = 1;
             }
         }
 
         if (dirty) {
+            /* Letterbox: clear the whole live surface first so margins beyond
+             * the fixed canvas (when the window is larger) stay clean. */
+            if (margins) {
+                clear_full_surface(win->pixels, stride_px,
+                                   (i32)win->w, (i32)win->h, COL_BG);
+                margins = 0;
+            }
             render(win->pixels, stride_px,
                    view_year, view_month,
                    today_year, today_month, today_day);

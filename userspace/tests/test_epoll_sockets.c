@@ -18,15 +18,15 @@
 #include "../libc/syscall.h"
 #include "../lib/epoll.h"
 
-/* Socket syscalls */
-#define SYS_SOCKET      63
-#define SYS_CONNECT     64
-#define SYS_SEND        65
-#define SYS_RECV        66
-#define SYS_CLOSE_SK    67
-#define SYS_SENDTO      68
-#define SYS_RECVFROM    69
-#define SYS_SOCK_POLL   70
+/* Socket syscalls (must match kernel/include/syscall.h) */
+#define SYS_SOCKET      51
+#define SYS_CONNECT     52
+#define SYS_SEND        53
+#define SYS_RECV        54
+#define SYS_CLOSE_SK    55
+#define SYS_SENDTO      56
+#define SYS_RECVFROM    57
+#define SYS_SOCK_POLL   58
 
 /* Socket types and flags */
 #define SOCK_STREAM     1  // TCP
@@ -59,32 +59,64 @@ static inline int64_t _syscall6(uint64_t num, uint64_t a1, uint64_t a2, uint64_t
     return ret;
 }
 
+/*
+ * Wrappers match this kernel's ABI (NOT BSD):
+ *   SYS_SOCKET(type)                     -> fd
+ *   SYS_CONNECT(fd, ip_host, port_host)  -> 0/neg
+ *   SYS_SEND(fd, buf, len)               -> bytes
+ *   SYS_RECV(fd, buf, len)               -> bytes
+ *   SYS_SENDTO(fd, buf, len, ip, port)   -> bytes
+ *   SYS_RECVFROM(fd, buf, len, &addr)    -> bytes  (addr = sock_addr_t*)
+ *   SYS_SOCK_POLL()                      -> frames
+ */
+
+/* sock_addr_t mirrors kernel/include/socket.h */
+typedef struct { uint32_t ip; uint16_t port; uint16_t _pad; } sock_addr_t;
+
 static int socket_create(int domain, int type, int protocol) {
-    return (int)_syscall3(SYS_SOCKET, domain, type, protocol);
+    (void)domain; (void)protocol;  /* kernel only uses type */
+    return (int)_syscall3(SYS_SOCKET, type, 0, 0);
 }
 
 static int socket_connect(int sockfd, struct sockaddr_in* addr, int addrlen) {
-    return (int)_syscall3(SYS_CONNECT, sockfd, (uint64_t)addr, addrlen);
+    (void)addrlen;
+    /* Extract ip (network->host) and port (network->host) from sockaddr_in */
+    uint32_t ip_host = __builtin_bswap32(addr->sin_addr);
+    uint16_t port_host = __builtin_bswap16(addr->sin_port);
+    return (int)_syscall3(SYS_CONNECT, sockfd, ip_host, port_host);
 }
 
 static int socket_send(int sockfd, void* buf, size_t len, int flags) {
+    (void)flags;
     return (int)_syscall3(SYS_SEND, sockfd, (uint64_t)buf, len);
 }
 
 static int socket_recv(int sockfd, void* buf, size_t len, int flags) {
+    (void)flags;
     return (int)_syscall3(SYS_RECV, sockfd, (uint64_t)buf, len);
 }
 
 static int socket_sendto(int sockfd, void* buf, size_t len, int flags,
                         struct sockaddr_in* dest, int addrlen) {
-    return (int)_syscall6(SYS_SENDTO, sockfd, (uint64_t)buf, len, flags,
-                         (uint64_t)dest, addrlen);
+    (void)flags; (void)addrlen;
+    uint32_t ip_host = __builtin_bswap32(dest->sin_addr);
+    uint16_t port_host = __builtin_bswap16(dest->sin_port);
+    return (int)_syscall6(SYS_SENDTO, sockfd, (uint64_t)buf, len,
+                         ip_host, port_host, 0);
 }
 
 static int socket_recvfrom(int sockfd, void* buf, size_t len, int flags,
                           struct sockaddr_in* src, int* addrlen) {
-    return (int)_syscall6(SYS_RECVFROM, sockfd, (uint64_t)buf, len, flags,
-                         (uint64_t)src, (uint64_t)addrlen);
+    (void)flags;
+    sock_addr_t out = {0, 0, 0};
+    int r = (int)_syscall6(SYS_RECVFROM, sockfd, (uint64_t)buf, len,
+                          (uint64_t)(src ? &out : 0), 0, 0);
+    if (r > 0 && src) {
+        src->sin_addr = __builtin_bswap32(out.ip);
+        src->sin_port = __builtin_bswap16(out.port);
+    }
+    if (addrlen) *addrlen = sizeof(struct sockaddr_in);
+    return r;
 }
 
 static int socket_poll(void) {
@@ -92,7 +124,7 @@ static int socket_poll(void) {
 }
 
 /* Timer syscalls */
-#define SYS_GET_TICKS_MS 46
+#define SYS_GET_TICKS_MS 40
 static uint64_t get_ticks_ms(void) {
     uint64_t ret;
     asm volatile("syscall" : "=a"(ret) : "a"(SYS_GET_TICKS_MS) : "rcx", "r11", "memory");

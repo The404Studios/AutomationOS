@@ -18,6 +18,85 @@ int errno = 0;
 /* Maximum memory dump lines around fault address */
 #define MEMORY_DUMP_LINES 4
 
+/* Page fault error code flags */
+#define PF_PRESENT   (1 << 0)  /* Page was present (protection violation) */
+#define PF_WRITE     (1 << 1)  /* Write access */
+#define PF_USER      (1 << 2)  /* User-mode access */
+#define PF_RESERVED  (1 << 3)  /* Reserved bit violation */
+#define PF_INSTR     (1 << 4)  /* Instruction fetch */
+
+/*
+ * Decode and display exception details
+ * Analyzes CR2 (fault address) and error code to provide human-readable
+ * diagnostic information about the fault type and cause
+ *
+ * This function provides enhanced diagnostics for page faults by decoding
+ * the error code bits and providing actionable diagnostic information.
+ */
+void decode_exception(uint64_t cr2, uint64_t error_code) {
+    kprintf("Exception decoder analysis:\n");
+
+    /* Analyze fault address */
+    if (cr2 == 0 || cr2 < 0x1000) {
+        kprintf("  \033[1;31m[CRITICAL]\033[0m Null pointer dereference at 0x%016llx\n", cr2);
+    } else if (cr2 >= 0xFFFF800000000000ULL) {
+        kprintf("  Fault address: 0x%016llx (kernel space)\n", cr2);
+    } else {
+        kprintf("  Fault address: 0x%016llx (user space)\n", cr2);
+    }
+
+    /* Decode error code bits */
+    kprintf("  Error code: 0x%llx [", error_code);
+
+    if (error_code & PF_PRESENT) {
+        kprintf("PROTECTION-VIOLATION ");
+    } else {
+        kprintf("NOT-PRESENT ");
+    }
+
+    if (error_code & PF_WRITE) {
+        kprintf("WRITE ");
+    } else {
+        kprintf("READ ");
+    }
+
+    if (error_code & PF_USER) {
+        kprintf("USER-MODE ");
+    } else {
+        kprintf("SUPERVISOR ");
+    }
+
+    if (error_code & PF_RESERVED) {
+        kprintf("RESERVED-BIT ");
+    }
+
+    if (error_code & PF_INSTR) {
+        kprintf("INSTRUCTION-FETCH ");
+    }
+
+    kprintf("]\n");
+
+    /* Provide specific diagnostic messages */
+    if (!(error_code & PF_PRESENT)) {
+        kprintf("  \033[1;33m[DIAGNOSIS]\033[0m Page not present in page table\n");
+        kprintf("              Possible causes: unmapped memory, demand paging needed, or use-after-free\n");
+    } else if (error_code & PF_WRITE) {
+        kprintf("  \033[1;33m[DIAGNOSIS]\033[0m Write to read-only page at 0x%016llx\n", cr2);
+        kprintf("              Possible causes: const/rodata modification, COW fault, or protection error\n");
+    } else if (error_code & PF_INSTR) {
+        kprintf("  \033[1;33m[DIAGNOSIS]\033[0m Instruction fetch from NX (no-execute) page at 0x%016llx\n", cr2);
+        kprintf("              Possible causes: stack/heap execution, DEP violation, or JIT issue\n");
+    } else if (error_code & PF_USER) {
+        kprintf("  \033[1;33m[DIAGNOSIS]\033[0m User-mode access to supervisor page at 0x%016llx\n", cr2);
+        kprintf("              Possible causes: improper page table flags or privilege escalation attempt\n");
+    } else if (error_code & PF_RESERVED) {
+        kprintf("  \033[1;31m[CRITICAL]\033[0m Reserved bit set in page table entry\n");
+        kprintf("              This indicates page table corruption\n");
+    }
+
+    kprintf("\n");
+}
+
 /*
  * Print stack trace by walking frame pointers
  * Attempts to unwind the call stack for debugging
@@ -137,6 +216,30 @@ static void print_registers(void) {
  * Dump memory around a fault address
  * Shows hex dump of memory for debugging pointer/access violations
  */
+// Return 1 if `va` is mapped PRESENT in the current address space (so a read of it
+// won't page-fault), 0 otherwise. Walks the page tables by reading each structure page
+// through its physical address (the kernel page tables are identity-mapped in low
+// memory, so those reads are always safe) and NEVER dereferences `va` itself -- so the
+// probe can't fault on the very address we're deciding about. This is what stops the
+// crash dump from DOUBLE-FAULTING on the unmapped/bad fault address (which obscures the
+// real panic): print_memory_dump used to read kernel addresses unconditionally.
+static int panic_addr_mapped(uint64_t va) {
+    uint64_t cr3;
+    asm volatile("mov %%cr3, %0" : "=r"(cr3));
+    uint64_t* pml4 = (uint64_t*)(cr3 & 0x000FFFFFFFFFF000ULL);
+    if (!(pml4[(va >> 39) & 0x1FF] & 1)) return 0;
+    uint64_t* pdpt = (uint64_t*)(pml4[(va >> 39) & 0x1FF] & 0x000FFFFFFFFFF000ULL);
+    uint64_t e3 = pdpt[(va >> 30) & 0x1FF];
+    if (!(e3 & 1)) return 0;
+    if (e3 & (1ULL << 7)) return 1;                 // 1GB huge page, present
+    uint64_t* pd = (uint64_t*)(e3 & 0x000FFFFFFFFFF000ULL);
+    uint64_t e2 = pd[(va >> 21) & 0x1FF];
+    if (!(e2 & 1)) return 0;
+    if (e2 & (1ULL << 7)) return 1;                 // 2MB huge page, present
+    uint64_t* pt = (uint64_t*)(e2 & 0x000FFFFFFFFFF000ULL);
+    return (pt[(va >> 12) & 0x1FF] & 1) ? 1 : 0;
+}
+
 static void print_memory_dump(uint64_t addr) {
     kprintf("Memory dump around 0x%016llx:\n", addr);
 
@@ -151,20 +254,21 @@ static void print_memory_dump(uint64_t addr) {
 
         // Check if address is in kernel space (simple check)
         if (line_addr >= 0xFFFF800000000000ULL) {
-            // Attempt to read (may still fault on unmapped pages)
+            // Probe EACH byte's page before reading it: an unmapped/bad page (often the
+            // very fault address) must print "??" rather than fault the panic handler
+            // itself (which would double-fault and hide the real crash). 16 bytes can
+            // straddle a page boundary, so probe per byte.
             for (int j = 0; j < 16; j++) {
-                uint8_t byte = *(uint8_t*)(line_addr + j);
-                kprintf("%02x ", byte);
+                if (panic_addr_mapped(line_addr + j))
+                    kprintf("%02x ", *(uint8_t*)(line_addr + j));
+                else
+                    kprintf("?? ");
             }
             kprintf(" |");
-            // Print ASCII if printable
             for (int j = 0; j < 16; j++) {
+                if (!panic_addr_mapped(line_addr + j)) { kprintf("."); continue; }
                 uint8_t byte = *(uint8_t*)(line_addr + j);
-                if (byte >= 32 && byte < 127) {
-                    kprintf("%c", byte);
-                } else {
-                    kprintf(".");
-                }
+                kprintf("%c", (byte >= 32 && byte < 127) ? (char)byte : '.');
             }
             kprintf("|");
         } else {
@@ -183,10 +287,51 @@ static void print_memory_dump(uint64_t addr) {
 /*
  * Main kernel panic handler
  * Displays comprehensive diagnostic information and halts the system
+ *
+ * RE-ENTRANCY GUARD: a panic can itself fault (e.g. the register dump reads
+ * an unmapped stack address, or the filesystem sync touches a corrupted
+ * inode). Without a guard the faulting panic re-enters kernel_panic(), which
+ * re-faults, and the kernel either triple-faults (undebuggable reset) or
+ * overflows the stack silently. The static `panic_in_progress` flag (atomically
+ * CAS'd 0->1 by the first entrant) lets the FIRST panic run the full
+ * diagnostic path while any recursive re-entry skips straight to the halt
+ * loop. The flag is never cleared — the system is dead after a panic.
+ *
+ * SMP HALT: on multi-CPU configurations the panicking CPU sends IPI_STOP to
+ * all other CPUs before printing diagnostics, so no remote core continues
+ * executing kernel code with potentially corrupted state.
  */
+static volatile int panic_in_progress = 0;
+
 void kernel_panic(const char* message) {
     // Disable interrupts - we're in critical failure mode
     cli();
+
+    // Re-entrancy guard: if we are already panicking (e.g. the panic handler
+    // itself faulted), skip the diagnostic output and go straight to the halt
+    // loop. __atomic_exchange prevents two CPUs from both claiming first-entry.
+    if (__atomic_exchange_n(&panic_in_progress, 1, __ATOMIC_SEQ_CST) != 0) {
+        // Recursive / concurrent panic — just halt.
+        while (1) { cli(); hlt(); }
+    }
+
+#if defined(SMP_FOUNDATION) && defined(SMP_IPI)
+    // Halt all other CPUs so they stop executing while we dump state.
+    // ipi_stop_all_cpus sends IPI_STOP to every core except this one;
+    // the handler on the remote core enters a cli/hlt loop.
+    //
+    // SMP-R0 NOTE: gated on SMP_IPI (not just SMP_FOUNDATION) because the IPI
+    // subsystem (kernel/arch/x86_64/ipi*.c) is NOT in quick_build's compile
+    // list yet -- the bare SMP_FOUNDATION gate (added in c70ee87) made every
+    // SMP=1 build LINK-FAIL on this undefined symbol, unnoticed because SMP
+    // builds are rare. SMP-G0 (IPI-LINK) compiles ipi.c, defines SMP_IPI, and
+    // re-enables this. Until then a panicking BSP doesn't stop CPU1 -- the
+    // pre-c70ee87 behavior (CPU1 is a bounded coprocessor; acceptable).
+    {
+        extern void ipi_stop_all_cpus(void);
+        ipi_stop_all_cpus();
+    }
+#endif
 
     kprintf("\n\n");
     kprintf("\033[1;31m"); /* Red bold */
@@ -238,7 +383,8 @@ void kernel_panic(const char* message) {
     kprintf("════════════════════════════════════════════════════════════\n");
     kprintf("\033[0m");
 
-    // Halt all CPUs (TODO: send IPI to halt other CPUs in SMP)
+    // Halt this CPU. Other CPUs were already stopped via IPI_STOP above
+    // (when SMP_FOUNDATION is enabled); without SMP this is the only CPU.
     while (1) {
         cli();
         hlt();

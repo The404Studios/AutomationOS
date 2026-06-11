@@ -179,6 +179,10 @@ int  net_get_mac(uint8_t out[ETH_ALEN]);
 /* Local IPv4 address (host byte order). 0 until net_init(). */
 uint32_t net_get_ip(void);
 
+/* Update the legacy stack's IP / gateway (used by netif_sync_globals after DHCP). */
+void net_set_ip(uint32_t ip);
+void net_set_gateway(uint32_t gw);
+
 /*
  * Transmit a fully-built Ethernet frame on the wire (thin wrapper over the
  * NIC). Returns bytes sent, or negative on error.
@@ -238,31 +242,21 @@ void net_icmp_dest_unreach(uint8_t code, const uint8_t* orig_ip, uint16_t orig_l
 void net_icmp_time_exceeded(uint8_t code, const uint8_t* orig_ip, uint16_t orig_len);
 
 /* ------------------------------------------------------------------ */
-/* Proposed syscall surface (REPORTED to the integrator)               */
+/* Syscall surface (wired — see kernel/core/syscall/syscall.c)         */
 /* ------------------------------------------------------------------ */
 /*
- * The integrator should add to kernel/include/syscall.h:
- *     #define SYS_NET_SEND   41
- *     #define SYS_NET_RECV   42
- *     #define SYS_NET_INFO   43   (optional: fetch MAC + IP)
- * and dispatch them to the helpers in kernel/net/netsyscall.c:
- *     sys_net_send(buf, len)            -> int64_t bytes sent / -errno
- *     sys_net_recv(buf, len)            -> int64_t frame len / 0 / -errno
- *     sys_net_info(out_net_info_t)      -> 0 / -errno
- * (signatures match syscall_handler_t; they use copy_from_user/copy_to_user.)
+ * SYS_NET_SEND  = 68   sys_net_send(buf, len)              -> bytes / -errno
+ * SYS_NET_RECV  = 69   sys_net_recv(buf, len)              -> len / 0 / -errno
+ * SYS_NET_INFO  = 59   sys_net_info(&uapi_net_info_t)      -> 0 / -errno
+ * SYS_NET_CONFIG= 89   sys_net_config(&uapi_net_config_t)  -> 0 / -errno
+ * SYS_ROUTE_TABLE=90   sys_route_table(buf, max)           -> count / -errno
+ * SYS_ARP_TABLE = 91   sys_arp_table(buf, max)             -> count / -errno
+ *
+ * Payload structs live in uapi/net.h (canonical, _Static_assert-guarded).
+ * Legacy aliases (net_info_ext_t, route_info_t, arp_info_t) in netif.h.
  */
 
-/* Payload for SYS_NET_INFO (filled by the kernel, read by userspace). */
-typedef struct {
-    uint8_t  mac[ETH_ALEN];
-    uint8_t  _pad[2];
-    uint32_t ip;          /* host byte order */
-    uint32_t gateway;     /* host byte order */
-} net_info_t;
-
-/* Syscall helper prototypes (kernel/net/netsyscall.c). The integrator just
- * needs to add the SYS_NET_* numbers and route to these. They are self-
- * contained (no edits to shared glue required to compile this file). */
+/* Syscall handler prototypes (kernel/net/netsyscall.c). */
 int64_t sys_net_send(uint64_t buf, uint64_t len, uint64_t a3,
                      uint64_t a4, uint64_t a5, uint64_t a6);
 int64_t sys_net_recv(uint64_t buf, uint64_t len, uint64_t a3,

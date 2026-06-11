@@ -135,6 +135,18 @@ int procapi_ctl(uint32_t pid, uint32_t verb, uint64_t arg)
         return ESRCH;
     }
 
+    /* Authorization: a process may control another only with the same UID; root
+     * (uid 0) may control anyone. Mirrors the check in sys_kill (kill.c) -- this
+     * path applies the same suspend/resume/kill/reprioritize operations and must
+     * gate them the same way. Today everything runs as uid 0 so this allows all
+     * callers, but it closes the cross-owner control gap under a future MU model. */
+    {
+        process_t* caller = process_get_current();
+        if (caller && caller->uid != 0 && caller->uid != proc->uid) {
+            return EPERM;
+        }
+    }
+
     switch (verb) {
 
     case PROCAPI_CTL_SUSPEND:
@@ -146,6 +158,13 @@ int procapi_ctl(uint32_t pid, uint32_t verb, uint64_t arg)
         kprintf("[PROCAPI] Suspending PID %u (%s)\n", proc->pid, proc->name);
         if (proc->state == PROCESS_RUNNING || proc->state == PROCESS_READY) {
             proc->state = PROCESS_BLOCKED;
+            // Mirror kill.c SIGSTOP (FIX H4): also take the process OFF the ready
+            // queue. scheduler_pick_next only drains TERMINATED, not BLOCKED, so a
+            // suspended-but-still-queued process would otherwise be picked and
+            // resurrected to RUNNING (suspend wouldn't actually suspend). Removing the
+            // queue ref here also pairs with RESUME's scheduler_add_process below to
+            // keep refcount accounting balanced.
+            scheduler_remove_process(proc);
         }
         break;
 
@@ -156,7 +175,13 @@ int procapi_ctl(uint32_t pid, uint32_t verb, uint64_t arg)
          */
         kprintf("[PROCAPI] Resuming PID %u (%s)\n", proc->pid, proc->name);
         if (proc->state == PROCESS_BLOCKED) {
-            proc->state = PROCESS_READY;
+            process_set_ready(proc);
+            // Mirror kill.c SIGCONT (FIX H4): process_set_ready only flips the state
+            // BLOCKED->READY; without scheduler_add_process the process is READY but
+            // linked in NO run queue -- invisible to the scheduler (it never runs
+            // again). scheduler_add_process re-takes exactly one queue ref, balancing
+            // the ref dropped by SUSPEND's scheduler_remove_process above.
+            scheduler_add_process(proc);
         }
         break;
 
@@ -166,6 +191,17 @@ int procapi_ctl(uint32_t pid, uint32_t verb, uint64_t arg)
          * Identical logic to kill.c case SIGKILL.
          */
         kprintf("[PROCAPI] Killing PID %u (%s)\n", proc->pid, proc->name);
+        // Mirror the kill.c SIGKILL fix (#9): if the victim is BLOCKED on a
+        // wait_object, force-unlink it so its object-ref is dropped and it becomes a
+        // reapable zombie (otherwise an event-only waiter leaks). Snapshot wait_on
+        // BEFORE marking TERMINATED; abort is idempotent. proc is held by our
+        // get_by_pid ref for the duration, so the unref can't free it mid-handler.
+        {
+            struct wait_object* wo = proc->wait_on;
+            if (proc->state == PROCESS_BLOCKED && wo) {
+                wait_object_abort(wo, proc);
+            }
+        }
         proc->state = PROCESS_TERMINATED;
         proc->exit_status = 128 + 9;   // SIGKILL-equivalent
         process_on_terminate(proc);    // wake a waitpid'ing parent
@@ -226,11 +262,11 @@ int procapi_sysinfo(sysinfo_t* out)
         n = 0;
     }
 
-    out->total_mem  = pmm_get_total_memory();
-    out->free_mem   = pmm_get_free_memory();
-    out->uptime_ms  = timer_get_ticks_ms();
-    out->proc_count = (uint32_t)n;
-    out->_pad       = 0;
+    out->total_mem    = pmm_get_total_memory();
+    out->free_mem     = pmm_get_free_memory();
+    out->uptime_ms    = timer_get_ticks_ms();
+    out->proc_count   = (uint32_t)n;
+    out->heap_used_kb = (uint32_t)(heap_get_used_bytes() / 1024);
 
     return 0;
 }

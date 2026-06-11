@@ -10,6 +10,12 @@
 #include "../include/string.h"
 #include "../include/syscall.h"
 
+// cleanup helper: auto-kfree a heap path buffer on scope exit -- keeps the
+// 4096-byte path buffers in vfs_unlink/vfs_rename OFF the 8KB kernel stack
+// (vfs_rename had TWO = 8KB, overflowing on its own even after sys_rename was
+// heap-allocated). kfree(NULL) is safe.
+static inline void free_path_buf(char** p) { if (*p) kfree(*p); }
+
 // Directory handle structure
 typedef struct {
     vfs_inode_t* inode;
@@ -234,8 +240,11 @@ int vfs_unlink(const char* path) {
         return VFS_ERR_INVAL;
     }
 
-    // Find parent directory and filename
-    char parent_path[VFS_MAX_PATH];
+    // Find parent directory and filename (heap buffer, auto-freed)
+    char* parent_path __attribute__((cleanup(free_path_buf))) = (char*)kmalloc(VFS_MAX_PATH);
+    if (!parent_path) {
+        return VFS_ERR_INVAL;
+    }
     const char* filename;
 
     // Find last slash
@@ -326,8 +335,11 @@ int vfs_rename(const char* oldpath, const char* newpath) {
         return VFS_ERR_INVAL;
     }
 
-    // Parse old path
-    char old_parent_path[VFS_MAX_PATH];
+    // Parse old path (heap buffer, auto-freed)
+    char* old_parent_path __attribute__((cleanup(free_path_buf))) = (char*)kmalloc(VFS_MAX_PATH);
+    if (!old_parent_path) {
+        return VFS_ERR_INVAL;
+    }
     const char* old_filename;
     const char* old_last_slash = NULL;
 
@@ -356,8 +368,11 @@ int vfs_rename(const char* oldpath, const char* newpath) {
         return VFS_ERR_INVAL;
     }
 
-    // Parse new path
-    char new_parent_path[VFS_MAX_PATH];
+    // Parse new path (heap buffer, auto-freed)
+    char* new_parent_path __attribute__((cleanup(free_path_buf))) = (char*)kmalloc(VFS_MAX_PATH);
+    if (!new_parent_path) {
+        return VFS_ERR_INVAL;
+    }
     const char* new_filename;
     const char* new_last_slash = NULL;
 
@@ -435,11 +450,27 @@ int vfs_rename(const char* oldpath, const char* newpath) {
 
     vfs_dentry_t* dentry = old_entries[old_index];
 
+    // Self-rename (same directory, same name) is a no-op. Without this guard the
+    // destination-removal loop below matches THIS very dentry (same parent + same
+    // name), vfs_dentry_free()s it, and the name memcpy / re-insert further down
+    // is then a use-after-free + directory corruption.
+    if (old_parent == new_parent && strcmp(old_filename, new_filename) == 0) {
+        vfs_inode_put(old_parent);
+        vfs_inode_put(new_parent);
+        return 0;
+    }
+
     // Check if destination exists and remove it
     if (new_parent->private_data) {
         vfs_dentry_t** new_entries = (vfs_dentry_t**)new_parent->private_data;
         for (uint64_t i = 0; i < new_parent->data_capacity; i++) {
             if (new_entries[i] && strcmp(new_entries[i]->name, new_filename) == 0) {
+                // Never free the source dentry itself (defensive: e.g. case-folded
+                // collisions). The self-rename short-circuit above is the primary
+                // guard; this prevents any residual aliasing from freeing `dentry`.
+                if (new_entries[i] == dentry) {
+                    continue;
+                }
                 // Destination exists - remove it. vfs_dentry_free() drops the
                 // inode reference, so don't put it separately (double-free).
                 vfs_dentry_t* old_dentry = new_entries[i];

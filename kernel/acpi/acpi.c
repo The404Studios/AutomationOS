@@ -137,6 +137,9 @@ void* acpi_find_table(const char* signature) {
 
     // Use XSDT if available (64-bit), otherwise RSDT (32-bit)
     if (acpi_state.xsdt) {
+        // A malformed length < the header size would underflow the unsigned
+        // subtraction below into a huge entry count -> OOB reads past the table.
+        if (acpi_state.xsdt->header.length < sizeof(acpi_table_header_t)) return NULL;
         uint32_t entries = (acpi_state.xsdt->header.length - sizeof(acpi_table_header_t)) / 8;
 
         for (uint32_t i = 0; i < entries; i++) {
@@ -150,6 +153,7 @@ void* acpi_find_table(const char* signature) {
             }
         }
     } else if (acpi_state.rsdt) {
+        if (acpi_state.rsdt->header.length < sizeof(acpi_table_header_t)) return NULL;
         uint32_t entries = (acpi_state.rsdt->header.length - sizeof(acpi_table_header_t)) / 4;
 
         for (uint32_t i = 0; i < entries; i++) {
@@ -254,7 +258,7 @@ static int acpi_parse_s5(acpi_table_header_t* dsdt, uint8_t* s5a, uint8_t* s5b) 
     const uint8_t* aml = (const uint8_t*)dsdt + sizeof(acpi_table_header_t);
     const uint8_t* end = (const uint8_t*)dsdt + dsdt->length;
 
-    for (const uint8_t* p = aml; p + 5 < end; p++) {
+    for (const uint8_t* p = aml; p + 5 <= end; p++) {   /* <= so the final 5-byte window (a trailing _S5_) is examined; body guards every q access against end */
         if (p[0] == '_' && p[1] == 'S' && p[2] == '5' && p[3] == '_') {
             const uint8_t* q = p + 4;
 
@@ -340,10 +344,18 @@ int acpi_parse_fadt(acpi_fadt_t* fadt) {
     // decode the real _S5_ sleep-type values. Without this, poweroff writes the
     // wrong SLP_TYP and the machine stays on.
     acpi_table_header_t* dsdt = NULL;
-    if (fadt->x_dsdt) {
-        dsdt = (acpi_table_header_t*)acpi_phys_to_virt(fadt->x_dsdt);
-    } else if (fadt->dsdt) {
-        dsdt = (acpi_table_header_t*)acpi_phys_to_virt((uint64_t)fadt->dsdt);
+    uint64_t dsdt_phys = fadt->x_dsdt ? fadt->x_dsdt : (uint64_t)fadt->dsdt;
+    // VALIDATE the DSDT physical address before dereferencing it. A firmware that
+    // leaves x_dsdt zero/garbage, or any FADT-layout drift, would otherwise make
+    // the memcmp below dereference a wild pointer and #GP/#PF — a hard kernel
+    // panic during early boot (observed on QEMU: x_dsdt resolved to a tiny bad
+    // address, GP-faulting in memcmp before the scheduler ever started). Require a
+    // plausible, page-aligned, identity-mapped low-memory address (the kernel
+    // identity-maps 0..16 GB). Anything else falls back to the default _S5 below,
+    // which is harmless — poweroff still works on the common machines.
+    if (dsdt_phys >= 0x1000 && dsdt_phys < 0x400000000ULL &&
+        (dsdt_phys & 0x3) == 0) {
+        dsdt = (acpi_table_header_t*)acpi_phys_to_virt(dsdt_phys);
     }
 
     bool have_s5 = false;
@@ -399,10 +411,20 @@ int acpi_parse_madt(acpi_madt_t* madt) {
     uint8_t* end = (uint8_t*)madt + madt->header.length;
 
     while (ptr < end) {
+        // Need the 2-byte entry header to read type+length without overrunning.
+        if (ptr + sizeof(acpi_madt_entry_header_t) > end) {
+            break;
+        }
         acpi_madt_entry_header_t* header = (acpi_madt_entry_header_t*)ptr;
 
         if (header->length == 0) {
             break;  // malformed; avoid infinite loop
+        }
+        // The whole entry (header->length bytes) must fit inside the table; a
+        // malformed length that overruns `end` would make the per-type handlers
+        // below read fields past the MADT buffer (kernel-memory over-read at boot).
+        if (ptr + header->length > end) {
+            break;
         }
 
         switch (header->type) {
@@ -667,7 +689,17 @@ int acpi_reboot(void) {
 
     acpi_io_delay(100000);
 
-    // 3. Last resort: triple fault via a null IDT would also reset; just hang.
+    // 3. Last resort: triple fault via a null IDT. Loading an all-zero IDT
+    // and triggering a software interrupt causes #GP -> #DF -> CPU reset on
+    // both real hardware and QEMU.
+    kprintf("[ACPI] 8042 reset did not fire; attempting triple-fault...\n");
+    {
+        struct { uint16_t limit; uint64_t base; } __attribute__((packed)) zero_idt = {0, 0};
+        __asm__ volatile("lidt %0" : : "m"(zero_idt));
+        __asm__ volatile("int $3");   // #BP -> #DF -> reset
+    }
+
+    // Should never reach here
     acpi_hang();
     return 0;
 }
@@ -688,9 +720,35 @@ int acpi_poweroff(void) {
 
 void power_off(void) {
     kprintf("[POWER] Shutting down...\n");
+
+    /*
+     * Layer 0: QEMU / Bochs / VirtualBox magic I/O ports. On QEMU these
+     * cause an immediate VM exit. On real hardware (T410) the ports are
+     * unused or no-ops, so we fall through harmlessly to the ACPI path.
+     */
+    outw(0x604,  0x2000);   /* QEMU SeaBIOS / pc / q35 */
+    outw(0xB004, 0x2000);   /* Bochs                   */
+    outw(0x4004, 0x3400);   /* VirtualBox              */
+
+    /* Layer 1: real ACPI S5 */
     acpi_poweroff();
     // acpi_poweroff() does not return; belt-and-suspenders below.
     acpi_hang();
+}
+
+/*
+ * acpi_power_off() -- void wrapper matching the header declaration.
+ * Called by the SYS_POWEROFF syscall handler.
+ */
+void acpi_power_off(void) {
+    power_off();
+}
+
+/*
+ * acpi_present() -- 1 if RSDP + FADT were located, else 0.
+ */
+int acpi_present(void) {
+    return (acpi_state.initialized && acpi_state.fadt) ? 1 : 0;
 }
 
 void power_reboot(void) {
@@ -891,6 +949,23 @@ int acpi_init(void) {
     kprintf("[ACPI] Initialization complete\n");
     acpi_dump_tables();
 
+    // 8. Probe the Embedded Controller for battery status (laptop detection).
+    // This is non-blocking: if the EC is absent (QEMU, desktops), the probe
+    // times out in ~100ms and all future ec_battery_read() calls return
+    // immediately. On laptops (T410) we log the initial battery state.
+    {
+        ec_battery_status_t bat;
+        if (ec_battery_read(&bat) == 0 && bat.present) {
+            kprintf("[ACPI] Battery: %u%% (%s), %u mV, %u mWh remaining\n",
+                    bat.percentage,
+                    bat.state == 1 ? "discharging" :
+                    bat.state == 2 ? "charging" : "idle",
+                    bat.voltage_mv, bat.remaining_mwh);
+            if (bat.ac_online)
+                kprintf("[ACPI] AC adapter: online\n");
+        }
+    }
+
     return 0;
 }
 
@@ -905,4 +980,147 @@ void acpi_shutdown(void) {
     }
 
     memset(&acpi_state, 0, sizeof(acpi_state));
+}
+
+/* ===================================================================
+ * Embedded Controller (EC) battery reader
+ *
+ * Lightweight, self-contained EC access for battery status on laptops
+ * (e.g. ThinkPad T410). On platforms without an EC (QEMU, desktops)
+ * the initial probe fails and all subsequent calls return immediately.
+ * =================================================================== */
+
+/* EC I/O ports (ACPI spec chapter 12) */
+#define EC_DATA_PORT    0x62
+#define EC_CMD_PORT     0x66    /* write=command, read=status */
+
+/* EC status bits */
+#define EC_OBF          (1 << 0)   /* Output Buffer Full    */
+#define EC_IBF          (1 << 1)   /* Input Buffer Full     */
+
+/* EC commands */
+#define EC_RD           0x80    /* Read:  cmd -> addr -> read data   */
+
+/* Timeout for busy-wait (~100k * 1us = ~100ms) */
+#define EC_TMO          100000
+
+/* ThinkPad EC battery RAM offsets (T410 / T420 / X220 family, from DSDT) */
+#define ECB_PRESENT     0x38    /* Byte: bit0 = BAT0 present */
+#define ECB_AC          0x39    /* Byte: bit0 = AC online    */
+#define ECB_STATE       0x3A    /* Byte: 0=idle,1=disch,2=chg */
+#define ECB_RATE        0x3C    /* 16LE: present rate (mW)   */
+#define ECB_REMAIN      0x3E    /* 16LE: remaining (mWh)     */
+#define ECB_VOLT        0x40    /* 16LE: voltage (mV)        */
+#define ECB_DESIGN      0x42    /* 16LE: design cap (mWh)    */
+#define ECB_FULLCAP     0x44    /* 16LE: last full cap (mWh) */
+
+static bool g_ec_ok     = false;   /* EC responded at least once */
+static bool g_ec_probed = false;
+
+static int ec_wait_ibf(void) {
+    for (int i = 0; i < EC_TMO; i++)
+        if (!(inb(EC_CMD_PORT) & EC_IBF)) return 0;
+    return -1;
+}
+
+static int ec_wait_obf(void) {
+    for (int i = 0; i < EC_TMO; i++)
+        if (inb(EC_CMD_PORT) & EC_OBF) return 0;
+    return -1;
+}
+
+static int ec_rd(uint8_t addr) {
+    if (ec_wait_ibf() < 0) return -1;
+    outb(EC_CMD_PORT, EC_RD);
+    if (ec_wait_ibf() < 0) return -1;
+    outb(EC_DATA_PORT, addr);
+    if (ec_wait_obf() < 0) return -1;
+    return (int)inb(EC_DATA_PORT);
+}
+
+static int ec_rd16(uint8_t addr) {
+    int lo = ec_rd(addr);
+    if (lo < 0) return -1;
+    int hi = ec_rd((uint8_t)(addr + 1));
+    if (hi < 0) return -1;
+    return lo | (hi << 8);
+}
+
+bool ec_battery_available(void) {
+    return g_ec_ok;
+}
+
+int ec_battery_read(ec_battery_status_t *out) {
+    if (!out) return -1;
+
+    memset(out, 0, sizeof(*out));
+
+    /* First-time probe */
+    if (!g_ec_probed) {
+        g_ec_probed = true;
+        int p = ec_rd(ECB_PRESENT);
+        if (p < 0) {
+            kprintf("[EC] No Embedded Controller (QEMU/desktop)\n");
+            g_ec_ok = false;
+            return -1;
+        }
+        g_ec_ok = true;
+        kprintf("[EC] Embedded Controller detected (port 0x62/0x66)\n");
+    }
+
+    if (!g_ec_ok) return -1;
+
+    /* Battery presence */
+    int bat = ec_rd(ECB_PRESENT);
+    if (bat < 0 || !(bat & 0x01)) {
+        out->present = false;
+        return 0;   /* EC works, just no battery inserted */
+    }
+    out->present = true;
+
+    /* AC adapter */
+    int ac = ec_rd(ECB_AC);
+    out->ac_online = (ac >= 0 && (ac & 0x01));
+
+    /* State */
+    int st = ec_rd(ECB_STATE);
+    out->state = (st >= 0) ? (uint8_t)(st & 0x03) : 0;
+
+    /* Readings */
+    int rate = ec_rd16(ECB_RATE);
+    int rem  = ec_rd16(ECB_REMAIN);
+    int volt = ec_rd16(ECB_VOLT);
+    int dcap = ec_rd16(ECB_DESIGN);
+    int fcap = ec_rd16(ECB_FULLCAP);
+
+    /* Sanity: reject garbage (wrong EC offsets for this laptop model) */
+    if (volt < 0 || volt > 30000 ||
+        dcap < 0 || dcap == 0xFFFF ||
+        rem  < 0 || rem  == 0xFFFF) {
+        out->present = false;
+        return -1;
+    }
+
+    out->voltage_mv    = (uint16_t)volt;
+    out->rate_mw       = (rate >= 0)  ? (uint16_t)rate : 0;
+    out->remaining_mwh = (uint16_t)rem;
+    out->design_mwh    = (dcap > 0)   ? (uint16_t)dcap : 0;
+    out->full_cap_mwh  = (fcap > 0)   ? (uint16_t)fcap : 0;
+
+    /* Percentage */
+    if (fcap > 0) {
+        uint32_t pct = (uint32_t)rem * 100 / (uint32_t)fcap;
+        out->percentage = (pct > 100) ? 100 : (uint8_t)pct;
+    }
+
+    /* Time estimate (minutes) */
+    if (out->state == 1 && rate > 0 && rem > 0) {
+        /* discharging: remaining_mWh / rate_mW * 60 */
+        out->time_min = (uint16_t)((uint32_t)rem * 60 / (uint32_t)rate);
+    } else if (out->state == 2 && rate > 0 && fcap > rem) {
+        /* charging: (full - remaining) / rate * 60 */
+        out->time_min = (uint16_t)((uint32_t)(fcap - rem) * 60 / (uint32_t)rate);
+    }
+
+    return 0;
 }

@@ -196,6 +196,7 @@ static void draw_border(u32 *pixels, u32 stride_px, u32 bw, u32 bh,
 #define KEY_TAB         15
 #define KEY_ENTER       28
 #define KEY_LEFTCTRL    29
+#define KEY_S           31
 #define KEY_LEFTSHIFT   42
 #define KEY_RIGHTSHIFT  54
 #define KEY_SPACE       57
@@ -231,35 +232,68 @@ static const char keymap_hi[256] = {
 };
 
 /* ---- window geometry ---- */
+/* Initial/default window size (used only at create time). */
 #define WIN_W       640
 #define WIN_H       440
 
+/* Minimum size we will lay out for, so a tiny window cannot make extents
+ * go negative.  All runtime layout is clamped against the live win->w/h. */
+#define MIN_WIN_W   240
+#define MIN_WIN_H   160
+
+/* Fixed (size-independent) geometry. */
 #define SIDEBAR_W   180
 #define DIVIDER_W   2
 
 #define EDITOR_X    (SIDEBAR_W + DIVIDER_W)
-#define EDITOR_W    (WIN_W - EDITOR_X)
 
 #define TITLEBAR_H  32
 #define STATUS_H    20
-#define EDITOR_H    (WIN_H - TITLEBAR_H - STATUS_H)
 
-/* Editor text area (relative to window top-left) */
+/* Editor text area left/top are fixed; right/bottom depend on window size. */
 #define EDIT_LEFT   (EDITOR_X + 4)
 #define EDIT_TOP    (TITLEBAR_H + 2)
-#define EDIT_RIGHT  (WIN_W - 4)
-#define EDIT_BOTTOM (WIN_H - STATUS_H)
-
-/* Visible text columns/rows in the editor */
-#define EDIT_COLS   ((EDIT_RIGHT - EDIT_LEFT) / FONT_W)
-#define EDIT_ROWS   ((EDIT_BOTTOM - EDIT_TOP) / FONT_H)
 
 /* Sidebar list top */
 #define SIDEBAR_LIST_TOP  (TITLEBAR_H + 4)
 /* Height for each sidebar row */
 #define SIDEBAR_ROW_H  20
-/* Max visible sidebar entries */
-#define SIDEBAR_VISIBLE  ((WIN_H - TITLEBAR_H - STATUS_H - 4) / SIDEBAR_ROW_H)
+
+/*
+ * Runtime geometry -- recomputed from win->w / win->h on create and on every
+ * WL_EVENT_RESIZE (compositor Maximize / snap).  Everything that draws or
+ * hit-tests reads these, NOT the WIN_W/WIN_H constants, so the surface is
+ * fully painted and the text reflows when the window is resized.
+ */
+static i32 g_win_w   = WIN_W;
+static i32 g_win_h   = WIN_H;
+static i32 g_editor_w;        /* g_win_w - EDITOR_X                         */
+static i32 g_editor_h;        /* g_win_h - TITLEBAR_H - STATUS_H            */
+static i32 g_edit_right;      /* g_win_w - 4                                */
+static i32 g_edit_bottom;     /* g_win_h - STATUS_H                         */
+static i32 g_edit_cols;       /* visible text columns in editor            */
+static i32 g_edit_rows;       /* visible text rows in editor               */
+static i32 g_sidebar_visible; /* max visible sidebar entries               */
+
+/* Recompute all size-dependent layout from g_win_w / g_win_h. */
+static void recompute_layout(void)
+{
+    if (g_win_w < MIN_WIN_W) g_win_w = MIN_WIN_W;
+    if (g_win_h < MIN_WIN_H) g_win_h = MIN_WIN_H;
+
+    g_editor_w    = g_win_w - EDITOR_X;
+    g_editor_h    = g_win_h - TITLEBAR_H - STATUS_H;
+    g_edit_right  = g_win_w - 4;
+    g_edit_bottom = g_win_h - STATUS_H;
+
+    g_edit_cols = (g_edit_right - EDIT_LEFT) / FONT_W;
+    g_edit_rows = (g_edit_bottom - (TITLEBAR_H + FONT_H + 6)) / FONT_H;
+    if (g_edit_cols < 1) g_edit_cols = 1;
+    if (g_edit_rows < 1) g_edit_rows = 1;
+
+    g_sidebar_visible = (g_win_h - TITLEBAR_H - STATUS_H - 4) / SIDEBAR_ROW_H;
+    if (g_sidebar_visible < 0) g_sidebar_visible = 0;
+}
 
 /* ---- colors ---- */
 #define COL_BG           0xFF1A1A2Eu  /* deep navy */
@@ -360,8 +394,8 @@ static void ensure_visible(void)
 {
     if (g_cur_row < g_scroll_row)
         g_scroll_row = g_cur_row;
-    else if (g_cur_row >= g_scroll_row + EDIT_ROWS)
-        g_scroll_row = g_cur_row - EDIT_ROWS + 1;
+    else if (g_cur_row >= g_scroll_row + g_edit_rows)
+        g_scroll_row = g_cur_row - g_edit_rows + 1;
 }
 
 static void insert_char(char c)
@@ -681,12 +715,21 @@ static void render(wl_window *win, u64 ticks)
     u32 bh  = win->h;
     u32 *pix = win->pixels;
 
+    /* Live window extent (also used by hit-testing). */
+    i32 ww = (i32)bw;
+    i32 wh = (i32)bh;
+    i32 editor_h = wh - TITLEBAR_H - STATUS_H;
+    if (editor_h < 0) editor_h = 0;
+    i32 editor_w = ww - EDITOR_X;
+    if (editor_w < 0) editor_w = 0;
+
     /* ---------- Background ---------- */
-    fill_rect(pix, spx, bw, bh, 0, 0, WIN_W, WIN_H, COL_BG);
+    /* Paint the WHOLE current surface so resize margins hold no garbage. */
+    fill_rect(pix, spx, bw, bh, 0, 0, ww, wh, COL_BG);
 
     /* ---------- Title bar ---------- */
-    fill_rect(pix, spx, bw, bh, 0, 0, WIN_W, TITLEBAR_H, COL_TITLEBAR_BG);
-    draw_border(pix, spx, bw, bh, 0, 0, WIN_W, TITLEBAR_H, COL_DIVIDER);
+    fill_rect(pix, spx, bw, bh, 0, 0, ww, TITLEBAR_H, COL_TITLEBAR_BG);
+    draw_border(pix, spx, bw, bh, 0, 0, ww, TITLEBAR_H, COL_DIVIDER);
 
     /* Title text */
     font_draw_string(pix, (int)spx, (int)bw, (int)bh,
@@ -695,12 +738,12 @@ static void render(wl_window *win, u64 ticks)
 
     /* [New] button in title bar */
     draw_button(pix, spx, bw, bh,
-                WIN_W - 130, (TITLEBAR_H - 22) / 2, 56, 22,
+                ww - 130, (TITLEBAR_H - 22) / 2, 56, 22,
                 "New", COL_NEW_BG, 0xFF50B03Bu, COL_BUTTON_TXT);
 
     /* [Save] button in title bar */
     draw_button(pix, spx, bw, bh,
-                WIN_W - 68, (TITLEBAR_H - 22) / 2, 56, 22,
+                ww - 68, (TITLEBAR_H - 22) / 2, 56, 22,
                 "Save", COL_SAVE_BG, COL_SAVE_HOV, COL_BUTTON_TXT);
 
     /* Dirty indicator in title bar next to "Notes" */
@@ -711,7 +754,7 @@ static void render(wl_window *win, u64 ticks)
     }
 
     /* ---------- Sidebar ---------- */
-    fill_rect(pix, spx, bw, bh, 0, TITLEBAR_H, SIDEBAR_W, EDITOR_H, COL_SIDEBAR_BG);
+    fill_rect(pix, spx, bw, bh, 0, TITLEBAR_H, SIDEBAR_W, editor_h, COL_SIDEBAR_BG);
 
     /* Sidebar header */
     fill_rect(pix, spx, bw, bh, 0, TITLEBAR_H, SIDEBAR_W, 22, COL_TITLEBAR_BG);
@@ -719,7 +762,7 @@ static void render(wl_window *win, u64 ticks)
                      4, TITLEBAR_H + 3, "Notes", COL_TEXT_DIM);
 
     /* List entries */
-    for (int i = 0; i < SIDEBAR_VISIBLE; i++) {
+    for (int i = 0; i < g_sidebar_visible; i++) {
         int idx = g_sidebar_scroll + i;
         if (idx >= g_note_count) break;
 
@@ -767,10 +810,10 @@ static void render(wl_window *win, u64 ticks)
     }
 
     /* ---------- Divider ---------- */
-    fill_rect(pix, spx, bw, bh, SIDEBAR_W, TITLEBAR_H, DIVIDER_W, EDITOR_H, COL_DIVIDER);
+    fill_rect(pix, spx, bw, bh, SIDEBAR_W, TITLEBAR_H, DIVIDER_W, editor_h, COL_DIVIDER);
 
     /* ---------- Editor background ---------- */
-    fill_rect(pix, spx, bw, bh, EDITOR_X, TITLEBAR_H, EDITOR_W, EDITOR_H, COL_EDITOR_BG);
+    fill_rect(pix, spx, bw, bh, EDITOR_X, TITLEBAR_H, editor_w, editor_h, COL_EDITOR_BG);
 
     /* File name header inside editor area */
     {
@@ -784,7 +827,7 @@ static void render(wl_window *win, u64 ticks)
                          EDITOR_X + 4, TITLEBAR_H + 2, hdr, COL_TEXT_DIM);
         /* horizontal rule under the name */
         fill_rect(pix, spx, bw, bh, EDITOR_X, TITLEBAR_H + FONT_H + 4,
-                  EDITOR_W, 1, COL_DIVIDER);
+                  editor_w, 1, COL_DIVIDER);
     }
 
     /* Cursor blink period 600ms */
@@ -792,7 +835,7 @@ static void render(wl_window *win, u64 ticks)
 
     /* Editor text lines */
     i32 text_top = TITLEBAR_H + FONT_H + 6;
-    for (int vi = 0; vi < EDIT_ROWS; vi++) {
+    for (int vi = 0; vi < g_edit_rows; vi++) {
         int row = g_scroll_row + vi;
         if (row >= g_num_lines) break;
 
@@ -806,8 +849,11 @@ static void render(wl_window *win, u64 ticks)
             }
         }
 
-        /* Draw each character */
-        for (int ci = 0; ci < g_line_len[row]; ci++) {
+        /* Draw each character (clamp to the visible column count so text
+         * reflows to the current width and never spills past the editor). */
+        int ncols = g_line_len[row];
+        if (ncols > g_edit_cols) ncols = g_edit_cols;
+        for (int ci = 0; ci < ncols; ci++) {
             i32 cx = EDIT_LEFT + ci * FONT_W;
             char c = g_lines[row][ci];
             u32 fg;
@@ -821,8 +867,8 @@ static void render(wl_window *win, u64 ticks)
     }
 
     /* ---------- Status bar ---------- */
-    fill_rect(pix, spx, bw, bh, 0, WIN_H - STATUS_H, WIN_W, STATUS_H, COL_STATUS_BG);
-    fill_rect(pix, spx, bw, bh, 0, WIN_H - STATUS_H, WIN_W, 1, COL_DIVIDER);
+    fill_rect(pix, spx, bw, bh, 0, wh - STATUS_H, ww, STATUS_H, COL_STATUS_BG);
+    fill_rect(pix, spx, bw, bh, 0, wh - STATUS_H, ww, 1, COL_DIVIDER);
 
     {
         char sb[128];
@@ -835,7 +881,7 @@ static void render(wl_window *win, u64 ticks)
         k_strlcat(sb, ns, sizeof(sb));
         k_strlcat(sb, "  |  F2=Save  F5=New", sizeof(sb));
         font_draw_string(pix, (int)spx, (int)bw, (int)bh,
-                         0, WIN_H - STATUS_H + 2, sb, COL_TEXT_DIM);
+                         0, wh - STATUS_H + 2, sb, COL_TEXT_DIM);
     }
 }
 
@@ -854,6 +900,12 @@ static void handle_key(int keycode, int pressed)
     }
 
     if (!pressed) return;
+
+    /* Ctrl chords. */
+    if (g_ctrl) {
+        if (keycode == KEY_S) { save_note(); return; }
+        /* Other Ctrl combos fall through to normal handling. */
+    }
 
     switch (keycode) {
     case KEY_ENTER:
@@ -921,12 +973,12 @@ static void handle_key(int keycode, int pressed)
     ensure_visible();
 }
 
-/* Handle a mouse click. */
+/* Handle a mouse click.  Uses runtime geometry so hit-tests track resize. */
 static void handle_click(int mx, int my)
 {
     /* [New] button */
     {
-        i32 bx = WIN_W - 130;
+        i32 bx = g_win_w - 130;
         i32 by = (TITLEBAR_H - 22) / 2;
         if (pt_in_rect(mx, my, bx, by, 56, 22)) {
             new_note();
@@ -936,7 +988,7 @@ static void handle_click(int mx, int my)
 
     /* [Save] button */
     {
-        i32 bx = WIN_W - 68;
+        i32 bx = g_win_w - 68;
         i32 by = (TITLEBAR_H - 22) / 2;
         if (pt_in_rect(mx, my, bx, by, 56, 22)) {
             save_note();
@@ -945,7 +997,7 @@ static void handle_click(int mx, int my)
     }
 
     /* Sidebar note entries */
-    if (mx < SIDEBAR_W && my >= TITLEBAR_H + 22 && my < WIN_H - STATUS_H) {
+    if (mx < SIDEBAR_W && my >= TITLEBAR_H + 22 && my < g_win_h - STATUS_H) {
         int row = (my - (TITLEBAR_H + 22)) / SIDEBAR_ROW_H;
         int idx = g_sidebar_scroll + row;
         if (idx >= 0 && idx < g_note_count) {
@@ -956,7 +1008,7 @@ static void handle_click(int mx, int my)
 
     /* Click in editor area: place cursor */
     i32 text_top = TITLEBAR_H + FONT_H + 6;
-    if (mx >= EDITOR_X && my >= text_top && my < WIN_H - STATUS_H) {
+    if (mx >= EDITOR_X && my >= text_top && my < g_win_h - STATUS_H) {
         int vi = (my - text_top) / FONT_H;
         int row = g_scroll_row + vi;
         if (row >= g_num_lines) row = g_num_lines - 1;
@@ -1019,6 +1071,11 @@ void _start(void)
     serial_num((i64)win->win_id);
     serial_print(" created\n");
 
+    /* Seed runtime geometry from the real buffer size, then derive layout. */
+    g_win_w = (i32)win->w;
+    g_win_h = (i32)win->h;
+    recompute_layout();
+
     /* If there are existing notes, load the first one. */
     if (g_note_count > 0) {
         load_note(0);
@@ -1041,6 +1098,19 @@ void _start(void)
                     handle_click(a, b);
                 }
                 prev_btn = cur_btn;
+            } else if (kind == WL_EVENT_RESIZE) {
+                /*
+                 * Compositor Maximize / snap.  The library has ALREADY
+                 * reallocated the buffer and updated win->{w,h,stride,pixels};
+                 * we only re-read the new size and recompute the text-area
+                 * extent so the whole surface is painted and the editor
+                 * reflows (more visible cols/rows on a bigger window).
+                 */
+                g_win_w = (i32)win->w;
+                g_win_h = (i32)win->h;
+                recompute_layout();
+                /* Keep the cursor row on screen at the new height. */
+                ensure_visible();
             }
         }
 

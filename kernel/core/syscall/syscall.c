@@ -4,7 +4,11 @@
 #include "../../include/seccomp.h"
 #include "../../include/sched.h"
 #include "../../include/net.h"   // sys_net_info / sys_net_send / sys_net_recv prototypes
+#include "../../include/netif.h" // sys_net_config prototype
 #include "../../include/socket.h" // sys_sock_* (BSD socket) prototypes
+#include "../../include/audio.h" // audio_beep (SYS_BEEP target)
+#include "../../include/acpi.h"  // power_off / power_reboot (SYS_POWEROFF/REBOOT)
+#include "../../include/pci.h"   // sys_pci_list (SYS_PCI_LIST=92)
 // NOTE: do NOT include compat/errno.h here. It defines EINVAL/ENOTSUP as
 // POSITIVE values, which (being included last) would override syscall.h's
 // canonical NEGATIVE errno — making syscall_dispatch return +22 / +95 to
@@ -14,6 +18,23 @@
 
 // Syscall handler table
 static syscall_handler_t syscall_table[MAX_SYSCALLS];
+
+/**
+ * SYS_BEEP handler: play a tone via the HDA audio driver.
+ * arg1 = frequency in Hz (0 defaults to 440 Hz)
+ * arg2 = duration in milliseconds (0 defaults to 200 ms)
+ * Returns 0 on success, negative on error (no HDA hardware).
+ */
+static int64_t sys_beep(uint64_t freq_hz, uint64_t duration_ms,
+                        uint64_t arg3, uint64_t arg4,
+                        uint64_t arg5, uint64_t arg6) {
+    (void)arg3; (void)arg4; (void)arg5; (void)arg6;
+    return (int64_t)audio_beep((uint32_t)freq_hz, (uint32_t)duration_ms);
+}
+
+/* sys_poweroff / sys_reboot live in handlers.c (canonical definitions).
+ * Removed duplicates that were here -- the syscall_table entries below
+ * reference the handlers.c versions via the header declarations. */
 
 void syscall_init(void) {
     kprintf("[SYSCALL] Initializing system call interface...\n");
@@ -57,6 +78,14 @@ void syscall_init(void) {
     syscall_table[SYS_GETPRIORITY] = sys_getpriority;
     syscall_table[SYS_SETPRIORITY] = sys_setpriority;
 
+    // Resource limit syscalls -- handlers exist in kernel/core/rlimit/syscall.c
+    // but the rlimit subsystem has unresolved deps and is not yet compiled.
+    // TODO: integrate rlimit subsystem into the build.
+    // syscall_table[SYS_SETRLIMIT] = sys_setrlimit;
+    // syscall_table[SYS_GETRLIMIT] = sys_getrlimit;
+    // syscall_table[SYS_GETRUSAGE] = sys_getrusage;
+    // syscall_table[SYS_PRLIMIT]   = sys_prlimit;
+
     // I/O control syscalls
     syscall_table[SYS_IOCTL] = sys_ioctl;
 
@@ -72,6 +101,17 @@ void syscall_init(void) {
 
     // Entropy syscall
     syscall_table[SYS_RANDOM] = sys_random;
+
+    // Audio beep (HDA tone playback)
+    syscall_table[SYS_BEEP] = sys_beep;
+
+    // Power management: ACPI poweroff (S5) and reboot
+    syscall_table[SYS_POWEROFF] = sys_poweroff;
+    syscall_table[SYS_REBOOT]   = sys_reboot;
+
+    // Security: seccomp -- handler in kernel/security/seccomp/seccomp_syscall.c
+    // but seccomp subsystem not yet compiled. TODO: integrate.
+    // syscall_table[SYS_SECCOMP] = sys_seccomp;
 
     // Process enumeration
     syscall_table[SYS_PROCLIST] = sys_proclist;
@@ -93,10 +133,19 @@ void syscall_init(void) {
     syscall_table[SYS_UNLINK] = sys_unlink;
     syscall_table[SYS_RENAME] = sys_rename;
     syscall_table[SYS_MKDIR] = sys_mkdir;
+    syscall_table[SYS_TRUNCATE] = sys_truncate;
+    syscall_table[SYS_FTRUNCATE] = sys_ftruncate;
+    syscall_table[SYS_FSYNC] = sys_fsync;
+    syscall_table[SYS_SYNC] = sys_sync;
+    syscall_table[SYS_RECOVERY_OVERLAY] = sys_recovery_overlay;
 
     // Block device syscalls (AHCI/SATA persistence)
     syscall_table[SYS_BLK_READ] = sys_blk_read;
     syscall_table[SYS_BLK_WRITE] = sys_blk_write;
+
+    // Persistent named-file syscalls (diskfs flat files; gate-safe, no-op w/o disk)
+    syscall_table[SYS_PERSIST_READ]  = sys_persist_read;
+    syscall_table[SYS_PERSIST_WRITE] = sys_persist_write;
 
     // Networking syscalls (e1000 NIC: info/MAC + raw frame TX/RX)
     syscall_table[SYS_NET_INFO] = (syscall_handler_t)sys_net_info;
@@ -115,6 +164,17 @@ void syscall_init(void) {
     syscall_table[SYS_BIND]      = (syscall_handler_t)sys_sock_bind;
     syscall_table[SYS_LISTEN]    = (syscall_handler_t)sys_sock_listen;
     syscall_table[SYS_ACCEPT]    = (syscall_handler_t)sys_sock_accept;
+
+    // Network configuration (DHCP lease apply, routing, ARP table query)
+    syscall_table[SYS_NET_CONFIG]  = (syscall_handler_t)sys_net_config;
+    syscall_table[SYS_ROUTE_TABLE] = (syscall_handler_t)sys_route_table;
+    syscall_table[SYS_ARP_TABLE]   = (syscall_handler_t)sys_arp_table;
+
+    // PCI device list (lspci userspace tool)
+    syscall_table[SYS_PCI_LIST]    = (syscall_handler_t)sys_pci_list;
+
+    // Battery status (EC embedded controller -- T410 / laptops)
+    syscall_table[SYS_BATTERY]     = sys_battery;
 
     // Futex (fast userspace mutex)
     syscall_table[SYS_FUTEX] = sys_futex;
@@ -141,6 +201,60 @@ void syscall_init(void) {
     syscall_table[SYS_EPOLL_CTL]    = sys_epoll_ctl;
     syscall_table[SYS_EPOLL_WAIT]   = sys_epoll_wait;
 
+    // CHANNEL-0: capability-backed shared-ring channels (kernel/ipc/channel.c).
+    // Additive -- every existing program is byte-for-byte unchanged (unregistered
+    // numbers return ENOTSUP; nothing binds a channel until a process opts in).
+    {
+        extern int64_t sys_ch_create(uint64_t,uint64_t,uint64_t,uint64_t,uint64_t,uint64_t);
+        extern int64_t sys_ch_write (uint64_t,uint64_t,uint64_t,uint64_t,uint64_t,uint64_t);
+        extern int64_t sys_ch_read  (uint64_t,uint64_t,uint64_t,uint64_t,uint64_t,uint64_t);
+        extern int64_t sys_ch_wait  (uint64_t,uint64_t,uint64_t,uint64_t,uint64_t,uint64_t);
+        extern int64_t sys_ch_close (uint64_t,uint64_t,uint64_t,uint64_t,uint64_t,uint64_t);
+        syscall_table[SYS_CH_CREATE] = sys_ch_create;
+        syscall_table[SYS_CH_WRITE]  = sys_ch_write;
+        syscall_table[SYS_CH_READ]   = sys_ch_read;
+        syscall_table[SYS_CH_WAIT]   = sys_ch_wait;
+        syscall_table[SYS_CH_CLOSE]  = sys_ch_close;
+        extern void channel_selftest(void);
+        channel_selftest();
+        // P2: additive spawn that binds a child's stdio to channel handles.
+        extern int64_t sys_spawn_ex(uint64_t,uint64_t,uint64_t,uint64_t,uint64_t,uint64_t);
+        syscall_table[SYS_SPAWN_EX] = sys_spawn_ex;
+        extern void channel_selftest_p2(void);
+        channel_selftest_p2();
+        // P5: typed CH_MSG message framing (substrate only; no syscall/agent yet).
+        extern void channel_selftest_p5(void);
+        channel_selftest_p5();
+        // P5b: explicit CH_MSG packet syscalls (byte channels keep stream semantics).
+        extern int64_t sys_ch_sendmsg(uint64_t,uint64_t,uint64_t,uint64_t,uint64_t,uint64_t);
+        extern int64_t sys_ch_recvmsg(uint64_t,uint64_t,uint64_t,uint64_t,uint64_t,uint64_t);
+        syscall_table[SYS_CH_SENDMSG] = sys_ch_sendmsg;
+        syscall_table[SYS_CH_RECVMSG] = sys_ch_recvmsg;
+        // P6c: one-shot read-only CH_BYTE capability grant/accept (AGENT-RPC-0 stdout transfer).
+        extern int64_t sys_ch_grant (uint64_t,uint64_t,uint64_t,uint64_t,uint64_t,uint64_t);
+        extern int64_t sys_ch_accept(uint64_t,uint64_t,uint64_t,uint64_t,uint64_t,uint64_t);
+        syscall_table[SYS_CH_GRANT]  = sys_ch_grant;
+        syscall_table[SYS_CH_ACCEPT] = sys_ch_accept;
+        // P6d: explicit argv-vector spawn (separate from the command-line SYS_SPAWN_EX).
+        extern int64_t sys_spawn_ex_argv(uint64_t,uint64_t,uint64_t,uint64_t,uint64_t,uint64_t);
+        syscall_table[SYS_SPAWN_EX_ARGV] = sys_spawn_ex_argv;
+    }
+
+#if defined(SMP_FOUNDATION) && !defined(SMP_SCHED_DISPATCH)
+    // SMP coprocessor offload (the userspace -> CPU1 bridge). Registered ONLY for
+    // the coprocessor SMP build; the DEFAULT kernel leaves this slot NULL, so the
+    // syscall returns ENOTSUP and the binary is byte-for-byte unchanged. The handler
+    // does all user-pointer validation + copy-in/out and dispatches a trusted kernel
+    // matmul to CPU1 (handlers.c, also SMP_FOUNDATION-gated).
+    //
+    // NOT registered under SMP_SCHED_DISPATCH: in SCHEDULER mode CPU1 runs
+    // ap_scheduler_loop, NOT the cpu1_job worker loop, so an offload would publish a
+    // job nobody services and time out silently. Leaving the slot NULL makes the
+    // syscall return ENOTSUP immediately (the cpu1offload userspace test then SKIPs
+    // cleanly instead of timing out / FAILing). Mode separation, per the SMP audit.
+    syscall_table[SYS_CPU1_OFFLOAD] = sys_cpu1_offload;
+#endif
+
     // Initialize epoll subsystem
     epoll_init();
 
@@ -150,8 +264,64 @@ void syscall_init(void) {
 
 int64_t syscall_dispatch(uint64_t syscall_num, uint64_t arg1, uint64_t arg2,
                          uint64_t arg3, uint64_t arg4, uint64_t arg5, uint64_t arg6) {
-    // Start performance measurement
-    PERF_START(PERF_OP_SYSCALL);
+#ifdef SCHED_DEBUG
+    // DIAGNOSTIC: paint a GREEN marker the first time ANY syscall arrives. If this
+    // appears on the T410, ring-3 was reached and /sbin/init executed at least up
+    // to its first syscall — i.e. the freeze (if any) is AFTER ring-3 entry, not in
+    // the IRETQ. If it never appears but the yellow "enter_usermode" marker does,
+    // the fault is in the IRETQ itself or init's first (pre-syscall) instructions.
+    {
+        extern void framebuffer_puts_scaled(const char*, uint32_t, uint32_t,
+                                            uint32_t, uint32_t);
+        static volatile int _first_syscall_seen = 0;
+        static volatile int _spawn_seen = 0;
+        static volatile int _fb_seen = 0;
+        if (!_first_syscall_seen) {
+            _first_syscall_seen = 1;
+            framebuffer_puts_scaled("ring3 OK: first syscall", 40, 150, 0x0000FF00u, 2);
+        }
+        // SYS_SPAWN (16): init launching a child (the compositor / services).
+        if (syscall_num == 16 && !_spawn_seen) {
+            _spawn_seen = 1;
+            framebuffer_puts_scaled("init: SYS_SPAWN ok", 40, 172, 0x0000FF00u, 2);
+        }
+        // First syscall from a process that is NOT init (pid 1) — proves the
+        // spawned compositor actually got SCHEDULED and executed ring-3 code.
+        // If this NEVER appears, the compositor was spawned but never ran (a
+        // scheduler/runqueue or yield bug). If it DOES appear but FB_ACQUIRE
+        // does not, the compositor runs but hangs early in its own startup.
+        {
+            static volatile int _noninit_seen = 0;
+            process_t* cur = process_get_current();
+            if (!_noninit_seen && cur && cur->pid != 1) {
+                _noninit_seen = 1;
+                framebuffer_puts_scaled("non-init proc RAN (compositor)", 40, 326, 0x0000FF00u, 2);
+            }
+        }
+        // SYS_WAITPID(6)/SYS_YIELD(15) from init(pid1): proves init FINISHED its
+        // spawn sequence and reached its blocking point — so it WILL invoke the
+        // scheduler. If this never appears, init is stuck in ring-3 before it ever
+        // blocks (so the scheduler is never asked to run a child).
+        {
+            static volatile int _initblock_seen = 0;
+            process_t* c2 = process_get_current();
+            if (!_initblock_seen && c2 && c2->pid == 1 &&
+                (syscall_num == 6 || syscall_num == 15)) {
+                _initblock_seen = 1;
+                framebuffer_puts_scaled("init reached WAITPID/YIELD", 40, 238, 0x00FFFF00u, 2);
+            }
+        }
+        // SYS_FB_ACQUIRE (39): the compositor mapping the framebuffer = it started.
+        if (syscall_num == 39 && !_fb_seen) {
+            _fb_seen = 1;
+            framebuffer_puts_scaled("compositor: FB_ACQUIRE ok", 40, 348, 0x0000FF00u, 2);
+        }
+    }
+#endif
+    // Wave-7 perf: PERF_START/END removed from the hot path. The RDTSC pair
+    // cost ~40 cycles per syscall (~20% of a fast getpid). Individual handlers
+    // that need profiling can instrument themselves; the dispatch wrapper is too
+    // hot. SYS_PERF_REPORT still works (it measures handler-level, not wrapper).
 
     // ═══════════════════════════════════════════════════════════════════════════
     // FAST PATH: Inline common read-only syscalls (40-56% latency reduction)
@@ -161,20 +331,21 @@ int64_t syscall_dispatch(uint64_t syscall_num, uint64_t arg1, uint64_t arg2,
     if (__builtin_expect(syscall_num == SYS_GETPID, 0)) {
         process_t* current = process_get_current();
         if (__builtin_expect(current != NULL, 1)) {
-            int64_t result = (int64_t)current->pid;
-            PERF_END(PERF_OP_SYSCALL);
-            return result;
+            return (int64_t)current->pid;
         }
-        PERF_END(PERF_OP_SYSCALL);
         return ESRCH;
     }
 
     // Fast path: gettimeofday (read-only, high-frequency)
     if (__builtin_expect(syscall_num == SYS_GET_TICKS_MS, 0)) {
         extern uint64_t timer_get_ticks_ms(void);
-        int64_t result = (int64_t)timer_get_ticks_ms();
-        PERF_END(PERF_OP_SYSCALL);
-        return result;
+        return (int64_t)timer_get_ticks_ms();
+    }
+
+    // Wave-7 perf: sys_yield fast path — avoid handler table lookup for the
+    // most latency-sensitive scheduling syscall (~5-8% of all syscalls).
+    if (__builtin_expect(syscall_num == SYS_YIELD, 0)) {
+        return sys_yield(arg1, arg2, arg3, arg4, arg5, arg6);
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
@@ -186,7 +357,6 @@ int64_t syscall_dispatch(uint64_t syscall_num, uint64_t arg1, uint64_t arg2,
 #ifndef SYSCALL_QUIET
         kprintf("[SYSCALL] Invalid syscall number: %u\n", (uint32_t)syscall_num);
 #endif
-        PERF_END(PERF_OP_SYSCALL);
         return EINVAL;
     }
 
@@ -196,7 +366,6 @@ int64_t syscall_dispatch(uint64_t syscall_num, uint64_t arg1, uint64_t arg2,
 #ifndef SYSCALL_QUIET
         kprintf("[SYSCALL] Unimplemented syscall: %u\n", (uint32_t)syscall_num);
 #endif
-        PERF_END(PERF_OP_SYSCALL);
         return ENOTSUP;
     }
 
@@ -219,14 +388,55 @@ int64_t syscall_dispatch(uint64_t syscall_num, uint64_t arg1, uint64_t arg2,
     kprintf("[SYSCALL] Dispatching syscall %u\n", (uint32_t)syscall_num);
 #endif
 
+#ifdef SMP_BKL
+    // SMP-H1 BKL-LITE: the marked-unsafe groups (FS/net/IPC/proc -- see the
+    // table + the loud blocking-exclusion doc in bkl.c) take the one outer
+    // kernel lock around the WHOLE handler body. Unmarked syscalls (and the
+    // getpid/ticks/yield fast paths above, which never reach this point) run
+    // exactly as before. Owner-recursive, so a marked handler internally
+    // re-entering a marked path cannot self-deadlock. Falls through (no early
+    // return) so the post-handler diagnostics below stay live for marked
+    // syscalls too.
+    extern int  bkl_is_marked(uint64_t n);
+    extern void bkl_acquire(void);
+    extern void bkl_release(void);
+    int bkl_held = 0;
+    if (bkl_is_marked(syscall_num)) {
+        bkl_acquire();
+        bkl_held = 1;
+    }
+#endif
+
     int64_t result = handler(arg1, arg2, arg3, arg4, arg5, arg6);
+
+#ifdef SMP_BKL
+    if (bkl_held) {
+        bkl_release();
+    }
+#endif
+
+#ifdef SCHED_DEBUG
+    // DIAGNOSTIC: report the RESULT of init's first SYS_SPAWN. The entry marker
+    // above fires before the handler (so it only proves init CALLED spawn); this
+    // fires after, proving whether the child actually LOADED. result>0 = pid
+    // (success); result<0 = load/exec failure (the spawned binary was rejected).
+    if (syscall_num == 16) {
+        static volatile int _spawn_ret_seen = 0;
+        if (!_spawn_ret_seen) {
+            _spawn_ret_seen = 1;
+            extern void framebuffer_puts_scaled(const char*, uint32_t, uint32_t,
+                                                uint32_t, uint32_t);
+            if (result > 0)
+                framebuffer_puts_scaled("spawn RESULT: OK (loaded)", 40, 194, 0x0000FF00u, 2);
+            else
+                framebuffer_puts_scaled("spawn RESULT: FAIL (load rejected)", 40, 194, 0x00FF0000u, 2);
+        }
+    }
+#endif
 
 #ifndef SYSCALL_QUIET
     kprintf("[SYSCALL] Syscall %u returned %d\n", (uint32_t)syscall_num, (int)result);
 #endif
-
-    // End performance measurement
-    PERF_END(PERF_OP_SYSCALL);
 
     return result;
 }

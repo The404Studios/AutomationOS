@@ -62,6 +62,7 @@
 #include "../include/kernel.h"
 #include "../include/string.h"
 #include "../include/drivers.h"   /* timer_get_ticks_ms */
+#include "../include/mem.h"       /* kmalloc (heap-backed OOO side-table)  */
 
 /* ------------------------------------------------------------------ */
 /* Timeouts and retransmit parameters                                  */
@@ -91,15 +92,19 @@ static inline bool SEQ32_GT(uint32_t a, uint32_t b) {
 /* Out-of-order segment side-table                                      */
 /* ------------------------------------------------------------------ */
 /*
- * sock_t has no OOO buffer.  We cannot edit socket.h, so we keep one
- * OOO slot per socket index in a static side-table.  One slot handles
- * the most common case: the server reorders or retransmits a single
- * segment.  If the integrator adds an ooo[] array to sock_t this table
- * should be dropped and sock_t's array used instead.
+ * NET-P1-B: a 4-DEEP out-of-order buffer per socket (was a single slot, so
+ * any reordering of 2+ segments stalled RX until the peer retransmitted).
+ * sock_t stays untouched; the buffer is a side-table indexed by socket slot.
  *
- * TCP_OOO_SLOTS must equal SOCK_MAX.
+ * HEAP-BACKED, not .bss: 16 sockets x 4 slots x ~1.5 KB is ~94 KB -- a
+ * static array that size risks pushing kernel .bss into the GRUB-placed
+ * initrd (the exact reason the socket table itself moved to kmalloc; see
+ * socket.c). Allocated once via tcp_buffers_init() from sock_init(). If the
+ * allocation ever fails the stack degrades CORRECTLY: OOO segments are
+ * simply dropped and the peer retransmits them in order.
  */
-#define TCP_OOO_SLOTS   SOCK_MAX      /* one entry per possible socket      */
+#define TCP_OOO_SLOTS   SOCK_MAX      /* rows: one per possible socket      */
+#define TCP_OOO_DEPTH   4             /* slots per socket (NET-P1-B)        */
 
 typedef struct {
     bool     valid;
@@ -108,7 +113,27 @@ typedef struct {
     uint8_t  data[TCP_MSS];           /* payload (capped at MSS)            */
 } tcp_ooo_slot_t;
 
-static tcp_ooo_slot_t tcp_ooo[TCP_OOO_SLOTS];
+static tcp_ooo_slot_t (*tcp_ooo)[TCP_OOO_DEPTH] = NULL;   /* [SOCK_MAX][4] */
+
+/* Allocate + zero the OOO side-table (idempotent; re-call re-zeroes). */
+void tcp_buffers_init(void) {
+    if (tcp_ooo == NULL) {
+        tcp_ooo = (tcp_ooo_slot_t(*)[TCP_OOO_DEPTH])
+            kmalloc(sizeof(tcp_ooo_slot_t) * TCP_OOO_SLOTS * TCP_OOO_DEPTH);
+        if (tcp_ooo == NULL) {
+            kprintf("[TCP] ooo buffer alloc failed: degrading to no-OOO\n");
+            return;
+        }
+    }
+    memset(tcp_ooo, 0,
+           sizeof(tcp_ooo_slot_t) * TCP_OOO_SLOTS * TCP_OOO_DEPTH);
+}
+
+/* Invalidate every OOO slot belonging to socket index `idx`. */
+static void tcp_ooo_clear(int idx) {
+    if (!tcp_ooo) return;
+    for (int k = 0; k < TCP_OOO_DEPTH; k++) tcp_ooo[idx][k].valid = false;
+}
 
 /*
  * Per-socket retransmit retry counter.  sock_t only has rt_done (bool).
@@ -225,24 +250,248 @@ static void tcp_send_ack(sock_t* s) {
     tcp_xmit(s, TCP_ACK, s->snd_nxt, s->rcv_nxt, NULL, 0);
 }
 
-/* Append in-order stream bytes into the socket RX ring (drop overflow). */
-static void rx_ring_push(sock_t* s, const uint8_t* p, uint16_t n) {
-    for (uint16_t i = 0; i < n; i++) {
-        if (s->rx_used >= SOCK_RXBUF_SIZE) break;   /* ring full -> drop */
-        s->rxbuf[s->rx_tail] = p[i];
-        s->rx_tail = (s->rx_tail + 1) % SOCK_RXBUF_SIZE;
-        s->rx_used++;
+/* ------------------------------------------------------------------ */
+/* NET-P1-A: half-open SYN side-table                                   */
+/* ------------------------------------------------------------------ */
+/*
+ * Passive open used to allocate a FULL sock_t (~45 KB: 32 KB rx ring + UDP
+ * queue + retransmit slot) for every incoming SYN, so a burst of half-opens
+ * drained the 16-slot shared table and starved ALL networking; SYNs past the
+ * backlog were silently dropped. Half-open state is tiny -- hold it in this
+ * compact side-table instead and promote to a real socket only when the
+ * final ACK of the handshake arrives (straight to ESTABLISHED + the accept
+ * queue). The listener's backlog now bounds ESTABLISHED-but-unaccepted
+ * children at promote time; half-opens are bounded by the table itself
+ * (evict-oldest on overflow -- the evicted peer just retransmits its SYN).
+ * SYN-ACK retransmit runs from the table via tcp_synq_tick() (sock_poll).
+ */
+#define TCP_SYNQ_MAX        32       /* half-open capacity (~1 KB total)    */
+#define TCP_SYNQ_RETRY_MS   1000     /* SYN-ACK retransmit cadence          */
+#define TCP_SYNQ_MAX_RETRY  4        /* give up re-SYN-ACKing after this    */
+#define TCP_SYNQ_TTL_MS     16000    /* drop half-opens older than this     */
+#define TCP_SYNQ_WND        32768    /* window advertised in the SYN-ACK    */
+
+typedef struct {
+    bool     valid;
+    uint32_t src_ip;       /* the peer                                     */
+    uint16_t src_port;
+    uint16_t local_port;   /* the listener's port                          */
+    uint32_t isn;          /* OUR initial seq (the SYN-ACK's seq)          */
+    uint32_t rcv_nxt;      /* peer's SYN seq + 1                           */
+    uint16_t peer_wnd;     /* peer's window from the SYN                   */
+    uint64_t born_ms;      /* age (TTL + evict-oldest)                     */
+    uint64_t last_tx_ms;   /* last SYN-ACK transmit                        */
+    uint8_t  retries;
+} tcp_synq_ent_t;
+
+static tcp_synq_ent_t tcp_synq[TCP_SYNQ_MAX];
+
+/* Build + send one socket-less TCP control segment (the side-table has no
+ * sock_t to hang tcp_xmit() off). No payload, no retransmit arming here. */
+static int tcp_xmit_raw(uint32_t remote_ip, uint16_t local_port,
+                        uint16_t remote_port, uint8_t flags,
+                        uint32_t seq, uint32_t ack, uint16_t window) {
+    uint8_t seg[sizeof(tcp_hdr_t)];
+    tcp_hdr_t* th = (tcp_hdr_t*)seg;
+    memset(th, 0, sizeof(*th));
+    th->src_port = net_htons(local_port);
+    th->dst_port = net_htons(remote_port);
+    th->seq      = net_htonl(seq);
+    th->ack      = net_htonl(ack);
+    th->data_off = (uint8_t)((sizeof(tcp_hdr_t) / 4) << 4);
+    th->flags    = flags;
+    th->window   = net_htons(window);
+    th->checksum = net_htons(net_transport_checksum(net_get_ip(), remote_ip,
+                                                    IPPROTO_TCP, seg,
+                                                    sizeof(tcp_hdr_t)));
+    return ip_tx(remote_ip, IPPROTO_TCP, seg, sizeof(tcp_hdr_t));
+}
+
+static tcp_synq_ent_t* synq_find(uint32_t src_ip, uint16_t src_port,
+                                 uint16_t local_port) {
+    for (int i = 0; i < TCP_SYNQ_MAX; i++) {
+        tcp_synq_ent_t* e = &tcp_synq[i];
+        if (e->valid && e->src_ip == src_ip && e->src_port == src_port &&
+            e->local_port == local_port)
+            return e;
+    }
+    return NULL;
+}
+
+/* A SYN arrived at a LISTEN socket: record (or refresh) the half-open in the
+ * side-table and answer with a SYN-ACK. No sock_t is consumed. */
+static void synq_on_syn(sock_t* listener, uint32_t src_ip, uint16_t src_port,
+                        uint32_t seq, uint16_t peer_wnd) {
+    /* Retransmitted SYN for an existing half-open: re-answer with the SAME
+     * ISN (the peer may have missed our first SYN-ACK). */
+    tcp_synq_ent_t* e = synq_find(src_ip, src_port, listener->local_port);
+    if (!e) {
+        /* New half-open: free slot, else evict the OLDEST (that peer simply
+         * retransmits its SYN later -- correct TCP behavior under load). */
+        tcp_synq_ent_t* oldest = &tcp_synq[0];
+        for (int i = 0; i < TCP_SYNQ_MAX; i++) {
+            if (!tcp_synq[i].valid) { e = &tcp_synq[i]; break; }
+            if (tcp_synq[i].born_ms < oldest->born_ms) oldest = &tcp_synq[i];
+        }
+        if (!e) e = oldest;
+        e->valid      = true;
+        e->src_ip     = src_ip;
+        e->src_port   = src_port;
+        e->local_port = listener->local_port;
+        e->isn        = gen_isn();
+        e->rcv_nxt    = seq + 1;          /* their SYN consumes one seq */
+        e->born_ms    = now_ms();
+        e->retries    = 0;
+    }
+    e->peer_wnd   = peer_wnd;
+    e->last_tx_ms = now_ms();
+    tcp_xmit_raw(src_ip, e->local_port, src_port, TCP_SYN | TCP_ACK,
+                 e->isn, e->rcv_nxt, TCP_SYNQ_WND);
+}
+
+/* The final handshake ACK arrived at the LISTEN socket: promote the matching
+ * half-open into a real ESTABLISHED child on the accept queue. This is the
+ * ONLY place passive open consumes a sock_t. */
+static void synq_on_ack(sock_t* listener, uint32_t src_ip, uint16_t src_port,
+                        uint32_t ack, uint16_t peer_wnd) {
+    tcp_synq_ent_t* e = synq_find(src_ip, src_port, listener->local_port);
+    if (!e) return;                              /* stray ACK: ignore       */
+    if (ack != e->isn + 1) return;               /* doesn't ack our SYN-ACK */
+
+    sock_t* base = sock_table_base();
+    if (!base) { e->valid = false; return; }
+
+    /* The backlog bounds ESTABLISHED-but-unaccepted children (half-opens no
+     * longer consume sockets, so this is now its true RFC meaning). */
+    int pending = 0;
+    for (int i = 0; i < SOCK_MAX; i++)
+        if (base[i].used && base[i].parent == listener) pending++;
+    int blcap = listener->backlog;
+    if (blcap <= 0) blcap = 1;
+    if (blcap > SOCK_MAX) blcap = SOCK_MAX;
+
+    sock_t* child = NULL;
+    int child_idx = -1;
+    if (pending < blcap) {
+        for (int i = 0; i < SOCK_MAX; i++) {
+            if (!base[i].used) { child = &base[i]; child_idx = i; break; }
+        }
+    }
+    if (!child) {
+        /* Backlog full or socket table exhausted: the peer believes it is
+         * ESTABLISHED, so an honest RST beats silently eating its data. */
+        tcp_xmit_raw(src_ip, e->local_port, src_port, TCP_RST,
+                     e->isn + 1, e->rcv_nxt, 0);
+        e->valid = false;
+        return;
+    }
+
+    memset(child, 0, sizeof(*child));
+    child->used        = true;
+    child->type        = SOCK_STREAM;
+    child->local_ip    = listener->local_ip;
+    child->local_port  = listener->local_port;
+    child->remote_ip   = src_ip;
+    child->remote_port = src_port;
+    child->parent      = listener;
+    child->owner_pid   = listener->owner_pid;
+    child->snd_wnd     = peer_wnd;
+    child->rcv_nxt     = e->rcv_nxt;
+    child->snd_una     = e->isn + 1;             /* our SYN-ACK is acked    */
+    child->snd_nxt     = e->isn + 1;
+    child->state       = TCP_ESTABLISHED;
+    child->reset       = false;
+
+    tcp_ooo_clear(child_idx);
+    tcp_rt_count[child_idx]   = 0;
+    tcp_rt_rto_ms[child_idx]  = TCP_RTO_INIT_MS;
+
+    /* Accept queue (same push the old SYN_RCVD promotion used). */
+    child->accept_next      = listener->accept_queue;
+    listener->accept_queue  = child;
+
+    e->valid = false;
+}
+
+/* Locate a live listener for a side-table entry's port (NULL if it closed). */
+static sock_t* synq_listener(uint16_t local_port) {
+    sock_t* base = sock_table_base();
+    if (!base) return NULL;
+    for (int i = 0; i < SOCK_MAX; i++) {
+        if (base[i].used && base[i].type == SOCK_STREAM &&
+            base[i].state == TCP_LISTEN && base[i].local_port == local_port)
+            return &base[i];
+    }
+    return NULL;
+}
+
+/* Run the side-table timers: SYN-ACK retransmit (bounded), TTL expiry, and
+ * orphan cleanup when a listener closes. Called once per sock_poll(). */
+void tcp_synq_tick(void) {
+    uint64_t now = now_ms();
+    for (int i = 0; i < TCP_SYNQ_MAX; i++) {
+        tcp_synq_ent_t* e = &tcp_synq[i];
+        if (!e->valid) continue;
+        if (now - e->born_ms >= TCP_SYNQ_TTL_MS ||
+            e->retries >= TCP_SYNQ_MAX_RETRY ||
+            synq_listener(e->local_port) == NULL) {
+            e->valid = false;
+            continue;
+        }
+        if (now - e->last_tx_ms >= TCP_SYNQ_RETRY_MS) {
+            e->retries++;
+            e->last_tx_ms = now;
+            tcp_xmit_raw(e->src_ip, e->local_port, e->src_port,
+                         TCP_SYN | TCP_ACK, e->isn, e->rcv_nxt, TCP_SYNQ_WND);
+        }
     }
 }
 
-static uint32_t rx_ring_pop(sock_t* s, uint8_t* dst, uint32_t want) {
-    uint32_t n = 0;
-    while (n < want && s->rx_used > 0) {
-        dst[n++] = s->rxbuf[s->rx_head];
-        s->rx_head = (s->rx_head + 1) % SOCK_RXBUF_SIZE;
-        s->rx_used--;
+/* Append in-order stream bytes into the socket RX ring. Returns the number of
+ * bytes actually stored (< n if the ring filled). Callers MUST advance rcv_nxt
+ * by the returned count only -- advancing by the full n would ACK bytes we
+ * dropped, so the peer frees them and never retransmits (silent stream loss).
+ *
+ * Uses memcpy (up to two chunks for the wrap case) instead of byte-at-a-time. */
+static uint16_t rx_ring_push(sock_t* s, const uint8_t* p, uint16_t n) {
+    uint32_t free_space = SOCK_RXBUF_SIZE - s->rx_used;
+    uint16_t to_push = (n <= free_space) ? n : (uint16_t)free_space;
+    if (to_push == 0) return 0;
+
+    /* First chunk: from rx_tail to end of buffer (or to_push, whichever smaller). */
+    uint32_t chunk1 = SOCK_RXBUF_SIZE - s->rx_tail;
+    if (chunk1 > to_push) chunk1 = to_push;
+    memcpy(s->rxbuf + s->rx_tail, p, chunk1);
+
+    /* Second chunk: wrap around to the beginning of the buffer. */
+    uint32_t chunk2 = to_push - chunk1;
+    if (chunk2 > 0) {
+        memcpy(s->rxbuf, p + chunk1, chunk2);
     }
-    return n;
+
+    s->rx_tail = (s->rx_tail + to_push) % SOCK_RXBUF_SIZE;
+    s->rx_used += to_push;
+    return to_push;
+}
+
+static uint32_t rx_ring_pop(sock_t* s, uint8_t* dst, uint32_t want) {
+    uint32_t avail = (want <= s->rx_used) ? want : s->rx_used;
+    if (avail == 0) return 0;
+
+    /* First chunk: from rx_head to end of buffer (or avail, whichever smaller). */
+    uint32_t chunk1 = SOCK_RXBUF_SIZE - s->rx_head;
+    if (chunk1 > avail) chunk1 = avail;
+    memcpy(dst, s->rxbuf + s->rx_head, chunk1);
+
+    /* Second chunk: wrap around to the beginning. */
+    uint32_t chunk2 = avail - chunk1;
+    if (chunk2 > 0) {
+        memcpy(dst + chunk1, s->rxbuf, chunk2);
+    }
+
+    s->rx_head = (s->rx_head + avail) % SOCK_RXBUF_SIZE;
+    s->rx_used -= avail;
+    return avail;
 }
 
 /*
@@ -251,18 +500,40 @@ static uint32_t rx_ring_pop(sock_t* s, uint8_t* dst, uint32_t want) {
  * CHANGED: new function to support OOO assembly.
  */
 static void tcp_ooo_drain(sock_t* s) {
+    if (!tcp_ooo) return;
     int idx = sock_index(s);
-    tcp_ooo_slot_t* slot = &tcp_ooo[idx];
 
-    /* Keep flushing as long as the saved segment becomes in-order. */
-    while (slot->valid && slot->seq == s->rcv_nxt) {
-        uint16_t n = slot->len;
-        if (n > (uint16_t)(SOCK_RXBUF_SIZE - s->rx_used))
-            n = (uint16_t)(SOCK_RXBUF_SIZE - s->rx_used);
-        rx_ring_push(s, slot->data, n);
-        s->rcv_nxt += n;
-        slot->valid = false;
-        /* No more slots; a real implementation would loop over an array. */
+    /* NET-P1-B: keep sweeping the 4-slot row until a full pass makes no
+     * progress. Each pass: discard stale slots, merge the slot whose data
+     * meets rcv_nxt (trimming any duplicate prefix). */
+    bool progress = true;
+    while (progress) {
+        progress = false;
+        for (int k = 0; k < TCP_OOO_DEPTH; k++) {
+            tcp_ooo_slot_t* slot = &tcp_ooo[idx][k];
+            if (!slot->valid) continue;
+
+            uint32_t seg_end = slot->seq + slot->len;
+            if (SEQ32_GEQ(s->rcv_nxt, seg_end)) {
+                /* Entirely duplicate by now: free the slot. */
+                slot->valid = false;
+                continue;
+            }
+            if (SEQ32_GT(slot->seq, s->rcv_nxt)) continue;  /* still a gap */
+
+            /* slot->seq <= rcv_nxt < seg_end: trim any duplicate prefix. */
+            uint32_t trim = s->rcv_nxt - slot->seq;
+            uint16_t len  = (uint16_t)(slot->len - trim);
+            /* Only consume the slot if the WHOLE remainder fits. Partially
+             * pushing and clearing would drop the tail forever while
+             * advancing rcv_nxt past it (an ACK lie). Retry after the app
+             * drains the ring. */
+            uint16_t freeb = (uint16_t)(SOCK_RXBUF_SIZE - s->rx_used);
+            if (len > freeb) return;
+            s->rcv_nxt += rx_ring_push(s, slot->data + trim, len);
+            slot->valid = false;
+            progress = true;
+        }
     }
 }
 
@@ -277,9 +548,9 @@ int tcp_connect(sock_t* s, uint32_t dst_ip, uint16_t dst_port) {
     s->local_ip    = net_get_ip();
     if (s->local_port == 0) s->local_port = sock_alloc_port();
 
-    /* Initialise OOO slot and retry counters for this socket. */
+    /* Initialise OOO slots and retry counters for this socket. */
     int idx = sock_index(s);
-    tcp_ooo[idx].valid      = false;
+    tcp_ooo_clear(idx);
     tcp_rt_count[idx]       = 0;
     tcp_rt_rto_ms[idx]      = TCP_RTO_INIT_MS;
 
@@ -312,11 +583,21 @@ int tcp_connect(sock_t* s, uint32_t dst_ip, uint16_t dst_port) {
 /* Send                                                                */
 /* ------------------------------------------------------------------ */
 /*
- * CHANGED: segments payloads > TCP_MSS into multiple consecutive sends
- * instead of truncating.  Waits for each segment's ACK before sending
- * the next (stop-and-wait within a call), respecting the peer's snd_wnd.
+ * Pipelined TCP send with a simple congestion window.
+ *
+ * Instead of stop-and-wait (1 segment in flight, wait for ACK, send next),
+ * we allow up to TCP_CWND_INIT segments in flight before blocking for ACKs.
+ * This is a ~4x throughput improvement on typical LAN RTTs.
+ *
+ * The retransmit bookkeeping only tracks the LAST outstanding segment (the
+ * sock_t structure has a single rt_data slot), so true loss recovery is still
+ * limited.  But for the common no-loss case, pipelining eliminates the
+ * round-trip wait between every segment.
+ *
  * Returns total bytes accepted (may be less than `len` on error mid-way).
  */
+#define TCP_CWND_INIT  4   /* segments in flight before we must wait for ACK */
+
 int tcp_send(sock_t* s, const void* data, uint16_t len) {
     if (s->state != TCP_ESTABLISHED && s->state != TCP_CLOSE_WAIT)
         return SOCK_ECONN;
@@ -324,24 +605,94 @@ int tcp_send(sock_t* s, const void* data, uint16_t len) {
 
     const uint8_t* ptr   = (const uint8_t*)data;
     uint16_t       sent  = 0;
+    uint32_t       in_flight = 0;   /* segments sent but not yet ACKed */
 
     while (sent < len) {
-        /* Wait for any previous outstanding segment to be ACKed. */
-        uint64_t start = now_ms();
-        while (s->rt_pending && now_ms() - start < TCP_CONNECT_MS) {
-            sock_poll();
-            if (s->reset) return sent ? (int)sent : SOCK_ECONN;
+        /* If we've hit the cwnd limit, drain until at least one ACK comes back.
+         * We detect ACKs by watching snd_una advance. */
+        if (in_flight >= TCP_CWND_INIT || s->rt_pending) {
+            uint32_t old_una = s->snd_una;
+            uint64_t start = now_ms();
+            while (now_ms() - start < TCP_CONNECT_MS) {
+                sock_poll();
+                if (s->reset) return sent ? (int)sent : SOCK_ECONN;
+                /* ACKs advanced snd_una -- we can send more. */
+                if (SEQ32_GT(s->snd_una, old_una)) {
+                    /* Estimate how many segments were ACKed. */
+                    uint32_t acked_bytes = s->snd_una - old_una;
+                    uint32_t acked_segs = (acked_bytes + TCP_MSS - 1) / TCP_MSS;
+                    if (acked_segs > in_flight) acked_segs = in_flight;
+                    in_flight -= acked_segs;
+                    break;
+                }
+                /* If retransmit cleared (single outstanding acked), we're good. */
+                if (!s->rt_pending && in_flight > 0) {
+                    in_flight = 0;
+                    break;
+                }
+            }
+            /* If snd_una still hasn't moved, check if rt timed out. */
+            if (in_flight >= TCP_CWND_INIT) {
+                if (s->rt_pending) {
+                    /* Still waiting -- one more brief drain attempt. */
+                    sock_poll();
+                    if (s->reset) return sent ? (int)sent : SOCK_ECONN;
+                    if (!s->rt_pending) { in_flight = 0; continue; }
+                    return sent ? (int)sent : SOCK_ETIMEDOUT;
+                }
+                in_flight = 0;  /* all ACKed if nothing pending */
+            }
         }
-        if (s->rt_pending) return sent ? (int)sent : SOCK_ETIMEDOUT;
 
         /* Determine this segment's size: min(remaining, MSS, peer window). */
         uint16_t chunk = (uint16_t)(len - sent);
         if (chunk > TCP_MSS) chunk = TCP_MSS;
-        /* Respect peer's advertised send window (never send 0-window data). */
-        if (s->snd_wnd > 0 && chunk > s->snd_wnd) chunk = (uint16_t)s->snd_wnd;
+        /* Respect peer's advertised send window (never send 0-window data).
+         * NET-P1-C: the old guard (`snd_wnd > 0 && ...`) skipped the clamp
+         * exactly when the window was ZERO, so the persist branch below was
+         * unreachable and we transmitted INTO a zero window -- the rig's
+         * window-shut peer caught it (probes=0 delivered=1). Every connected
+         * socket carries a real advertised window (sock_socket seeds 1024;
+         * the handshake + every non-RST segment update it), so snd_wnd==0
+         * means the peer genuinely closed its window. */
+        if (chunk > s->snd_wnd) chunk = (uint16_t)s->snd_wnd;
         if (chunk == 0) {
-            /* Peer window is zero: probe with 1-byte segment after a brief poll. */
-            sock_poll();
+            /* NET-P1-C: zero-window PERSIST timer. The old code just spun
+             * sock_poll() here -- no probe and NO BOUND, so a lost window
+             * update deadlocked the send forever inside a syscall (IF=0:
+             * the frozen-tick freeze family). Send a 1-byte probe with
+             * exponential backoff until the peer re-advertises window; the
+             * probe carries the next unsent byte at snd_nxt (snd_nxt is NOT
+             * advanced -- if the peer happens to accept it, the next real
+             * segment resends that byte and the receiver trims the
+             * duplicate prefix). Bounded by wall clock AND the iteration
+             * cap (the load-bearing backstop when ticks are frozen). */
+            uint64_t pstart   = now_ms();
+            uint64_t plast    = 0;
+            uint64_t last_now = pstart;
+            uint32_t pint     = TCP_RTO_INIT_MS;
+            uint32_t frozen   = 0;
+            while (s->snd_wnd == 0) {
+                uint64_t now = now_ms();
+                if (plast == 0 || now - plast >= (uint64_t)pint) {
+                    tcp_xmit(s, TCP_ACK, s->snd_nxt, s->rcv_nxt,
+                             ptr + sent, 1);
+                    plast = now;
+                    pint *= 2;
+                    if (pint > TCP_RTO_MAX_MS) pint = TCP_RTO_MAX_MS;
+                }
+                sock_poll();
+                if (s->reset) return sent ? (int)sent : SOCK_ECONN;
+                if (now - pstart >= TCP_CONNECT_MS)
+                    return sent ? (int)sent : SOCK_ETIMEDOUT;
+                /* Frozen-tick backstop: the cap counts only CONSECUTIVE
+                 * iterations where the millisecond clock did not move, so it
+                 * fires exactly in the IF=0/frozen-PIT condition it guards
+                 * against and never races the wall-clock budget above. */
+                if (now != last_now) { last_now = now; frozen = 0; }
+                else if (++frozen >= 200000)
+                    return sent ? (int)sent : SOCK_ETIMEDOUT;
+            }
             continue;
         }
 
@@ -351,14 +702,27 @@ int tcp_send(sock_t* s, const void* data, uint16_t len) {
             return sent ? (int)sent : SOCK_ECONN;
 
         s->snd_nxt += chunk;
+        /* Arm retransmit for this latest segment (overwrites previous -- only
+         * the tail of the pipeline is retransmittable, which is acceptable for
+         * the common no-loss case and matches the single-slot rt_data design). */
         tcp_arm_retransmit(s, TCP_ACK | TCP_PSH, seq, ptr + sent, chunk);
         sent = (uint16_t)(sent + chunk);
+        in_flight++;
 
-        /* Best-effort wait for ACK so we don't overrun the peer. */
-        start = now_ms();
+        /* Non-blocking poll: pick up any ACKs that arrived while we were
+         * building and transmitting, without waiting a full RTT. */
+        sock_poll();
+        if (s->reset) return sent ? (int)sent : SOCK_ECONN;
+        if (!s->rt_pending) in_flight = 0;
+    }
+
+    /* Final drain: wait briefly for the last segment's ACK so the caller
+     * doesn't close the connection before the peer has confirmed receipt. */
+    if (s->rt_pending) {
+        uint64_t start = now_ms();
         while (s->rt_pending && now_ms() - start < TCP_CONNECT_MS) {
             sock_poll();
-            if (s->reset) return sent ? (int)sent : SOCK_ECONN;
+            if (s->reset) break;
         }
     }
 
@@ -403,9 +767,8 @@ int tcp_recv(sock_t* s, void* buf, uint16_t len) {
 int tcp_close(sock_t* s) {
     if (s->state == TCP_CLOSED) return SOCK_OK;
 
-    /* Clear OOO side-table slot on close. */
-    int idx = sock_index(s);
-    tcp_ooo[idx].valid = false;
+    /* Clear OOO side-table slots on close. */
+    tcp_ooo_clear(sock_index(s));
 
     if (s->state == TCP_ESTABLISHED || s->state == TCP_CLOSE_WAIT) {
         uint32_t seq = s->snd_nxt;
@@ -477,50 +840,16 @@ void tcp_input(uint32_t src_ip, uint32_t dst_ip,
 
     switch (s->state) {
     case TCP_LISTEN:
-        /* Server-side: handle incoming SYN for passive connection. */
+        /* NET-P1-A: passive open runs through the half-open SYN side-table.
+         * A SYN records ~32 B of state + answers SYN-ACK (NO sock_t burned);
+         * the final handshake ACK promotes the entry into an ESTABLISHED
+         * child on the accept queue -- the only point a socket is consumed.
+         * A SYN flood now exhausts a 1 KB table (evict-oldest) instead of
+         * starving every socket in the system. */
         if (flags & TCP_SYN) {
-            /* Allocate a new child socket for this connection. */
-            sock_t* base = sock_table_base();
-            if (!base) return;
-
-            sock_t* child = NULL;
-            int child_idx = -1;
-            for (int i = 0; i < SOCK_MAX; i++) {
-                if (!base[i].used) {
-                    child = &base[i];
-                    child_idx = i;
-                    break;
-                }
-            }
-            if (!child) return;  /* No free sockets */
-
-            /* Initialize the child socket. */
-            memset(child, 0, sizeof(*child));
-            child->used       = true;
-            child->type       = SOCK_STREAM;
-            child->local_ip   = s->local_ip;
-            child->local_port = s->local_port;
-            child->remote_ip  = src_ip;
-            child->remote_port = src_port;
-            child->parent     = s;
-            child->snd_wnd    = net_ntohs(th->window);
-
-            /* Initialize TCP state machine. */
-            child->rcv_nxt    = seq + 1;      /* SYN consumes one seq */
-            uint32_t isn      = gen_isn();
-            child->snd_una    = isn;
-            child->snd_nxt    = isn + 1;      /* SYN-ACK will consume one seq */
-            child->state      = TCP_SYN_RCVD;
-            child->reset      = false;
-
-            /* Initialize retransmit machinery for the child. */
-            tcp_ooo[child_idx].valid = false;
-            tcp_rt_count[child_idx]  = 0;
-            tcp_rt_rto_ms[child_idx] = TCP_RTO_INIT_MS;
-
-            /* Send SYN-ACK to complete the 3-way handshake. */
-            tcp_xmit(child, TCP_SYN | TCP_ACK, isn, child->rcv_nxt, NULL, 0);
-            tcp_arm_retransmit(child, TCP_SYN | TCP_ACK, isn, NULL, 0);
+            synq_on_syn(s, src_ip, src_port, seq, net_ntohs(th->window));
+        } else if (flags & TCP_ACK) {
+            synq_on_ack(s, src_ip, src_port, ack, net_ntohs(th->window));
         }
         return;
 
@@ -597,8 +926,9 @@ void tcp_input(uint32_t src_ip, uint32_t dst_ip,
 
             if (seq == s->rcv_nxt) {
                 /* --- In-order segment --- */
-                rx_ring_push(s, payload, payload_len);
-                s->rcv_nxt += payload_len;
+                /* Advance only by bytes actually buffered: if the ring is full
+                 * the dropped tail stays un-ACKed so the peer retransmits it. */
+                s->rcv_nxt += rx_ring_push(s, payload, payload_len);
                 /* Try to merge any previously-saved OOO segment. */
                 tcp_ooo_drain(s);
                 tcp_send_ack(s);
@@ -610,26 +940,40 @@ void tcp_input(uint32_t src_ip, uint32_t dst_ip,
                 const uint8_t* new_start = payload + trim;
                 uint16_t       new_len   = (uint16_t)(payload_len - trim);
                 if (new_len > 0) {
-                    rx_ring_push(s, new_start, new_len);
-                    s->rcv_nxt += new_len;
+                    s->rcv_nxt += rx_ring_push(s, new_start, new_len);
                     tcp_ooo_drain(s);
                 }
                 tcp_send_ack(s);
 
             } else if (SEQ32_GT(seq, s->rcv_nxt)) {
-                /* --- Out-of-order segment: save in side-table slot --- */
-                int idx = sock_index(s);
-                tcp_ooo_slot_t* slot = &tcp_ooo[idx];
-
-                /* Only save if the slot is empty or this segment is
-                 * closer to rcv_nxt (prefer earlier segments). */
-                if (!slot->valid || SEQ32_GT(slot->seq, seq)) {
-                    uint16_t save_len = payload_len;
-                    if (save_len > TCP_MSS) save_len = TCP_MSS;
-                    slot->valid = true;
-                    slot->seq   = seq;
-                    slot->len   = save_len;
-                    memcpy(slot->data, payload, save_len);
+                /* --- Out-of-order segment: save in the 4-slot row --- */
+                /* NET-P1-B: dedupe by seq, take a free slot, else evict the
+                 * slot FARTHEST from rcv_nxt if this segment is nearer
+                 * (earlier data fills the gap sooner). No buffer (alloc
+                 * failed at boot) degrades to drop + re-ACK: correct, the
+                 * peer retransmits in order. */
+                if (tcp_ooo) {
+                    int idx = sock_index(s);
+                    tcp_ooo_slot_t* dst = NULL;
+                    tcp_ooo_slot_t* far = NULL;
+                    bool dup = false;
+                    for (int k = 0; k < TCP_OOO_DEPTH; k++) {
+                        tcp_ooo_slot_t* slot = &tcp_ooo[idx][k];
+                        if (slot->valid && slot->seq == seq) { dup = true; break; }
+                        if (!slot->valid) { if (!dst) dst = slot; continue; }
+                        if (!far || SEQ32_GT(slot->seq, far->seq)) far = slot;
+                    }
+                    if (!dup) {
+                        if (!dst && far && SEQ32_GT(far->seq, seq)) dst = far;
+                        if (dst) {
+                            uint16_t save_len = payload_len;
+                            if (save_len > TCP_MSS) save_len = TCP_MSS;
+                            dst->valid = true;
+                            dst->seq   = seq;
+                            dst->len   = save_len;
+                            memcpy(dst->data, payload, save_len);
+                        }
+                    }
                 }
                 /* ACK our current position to prompt the server to
                  * fill the gap or retransmit the missing segment. */

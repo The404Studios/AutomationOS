@@ -53,8 +53,8 @@ int main(void) {
         return 1;
     }
 
-    char buf[64];
-    int len = sprintf(buf, "[PASS] Created shared memory segment ID: %d\n", shm_id);
+    char buf[256];
+    int len = snprintf(buf, sizeof(buf), "[PASS] Created shared memory segment ID: %d\n", shm_id);
     write(STDOUT_FILENO, buf, len);
 
     // ========================================================================
@@ -69,7 +69,7 @@ int main(void) {
         return 1;
     }
 
-    len = sprintf(buf, "[PASS] Attached at address: %p\n", surface);
+    len = snprintf(buf, sizeof(buf), "[PASS] Attached at address: %p\n", surface);
     write(STDOUT_FILENO, buf, len);
 
     // ========================================================================
@@ -94,11 +94,11 @@ int main(void) {
     // ========================================================================
     write(STDOUT_FILENO, "\n[TEST 4] Reading from shared memory...\n", 41);
 
-    len = sprintf(buf, "[PASS] Window: %s (%dx%d)\n",
+    len = snprintf(buf, sizeof(buf), "[PASS] Window: %s (%dx%d)\n",
                   surface->title, surface->width, surface->height);
     write(STDOUT_FILENO, buf, len);
 
-    len = sprintf(buf, "[PASS] First pixel: 0x%08X\n", surface->pixel_data[0]);
+    len = snprintf(buf, sizeof(buf), "[PASS] First pixel: 0x%08X\n", surface->pixel_data[0]);
     write(STDOUT_FILENO, buf, len);
 
     // ========================================================================
@@ -114,7 +114,7 @@ int main(void) {
         return 1;
     }
 
-    len = sprintf(buf, "[PASS] Created message queue ID: %d\n", msg_id);
+    len = snprintf(buf, sizeof(buf), "[PASS] Created message queue ID: %d\n", msg_id);
     write(STDOUT_FILENO, buf, len);
 
     // ========================================================================
@@ -167,7 +167,7 @@ int main(void) {
     if (recv_len < 0) {
         write(STDOUT_FILENO, "[FAIL] msgrcv failed\n", 21);
     } else {
-        len = sprintf(buf, "[PASS] Received message (type=%ld): %s\n",
+        len = snprintf(buf, sizeof(buf), "[PASS] Received message (type=%ld): %s\n",
                       recv_msg.mtype, recv_msg.mtext);
         write(STDOUT_FILENO, buf, len);
     }
@@ -177,7 +177,7 @@ int main(void) {
     if (recv_len < 0) {
         write(STDOUT_FILENO, "[FAIL] msgrcv failed (specific type)\n", 38);
     } else {
-        len = sprintf(buf, "[PASS] Received message (type=%ld): %s\n",
+        len = snprintf(buf, sizeof(buf), "[PASS] Received message (type=%ld): %s\n",
                       recv_msg.mtype, recv_msg.mtext);
         write(STDOUT_FILENO, buf, len);
     }

@@ -17,8 +17,11 @@ multiboot_header:
     dd MBCHECKSUM
     dd 0, 0, 0, 0, 0         ; address fields (unused)
     dd 0                      ; mode_type: 0 = linear graphics
-    dd 1024                   ; width
-    dd 768                    ; height
+    ; Request the T410's NATIVE panel resolution (1280x800). GRUB's gfxpayload
+    ; chain in grub.cfg provides safe fallbacks (1024x768 -> auto) for VBEs that
+    ; lack 1280x800, so a framebuffer is always set even when native is missing.
+    dd 1280                   ; width  (was 1024; T410 native is 1280x800)
+    dd 800                    ; height (was 768)
     dd 32                     ; depth
 
 section .boot
@@ -121,6 +124,18 @@ _start:
 
 [BITS 64]
 long_mode_start:
+    ; CRITICAL — clear the Direction Flag before ANY string op.
+    ; Multiboot/GRUB hands off with EFLAGS.DF *undefined*, and the 32-bit CPUID
+    ; probe above ends with `popfd` (restoring the ORIGINAL, possibly DF=1, flags).
+    ; The `rep movsb` (initrd rescue) and `rep stosq` (BSS clear) below — plus
+    ; every compiler-emitted `rep movs`/`rep stos` in the C kernel, which all
+    ; assume DF=0 per the SysV ABI — would otherwise run BACKWARDS when DF=1.
+    ; On QEMU GRUB happens to leave DF=0 so it boots; on the real T410 GRUB can
+    ; leave DF=1, copying the initrd (and thus /sbin/init) backwards into garbage
+    ; -> hard freeze at ring-3 entry with the scheduler's yellow markers frozen
+    ; on screen. One byte, fixes it for the entire kernel lifetime.
+    cld
+
     ; Set up 64-bit segments
     mov ax, 0x10
     mov ds, ax

@@ -85,6 +85,43 @@ static inline int fpu_state_is_uninitialised(const uint8_t* fpu_state) {
     return (mxcsr == 0);
 }
 
+// Initialize the FPU template ONCE, eagerly. Called from scheduler_init() (SMP
+// builds) and scheduler_start() (all builds, T410 cold-start fix) so the very
+// first enter_usermode IRETQ runs with a sane MXCSR. Idempotent.
+void context_fpu_template_init(void) {
+    if (!fpu_template_ready) fpu_init_template();
+}
+
+// Externally-visible wrappers so scheduler_start() can prime the first process's
+// FPU state without duplicating the inline detection / template-copy logic.
+int fpu_state_needs_init(const uint8_t* fpu_state) {
+    return fpu_state_is_uninitialised(fpu_state);
+}
+
+void fpu_state_prime(uint8_t* fpu_state) {
+    if (!fpu_template_ready) fpu_init_template();
+    __builtin_memcpy(fpu_state, fpu_template, 512);
+}
+
+#if defined(SMP_SCHED) && defined(SMP_SCHED_DISPATCH)
+// AP-safe FPU priming (Brick F3 fix D6). The CPU1 dispatcher (ap_cooperative_schedule)
+// calls context_switch_asm() DIRECTLY, bypassing context_switch()'s template priming
+// above — so a fresh process's all-zero fpu_state would fxrstor MXCSR=0 (all SSE
+// exceptions unmasked) and a ring-3 app's first SSE op would #XM with no handler.
+// Call this on `to` BEFORE the AP's context_switch_asm. It writes ONLY `to`'s own
+// fpu_state (no global state), so it is safe to run on CPU1. Idempotent: only primes
+// the uninitialised (memset-zeroed) sentinel; an already-saved FPU state is left alone.
+void context_prime_fpu(process_t* to) {
+    if (!to) return;
+    if (__builtin_expect(!fpu_template_ready, 0)) {
+        fpu_init_template();
+    }
+    if (fpu_state_is_uninitialised(to->context.fpu_state)) {
+        __builtin_memcpy(to->context.fpu_state, fpu_template, 512);
+    }
+}
+#endif
+
 // C wrapper for context switching
 void context_switch(process_t* from, process_t* to) {
     // Start performance measurement
@@ -175,11 +212,20 @@ void context_switch(process_t* from, process_t* to) {
     // with heavy munmap activity.
     tlb_flush_pending();
 
+    // STACK CANARY CHECK: verify the outgoing process's kernel stack has not
+    // overflowed before we save its state. Catching it here (the single
+    // cooperative-switch chokepoint) rather than in a random fault gives a clear
+    // panic with the process name, PID, and the corrupted canary value.
+    STACK_CANARY_CHECK(from);
+
     // GPF-001 fix: Set re-entrancy guard before the assembly switch.
     // This prevents the timer handler from calling schedule() re-entrantly
     // if the timer somehow fires during the switch (even though we've removed
     // the `sti` that created the race window, this is a safety net).
-    __atomic_store_n(&scheduler_in_switch, 1, __ATOMIC_SEQ_CST);
+    // Wave-7 perf: RELAXED is sufficient — scheduler_in_switch is a single-CPU
+    // re-entrancy guard read by the timer ISR on the SAME core. No cross-CPU
+    // ordering is required; SEQ_CST added unnecessary fence instructions.
+    __atomic_store_n(&scheduler_in_switch, 1, __ATOMIC_RELAXED);
 
     // Perform the actual context switch
     // This will save 'from' registers and restore 'to' registers
@@ -187,7 +233,7 @@ void context_switch(process_t* from, process_t* to) {
 
     // When we return here, we've been context-switched back.
     // Clear the re-entrancy guard.
-    __atomic_store_n(&scheduler_in_switch, 0, __ATOMIC_SEQ_CST);
+    __atomic_store_n(&scheduler_in_switch, 0, __ATOMIC_RELAXED);
 
     // End performance measurement
     PERF_END(PERF_OP_CONTEXT_SWITCH);

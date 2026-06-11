@@ -101,10 +101,16 @@ ap_pmode_entry:
     mov eax, [AP_TRAMPOLINE_BASE + AP_PARAM_OFFSET + 0]   ; ap_param_cr3 (low 32)
     mov cr3, eax
 
-    ; Enable long mode in EFER (MSR 0xC0000080, LME = bit 8)
+    ; Enable long mode + No-Execute in EFER (MSR 0xC0000080, LME=bit 8, NXE=bit 11).
+    ; NXE is PER-CPU: the BSP enables it in paging_init, but the AP must enable its
+    ; own. Without NXE here, the NX bit (63) the kernel sets on data mappings (incl.
+    ; the higher-half DIRECT MAP) is a RESERVED bit on CPU1 -- so CPU1 takes a
+    ; reserved-bit #PF (err=0x8) the instant it reads a kmalloc'd offload operand via
+    ; PHYS_TO_DIRECT in matmul_band_n (the smpstress crash long misread as a direct-map
+    ; "alias" coherence bug). Set NXE with LME, before CR0.PG below.
     mov ecx, 0xC0000080
     rdmsr
-    or eax, 1 << 8
+    or eax, (1 << 8) | (1 << 11)
     wrmsr
 
     ; Enable paging (CR0.PG = bit 31). PE is already set.

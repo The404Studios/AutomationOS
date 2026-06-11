@@ -148,6 +148,89 @@ static void mp_collect_calls(Func* f, AstNode* n, int depth) {
 }
 
 /* ----------------------------------------------------------------------- */
+/* PASS 0: pre-parse scan of preprocessor tokens for #include and #define  */
+/* (called before parser_init strips them).                                */
+/* ----------------------------------------------------------------------- */
+static int mp_startswith(const char* s, int len, const char* prefix) {
+    int i = 0;
+    if (!s || !prefix) return 0;
+    while (prefix[i]) {
+        if (i >= len) return 0;
+        if (s[i] != prefix[i]) return 0;
+        i++;
+    }
+    return 1;
+}
+
+static void mp_pass_preproc(Model* m, const char* src, int src_len) {
+    /* Scan each line looking for #include and #define directives. */
+    int pos = 0, line = 1;
+    while (pos < src_len) {
+        /* skip leading whitespace on the line */
+        while (pos < src_len && (src[pos] == ' ' || src[pos] == '\t')) pos++;
+
+        if (pos < src_len && src[pos] == '#') {
+            pos++; /* skip '#' */
+            /* skip spaces after '#' */
+            while (pos < src_len && (src[pos] == ' ' || src[pos] == '\t')) pos++;
+
+            int remaining = src_len - pos;
+
+            if (mp_startswith(src + pos, remaining, "include")) {
+                /* #include directive */
+                pos += 7; /* skip "include" */
+                while (pos < src_len && (src[pos] == ' ' || src[pos] == '\t')) pos++;
+                if (m->nincludes < M_MAXINCLUDES) {
+                    Include* inc = &m->includes[m->nincludes];
+                    inc->line = line;
+                    inc->path[0] = '\0';
+                    /* extract the path: "foo.h" or <foo.h> */
+                    if (pos < src_len && (src[pos] == '"' || src[pos] == '<')) {
+                        char close = (src[pos] == '"') ? '"' : '>';
+                        int pstart = pos;
+                        pos++;
+                        while (pos < src_len && src[pos] != close && src[pos] != '\n') pos++;
+                        if (pos < src_len && src[pos] == close) pos++;
+                        int plen = pos - pstart;
+                        if (plen > M_NAME - 1) plen = M_NAME - 1;
+                        for (int i = 0; i < plen; i++) inc->path[i] = src[pstart + i];
+                        inc->path[plen] = '\0';
+                    }
+                    m->nincludes++;
+                }
+            } else if (mp_startswith(src + pos, remaining, "define")) {
+                /* #define directive */
+                pos += 6; /* skip "define" */
+                while (pos < src_len && (src[pos] == ' ' || src[pos] == '\t')) pos++;
+                if (m->nmacros < M_MAXMACROS) {
+                    Macro* mac = &m->macros[m->nmacros];
+                    mac->line = line;
+                    mac->name[0] = '\0';
+                    /* extract macro name (identifier chars) */
+                    int nstart = pos;
+                    while (pos < src_len && ((src[pos] >= 'a' && src[pos] <= 'z') ||
+                           (src[pos] >= 'A' && src[pos] <= 'Z') ||
+                           (src[pos] >= '0' && src[pos] <= '9') ||
+                           src[pos] == '_')) pos++;
+                    int nlen = pos - nstart;
+                    if (nlen > 0) {
+                        if (nlen > M_NAME - 1) nlen = M_NAME - 1;
+                        for (int i = 0; i < nlen; i++) mac->name[i] = src[nstart + i];
+                        mac->name[nlen] = '\0';
+                        m->nmacros++;
+                    }
+                }
+            }
+        }
+
+        /* advance to end of line */
+        while (pos < src_len && src[pos] != '\n') pos++;
+        if (pos < src_len) pos++; /* skip '\n' */
+        line++;
+    }
+}
+
+/* ----------------------------------------------------------------------- */
 /* PASS 1: top-level globals                                               */
 /* ----------------------------------------------------------------------- */
 static void mp_pass_globals(Model* m, AstNode* root) {
@@ -164,6 +247,53 @@ static void mp_pass_globals(Model* m, AstNode* root) {
         g->nreaders = 0;
         g->nwriters = 0;
         m->nglobals++;
+    }
+}
+
+/* ----------------------------------------------------------------------- */
+/* PASS 1b: top-level records (struct/union/enum) and typedefs             */
+/* ----------------------------------------------------------------------- */
+static void mp_pass_records(Model* m, AstNode* root) {
+    for (AstNode* c = root->first_child; c; c = c->next) {
+        if (c->kind == AST_RECORD) {
+            if (m->nrecords >= M_MAXRECORDS) continue;
+            Record* r = &m->records[m->nrecords];
+            ide_strlcpy(r->name, c->name, M_NAME);
+            /* figure out the kind tag from the type_str or by context */
+            r->kind_tag[0] = '\0';
+            if (c->type_str[0])
+                ide_strlcpy(r->kind_tag, c->type_str, 16);
+            else
+                ide_strlcpy(r->kind_tag, "struct", 16);
+            r->line = c->span.start_line;
+            r->nfields = c->nchildren;
+            m->nrecords++;
+        } else if (c->kind == AST_TYPEDEF) {
+            if (m->nrecords >= M_MAXRECORDS) continue;
+            Record* r = &m->records[m->nrecords];
+            ide_strlcpy(r->name, c->name, M_NAME);
+            ide_strlcpy(r->kind_tag, "typedef", 16);
+            r->line = c->span.start_line;
+            r->nfields = 0;
+            m->nrecords++;
+        }
+    }
+}
+
+/* ----------------------------------------------------------------------- */
+/* PASS 1c: top-level function prototypes                                  */
+/* ----------------------------------------------------------------------- */
+static void mp_pass_protos(Model* m, AstNode* root) {
+    for (AstNode* c = root->first_child; c; c = c->next) {
+        if (c->kind != AST_FUNC_PROTO) continue;
+        if (m->nprotos >= M_MAXPROTOS) break;
+        if (!c->name[0]) continue;
+
+        Proto* pr = &m->protos[m->nprotos];
+        ide_strlcpy(pr->name, c->name, M_NAME);
+        ide_strlcpy(pr->ret,  c->type_str, M_TYPE);
+        pr->line = c->span.start_line;
+        m->nprotos++;
     }
 }
 
@@ -219,24 +349,147 @@ static void mp_pass_funcs(Model* m, AstNode* root) {
     }
 }
 
+/* ======================================================================= */
+/* ASM model builder: assembly files ALSO populate the Semantic LEGO Map.  */
+/* Each code label (name:) becomes a node ("function"); `call`/`jmp`/jcc to */
+/* a label is an outgoing edge -> the map renders the control-flow graph.   */
+/* `global`/`extern` directives become protos; data labels (db/dd/...)      */
+/* become globals. Supports both NASM (global foo) and GAS (.globl foo,     */
+/* labels like .L1) syntax. Freestanding line scanner; no AST.              */
+/* ======================================================================= */
+static char mp_lower(char c){ return (c >= 'A' && c <= 'Z') ? (char)(c - 'A' + 'a') : c; }
+static int  mp_asm_ident(char c){
+    return (c>='a'&&c<='z')||(c>='A'&&c<='Z')||(c>='0'&&c<='9')||c=='_'||c=='.'||c=='$'||c=='@';
+}
+static int mp_is_reg(const char* s){
+    static const char* const regs[] = {
+        "rax","rbx","rcx","rdx","rsi","rdi","rbp","rsp",
+        "r8","r9","r10","r11","r12","r13","r14","r15",
+        "eax","ebx","ecx","edx","esi","edi","ebp","esp",
+        "ax","bx","cx","dx","al","bl","cl","dl","ah","bh","ch","dh", 0 };
+    for (int i = 0; regs[i]; i++) if (ide_streq(s, regs[i])) return 1;
+    return 0;
+}
+/* filename ends with .asm / .s / .S / .inc / .nasm (case-insensitive)? */
+static int mp_filename_is_asm(const char* fn){
+    if (!fn) return 0;
+    int n = 0; while (fn[n]) n++;
+    int dot = -1;
+    for (int i = n - 1; i >= 0 && fn[i] != '/'; i--) if (fn[i] == '.') { dot = i; break; }
+    if (dot < 0) return 0;
+    char e[8]; int el = 0;
+    for (int i = dot + 1; i < n && el < 7; i++) e[el++] = mp_lower(fn[i]);
+    e[el] = 0;
+    return ide_streq(e,"asm") || ide_streq(e,"s") || ide_streq(e,"inc") || ide_streq(e,"nasm");
+}
+
+static void mp_parse_asm(Model* m, const char* src, int len){
+    int pos = 0, line = 1;
+    Func* cur = 0;
+    while (pos < len) {
+        int le = pos; while (le < len && src[le] != '\n') le++;     /* line = [pos, le) */
+        int i = pos; while (i < le && (src[i] == ' ' || src[i] == '\t')) i++;
+        int lineend = le;
+        for (int k = i; k < le; k++) if (src[k] == ';') { lineend = k; break; }  /* strip ; comment */
+
+        /* label?  ident ':'  */
+        if (i < lineend) {
+            int j = i; while (j < lineend && mp_asm_ident(src[j])) j++;
+            if (j > i && j < lineend && src[j] == ':') {
+                char name[M_NAME]; int nl = j - i; if (nl > M_NAME - 1) nl = M_NAME - 1;
+                for (int x = 0; x < nl; x++) name[x] = src[i + x]; name[nl] = 0;
+                /* data label? next token is a data/reserve directive */
+                int r = j + 1; while (r < lineend && (src[r] == ' ' || src[r] == '\t')) r++;
+                char d[8]; int dl = 0;
+                for (int rr = r; rr < lineend && mp_asm_ident(src[rr]) && dl < 7; rr++) d[dl++] = mp_lower(src[rr]);
+                d[dl] = 0;
+                int is_data = ide_streq(d,"db")||ide_streq(d,"dw")||ide_streq(d,"dd")||ide_streq(d,"dq")||
+                              ide_streq(d,"resb")||ide_streq(d,"resw")||ide_streq(d,"resd")||ide_streq(d,"resq")||
+                              ide_streq(d,"equ")||ide_streq(d,"times");
+                if (cur) cur->line_end = (line > 1 ? line - 1 : line);
+                if (is_data) {
+                    if (m->nglobals < M_MAXGLOBALS && mp_global_index(m, name) < 0) {
+                        Global* g = &m->globals[m->nglobals++];
+                        ide_strlcpy(g->name, name, M_NAME); ide_strlcpy(g->type, "data", M_TYPE);
+                        ide_strlcpy(g->file, m->cur_file, M_NAME); g->nreaders = 0; g->nwriters = 0;
+                    }
+                    cur = 0;
+                    pos = (le < len) ? le + 1 : le; line++; continue;
+                }
+                if (m->nfuncs < M_MAXFUNCS) {
+                    cur = &m->funcs[m->nfuncs++];
+                    ide_strlcpy(cur->name, name, M_NAME); ide_strlcpy(cur->ret, "label", M_TYPE);
+                    ide_strlcpy(cur->file, m->cur_file, M_NAME);
+                    cur->line_start = line; cur->line_end = line;
+                    cur->nparams = 0; cur->ncalls = 0; cur->nreads = 0; cur->nwrites = 0;
+                    cur->nports = 0; cur->closed = 0;
+                } else cur = 0;
+                i = j + 1;   /* scan the rest of the line for an instruction (e.g. "foo: call bar") */
+            }
+        }
+
+        /* instruction / directive on the rest of the line */
+        while (i < lineend && (src[i] == ' ' || src[i] == '\t')) i++;
+        if (i < lineend) {
+            int j = i; while (j < lineend && mp_asm_ident(src[j])) j++;
+            char mn[16]; int ml = j - i; if (ml > 15) ml = 15;
+            for (int x = 0; x < ml; x++) mn[x] = mp_lower(src[i + x]); mn[ml] = 0;
+            const char* mnn = (mn[0] == '.') ? mn + 1 : mn;   /* normalize GAS .globl etc. */
+            int o = j; while (o < lineend && (src[o] == ' ' || src[o] == '\t')) o++;
+            int oe = o; while (oe < lineend && mp_asm_ident(src[oe])) oe++;
+            char op[M_NAME]; int ol = oe - o; if (ol > M_NAME - 1) ol = M_NAME - 1;
+            for (int x = 0; x < ol; x++) op[x] = src[o + x]; op[ol] = 0;
+
+            if (ide_streq(mnn,"global") || ide_streq(mnn,"globl") || ide_streq(mnn,"extern")) {
+                if (op[0] && !mp_is_reg(op) && m->nprotos < M_MAXPROTOS) {
+                    Proto* pr = &m->protos[m->nprotos++];
+                    ide_strlcpy(pr->name, op, M_NAME);
+                    ide_strlcpy(pr->ret, ide_streq(mnn,"extern") ? "extern" : "global", M_TYPE);
+                    pr->line = line;
+                }
+            } else if (cur && op[0] && !mp_is_reg(op)) {
+                int isctl = ide_streq(mnn,"call") || (mnn[0] == 'j' && ide_strlen(mnn) <= 4);  /* call / jmp / jcc */
+                if (isctl) mp_list_add(cur->calls, &cur->ncalls, M_MAXCALLS, op);
+            }
+        }
+        pos = (le < len) ? le + 1 : le; line++;
+    }
+    if (cur) cur->line_end = (line > 1 ? line - 1 : line);
+}
+
 /* ----------------------------------------------------------------------- */
 /* entry point                                                             */
 /* ----------------------------------------------------------------------- */
-void model_parse(Model* m, const char* src, int len, const char* filename) {
+/* IDE-XFILE-0: the reset half of the old fused reset+parse. Callers that
+ * build a MULTI-FILE model reset once, then model_parse_append() per file. */
+void model_reset(Model* m) {
     if (!m) return;
-
-    /* 1. reset model */
-    m->nfuncs   = 0;
-    m->nglobals = 0;
-    m->nconns   = 0;
-    m->nrisks   = 0;
-    m->nactions = 0;
-    m->nflow    = 0;
-    m->focus    = -1;
+    m->nfuncs    = 0;
+    m->nglobals  = 0;
+    m->nincludes = 0;
+    m->nmacros   = 0;
+    m->nrecords  = 0;
+    m->nprotos   = 0;
+    m->nconns    = 0;
+    m->nrisks    = 0;
+    m->nactions  = 0;
+    m->nflow     = 0;
+    m->focus     = -1;
     m->coherence = 0;
     m->analyzed  = 0;
     m->lexed     = 0;
     m->parsed    = 0;
+    m->total_lines = 0;
+}
+
+/* IDE-XFILE-0: parse ONE file's source INTO m without clearing prior files.
+ * The transient parse state (token buffer + AST arena) is reset per call by
+ * parser_init/parse_translation_unit, so only the Model accumulates. Sets
+ * cur_file=basename and total_lines for THIS file -- last caller wins, so a
+ * multi-file driver parses the OPEN file last. Body = the old model_parse
+ * minus the reset; NO new parser features. */
+void model_parse_append(Model* m, const char* src, int len, const char* filename) {
+    if (!m) return;
 
     /* line count = number of '\n' + 1 (empty buffer -> 1 line) */
     int lines = 1;
@@ -261,7 +514,20 @@ void model_parse(Model* m, const char* src, int len, const char* filename) {
         return;
     }
 
-    /* 2. parse to an AST */
+    /* Assembly files: build the model from labels + call/jmp edges (a real
+     * control-flow graph) instead of the C parser, so .asm/.s ALSO render in
+     * the Semantic LEGO Map. */
+    if (mp_filename_is_asm(filename)) {
+        mp_parse_asm(m, src, len);
+        m->lexed  = 1;
+        m->parsed = 1;
+        return;
+    }
+
+    /* 2a. pre-parse scan for #include / #define (before parser_init strips them) */
+    mp_pass_preproc(m, src, len);
+
+    /* 2b. parse to an AST */
     parser_init(&P, src, len, toks, PARSE_MAX_TOKS);
     m->lexed = 1;
     AstNode* root = parse_translation_unit(&P);
@@ -270,11 +536,20 @@ void model_parse(Model* m, const char* src, int len, const char* filename) {
     if (root) {
         mp_pass_globals(m, root);   /* PASS 1: globals first (so func walk
                                        can recognise global references)     */
+        mp_pass_records(m, root);   /* PASS 1b: structs/typedefs/enums      */
+        mp_pass_protos(m, root);    /* PASS 1c: function prototypes         */
         mp_pass_funcs(m, root);     /* PASS 2: functions + bodies           */
     }
 
     /* 5. status */
     m->parsed = 1;
     /* NOTE: model_analyze() is called by the caller next; do not call here.
-     * focus was reset to -1 above; the caller sets it afterward. */
+     * focus was reset by model_reset(); the caller sets it afterward. */
+}
+
+/* The legacy fused entry point: single-file reset+parse, byte-for-byte the
+ * old behavior (every existing caller keeps working unchanged). */
+void model_parse(Model* m, const char* src, int len, const char* filename) {
+    model_reset(m);
+    model_parse_append(m, src, len, filename);
 }

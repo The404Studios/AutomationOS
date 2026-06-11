@@ -51,6 +51,13 @@ int64_t sys_kill(uint64_t pid, uint64_t sig, uint64_t arg3,
         return EINVAL;
     }
 
+    // Reject PIDs that don't fit in 32 bits BEFORE the (uint32_t) casts below,
+    // so a value like 0x1_00000001 can't truncate to a valid low PID (e.g. 1 =
+    // init) and signal the wrong process.
+    if (pid > 0xFFFFFFFFULL) {
+        return ESRCH;
+    }
+
     // Special case: sig=0 just checks if process exists.
     // process_get_by_pid takes a ref; process_unref drops it before return.
     // Ref balance: +1 (get_by_pid) -1 (unref) = 0. Correct.
@@ -116,6 +123,20 @@ int64_t sys_kill(uint64_t pid, uint64_t sig, uint64_t arg3,
             // KILL-FIX-002.  No double-remove, no double-unref.
             kprintf("[KILL] Sending SIGKILL to process %u (%s)\n",
                     target->pid, target->name);
+            // #9 kill-while-blocked: if the victim is BLOCKED on a wait_object,
+            // force-unlink it so the object-ref it holds is dropped. Snapshot
+            // wait_on BEFORE marking TERMINATED. Without this, an event-only waiter
+            // (futex/waitpid/epoll, not on the timer sleep list) stays linked
+            // forever, the object-ref leaks, ref_count never reaches 0, and the PCB
+            // is never reaped. wait_object_abort is idempotent vs a racing signal.
+            // target is kept alive by our get_by_pid ref, so the unref can't free it
+            // mid-handler.
+            {
+                struct wait_object* wo = target->wait_on;
+                if (target->state == PROCESS_BLOCKED && wo) {
+                    wait_object_abort(wo, target);
+                }
+            }
             target->state = PROCESS_TERMINATED;
             target->exit_status = 128 + SIGKILL;   // conventional "killed by sig"
             process_on_terminate(target);          // wake a waitpid'ing parent
@@ -127,6 +148,14 @@ int64_t sys_kill(uint64_t pid, uint64_t sig, uint64_t arg3,
             // Same ref/removal semantics as SIGKILL above.
             kprintf("[KILL] Sending SIGTERM to process %u (%s)\n",
                     target->pid, target->name);
+            // Same blocked-waiter reclamation as SIGKILL above (#9): drop the
+            // stranded wait_object ref so a BLOCKED victim becomes a reapable zombie.
+            {
+                struct wait_object* wo = target->wait_on;
+                if (target->state == PROCESS_BLOCKED && wo) {
+                    wait_object_abort(wo, target);
+                }
+            }
             target->state = PROCESS_TERMINATED;
             target->exit_status = 128 + SIGTERM;
             process_on_terminate(target);
@@ -159,6 +188,7 @@ int64_t sys_kill(uint64_t pid, uint64_t sig, uint64_t arg3,
                     target->pid, target->name);
             if (target->state == PROCESS_RUNNING || target->state == PROCESS_READY) {
                 target->state = PROCESS_BLOCKED;
+                target->stopped_by_signal = 1;
                 scheduler_remove_process(target);
             }
             break;
@@ -191,8 +221,9 @@ int64_t sys_kill(uint64_t pid, uint64_t sig, uint64_t arg3,
             // SIGCONT to a READY or RUNNING process is a no-op per POSIX.
             kprintf("[KILL] Sending SIGCONT to process %u (%s)\n",
                     target->pid, target->name);
-            if (target->state == PROCESS_BLOCKED) {
-                target->state = PROCESS_READY;
+            if (target->state == PROCESS_BLOCKED && target->stopped_by_signal) {
+                target->stopped_by_signal = 0;
+                process_set_ready(target);
                 scheduler_add_process(target);
                 // Note: scheduler_add_process() calls process_ref() internally,
                 // so after this call target->ref_count is incremented by 1 for

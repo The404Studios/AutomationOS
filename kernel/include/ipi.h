@@ -16,17 +16,34 @@
  */
 
 // IPI function call structure
+// NOTE: When wait=true, this lives on sender's stack (blocked until completion).
+//       When wait=false, caller MUST ensure this outlives all target IPIs (heap/static).
 typedef struct ipi_call {
     void (*func)(void* data);           // Function to call
     void* data;                         // Argument
-    volatile uint32_t done_count;       // Number of CPUs that finished
-    volatile uint32_t ack_count;        // Number of CPUs that acknowledged
+    uint32_t done_count;                // Number of CPUs that finished (atomic)
+    uint32_t ack_count;                 // Number of CPUs that acknowledged (atomic)
     cpumask_t target_mask;              // Target CPUs
     bool wait;                          // Wait for completion?
 } ipi_call_t;
 
+// Bounded per-CPU array size for the IPI subsystem (SMP-G0). smp.h's MAX_CPUS
+// is 256, which would put ~120 KB of IPI queues/stats into the packed .bss --
+// pure pressure on the < 0x200000 user-shadow boundary (linker.ld: user ELFs
+// link at 0x200000 and shadow any kernel global above it under their CR3; the
+// IPI queues are touched from IPI handlers that run under ARBITRARY CR3, so
+// they MUST stay in the packed low .bss). 8 matches the scheduler's own local
+// MAX_CPUS; the live machine model is 2 (BSP + AP1).
+#define IPI_MAX_CPUS 8
+
 // IPI initialization
 void ipi_init(void);
+
+// SMP-G0 IPI-LINK acceptance: BSP sends one IPI_RESCHEDULE to CPU1, CPU1's
+// handler increments its counter, BSP bounded-polls and prints
+// "IPILINK: PASS ipi_resched=1 cpu1_count=1" (or FAIL). Call on the BSP only,
+// after CPU1 is online and taking interrupts (post Brick E/F2).
+void ipi_link_selftest(void);
 
 // Send IPI to specific CPU
 void ipi_send(uint32_t cpu, uint32_t vector);
@@ -64,6 +81,16 @@ void ipi_handle_reschedule(void);
 void ipi_handle_tlb_flush(void);
 void ipi_handle_function_call(void);
 void ipi_handle_stop(void);
+void ipi_handle_tlb_flush_page(void);   // SMP-G2: bounded kernel-range invlpg
+
+// SMP-G2 TLBSHOOT-MIN: bounded, ack-counted KERNEL-range shootdown (local
+// invlpg + IPI_TLB_FLUSH_PAGE to CPU1). User ranges need only a LOCAL invlpg
+// under the pin/no-migration model -- see the loud assumption block in ipi.c.
+// Call from lock-free, IF=1 context ONLY (law 16). Returns 0 = remote
+// confirmed, -1 = remote unconfirmed (timeout/refusal; local flush done).
+int ipi_tlb_flush_kernel_range(void* addr, uint64_t npages);
+void tlb_shootdown_selftest(void);      // prints TLBSHOOT + TLBSHOOT_NEG gates
+extern volatile uint32_t g_tlb_invariant_violations;
 
 // IPI statistics
 typedef struct {
@@ -77,7 +104,12 @@ typedef struct {
     uint64_t stop_received;
 } ipi_stats_t;
 
-extern ipi_stats_t ipi_stats[MAX_CPUS];
+extern ipi_stats_t ipi_stats[IPI_MAX_CPUS];
+
+// SMP-G1: per-CPU wake flag (set by the IPI_RESCHEDULE handler on the target
+// CPU; consumed by that CPU's idle loop inside its cli'd check window).
+extern volatile uint32_t ipi_need_resched[IPI_MAX_CPUS];
+uint32_t ipi_consume_need_resched(void);   // call with interrupts DISABLED
 
 void ipi_print_stats(void);
 

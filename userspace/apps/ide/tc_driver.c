@@ -98,6 +98,23 @@ static const char* find_ext(const char* path)
     return dot;
 }
 
+/* Copy the directory part of `path` (everything up to, not including, the final
+ * separator) into out[0..cap-1]. If there is no separator, out becomes "" (the
+ * current/relative dir). Always NUL-terminates. */
+static void dirname_of(const char* path, char* out, int cap)
+{
+    int last = -1, i;
+    if (!out || cap <= 0) return;
+    out[0] = '\0';
+    if (!path) return;
+    for (i = 0; path[i]; i++)
+        if (path[i] == '/' || path[i] == '\\') last = i;
+    if (last < 0) return;                 /* no directory component */
+    if (last > cap - 1) last = cap - 1;
+    for (i = 0; i < last; i++) out[i] = path[i];
+    out[i] = '\0';
+}
+
 /* Derive the basename (no directory, no extension) into out[0..cap-1]. */
 static void basename_noext(const char* path, char* out, int cap)
 {
@@ -152,6 +169,22 @@ TcLang tc_lang_of(const char* path)
     return LANG_UNKNOWN;
 }
 
+/* Optional one-shot output override (set by the IDE for project builds). When
+ * g_out_override_dir[0] != 0, the next tc_build writes <dir>/<base>.elf instead
+ * of the default /Desktop/<srcbase>.elf. The IDE clears it after each project
+ * build so loose-file builds keep landing on the desktop. */
+static char g_out_override_dir[160];
+static char g_out_override_base[64];
+void tc_set_output_override(const char* dir, const char* base) {
+    if (dir && base && dir[0] && base[0]) {
+        sk_copy(g_out_override_dir,  dir,  (int)sizeof(g_out_override_dir));
+        sk_copy(g_out_override_base, base, (int)sizeof(g_out_override_base));
+    } else {
+        g_out_override_dir[0]  = 0;
+        g_out_override_base[0] = 0;
+    }
+}
+
 int tc_build(const char* path, TcResult* res)
 {
     int srclen;
@@ -173,7 +206,14 @@ int tc_build(const char* path, TcResult* res)
     srclen = ide_read_file(path, g_src, TC_ASM_CAP);
     if (srclen < 0) {
         res->ok = 0;
-        set_msg(res, "cannot read file");
+        /* Build a message that includes the filename so the user knows what failed. */
+        {
+            int mi = 0;
+            sk_copy(res->message, "cannot read '", (int)sizeof(res->message));
+            mi = 13;  /* length of "cannot read '" */
+            mi += sk_copy(res->message + mi, path, (int)sizeof(res->message) - mi);
+            sk_copy(res->message + mi, "' -- check file exists", (int)sizeof(res->message) - mi);
+        }
         return 0;
     }
     if (srclen > TC_ASM_CAP - 1)      /* clamp; keep room for NUL */
@@ -187,9 +227,20 @@ int tc_build(const char* path, TcResult* res)
         AstNode* tu;
         parser_init(&g_P, g_src, srclen, g_toks, PARSE_MAX_TOKS);
         tu = parse_translation_unit(&g_P);
+        /* If the AST node pool overflowed, the tree is SILENTLY truncated (further
+         * ast_new() return a shared sentinel) -- feeding that to codegen yields
+         * wrong asm or a null-deref crash. Fail cleanly instead. */
+        if (ast_arena_full()) {
+            res->ok = 0;
+            set_msg(res, "source too large: AST node pool exhausted -- split the file");
+            return 0;
+        }
         if (!cc_compile(tu, g_asm, TC_ASM_CAP, res->diags, &res->ndiags)) {
             res->ok = 0;
-            set_msg(res, "C compile failed");
+            if (res->ndiags > 0)
+                set_msg(res, "C compile failed -- see diagnostics below");
+            else
+                set_msg(res, "C compile failed (codegen error)");
             copy_preview(res, g_asm);
             return 0;
         }
@@ -216,7 +267,10 @@ int tc_build(const char* path, TcResult* res)
                      &res->code_len, res->diags, &res->ndiags)
         || res->code_len <= 0) {
         res->ok = 0;
-        set_msg(res, "assembly failed");
+        if (res->ndiags > 0)
+            set_msg(res, "assembly failed -- see diagnostics below");
+        else
+            set_msg(res, "assembly failed (no instructions produced)");
         copy_preview(res, g_asm);
         return 0;
     }
@@ -230,38 +284,70 @@ int tc_build(const char* path, TcResult* res)
     }
     res->elf_len = elen;
 
-    /* 6. output path "/Desktop/<base>" and write the ELF; fall back to
-     *    "/tmp/<base>" if the Desktop write fails for any reason so a build
-     *    never silently fails. */
+    /* 6. The PRIMARY deliverable is a runnable ELF on the DESKTOP, named after
+     *    the PROGRAM (e.g. /Desktop/hello.elf), so it shows up as a clickable
+     *    icon and is directly SYS_SPAWN-able. The compositor enumerates /Desktop
+     *    and SYS_SPAWNs a file icon on double-click.
+     *
+     *    (Previously the primary output went to "<srcdir>/build/<base>.elf" and
+     *    the desktop copy was named after the source *directory*. For the default
+     *    scratch project rooted at /usr/src/native that produced
+     *    /Desktop/native.elf and made every build look like it "went into native"
+     *    instead of onto the desktop. The desktop path named after the program is
+     *    the one the user expects.) Falls back to /tmp so a build never silently
+     *    fails even if /Desktop is read-only. A best-effort copy is still dropped
+     *    into "<srcdir>/build/" so the project explorer can reveal it in-tree. */
     basename_noext(path, base, (int)sizeof(base));
 
     /* preview is independent of where we write. */
     copy_preview(res, g_asm);
 
-    /* Ensure /Desktop exists (ignore "already exists" / any mkdir error). */
-    ide_sc(67 /* SYS_MKDIR */, (long)"/Desktop", 0755, 0, 0, 0, 0);
-
-    /* Try /Desktop first. */
-    sk_copy(res->out_path, "/Desktop/", (int)sizeof(res->out_path));
-    {
-        int n = ide_strlen(res->out_path);
-        sk_copy(res->out_path + n, base,
-                (int)sizeof(res->out_path) - n);
+    /* Output path. A project build (IDE override) writes <dir>/<base>.elf into
+     * the project's build/ folder; a loose-file build writes /Desktop/<srcbase>.elf. */
+    if (g_out_override_dir[0]) {
+        ide_sc(67 /* SYS_MKDIR */, (long)g_out_override_dir, 0755, 0, 0, 0, 0);
+        sk_copy(res->out_dir, g_out_override_dir, (int)sizeof(res->out_dir));
+        int n = sk_copy(res->out_path, g_out_override_dir, (int)sizeof(res->out_path));
+        n += sk_copy(res->out_path + n, "/", (int)sizeof(res->out_path) - n);
+        n += sk_copy(res->out_path + n, g_out_override_base, (int)sizeof(res->out_path) - n);
+        sk_copy(res->out_path + n, ".elf", (int)sizeof(res->out_path) - n);
+    } else {
+        ide_sc(67 /* SYS_MKDIR */, (long)"/Desktop", 0755, 0, 0, 0, 0);
+        sk_copy(res->out_dir, "/Desktop", (int)sizeof(res->out_dir));
+        int n = sk_copy(res->out_path, "/Desktop/", (int)sizeof(res->out_path));
+        n += sk_copy(res->out_path + n, base, (int)sizeof(res->out_path) - n);
+        sk_copy(res->out_path + n, ".elf", (int)sizeof(res->out_path) - n);
     }
 
-    /* 7. write the ELF, with /tmp fallback. */
+    /* 7. write the ELF, with a /tmp fallback so a build never silently fails. */
     if (ide_write_file(res->out_path, (char*)g_elf, elen) < 0) {
-        /* Fall back to /tmp/<base> (the original behavior). */
-        sk_copy(res->out_path, "/tmp/", (int)sizeof(res->out_path));
-        {
-            int n = ide_strlen(res->out_path);
-            sk_copy(res->out_path + n, base,
-                    (int)sizeof(res->out_path) - n);
-        }
+        ide_sc(67 /* SYS_MKDIR */, (long)"/tmp", 0755, 0, 0, 0, 0);
+        sk_copy(res->out_dir, "/tmp", (int)sizeof(res->out_dir));
+        int n = sk_copy(res->out_path, "/tmp/", (int)sizeof(res->out_path));
+        n += sk_copy(res->out_path + n, base, (int)sizeof(res->out_path) - n);
+        sk_copy(res->out_path + n, ".elf", (int)sizeof(res->out_path) - n);
         if (ide_write_file(res->out_path, (char*)g_elf, elen) < 0) {
             res->ok = 0;
-            set_msg(res, "elf write failed (/Desktop and /tmp)");
+            set_msg(res, "elf write failed");
             return 0;
+        }
+    }
+
+    /* 7b. Loose-file builds only: drop a best-effort copy into
+     * "<srcdir>/build/<base>.elf" so the project explorer can reveal it. Project
+     * builds already write into <root>/build, so this is skipped for them. */
+    if (!g_out_override_dir[0]) {
+        char dir[160];
+        dirname_of(path, dir, (int)sizeof(dir));
+        if (dir[0]) {
+            char bpath[200];
+            int n  = sk_copy(bpath, dir, (int)sizeof(bpath));
+            n += sk_copy(bpath + n, "/build", (int)sizeof(bpath) - n);
+            ide_sc(67 /* SYS_MKDIR */, (long)bpath, 0755, 0, 0, 0, 0);
+            n += sk_copy(bpath + n, "/", (int)sizeof(bpath) - n);
+            n += sk_copy(bpath + n, base, (int)sizeof(bpath) - n);
+            sk_copy(bpath + n, ".elf", (int)sizeof(bpath) - n);
+            ide_write_file(bpath, (char*)g_elf, elen);   /* best-effort; ignore failure */
         }
     }
 

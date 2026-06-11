@@ -20,6 +20,7 @@
  */
 
 #include "../include/net.h"
+#include "../include/netif.h"
 #include "../include/types.h"
 #include "../include/kernel.h"
 #include "../include/string.h"
@@ -404,6 +405,15 @@ static int ip_reassemble(const ipv4_hdr_t* ip, uint16_t ip_avail,
         if (fr->holes[i]) return 0; /* still have holes */
     }
 
+    /* The reassembled IP packet is ihl + total_len bytes. DROP anything that would
+     * not fit the FRAG_BUF_SIZE output buffer: the payload memcpy below writes at
+     * out_buf + ihl for total_len bytes, so ihl + total_len (up to ~65555) would
+     * overrun the 65535-byte buffer. This also keeps the IP total-length field valid. */
+    if ((uint32_t)ihl + (uint32_t)fr->total_len > FRAG_BUF_SIZE) {
+        fr->valid = false;
+        return -1;
+    }
+
     /* Reassembly complete! Build the reassembled packet. */
     /* Copy IP header from first fragment (reconstruct). */
     memcpy(out_buf, ip, ihl);
@@ -482,6 +492,15 @@ static void icmp_echo_reply(const eth_hdr_t* eh, const ipv4_hdr_t* ip,
     uint16_t off = eth_build(f, eh->src, ETH_P_IP);
 
     ipv4_hdr_t* oip = (ipv4_hdr_t*)(f + off);
+    // Clamp the echoed ICMP length so the whole reply fits g_frame[ETH_MAX_FRAME].
+    // oic lands at off + sizeof(ipv4_hdr_t), so at most ETH_MAX_FRAME-off-20 ICMP
+    // bytes fit. Without this, a reassembled/oversized (fragmented) echo request
+    // overflows g_frame by up to 16 bytes AND net_send emits a bogus ~65K on-wire
+    // length. Clamp BEFORE ip_total so the memcpy and net_send below both use it.
+    {
+        uint16_t max_icmp = (uint16_t)(ETH_MAX_FRAME - off - sizeof(ipv4_hdr_t));
+        if (icmp_len > max_icmp) icmp_len = max_icmp;
+    }
     uint16_t ip_total = (uint16_t)(sizeof(ipv4_hdr_t) + icmp_len);
     oip->ver_ihl   = 0x45;
     oip->tos       = 0;
@@ -496,8 +515,7 @@ static void icmp_echo_reply(const eth_hdr_t* eh, const ipv4_hdr_t* ip,
     oip->checksum  = net_htons(inet_checksum(oip, sizeof(ipv4_hdr_t)));
 
     icmp_hdr_t* oic = (icmp_hdr_t*)((uint8_t*)oip + sizeof(ipv4_hdr_t));
-    if (icmp_len > ETH_MTU) icmp_len = ETH_MTU;
-    memcpy(oic, req, icmp_len);
+    memcpy(oic, req, icmp_len);   // icmp_len already clamped to fit g_frame above
     oic->type     = ICMP_ECHO_REPLY;
     oic->code     = 0;
     oic->checksum = 0;
@@ -527,7 +545,11 @@ static void ipv4_input(const eth_hdr_t* eh, const uint8_t* ip_start,
 
     /* If fragmented, reassemble. */
     if (is_fragment) {
-        uint8_t reasm_buf[FRAG_BUF_SIZE];
+        /* FRAG_BUF_SIZE is 64KB -- WAY past the 8KB/16KB kernel stack, so this
+         * MUST NOT be a stack array (any fragmented packet would smash the
+         * stack). Static .bss instead; the net RX path is single-threaded on
+         * this uniprocessor kernel, same assumption as net.frags et al. */
+        static uint8_t reasm_buf[FRAG_BUF_SIZE];
         uint16_t reasm_len = 0;
         int r = ip_reassemble(ip, ip_avail, reasm_buf, &reasm_len);
         if (r < 0) return; /* error */
@@ -546,7 +568,13 @@ static void ipv4_input(const eth_hdr_t* eh, const uint8_t* ip_start,
     if (ip->proto == IPPROTO_ICMP) {
         uint16_t icmp_len = tot - ihl;
         if (icmp_len < sizeof(icmp_hdr_t)) return;
-        const icmp_hdr_t* ic = (const icmp_hdr_t*)(ip_start + ihl);
+        /* Derive the ICMP header from `ip`, NOT ip_start: after reassembly `ip`
+         * points at reasm_buf while ip_start still points at the small original
+         * fragment. Reading icmp_len (reassembled-length) bytes from ip_start
+         * would read past the 1518-byte NIC buffer (OOB read leaked on the wire)
+         * and parse stale first-fragment bytes. On the non-fragment path
+         * ip == ip_start so this is unchanged. */
+        const icmp_hdr_t* ic = (const icmp_hdr_t*)((const uint8_t*)ip + ihl);
 
         if (ic->type == ICMP_ECHO_REPLY) {
             net.got_echo_reply = true;
@@ -607,6 +635,14 @@ uint32_t net_get_ip(void) {
     return net.up ? net.ip : 0;
 }
 
+void net_set_ip(uint32_t ip) {
+    net.ip = ip;
+}
+
+void net_set_gateway(uint32_t gw) {
+    net.gateway = gw;
+}
+
 bool net_up(void) {
     return net.up;
 }
@@ -641,6 +677,25 @@ int net_init(void) {
             net.mac[0], net.mac[1], net.mac[2],
             net.mac[3], net.mac[4], net.mac[5]);
 
+    /* Register the default "eth0" interface in the netif registry so that
+     * SYS_NET_INFO returns the full net_info_ext_t struct that userspace
+     * (DHCP client, nettool, etc.) expects. */
+    {
+        netif_t eth0;
+        memset(&eth0, 0, sizeof(eth0));
+        memcpy(eth0.name, "eth0", 5);
+        memcpy(eth0.mac, net.mac, ETH_ALEN);
+        eth0.ip      = net.ip;
+        eth0.netmask = 0xFFFFFF00u;         /* 255.255.255.0 */
+        eth0.gateway = net.gateway;
+        eth0.dns     = NET_QEMU_DNS;        /* 10.0.2.3      */
+        eth0.up      = true;
+        eth0.tx      = (g_nic == NIC_RTL8139) ? rtl8139_tx : e1000_tx;
+        eth0.rx_poll = (g_nic == NIC_RTL8139) ? rtl8139_rx_poll : e1000_rx_poll;
+        eth0.get_mac = (g_nic == NIC_RTL8139) ? rtl8139_get_mac : e1000_get_mac;
+        netif_register(&eth0);
+    }
+
     /* Gateway ARP pre-resolve (settle loop).
      * -----------------------------------------------------------------
      * A previous attempt busy-polled net_recv() a fixed iteration count right
@@ -671,7 +726,12 @@ int net_init(void) {
          * this cap `resolved` stays false forever and the boot HANGS here. The
          * cap bounds the settle to a finite number of RX-drain passes. */
         uint32_t iters = 0;
-        const uint32_t iter_cap = 2000000u;
+        /* The cap bounds the settle to a finite number of RX-drain passes.
+         * 200K iterations is still generous for the QEMU happy path (reply
+         * arrives within ~1000 iterations) and keeps the T410 stall under
+         * ~0.5s even on a slow bus. The previous 2M cap burned ~2-3s of
+         * wall-clock time in tight polling on real hardware. */
+        const uint32_t iter_cap = 200000u;
 
         while (!resolved && iters++ < iter_cap) {
             uint64_t now = timer_get_ticks_ms();
@@ -693,14 +753,63 @@ int net_init(void) {
 
         if (resolved) {
             kprintf("[NET] gateway 10.0.2.2 is at "
-                    "%02x:%02x:%02x:%02x:%02x:%02x\n",
+                    "%02x:%02x:%02x:%02x:%02x:%02x (after %u iters)\n",
                     gwmac[0], gwmac[1], gwmac[2],
-                    gwmac[3], gwmac[4], gwmac[5]);
+                    gwmac[3], gwmac[4], gwmac[5], iters);
         } else {
             kprintf("[NET] WARN: gateway 10.0.2.2 ARP pre-resolve timed out "
-                    "after %ums\n", (unsigned)budget_ms);
+                    "after %u iters (~%ums budget)\n", iters, (unsigned)budget_ms);
         }
     }
+    return 0;
+}
+
+/*
+ * E1000-PCH-0B: attach the network stack to a NIC that came up AFTER boot.
+ *
+ * The T410's 82577LM defers its risky ME-shared-MDIO bring-up out of boot
+ * (E1000-PCH-0A); when the operator triggers it (nicup -> SYS_NET_CONFIG
+ * NIC_BRINGUP) this completes the stack side: backend selection, MAC, the
+ * static fallback config, routes, and the eth0 netif registration that
+ * net_init() does on the boot path. NO ARP settle loop here -- the caller
+ * runs post-desktop and dhcpc/ping perform their own capped resolves.
+ * Idempotent: returns 0 if the stack is already up.
+ */
+int net_attach_late(void) {
+    if (net.up) return 0;
+
+    extern int e1000_pch_deferred_bringup(void);
+    int r = e1000_pch_deferred_bringup();
+    if (r != 0) return r;                    /* -1 aborted / -2 not deferred */
+    if (e1000_get_mac(net.mac) != 0) return -1;
+    g_nic = NIC_E1000;
+
+    /* Static fallback config (a real LAN replaces this via dhcpc ->
+     * SYS_NET_CONFIG immediately after). */
+    net.ip      = NET_QEMU_GUEST;
+    net.gateway = NET_QEMU_GATEWAY;
+    net.up      = true;
+
+    extern void route_init(void);
+    route_init();
+
+    {
+        netif_t eth0;
+        memset(&eth0, 0, sizeof(eth0));
+        memcpy(eth0.name, "eth0", 5);
+        memcpy(eth0.mac, net.mac, ETH_ALEN);
+        eth0.ip      = net.ip;
+        eth0.netmask = 0xFFFFFF00u;
+        eth0.gateway = net.gateway;
+        eth0.dns     = NET_QEMU_DNS;
+        eth0.up      = true;
+        eth0.tx      = e1000_tx;
+        eth0.rx_poll = e1000_rx_poll;
+        eth0.get_mac = e1000_get_mac;
+        netif_register(&eth0);               /* no-op if eth0 already exists */
+    }
+
+    kprintf("[NET] late-attach: eth0 up (deferred PCH bring-up complete)\n");
     return 0;
 }
 
@@ -784,4 +893,23 @@ void net_selftest(void) {
     } else {
         kprintf("[NET] PING 10.0.2.2 FAILED (no reply)\n");
     }
+}
+
+/* ------------------------------------------------------------------ */
+/* ARP table export (used by SYS_ARP_TABLE syscall)                    */
+/* ------------------------------------------------------------------ */
+int net_get_arp_table(arp_info_t* out, int max) {
+    if (!out || max <= 0) return 0;
+
+    int n = 0;
+    for (int i = 0; i < ARP_CACHE_SIZE && n < max; i++) {
+        if (net.arp[i].valid && net.arp[i].ip != 0) {
+            out[n].ip = net.arp[i].ip;
+            memcpy(out[n].mac, net.arp[i].mac, ETH_ALEN);
+            out[n].valid = 1;
+            out[n]._pad  = 0;
+            n++;
+        }
+    }
+    return n;
 }

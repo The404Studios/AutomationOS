@@ -47,20 +47,24 @@ typedef struct {
  * sysinfo_t  —  system-wide resource snapshot
  *
  * Byte layout:
- *   offset  0  uint64_t  total_mem    8 bytes   (bytes, from pmm_get_total_memory)
- *   offset  8  uint64_t  free_mem     8 bytes   (bytes, from pmm_get_free_memory)
- *   offset 16  uint64_t  uptime_ms    8 bytes   (milliseconds, timer_get_ticks_ms)
- *   offset 24  uint32_t  proc_count   4 bytes   (live processes in table)
- *   offset 28  uint32_t  _pad         4 bytes   (reserved, always 0)
+ *   offset  0  uint64_t  total_mem      8 bytes   (bytes, from pmm_get_total_memory)
+ *   offset  8  uint64_t  free_mem       8 bytes   (bytes, from pmm_get_free_memory)
+ *   offset 16  uint64_t  uptime_ms      8 bytes   (milliseconds, timer_get_ticks_ms)
+ *   offset 24  uint32_t  proc_count     4 bytes   (live processes in table)
+ *   offset 28  uint32_t  heap_used_kb   4 bytes   (kernel heap usage in KiB)
  *   -------
  *   total: 32 bytes
+ *
+ * ABI note: heap_used_kb replaces the former _pad field (which was always 0).
+ * Old userspace ignoring this field is unaffected; new userspace can read it
+ * to detect kernel heap leaks (monitor growth over time).
  * ------------------------------------------------------------------------- */
 typedef struct {
     uint64_t total_mem;     /*  0 — total physical memory in bytes          */
     uint64_t free_mem;      /*  8 — free physical memory in bytes           */
     uint64_t uptime_ms;     /* 16 — milliseconds since boot                 */
     uint32_t proc_count;    /* 24 — number of live processes                */
-    uint32_t _pad;          /* 28 — reserved, always 0                      */
+    uint32_t heap_used_kb;  /* 28 — kernel heap bytes in use / 1024         */
     /* Total: 32 bytes */
 } sysinfo_t;
 

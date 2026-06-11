@@ -180,7 +180,6 @@ void render_processes_tab(const ui_state_t* ui, const process_info_t* procs, int
 // Render performance tab
 void render_performance_tab(const system_stats_t* stats, const perf_history_t* history) {
     printf("\n");
-    char buf[32];
 
     // CPU usage
     printf(COLOR_BOLD "CPU Usage" COLOR_RESET " (%d cores)\n", stats->cpu_count);
@@ -224,10 +223,11 @@ void render_performance_tab(const system_stats_t* stats, const perf_history_t* h
     printf(COLOR_BOLD "Memory Usage" COLOR_RESET "\n");
     printf("────────────────────────────────────────────────────────────────────────────────\n");
 
-    uint64_t mem_percent = (stats->memory_used * 100) / stats->memory_total;
+    uint64_t mem_percent = stats->memory_total ? (stats->memory_used * 100) / stats->memory_total : 0;
+    char buf_used[32], buf_total[32];
     printf("  Used:   %s / %s (%llu%%)\n",
-           format_bytes(stats->memory_used, buf, sizeof(buf)),
-           format_bytes(stats->memory_total, buf, sizeof(buf)),
+           format_bytes(stats->memory_used, buf_used, sizeof(buf_used)),
+           format_bytes(stats->memory_total, buf_total, sizeof(buf_total)),
            mem_percent);
 
     printf("  [");
@@ -247,27 +247,30 @@ void render_performance_tab(const system_stats_t* stats, const perf_history_t* h
     }
     printf("]\n");
 
+    char buf_cached[32], buf_buffers[32];
     printf("  Cached: %s    Buffers: %s\n",
-           format_bytes(stats->memory_cached, buf, sizeof(buf)),
-           format_bytes(stats->memory_buffers, buf, sizeof(buf)));
+           format_bytes(stats->memory_cached, buf_cached, sizeof(buf_cached)),
+           format_bytes(stats->memory_buffers, buf_buffers, sizeof(buf_buffers)));
 
     printf("\n");
 
     // Disk I/O
     printf(COLOR_BOLD "Disk I/O" COLOR_RESET "\n");
     printf("────────────────────────────────────────────────────────────────────────────────\n");
+    char buf_dread[32], buf_dwrite[32];
     printf("  Read:  %s    Write: %s\n",
-           format_rate(stats->disk_read_rate, buf, sizeof(buf)),
-           format_rate(stats->disk_write_rate, buf, sizeof(buf)));
+           format_rate(stats->disk_read_rate, buf_dread, sizeof(buf_dread)),
+           format_rate(stats->disk_write_rate, buf_dwrite, sizeof(buf_dwrite)));
 
     printf("\n");
 
     // Network I/O
     printf(COLOR_BOLD "Network I/O" COLOR_RESET "\n");
     printf("────────────────────────────────────────────────────────────────────────────────\n");
+    char buf_nrecv[32], buf_nsend[32];
     printf("  Recv:  %s    Send: %s\n",
-           format_rate(stats->net_recv_rate, buf, sizeof(buf)),
-           format_rate(stats->net_send_rate, buf, sizeof(buf)));
+           format_rate(stats->net_recv_rate, buf_nrecv, sizeof(buf_nrecv)),
+           format_rate(stats->net_send_rate, buf_nsend, sizeof(buf_nsend)));
 
     printf("\n");
 

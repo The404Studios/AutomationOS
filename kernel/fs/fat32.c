@@ -99,7 +99,9 @@ static ssize_t fat32_vfs_read(vfs_file_t* file, void* buf, size_t count) {
         return 0;
     }
 
-    if (file->offset + count > vfs_inode->size) {
+    /* offset < size is guaranteed above, so size - offset is safe; comparing this
+     * way avoids the offset+count overflow that let a huge `count` skip the clamp. */
+    if (count > vfs_inode->size - file->offset) {
         count = vfs_inode->size - file->offset;
     }
 
@@ -189,22 +191,25 @@ static int fat32_vfs_close(vfs_file_t* file) {
 
 /**
  * VFS lseek operation for FAT32
+ *
+ * BUG-FIX (underflow): the old code assigned directly without validating,
+ * so a negative offset for SEEK_SET, or a negative SEEK_CUR/SEEK_END that
+ * exceeds the current position/file size, would wrap the uint64_t file->offset
+ * to a near-UINT64_MAX value, corrupting all subsequent read/write offset math.
  */
 static off_t fat32_vfs_lseek(vfs_file_t* file, off_t offset, int whence) {
+    uint64_t base;
     switch (whence) {
-        case SEEK_SET:
-            file->offset = offset;
-            break;
-        case SEEK_CUR:
-            file->offset += offset;
-            break;
-        case SEEK_END:
-            file->offset = file->inode->size + offset;
-            break;
-        default:
-            return -1;
+        case SEEK_SET: base = 0; break;
+        case SEEK_CUR: base = file->offset; break;
+        case SEEK_END: base = file->inode->size; break;
+        default:       return -1;
     }
-    return file->offset;
+    if (offset < 0 && (uint64_t)(-offset) > base) {
+        return -1;   /* would seek before byte 0 */
+    }
+    file->offset = base + (uint64_t)offset;
+    return (off_t)file->offset;
 }
 
 /**
@@ -276,6 +281,10 @@ static int fat32_read_lfn(fat32_dir_entry_t* entries, uint32_t max_entries,
 
     int total_lfn_entries = seq;
     char temp_buffer[260];  // Max LFN length
+    // Zero first: the extraction loops below write ONLY the character positions
+    // that pass their guards, so any skipped slot would otherwise be read back as
+    // uninitialized stack garbage when the name is assembled -> corrupt filenames.
+    memset(temp_buffer, 0, sizeof(temp_buffer));
     int pos = 0;
 
     // Read LFN entries in reverse order
@@ -328,6 +337,13 @@ static int fat32_read_lfn(fat32_dir_entry_t* entries, uint32_t max_entries,
     memcpy(lfn_buffer, temp_buffer, pos);
     lfn_buffer[pos] = '\0';
 
+    // Never report more entries than we were allowed to scan this cluster. The
+    // caller does `i += count - 1` to skip the LFN group; an on-disk seq that
+    // exceeds the entries remaining in the cluster would otherwise skip past the
+    // cluster boundary and misparse the next cluster's entries mid-group.
+    if (total_lfn_entries > (int)max_entries) {
+        total_lfn_entries = (int)max_entries;
+    }
     return total_lfn_entries;
 }
 
@@ -352,7 +368,15 @@ static vfs_dentry_t* fat32_vfs_lookup(vfs_inode_t* dir, const char* name) {
 
     // Read directory entries
     uint32_t cluster = dir_cluster;
+    uint32_t walk_guard = 0;
     while (cluster < FAT32_EOC) {
+        // Cycle guard: a valid chain visits each cluster at most once, so cap
+        // the walk at total_clusters. A crafted/corrupt FAT can encode an
+        // in-range cluster cycle (fat[N]=N, A->B->A) that never reaches EOC and
+        // would otherwise hang the kernel re-reading the same directory cluster.
+        if (++walk_guard > fs_data->total_clusters) {
+            break;
+        }
         uint64_t lba = fat32_cluster_to_lba(fs_data, cluster);
         if (lba == 0) {
             break;
@@ -408,8 +432,9 @@ static vfs_dentry_t* fat32_vfs_lookup(vfs_inode_t* dir, const char* name) {
             // Determine name to use (LFN if available, otherwise 8.3)
             char entry_name[260];
             if (lfn_name[0] != '\0') {
-                // Use long filename
-                strcpy(entry_name, lfn_name);
+                // Use long filename (bounded copy; lfn_name comes from disk)
+                strncpy(entry_name, lfn_name, sizeof(entry_name) - 1);
+                entry_name[sizeof(entry_name) - 1] = '\0';
             } else {
                 // Use short 8.3 name
                 fat32_name_to_string(entry->name, entry_name);
@@ -561,6 +586,19 @@ vfs_superblock_t* fat32_mount(const char* source, uint32_t flags) {
         return NULL;
     }
 
+    // Validate untrusted on-disk geometry BEFORE using as divisors/multipliers.
+    // A corrupt or crafted image with 0 in any of these fields would cause a
+    // ring-0 #DE (divide-by-zero) or nonsensical cluster/sector math.
+    if (fs_data->boot_sector->bytes_per_sector == 0 ||
+        fs_data->boot_sector->sectors_per_cluster == 0) {
+        kprintf("[FAT32] Invalid geometry: bytes_per_sector=%u sectors_per_cluster=%u\n",
+                fs_data->boot_sector->bytes_per_sector,
+                fs_data->boot_sector->sectors_per_cluster);
+        kfree(fs_data->boot_sector);
+        kfree(fs_data);
+        return NULL;
+    }
+
     // Calculate filesystem parameters
     fs_data->bytes_per_cluster = fs_data->boot_sector->bytes_per_sector *
                                   fs_data->boot_sector->sectors_per_cluster;
@@ -636,20 +674,31 @@ vfs_superblock_t* fat32_mount(const char* source, uint32_t flags) {
  * Unmount a FAT32 filesystem
  */
 void fat32_unmount(vfs_superblock_t* sb) {
-    if (!sb || !sb->private_data) {
+    if (!sb) {
         return;
     }
 
-    fat32_fs_data_t* fs_data = (fat32_fs_data_t*)sb->private_data;
-
-    if (fs_data->boot_sector) {
-        kfree(fs_data->boot_sector);
-    }
-    if (fs_data->fat) {
-        kfree(fs_data->fat);
+    // Free the root inode if present
+    if (sb->root) {
+        vfs_inode_put(sb->root);
+        sb->root = NULL;
     }
 
-    kfree(fs_data);
+    // Free FAT32-specific data
+    if (sb->private_data) {
+        fat32_fs_data_t* fs_data = (fat32_fs_data_t*)sb->private_data;
+
+        if (fs_data->boot_sector) {
+            kfree(fs_data->boot_sector);
+        }
+        if (fs_data->fat) {
+            kfree(fs_data->fat);
+        }
+
+        kfree(fs_data);
+        sb->private_data = NULL;
+    }
+
     kfree(sb);
 }
 

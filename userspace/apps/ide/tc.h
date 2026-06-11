@@ -20,7 +20,7 @@
  *  - e_entry = 0x200000 + 120 = first emitted instruction (must be _start).
  *  - Entered with RSP 16-byte aligned near 0x7FFFFFFFE000. No argc/argv.
  *  - Syscalls: `syscall`; number in RAX; args RDI,RSI,RDX,R10,R8,R9; ret RAX.
- *    SYS_EXIT=1 (rdi=code), SYS_WRITE=3 (rdi=fd, rsi=buf, rdx=len).
+ *    SYS_EXIT=0 (rdi=code), SYS_WRITE=3 (rdi=fd, rsi=buf, rdx=len).
  *
  * ===========================================================================
  *  SUPPORTED ASSEMBLY SUBSET (Intel syntax, one instruction per line)
@@ -70,6 +70,7 @@ typedef struct {
     int    ok;                       /* 1 = produced a runnable ELF        */
     TcLang lang;
     char   out_path[160];            /* ELF written here                   */
+    char   out_dir[160];             /* the build/ folder the ELF lives in */
     int    code_len, elf_len;
     char   asm_preview[1536];        /* first ~lines of generated asm      */
     TcDiag diags[TC_MAXDIAG]; int ndiags;
@@ -82,6 +83,11 @@ TcLang tc_lang_of(const char* path);
 /* Read `path`, build it, write the ELF (same dir, basename without extension),
  * fill *res, return res->ok. (tc_driver.c) */
 int tc_build(const char* path, TcResult* res);
+
+/* Optional one-shot output override for the next tc_build(): the ELF is written
+ * to <dir>/<base>.elf instead of the default /Desktop/<srcbase>.elf. Pass (0,0)
+ * to clear. Used by the IDE for project builds. (tc_driver.c) */
+void tc_set_output_override(const char* dir, const char* base);
 
 /* ---- individual stages (driver + host tests call these) ---- */
 /* C AST -> Intel-subset asm text. 1=ok. (cc_codegen.c) */

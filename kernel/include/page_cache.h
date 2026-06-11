@@ -87,4 +87,14 @@ void page_cache_print_stats(void);
 /* Prefetch pages for read-ahead - internal use */
 int page_cache_prefetch(vfs_inode_t* inode, uint64_t offset, size_t count);
 
+/**
+ * page_cache_readahead - Public API for sequential read-ahead.
+ *
+ * Prefetches `window` pages starting at `offset` into the cache for the given
+ * inode.  Designed to be called by VFS/FS read paths when sequential access is
+ * detected.  Skips pages that are already cached.  Stops early if the cache is
+ * >75% full or the prefetch would extend past EOF.
+ */
+void page_cache_readahead(vfs_inode_t* inode, uint64_t offset, uint64_t window);
+
 #endif // PAGE_CACHE_H

@@ -40,6 +40,8 @@ static off_t ramfs_lseek(vfs_file_t* file, off_t offset, int whence);
 static vfs_dentry_t* ramfs_lookup(vfs_inode_t* dir, const char* name);
 static int ramfs_create(vfs_inode_t* dir, vfs_dentry_t* dentry, uint32_t mode);
 static int ramfs_mkdir(vfs_inode_t* dir, vfs_dentry_t* dentry, uint32_t mode);
+static int ramfs_unlink(vfs_inode_t* dir, vfs_dentry_t* dentry);
+static int ramfs_rmdir(vfs_inode_t* dir, vfs_dentry_t* dentry);
 static vfs_inode_t* vfs_create_file_inode(const char* path, uint32_t mode);
 
 static vfs_file_ops_t ramfs_file_ops = {
@@ -54,8 +56,8 @@ static vfs_inode_ops_t ramfs_inode_ops = {
     .lookup = ramfs_lookup,
     .create = ramfs_create,
     .mkdir = ramfs_mkdir,
-    .unlink = NULL,  // Not implemented yet
-    .rmdir = NULL,   // Not implemented yet
+    .unlink = ramfs_unlink,
+    .rmdir = ramfs_rmdir,
 };
 
 /* Initial number of dentry slots in a directory's entry array */
@@ -101,6 +103,9 @@ static int ramfs_dir_add(vfs_inode_t* dir, vfs_dentry_t* dentry) {
 
     // No free slot - grow the array (double capacity)
     uint64_t new_cap = dir->data_capacity * 2;
+    if (new_cap <= dir->data_capacity) {     // capacity doubling overflowed -> bail
+        return -1;
+    }
     vfs_dentry_t** new_entries = (vfs_dentry_t**)kmalloc(sizeof(vfs_dentry_t*) * new_cap);
     if (!new_entries) {
         return -1;
@@ -128,6 +133,7 @@ static inline size_t vfs_strlen(const char* s) {
 }
 
 static inline void vfs_strcpy(char* dst, const char* src, size_t max) {
+    if (max == 0) return;            /* else max-1 underflows to SIZE_MAX (overflow) */
     size_t i;
     for (i = 0; i < max - 1 && src[i]; i++) {
         dst[i] = src[i];
@@ -375,6 +381,15 @@ void vfs_close_all_fds(struct process* proc) {
     for (int fd = 3; fd < VFS_MAX_FDS; fd++) {
         vfs_file_t* file = t[fd];
         if (!file) continue;
+
+        /* BUG-FIX: flush dirty page-cache pages before dropping the inode
+         * reference. vfs_close() does this, but vfs_close_all_fds() was
+         * missing it — dirty data written via page_cache_write() would be
+         * lost when the process exits without an explicit close(). */
+        if (file->inode) {
+            page_cache_flush_inode(file->inode);
+        }
+
         if (file->ops && file->ops->close) {
             file->ops->close(file);
         }
@@ -468,10 +483,54 @@ static vfs_inode_t* vfs_lookup_component(vfs_inode_t* dir, const char* name, siz
 
 /**
  * Path lookup - returns inode for path
+ *
+ * Follows symlinks up to a maximum depth to prevent infinite loops.
+ *
+ * ".." NAVIGATION BEHAVIOR:
+ * This function implements single-level ".." tracking: 'parent' points to the
+ * directory one level up from 'current', but grandparent and higher ancestors
+ * are not tracked. This means:
+ *   - "cd /a/b" followed by "cd .." works (returns to /a)
+ *   - "cd /a/b/c" followed by "cd ../.." works (returns to /a)
+ *   - But paths like "/a/b/../../.." can only go up as many levels as the
+ *     path descended, because each ".." discards the grandparent pointer
+ *
+ * The underlying issue is that dentry->parent is NULL for all dentries created
+ * via ramfs_create/ramfs_mkdir (they receive a parent inode, not a parent
+ * dentry, so there's no dentry tree to link into). Until we implement a full
+ * dentry cache with inode-to-dentry back-pointers, this manual tracking is the
+ * best we can do.
+ *
+ * For userspace shell navigation, this is sufficient because shells normalize
+ * paths client-side (e.g., terminal_m3.c's resolve_path() collapses ".."
+ * before calling the kernel), so the kernel never sees deeply nested ".."
+ * sequences that would exceed the single-level tracking.
  */
+#define MAX_SYMLINK_DEPTH 8
+
+/* cleanup helper: auto-kfree a heap path buffer on scope exit. The syscall->VFS
+ * path-lookup/mkdir/rmdir chain stacks several 4096-byte path buffers; on the
+ * 8KB kernel stack (no guard page) that overflows, so these buffers are
+ * heap-allocated and freed via __attribute__((cleanup)) on every return path. */
+static inline void free_path_buf(char** p) { if (*p) kfree(*p); }
+
+static vfs_inode_t* vfs_path_lookup_rec(const char* path, int rec_depth);
+
 vfs_inode_t* vfs_path_lookup(const char* path) {
+    return vfs_path_lookup_rec(path, 0);
+}
+
+/* Internal recursive worker. rec_depth bounds symlink-chain recursion ACROSS
+ * calls: the public wrapper passes 0 and the absolute-symlink case recurses with
+ * rec_depth+1. (The old code recursed via vfs_path_lookup() and reset the
+ * per-walk symlink_depth to 0 each call, so an absolute-symlink cycle
+ * /a->/b->/a recursed without bound and blew the kernel stack -- now capped.) */
+static vfs_inode_t* vfs_path_lookup_rec(const char* path, int rec_depth) {
     if (!path || path[0] != '/') {
         return NULL;
+    }
+    if (rec_depth > MAX_SYMLINK_DEPTH) {
+        return NULL;  // symlink chain too deep (global recursion bound)
     }
 
     // Find mount point
@@ -495,6 +554,9 @@ vfs_inode_t* vfs_path_lookup(const char* path) {
     if (*path == '\0') {
         return current;
     }
+
+    // Symlink resolution depth counter
+    int symlink_depth = 0;
 
     // Parse path components
     while (*path) {
@@ -537,6 +599,79 @@ vfs_inode_t* vfs_path_lookup(const char* path) {
                 vfs_inode_put(parent);
             }
             return NULL;
+        }
+
+        // Check if the resolved component is a symlink
+        if (next->type & VFS_TYPE_SYMLINK) {
+            // Prevent infinite symlink loops
+            if (++symlink_depth > MAX_SYMLINK_DEPTH) {
+                vfs_inode_put(next);
+                vfs_inode_put(current);
+                if (parent) {
+                    vfs_inode_put(parent);
+                }
+                return NULL;  // Too many symlinks
+            }
+
+            // Read symlink target from inode data
+            if (!next->data || next->size == 0) {
+                // Symlink has no target
+                vfs_inode_put(next);
+                vfs_inode_put(current);
+                if (parent) {
+                    vfs_inode_put(parent);
+                }
+                return NULL;
+            }
+
+            // Copy symlink target (heap-allocated, auto-freed on block/return
+            // exit -- keeps this recursive frame's 4096B off the 8KB stack).
+            char* target __attribute__((cleanup(free_path_buf))) = (char*)kmalloc(VFS_MAX_PATH);
+            if (!target) {
+                vfs_inode_put(next);
+                vfs_inode_put(current);
+                if (parent) {
+                    vfs_inode_put(parent);
+                }
+                return NULL;
+            }
+            size_t target_len = next->size;
+            if (target_len >= VFS_MAX_PATH) {
+                target_len = VFS_MAX_PATH - 1;
+            }
+            memcpy(target, next->data, target_len);
+            target[target_len] = '\0';
+
+            // Done with the symlink inode
+            vfs_inode_put(next);
+
+            // Resolve the symlink target
+            vfs_inode_t* symlink_target = NULL;
+            if (target[0] == '/') {
+                // Absolute symlink: resolve from root (depth-bounded recursion)
+                symlink_target = vfs_path_lookup_rec(target, rec_depth + 1);
+            } else {
+                // Relative symlink: resolve from current directory
+                // Build full path: current directory + '/' + target
+                // For simplicity, we'll just fail on relative symlinks for now
+                // (proper implementation would reconstruct the full path)
+                vfs_inode_put(current);
+                if (parent) {
+                    vfs_inode_put(parent);
+                }
+                return NULL;  // Relative symlinks not yet supported
+            }
+
+            if (!symlink_target) {
+                vfs_inode_put(current);
+                if (parent) {
+                    vfs_inode_put(parent);
+                }
+                return NULL;
+            }
+
+            // Replace next with the symlink target
+            next = symlink_target;
         }
 
         // 'current' becomes the new parent for the next level.  Release any
@@ -655,6 +790,38 @@ int vfs_open(const char* path, int flags, int mode) {
 }
 
 /**
+ * vfs_read_fast -- inline fast path for ramfs files with inode->data.
+ *
+ * When a file's ops pointer is the ramfs_file_ops (the overwhelmingly common
+ * case for initrd + tmpfs files), the full ramfs_read() function pointer
+ * dispatch is unnecessary overhead.  This inline does the same bounds-check +
+ * memcpy directly, avoiding the call/return overhead on the hot read path.
+ * Returns >= 0 if handled, < 0 if the caller should fall through to the
+ * generic ops->read path.
+ */
+static inline ssize_t vfs_read_fast(vfs_file_t* file, void* buf, size_t count) {
+    /* Only handle ramfs files with existing inode data */
+    if (file->ops != &ramfs_file_ops || !file->inode || !file->inode->data) {
+        return -1;  /* not handled -- fall through */
+    }
+
+    vfs_inode_t* inode = file->inode;
+    if (file->offset >= inode->size) {
+        return 0;  /* EOF */
+    }
+
+    uint64_t available = inode->size - file->offset;
+    size_t bytes_to_read = count;
+    if ((uint64_t)bytes_to_read > available) {
+        bytes_to_read = (size_t)available;
+    }
+
+    memcpy(buf, (uint8_t*)inode->data + file->offset, bytes_to_read);
+    file->offset += bytes_to_read;
+    return (ssize_t)bytes_to_read;
+}
+
+/**
  * Read from file
  */
 ssize_t vfs_read(int fd, void* buf, size_t count) {
@@ -673,6 +840,12 @@ ssize_t vfs_read(int fd, void* buf, size_t count) {
     }
     if (!file->ops || !file->ops->read) {
         return VFS_ERR_NOSYS;
+    }
+
+    /* Fast path: direct inode->data copy for ramfs, skips function pointer. */
+    ssize_t fast = vfs_read_fast(file, buf, count);
+    if (fast >= 0) {
+        return fast;
     }
 
     return file->ops->read(file, buf, count);
@@ -838,6 +1011,221 @@ int vfs_fstat(int fd, vfs_stat_t* buf) {
 }
 
 /**
+ * Truncate file to specified length
+ */
+int vfs_truncate(const char* path, off_t length) {
+    if (!path || length < 0) {
+        return VFS_ERR_INVAL;
+    }
+
+    vfs_inode_t* inode = vfs_path_lookup(path);
+    if (!inode) {
+        return VFS_ERR_NOENT;
+    }
+
+    // Can't truncate directories
+    if (inode->type & VFS_TYPE_DIR) {
+        vfs_inode_put(inode);
+        return VFS_ERR_ISDIR;
+    }
+
+    // Can't truncate symlinks directly
+    if (inode->type & VFS_TYPE_SYMLINK) {
+        vfs_inode_put(inode);
+        return VFS_ERR_INVAL;
+    }
+
+    // Flush dirty pages first
+    page_cache_flush_inode(inode);
+
+    // Truncate to new length
+    if ((uint64_t)length < inode->size) {
+        // Shrinking: free excess data
+        if (inode->data && (inode->flags & VFS_DATA_OWNED)) {
+            // Could realloc to shrink, but for simplicity just truncate in place
+            inode->size = (uint64_t)length;
+        } else {
+            // Initrd-backed or no data: just update size
+            inode->size = (uint64_t)length;
+        }
+    } else if ((uint64_t)length > inode->size) {
+        // Growing: extend data
+        if (inode->flags & VFS_DATA_OWNED) {
+            // Need to grow allocated buffer
+            if ((uint64_t)length > inode->data_capacity) {
+                void* new_data = kmalloc((size_t)length);
+                if (!new_data) {
+                    vfs_inode_put(inode);
+                    return VFS_ERR_NOMEM;
+                }
+                // Copy existing data
+                if (inode->data && inode->size > 0) {
+                    memcpy(new_data, inode->data, inode->size);
+                }
+                // Zero-fill the extension
+                memset((char*)new_data + inode->size, 0, (size_t)length - inode->size);
+                // Free old buffer
+                if (inode->data) {
+                    kfree(inode->data);
+                }
+                inode->data = new_data;
+                inode->data_capacity = (uint64_t)length;
+            } else {
+                // Fits in existing capacity: zero-fill extension
+                memset((char*)inode->data + inode->size, 0, (size_t)length - inode->size);
+            }
+            inode->size = (uint64_t)length;
+        } else {
+            // Initrd-backed or no data: allocate new buffer
+            void* new_data = kmalloc((size_t)length);
+            if (!new_data) {
+                vfs_inode_put(inode);
+                return VFS_ERR_NOMEM;
+            }
+            // Copy existing data
+            if (inode->data && inode->size > 0) {
+                memcpy(new_data, inode->data, inode->size);
+            }
+            // Zero-fill the extension
+            memset((char*)new_data + inode->size, 0, (size_t)length - inode->size);
+            // Don't free initrd-backed data
+            inode->data = new_data;
+            inode->data_capacity = (uint64_t)length;
+            inode->size = (uint64_t)length;
+            inode->flags |= VFS_DATA_OWNED;
+            inode->flags &= ~(uint32_t)VFS_DATA_INITRD_BACKED;
+        }
+    }
+
+    // Evict now-invalid cached pages beyond new size
+    page_cache_evict_inode(inode);
+
+    vfs_inode_put(inode);
+    return 0;
+}
+
+/**
+ * Truncate file via file descriptor
+ */
+int vfs_ftruncate(int fd, off_t length) {
+    if (length < 0) {
+        return VFS_ERR_INVAL;
+    }
+
+    if (fd < 0 || fd >= VFS_MAX_FDS) {
+        return VFS_ERR_BADF;
+    }
+
+    vfs_file_t* file = vfs_fd_get(fd);
+    if (!file || !file->inode) {
+        return VFS_ERR_BADF;
+    }
+
+    vfs_inode_t* inode = file->inode;
+
+    // Can't truncate directories
+    if (inode->type & VFS_TYPE_DIR) {
+        return VFS_ERR_ISDIR;
+    }
+
+    // Can't truncate symlinks
+    if (inode->type & VFS_TYPE_SYMLINK) {
+        return VFS_ERR_INVAL;
+    }
+
+    // Check if file is open for writing
+    if (!(file->flags & (O_WRONLY | O_RDWR))) {
+        return VFS_ERR_INVAL;
+    }
+
+    // Flush dirty pages first
+    page_cache_flush_inode(inode);
+
+    // Truncate to new length (same logic as vfs_truncate)
+    if ((uint64_t)length < inode->size) {
+        // Shrinking
+        inode->size = (uint64_t)length;
+    } else if ((uint64_t)length > inode->size) {
+        // Growing
+        if (inode->flags & VFS_DATA_OWNED) {
+            if ((uint64_t)length > inode->data_capacity) {
+                void* new_data = kmalloc((size_t)length);
+                if (!new_data) {
+                    return VFS_ERR_NOMEM;
+                }
+                if (inode->data && inode->size > 0) {
+                    memcpy(new_data, inode->data, inode->size);
+                }
+                memset((char*)new_data + inode->size, 0, (size_t)length - inode->size);
+                if (inode->data) {
+                    kfree(inode->data);
+                }
+                inode->data = new_data;
+                inode->data_capacity = (uint64_t)length;
+            } else {
+                memset((char*)inode->data + inode->size, 0, (size_t)length - inode->size);
+            }
+            inode->size = (uint64_t)length;
+        } else {
+            void* new_data = kmalloc((size_t)length);
+            if (!new_data) {
+                return VFS_ERR_NOMEM;
+            }
+            if (inode->data && inode->size > 0) {
+                memcpy(new_data, inode->data, inode->size);
+            }
+            memset((char*)new_data + inode->size, 0, (size_t)length - inode->size);
+            inode->data = new_data;
+            inode->data_capacity = (uint64_t)length;
+            inode->size = (uint64_t)length;
+            inode->flags |= VFS_DATA_OWNED;
+            inode->flags &= ~(uint32_t)VFS_DATA_INITRD_BACKED;
+        }
+    }
+
+    // Evict cached pages beyond new size
+    page_cache_evict_inode(inode);
+
+    return 0;
+}
+
+/**
+ * Sync file descriptor - flush dirty pages to storage
+ */
+int vfs_fsync(int fd) {
+    if (fd < 0 || fd >= VFS_MAX_FDS) {
+        return VFS_ERR_BADF;
+    }
+
+    vfs_file_t* file = vfs_fd_get(fd);
+    if (!file || !file->inode) {
+        return VFS_ERR_BADF;
+    }
+
+    // Flush dirty pages for this inode
+    return page_cache_flush_inode(file->inode);
+}
+
+/**
+ * Sync all filesystems - flush all dirty pages
+ */
+int vfs_sync(void) {
+    // Flush all dirty pages in the page cache
+    int result = page_cache_flush_all();
+
+    // Could also call sync_fs on all mounted filesystems if they support it
+    vfs_mount_t* mount = vfs_state.mounts;
+    while (mount) {
+        if (mount->sb && mount->sb->sync_fs) {
+            mount->sb->sync_fs(mount->sb);
+        }
+        mount = mount->next;
+    }
+
+    return result;
+}
+
+/**
  * Mount filesystem
  */
 int vfs_mount(const char* source, const char* target, const char* fstype) {
@@ -885,8 +1273,11 @@ int vfs_mount(const char* source, const char* target, const char* fstype) {
  * Create directory (single level)
  */
 int vfs_mkdir(const char* path, uint32_t mode) {
-    // Find parent directory
-    char parent_path[VFS_MAX_PATH];
+    // Find parent directory (heap buffer, auto-freed; off the 8KB kernel stack)
+    char* parent_path __attribute__((cleanup(free_path_buf))) = (char*)kmalloc(VFS_MAX_PATH);
+    if (!parent_path) {
+        return -1;
+    }
     const char* name;
 
     // Find last slash
@@ -901,6 +1292,11 @@ int vfs_mkdir(const char* path, uint32_t mode) {
 
     // Copy parent path
     size_t parent_len = last_slash - path;
+    // Clamp to the buffer so an over-long parent component can't overflow
+    // parent_path[VFS_MAX_PATH] (matches vfs_rmdir / vfs_unlink).
+    if (parent_len >= VFS_MAX_PATH) {
+        parent_len = VFS_MAX_PATH - 1;
+    }
     if (parent_len == 0) {
         parent_path[0] = '/';
         parent_path[1] = '\0';
@@ -937,7 +1333,12 @@ int vfs_mkdir(const char* path, uint32_t mode) {
  * Create directory recursively
  */
 int vfs_mkdir_recursive(const char* path, uint32_t mode) {
-    char tmp[VFS_MAX_PATH];
+    // Heap buffer, auto-freed on every return (incl. `return vfs_mkdir(tmp,...)`
+    // below: tmp is valid during the call, freed after on scope exit).
+    char* tmp __attribute__((cleanup(free_path_buf))) = (char*)kmalloc(VFS_MAX_PATH);
+    if (!tmp) {
+        return -1;
+    }
     char* p = NULL;
     size_t len;
 
@@ -1115,20 +1516,22 @@ static int ramfs_close(vfs_file_t* file) {
  * RAMFS: Seek in file
  */
 static off_t ramfs_lseek(vfs_file_t* file, off_t offset, int whence) {
+    /* Validate before assigning: this op-specific lseek bypasses vfs_lseek's own
+     * guards, so without these checks a negative/underflowing seek would store a
+     * near-UINT64_MAX value into the uint64 file->offset and corrupt later
+     * read/write/page-cache offset math. Mirrors the vfs_lseek default path. */
+    uint64_t base;
     switch (whence) {
-        case SEEK_SET:
-            file->offset = offset;
-            break;
-        case SEEK_CUR:
-            file->offset += offset;
-            break;
-        case SEEK_END:
-            file->offset = file->inode->size + offset;
-            break;
-        default:
-            return -1;
+        case SEEK_SET: base = 0; break;
+        case SEEK_CUR: base = file->offset; break;
+        case SEEK_END: base = file->inode->size; break;
+        default:       return -1;
     }
-    return file->offset;
+    if (offset < 0 && (uint64_t)(-offset) > base) {
+        return -1;   /* would seek before byte 0 */
+    }
+    file->offset = base + (uint64_t)offset;
+    return (off_t)file->offset;
 }
 
 /**
@@ -1193,7 +1596,6 @@ static int ramfs_create(vfs_inode_t* dir, vfs_dentry_t* dentry, uint32_t mode) {
     inode->data_capacity = 0;
 
     dentry->inode = inode;
-    dentry->parent = NULL;  // TODO: track parent
 
     // Link the dentry into the parent directory.
     if (ramfs_dir_add(dir, dentry) != 0) {
@@ -1201,6 +1603,19 @@ static int ramfs_create(vfs_inode_t* dir, vfs_dentry_t* dentry, uint32_t mode) {
         vfs_inode_free(inode);
         return -1;
     }
+
+    /* Set up parent tracking: we don't have the parent dentry pointer here
+     * (ramfs_create is called with a parent inode, not a parent dentry), so
+     * we cannot establish a proper dentry tree link at this level. The parent
+     * pointer remains NULL, which means ".." navigation will be limited to
+     * the vfs_path_lookup() manual parent tracking (one level only).
+     *
+     * A complete fix would require:
+     *   1. Maintaining a dentry for every directory inode (including root)
+     *   2. Passing parent_dentry instead of parent_inode to create/mkdir ops
+     *   3. Storing a back-pointer from inode to its primary dentry
+     * This is deferred until the dentry cache is fully implemented. */
+    dentry->parent = NULL;
 
     return 0;
 }
@@ -1229,7 +1644,10 @@ static vfs_inode_t* vfs_create_file_inode(const char* path, uint32_t mode) {
         return NULL;  // trailing slash - not a file
     }
 
-    char parent_path[VFS_MAX_PATH];
+    char* parent_path __attribute__((cleanup(free_path_buf))) = (char*)kmalloc(VFS_MAX_PATH);
+    if (!parent_path) {
+        return NULL;
+    }
     size_t parent_len = (size_t)(last_slash - path);
     if (parent_len == 0) {
         parent_path[0] = '/';
@@ -1301,7 +1719,6 @@ static int ramfs_mkdir(vfs_inode_t* dir, vfs_dentry_t* dentry, uint32_t mode) {
     }
 
     dentry->inode = inode;
-    dentry->parent = NULL;
 
     // Link into parent directory (grows the parent array if needed).
     if (ramfs_dir_add(dir, dentry) != 0) {
@@ -1310,7 +1727,95 @@ static int ramfs_mkdir(vfs_inode_t* dir, vfs_dentry_t* dentry, uint32_t mode) {
         return -1;
     }
 
+    /* Set up parent tracking: we don't have the parent dentry pointer here
+     * (ramfs_mkdir is called with a parent inode, not a parent dentry), so
+     * we cannot establish a proper dentry tree link at this level. The parent
+     * pointer remains NULL, which means ".." navigation will be limited to
+     * the vfs_path_lookup() manual parent tracking (one level only).
+     *
+     * A complete fix would require:
+     *   1. Maintaining a dentry for every directory inode (including root)
+     *   2. Passing parent_dentry instead of parent_inode to create/mkdir ops
+     *   3. Storing a back-pointer from inode to its primary dentry
+     * This is deferred until the dentry cache is fully implemented. */
+    dentry->parent = NULL;
+
     return 0;
+}
+
+/**
+ * RAMFS: Unlink file from directory
+ *
+ * Removes a file (not directory) from the parent directory by setting the
+ * dentry slot to NULL and decrementing the directory size. The dentry is
+ * NOT freed here - the caller owns it and must free it.
+ */
+static int ramfs_unlink(vfs_inode_t* dir, vfs_dentry_t* dentry) {
+    if (!dir || !dentry || !(dir->type & VFS_TYPE_DIR)) {
+        return -1;
+    }
+
+    // Can't unlink directories with unlink (use rmdir instead)
+    if (dentry->inode && (dentry->inode->type & VFS_TYPE_DIR)) {
+        return -1;
+    }
+
+    // Find and remove the dentry from the directory's entry array
+    if (!dir->private_data) {
+        return -1;
+    }
+
+    vfs_dentry_t** entries = (vfs_dentry_t**)dir->private_data;
+    for (uint64_t i = 0; i < dir->data_capacity; i++) {
+        if (entries[i] == dentry) {
+            entries[i] = NULL;
+            dir->size--;
+            return 0;
+        }
+    }
+
+    // Dentry not found in this directory
+    return -1;
+}
+
+/**
+ * RAMFS: Remove directory
+ *
+ * Removes an empty directory from the parent directory. The directory must
+ * be empty (size == 0) to be removed. The dentry is NOT freed here - the
+ * caller owns it and must free it.
+ */
+static int ramfs_rmdir(vfs_inode_t* dir, vfs_dentry_t* dentry) {
+    if (!dir || !dentry || !(dir->type & VFS_TYPE_DIR)) {
+        return -1;
+    }
+
+    // Can only rmdir directories
+    if (!dentry->inode || !(dentry->inode->type & VFS_TYPE_DIR)) {
+        return -1;
+    }
+
+    // Directory must be empty (size == 0)
+    if (dentry->inode->size != 0) {
+        return -1;  // Directory not empty
+    }
+
+    // Find and remove the dentry from the directory's entry array
+    if (!dir->private_data) {
+        return -1;
+    }
+
+    vfs_dentry_t** entries = (vfs_dentry_t**)dir->private_data;
+    for (uint64_t i = 0; i < dir->data_capacity; i++) {
+        if (entries[i] == dentry) {
+            entries[i] = NULL;
+            dir->size--;
+            return 0;
+        }
+    }
+
+    // Dentry not found in this directory
+    return -1;
 }
 
 /**
@@ -1484,7 +1989,15 @@ int vfs_ramfs_create_dir(vfs_inode_t* dir, const char* name, uint32_t mode) {
         return -1;
     }
 
-    return ramfs_mkdir(dir, dentry, mode);
+    int result = ramfs_mkdir(dir, dentry, mode);
+    /* BUG-FIX (dentry leak): if ramfs_mkdir fails (duplicate name, OOM in
+     * dir_ensure or dir_add), the dentry we allocated is orphaned -- nobody
+     * else holds a reference.  vfs_mkdir() handles this correctly; this
+     * convenience wrapper did not. */
+    if (result < 0) {
+        vfs_dentry_free(dentry);
+    }
+    return result;
 }
 
 /**
@@ -1509,21 +2022,170 @@ void vfs_fs_init(void) {
 }
 
 /**
- * Unmount filesystem (stub)
+ * Unmount filesystem
+ *
+ * Removes the mount from vfs_state.mounts, calls the filesystem-specific
+ * unmount handler (which frees the superblock, root inode, and any fs-specific
+ * data like ext2's group_desc and superblock buffer), and prevents leaks.
+ *
+ * Returns 0 on success, -1 on failure (target not mounted, or VFS not initialized).
  */
 int vfs_unmount(const char* target) {
-    (void)target;
-    /* TODO: Implement unmount */
+    if (!vfs_state.initialized || !target) {
+        return -1;
+    }
+
+    kprintf("[VFS] Unmounting %s\n", target);
+
+    // Find the mount point in the linked list
+    vfs_mount_t** prev_ptr = &vfs_state.mounts;
+    vfs_mount_t* mount = vfs_state.mounts;
+
+    while (mount) {
+        if (vfs_strcmp(mount->target, target) == 0) {
+            // Found the mount - unlink it from the list
+            *prev_ptr = mount->next;
+
+            vfs_superblock_t* sb = mount->sb;
+
+            // Look up the filesystem type to call its unmount handler
+            if (sb && sb->type) {
+                fs_type_t* fs_type = fs_lookup_type(sb->type);
+                if (fs_type && fs_type->ops && fs_type->ops->unmount) {
+                    // Filesystem-specific unmount (frees sb, root inode, fs_data, etc.)
+                    fs_type->ops->unmount(sb);
+                } else {
+                    // No registered unmount handler - fall back to manual cleanup
+                    if (sb->root) {
+                        vfs_inode_put(sb->root);
+                    }
+                    kfree(sb);
+                }
+            }
+
+            kfree(mount);
+            kprintf("[VFS] Unmounted %s successfully\n", target);
+            return 0;
+        }
+        prev_ptr = &mount->next;
+        mount = mount->next;
+    }
+
+    kprintf("[VFS] Unmount failed: %s not mounted\n", target);
     return -1;
 }
 
 /**
- * Remove directory (stub)
+ * Remove directory
+ *
+ * Removes an empty directory at the given path. The directory must exist,
+ * be a directory, and be empty (contain no entries). Returns 0 on success,
+ * -1 on failure.
  */
 int vfs_rmdir(const char* path) {
-    (void)path;
-    /* TODO: Implement rmdir */
-    return -1;
+    if (!path) {
+        return -1;
+    }
+
+    // Find parent directory and directory name (heap buffer, auto-freed)
+    char* parent_path __attribute__((cleanup(free_path_buf))) = (char*)kmalloc(VFS_MAX_PATH);
+    if (!parent_path) {
+        return -1;
+    }
+    const char* dirname;
+
+    // Find last slash
+    const char* last_slash = NULL;
+    for (const char* p = path; *p; p++) {
+        if (*p == '/') last_slash = p;
+    }
+
+    if (!last_slash) {
+        return -1;
+    }
+
+    // Copy parent path
+    size_t parent_len = last_slash - path;
+    if (parent_len == 0) {
+        parent_path[0] = '/';
+        parent_path[1] = '\0';
+    } else {
+        if (parent_len >= VFS_MAX_PATH) {
+            parent_len = VFS_MAX_PATH - 1;
+        }
+        memcpy(parent_path, path, parent_len);
+        parent_path[parent_len] = '\0';
+    }
+
+    dirname = last_slash + 1;
+    if (*dirname == '\0') {
+        return -1;  // Can't remove directory with trailing slash
+    }
+
+    // Lookup parent directory
+    vfs_inode_t* parent = vfs_path_lookup(parent_path);
+    if (!parent) {
+        return -1;
+    }
+
+    if (!(parent->type & VFS_TYPE_DIR)) {
+        vfs_inode_put(parent);
+        return -1;
+    }
+
+    // Find the entry in parent directory
+    if (!parent->private_data) {
+        vfs_inode_put(parent);
+        return -1;
+    }
+
+    vfs_dentry_t** entries = (vfs_dentry_t**)parent->private_data;
+    int found = -1;
+
+    for (uint64_t i = 0; i < parent->data_capacity; i++) {
+        if (entries[i] && vfs_strcmp(entries[i]->name, dirname) == 0) {
+            found = i;
+            break;
+        }
+    }
+
+    if (found < 0) {
+        vfs_inode_put(parent);
+        return -1;  // Directory not found
+    }
+
+    vfs_dentry_t* dentry = entries[found];
+
+    // Must be a directory
+    if (!dentry->inode || !(dentry->inode->type & VFS_TYPE_DIR)) {
+        vfs_inode_put(parent);
+        return -1;
+    }
+
+    // Directory must be empty
+    if (dentry->inode->size != 0) {
+        vfs_inode_put(parent);
+        return -1;  // Directory not empty
+    }
+
+    // Use inode operations if available
+    if (parent->ops && parent->ops->rmdir) {
+        if (parent->ops->rmdir(parent, dentry) != 0) {
+            vfs_inode_put(parent);
+            return -1;
+        }
+    } else {
+        // Fallback: manually remove from parent directory
+        entries[found] = NULL;
+        parent->size--;
+    }
+
+    // Free the dentry; vfs_dentry_free() drops the inode's reference (and frees
+    // the inode if this was the last link).
+    vfs_dentry_free(dentry);
+
+    vfs_inode_put(parent);
+    return 0;
 }
 
 /**
@@ -1537,10 +2199,28 @@ vfs_dentry_t* vfs_dentry_lookup(vfs_inode_t* dir, const char* name) {
 }
 
 /**
- * Add child dentry to parent (stub)
+ * Add child dentry to parent
+ *
+ * Establishes the parent-child relationship in the dentry tree so that ".."
+ * navigation works correctly. This function is called AFTER the child dentry
+ * has been linked into the parent directory's entry array.
+ *
+ * The parent pointer is NOT reference-counted: the child dentry's lifetime is
+ * tied to its presence in the parent's entry array. When the child is unlinked
+ * (vfs_unlink/vfs_rmdir), the parent pointer becomes stale, but the dentry is
+ * freed immediately afterward so there's no dangling-pointer window.
  */
 void vfs_dentry_add_child(vfs_dentry_t* parent, vfs_dentry_t* child) {
-    (void)parent;
-    (void)child;
-    /* TODO: Implement dentry tree management */
+    if (!parent || !child) {
+        return;
+    }
+
+    /* Validation: parent must point to a directory inode */
+    if (!parent->inode || !(parent->inode->type & VFS_TYPE_DIR)) {
+        kprintf("[VFS] Warning: vfs_dentry_add_child called with non-directory parent\n");
+        return;
+    }
+
+    /* Set the child's parent pointer (not reference-counted) */
+    child->parent = parent;
 }

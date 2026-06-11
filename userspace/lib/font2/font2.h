@@ -52,6 +52,42 @@ void font2_draw_scaled(unsigned int *px, int stride,
                        unsigned int argb);
 
 /* --------------------------------------------------------------------------
+ * font2_draw_scaled_clip
+ *
+ * Like font2_draw_scaled, but BOUNDS-SAFE: every pixel is written only if it
+ * lies inside the destination buffer [0,maxw) x [0,maxh) AND inside the
+ * horizontal clip window [clip_x0, clip_x1). This is the variant UI code MUST
+ * use — font2_draw_scaled() has no bounds checking and will corrupt memory if
+ * text reaches a buffer edge. Pass clip_x0=0, clip_x1=maxw for "no horizontal
+ * clip" (still bounded by the buffer).
+ *
+ * @maxw,@maxh  destination buffer width/height in pixels (hard bounds).
+ * @clip_x0,@clip_x1  horizontal clip window in pixels [x0, x1).
+ * -------------------------------------------------------------------------- */
+void font2_draw_scaled_clip(unsigned int *px, int stride, int maxw, int maxh,
+                            int clip_x0, int clip_x1,
+                            int x, int y,
+                            const char *str, int scale,
+                            unsigned int argb);
+
+/* --------------------------------------------------------------------------
+ * font2_draw_cell_clip — FRACTIONAL scaled text (nearest-neighbor) into an
+ * arbitrary glyph cell (cell_w x cell_h), bounds-safe + horizontally clipped.
+ *
+ * Unlike font2_draw_scaled (integer replication only), this maps each output
+ * pixel back to the 8x16 source by nearest-neighbor, so it can render any
+ * intermediate size — e.g. 12x24 (1.5x) or 10x20 (1.25x) — to land between the
+ * "too small" 8x16 and the "too big" 16x32. Same bounds/clip guarantees as
+ * font2_draw_scaled_clip. cell advance == cell_w (matches font2_text_width when
+ * width is computed as nchars*cell_w).
+ * -------------------------------------------------------------------------- */
+void font2_draw_cell_clip(unsigned int *px, int stride, int maxw, int maxh,
+                          int clip_x0, int clip_x1,
+                          int x, int y,
+                          const char *str, int cell_w, int cell_h,
+                          unsigned int argb);
+
+/* --------------------------------------------------------------------------
  * font2_draw_aa
  *
  * Lightly anti-aliased 1× render via 2×2 supersampling.

@@ -120,6 +120,7 @@ qemu-system-x86_64 \
     -display none \
     -no-reboot \
     -no-shutdown \
+    -device intel-hda -device hda-duplex \
     &
 QEMU_PID=$!
 

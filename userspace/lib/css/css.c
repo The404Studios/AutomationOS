@@ -166,10 +166,10 @@ static unsigned int parse_color(const char *value, int *ok)
                 /* alpha 0.0-1.0 */
                 int whole = 0, dec = 0, dec_div = 1;
                 int saw_digit = 0;
-                while (*p >= '0' && *p <= '9') { whole = whole * 10 + (*p - '0'); p++; saw_digit = 1; }
+                while (*p >= '0' && *p <= '9') { if (whole < 100000) whole = whole * 10 + (*p - '0'); p++; saw_digit = 1; }
                 if (*p == '.') {
                     p++;
-                    while (*p >= '0' && *p <= '9') { dec = dec * 10 + (*p - '0'); dec_div *= 10; p++; saw_digit = 1; }
+                    while (*p >= '0' && *p <= '9') { if (dec_div < 100000) { dec = dec * 10 + (*p - '0'); dec_div *= 10; } p++; saw_digit = 1; }
                 }
                 if (!saw_digit) { if (ok) *ok = 0; return 0xFF000000; }
                 /* alpha float -> 0..255 */
@@ -180,7 +180,7 @@ static unsigned int parse_color(const char *value, int *ok)
             } else {
                 int v = 0;
                 int saw = 0;
-                while (*p >= '0' && *p <= '9') { v = v * 10 + (*p - '0'); p++; saw = 1; }
+                while (*p >= '0' && *p <= '9') { if (v < 100000) v = v * 10 + (*p - '0'); p++; saw = 1; }
                 if (!saw) { if (ok) *ok = 0; return 0xFF000000; }
                 if (*p == '%') {
                     p++;
@@ -229,11 +229,15 @@ static int parse_length_ex(const char *v, int *ok, int *unit_out)
     else if (*v == '-') { sign = -1; v++; }
     int whole = 0;
     int saw = 0;
-    while (*v >= '0' && *v <= '9') { whole = whole * 10 + (*v - '0'); v++; saw = 1; }
+    /* Cap the accumulators so a pathological value (e.g. "padding: 9999...9px")
+     * cannot overflow the signed int and feed garbage into the box-model math
+     * in layout.c. We keep consuming digits (so the unit suffix still parses)
+     * but stop growing once past a sane bound -- 1e6 px is already absurd. */
+    while (*v >= '0' && *v <= '9') { if (whole < 1000000) whole = whole * 10 + (*v - '0'); v++; saw = 1; }
     int frac = 0, frac_div = 1;
     if (*v == '.') {
         v++;
-        while (*v >= '0' && *v <= '9') { frac = frac * 10 + (*v - '0'); frac_div *= 10; v++; saw = 1; }
+        while (*v >= '0' && *v <= '9') { if (frac_div < 1000000) { frac = frac * 10 + (*v - '0'); frac_div *= 10; } v++; saw = 1; }
     }
     if (!saw) { if (ok) *ok = 0; return 0; }
     double val = (double)whole + (double)frac / (double)frac_div;
@@ -926,10 +930,10 @@ static void apply_decl(css_computed *o, const char *prop, const char *val)
         if (ci_eq(val, "bold")) o->bold = 1;
         else if (ci_eq(val, "normal")) o->bold = 0;
         else {
-            /* numeric? */
+            /* numeric? Cap accumulator to prevent overflow. */
             int v = 0; const char *p = val;
             int saw = 0;
-            while (*p >= '0' && *p <= '9') { v = v * 10 + (*p - '0'); p++; saw = 1; }
+            while (*p >= '0' && *p <= '9') { if (v < 100000) v = v * 10 + (*p - '0'); p++; saw = 1; }
             if (saw) o->bold = (v >= 600);
         }
     } else if (strcmp(prop, "font-style") == 0) {

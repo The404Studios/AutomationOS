@@ -3,7 +3,7 @@
  * ===========================================================================
  *
  * Windows-11-style task manager built on the M4 UI toolkit + wl_client.
- * Live process list every ~1 s, CPU%, memory, End-Task action.
+ * Live process list every ~2 s, CPU%, memory, End-Task action.
  *
  * Syscalls used:
  *   SYS_PROCLIST   = 44  — fill proc_info_t[max], returns count
@@ -68,7 +68,7 @@ typedef struct {
     unsigned long free_mem;    /* bytes */
     unsigned long uptime_ms;
     unsigned int  proc_count;
-    unsigned int  _pad;
+    unsigned int  heap_used_kb;  /* kernel heap usage in KiB */
 } sysinfo_t;
 
 /* procapi_ctl verb */
@@ -189,7 +189,7 @@ typedef struct {
     ui_widget_t  *btn_endtask;
     ui_widget_t  *lbl_status;
 
-    /* Tick counter to throttle refresh to ~1 s */
+    /* Tick counter to throttle refresh to ~2 s */
     int           tick_skip;
 
     /* Previous refresh time (ms) for CPU delta */
@@ -203,12 +203,12 @@ static tm_state_t g_tm;
  * ========================================================================= */
 static const char *state_str(unsigned int s) {
     switch (s) {
-        case 0: return "New  ";
-        case 1: return "Ready";
-        case 2: return "Run  ";
-        case 3: return "Blkd ";
-        case 4: return "Dead ";
-        default: return "?    ";
+        case 0: return "New    ";
+        case 1: return "Ready  ";
+        case 2: return "Running";
+        case 3: return "Blocked";
+        case 4: return "Stopped";
+        default: return "?      ";
     }
 }
 
@@ -342,6 +342,13 @@ static void tm_render(tm_state_t *st) {
     /* --- Render process rows --- */
     for (int r = 0; r < VISIBLE; r++) {
         int idx = st->scroll + r;
+
+        /* Highlight selected row with a distinct background color. */
+        if (idx == st->selected && idx < st->count)
+            ui_widget_set_bg(st->row_bg[r], C_BG_SEL);
+        else
+            ui_widget_set_bg(st->row_bg[r], (r & 1) ? C_BG_ROW_B : C_BG_ROW_A);
+
         if (idx >= st->count) {
             ui_label_set_text(st->row_pid[r],   "");
             ui_label_set_text(st->row_name[r],  "");
@@ -366,8 +373,15 @@ static void tm_render(tm_state_t *st) {
             ui_label_set_text(st->row_name[r], name_buf);
         }
 
-        /* State */
+        /* State — color-coded for quick visual scanning */
         ui_label_set_text(st->row_state[r], state_str(d->state));
+        switch (d->state) {
+            case 2:  ui_widget_set_fg(st->row_state[r], C_GREEN);  break; /* Running */
+            case 1:  ui_widget_set_fg(st->row_state[r], C_CYAN);   break; /* Ready */
+            case 3:  ui_widget_set_fg(st->row_state[r], C_ORANGE); break; /* Blocked */
+            case 4:  ui_widget_set_fg(st->row_state[r], C_RED);    break; /* Dead */
+            default: ui_widget_set_fg(st->row_state[r], C_DIM);    break;
+        }
 
         /* CPU% — delta / total_delta * 100 */
         {
@@ -414,6 +428,12 @@ static void tm_render(tm_state_t *st) {
         p = tm_app(p, fmt_mem(used, mb));
         p = tm_app(p, " / ");
         p = tm_app(p, fmt_mem(st->sysinfo.total_mem, mb));
+        /* Append kernel heap usage if available */
+        if (st->sysinfo.heap_used_kb > 0) {
+            p = tm_app(p, "  Heap: ");
+            p = tm_app(p, tm_utoa(st->sysinfo.heap_used_kb, nb, 0, ' '));
+            p = tm_app(p, " KB");
+        }
         ui_label_set_text(st->ftr_mem, buf);
 
         fmt_uptime(buf, st->sysinfo.uptime_ms);
@@ -427,8 +447,51 @@ static void tm_render(tm_state_t *st) {
 }
 
 /* =========================================================================
+ * Row selection ud struct
+ * ========================================================================= */
+typedef struct {
+    tm_state_t *st;
+    int         row;   /* visible row index (0..VISIBLE-1) */
+} ud_row_t;
+
+static ud_row_t g_ud_rows[VISIBLE];
+
+/* =========================================================================
  * Button callbacks
  * ========================================================================= */
+
+/* Click a process row to select it. */
+static void on_select_row(void *ud) {
+    ud_row_t *r = (ud_row_t *)ud;
+    if (!r || !r->st) return;
+    int abs_idx = r->st->scroll + r->row;
+    if (abs_idx < r->st->count)
+        r->st->selected = abs_idx;
+    ui_label_set_text(r->st->lbl_status, "");
+}
+
+/* Scroll up by one row. */
+static void on_scroll_up(void *ud) {
+    tm_state_t *st = (tm_state_t *)ud;
+    if (st->scroll > 0) {
+        st->scroll--;
+        if (st->selected > st->scroll + VISIBLE - 1)
+            st->selected = st->scroll + VISIBLE - 1;
+    }
+}
+
+/* Scroll down by one row. */
+static void on_scroll_down(void *ud) {
+    tm_state_t *st = (tm_state_t *)ud;
+    int max_scroll = st->count - VISIBLE;
+    if (max_scroll < 0) max_scroll = 0;
+    if (st->scroll < max_scroll) {
+        st->scroll++;
+        if (st->selected < st->scroll)
+            st->selected = st->scroll;
+    }
+}
+
 static void on_endtask(void *ud) {
     tm_state_t *st = (tm_state_t *)ud;
     if (st->count == 0) return;
@@ -438,6 +501,13 @@ static void on_endtask(void *ud) {
     unsigned int pid = st->detail[idx].pid;
     if (pid <= 1) {
         ui_label_set_text(st->lbl_status, "Cannot kill PID 0/1");
+        return;
+    }
+
+    /* Don't kill ourselves */
+    unsigned int my_pid = (unsigned int)sc6(SYS_GETPID, 0, 0, 0, 0, 0, 0);
+    if (pid == my_pid) {
+        ui_label_set_text(st->lbl_status, "Cannot kill self");
         return;
     }
 
@@ -451,20 +521,35 @@ static void on_endtask(void *ud) {
         p = tm_app(p, tm_utoa(pid, nb, 0, ' '));
         *p = '\0';
         ui_label_set_text(st->lbl_status, msg);
+
+        /* Force an immediate refresh so the killed process disappears */
+        tm_refresh(st);
+        st->tick_skip = 0;   /* reset the refresh timer */
+
+        /* Clamp selection in case the killed process was the last one */
+        if (st->selected >= st->count)
+            st->selected = (st->count > 0) ? st->count - 1 : 0;
     } else {
-        ui_label_set_text(st->lbl_status, "Kill failed (EPERM?)");
+        /* r is a negative errno from the kernel */
+        if (r == -1)   /* EPERM */
+            ui_label_set_text(st->lbl_status, "Kill denied (EPERM)");
+        else if (r == -3) /* ESRCH */
+            ui_label_set_text(st->lbl_status, "No such process");
+        else
+            ui_label_set_text(st->lbl_status, "Kill failed");
     }
 }
 
 /* =========================================================================
- * Tick callback (~60 fps, throttle refresh to 1 s)
+ * Tick callback (~25 fps, throttle data refresh to ~2 s)
  * ========================================================================= */
 static void tm_tick(void *ud) {
     tm_state_t *st = (tm_state_t *)ud;
 
-    /* Refresh data every ~60 ticks (~1 s at 60 fps) */
+    /* Refresh data every ~50 ticks (~2 s at 25 fps).
+     * The UI event loop in ui_app_run() paces at ~25 fps (40 ms per frame). */
     st->tick_skip++;
-    if (st->tick_skip < 60) {
+    if (st->tick_skip < 50) {
         /* Still render to update highlight if selection changed */
         tm_render(st);
         return;
@@ -537,6 +622,12 @@ void _start(void) {
         g_tm.row_state[r] = ui_label(list_pnl, 310, y, "", C_DIM);
         g_tm.row_cpu[r]   = ui_label(list_pnl, 390, y, "", C_GREEN);
         g_tm.row_mem[r]   = ui_label(list_pnl, 460, y, "", C_BLUE);
+
+        /* Invisible click button covering the entire row for selection. */
+        g_ud_rows[r].st  = &g_tm;
+        g_ud_rows[r].row = r;
+        ui_button(list_pnl, 0, y - 1, WIN_W, ROW_H, "",
+                  on_select_row, (void *)&g_ud_rows[r]);
     }
 
     /* ---- Footer panel ---- */
@@ -547,6 +638,12 @@ void _start(void) {
     g_tm.ftr_procs  = ui_label(ftr_pnl, 12,  4, "Procs: --",        C_DIM);
     g_tm.ftr_mem    = ui_label(ftr_pnl, 12, 20, "Mem: --",           C_DIM);
     g_tm.ftr_uptime = ui_label(ftr_pnl, 12, 36, "Up: --:--:--",     C_DIM);
+
+    /* ---- Scroll buttons ---- */
+    ui_button(ftr_pnl, WIN_W - 130, 40, 50, 12, "Up",
+              on_scroll_up, &g_tm);
+    ui_button(ftr_pnl, WIN_W - 70, 40, 50, 12, "Dn",
+              on_scroll_down, &g_tm);
 
     /* ---- End Task button ---- */
     g_tm.btn_endtask = ui_button(ftr_pnl, WIN_W - 130, 10, 110, 28,

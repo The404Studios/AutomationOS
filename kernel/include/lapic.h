@@ -88,12 +88,29 @@
 #define LAPIC_DSH_ALL_INC_SELF  0x00080000
 #define LAPIC_DSH_ALL_EXC_SELF  0x000C0000
 
-// IPI types
-#define IPI_RESCHEDULE          0x40  // Force reschedule
-#define IPI_TLB_FLUSH           0x41  // TLB flush
-#define IPI_FUNCTION_CALL       0x42  // Call function on remote CPU
-#define IPI_STOP                0x43  // Stop CPU
-#define IPI_TEST                0x44  // Test IPI
+// IPI types -- IDT vectors claimed by ipi_init() (SMP_IPI builds only).
+//
+// SMP-G0 RENUMBER (0x40..0x46 -> 0x50..0x56): the original IPI_RESCHEDULE=0x40
+// COLLIDED with AP_LAPIC_TIMER_VECTOR=0x40 (lapic_constants.h) -- Brick E armed
+// CPU1's LAPIC timer at 0x40 and idt.c points IDT[0x40] at ap_lapic_timer_isr.
+// An unmodified ipi_init() would have silently overwritten that gate and killed
+// CPU1's tick. The IPI block now lives at 0x50+: above the exceptions (0x00-
+// 0x1F), the remapped PIC IRQs (0x20-0x2F), and the per-CPU LAPIC timer (0x40);
+// below the LAPIC spurious vector (0xFF). Vector-class note: priority = vector
+// >> 4, so IPIs (class 5) outrank the AP timer tick (class 4) -- a STOP/
+// RESCHEDULE is never starved by the tick. Collisions are STATICALLY ASSERTED
+// in ipi.c and re-checked at runtime (idt_gate_present) before any gate is
+// claimed -- never assume a vector is free.
+#define IPI_RESCHEDULE          0x50  // Force reschedule
+#define IPI_TLB_FLUSH           0x51  // TLB flush (lazy)
+#define IPI_FUNCTION_CALL       0x52  // Call function on remote CPU
+#define IPI_STOP                0x53  // Stop CPU
+#define IPI_TEST                0x54  // Test IPI
+#define IPI_TLB_FLUSH_ALL       0x55  // TLB flush all contexts (PCID recycle)
+#define IPI_AP_PANIC            0x56  // AP panic notification
+#define IPI_TLB_FLUSH_PAGE      0x57  // SMP-G2: bounded kernel-range invlpg shootdown
+                                      // (the stash-mined SMP-R0 harvest, renumbered
+                                      // from its pre-G0 0x47 into this block)
 
 // LAPIC initialization
 void lapic_init(void);

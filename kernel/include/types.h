@@ -33,6 +33,7 @@ typedef uint8_t bool;
 #define UINT32_MAX 0xFFFFFFFFU
 #define INT32_MAX  0x7FFFFFFF
 #define INT32_MIN  (-INT32_MAX - 1)
+#define SIZE_MAX   UINT64_MAX
 
 // Useful macros
 #define ALIGN_UP(x, align) (((x) + (align) - 1) & ~((align) - 1))

@@ -30,28 +30,64 @@ process_t* current_process = NULL;
 // RACE-002 fix: Global process table lock protects process_table[] and pid_used[]
 static spinlock_t process_table_lock;
 
+// Monotonic creation stamp for stable process identity (#10). Incremented under
+// process_table_lock each time a PCB is published, so (pid, create_seq) uniquely
+// identifies an incarnation even after the PID is recycled. Never reused/reset.
+static uint64_t g_create_seq = 0;
+
 // Allocate a free PID by scanning the bitmap under the table lock. Returns a PID
 // in [1, MAX_PROCESSES) on success, or 0 if the table is full (caller returns
 // NULL rather than panicking).
 static uint32_t allocate_pid(void) {
-    spin_lock(&process_table_lock);
+    // IRQ-safe: process_unref() may run in hard-IRQ context and now ALWAYS takes
+    // process_table_lock (TOCTOU fix). A plain spin_lock here would let an IRQ that
+    // unrefs self-deadlock against this same-CPU holder. spin_lock_irqsave masks
+    // interrupts for the (short) duration we hold the lock.
+    uint64_t flags;
+    spin_lock_irqsave(&process_table_lock, &flags);
     for (uint32_t i = 1; i < MAX_PROCESSES; i++) {
         if (!pid_used[i]) {
             pid_used[i] = 1;
-            spin_unlock(&process_table_lock);
+            spin_unlock_irqrestore(&process_table_lock, flags);
             return i;
         }
     }
-    spin_unlock(&process_table_lock);
+    spin_unlock_irqrestore(&process_table_lock, flags);
     return 0;  // no free PID
 }
 
 // Return a PID to the pool so it can be reused.
 static void free_pid(uint32_t pid) {
     if (pid == 0 || pid >= MAX_PROCESSES) return;
-    spin_lock(&process_table_lock);
+    // IRQ-safe (see allocate_pid): IRQ-context process_unref() also takes this lock.
+    uint64_t flags;
+    spin_lock_irqsave(&process_table_lock, &flags);
     pid_used[pid] = 0;
-    spin_unlock(&process_table_lock);
+    spin_unlock_irqrestore(&process_table_lock, flags);
+}
+
+// Relocate an already-created process onto the reserved PID 0 (the idle thread).
+// allocate_pid() never hands out 0 (it scans from index 1), so the FIRST
+// process_create() — the per-CPU idle thread in scheduler_init() — is given PID 1
+// and bumps /sbin/init to PID 2. init.c hard-requires getpid()==1 and exits(1)
+// otherwise ("Not PID 1!"), so we re-home idle into slot 0: free its allocated
+// PID back to the pool, reserve slot 0, and move its table entry. After this the
+// first real allocate_pid() returns 1, which init receives. No-op for a NULL arg
+// or a process already at PID 0.
+void process_adopt_pid0(process_t* proc) {
+    if (!proc || proc->pid == 0) return;
+    // IRQ-safe (see allocate_pid): IRQ-context process_unref() also takes this lock.
+    uint64_t flags;
+    spin_lock_irqsave(&process_table_lock, &flags);
+    uint32_t old = proc->pid;
+    if (old < MAX_PROCESSES && process_table[old] == proc) {
+        process_table[old] = NULL;
+        pid_used[old] = 0;
+    }
+    proc->pid = 0;
+    pid_used[0] = 1;            // keep slot 0 reserved (allocate_pid never returns 0)
+    process_table[0] = proc;
+    spin_unlock_irqrestore(&process_table_lock, flags);
 }
 
 void process_init(void) {
@@ -66,6 +102,100 @@ void process_init(void) {
     }
 
     PROC_LOG("[PROCESS] Process table initialized (max %d processes, SMP-safe)\n", MAX_PROCESSES);
+}
+
+// ===========================================================================
+// process_cleanup — teardown counterpart to process_init()
+// ===========================================================================
+// Walks the entire process table and forcibly terminates/frees all live
+// processes, preventing PCB + address-space leaks on kernel shutdown. This
+// is the single-point cleanup that process_init() was missing.
+//
+// Safe teardown sequence per process:
+//   1. Mark TERMINATED (cooperative paths stop scheduling it)
+//   2. Remove from scheduler (releases scheduler's reference)
+//   3. Unref our table reference (triggers full PCB teardown if ref==0)
+//
+// Two-phase approach: Phase 1 collects all live processes under the lock (with
+// extra refs so they don't vanish mid-cleanup). Phase 2 releases the lock and
+// performs the complex teardown (process_on_terminate, scheduler_remove_process,
+// process_unref) without holding locks.
+//
+// Called from kernel shutdown/halt path. Runs with interrupts disabled (no
+// concurrent process_create/destroy). The table lock is still acquired out
+// of discipline (safe even at shutdown), but no real contention is expected.
+void process_cleanup(void) {
+    PROC_LOG("[PROCESS] Cleaning up process table...\n");
+
+    // Phase 1: collect all live processes under the lock
+    process_t* to_cleanup[MAX_PROCESSES];
+    int cleanup_count = 0;
+
+    // IRQ-safe (see allocate_pid): IRQ-context process_unref() also takes this lock.
+    uint64_t flags;
+    spin_lock_irqsave(&process_table_lock, &flags);
+    for (int i = 0; i < MAX_PROCESSES; i++) {
+        process_t* proc = process_table[i];
+        if (proc) {
+            // Take an extra ref so the process doesn't vanish while we work on it
+            process_ref(proc);
+            to_cleanup[cleanup_count++] = proc;
+
+            // Mark TERMINATED
+            proc->state = PROCESS_TERMINATED;
+
+            // Clear table slot and free PID
+            process_table[i] = NULL;
+            pid_used[i] = 0;
+        }
+    }
+    spin_unlock_irqrestore(&process_table_lock, flags);
+
+    // Phase 2: outside the lock, terminate and unref each process
+    for (int i = 0; i < cleanup_count; i++) {
+        process_t* proc = to_cleanup[i];
+
+        PROC_LOG("[PROCESS] Cleaning up PID %d (%s) refcount=%d\n",
+                 proc->pid, proc->name, proc->ref_count);
+
+        // Wake waiters (parent blocked in waitpid, or own child_wait queue)
+        process_on_terminate(proc);
+
+        // Try to remove from scheduler (if it was enqueued). This releases
+        // the scheduler's reference. Safe even if already removed.
+        extern void scheduler_remove_process(process_t* proc);
+        scheduler_remove_process(proc);
+
+        // #9 fix: release the CREATION ref too. A never-reaped process at shutdown
+        // still holds it, so without this the final leak scan below reports it as
+        // "still in table". CAS-guarded so a concurrent parent reaper can't double-
+        // release, and it MUST run BEFORE the extra-ref unref below so the PCB
+        // survives to be freed by that final unref.
+        reap_claim_release(proc);
+
+        // Drop the table's reference (our +ref above will be the last one after
+        // scheduler_remove_process released its ref, so this should trigger the
+        // final teardown)
+        process_unref(proc);
+    }
+
+    // Final leak check: walk the table one more time to see if anything survived
+    int leaked_count = 0;
+    spin_lock_irqsave(&process_table_lock, &flags);
+    for (int i = 0; i < MAX_PROCESSES; i++) {
+        if (process_table[i] != NULL) {
+            leaked_count++;
+            PROC_LOG("[PROCESS] LEAK: PID %d still in table after cleanup\n", i);
+        }
+    }
+    spin_unlock_irqrestore(&process_table_lock, flags);
+
+    if (leaked_count > 0) {
+        PROC_LOG("[PROCESS] WARNING: %d processes leaked after cleanup\n", leaked_count);
+    }
+
+    PROC_LOG("[PROCESS] Process cleanup complete: %d processes terminated\n",
+             cleanup_count);
 }
 
 process_t* process_create(const char* name, void* entry_point) {
@@ -93,9 +223,22 @@ process_t* process_create(const char* name, void* entry_point) {
     // root-cause fix for that whole class of uninitialized-field bugs.
     memset(proc, 0, sizeof(process_t));
 
+    // F3-2 affinity defaults — MUST follow the memset, which zeroed BOTH fields into
+    // their trap states: allowed_cpus=0 means "allowed on NO cpu" (the validator would
+    // trip for every task) and pinned_cpu=0 means "pinned to CPU0", NOT the unpinned
+    // sentinel. Normal tasks are CPU0-only and unpinned. process_create is the funnel
+    // for almost every PCB ctor (idle, exec, fork, health_monitor, ...), so this one
+    // assignment closes the trap for all of them. The lone CPU1 test kthread OVERRIDES
+    // these after process_create returns (see ap_spawn_test_kthread in scheduler.c).
+    proc->allowed_cpus = (uint64_t)1 << 0;   // CPU0 only
+    proc->pinned_cpu   = CPU_NONE;           // not pinned
+
     // Initialize process structure
     proc->pid = pid;
     proc->parent_pid = current_process ? current_process->pid : 0;
+    // #10: snapshot the creator's stable identity so this child can later validate
+    // its parent is the SAME incarnation (guards against a recycled parent PID).
+    proc->parent_seq = current_process ? current_process->create_seq : 0;
     proc->state = PROCESS_CREATED;
     proc->resume_mode = RESUME_CRETURN;  // new processes resume via the C-return path
     // Inherit credentials from the creating process (root/0 for early procs).
@@ -143,6 +286,9 @@ process_t* process_create(const char* name, void* entry_point) {
     }
 
     uint64_t kstack_top = (uint64_t)proc->kernel_stack + KERNEL_STACK_SIZE;
+
+    // Plant a canary at the BOTTOM of the kernel stack to detect overflow.
+    STACK_CANARY_PLANT(proc);
 
     // Setup initial CPU context
     memset(&proc->context, 0, sizeof(cpu_context_t));
@@ -206,10 +352,15 @@ process_t* process_create(const char* name, void* entry_point) {
     // Initialize sandbox flags
     proc->sandbox_flags = 0;
 
-    // RACE-002 fix: Add to process table with lock protection
-    spin_lock(&process_table_lock);
-    process_table[pid] = proc;
-    spin_unlock(&process_table_lock);
+    // RACE-002 fix: Add to process table with lock protection.
+    // IRQ-safe (see allocate_pid): IRQ-context process_unref() also takes this lock.
+    {
+        uint64_t flags;
+        spin_lock_irqsave(&process_table_lock, &flags);
+        proc->create_seq = ++g_create_seq;   // stable-identity stamp (#10), under lock
+        process_table[pid] = proc;
+        spin_unlock_irqrestore(&process_table_lock, flags);
+    }
 
     PROC_LOG("[PROCESS] Created process '%s' (PID %d)\n", proc->name, proc->pid);
     PROC_LOG("[PROCESS]   Entry point: %p\n", entry_point);
@@ -260,8 +411,16 @@ process_t* thread_create(process_t* parent, uint64_t entry, uint64_t arg,
     }
     memset(t, 0, sizeof(process_t));
 
+    // F3-2 affinity defaults (post-memset, same trap as process_create). thread_create
+    // has its OWN kmalloc+memset (does NOT funnel through process_create), so it must
+    // set both here. A child thread takes the CPU0-only default (NOT the parent's mask)
+    // -- conservative: no cross-cpu spread at F3-2.
+    t->allowed_cpus = (uint64_t)1 << 0;   // CPU0 only
+    t->pinned_cpu   = CPU_NONE;           // not pinned
+
     t->pid = pid;
     t->parent_pid = parent->pid;
+    t->parent_seq = parent->create_seq;   // stable parent identity (#10)
     t->state = PROCESS_CREATED;
     t->resume_mode = RESUME_CRETURN;     // first run via the trampoline `ret` path
     t->uid = parent->uid;
@@ -291,6 +450,9 @@ process_t* thread_create(process_t* parent, uint64_t entry, uint64_t arg,
         free_pid(pid);
         return NULL;
     }
+
+    // Plant a canary at the BOTTOM of the kernel stack to detect overflow.
+    STACK_CANARY_PLANT(t);
 
     // SHARE the parent's address space: same CR3, same as_refcount, +1 owner.
     // This is the crux of "a thread shares its parent's address space" and of the
@@ -323,12 +485,18 @@ process_t* thread_create(process_t* parent, uint64_t entry, uint64_t arg,
     // Initialize the join wait_object so a joiner can block on it.
     wait_object_init(&t->thread_join_wo);
 
-    t->state = PROCESS_READY;
+    // Mark READY (CREATED->READY transition)
+    process_set_ready(t);
 
     // Publish into the process table so process_get_by_pid()/join can find it.
-    spin_lock(&process_table_lock);
-    process_table[pid] = t;
-    spin_unlock(&process_table_lock);
+    // IRQ-safe (see allocate_pid): IRQ-context process_unref() also takes this lock.
+    {
+        uint64_t flags;
+        spin_lock_irqsave(&process_table_lock, &flags);
+        t->create_seq = ++g_create_seq;   // stable-identity stamp (#10), under lock
+        process_table[pid] = t;
+        spin_unlock_irqrestore(&process_table_lock, flags);
+    }
 
     PROC_LOG("[THREAD] Created thread TID %d (tgid %d) sharing CR3=0x%016lx "
              "entry=0x%lx arg=0x%lx ustack=0x%lx (AS refs now %d)\n",
@@ -360,15 +528,125 @@ void process_ref(process_t* proc) {
 //      the entry, sees the process is no longer BLOCKED, and releases that ref.
 void process_on_terminate(process_t* child) {
     if (!child) return;
+
+#ifdef SMP_RUNMASK
+    // SMP-RUNMASK-0: record the (declared, actual) CPU footprint of every
+    // dying MULTI-MASK process. The audit walk only sees LIVE processes, and
+    // the interesting multimask tasks (batchdemo: ~50 ms lifetime) die long
+    // before any late walk -- so the proof evidence is captured at the exit
+    // boundary. One serial line per multimask exit (rare by construction)
+    // + counters for the smoke. Runs on whichever CPU executes the exit
+    // (CPU1 for batchdemo) -- safe: scalar reads of the dying PCB we already
+    // hold, and kprintf lines are cross-CPU atomic since the F3-7 line lock.
+    {
+        uint64_t m = child->allowed_cpus;
+        if (m & (m - 1)) {                       /* declared on >1 CPU */
+            int bits = 0;
+            for (uint32_t r = child->ran_on_cpus; r; r &= (r - 1)) bits++;
+            extern volatile uint32_t g_runmask_exit_multimask;
+            extern volatile uint32_t g_runmask_exit_crosscpu;
+            g_runmask_exit_multimask++;
+            if (bits > 1) g_runmask_exit_crosscpu++;
+            kprintf("[RUNMASK] exit record: pid=%d '%s' allowed=0x%llx "
+                    "ran=0x%x single_cpu=%d\n",
+                    child->pid, child->name, (unsigned long long)m,
+                    child->ran_on_cpus, (bits <= 1) ? 1 : 0);
+        }
+    }
+#endif
+
+    // ---- Phase A: reparent this dying process's own children to init (PID 1).
+    //
+    // LOCKED DESIGN (#9): orphans are reparented-to-init; NO process self-reaps.
+    // When a process dies, every child that still names it as parent must be handed
+    // to init so init's waitpid(-1) loop (userspace/init/main.c) eventually harvests
+    // the child's zombie and releases its creation ref via reap_claim_release.
+    // Without this, a child that outlives its parent -- or is already a zombie when
+    // the parent dies -- is NEVER reaped (init's scan matches only parent_pid==1, so
+    // a grandchild keeps leaking). This is the load-bearing half of the leak fix.
+    //
+    // RECURSIVE-DEADLOCK AVOIDANCE: process_table_lock is a PLAIN, NON-RECURSIVE
+    // spinlock. We must walk process_table[] under it to find our children, so we
+    // MUST NOT call process_get_by_pid() (or anything that takes the same lock)
+    // while holding it. We therefore touch process_table[i] DIRECTLY here, exactly
+    // like process_cleanup() does, and defer every lock-taking call (the parent wake
+    // and the init wake, both of which use process_get_by_pid) to AFTER we drop the
+    // lock. We only read/set scalar PCB fields (parent_pid, state) under the lock --
+    // no allocation, no wq calls, no unref -- so the section is tiny and IRQ-safe
+    // (acquired irqsave, matching every other holder).
+    //
+    // dying==init guard: if the dying process IS init (pid 1) we are on the shutdown
+    // path; reparenting children to "1" would point them at the corpse and no
+    // surviving reaper exists, so skip Phase A and the init-wake entirely.
+    int reparented_zombie = 0;   // did we hand init an already-TERMINATED child?
+    if (child->pid != 1) {
+        // Fetch init's stable identity ONCE (outside the table lock) so reparented
+        // orphans adopt BOTH parent_pid=1 AND parent_seq=<init's create_seq> -- then
+        // the (pid, create_seq) identity check in Phase B and sys_waitpid holds for
+        // them uniformly (no init special-case needed). (#10)
+        uint64_t init_seq = 0;
+        process_t* init_p = process_get_by_pid(1);
+        if (init_p) { init_seq = init_p->create_seq; process_unref(init_p); }
+
+        uint64_t flags;
+        spin_lock_irqsave(&process_table_lock, &flags);
+        for (int i = 0; i < MAX_PROCESSES; i++) {
+            process_t* p = process_table[i];
+            // Skip empty slots and the dying process itself. Touch fields directly
+            // -- NO process_get_by_pid here (it would re-take this same lock).
+            if (!p || p == child) continue;
+            if (p->parent_pid == child->pid) {
+                p->parent_pid = 1;                       // reparent to init
+                p->parent_seq = init_seq;                // adopt init's identity (#10)
+                if (p->state == PROCESS_TERMINATED) {     // already a zombie
+                    reparented_zombie = 1;                // init must be woken
+                }
+            }
+        }
+        spin_unlock_irqrestore(&process_table_lock, flags);
+    }
+
+    // ---- Phase B: wake this dying process's OWN parent (unchanged behavior), now
+    // safely outside process_table_lock. process_get_by_pid()/process_unref() take
+    // the lock internally -- fine, we hold nothing here.
     if (child->parent_pid) {
         process_t* parent = process_get_by_pid(child->parent_pid);
         if (parent) {
-            if (parent->child_wait) {
+            // #10: only wake the parent if it is the SAME incarnation the child was
+            // created under (pid + create_seq). A recycled PID now belonging to an
+            // unrelated process has a different create_seq -- we must NOT poke its
+            // child_wait (spurious wake / wrong-child reap). Reparented orphans carry
+            // init's create_seq (set in Phase A), so init is matched correctly.
+            // init (PID 1) is never recycled and is the universal reaper, so always
+            // match it; otherwise require the stable-identity match. The pid-1
+            // wildcard also covers the (unreachable in normal boot) init-absent
+            // reparent edge where an orphan's parent_seq stayed 0.
+            if ((child->parent_pid == 1 || parent->create_seq == child->parent_seq)
+                && parent->child_wait) {
                 wq_wake_one((wait_queue_t*)parent->child_wait);
             }
             process_unref(parent);
         }
     }
+
+    // ---- Phase C: if we handed init an already-TERMINATED orphan, wake init's
+    // child_wait so its waitpid(-1) loop re-scans and harvests the zombie. Done
+    // outside the lock (process_get_by_pid takes it). Tolerate a missing init (NULL
+    // pre-init / at shutdown) and a not-yet-allocated init->child_wait (init has
+    // never blocked in waitpid yet -- its next scan finds the zombie anyway).
+    if (reparented_zombie) {
+        process_t* init_proc = process_get_by_pid(1);
+        if (init_proc) {
+            if (init_proc->child_wait) {
+                wq_wake_one((wait_queue_t*)init_proc->child_wait);
+            }
+            process_unref(init_proc);
+        }
+    }
+
+    // ---- Self-drain (unchanged): if this dying process was itself blocked in
+    // waitpid(), its self-referencing wait entry holds a ref; wq_wake_all releases
+    // it so the PCB can actually be freed.
     if (child->child_wait) {
         wq_wake_all((wait_queue_t*)child->child_wait);
     }
@@ -378,30 +656,87 @@ void process_on_terminate(process_t* child) {
 void process_unref(process_t* proc) {
     if (!proc) return;
 
-    // BUG-008 fix: Use atomic decrement (SMP-safe)
-    // Only ONE CPU will see the transition to 0
-    uint32_t old_count = __atomic_sub_fetch(&proc->ref_count, 1, __ATOMIC_SEQ_CST);
+    // TOCTOU fix: do the FINAL decrement and the table-slot NULL in the SAME
+    // critical section under process_table_lock.
+    //
+    // The old code decremented ref_count OUTSIDE the lock and then took the lock
+    // only to NULL the slot. That left a window where the PCB was still published
+    // in process_table[pid] with ref_count already at 0: a concurrent
+    // process_get_by_pid() could take the lock, observe the still-published slot,
+    // and process_ref() it back to 1 — resurrecting an object this CPU has already
+    // committed to freeing. The unref'ing CPU then NULLs the slot and frees the
+    // PCB, leaving the resurrecter with a dangling pointer (UAF / double-free).
+    // Benign on the current uniprocessor build (only CPU0 schedules, so no other
+    // context runs between the decrement and the lock) but a guaranteed UAF once
+    // AP scheduling goes live.
+    //
+    // By decrementing UNDER the lock and NULLing the slot in the same section,
+    // every process_get_by_pid() either (a) refs before our decrement — then it
+    // observes ref_count > 0 and we do NOT free — or (b) runs after we NULL the
+    // slot — then it sees NULL and returns NULL. There is no observe-and-ref gap.
+    //
+    // IRQ-SAFETY / DEADLOCK: process_unref() can be reached from a hard IRQ
+    // (wait_object_signal() -> wo_wake_one_proc() -> process_unref(), documented
+    // IRQ-safe in waitqueue.c). process_table_lock is a plain (non-IRQ) spinlock,
+    // so if a non-IRQ holder is interrupted by an IRQ-context unref that takes the
+    // same lock, the CPU self-deadlocks. We therefore acquire it IRQ-safe here
+    // (spin_lock_irqsave): interrupts are masked for the (tiny, allocation-free)
+    // duration of the decrement + slot NULL, so no IRQ-context unref can land
+    // while we hold it. The heavy teardown below runs AFTER the lock is dropped
+    // and interrupts are restored, exactly as before.
+    uint64_t ptl_flags;
+    spin_lock_irqsave(&process_table_lock, &ptl_flags);
 
-    if (old_count == 0) {
-        // Only the CPU that decremented from 1 to 0 will enter here
-        // This prevents double-free race condition
+    uint32_t new_count = __atomic_sub_fetch(&proc->ref_count, 1, __ATOMIC_SEQ_CST);
+
+    if (new_count != 0) {
+        // Not the last reference (or a getter re-reffed in the gap we just closed).
+        // Nothing to free; just drop the lock and return.
+        spin_unlock_irqrestore(&process_table_lock, ptl_flags);
+        return;
+    }
+
+    // We are the single CPU that drove ref_count 1 -> 0 while holding the lock.
+    // No concurrent process_get_by_pid() can observe-and-ref this PCB anymore:
+    // unpublish it from the table NOW, in the same critical section, before we
+    // drop the lock. The PID is returned to the pool here too.
+    if (proc->pid < MAX_PROCESSES) {
+        process_table[proc->pid] = NULL;
+        pid_used[proc->pid] = 0;
+    }
+
+    spin_unlock_irqrestore(&process_table_lock, ptl_flags);
+
+    {
+        // Only the CPU that decremented from 1 to 0 reaches here.
+        // This prevents double-free race condition.
         PROC_LOG("[PROCESS] Freeing process '%s' (PID %d) - ref_count reached 0\n",
                 proc->name, proc->pid);
 
-        // RACE-002 fix: Remove from process table with lock protection, and
-        // return the PID to the pool so it can be reused (prevents the eventual
-        // "table full" panic on long-running, app-churning sessions).
-        if (proc->pid < MAX_PROCESSES) {
-            spin_lock(&process_table_lock);
-            process_table[proc->pid] = NULL;
-            pid_used[proc->pid] = 0;
-            spin_unlock(&process_table_lock);
-        }
+#ifdef SMP_FOUNDATION
+        // CPU1 job orphan cleanup: if this process owns a pending CPU1 job we must
+        // NOT block indefinitely (violates the async goal) and must NOT free any
+        // buffers CPU1 is still touching. cpu1_orphan_jobs() is two-phase: it first
+        // GRACE-WAITS up to ~100 ms for the in-flight job to drain cleanly (the
+        // common case -- no orphan needed), and only if it is STILL pending does it
+        // orphan it (clear owner_pid so the result is dropped, and transition the
+        // arg/result ownership descriptors TRANSFERRED -> ORPHANED). The offload
+        // BUFFERS are kref'd (kmalloc_ref in sys_cpu1_offload); the handler's own
+        // kput frees them only once CPU1 is also done -- so no UAF and no leak. The
+        // exiting process returns promptly (<= ~100 ms, usually instantly), bounded
+        // on a finite TSC deadline so a wedged AP can never hang teardown. job_seq
+        // guards against the slot being recycled by a newer job mid-wait. Called
+        // AFTER process_table_lock is dropped, so the grace-wait holds no locks.
+        extern void cpu1_orphan_jobs(uint32_t exiting_pid);
+        cpu1_orphan_jobs(proc->pid);
+#endif
 
-        // Release IPC resources owned by this process (SysV shm/msg). Must run
-        // while proc->pid is still valid and BEFORE the address space is torn
-        // down, so deferred-destroy segments are accounted correctly.
-        shm_cleanup_process(proc->pid);
+        // Release IPC resources owned by this process (SysV shm/msg). shm cleanup
+        // takes the process_t* directly (NOT a pid lookup): process_table[pid] has
+        // already been nulled above, so a by-pid lookup would return NULL and skip
+        // all cleanup (segment/attachment leak). msg cleanup scans by owner_pid so
+        // it still uses the pid.
+        shm_cleanup_process(proc);
         msg_cleanup_process(proc->pid);
 
         // Close any file descriptors the process still had open (per-process fd
@@ -409,6 +744,20 @@ void process_unref(process_t* proc) {
         // and not in the table. Safe here: still single-threaded teardown.
         extern void vfs_close_all_fds(struct process* proc);
         vfs_close_all_fds(proc);
+
+        // CHANNEL-0: release any channel handles the process still held so their
+        // shared rings + refcounts don't leak (mirrors vfs_close_all_fds).
+        extern void channel_cleanup_process(struct process* proc);
+        channel_cleanup_process(proc);
+
+        // Close any sockets the process had open (owner_pid match). Without
+        // this, a process that exits without explicit sock_close() leaks its
+        // socket descriptors forever (and, for TCP, leaves half-open
+        // connections). sock_cleanup_process iterates the socket table and
+        // calls sock_close on each matching slot. Safe here: the process is
+        // already off the scheduler and unreachable.
+        extern void sock_cleanup_process(uint32_t pid);
+        sock_cleanup_process(proc->pid);
 
         // Free the lazily-allocated waitpid wait queue, if any.
         if (proc->child_wait) {
@@ -471,8 +820,35 @@ void process_unref(process_t* proc) {
     }
 }
 
+// See sched.h. CAS-guarded single release of the CREATION ref: only the reaper
+// that wins reaped:0->1 drops the creation ref; losers no-op. Never touches the
+// caller's get_by_pid ref (the caller drops that itself, via process_destroy or
+// process_unref). SEQ_CST matches the rest of the refcount atomics in this file.
+// This is the headline #9 fix: today the creation ref (process_create sets
+// ref_count=1) is NEVER released for a reaped zombie, so the PCB/8KB stack/CR3/PID
+// leak and the 256-PID pool exhausts under spawn/exit churn.
+void reap_claim_release(process_t* proc) {
+    if (!proc) return;
+    if (__atomic_exchange_n(&proc->reaped, 1, __ATOMIC_SEQ_CST) == 0) {
+        process_unref(proc);   // release the creation ref, exactly once
+    }
+}
+
 void process_destroy(process_t* proc) {
     if (!proc) return;
+
+    // #48: if this process died while blocked in sys_thread_join (killed mid-join), it
+    // still holds a get_by_pid reference on its join target that its own join cleanup
+    // never released (its stack never resumed). Drop it here at reap so the target does
+    // not leak as an unreapable zombie. A normally-completed joiner cleared join_target
+    // before reaping its target, so this is NULL for it and for every non-joining
+    // process. Released OUTSIDE process_table_lock (process_destroy holds none), so the
+    // nested process_unref cannot self-deadlock.
+    if (proc->join_target) {
+        process_t* jt = proc->join_target;
+        proc->join_target = NULL;
+        process_unref(jt);
+    }
 
     PROC_LOG("[PROCESS] Destroying process '%s' (PID %d)\n", proc->name, proc->pid);
 
@@ -489,31 +865,141 @@ process_t* process_get_by_pid(uint32_t pid) {
     }
 
     // RACE-002 fix: Read process_table[] with lock AND take reference
-    // This prevents the process from being freed while caller uses it
-    spin_lock(&process_table_lock);
+    // This prevents the process from being freed while caller uses it.
+    //
+    // IRQ-SAFE (TOCTOU fix): this acquisition MUST mask interrupts. process_unref()
+    // now does its final decrement + slot-NULL under this same lock, and may run in
+    // hard-IRQ context (wait_object_signal path). A plain spin_lock here would let
+    // such an IRQ fire while we hold the lock and self-deadlock. With interrupts
+    // masked, the decrement-vs-ref race is fully serialized: we either ref a PCB
+    // whose ref_count is still > 0 (it cannot reach 0 and free until our ref is
+    // dropped), or we read a NULL slot that a completed unref already cleared.
+    uint64_t flags;
+    spin_lock_irqsave(&process_table_lock, &flags);
     process_t* proc = process_table[pid];
     if (proc) {
         process_ref(proc);  // Increment ref count before returning
     }
-    spin_unlock(&process_table_lock);
+    spin_unlock_irqrestore(&process_table_lock, flags);
 
     return proc;
 
     // IMPORTANT: Callers MUST call process_unref() when done with the returned process!
 }
 
-process_t* process_get_current(void) {
-    return current_process;
+// Find the first live process whose name contains `needle` (substring match).
+// Returns a ref'd process_t* (caller MUST process_unref) or NULL if not found.
+// IRQ-safe: uses spin_lock_irqsave on process_table_lock, same as process_get_by_pid.
+// Skips TERMINATED processes so a zombie compositor is not returned.
+process_t* process_get_by_name(const char* needle) {
+    if (!needle || !needle[0]) return NULL;
+
+    uint64_t flags;
+    spin_lock_irqsave(&process_table_lock, &flags);
+    for (uint32_t i = 1; i < MAX_PROCESSES; i++) {
+        process_t* p = process_table[i];
+        if (!p || p->state == PROCESS_TERMINATED) continue;
+        // Substring match: the compositor's name is "sbin/compositor",
+        // so searching for "compositor" will find it.
+        const char* hay = p->name;
+        const char* n = needle;
+        for (const char* h = hay; *h; h++) {
+            const char* hh = h;
+            const char* nn = n;
+            while (*nn && *hh && *hh == *nn) { hh++; nn++; }
+            if (!*nn) {
+                // Found — take a ref and return.
+                process_ref(p);
+                spin_unlock_irqrestore(&process_table_lock, flags);
+                return p;
+            }
+        }
+    }
+    spin_unlock_irqrestore(&process_table_lock, flags);
+    return NULL;
+}
+
+// process_get_current() is now static inline in sched.h (hot-path optimisation).
+
+// ===========================================================================
+// process_set_ready — validated CREATED/BLOCKED -> READY transition
+// ===========================================================================
+// THE single chokepoint for marking a process READY (schedulable). Validates
+// the transition is legal (CREATED->READY or BLOCKED->READY) and logs illegal
+// attempts (TERMINATED->READY would silently resurrect a zombie; READY->READY
+// is a no-op but may indicate caller confusion). Returns 0 on success, -1 if
+// the transition was rejected.
+//
+// Callers: health_monitor.c, procapi.c, kill.c, waitqueue.c, scheduler.c
+// (sleep wakeup), exec.c, thread_create, and any code that needs to activate
+// a newly-created or blocked process. Use this INSTEAD of direct
+// `proc->state = PROCESS_READY` assignments to catch resurrection bugs.
+int process_set_ready(process_t* proc) {
+    if (!proc) {
+        return -1;
+    }
+
+    process_state_t old = proc->state;
+
+    // Valid transitions: CREATED->READY (initial activation), BLOCKED->READY (wake)
+    if (old == PROCESS_CREATED || old == PROCESS_BLOCKED) {
+        proc->state = PROCESS_READY;
+        return 0;
+    }
+
+    // RUNNING->READY is the cooperative yield/requeue transition. A process that
+    // voluntarily yields (sys_yield -> scheduler_yield_requeue) or is rotated by
+    // the scheduler is still marked RUNNING at the moment it is put back on the
+    // ready queue; the subsequent context_switch() saves its context so it can be
+    // resumed later. This is legal and happens on EVERY yield, so allow it. (The
+    // dangerous transition this chokepoint guards against is TERMINATED->READY
+    // below — resurrecting a zombie — which stays rejected.)
+    if (old == PROCESS_RUNNING) {
+        proc->state = PROCESS_READY;
+        return 0;
+    }
+
+    // READY->READY is a harmless idempotent no-op: the cooperative requeue paths
+    // (scheduler_add_process / scheduler_yield_requeue) call process_set_ready and
+    // are guarded against double-enqueue by proc->on_queue, so a process can be
+    // marked READY while already READY without harm. This fires constantly for
+    // CPU-bound, frequently-requeued tasks (e.g. the priority-test burners under
+    // preemption — 70k lines/boot), so it is NOT logged. Still tolerated.
+    if (old == PROCESS_READY) {
+        return 0;  // tolerate (idempotent)
+    }
+
+    // TERMINATED->READY is illegal (resurrection)
+    if (old == PROCESS_TERMINATED) {
+        kprintf("[PROCESS] ERROR: rejected TERMINATED->READY transition for "
+                "process %u (%s) — cannot resurrect a zombie\n",
+                proc->pid, proc->name);
+        return -1;
+    }
+
+    return -1;  // unknown state
 }
 
 void process_set_current(process_t* proc) {
     current_process = proc;
+    // SMP brick 4: mirror the current task into this CPU's cpu_t slot. At N=1
+    // (cpu_id()==0) this is just an extra store into cpus[0].current_thread and
+    // changes no observable behavior; it keeps this_cpu()->current_thread live
+    // for the later SMP bricks. The shared global above stays authoritative.
+    cpu_set_current_thread(proc);
     if (proc) {
         proc->state = PROCESS_RUNNING;
         // Single chokepoint hit by EVERY dispatch (cooperative schedule/yield/wq
         // AND preemptive resume/first-dispatch): count one context switch per
         // dispatch. Counter only; does not alter switch logic.
         proc->ctx_switches++;
+#ifdef SMP_RUNMASK
+        // SMP-RUNMASK-0: record REALITY at the BSP dispatch chokepoint (the
+        // CPU1 path stamps in ap_cooperative_schedule -- it does not come
+        // through here). ran_on_cpus is the ground truth the TLB pin audit
+        // aggregates per CR3: declared masks may lie, this bit cannot.
+        proc->ran_on_cpus |= (1u << cpu_id());
+#endif
     }
 }
 
@@ -523,7 +1009,9 @@ int process_list(proc_info_t* out, int max) {
         return 0;
     }
     int n = 0;
-    spin_lock(&process_table_lock);
+    // IRQ-safe (see allocate_pid): IRQ-context process_unref() also takes this lock.
+    uint64_t flags;
+    spin_lock_irqsave(&process_table_lock, &flags);
     for (int i = 0; i < MAX_PROCESSES && n < max; i++) {
         process_t* p = process_table[i];
         if (!p) {
@@ -543,6 +1031,23 @@ int process_list(proc_info_t* out, int max) {
         out[n].ctx_switches = p->ctx_switches;
         n++;
     }
-    spin_unlock(&process_table_lock);
+    spin_unlock_irqrestore(&process_table_lock, flags);
     return n;
+}
+
+// Count the number of live processes owned by a given UID. Used by sys_fork
+// for fork-bomb protection (per-UID process count limit). O(MAX_PROCESSES)
+// under the table lock -- acceptable at fork time (not a hot path).
+int process_count_by_uid(uint32_t uid) {
+    int count = 0;
+    uint64_t flags;
+    spin_lock_irqsave(&process_table_lock, &flags);
+    for (int i = 0; i < MAX_PROCESSES; i++) {
+        process_t* p = process_table[i];
+        if (p && p->uid == uid) {
+            count++;
+        }
+    }
+    spin_unlock_irqrestore(&process_table_lock, flags);
+    return count;
 }

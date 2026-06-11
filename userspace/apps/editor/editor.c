@@ -281,7 +281,21 @@ static char clip_buf[CLIP_MAX];
 #define TEXT_Y      2                        /* top margin */
 #define STATUS_H    18
 #define TEXT_AREA_H (WIN_H - STATUS_H)
-#define VISIBLE_ROWS (TEXT_AREA_H / FONT_H)
+#define VISIBLE_ROWS (TEXT_AREA_H / FONT_H)  /* default-size fallback only */
+
+/* Live count of text rows that fit the CURRENT window height. Recomputed in
+ * render() from win->h (and refreshed on WL_EVENT_RESIZE) so the editor
+ * reflows when the compositor maximizes/snaps/shrinks the window. */
+static int g_visible_rows = VISIBLE_ROWS;
+
+/* Rows that fit a window of pixel height `h`, clamped to at least 1. */
+static int rows_for_height(u32 h)
+{
+    i32 area = (i32)h - STATUS_H;
+    int rows = area / FONT_H;
+    if (rows < 1) rows = 1;
+    return rows;
+}
 
 /* ---- colors ---- */
 #define COL_BG          0xFF1E1E1Eu
@@ -302,8 +316,8 @@ static void ensure_visible(void)
 {
     if (cur_row < scroll_row)
         scroll_row = cur_row;
-    else if (cur_row >= scroll_row + VISIBLE_ROWS)
-        scroll_row = cur_row - VISIBLE_ROWS + 1;
+    else if (cur_row >= scroll_row + g_visible_rows)
+        scroll_row = cur_row - g_visible_rows + 1;
 }
 
 /* ---- insert char ---- */
@@ -557,8 +571,10 @@ static void render(wl_window *win, u64 ticks)
     i32 sb_y = (i32)bh - STATUS_H;
     fill_rect(pix, stride_px, bw, bh, 0, sb_y, (i32)bw, STATUS_H, COL_STATUS_BG);
 
-    /* Draw text lines */
-    int vis_rows = VISIBLE_ROWS;
+    /* Draw text lines. Recompute the visible-row count from the CURRENT
+     * window height so the text reflows after a resize/maximize/snap. */
+    g_visible_rows = rows_for_height(bh);
+    int vis_rows = g_visible_rows;
     for (int vi = 0; vi < vis_rows; vi++) {
         int row = scroll_row + vi;
         if (row >= num_lines) break;
@@ -732,6 +748,14 @@ void _start(void)
                 } else if (b /* pressed */) {
                     handle_key(a);
                 }
+            } else if (kind == WL_EVENT_RESIZE) {
+                /* Library already reallocated the buffer and updated
+                 * win->{w,h,stride,pixels}. render() re-reads all geometry
+                 * from win every frame, so we only refresh the cached
+                 * visible-row count and re-clamp the scroll so the cursor
+                 * stays on screen at the new size. (a=new_w, b=new_h.) */
+                g_visible_rows = rows_for_height(win->h);
+                ensure_visible();
             }
             /* pointer events ignored */
         }

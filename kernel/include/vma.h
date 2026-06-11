@@ -11,6 +11,7 @@
 // VMA flags.
 #define VMA_FLAG_COW       0x1u
 #define VMA_FLAG_GROWSDOWN 0x2u
+#define VMA_FLAG_GUARD     0x4u  // Guard page: never faulted in, triggers kill on access
 
 typedef enum { VMA_ANON = 0, VMA_FILE = 1 } vma_backing_t;
 

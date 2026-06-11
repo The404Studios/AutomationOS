@@ -7,6 +7,17 @@
 #include "../include/string.h"
 #include "../include/drivers.h"   // timer_get_ticks()
 
+// Per-operation tracing. SILENT by default: msgrcv/msgsnd are on the hot path
+// (the compositor and every windowed app poll their event queue many times per
+// second), so unconditional kprintf here floods the serial with 100k+ lines per
+// boot — under TCG that serial I/O dominates wall-clock and starves late-boot
+// apps. Build with -DIPC_VERBOSE to re-enable the trace.
+#ifdef IPC_VERBOSE
+#define MQ_LOG(...) kprintf(__VA_ARGS__)
+#else
+#define MQ_LOG(...) ((void)0)
+#endif
+
 /*
  * Message Queue Implementation
  * ============================
@@ -164,7 +175,9 @@ static bool msg_check_permission(msg_queue_t* q, uint32_t uid, uint32_t gid, boo
         return true;
     }
     if (gid == q->creator_gid) {
-        return write ? (q->mode & IPC_W) != 0 : (q->mode & IPC_R) != 0;
+        /* GROUP bits are mode>>3; the owner bits IPC_W/R would grant a group
+         * member the owner's rights (mode 0640 => group can WRITE). 'other' >>6. */
+        return write ? (q->mode & (IPC_W >> 3)) != 0 : (q->mode & (IPC_R >> 3)) != 0;
     }
     return write ? (q->mode & (IPC_W >> 6)) != 0 : (q->mode & (IPC_R >> 6)) != 0;
 }
@@ -179,6 +192,15 @@ static bool msg_check_permission(msg_queue_t* q, uint32_t uid, uint32_t gid, boo
  *   msgflg - Flags (IPC_CREAT, IPC_EXCL, mode bits)
  *
  * Returns: Queue ID on success, negative error code on failure
+ *
+ * Lock-order discipline (mirrors shm.c two-phase protocol):
+ * ---------------------------------------------------------
+ * msg_lock must NEVER be held while calling kmalloc/kfree. The heap has its
+ * own internal lock; acquiring it while msg_lock is held inverts the lock
+ * order and deadlocks under SMP. We use a three-phase protocol:
+ *   Phase 1 (under lock):   key/exist check + reserve an ID slot
+ *   Phase 2 (lock dropped): kmalloc the queue struct + initialise
+ *   Phase 3 (under lock):   re-validate, then publish to both tables
  */
 int64_t sys_msgget(uint64_t key, uint64_t msgflg, uint64_t arg3,
                    uint64_t arg4, uint64_t arg5, uint64_t arg6) {
@@ -190,7 +212,9 @@ int64_t sys_msgget(uint64_t key, uint64_t msgflg, uint64_t arg3,
         return IPC_EINVAL;
     }
 
-    kprintf("[MSGGET] key=%d flags=0x%x (PID %d)\n", k, flags, current->pid);
+    MQ_LOG("[MSGGET] key=%d flags=0x%x (PID %d)\n", k, flags, current->pid);
+
+    /* ── Phase 1: key/exist check + ID reservation (under lock) ─────────── */
 
     spin_lock(&msg_lock);
 
@@ -200,24 +224,23 @@ int64_t sys_msgget(uint64_t key, uint64_t msgflg, uint64_t arg3,
         if (existing) {
             if (flags & IPC_EXCL) {
                 spin_unlock(&msg_lock);
-                kprintf("[MSGGET] Queue exists and IPC_EXCL specified\n");
+                MQ_LOG("[MSGGET] Queue exists and IPC_EXCL specified\n");
                 return IPC_EEXIST;
             }
             spin_unlock(&msg_lock);
-            kprintf("[MSGGET] Returning existing queue %d\n", existing->id);
+            MQ_LOG("[MSGGET] Returning existing queue %d\n", existing->id);
             return existing->id;
         }
 
         if (!(flags & IPC_CREAT)) {
             spin_unlock(&msg_lock);
-            kprintf("[MSGGET] Queue not found and IPC_CREAT not specified\n");
+            MQ_LOG("[MSGGET] Queue not found and IPC_CREAT not specified\n");
             return IPC_ENOENT;
         }
     }
 
-    // Find a free ID slot
+    // Find a free ID slot — reserve but do NOT publish yet
     if (next_msg_id > MQ_TABLE_SIZE) {
-        // Wrap and scan for a free slot
         next_msg_id = 1;
     }
     uint32_t start = next_msg_id;
@@ -228,22 +251,25 @@ int64_t sys_msgget(uint64_t key, uint64_t msgflg, uint64_t arg3,
         }
         if (next_msg_id == start) {
             spin_unlock(&msg_lock);
-            kprintf("[MSGGET] No free queue slots\n");
+            MQ_LOG("[MSGGET] No free queue slots\n");
             return IPC_ENOMEM;
         }
     }
+    uint32_t reserved_id = next_msg_id;
 
-    // Allocate queue structure
+    spin_unlock(&msg_lock);
+
+    /* ── Phase 2: heap work outside the lock ────────────────────────────── */
+
     msg_queue_t* q = (msg_queue_t*)kmalloc(sizeof(msg_queue_t));
     if (!q) {
-        spin_unlock(&msg_lock);
-        kprintf("[MSGGET] Failed to allocate queue structure\n");
+        MQ_LOG("[MSGGET] Failed to allocate queue structure\n");
         return IPC_ENOMEM;
     }
 
-    // Initialize queue
+    // Fully initialise while unlocked — safe because q is not visible yet
     memset(q, 0, sizeof(msg_queue_t));
-    q->id = (ipc_id_t)next_msg_id;
+    q->id = (ipc_id_t)reserved_id;
     q->key = k;
     q->first = NULL;
     q->last = NULL;
@@ -258,20 +284,50 @@ int64_t sys_msgget(uint64_t key, uint64_t msgflg, uint64_t arg3,
     q->create_time = timer_get_ticks();
     q->send_time = 0;
     q->recv_time = 0;
-    q->next = NULL;   // Not used for list traversal anymore, but kept for struct compat
+    q->next = NULL;
 
-    // Register in both tables
+    /* ── Phase 3: commit under lock (re-validate before publishing) ──────── */
+
+    spin_lock(&msg_lock);
+
+    // Re-check: the slot we reserved might have been taken by a concurrent
+    // msgget (possible under SMP between Phase 1 and Phase 3).
+    if (id_table[reserved_id - 1] != NULL) {
+        spin_unlock(&msg_lock);
+        kfree(q);
+        MQ_LOG("[MSGGET] ID slot %u raced; retrying\n", reserved_id);
+        return IPC_ENOMEM;
+    }
+
+    // Re-check: for keyed queues, someone else might have created the same
+    // key between Phase 1 and Phase 3.
+    if (k != IPC_PRIVATE) {
+        msg_queue_t* racing = msg_find_by_key(k);
+        if (racing) {
+            spin_unlock(&msg_lock);
+            kfree(q);
+            if (flags & IPC_EXCL) {
+                MQ_LOG("[MSGGET] Key raced in; IPC_EXCL -> EEXIST\n");
+                return IPC_EEXIST;
+            }
+            MQ_LOG("[MSGGET] Key raced in; returning existing queue %d\n",
+                    racing->id);
+            return racing->id;
+        }
+    }
+
+    // Safe to publish
     id_table[q->id - 1] = q;
     key_table_insert(q);
 
-    next_msg_id++;
+    next_msg_id = reserved_id + 1;
     if (next_msg_id > MQ_TABLE_SIZE) {
         next_msg_id = 1;
     }
 
     spin_unlock(&msg_lock);
 
-    kprintf("[MSGGET] Created queue %d: key=%d\n", q->id, k);
+    MQ_LOG("[MSGGET] Created queue %d: key=%d\n", q->id, k);
 
     return q->id;
 }
@@ -309,7 +365,7 @@ int64_t sys_msgsnd(uint64_t msqid, uint64_t msgp, uint64_t msgsz,
         return IPC_EINVAL;
     }
 
-    kprintf("[MSGSND] msqid=%d size=%lu flags=0x%x (PID %d)\n",
+    MQ_LOG("[MSGSND] msqid=%d size=%lu flags=0x%x (PID %d)\n",
             id, size, flags, current->pid);
 
     // Copy message type from user space (just the int64_t header field)
@@ -319,7 +375,7 @@ int64_t sys_msgsnd(uint64_t msqid, uint64_t msgp, uint64_t msgsz,
     }
 
     if (header.mtype <= 0) {
-        kprintf("[MSGSND] Invalid message type: %ld\n", header.mtype);
+        MQ_LOG("[MSGSND] Invalid message type: %ld\n", header.mtype);
         return IPC_EINVAL;
     }
 
@@ -351,14 +407,14 @@ int64_t sys_msgsnd(uint64_t msqid, uint64_t msgp, uint64_t msgsz,
     if (!q) {
         spin_unlock(&msg_lock);
         kfree(node);
-        kprintf("[MSGSND] Queue %d not found\n", id);
+        MQ_LOG("[MSGSND] Queue %d not found\n", id);
         return IPC_EINVAL;
     }
 
     if (!msg_check_permission(q, current->uid, current->gid, true)) {
         spin_unlock(&msg_lock);
         kfree(node);
-        kprintf("[MSGSND] Permission denied\n");
+        MQ_LOG("[MSGSND] Permission denied\n");
         return IPC_EACCES;
     }
 
@@ -368,7 +424,7 @@ int64_t sys_msgsnd(uint64_t msqid, uint64_t msgp, uint64_t msgsz,
         if (flags & IPC_NOWAIT) {
             return IPC_EAGAIN;
         }
-        kprintf("[MSGSND] Queue full (blocking not implemented)\n");
+        MQ_LOG("[MSGSND] Queue full (blocking not implemented)\n");
         return IPC_EAGAIN;
     }
 
@@ -387,7 +443,7 @@ int64_t sys_msgsnd(uint64_t msqid, uint64_t msgp, uint64_t msgsz,
 
     spin_unlock(&msg_lock);
 
-    kprintf("[MSGSND] Sent message type=%ld size=%lu to queue %d\n",
+    MQ_LOG("[MSGSND] Sent message type=%ld size=%lu to queue %d\n",
             header.mtype, size, id);
 
     return IPC_SUCCESS;
@@ -429,7 +485,7 @@ int64_t sys_msgrcv(uint64_t msqid, uint64_t msgp, uint64_t msgsz,
         return IPC_EINVAL;
     }
 
-    kprintf("[MSGRCV] msqid=%d size=%lu type=%ld flags=0x%x (PID %d)\n",
+    MQ_LOG("[MSGRCV] msqid=%d size=%lu type=%ld flags=0x%x (PID %d)\n",
             id, size, type, flags, current->pid);
 
     // Pre-allocate a kernel bounce buffer for the payload BEFORE taking the
@@ -451,14 +507,14 @@ int64_t sys_msgrcv(uint64_t msqid, uint64_t msgp, uint64_t msgsz,
     if (!q) {
         spin_unlock(&msg_lock);
         if (tmp) kfree(tmp);
-        kprintf("[MSGRCV] Queue %d not found\n", id);
+        MQ_LOG("[MSGRCV] Queue %d not found\n", id);
         return IPC_EINVAL;
     }
 
     if (!msg_check_permission(q, current->uid, current->gid, false)) {
         spin_unlock(&msg_lock);
         if (tmp) kfree(tmp);
-        kprintf("[MSGRCV] Permission denied\n");
+        MQ_LOG("[MSGRCV] Permission denied\n");
         return IPC_EACCES;
     }
 
@@ -491,7 +547,7 @@ int64_t sys_msgrcv(uint64_t msqid, uint64_t msgp, uint64_t msgsz,
         if (flags & IPC_NOWAIT) {
             return IPC_ENOMSG;
         }
-        kprintf("[MSGRCV] No matching message (blocking not implemented)\n");
+        MQ_LOG("[MSGRCV] No matching message (blocking not implemented)\n");
         return IPC_ENOMSG;
     }
 
@@ -507,8 +563,11 @@ int64_t sys_msgrcv(uint64_t msqid, uint64_t msgp, uint64_t msgsz,
         }
     }
 
-    // Snapshot the message into the kernel bounce buffer, unlink it, and free
-    // the node — all under the lock. User-space delivery happens after unlock.
+    // Snapshot the message into the kernel bounce buffer, unlink it from the
+    // queue, and record the pointer for deferred free AFTER unlock. The kfree
+    // must NOT run under msg_lock (the heap has its own lock; holding msg_lock
+    // across it inverts the lock order and will deadlock under SMP). User-space
+    // delivery also happens after unlock.
     int64_t mtype_snapshot = m->mtype;
     if (copy_size > 0) {
         memcpy(tmp, m->mtext, copy_size);
@@ -525,9 +584,11 @@ int64_t sys_msgrcv(uint64_t msqid, uint64_t msgp, uint64_t msgsz,
     q->msg_count--;
     q->total_bytes -= m->msize;
     q->recv_time = timer_get_ticks();
-    kfree(m);
+    msg_message_t* deferred_msg = m;   // save for post-unlock free
 
     spin_unlock(&msg_lock);
+
+    kfree(deferred_msg);               // free outside the lock
 
     // Deliver to user space OUTSIDE the lock. If the user buffer is bad the
     // message is already consumed (acceptable — the caller passed a bad ptr).
@@ -544,7 +605,7 @@ int64_t sys_msgrcv(uint64_t msqid, uint64_t msgp, uint64_t msgsz,
     }
     if (tmp) kfree(tmp);
 
-    kprintf("[MSGRCV] Received message type=%ld size=%lu from queue %d\n",
+    MQ_LOG("[MSGRCV] Received message type=%ld size=%lu from queue %d\n",
             mtype_snapshot, copy_size, id);
 
     return (int64_t)copy_size;
@@ -577,7 +638,7 @@ int64_t sys_msgctl(uint64_t msqid, uint64_t cmd, uint64_t buf,
         return IPC_EINVAL;
     }
 
-    kprintf("[MSGCTL] msqid=%d cmd=0x%x (PID %d)\n", id, command, current->pid);
+    MQ_LOG("[MSGCTL] msqid=%d cmd=0x%x (PID %d)\n", id, command, current->pid);
 
     spin_lock(&msg_lock);
 
@@ -585,7 +646,7 @@ int64_t sys_msgctl(uint64_t msqid, uint64_t cmd, uint64_t buf,
     msg_queue_t* q = msg_find_by_id(id);
     if (!q) {
         spin_unlock(&msg_lock);
-        kprintf("[MSGCTL] Queue %d not found\n", id);
+        MQ_LOG("[MSGCTL] Queue %d not found\n", id);
         return IPC_EINVAL;
     }
 
@@ -600,20 +661,26 @@ int64_t sys_msgctl(uint64_t msqid, uint64_t cmd, uint64_t buf,
             id_table[q->id - 1] = NULL;
             key_table_remove(q);
 
-            // Free all pending messages (single kfree per node — fused alloc)
+            // Snapshot the queue and its message chain for post-unlock free.
+            // kfree must NOT run under msg_lock (heap has its own lock;
+            // holding msg_lock across it inverts the lock order).
             {
-                msg_message_t* msg = q->first;
+                msg_message_t* to_free_msgs = q->first;
+                msg_queue_t*   to_free_q    = q;
+
+                spin_unlock(&msg_lock);
+
+                // Free all pending messages outside the lock
+                msg_message_t* msg = to_free_msgs;
                 while (msg) {
                     msg_message_t* next = msg->next;
                     kfree(msg);   // payload is embedded; one free suffices
                     msg = next;
                 }
+                kfree(to_free_q);
             }
 
-            kfree(q);
-            spin_unlock(&msg_lock);
-
-            kprintf("[MSGCTL] Deleted queue %d\n", id);
+            MQ_LOG("[MSGCTL] Deleted queue %d\n", id);
             return IPC_SUCCESS;
 
         case IPC_STAT:
@@ -645,8 +712,22 @@ int64_t sys_msgctl(uint64_t msqid, uint64_t cmd, uint64_t buf,
  * both lookup tables, free the queue struct.  This mirrors exactly what
  * sys_msgctl(IPC_RMID) does, but without the permission check (kernel path).
  */
+/*
+ * Deferred-free work item for msg_cleanup_process: one entry per queue to free
+ * after we drop msg_lock. A process typically owns 1-3 queues, so a small fixed
+ * buffer suffices.
+ */
+#define MSG_CLEANUP_MAX 32
+typedef struct {
+    msg_queue_t*    queue;
+    msg_message_t*  first_msg;   /* head of the queued-message chain */
+} msg_deferred_free_t;
+static msg_deferred_free_t msg_cleanup_work[MSG_CLEANUP_MAX];
+
 void msg_cleanup_process(uint32_t pid) {
-    kprintf("[MSG] Cleanup for PID %d\n", pid);
+    MQ_LOG("[MSG] Cleanup for PID %d\n", pid);
+
+    uint32_t nfree = 0;
 
     spin_lock(&msg_lock);
 
@@ -660,17 +741,29 @@ void msg_cleanup_process(uint32_t pid) {
         id_table[i] = NULL;
         key_table_remove(q);
 
-        /* Drain all queued messages (node+payload fused allocation) */
-        msg_message_t* m = q->first;
+        /* Snapshot the queue and its message chain for post-unlock free.
+         * The kfree calls must NOT run under msg_lock (the heap has its own
+         * lock; holding msg_lock across it inverts the lock order). */
+        if (nfree < MSG_CLEANUP_MAX) {
+            msg_cleanup_work[nfree].queue     = q;
+            msg_cleanup_work[nfree].first_msg = q->first;
+            nfree++;
+        }
+
+        MQ_LOG("[MSG] Cleanup PID %d: queuing queue %d for deferred free\n", pid, q->id);
+    }
+
+    spin_unlock(&msg_lock);
+
+    /* Heap frees outside the lock */
+    for (uint32_t i = 0; i < nfree; i++) {
+        msg_message_t* m = msg_cleanup_work[i].first_msg;
         while (m) {
             msg_message_t* next = m->next;
             kfree(m);
             m = next;
         }
-
-        kprintf("[MSG] Cleanup PID %d: deleted queue %d\n", pid, q->id);
-        kfree(q);
+        MQ_LOG("[MSG] Cleanup PID %d: freed queue\n", pid);
+        kfree(msg_cleanup_work[i].queue);
     }
-
-    spin_unlock(&msg_lock);
 }

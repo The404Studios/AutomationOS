@@ -36,6 +36,7 @@ typedef unsigned long long  u64;
 #define SYS_RECVFROM    57   /* sc(57, fd, buf, len, &sock_addr|0, 0)         */
 #define SYS_SOCK_POLL   58   /* sc(58, 0,0,0,0,0) -- pump NIC/timers          */
 #define SYS_NET_INFO    59   /* sc(59, &net_info, 0,0,0,0)                     */
+#define SYS_BIND        76   /* sc(76, fd, port, 0,0,0) -> 0/-err             */
 /* Raw-frame fallback path (only used when DHCP_USE_RAW_FALLBACK is defined). */
 #define SYS_NET_SEND    68
 #define SYS_NET_RECV    69
@@ -139,12 +140,26 @@ typedef struct {
     u16 _pad;
 } sock_addr_t;
 
-/* Mirror of the kernel net_info_t (SYS_NET_INFO). */
+/*
+ * Mirror of the kernel net_info_ext_t (SYS_NET_INFO, kernel/include/netif.h).
+ * Layout must match exactly: ifname[16], mac[6], _pad[2], ip, netmask,
+ * gateway, dns, up(1), dhcp_active(1), _pad2[6], tx/rx counters.
+ */
 typedef struct {
-    u8  mac[6];
-    u8  _pad[2];
-    u32 ip;
-    u32 gateway;
+    char ifname[16];
+    u8   mac[6];
+    u8   _pad1[2];
+    u32  ip;
+    u32  netmask;
+    u32  gateway;
+    u32  dns;
+    u8   up;
+    u8   dhcp_active;
+    u8   _pad2[6];
+    u64  tx_packets;
+    u64  rx_packets;
+    u64  tx_bytes;
+    u64  rx_bytes;
 } net_info_t;
 
 /* ---- tiny freestanding helpers ----------------------------------------- */
@@ -469,6 +484,12 @@ int dhcp_acquire(dhcp_lease_t* out)
 
     long fd = sc(SYS_SOCKET, SOCK_DGRAM, 0, 0, 0, 0);
     if (fd < 0) return DHCP_E_SOCK;
+
+    /* Bind to the DHCP client port (68) so the kernel's UDP demux delivers
+     * server replies (which are always addressed to port 68 per RFC 2131)
+     * to this socket.  Without this, replies go to port 68 but our socket
+     * sits on an ephemeral port and the reply is silently dropped. */
+    sc(SYS_BIND, fd, DHCP_CLIENT_PORT, 0, 0, 0);
 
     u8 pkt[DHCP_PKT_MAX];
     u8 rbuf[DHCP_PKT_MAX];

@@ -85,6 +85,12 @@ ui_widget_t* ui_button(ui_widget_t* parent, int x, int y, int w, int h,
 /* Replace a widget's text (copied, truncated to 63 chars). */
 void ui_label_set_text(ui_widget_t* w, const char* text);
 
+/* Change a widget's background fill color (panels, buttons, etc.). */
+void ui_widget_set_bg(ui_widget_t* w, unsigned int bg);
+
+/* Change a widget's foreground (text) color. */
+void ui_widget_set_fg(ui_widget_t* w, unsigned int fg);
+
 /*
  * Register a per-frame tick callback.  Before each frame is rendered,
  * ui_app_run() will call tick(ud) so the application can update labels
@@ -100,6 +106,21 @@ void ui_app_set_tick(ui_app_t* app, void (*tick)(void* ud), void* ud);
  * tree and commits a frame each iteration, paced lightly. Never returns.
  */
 void ui_app_run(ui_app_t* app);
+
+/*
+ * Recursively free a widget and all its descendants, returning their pool
+ * slots for reuse. The widget MUST already have been detached from its
+ * parent's children[] array (or be a content panel you are about to replace).
+ * Does NOT detach from any parent -- caller is responsible for that.
+ */
+void ui_widget_free_tree(ui_widget_t* w);
+
+/*
+ * Remove a direct child from a parent's children[] array (shifts later
+ * children down). Does NOT free the child -- call ui_widget_free_tree()
+ * after if desired. Returns 0 on success, -1 if not found.
+ */
+int ui_widget_detach(ui_widget_t* parent, ui_widget_t* child);
 
 /* =========================================================================
  * NEW WIDGETS (additive, v2)

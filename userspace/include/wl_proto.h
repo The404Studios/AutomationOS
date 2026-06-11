@@ -36,17 +36,25 @@
 #define WL_REQ_CREATE  1
 #define WL_REQ_COMMIT  2
 #define WL_REQ_DESTROY 3
+#define WL_REQ_RESIZE  4   /* client reallocated its buffer; carries new shm_id  */
 
 /* compositor->client (to WL_REPLY_KEY(pid)), mtype = id */
 #define WL_EVT_CREATED 1
 #define WL_EVT_POINTER 2
 #define WL_EVT_KEY     3
+#define WL_EVT_CONFIGURE 4 /* compositor asks the client to resize to w x h       */
 
 typedef struct { long mtype; int pid; int shm_id; unsigned int w,h,stride; char title[48]; } wl_create_req;
 typedef struct { long mtype; int win_id; unsigned int x,y,w,h; } wl_commit_req;   /* damage */
 typedef struct { long mtype; int win_id; } wl_destroy_req;
+/* Client -> compositor after it reallocs a bigger/smaller pixel buffer in
+ * response to WL_EVT_CONFIGURE. win_id stays stable; the compositor re-attaches
+ * the new shm_id and updates the window's immutable buffer extent. */
+typedef struct { long mtype; int win_id; int shm_id; unsigned int w,h,stride; } wl_resize_req;
 typedef struct { long mtype; int win_id; } wl_created_evt;
-typedef struct { long mtype; int x,y,buttons; } wl_pointer_evt;
+typedef struct { long mtype; int x,y,buttons,wheel; } wl_pointer_evt;
 typedef struct { long mtype; int keycode,pressed; } wl_key_evt;
+/* Compositor -> client: "resize your surface to w x h" (e.g. on maximize). */
+typedef struct { long mtype; int win_id; unsigned int w,h; } wl_configure_evt;
 
 #endif /* WL_PROTO_H */

@@ -3,6 +3,10 @@
 #include "../../include/kernel.h"
 #include "../../include/string.h"
 #include "../../include/tlb.h"
+#ifdef SMP_FOUNDATION
+#include "ipi.h"
+#include "lapic.h"
+#endif
 
 #define ENTRIES_PER_TABLE 512
 
@@ -24,6 +28,11 @@ static page_table_t* active_pml4 = NULL;  // Currently targeted PML4 for mapping
 static uint16_t next_pcid = 1;          // PCID 0 reserved for kernel
 static bool pcid_supported = false;
 
+// Global: set true by paging_init() when SMAP is enabled.  STAC/CLAC
+// (x86_64.h) check this to avoid emitting Haswell-only opcodes on older
+// CPUs (Westmere/Arrandale) where they would #UD.
+bool cpu_smap_active = false;
+
 // Get index for each paging level
 #define PML4_INDEX(addr) (((uint64_t)(addr) >> 39) & 0x1FF)
 #define PDPT_INDEX(addr) (((uint64_t)(addr) >> 30) & 0x1FF)
@@ -41,7 +50,15 @@ static page_table_t* alloc_page_table(void) {
     void* page = pmm_alloc_page();
     if (!page) return NULL;
 
-    memset(page, 0, PAGE_SIZE);
+    // Zero the fresh frame via the DIRECT MAP (PML4[256], shared + present in every
+    // CR3) rather than its raw identity address: alloc_page_table runs under whatever
+    // CR3 is live (a PROCESS CR3 during exec PHASE 1 / fork / a demand fault), whose
+    // identity map may not cover a high frame (the phys==virt bug family). The RETURN
+    // value stays the raw PHYSICAL address (callers store it in PTEs / index it). The
+    // caller-side page-table WALK derefs (paging_map_page/paging_get_pte) still use the
+    // identity and are deferred (low-risk: PT pages are always low-allocated); see the
+    // direct-map review + task notes.
+    memset(PHYS_TO_DIRECT(page), 0, PAGE_SIZE);
     return (page_table_t*)page;
 }
 
@@ -99,6 +116,8 @@ static void cpu_enable_fpu_sse(void) {
 
     kprintf("[VMM] FPU/SSE/AVX enabled for userspace\n");
 }
+
+static void paging_alias_selftest(void);   // #20 coherence proof (defined below)
 
 void paging_init(void) {
     kprintf("[VMM] Initializing paging...\n");
@@ -198,6 +217,197 @@ void paging_init(void) {
 
     kprintf("[VMM] Identity mapping extended successfully\n");
 
+    // ----------------------------------------------------------------------
+    // CRITICAL: Un-alias the higher-half kernel PD from the identity PD.
+    //
+    // boot.asm points BOTH PML4[0]->PDPT[0] (identity, virt 0-1GB) and
+    // PML4[511]->PDPT_high[510] (higher half, virt 0xFFFFFFFF80000000+) at the
+    // SAME pd_table. The kernel heap lives in the higher half at HEAP_START
+    // 0xFFFFFFFF90000000 == pd_table[128] (the +256MB slot), so when heap_extend()
+    // maps/splits heap pages it rewrites pd_table[128..], which is ALSO the LOW
+    // identity map for physical 256MB+. A heap grown past 16MB reaches pd_table[136]
+    // and destroys the identity mapping for ~272MB; a PMM frame later handed out
+    // there then #PFs when the kernel zeroes/uses it via identity (the long-hunted
+    // spawn-under-churn crash: PD[136] split, PT[61]=0, CR2=0x1103d000). Give the
+    // higher half its OWN PD copy so heap splits never touch the identity map. The
+    // kernel runs from the low identity map, so this is transparent to live code,
+    // and create_address_space() shares PML4[511] by reference so every process
+    // sees the same (un-aliased) higher-half PD.
+    if (kernel_pml4->entries[511] & PTE_PRESENT) {
+        page_table_t* high_pdpt =
+            (page_table_t*)(kernel_pml4->entries[511] & 0x000FFFFFFFFFF000ULL);
+        if (high_pdpt->entries[510] & PTE_PRESENT) {
+            uint64_t shared = high_pdpt->entries[510];
+            page_table_t* shared_pd = (page_table_t*)(shared & 0x000FFFFFFFFFF000ULL);
+            page_table_t* priv_pd = (page_table_t*)pmm_alloc_page();
+            if (priv_pd) {
+                for (int i = 0; i < 512; i++) priv_pd->entries[i] = shared_pd->entries[i];
+                high_pdpt->entries[510] = (uint64_t)priv_pd | (shared & 0xFFF);
+                write_cr3(read_cr3());   // flush TLB so the private PD is live
+                kprintf("[VMM] Un-aliased higher-half kernel PD %p from identity PD %p (heap-safe)\n",
+                        priv_pd, shared_pd);
+            } else {
+                kprintf("[VMM] WARNING: failed to un-alias higher-half PD; heap growth may corrupt identity map\n");
+            }
+        }
+    }
+
+    // ----------------------------------------------------------------------
+    // DIRECT MAP (#20 fix). Give PML4[256] its OWN dedicated PDPT + PD chain of
+    // never-split 2MB huge pages, INSTEAD of aliasing the identity PDPT.
+    //
+    // OLD (buggy): kernel_pml4->entries[256] = kernel_pml4->entries[0], so the
+    // direct map and the low identity map shared ONE PDPT -> PD -> 2MB-huge-PDE
+    // chain. Under churn a paging_map_page split a 2MB identity PDE (exec maps a
+    // process's low PT_LOAD VAs at 4KB, hitting the huge-page split branch), and
+    // because PML4[256] is in the SHARED kernel higher-half the corrupted view was
+    // visible in EVERY CR3 -- including the AP's fixed master kernel_cr3. CPU1 then
+    // #PF'd reading a kmalloc_ref offload operand via PHYS_TO_DIRECT in
+    // matmul_band_n (the smpstress crash, phys ~194MB).
+    //
+    // NEW (fixed): a DEDICATED chain that shares NO structural page with the
+    // splittable identity. Nothing ever paging_map_page's into the direct-map VA
+    // range, so its huge PDEs stay present forever; a split of an identity PDE
+    // perturbs only PML4[0]'s private chain. Installed at kernel_pml4->entries[256]
+    // BEFORE any process or the AP exists, so it propagates BY REFERENCE to every
+    // CR3 (paging_create_address_space copies 256-511) and the AP master CR3 -- no
+    // per-CR3 work. Supervisor-only (no USER: ring-3 must not read all RAM) + NX
+    // (data, W^X). Covers phys 0..16GB, matching the identity extent.
+    //
+    // BOOTSTRAP ORDER (critical, or triple-fault): fill the dedicated tables via
+    // the LOW IDENTITY (raw pointers -- the frames are low + identity-covered here)
+    // and only THEN install entries[256] + flush. PHYS_TO_DIRECT does not resolve
+    // until the map is live.
+    {
+        const uint64_t DM_GB = 16;                          // cover the 16GB the identity covers
+        page_table_t* dm_pdpt = (page_table_t*)pmm_alloc_page();
+        int dm_ok = (dm_pdpt != 0);
+        if (dm_ok) {
+            memset(dm_pdpt, 0, PAGE_SIZE);
+            for (uint64_t g = 0; g < DM_GB; g++) {
+                page_table_t* dm_pd = (page_table_t*)pmm_alloc_page();
+                if (!dm_pd) { dm_ok = 0; break; }
+                memset(dm_pd, 0, PAGE_SIZE);
+                for (uint64_t i = 0; i < 512; i++) {
+                    uint64_t ph = (g * 512 + i) * 0x200000ULL;       // 2MB huge page
+                    dm_pd->entries[i] = ph | PTE_PRESENT | PTE_WRITE
+                                        | (1ULL << 7)                 // PS (2MB huge)
+                                        | (1ULL << 63);               // NX (data, W^X)
+                }
+                dm_pdpt->entries[g] = (uint64_t)dm_pd | PTE_PRESENT | PTE_WRITE;  // no USER
+            }
+        }
+        if (dm_ok) {
+            kernel_pml4->entries[256] = (uint64_t)dm_pdpt
+                                        | PTE_PRESENT | PTE_WRITE     // supervisor-only
+                                        | (1ULL << 63);               // NX
+            write_cr3(read_cr3());                                    // flush -> dedicated map live
+            kprintf("[VMM] Direct map ONLINE @ 0x%016lx (DEDICATED PDPT+PD, phys 0..%luGB, never-split, all CR3s)\n",
+                    (unsigned long)DIRECT_MAP_BASE, (unsigned long)DM_GB);
+        } else {
+            // OOM (essentially unreachable this early): fall back to the old alias so
+            // boot still completes in the known-buggy-but-boots state (#20 unfixed).
+            kernel_pml4->entries[256] = (kernel_pml4->entries[0] & ~0x4ULL) | (1ULL << 63);
+            write_cr3(read_cr3());
+            kprintf("[VMM] WARNING: dedicated direct-map alloc failed; fell back to identity alias (#20 unfixed)\n");
+        }
+
+        // Boot self-test: write a sentinel via the DIRECT MAP and read it back via
+        // the LOW identity (and vice-versa). Proves the direct map resolves to the
+        // same physical RAM as the identity. (Post-split coherence is PAGINGALIAS.)
+        void* probe = pmm_alloc_page();
+        if (probe) {
+            volatile uint64_t* via_ident  = (volatile uint64_t*)probe;
+            volatile uint64_t* via_direct = (volatile uint64_t*)PHYS_TO_DIRECT(probe);
+            *via_direct = 0xD15EA5ED0FF5E7ULL;
+            uint64_t rb_ident = *via_ident;
+            *via_ident = 0xC0FFEE5DEADBEEFULL;
+            uint64_t rb_direct = *via_direct;
+            if (rb_ident == 0xD15EA5ED0FF5E7ULL && rb_direct == 0xC0FFEE5DEADBEEFULL) {
+                kprintf("[VMM] Direct-map self-test OK (direct<->identity coherent)\n");
+            } else {
+                kprintf("[VMM] WARNING: direct-map self-test FAILED (ident=0x%lx direct=0x%lx)\n",
+                        (unsigned long)rb_ident, (unsigned long)rb_direct);
+            }
+            pmm_free_page(probe);
+        }
+    }
+
+    // Enable SMEP and SMAP if the CPU supports them.
+    //
+    // SMEP (Supervisor Mode Execution Prevention, CR4 bit 20): prevents the
+    // kernel from EXECUTING code on user-accessible pages. A #PF is raised
+    // instead, blocking ret2user / JOP into user-mapped trampolines.
+    //
+    // SMAP (Supervisor Mode Access Prevention, CR4 bit 21): prevents the
+    // kernel from READING or WRITING user-accessible pages unless RFLAGS.AC
+    // is explicitly set (via the STAC instruction). This forces every kernel
+    // user-memory access through the validated copy_from/to_user paths
+    // (which bracket the access with stac/clac) and catches wild dereferences
+    // of user pointers in kernel code.
+    //
+    // CPUID.07H:EBX: bit 7 = SMEP, bit 20 = SMAP.
+    // GUARD: Westmere/Arrandale (T410) max CPUID leaf is 0xB.  Leaf 7 is in
+    // range but returns zeroes for SMEP/SMAP (those are Haswell+).  Older CPUs
+    // with max leaf < 7 would get the highest-supported-leaf result (garbage),
+    // so always check max leaf first.
+    {
+        uint32_t max_leaf;
+        __asm__ volatile("cpuid"
+                         : "=a"(max_leaf)
+                         : "a"(0)
+                         : "ebx", "ecx", "edx");
+        uint64_t cr4 = read_cr4();
+        if (max_leaf >= 7) {
+            uint32_t eax7, ebx7, ecx7, edx7;
+            __asm__ volatile("cpuid"
+                             : "=a"(eax7), "=b"(ebx7), "=c"(ecx7), "=d"(edx7)
+                             : "a"(7), "c"(0));
+            if (ebx7 & (1U << 7)) {
+                cr4 |= CR4_SMEP;
+                kprintf("[VMM] SMEP enabled (Supervisor Mode Execution Prevention)\n");
+            } else {
+                kprintf("[VMM] SMEP not supported on this CPU\n");
+            }
+            if (ebx7 & (1U << 20)) {
+                cr4 |= CR4_SMAP;
+                cpu_smap_active = true;  // arm STAC/CLAC in x86_64.h
+                kprintf("[VMM] SMAP enabled (Supervisor Mode Access Prevention)\n");
+            } else {
+                kprintf("[VMM] SMAP not supported on this CPU\n");
+            }
+            // ERMS (Enhanced REP MOVSB/STOSB), CPUID.07H:EBX[bit 9]. Ivy-Bridge
+            // 2012+. Gates the kernel's fast REP-string memcpy/memset path
+            // (kernel/lib/string.c, g_string_erms_ok — default 0). The T410's
+            // 2010 Westmere i5 reports 0 here, so it keeps the portable, DF-safe
+            // word-copy loop. Under T410_SAFE the whole block is compiled out so
+            // ERMS can never arm regardless of what CPUID claims.
+#ifndef T410_SAFE
+            {
+                extern volatile int g_string_erms_ok;
+                if (ebx7 & (1U << 9)) {
+                    g_string_erms_ok = 1;
+                    kprintf("[VMM] ERMS enabled (fast REP MOVSB/STOSB string ops)\n");
+                } else {
+                    kprintf("[VMM] ERMS not supported; portable word-copy loop\n");
+                }
+            }
+#endif
+        } else {
+            kprintf("[VMM] CPUID max leaf %u < 7, skipping SMEP/SMAP detection\n",
+                    max_leaf);
+        }
+        write_cr4(cr4);
+        if (cpu_smap_active)
+            __asm__ volatile("clac" ::: "cc");  // establish AC=0 default
+        kprintf("[CPU] features: SMEP=%d SMAP=%d leaf7=%d\n",
+                (cr4 & CR4_SMEP) ? 1 : 0,
+                cpu_smap_active ? 1 : 0,
+                (max_leaf >= 7) ? 1 : 0);
+        kprintf("[CPU] usercopy: STAC/CLAC %s\n",
+                cpu_smap_active ? "active" : "disabled (pre-Haswell CPU)");
+    }
+
     // Enable PCID if supported (must be done AFTER setting up paging)
     paging_enable_pcid();
 
@@ -206,6 +416,10 @@ void paging_init(void) {
 
     active_pml4 = kernel_pml4;
     kprintf("[VMM] Paging initialized with full identity mapping\n");
+
+    // Permanent coherence proof for the #20 fix: split a low-identity 2MB PDE and
+    // confirm the dedicated direct map stays coherent (emits PAGINGALIAS PASS/FAIL).
+    paging_alias_selftest();
 }
 
 // Switch which PML4 paging_map_page targets (for per-process mapping)
@@ -215,6 +429,58 @@ void paging_set_target(uint64_t cr3) {
 
 void paging_reset_target(void) {
     active_pml4 = kernel_pml4;
+}
+
+// ---------------------------------------------------------------------------
+// PAGINGALIAS coherence self-test (#20). Proves the direct map is STRUCTURALLY
+// INDEPENDENT of the splittable identity -- the invariant the fix establishes.
+//
+// We assert it WITHOUT mutating the kernel identity: forcing a split here would
+// create a kernel-identity PT that processes deep-copy (shared) and the teardown
+// path then frees (the shared-kernel-PT guard only protects PTs split from a
+// STILL-HUGE kernel PDE), corrupting memory under churn. Structural independence
+// is the stronger, safe proof: if PML4[256]'s PDPT is a DIFFERENT physical page
+// than PML4[0]'s identity PDPT, then NO identity split (which only edits the
+// identity's PD pages) can ever reach the direct map's pages -- coherence holds
+// by construction. The pre-fix aliased code had entries[256]==entries[0], so this
+// FAILs on the bug and PASSes on the fix.
+static void paging_alias_selftest(void) {
+    void* F = pmm_alloc_page();
+    if (!F) { kprintf("[VMM] PAGINGALIAS SKIP (no probe frame)\n"); return; }
+    uint64_t phys = (uint64_t)F;
+    const uint64_t MASK = 0x000FFFFFFFFFF000ULL;
+    const uint64_t HUGE = (1ULL << 7);
+
+    // (1) STRUCTURAL INDEPENDENCE: direct-map PDPT != identity PDPT.
+    uint64_t dm_pdpt_phys = kernel_pml4->entries[256] & MASK;
+    uint64_t id_pdpt_phys = kernel_pml4->entries[0]   & MASK;
+    int independent = (dm_pdpt_phys != id_pdpt_phys) && dm_pdpt_phys != 0;
+
+    // (2) COHERENCE: a write via the DIRECT MAP is seen via the LOW identity
+    //     (both name the same physical frame).
+    volatile uint64_t* dm = (volatile uint64_t*)PHYS_TO_DIRECT(phys);
+    volatile uint64_t* id = (volatile uint64_t*)phys;
+    *dm = 0xA11A5C0DEULL;
+    int coherent = (*id == 0xA11A5C0DEULL);
+
+    // (3) the direct-map PDE for the probe is a PRESENT 2MB HUGE page (never split).
+    uint64_t dva          = (uint64_t)PHYS_TO_DIRECT(phys);
+    page_table_t* dm_pdpt = (page_table_t*)PHYS_TO_DIRECT(dm_pdpt_phys);
+    uint64_t dm_pdpte     = dm_pdpt->entries[(dva >> 30) & 0x1FF];
+    page_table_t* dm_pd   = (page_table_t*)PHYS_TO_DIRECT(dm_pdpte & MASK);
+    uint64_t dm_pde       = dm_pd->entries[(dva >> 21) & 0x1FF];
+    int dm_huge           = (dm_pde & PTE_PRESENT) && (dm_pde & HUGE);
+
+    pmm_free_page(F);
+
+    if (independent && coherent && dm_huge) {
+        kprintf("[VMM] PAGINGALIAS PASS (direct map independent of identity: dm_pdpt=0x%lx id_pdpt=0x%lx)\n",
+                (unsigned long)dm_pdpt_phys, (unsigned long)id_pdpt_phys);
+    } else {
+        kprintf("[VMM] PAGINGALIAS FAIL (independent=%d coherent=%d dm_huge=%d dm_pdpt=0x%lx id_pdpt=0x%lx)\n",
+                independent, coherent, dm_huge,
+                (unsigned long)dm_pdpt_phys, (unsigned long)id_pdpt_phys);
+    }
 }
 
 // Physical address (CR3 value, PCID 0) of the kernel's master PML4. The kernel
@@ -700,7 +966,18 @@ int vmm_unmap_range_into(uint64_t cr3, uint64_t vaddr, uint64_t size,
                         page_table_t* pt = (page_table_t*)(pd->entries[pd_idx] & 0x000FFFFFFFFFF000ULL);
                         uint64_t e = pt->entries[pt_idx];
                         if ((e & PTE_PRESENT) && (e & PTE_OWNED)) {
-                            pmm_free_page((void*)(e & 0x000FFFFFFFFFF000ULL));
+                            // CoW-aware free, mirroring the teardown path below
+                            // (~line 865). A fork()-shared OWNED page is mapped in
+                            // BOTH co-owners' CR3s with cow_table[pfn] > 0; freeing
+                            // it here with a bare pmm_free_page() (no cow_unref())
+                            // returns a still-referenced frame to the PMM, which
+                            // then double-frees + re-hands it to two owners ->
+                            // page-table corruption. Only free when WE are the last
+                            // owner.
+                            uint64_t pa = e & 0x000FFFFFFFFFF000ULL;
+                            if (cow_unref(pa)) {
+                                pmm_free_page((void*)pa);
+                            }
                         }
                     }
                 }
@@ -783,17 +1060,21 @@ uint64_t paging_create_address_space(void) {
         next_pcid++;
 
         // Handle PCID exhaustion (recycle PCIDs if needed)
-        // BUG-013 fix: Flush ALL TLB entries before recycling PCIDs
+        // BUG-013 fix: Flush ALL TLB entries for ALL PCIDs before recycling
         if (next_pcid >= 4096) {
-            kprintf("[PAGING] Warning: PCID exhausted, recycling from 1\n");
-            kprintf("[PAGING] Flushing all TLB entries before PCID recycling\n");
+            kprintf("[PAGING] PCID exhausted, recycling from 1 (all-context flush)\n");
 
-            // Flush TLB on ALL CPUs by reloading CR3 without PCID preservation
-            uint64_t cr3 = read_cr3() & ~CR3_NO_FLUSH;
-            write_cr3(cr3);
+            // Flush ALL PCIDs on local CPU
+            tlb_flush_all_contexts_local();
 
-            // TODO: Send IPI to other CPUs to flush their TLBs
-            // For now, this flushes current CPU's TLB
+            #ifdef SMP_FOUNDATION
+            // Remote CPU flush deferred: The AP in SMP_FOUNDATION runs with the BSP's
+            // CR3 (shared page tables) and executes no userspace (single kernel worker),
+            // so PCID recycling on the AP is moot. Remote TLB-flush-all will be added
+            // in a later brick when the AP runs its own address spaces.
+            // (Sending IPI_TLB_FLUSH_ALL here would be a no-op: the AP has no IDT gate
+            // for vector 0x45 and runs with interrupts permanently masked.)
+            #endif
 
             next_pcid = 1;
         }
@@ -839,11 +1120,67 @@ void paging_destroy_address_space(uint64_t cr3) {
 
             for (int k = 0; k < 512; k++) {
                 if (!(pd->entries[k] & PTE_PRESENT)) continue;
-                // 2MB huge page (e.g. identity-mapped RAM copied by value in
-                // paging_create_address_space): no PT beneath it and the
-                // physical RAM is shared. Do not dereference or free it.
-                if (pd->entries[k] & PTE_HUGE) continue;
+                // 2MB huge page: no PT beneath it. Identity-mapped huge pages
+                // (inherited from the kernel, no PTE_OWNED) are shared RAM and
+                // must NOT be freed. Process-private huge pages (PTE_OWNED,
+                // created by paging_map_huge_page for user code) must be freed.
+                if (pd->entries[k] & PTE_HUGE) {
+                    if (pd->entries[k] & PTE_OWNED) {
+                        void* huge_phys = (void*)(pd->entries[k] & 0x000FFFFFFFFFF000ULL);
+                        pmm_free_huge_page(huge_phys);
+                    }
+                    continue;
+                }
                 page_table_t* pt = (page_table_t*)(pd->entries[k] & 0x000FFFFFFFFFF000ULL);
+
+                // SHARED-KERNEL-PT GUARD: create_address_space() copies a split
+                // huge-page PD entry (a PT *pointer*, not a 2MB leaf) BY VALUE, so
+                // this process's deep-copied PD can point at the KERNEL's own
+                // identity PT. Freeing that shared PT here returns it to the PMM;
+                // it is then reused/zeroed and the kernel identity map for that
+                // region goes NOT-PRESENT for EVERY CR3 — observed as a ring-0 #PF
+                // in memset on a high identity page (~272MB) only under spawn/kill
+                // churn (PD[136] split, PT[61]=0). If the kernel references this
+                // exact physical PT at the same PML4/PDPT/PD slot, it is shared —
+                // skip its owned-leaf scan AND its free. Process-private PTs are
+                // distinct physical pages, so they never match and are still freed.
+                // leak_pt: when set, free this PT's OWNED leaves but do NOT return the
+                // PT STRUCTURAL page to the PMM (it shadows a still-shared kernel huge
+                // page -- see FIX A below).
+                int leak_pt = 0;
+                if (kernel_pml4 && (kernel_pml4->entries[i] & PTE_PRESENT)) {
+                    page_table_t* kpdpt = (page_table_t*)(kernel_pml4->entries[i] & 0x000FFFFFFFFFF000ULL);
+                    uint64_t kpdpte = kpdpt->entries[j];
+                    if ((kpdpte & PTE_PRESENT) && !(kpdpte & PTE_HUGE)) {
+                        page_table_t* kpd = (page_table_t*)(kpdpte & 0x000FFFFFFFFFF000ULL);
+                        uint64_t kpde = kpd->entries[k];
+                        if ((kpde & PTE_PRESENT) && !(kpde & PTE_HUGE) &&
+                            (page_table_t*)(kpde & 0x000FFFFFFFFFF000ULL) == pt) {
+                            continue;  // process aliases the kernel's OWN PT — never touch it
+                        }
+                        // FIX A (slab-churn corruption ROOT FIX): the kernel still maps
+                        // this slot as a 2MB HUGE page, but THIS process SPLIT it into a
+                        // private PT (exec maps a user page at a LOW VA -- e.g. a big
+                        // app's BSS at ~27MB that falls inside an inherited identity huge
+                        // page; paging_map_page splits the huge page into a PT whose 511
+                        // fill-entries STILL alias the shared identity RAM). The 511
+                        // identity leaves carry no PTE_OWNED (skipped below); the 1 private
+                        // target leaf IS owned and is freed. But the PT STRUCTURAL page
+                        // must NOT go back to the PMM: it is a LOW frame whose backing 2MB
+                        // range is still mapped for EVERY CR3. Freeing it lets slab_grow
+                        // recycle it into a slab, which the NEXT exec's identity-path BSS
+                        // memset (exec.c, dphys = pte & ~0xFFF) then zeros -> slab header
+                        // magic=0 (the SLABDIAG self-heal event under churn). The old guard
+                        // only matched when the kernel's PDE was itself a 4KB PT pointer;
+                        // it missed this process-side-split-of-a-still-huge-PDE case. Leak
+                        // the PT (bounded: <=1 per split-once 2MB region per process).
+                        if ((kpde & PTE_PRESENT) && (kpde & PTE_HUGE)) {
+                            leak_pt = 1;
+                            kprintf("[SLABPROBE] FixA leak PT %p (split from huge kernel "
+                                    "PDE i=%d j=%d k=%d)\n", (void*)pt, i, j, k);
+                        }
+                    }
+                }
 
                 // Free only leaf pages this process privately owns.
                 for (int m = 0; m < 512; m++) {
@@ -859,8 +1196,10 @@ void paging_destroy_address_space(uint64_t cr3) {
                     }
                 }
 
-                // The PT itself is process-private; free it.
-                pmm_free_page(pt);
+                // The PT itself is process-private; free it -- UNLESS it was split from
+                // a still-shared kernel huge page (FIX A): leak it so its low frame is
+                // never recycled into a slab and then zeroed by an identity-path memset.
+                if (!leak_pt) pmm_free_page(pt);
             }
             // The PD is process-private (deep-copied per address space); free it.
             pmm_free_page(pd);
@@ -1033,6 +1372,100 @@ int paging_unmap_huge_page(void* virt) {
     pd->entries[pd_idx] = 0;
 
     // Invalidate TLB (one invlpg invalidates the entire 2MB huge page)
+    invlpg(virt);
+
+    return 0;
+}
+
+/*
+ * paging_modify_pte_flags - modify protection flags on an existing PTE
+ * =====================================================================
+ * Walks the page tables in active_pml4 to find the leaf PTE for `virt` and
+ * updates its protection flags (PRESENT, WRITE, USER, NX) while preserving
+ * the physical address and other bits. Automatically invalidates the TLB for
+ * the modified page.
+ *
+ * Used by vmm_protect() to implement page-protection changes for PE loader
+ * section permissions and Win32 VirtualProtect().
+ *
+ * Parameters:
+ *   virt       - virtual address of the page to modify (must be 4KB-aligned)
+ *   new_flags  - new protection flags (PAGE_PRESENT, PAGE_WRITE, PAGE_USER, PAGE_NX)
+ *
+ * Returns:
+ *    0 on success
+ *   -1 if the page is not mapped or any level is missing
+ *
+ * NOTE: This function modifies 4KB pages only. For 2MB huge pages, use
+ *       paging_unmap_huge_page() and remap with new flags.
+ */
+int paging_modify_pte_flags(void* virt, uint64_t new_flags) {
+    uint64_t virt_addr = (uint64_t)virt;
+
+    // Validate alignment
+    if (virt_addr & (PAGE_SIZE - 1)) {
+        kprintf("[PAGING] ERROR: paging_modify_pte_flags requires 4KB alignment (virt=%p)\n", virt);
+        return -1;
+    }
+
+    uint64_t pml4_idx = PML4_INDEX(virt);
+    uint64_t pdpt_idx = PDPT_INDEX(virt);
+    uint64_t pd_idx   = PD_INDEX(virt);
+    uint64_t pt_idx   = PT_INDEX(virt);
+
+    page_table_t* target = active_pml4;
+    if (!target) {
+        kprintf("[PAGING] ERROR: paging_modify_pte_flags called with NULL active_pml4\n");
+        return -1;
+    }
+
+    // Walk PML4 -> PDPT
+    if (!(target->entries[pml4_idx] & PTE_PRESENT)) {
+        return -1;  // Page not mapped
+    }
+    page_table_t* pdpt = (page_table_t*)(target->entries[pml4_idx] & 0x000FFFFFFFFFF000ULL);
+
+    // Walk PDPT -> PD
+    if (!(pdpt->entries[pdpt_idx] & PTE_PRESENT)) {
+        return -1;  // Page not mapped
+    }
+    page_table_t* pd = (page_table_t*)(pdpt->entries[pdpt_idx] & 0x000FFFFFFFFFF000ULL);
+
+    // Walk PD -> PT
+    if (!(pd->entries[pd_idx] & PTE_PRESENT)) {
+        return -1;  // Page not mapped
+    }
+
+    // Check for 2MB huge page (PS bit set in PD entry)
+    if (pd->entries[pd_idx] & (1ULL << 7)) {
+        kprintf("[PAGING] WARNING: paging_modify_pte_flags cannot modify 2MB huge pages (virt=%p)\n", virt);
+        return -1;
+    }
+
+    page_table_t* pt = (page_table_t*)(pd->entries[pd_idx] & 0x000FFFFFFFFFF000ULL);
+
+    // Get current PTE
+    uint64_t old_pte = pt->entries[pt_idx];
+    if (!(old_pte & PTE_PRESENT)) {
+        return -1;  // Page not mapped
+    }
+
+    // Preserve physical address and OS-available bits (PTE_OWNED, PTE_COW, etc.)
+    // but replace the protection flags
+    uint64_t phys_and_os_bits = old_pte & 0xFFFFFFFFFFFFF600ULL;  // Preserve phys addr [51:12] and OS bits [11:9]
+    uint64_t new_pte = phys_and_os_bits | (new_flags & 0x1FF);    // Apply new flags [8:0]
+
+    // Preserve NX bit (bit 63) from new_flags
+    if (new_flags & PAGE_NX) {
+        new_pte |= PAGE_NX;
+    } else {
+        new_pte &= ~PAGE_NX;
+    }
+
+    // Update PTE
+    pt->entries[pt_idx] = new_pte;
+
+    // Invalidate TLB for this page
     invlpg(virt);
 
     return 0;

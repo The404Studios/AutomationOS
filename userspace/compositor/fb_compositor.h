@@ -70,7 +70,19 @@ typedef struct {
 
     surface_t *surface;      // Window pixel buffer
     float alpha;             // Window opacity (0.0 - 1.0)
+    // Pixel capacity of the create-time SHM surface segment (width*height at create).
+    // The segment is never resized, so window_update_surface clamps its memcpy SOURCE
+    // read to this many pixels -- a client that sets a larger surface->width/height in
+    // the shared header otherwise makes the compositor read past the end of the segment
+    // (OOB read / info-leak across the IPC boundary).
+    uint64_t surface_capacity_pixels;
 } window_t;
+
+// Hard per-dimension cap for untrusted window dimensions (from the create/update IPC).
+// Bounds allocations and makes width*height fit in 64-bit without overflow.
+#ifndef WINDOW_MAX_DIM
+#define WINDOW_MAX_DIM 16384u
+#endif
 
 /**
  * Damage tracking structure

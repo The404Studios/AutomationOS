@@ -1349,6 +1349,7 @@ static const uint32_t *icon_asset_for(const char *name)
         {"paint","paint"},
         {"snake","games"}, {"tetris","games"}, {"game2048","games"},
         {"2048","games"},  {"bubbletd","games"}, {"bubble","games"},
+        {"zombietd","games"}, {"zombie","games"}, {"ztd","games"},
         {"game","games"},
         {"settings","settings"}, {"setting","settings"},
         {"dateapp","calendar"}, {"date","calendar"}, {"calendar","calendar"},

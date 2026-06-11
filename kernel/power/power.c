@@ -114,6 +114,22 @@ int power_init(void) {
  */
 void power_shutdown(void) {
     kprintf("[POWER] Shutting down power management...\n");
+
+    // Free per-CPU available_freqs arrays
+    if (power_global.cpu_policies) {
+        for (uint32_t i = 0; i < power_global.num_cpus; i++) {
+            if (power_global.cpu_policies[i].available_freqs) {
+                kfree(power_global.cpu_policies[i].available_freqs);
+            }
+        }
+        kfree(power_global.cpu_policies);
+    }
+
+    // Free thermal zones array
+    if (power_global.thermal_zones) {
+        kfree(power_global.thermal_zones);
+    }
+
     memset(&power_global, 0, sizeof(power_global));
 }
 
@@ -516,9 +532,14 @@ uint32_t power_estimate_battery_life(void) {
         return 0;  // No battery or charging
     }
 
+    // Guard INT32_MIN negation overflow
+    if (power_global.battery.current_ma == INT32_MIN) {
+        return 0;
+    }
+
     // remaining_mah / current_ma = hours
     // * 60 = minutes
-    uint32_t current_ma = -power_global.battery.current_ma;
+    uint32_t current_ma = (uint32_t)(-power_global.battery.current_ma);
     if (current_ma == 0) {
         return 0;
     }

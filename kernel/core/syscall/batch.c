@@ -142,6 +142,16 @@ int64_t sys_batch_submit(uint64_t ring_ptr, uint64_t count, uint64_t arg3,
             continue;
         }
 
+        /* Refuse re-entrant batch submission: a batch entry whose syscall_num is
+         * SYS_BATCH_SUBMIT would recurse back into this function via
+         * syscall_dispatch (which has no recursion guard), letting userspace
+         * blow the fixed 8KB kernel stack by chaining a ring to itself. */
+        if (req->syscall_num == SYS_BATCH_SUBMIT) {
+            kernel_cq[i] = EINVAL;
+            executed++;
+            continue;
+        }
+
         /* Dispatch syscall (this is the hot path - minimize overhead) */
         int64_t result = syscall_dispatch(
             (uint64_t)req->syscall_num,

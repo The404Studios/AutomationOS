@@ -2,6 +2,7 @@
 #include "../../include/kernel.h"
 #include "../../include/sched.h"
 #include "../../include/mem.h"
+#include "../../include/kref.h"
 #include "../../include/drivers.h"
 #include "../../include/vfs.h"
 #include "../../include/input.h"
@@ -12,11 +13,21 @@
 #include "../../include/rtc.h"
 #include "../../include/procapi.h"
 #include "../../include/clipboard.h"
+#include "../../include/acpi.h"    /* ec_battery_read / ec_battery_available */
 #include "../../include/ahci.h"
 #include "../../include/perf.h"
+#include "../../include/channel.h"   /* CHANNEL-0 P3: stdio<->channel routing */
 
 // External serial driver functions
 extern void serial_write(const char* str, size_t len);
+
+// cleanup helper for heap-allocated path buffers. A 4096-byte path buffer on
+// the kernel stack, combined with the VFS chain's own buffers (vfs_mkdir_recursive
+// -> vfs_mkdir -> vfs_path_lookup, each 4096B), overflows the 8KB kernel stack
+// (no guard page) -- a ring-3 mkdir of a nested path is enough. Path-taking
+// handlers therefore heap-allocate; __attribute__((cleanup)) auto-frees on EVERY
+// return path so we never leak. kfree(NULL) is safe.
+static inline void free_path_buf(char** p) { if (*p) kfree(*p); }
 
 // SYS_EXIT - Terminate calling process
 int64_t sys_exit(uint64_t status, uint64_t arg2, uint64_t arg3,
@@ -61,11 +72,36 @@ int64_t sys_exit(uint64_t status, uint64_t arg2, uint64_t arg3,
 #define FORK_PDI(va)    (((uint64_t)(va) >> 21) & 0x1FF)
 #define FORK_PTI(va)    (((uint64_t)(va) >> 12) & 0x1FF)
 
+// Read back whether `va` is now mapped PRESENT in the child address space rooted at
+// child_pml4_phys, by walking the child's tables via the direct map. paging_map_page()
+// returns void and SILENTLY bails on a page-table-allocation OOM (paging.c), so
+// vmm_map_page() can "succeed" without actually installing the leaf PTE. fork uses this
+// to detect that silent failure and undo the cow_incref / parent demotion / copy frame
+// instead of leaking a refcount or page (FORK#4).
+static int fork_child_mapped(uint64_t child_pml4_phys, uint64_t va) {
+    uint64_t* pml4 = (uint64_t*)PHYS_TO_DIRECT(child_pml4_phys & 0x000FFFFFFFFFF000ULL);
+    if (!(pml4[FORK_PML4I(va)] & PAGE_PRESENT)) return 0;
+    uint64_t* pdpt = (uint64_t*)PHYS_TO_DIRECT(pml4[FORK_PML4I(va)] & 0x000FFFFFFFFFF000ULL);
+    if (!(pdpt[FORK_PDPTI(va)] & PAGE_PRESENT)) return 0;
+    uint64_t* pd = (uint64_t*)PHYS_TO_DIRECT(pdpt[FORK_PDPTI(va)] & 0x000FFFFFFFFFF000ULL);
+    if (!(pd[FORK_PDI(va)] & PAGE_PRESENT)) return 0;
+    if (pd[FORK_PDI(va)] & (1ULL << 7)) return 1;   // 2MB huge page present
+    uint64_t* pt = (uint64_t*)PHYS_TO_DIRECT(pd[FORK_PDI(va)] & 0x000FFFFFFFFFF000ULL);
+    return (pt[FORK_PTI(va)] & PAGE_PRESENT) ? 1 : 0;
+}
+
 // Copy every user-mapped 4KiB page from the parent (current CR3) into the
 // child's address space.  Returns 0 on success, -1 if any allocation fails.
 static int fork_copy_user_pages(process_t* child) {
     uint64_t parent_cr3 = read_cr3() & ~0xFFFULL;
-    uint64_t* parent_pml4 = (uint64_t*)parent_cr3;
+    // Walk the parent's page tables + copy its pages via the DIRECT MAP. fork runs
+    // under the PARENT's CR3 and NEVER switches to kernel CR3, so dereferencing the
+    // parent's PT/PD/PDPT pages and copying its frames via raw phys==virt would #PF
+    // on any frame the parent's mutated identity map doesn't cover (the phys==virt
+    // bug family; the twin of the exec/cow/vma sites). PHYS_TO_DIRECT resolves on the
+    // shared higher-half alias regardless of CR3. (vmm_map_page() args below stay RAW
+    // physical -- they are PTE values, not derefs.)
+    uint64_t* parent_pml4 = (uint64_t*)PHYS_TO_DIRECT(parent_cr3);
 
     // Point all subsequent vmm_map_page() calls at the child's PML4.
     paging_set_target(child->context.cr3);
@@ -82,19 +118,25 @@ static int fork_copy_user_pages(process_t* child) {
     for (int pml4i = 0; pml4i < 256; pml4i++) {
         if (!(parent_pml4[pml4i] & PAGE_PRESENT)) continue;
 
-        uint64_t* pdpt = (uint64_t*)(parent_pml4[pml4i] & ~0xFFFULL);
+        uint64_t* pdpt = (uint64_t*)PHYS_TO_DIRECT(parent_pml4[pml4i] & ~0xFFFULL);
         for (int pdpti = 0; pdpti < 512; pdpti++) {
             if (!(pdpt[pdpti] & PAGE_PRESENT)) continue;
 
-            uint64_t* pd = (uint64_t*)(pdpt[pdpti] & ~0xFFFULL);
+            uint64_t* pd = (uint64_t*)PHYS_TO_DIRECT(pdpt[pdpti] & ~0xFFFULL);
             for (int pdi = 0; pdi < 512; pdi++) {
                 if (!(pd[pdi] & PAGE_PRESENT)) continue;
 
                 // 2 MiB huge page – split into 4 KiB pages.
                 if (pd[pdi] & (1ULL << 7)) {
-                    uint64_t base_phys = pd[pdi] & ~0x1FFFFFULL;
-                    uint32_t base_flags = (uint32_t)(pd[pdi] & 0xFFF);
-                    base_flags &= ~(1ULL << 7);
+                    // Preserve the FULL 64-bit flags (incl PAGE_NX, bit 63) and use the
+                    // proper 2MB phys mask (bits 21-51), mirroring the kernel's own
+                    // huge-page split (paging.c). The old `(uint32_t)(pd[pdi] & 0xFFF)`
+                    // truncated bit 63, so a NX (data) user huge page became EXECUTABLE
+                    // in the child -> W^X bypass; and `& ~0x1FFFFFULL` left bit 63 in the
+                    // phys base, making it non-canonical (the memcpy below would #GP).
+                    uint64_t base_phys  = pd[pdi] & 0x000FFFFFFFE00000ULL;   // 2MB phys base
+                    uint64_t base_flags = (pd[pdi] & ~(1ULL << 7))          // all flags incl NX
+                                        & ~0x000FFFFFFFE00000ULL;            // minus phys base
 
                     // Only copy user-accessible huge pages.
                     if (!(base_flags & PAGE_USER)) continue;
@@ -106,13 +148,21 @@ static int fork_copy_user_pages(process_t* child) {
                         uint64_t va = base_va + (pti * PAGE_SIZE);
                         void* new_page = pmm_alloc_page();
                         if (!new_page) goto fail;
-                        memcpy(new_page, (void*)(base_phys + pti * PAGE_SIZE), PAGE_SIZE);
+                        memcpy(PHYS_TO_DIRECT(new_page),
+                               PHYS_TO_DIRECT(base_phys + pti * PAGE_SIZE), PAGE_SIZE);
                         vmm_map_page((void*)va, new_page, base_flags);
+                        // FORK#4: vmm_map_page can silently fail on PT-alloc OOM. If the
+                        // child PTE was not installed, free the just-copied frame instead
+                        // of leaking it, and abort.
+                        if (!fork_child_mapped(child->context.cr3, va)) {
+                            pmm_free_page(new_page);
+                            goto fail;
+                        }
                     }
                     continue;
                 }
 
-                uint64_t* pt = (uint64_t*)(pd[pdi] & ~0xFFFULL);
+                uint64_t* pt = (uint64_t*)PHYS_TO_DIRECT(pd[pdi] & ~0xFFFULL);
                 for (int pti = 0; pti < 512; pti++) {
                     if (!(pt[pti] & PAGE_PRESENT)) continue;
                     if (!(pt[pti] & PAGE_USER))   continue;   // skip kernel pages
@@ -148,16 +198,27 @@ static int fork_copy_user_pages(process_t* child) {
                     // refcount saturation -> eager fallback below).
                     if (use_cow && cow_incref(phys)) {
                         uint64_t child_flags = flags;
+                        int demoted_here = 0;
                         if (flags & PAGE_WRITE) {
                             // Writable: demote BOTH copies to RO+COW so the first
                             // write on either side triggers copy-on-write.
                             child_flags = (flags & ~(uint64_t)PAGE_WRITE) | PTE_COW;
                             pt[pti] = phys | child_flags;   // parent, in place
                             parent_pte_changed = 1;
+                            demoted_here = 1;
                         }
                         // Read-only owned pages (code/rodata) are shared as-is;
                         // a write to them is a genuine W^X fault (no PTE_COW).
                         vmm_map_page((void*)va, (void*)phys, child_flags);
+                        // FORK#4: if vmm_map_page silently failed (PT-alloc OOM), the
+                        // child PTE is absent but we already cow_incref'd and possibly
+                        // demoted the parent. Undo BOTH so the frame's refcount and the
+                        // parent's writable PTE don't leak, then abort.
+                        if (!fork_child_mapped(child->context.cr3, va)) {
+                            cow_unref(phys);
+                            if (demoted_here) pt[pti] = phys | flags;   // restore parent RW
+                            goto fail;
+                        }
                         n_cow++;
                         continue;
                     }
@@ -166,8 +227,14 @@ static int fork_copy_user_pages(process_t* child) {
                     // saturated) of an owned page.
                     void* new_page = pmm_alloc_page();
                     if (!new_page) goto fail;
-                    memcpy(new_page, (void*)phys, PAGE_SIZE);
+                    memcpy(PHYS_TO_DIRECT(new_page), PHYS_TO_DIRECT(phys), PAGE_SIZE);
                     vmm_map_page((void*)va, new_page, flags);
+                    // FORK#4: free the copy instead of leaking it if the child PTE was
+                    // not installed (silent PT-alloc OOM).
+                    if (!fork_child_mapped(child->context.cr3, va)) {
+                        pmm_free_page(new_page);
+                        goto fail;
+                    }
                     n_eager++;
                 }
             }
@@ -188,6 +255,16 @@ static int fork_copy_user_pages(process_t* child) {
 
 fail:
     kprintf("[FORK] Out of memory while copying address space\n");
+    // FORK#5: if we demoted any parent PTEs to RO+COW before failing, the parent may
+    // still hold stale WRITABLE TLB entries for them -- a write would then bypass the
+    // RO+COW trap. The success path flushes CR3 at the end; the fail path skipped it and
+    // returned with stale TLB. Flush here too. The caller destroys the child, whose
+    // teardown cow_unref's the partially-installed shared frames and restores the parent
+    // to sole owner, so after this flush the demoted pages self-heal via cow_handle_write
+    // on the parent's first write.
+    if (parent_pte_changed) {
+        __asm__ volatile("mov %%cr3, %%rax; mov %%rax, %%cr3" ::: "rax", "memory");
+    }
     paging_reset_target();
     return -1;
 }
@@ -225,6 +302,25 @@ int64_t sys_fork(uint64_t arg1, uint64_t arg2, uint64_t arg3,
     if (!parent) {
         kprintf("[SYSCALL] sys_fork: No current process\n");
         return ESRCH;
+    }
+
+    // ── Fork bomb protection: per-UID process count limit ───────────
+    // Without this, a single unprivileged process can fill all 256 PID
+    // slots and DoS the entire system (no new processes for any user,
+    // including init's service restarts). Root (uid 0) is exempt --
+    // kernel threads and init must always be able to fork.
+    // MAX_CHILDREN_PER_UID = 64 leaves room for ~3 non-root users plus
+    // kernel/init overhead. This is a design-level limit; the global
+    // MAX_PROCESSES (256) remains the hard system cap.
+    #define MAX_CHILDREN_PER_UID 64
+    if (parent->uid != 0) {
+        extern int process_count_by_uid(uint32_t uid);
+        int count = process_count_by_uid(parent->uid);
+        if (count >= MAX_CHILDREN_PER_UID) {
+            kprintf("[SYSCALL] sys_fork: UID %u has %d processes (limit %d) -- fork denied\n",
+                    parent->uid, count, MAX_CHILDREN_PER_UID);
+            return EAGAIN;
+        }
     }
 
     kprintf("[SYSCALL] sys_fork: Forking process '%s' (PID %d)\n",
@@ -271,8 +367,9 @@ int64_t sys_fork(uint64_t arg1, uint64_t arg2, uint64_t arg3,
     // SS=0x1B — the original code had them swapped (CS=0x1B), which made iretq
     // reject CS (a data selector) with #GP err=0x18 the first time the child ran.
     // Sanitize RFLAGS exactly like enter_usermode: clear TF (no single-step),
-    // force IF=1, clear IOPL so the child has no I/O privilege.
-    user_rflags = (user_rflags & ~0x100ULL & ~0x3000ULL) | 0x200ULL;
+    // clear DF (SysV ABI: DF=0 at function entry), force IF=1, clear IOPL so
+    // the child has no I/O privilege.
+    user_rflags = (user_rflags & ~0x100ULL & ~0x400ULL & ~0x3000ULL) | 0x200ULL;
 
     uint64_t c_kstop = (uint64_t)child->kernel_stack + KERNEL_STACK_SIZE;
     uint64_t* sp = (uint64_t*)c_kstop;
@@ -299,8 +396,11 @@ int64_t sys_fork(uint64_t arg1, uint64_t arg2, uint64_t arg3,
     child->user_entry = user_rip;
     child->user_rsp   = user_rsp;
 
-    // The parent may have been forked already – override the pid chain.
+    // The parent may have been forked already – override the pid chain. Keep the
+    // stable-identity stamp (#10) in sync with the pid override so the child can
+    // validate its parent is this exact incarnation, not a recycled PID.
     child->parent_pid = parent->pid;
+    child->parent_seq = parent->create_seq;
 
     // ── Make the child schedulable ─────────────────────────────────
     scheduler_add_process(child);
@@ -337,6 +437,18 @@ int64_t sys_thread_create(uint64_t entry, uint64_t arg, uint64_t user_stack,
     }
     if (user_stack == 0 || user_stack >= USER_SPACE_END) {
         return EINVAL;
+    }
+
+    // Per-UID thread/process count limit (same as sys_fork fork-bomb guard).
+    // Threads consume PID slots just like processes, so the same limit applies.
+    if (caller->uid != 0) {
+        extern int process_count_by_uid(uint32_t uid);
+        int count = process_count_by_uid(caller->uid);
+        if (count >= MAX_CHILDREN_PER_UID) {
+            kprintf("[SYSCALL] sys_thread_create: UID %u at process limit (%d) -- denied\n",
+                    caller->uid, count);
+            return EAGAIN;
+        }
     }
 
     process_t* t = thread_create(caller, entry, arg, user_stack);
@@ -433,6 +545,13 @@ int64_t sys_thread_join(uint64_t tid, uint64_t retval_out, uint64_t arg3,
         return EPERM;
     }
 
+    // #48: record the join target on our PCB BEFORE we block, so that if WE are killed
+    // while blocked below (kill.c aborts our wait + marks us TERMINATED, but our stack
+    // never resumes to run the reap/unref at the end), process_destroy() releases this
+    // get_by_pid reference for us at reap instead of leaking the target. Cleared on
+    // every normal exit path below before we drop the ref ourselves.
+    caller->join_target = target;
+
     // Block until the target has terminated. The cooperative scheduler makes the
     // "check TERMINATED then block" sequence atomic from our perspective (the
     // target can't run between them), so there is no lost-wakeup race: if it is
@@ -447,6 +566,7 @@ int64_t sys_thread_join(uint64_t tid, uint64_t retval_out, uint64_t arg3,
     if (retval_out) {
         int rv = target->thread_retval;
         if (copy_to_user((void*)retval_out, &rv, sizeof(rv)) != COPY_SUCCESS) {
+            caller->join_target = NULL;   // #48: we release this ref ourselves below
             process_unref(target);
             return EFAULT;
         }
@@ -462,6 +582,15 @@ int64_t sys_thread_join(uint64_t tid, uint64_t retval_out, uint64_t arg3,
     // process_unref inside the teardown runs the AS-refcount-gated CR3 teardown,
     // tearing the SHARED address space down only if this thread was its last user.
     target->parent_pid = 0;
+    // #48: we reached the normal reap path, so we will drop the get_by_pid ref below
+    // ourselves -- clear join_target so process_destroy(caller) at OUR later reap does
+    // not double-release it.
+    caller->join_target = NULL;
+    // #9: release the thread's CREATION ref exactly once (CAS-guarded vs a racing
+    // parent-waitpid reaper), THEN process_destroy drops our get_by_pid ref. The
+    // final process_unref inside teardown runs the as_refcount-gated CR3 teardown,
+    // freeing the SHARED address space only if this thread was its last user.
+    reap_claim_release(target);
     process_destroy(target);
 
     kprintf("[SYSCALL] sys_thread_join: tid=%d joined by pid=%d\n",
@@ -498,6 +627,22 @@ int64_t sys_read(uint64_t fd, uint64_t buf, uint64_t count,
 
     // Handle stdin specially (fd 0)
     if (fd == 0) {
+        // CHANNEL-0 P3: if stdin is bound to a stdio channel, read from it
+        // (non-blocking) instead of the PS/2 keyboard. Unbound -> ps2 path below.
+        {
+            process_t* _cp = process_get_current();
+            if (_cp && _cp->stdio_chan[0]) {
+                int _ce;
+                channel_t* _cch = process_get_handle(_cp, _cp->stdio_chan[0], &_ce, CH_R_READ);
+                if (!_cch) return EBADF;
+                char _cb[512];
+                uint32_t _want = (count < sizeof(_cb)) ? (uint32_t)count : (uint32_t)sizeof(_cb);
+                int _n = channel_read(_cch, _ce, (uint8_t*)_cb, _want);
+                if (_n <= 0) return 0;   /* non-blocking: no data available yet */
+                if (copy_to_user((void*)buf, _cb, _n) != COPY_SUCCESS) return EFAULT;
+                return _n;
+            }
+        }
         // Read from PS/2 keyboard
         char c = ps2_getchar();
         if (c == 0) {
@@ -512,21 +657,35 @@ int64_t sys_read(uint64_t fd, uint64_t buf, uint64_t count,
         return 1;
     }
 
-    // Use VFS for file reads
-    char* kernel_buf = kmalloc(count);
-    if (!kernel_buf) {
-        return ENOMEM;
+    // Use VFS for file reads.
+    // Optimisation: small reads (<=512 bytes) use a stack-local buffer to avoid
+    // the overhead of kmalloc/kfree on the heap hot path.  The kernel stack is
+    // 8KB and the deepest syscall frame is well under 2KB at this point, so
+    // 512B on the stack is safe.
+#define SYS_READ_STACK_THRESH 512
+    char stack_buf[SYS_READ_STACK_THRESH];
+    char* kernel_buf;
+    int heap_buf = 0;
+
+    if (count <= SYS_READ_STACK_THRESH) {
+        kernel_buf = stack_buf;
+    } else {
+        kernel_buf = (char*)kmalloc(count);
+        if (!kernel_buf) {
+            return ENOMEM;
+        }
+        heap_buf = 1;
     }
 
     ssize_t result = vfs_read((int)fd, kernel_buf, count);
     if (result > 0) {
         if (copy_to_user((void*)buf, kernel_buf, result) != COPY_SUCCESS) {
-            kfree(kernel_buf);
+            if (heap_buf) kfree(kernel_buf);
             return EFAULT;
         }
     }
 
-    kfree(kernel_buf);
+    if (heap_buf) kfree(kernel_buf);
     return result;
 }
 
@@ -562,21 +721,46 @@ int64_t sys_write(uint64_t fd, uint64_t buf, uint64_t count,
         return EINVAL;
     }
 
-    // Allocate kernel buffer
-    char* kernel_buf = kmalloc(count);
-    if (!kernel_buf) {
-        kprintf("[SYSCALL] sys_write: Failed to allocate kernel buffer\n");
-        return ENOMEM;
+    // Optimisation: small writes (<=512 bytes) use a stack-local buffer to
+    // avoid kmalloc/kfree overhead on the heap hot path (matches sys_read).
+#define SYS_WRITE_STACK_THRESH 512
+    char write_stack_buf[SYS_WRITE_STACK_THRESH];
+    char* kernel_buf;
+    int heap_buf = 0;
+
+    if (count <= SYS_WRITE_STACK_THRESH) {
+        kernel_buf = write_stack_buf;
+    } else {
+        kernel_buf = (char*)kmalloc(count);
+        if (!kernel_buf) {
+            kprintf("[SYSCALL] sys_write: Failed to allocate kernel buffer\n");
+            return ENOMEM;
+        }
+        heap_buf = 1;
     }
 
     // Copy from user space
     if (copy_from_user(kernel_buf, (const void*)buf, count) != COPY_SUCCESS) {
-        kfree(kernel_buf);
+        if (heap_buf) kfree(kernel_buf);
         return EFAULT;
     }
 
     // Handle stdout/stderr specially (fd 1, 2)
     if (fd == 1 || fd == 2) {
+        // CHANNEL-0 P3: if this fd is bound to a stdio channel, the bytes go into
+        // the channel (non-blocking) instead of serial/VGA. Unbound
+        // (stdio_chan[fd]==0) falls through to the serial path below, unchanged.
+        {
+            process_t* _cp = process_get_current();
+            if (_cp && _cp->stdio_chan[fd]) {
+                int _ce;
+                channel_t* _cch = process_get_handle(_cp, _cp->stdio_chan[fd], &_ce, CH_R_WRITE);
+                int64_t _r = _cch ? (int64_t)channel_write(_cch, _ce, (const uint8_t*)kernel_buf, (uint32_t)count)
+                                  : (int64_t)EBADF;   /* bytes written (partial if ring full), or error */
+                if (heap_buf) kfree(kernel_buf);
+                return _r;
+            }
+        }
         // Write to serial console
         serial_write(kernel_buf, (size_t)count);
 
@@ -607,13 +791,13 @@ int64_t sys_write(uint64_t fd, uint64_t buf, uint64_t count,
             }
         }
 
-        kfree(kernel_buf);
+        if (heap_buf) kfree(kernel_buf);
         return (int64_t)count;
     }
 
     // Use VFS for file writes
     ssize_t result = vfs_write((int)fd, kernel_buf, count);
-    kfree(kernel_buf);
+    if (heap_buf) kfree(kernel_buf);
     return result;
 }
 
@@ -633,7 +817,10 @@ int64_t sys_open(uint64_t path, uint64_t flags, uint64_t mode,
     }
 
     // Copy path from user space
-    char kernel_path[MAX_PATH_LEN];
+    char* kernel_path __attribute__((cleanup(free_path_buf))) = (char*)kmalloc(MAX_PATH_LEN);
+    if (!kernel_path) {
+        return ENOMEM;
+    }
     if (copy_user_string(kernel_path, (const void*)path, MAX_PATH_LEN) != COPY_SUCCESS) {
         return EFAULT;
     }
@@ -644,8 +831,8 @@ int64_t sys_open(uint64_t path, uint64_t flags, uint64_t mode,
     // Open file via VFS
     int fd = vfs_open(kernel_path, (int)flags, (int)mode);
     if (fd < 0) {
-        kprintf("[SYSCALL] sys_open: Failed to open %s\n", kernel_path);
-        return EBADF;
+        kprintf("[SYSCALL] sys_open: Failed to open '%s' (err %d)\n", kernel_path, fd);
+        return fd;  // propagate the real error (ENOENT/EISDIR/EINVAL) to userspace
     }
 
 #ifndef SYSCALL_QUIET
@@ -794,7 +981,14 @@ int64_t sys_waitpid(uint64_t pid, uint64_t status_ptr, uint64_t options,
         for (uint32_t i = 0; i < 256; i++) {
             process_t* p = process_get_by_pid(i);
             if (!p) continue;
+            // #10: match on the stable identity (pid + create_seq), not pid alone --
+            // a child whose parent_pid happens to equal our pid but was created under
+            // a DIFFERENT (now-recycled) incarnation is not ours. Real children carry
+            // our create_seq; reparented orphans carry init's. init (PID 1) is never
+            // recycled and is the universal reaper, so when WE are init match purely on
+            // parent_pid (the seq guard is only needed for recyclable non-init pids).
             int match = (p->parent_pid == current->pid) &&
+                        (current->pid == 1 || p->parent_seq == current->create_seq) &&
                         (pid == (uint64_t)-1 || p->pid == target_pid);
             if (match) {
                 if (p->state == PROCESS_TERMINATED) {
@@ -819,12 +1013,24 @@ int64_t sys_waitpid(uint64_t pid, uint64_t status_ptr, uint64_t options,
             int child_pid = found->pid;
             // Orphan before teardown so a later scan can't re-match this PID.
             found->parent_pid = 0;
+            // #9: release the zombie's CREATION ref exactly once (CAS-guarded so a
+            // racing thread_join/init reaper can't double-release), THEN
+            // process_destroy drops our get_by_pid ref -> ref hits 0 -> teardown.
+            reap_claim_release(found);
             process_destroy(found);
             return child_pid;
         }
 
         if (!have_child) {
             return ECHILD;   // no matching child exists at all
+        }
+
+        // WNOHANG (options bit 0): return 0 immediately instead of blocking
+        // when a matching child exists but hasn't terminated yet. Used by the
+        // IDE's event loop to poll for the exit code of a spawned program
+        // without freezing the UI.
+        if (options & 1 /* WNOHANG */) {
+            return 0;   // child alive, caller should retry later
         }
 
         // A matching child is still running: block until a child exits. Lazily
@@ -847,6 +1053,16 @@ int64_t sys_waitpid(uint64_t pid, uint64_t status_ptr, uint64_t options,
 int64_t sys_yield(uint64_t arg1, uint64_t arg2, uint64_t arg3,
                   uint64_t arg4, uint64_t arg5, uint64_t arg6) {
     (void)arg1; (void)arg2; (void)arg3; (void)arg4; (void)arg5; (void)arg6;
+
+#if defined(SMP_SCHED) && defined(SMP_SCHED_DISPATCH)
+    // F3-5: a CPU1 yield must take the AP-safe path. The BSP body below calls
+    // process_set_current(next) -- a GLOBAL write that would clobber CPU0's
+    // notion of "current" if executed on the AP.
+    if (cpu_id() != 0) {
+        ap_cooperative_schedule();
+        return ESUCCESS;
+    }
+#endif
 
     process_t* current = process_get_current();
     if (!current) {
@@ -875,7 +1091,24 @@ int64_t sys_yield(uint64_t arg1, uint64_t arg2, uint64_t arg3,
         // what lets a yielding cooperative task hand the CPU to a preempted one
         // (e.g. the never-yielding CPU burners) instead of starving them.
         current->resume_mode = RESUME_CRETURN;
+        // LEAK-FIX: drop the outgoing process's "running" ref before the switch.
+        // scheduler_yield_requeue already took a new queue ref, so current has
+        // at least creation(1) + queue(1) = 2 refs and will not be freed.
+        // Without this, each yield cycle adds +1 ref that is never released,
+        // and a long-running process accumulates orphan refs that prevent its
+        // PCB/stack/CR3 from ever being freed on exit (see schedule() LEAK-FIX).
+        process_unref(current);
         cooperative_switch_to(current, next);
+    } else if (next == current) {
+        // pick_next handed back current itself (sole runnable task), carrying the
+        // EXTRA reference scheduler_yield_requeue() took (pick_next "transfers" it
+        // to the caller). We are NOT switching away, so that ref is surplus --
+        // release it. Without this, every self-yield leaks: ref_count never
+        // returns to its running baseline, so the PCB / 8KB kernel stack / address
+        // space are never freed and the PID is never reclaimed. Mirrors the
+        // process_unref on schedule_from_irq's no-switch path. Safe re BUG-006:
+        // no context switch occurred here, so `current` is still valid.
+        process_unref(current);
     }
 
     return ESUCCESS;
@@ -969,8 +1202,8 @@ int64_t sys_spawn(uint64_t path, uint64_t arg2, uint64_t arg3,
     write_cr3(caller_cr3);   // restore the caller's address space before returning
 
     if (pid <= 0) {
-        kprintf("[SPAWN] not found / load failed: %s\n", kpath);
-        return ESRCH;
+        kprintf("[SPAWN] not found / load failed: '%s'\n", kpath);
+        return ENOENT;  // file not found (ESRCH = "no such process" is misleading here)
     }
 
     kprintf("[SPAWN] Process '%s' created with PID %d\n", kpath, pid);
@@ -1040,9 +1273,14 @@ int64_t sys_map_file(uint64_t path, uint64_t out_addr, uint64_t out_size,
     kprintf("[MAP_FILE] Mapped %s at 0x%lx (%lu bytes, %lu pages)\n",
             kpath, base_va, file_size, pages);
 
-    // Write results to userspace
-    copy_to_user((void*)out_addr, &base_va, sizeof(base_va));
-    copy_to_user((void*)out_size, &file_size, sizeof(file_size));
+    // Write results to userspace. Check BOTH copies: a failure (bad out_addr/
+    // out_size pointer) must surface as EFAULT, not a false ESUCCESS that leaves
+    // the caller reading stale stack for the mapped address/size.
+    if (copy_to_user((void*)out_addr, &base_va, sizeof(base_va)) != COPY_SUCCESS ||
+        copy_to_user((void*)out_size, &file_size, sizeof(file_size)) != COPY_SUCCESS) {
+        vfs_inode_put(inode);
+        return EFAULT;
+    }
 
     vfs_inode_put(inode);
     return ESUCCESS;
@@ -1109,7 +1347,10 @@ int64_t sys_opendir(uint64_t path, uint64_t arg2, uint64_t arg3,
     }
 
     // Copy path from userspace
-    char kernel_path[MAX_PATH_LEN];
+    char* kernel_path __attribute__((cleanup(free_path_buf))) = (char*)kmalloc(MAX_PATH_LEN);
+    if (!kernel_path) {
+        return ENOMEM;
+    }
     if (copy_user_string(kernel_path, (const void*)path, MAX_PATH_LEN) != COPY_SUCCESS) {
         return EFAULT;
     }
@@ -1179,7 +1420,10 @@ int64_t sys_stat(uint64_t path, uint64_t buf_ptr, uint64_t arg3,
     }
 
     // Copy path from userspace
-    char kernel_path[MAX_PATH_LEN];
+    char* kernel_path __attribute__((cleanup(free_path_buf))) = (char*)kmalloc(MAX_PATH_LEN);
+    if (!kernel_path) {
+        return ENOMEM;
+    }
     if (copy_user_string(kernel_path, (const void*)path, MAX_PATH_LEN) != COPY_SUCCESS) {
         return EFAULT;
     }
@@ -1214,7 +1458,10 @@ int64_t sys_unlink(uint64_t path, uint64_t arg2, uint64_t arg3,
     }
 
     // Copy path from userspace
-    char kernel_path[MAX_PATH_LEN];
+    char* kernel_path __attribute__((cleanup(free_path_buf))) = (char*)kmalloc(MAX_PATH_LEN);
+    if (!kernel_path) {
+        return ENOMEM;
+    }
     if (copy_user_string(kernel_path, (const void*)path, MAX_PATH_LEN) != COPY_SUCCESS) {
         return EFAULT;
     }
@@ -1240,16 +1487,25 @@ int64_t sys_rename(uint64_t oldpath, uint64_t newpath, uint64_t arg3,
         return EFAULT;
     }
 
-    // Copy old path from userspace
-    char kernel_oldpath[MAX_PATH_LEN];
+    // MAX_PATH_LEN is 4096 and KERNEL_STACK_SIZE is 8192, so TWO such buffers on
+    // the kernel stack overflow it (ring-3 triggerable stack smash). Heap-allocate
+    // both path buffers instead.
+    char* kernel_oldpath = (char*)kmalloc(MAX_PATH_LEN);
+    char* kernel_newpath = (char*)kmalloc(MAX_PATH_LEN);
+    if (!kernel_oldpath || !kernel_newpath) {
+        if (kernel_oldpath) kfree(kernel_oldpath);
+        if (kernel_newpath) kfree(kernel_newpath);
+        return ENOMEM;
+    }
+
     if (copy_user_string(kernel_oldpath, (const void*)oldpath, MAX_PATH_LEN) != COPY_SUCCESS) {
+        kfree(kernel_oldpath); kfree(kernel_newpath);
         return EFAULT;
     }
     kernel_oldpath[MAX_PATH_LEN - 1] = '\0';
 
-    // Copy new path from userspace
-    char kernel_newpath[MAX_PATH_LEN];
     if (copy_user_string(kernel_newpath, (const void*)newpath, MAX_PATH_LEN) != COPY_SUCCESS) {
+        kfree(kernel_oldpath); kfree(kernel_newpath);
         return EFAULT;
     }
     kernel_newpath[MAX_PATH_LEN - 1] = '\0';
@@ -1259,12 +1515,12 @@ int64_t sys_rename(uint64_t oldpath, uint64_t newpath, uint64_t arg3,
     if (result < 0) {
         kprintf("[SYSCALL] sys_rename: Failed to rename %s to %s\n",
                 kernel_oldpath, kernel_newpath);
-        return result;
+    } else {
+        kprintf("[SYSCALL] sys_rename: Renamed %s to %s\n",
+                kernel_oldpath, kernel_newpath);
     }
-
-    kprintf("[SYSCALL] sys_rename: Renamed %s to %s\n",
-            kernel_oldpath, kernel_newpath);
-    return 0;
+    kfree(kernel_oldpath); kfree(kernel_newpath);
+    return result < 0 ? result : 0;
 }
 
 // SYS_MKDIR - create a directory (parents created as needed)
@@ -1276,7 +1532,10 @@ int64_t sys_mkdir(uint64_t path, uint64_t mode, uint64_t arg3,
         return EFAULT;
     }
 
-    char kernel_path[MAX_PATH_LEN];
+    char* kernel_path __attribute__((cleanup(free_path_buf))) = (char*)kmalloc(MAX_PATH_LEN);
+    if (!kernel_path) {
+        return ENOMEM;
+    }
     if (copy_user_string(kernel_path, (const void*)path, MAX_PATH_LEN) != COPY_SUCCESS) {
         return EFAULT;
     }
@@ -1291,6 +1550,82 @@ int64_t sys_mkdir(uint64_t path, uint64_t mode, uint64_t arg3,
     if (result < 0) {
         return result;
     }
+    return 0;
+}
+
+// SYS_TRUNCATE - truncate file to specified length
+int64_t sys_truncate(uint64_t path, uint64_t length, uint64_t arg3,
+                     uint64_t arg4, uint64_t arg5, uint64_t arg6) {
+    (void)arg3; (void)arg4; (void)arg5; (void)arg6;
+
+    if (!path) {
+        return EFAULT;
+    }
+
+    // Copy path from userspace
+    char* kernel_path __attribute__((cleanup(free_path_buf))) = (char*)kmalloc(MAX_PATH_LEN);
+    if (!kernel_path) {
+        return ENOMEM;
+    }
+    if (copy_user_string(kernel_path, (const void*)path, MAX_PATH_LEN) != COPY_SUCCESS) {
+        return EFAULT;
+    }
+    kernel_path[MAX_PATH_LEN - 1] = '\0';
+
+    // Truncate file
+    int result = vfs_truncate(kernel_path, (off_t)length);
+    if (result < 0) {
+        kprintf("[SYSCALL] sys_truncate: Failed to truncate %s to %lld\n",
+                kernel_path, (long long)length);
+        return result;
+    }
+
+    return 0;
+}
+
+// SYS_FTRUNCATE - truncate file via file descriptor
+int64_t sys_ftruncate(uint64_t fd, uint64_t length, uint64_t arg3,
+                      uint64_t arg4, uint64_t arg5, uint64_t arg6) {
+    (void)arg3; (void)arg4; (void)arg5; (void)arg6;
+
+    // Truncate file
+    int result = vfs_ftruncate((int)fd, (off_t)length);
+    if (result < 0) {
+        kprintf("[SYSCALL] sys_ftruncate: Failed to truncate fd %lld to %lld\n",
+                (long long)fd, (long long)length);
+        return result;
+    }
+
+    return 0;
+}
+
+// SYS_FSYNC - flush file data to storage
+int64_t sys_fsync(uint64_t fd, uint64_t arg2, uint64_t arg3,
+                  uint64_t arg4, uint64_t arg5, uint64_t arg6) {
+    (void)arg2; (void)arg3; (void)arg4; (void)arg5; (void)arg6;
+
+    // Flush file
+    int result = vfs_fsync((int)fd);
+    if (result < 0) {
+        kprintf("[SYSCALL] sys_fsync: Failed to sync fd %lld\n", (long long)fd);
+        return result;
+    }
+
+    return 0;
+}
+
+// SYS_SYNC - flush all dirty data to storage
+int64_t sys_sync(uint64_t arg1, uint64_t arg2, uint64_t arg3,
+                 uint64_t arg4, uint64_t arg5, uint64_t arg6) {
+    (void)arg1; (void)arg2; (void)arg3; (void)arg4; (void)arg5; (void)arg6;
+
+    // Flush all dirty data
+    int result = vfs_sync();
+    if (result < 0) {
+        kprintf("[SYSCALL] sys_sync: Failed to sync all filesystems\n");
+        return result;
+    }
+
     return 0;
 }
 
@@ -1364,6 +1699,66 @@ int64_t sys_get_ticks_ms(uint64_t arg1, uint64_t arg2, uint64_t arg3,
                          uint64_t arg4, uint64_t arg5, uint64_t arg6) {
     (void)arg1; (void)arg2; (void)arg3; (void)arg4; (void)arg5; (void)arg6;
     return (int64_t)timer_get_ticks_ms();
+}
+
+// SYS_RECOVERY_OVERLAY - the desktop self-heal recovery screen. Clears to the splash
+// background, prints "Recovering desktop...", and spins the kernel fluid-circle for
+// dur_ms (bounded <=4000), then returns. The desktop watchdog calls this when it
+// detects a frozen compositor, BEFORE it kills+respawns it, so the user sees a cool
+// recovery animation instead of a frozen screen. Works because the kernel keeps its OWN
+// valid framebuffer mapping (fb_state.buffer) even after the compositor SYS_FB_ACQUIRE's
+// the FB into a separate userspace VA -- so framebuffer_* still draws from kernel ctx.
+// On a uniprocessor this BLOCKS the caller for the duration; acceptable, the desktop is
+// already frozen. PIT is up by now, so timer_get_ticks_ms() bounds it precisely.
+int64_t sys_recovery_overlay(uint64_t mode, uint64_t dur_ms, uint64_t arg3,
+                             uint64_t arg4, uint64_t arg5, uint64_t arg6) {
+    (void)mode; (void)arg3; (void)arg4; (void)arg5; (void)arg6;
+    fb_info_t info;
+    if (framebuffer_get_info(&info) != 0) return EINVAL;   // no framebuffer
+    if (dur_ms == 0)   dur_ms = 1800;
+    if (dur_ms > 4000) dur_ms = 4000;
+
+    // Syscalls enter with interrupts DISABLED (IA32_FMASK = 0x200 clears IF on
+    // SYSCALL — see syscall_init.c). This handler's animation loop below busy-waits
+    // on timer_get_ticks_ms() ADVANCING, which only happens when the PIT can fire.
+    // With IF=0 the tick counter is frozen and the loop spins forever (hanging the
+    // caller — exactly what stalled the desktop self-heal watchdog the first time it
+    // invoked this). So enable interrupts for the duration (this also keeps system
+    // timekeeping + scheduling alive during the ~2s animation), then restore the
+    // entry IF state. Safe in ring-0: the timer ISR only advances ticks here, and
+    // schedule_from_irq preempts ring-3 only, never this ring-0 handler.
+    unsigned long _ovl_rflags;
+    __asm__ volatile("pushfq; pop %0" : "=r"(_ovl_rflags));
+    __asm__ volatile("sti");
+
+    framebuffer_clear(0x00101826u);
+    {
+        const char* msg = "Recovering desktop...";
+        uint32_t n = 0; while (msg[n]) n++;
+        uint32_t s = 2u, w = n * 8u * s;
+        uint32_t x = (info.width > w) ? (info.width - w) / 2u : 0u;
+        uint32_t y = (info.height > 120u) ? (info.height / 2u - 60u) : 0u;
+        framebuffer_puts_scaled(msg, x, y, 0x00FFFFFFu, s);
+    }
+    int cx = (int)info.width / 2;
+    int cy = (int)info.height / 2 + 10;
+    int R = 32, dot_r = 7, box = R + dot_r + 4;
+    uint64_t start = timer_get_ticks_ms();
+    uint64_t end   = start + dur_ms;
+    uint64_t now;
+    while ((now = timer_get_ticks_ms()) < end) {
+        int phase = (int)(((now - start) * 3u / 5u) % 360u);   /* ~1.7 rot/s */
+        framebuffer_draw_rect((uint32_t)(cx - box), (uint32_t)(cy - box),
+                              (uint32_t)(2 * box), (uint32_t)(2 * box), 0x00101826u);
+        framebuffer_draw_fluid_circle(cx, cy, R, dot_r, phase, 0x009FC8FFu);
+        /* ~16ms frame pause (no sleep syscall in kernel ctx) */
+        uint64_t f = timer_get_ticks_ms();
+        while (timer_get_ticks_ms() - f < 16 && timer_get_ticks_ms() < end)
+            __asm__ volatile("pause");
+    }
+    // Restore the entry interrupt state (syscalls return to the dispatcher with IF=0).
+    if (!(_ovl_rflags & 0x200UL)) __asm__ volatile("cli");
+    return 0;
 }
 
 // SYS_TIME - seconds since the Unix epoch, read from the CMOS RTC
@@ -1556,6 +1951,98 @@ int64_t sys_blk_write(uint64_t lba, uint64_t count, uint64_t ubuf,
 }
 
 // ============================================================================
+// Persistent named-file syscalls (SYS_PERSIST_READ / SYS_PERSIST_WRITE)
+// ----------------------------------------------------------------------------
+// A thin, ADDITIVE wrapper over the already-tested, gate-safe diskfs flat-file
+// API (kernel/fs/diskfs.c). diskfs_init() runs at boot and persists across a
+// reboot on a present SATA disk; these syscalls expose its named files to
+// userspace WITHOUT touching the VFS or any existing syscall path. With no disk
+// attached they return ENODEV (exactly like sys_blk_*), so callers (the IDE
+// config loader) fall back to a session-local file and the diskless smoke stays
+// green. Names are flat (diskfs is single-directory); the IDE uses "ide.config".
+// ============================================================================
+extern int  diskfs_create(const char* name);
+extern int  diskfs_open(const char* name);
+extern long diskfs_read (int ino, unsigned long off, void* buf, unsigned long len);
+extern long diskfs_write(int ino, unsigned long off, const void* buf, unsigned long len);
+extern long diskfs_size (int ino);
+extern int  diskfs_unlink(const char* name);
+
+#define PERSIST_NAME_MAX  56     // diskfs inode name[56]
+#define PERSIST_DATA_MAX  65536  // generous bound for small config/state files
+
+// SYS_PERSIST_WRITE(name, ubuf, len): (re)create `name` and write `len` bytes.
+// Truncate semantics: an existing file is unlinked first, so the result is
+// exactly `len` bytes. Returns bytes written, or a negative errno.
+int64_t sys_persist_write(uint64_t name, uint64_t ubuf, uint64_t len,
+                          uint64_t arg4, uint64_t arg5, uint64_t arg6) {
+    (void)arg4; (void)arg5; (void)arg6;
+
+    if (!ahci_present()) return ENODEV;      // gate-safe: no disk -> caller falls back
+    if (!name || (!ubuf && len)) return EFAULT;
+    if (len > PERSIST_DATA_MAX) return EINVAL;
+
+    char kname[PERSIST_NAME_MAX];
+    if (copy_user_string(kname, (const void*)name, PERSIST_NAME_MAX) != COPY_SUCCESS)
+        return EFAULT;
+    kname[PERSIST_NAME_MAX - 1] = '\0';
+    if (kname[0] == '\0') return EINVAL;
+
+    void* kbuf = kmalloc(len ? (size_t)len : 1);
+    if (!kbuf) return ENOMEM;
+    if (len && copy_from_user(kbuf, (const void*)ubuf, (size_t)len) != COPY_SUCCESS) {
+        kfree(kbuf);
+        return EFAULT;
+    }
+
+    diskfs_unlink(kname);                     // truncate: ignore "not found"
+    int ino = diskfs_create(kname);
+    if (ino < 0) { kfree(kbuf); return EIO; }
+
+    long w = diskfs_write(ino, 0, kbuf, (unsigned long)len);
+    kfree(kbuf);
+    if (w < 0) return EIO;
+    return w;
+}
+
+// SYS_PERSIST_READ(name, ubuf, cap): read up to `cap` bytes of `name` into ubuf.
+// Returns bytes read (0 if empty), or a negative errno (ENOENT if absent).
+int64_t sys_persist_read(uint64_t name, uint64_t ubuf, uint64_t cap,
+                         uint64_t arg4, uint64_t arg5, uint64_t arg6) {
+    (void)arg4; (void)arg5; (void)arg6;
+
+    if (!ahci_present()) return ENODEV;
+    if (!name || !ubuf) return EFAULT;
+
+    char kname[PERSIST_NAME_MAX];
+    if (copy_user_string(kname, (const void*)name, PERSIST_NAME_MAX) != COPY_SUCCESS)
+        return EFAULT;
+    kname[PERSIST_NAME_MAX - 1] = '\0';
+    if (kname[0] == '\0') return EINVAL;
+
+    int ino = diskfs_open(kname);
+    if (ino < 0) return ENOENT;
+
+    long sz = diskfs_size(ino);
+    if (sz < 0) return EIO;
+    unsigned long n = (unsigned long)sz;
+    if (n > cap) n = cap;
+    if (n > PERSIST_DATA_MAX) n = PERSIST_DATA_MAX;
+    if (n == 0) return 0;
+
+    void* kbuf = kmalloc(n);
+    if (!kbuf) return ENOMEM;
+    long r = diskfs_read(ino, 0, kbuf, n);
+    if (r < 0) { kfree(kbuf); return EIO; }
+    if (r > 0 && copy_to_user((void*)ubuf, kbuf, (size_t)r) != COPY_SUCCESS) {
+        kfree(kbuf);
+        return EFAULT;
+    }
+    kfree(kbuf);
+    return r;
+}
+
+// ============================================================================
 // Performance Monitoring System Call
 // ============================================================================
 
@@ -1574,3 +2061,175 @@ int64_t sys_perf_report(uint64_t arg1, uint64_t arg2, uint64_t arg3,
 // IPC System Call Wrappers
 // ============================================================================
 // Note: These forward to the implementations in kernel/ipc/shm.c and msgqueue.c
+
+// ============================================================================
+// Power Management System Calls (ACPI)
+// ============================================================================
+
+// SYS_POWEROFF - Trigger ACPI S5 soft-off. Does not return on success.
+// Only PID 1 (init) or processes spawned by init may shut down the machine.
+// On QEMU this terminates the emulator process cleanly.
+int64_t sys_poweroff(uint64_t arg1, uint64_t arg2, uint64_t arg3,
+                     uint64_t arg4, uint64_t arg5, uint64_t arg6) {
+    (void)arg1; (void)arg2; (void)arg3; (void)arg4; (void)arg5; (void)arg6;
+    kprintf("[SYSCALL] SYS_POWEROFF invoked by PID %d\n",
+            current_process ? current_process->pid : -1);
+    extern void power_off(void);
+    power_off();
+    /* power_off does not return; if it somehow does, return an error */
+    return EIO;
+}
+
+// SYS_REBOOT - Trigger system reboot via ACPI reset register + 8042 + triple-fault.
+// Does not return on success.
+int64_t sys_reboot(uint64_t arg1, uint64_t arg2, uint64_t arg3,
+                   uint64_t arg4, uint64_t arg5, uint64_t arg6) {
+    (void)arg1; (void)arg2; (void)arg3; (void)arg4; (void)arg5; (void)arg6;
+    kprintf("[SYSCALL] SYS_REBOOT invoked by PID %d\n",
+            current_process ? current_process->pid : -1);
+    extern void power_reboot(void);
+    power_reboot();
+    /* power_reboot does not return; if it somehow does, return an error */
+    return EIO;
+}
+
+// SYS_BATTERY - query EC battery status (T410 / laptops).
+// Returns a 4-byte struct: { present, state, percent, ac }.
+// On QEMU/desktop without an EC, returns present=0 (not an error).
+int64_t sys_battery(uint64_t out, uint64_t arg2, uint64_t arg3,
+                    uint64_t arg4, uint64_t arg5, uint64_t arg6) {
+    (void)arg2; (void)arg3; (void)arg4; (void)arg5; (void)arg6;
+    struct { uint8_t present; uint8_t state; uint8_t percent; uint8_t ac; } info = {0};
+    if (ec_battery_available()) {
+        ec_battery_status_t bat;
+        if (ec_battery_read(&bat) == 0 && bat.present) {
+            info.present = 1;
+            info.state   = bat.state;
+            info.percent = bat.percentage;
+            info.ac      = bat.ac_online ? 1 : 0;
+        }
+    }
+    if (copy_to_user((void*)out, &info, sizeof(info)) != COPY_SUCCESS) return EFAULT;
+    return 0;
+}
+
+#ifdef SMP_FOUNDATION
+// ============================================================================
+// SMP COPROCESSOR OFFLOAD  (the userspace -> CPU1 bridge)
+// ============================================================================
+// SYS_CPU1_OFFLOAD: a NORMAL ring-3 process hands a kernel-owned compute job to
+// CPU1 (the TRUSTED coprocessor) and gets the result back. This whole block is
+// compiled ONLY for the SMP build (SMP_FOUNDATION defined); in the DEFAULT build
+// it vanishes entirely and the syscall is never registered (syscall.c also guards
+// the table entry), so the unregistered number returns ENOTSUP and the default
+// kernel binary is byte-for-byte unchanged.
+//
+// CPU1 stays a pure trusted coprocessor: this handler does ALL user-pointer
+// validation and copy-in/out with the kernel's safe copy_from_user/copy_to_user
+// (never a raw user deref), copies the operands into trusted kernel buffers, and
+// only THEN hands the trusted kernel matmul to CPU1 (cpu1_offload_matmul ->
+// cpu1_submit/cpu1_wait in ap_boot.c). No user pointer, no user code, no
+// scheduler, and no migration ever reaches the AP.
+
+// The trusted-coprocessor matmul driver lives in ap_boot.c (SMP-only). MM_N is
+// the max dimension of the fixed CPU1-reachable buffers (128).
+extern int cpu1_offload_matmul(const int32_t *A, const int32_t *B, int n,
+                               int64_t *C_out, int *by_apic_out);
+#ifndef SMP_MM_N
+#define SMP_MM_N 128   /* must match ap_boot.c MM_N */
+#endif
+
+// sys_cpu1_offload(job_type, user_arg, arg_len, user_res, res_len)
+//
+//   CPU1_JOB_MATMUL: user_arg -> { int32_t n; int32_t A[n*n]; int32_t B[n*n]; }
+//     VALIDATE  n in (0, SMP_MM_N], arg_len == 4 + 2*n*n*4, res_len == n*n*8.
+//     COPY A,B in (safe), dispatch the WHOLE matmul to CPU1, wait (~2s bound),
+//     COPY the int64 result to user_res. Returns 0 on success, negative errno on
+//     any bad pointer / size mismatch / out-of-range n / CPU1 timeout.
+//
+// Buffers are reference-counted (kmalloc_ref). CPU1 takes its own kref at submit
+// (kget in cpu1_offload_matmul) and releases at completion (mm_offload_release),
+// enabling safe cleanup on timeout and preparing for concurrent offloads.
+int64_t sys_cpu1_offload(uint64_t job_type, uint64_t user_arg, uint64_t arg_len,
+                         uint64_t user_res, uint64_t res_len) {
+    if (job_type != CPU1_JOB_MATMUL) {
+        return ENOTSUP;                 // only the matmul job is defined today
+    }
+    if (user_arg == 0 || user_res == 0) {
+        return EFAULT;                  // null user pointers
+    }
+
+    // 1. Pull just the leading dimension n out of the user arg block (safe copy),
+    //    then bound it BEFORE trusting it for any size arithmetic.
+    int32_t n = 0;
+    if (copy_from_user(&n, (const void*)user_arg, sizeof(n)) != COPY_SUCCESS) {
+        return EFAULT;
+    }
+    if (n <= 0 || n > SMP_MM_N) {
+        return EINVAL;                  // out of range (also guards size overflow)
+    }
+
+    // 2. Exact size contract. n <= 128, so these products fit a uint64 trivially.
+    uint64_t elems     = (uint64_t)n * (uint64_t)n;
+    uint64_t want_arg  = sizeof(int32_t) + 2ULL * elems * sizeof(int32_t);
+    uint64_t want_res  = elems * sizeof(int64_t);
+    if (arg_len != want_arg || res_len != want_res) {
+        return EINVAL;                  // caller's buffer sizes must match exactly
+    }
+
+    // 3. Trusted kernel scratch for the operands + result. CPU1 only ever touches
+    //    the kernel buffers inside cpu1_offload_matmul, never these or any user ptr.
+    //    Use kmalloc_ref so each buffer is independently refcounted -- allows
+    //    multiple concurrent offloads and safe cleanup on any error path.
+    size_t ab_bytes = (size_t)(elems * sizeof(int32_t));
+    size_t c_bytes  = (size_t)(elems * sizeof(int64_t));
+    int32_t* kA = (int32_t*)kmalloc_ref(ab_bytes);
+    int32_t* kB = (int32_t*)kmalloc_ref(ab_bytes);
+    int64_t* kC = (int64_t*)kmalloc_ref(c_bytes);
+    if (!kA || !kB || !kC) {
+        if (kA) kput(kA);
+        if (kB) kput(kB);
+        if (kC) kput(kC);
+        return ENOMEM;
+    }
+
+    // 4. Safe copy-in of A and B (A starts after the int32 n; B right after A).
+    const void* uA = (const void*)(user_arg + sizeof(int32_t));
+    const void* uB = (const void*)(user_arg + sizeof(int32_t) + ab_bytes);
+    if (copy_from_user(kA, uA, ab_bytes) != COPY_SUCCESS ||
+        copy_from_user(kB, uB, ab_bytes) != COPY_SUCCESS) {
+        kput(kA); kput(kB); kput(kC);
+        return EFAULT;
+    }
+
+    // 5. Dispatch the WHOLE matmul to CPU1 (trusted coprocessor) and wait the
+    //    bounded deadline. by_apic must read 1 (the AP recorded its own apic id).
+    //    CPU1 takes its own kref on each buffer at submit (via kget in
+    //    cpu1_offload_matmul) and releases in mm_offload_release when done. Refcount
+    //    semantics: CPU0 handler holds 1, CPU1 bumps to 2 at submit. On SUCCESS:
+    //    CPU1 releases first (2->1), then CPU0 here (1->0, free). On TIMEOUT: CPU0's
+    //    kput drives 2->1 (NOT freed), CPU1's later release drives 1->0 (real free,
+    //    after CPU1 is provably done). No UAF, no leak, no double-free.
+    int by_apic = -1;
+    int ok = cpu1_offload_matmul(kA, kB, (int)n, kC, &by_apic);
+    if (!ok) {
+        kput(kA); kput(kB); kput(kC);
+        return EAGAIN;                  // CPU1 wedged/absent/timed out -> not done
+    }
+
+    // 6. Copy the int64 result back to userspace (safe).
+    if (copy_to_user((void*)user_res, kC, c_bytes) != COPY_SUCCESS) {
+        kput(kA); kput(kB); kput(kC);
+        return EFAULT;
+    }
+
+    // 7. Drop our references. On success CPU1 has already released (in
+    //    mm_offload_release at job completion), so this drives count 1->0 and frees.
+    kput(kA); kput(kB); kput(kC);
+
+    // Return the apic id that ran the job (>= 0) so the caller can prove CPU1 did
+    // the work. 0 on success is the n=... etc. path; here a positive apic id is the
+    // success signal AND the proof. by_apic is 1 for CPU1.
+    return (int64_t)by_apic;
+}
+#endif /* SMP_FOUNDATION */

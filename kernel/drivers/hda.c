@@ -4,6 +4,7 @@
 #include "../include/x86_64.h"
 #include "../include/types.h"
 #include "../include/drivers.h"   /* serial_write, serial_putchar, timer_get_ticks, timer_get_frequency */
+#include "../include/syscall.h"   /* sys_yield */
 
 // Global HDA controller instance
 static hda_controller_t* g_hda_ctrl = NULL;
@@ -22,8 +23,17 @@ void hda_msleep(uint32_t ms) {
     // Assuming 1000 Hz timer, convert to ticks
     uint64_t start = timer_get_ticks();
     uint64_t end = start + (ms * timer_get_frequency() / 1000);
+    /* Frozen-tick backstop: SYS_BEEP runs in syscall context with IF=0, so the
+     * PIT (IRQ0) cannot advance timer_get_ticks() while THIS task holds the CPU.
+     * The yield lets other IF=1 tasks run (IRQ0 ticks during them), but if the
+     * system is otherwise idle the tick may never advance -- so cap the spin so
+     * audio can NEVER hang the caller. Same rule as net resolve_mac():
+     * "any wall-clock wait inside a syscall MUST also have an iteration cap." */
+    uint32_t iters = 0;
+    const uint32_t iter_cap = 4000000u;
     while (timer_get_ticks() < end) {
-        hlt();
+        sys_yield(0, 0, 0, 0, 0, 0);  // Scheduler-aware sleep
+        if (++iters >= iter_cap) break;
     }
 }
 
@@ -543,14 +553,22 @@ int hda_enumerate_codecs(hda_controller_t* ctrl) {
         serial_putchar('0' + num_nodes);
         serial_putchar('\n');
 
-        // Search for AFG
+        // Search for AFG. start_nid/num_nodes are device-reported (uint8); with a
+        // uint8 loop variable, `nid < start_nid + num_nodes` is ALWAYS true once the
+        // int-promoted sum exceeds 255 -- nid wraps at 256 and never reaches it, so a
+        // malformed codec wedges init in an infinite hda_send_command loop (IF off).
+        // Bound the scan by the real hardware limit instead: a NID is an 8-bit
+        // command field, so the highest possible node is 255 (end-exclusive = 256).
+        // Widen the loop math to uint16 so it actually terminates.
         codec->afg_nid = 0;
-        for (uint8_t nid = start_nid; nid < start_nid + num_nodes; nid++) {
-            uint32_t func_type = hda_send_command(ctrl, addr, nid, HDA_VERB_GET_PARAMETER, HDA_PARAM_FUNC_GROUP_TYPE);
+        uint16_t end_nid = (uint16_t)start_nid + (uint16_t)num_nodes;
+        if (end_nid > 256) end_nid = 256;
+        for (uint16_t nid = start_nid; nid < end_nid; nid++) {
+            uint32_t func_type = hda_send_command(ctrl, addr, (uint8_t)nid, HDA_VERB_GET_PARAMETER, HDA_PARAM_FUNC_GROUP_TYPE);
             if ((func_type & 0xFF) == 0x01) {  // Audio Function Group
-                codec->afg_nid = nid;
+                codec->afg_nid = (uint8_t)nid;
                 serial_write("HDA: Found AFG at NID ", 23);
-                serial_putchar('0' + nid);
+                serial_putchar('0' + (uint8_t)nid);
                 serial_putchar('\n');
                 break;
             }
@@ -607,10 +625,20 @@ int hda_codec_read_widgets(hda_codec_t* codec, hda_controller_t* ctrl) {
     serial_putchar('\n');
 
     // Read each widget
+    // afg_start_nid/afg_num_nodes are device-reported (uint8). A uint8 loop var
+    // makes `nid < afg_start_nid + afg_num_nodes` always true once the int-promoted
+    // sum exceeds 255 (nid wraps at 256); the num_widgets guard then stops the loop
+    // after 128 iterations but over the WRONG NID range (0..127 instead of the real
+    // range), corrupting the audio topology. Iterate a uint16 over the real 8-bit
+    // NID space (end-exclusive 256) AND the widget array; the body keeps the uint8
+    // `nid` it expects. Mirrors the AFG-search fix.
     codec->num_widgets = 0;
-    for (uint8_t nid = codec->afg_start_nid;
-         nid < codec->afg_start_nid + codec->afg_num_nodes && codec->num_widgets < HDA_MAX_WIDGETS;
-         nid++) {
+    uint16_t end_nid = (uint16_t)codec->afg_start_nid + (uint16_t)codec->afg_num_nodes;
+    if (end_nid > 256) end_nid = 256;
+    for (uint16_t n = codec->afg_start_nid;
+         n < end_nid && codec->num_widgets < HDA_MAX_WIDGETS;
+         n++) {
+        uint8_t nid = (uint8_t)n;
 
         hda_widget_t* widget = &codec->widgets[codec->num_widgets];
         widget->nid = nid;

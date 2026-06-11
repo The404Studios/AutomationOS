@@ -369,13 +369,23 @@ static void game_init(u64 ticks)
 
 /* ---- draw helpers ---- */
 
+/*
+ * Live surface bounds, refreshed every frame from win->w/h. All clamping is
+ * done against these (never the WIN_W/WIN_H constants) so a resized window
+ * never writes outside the CURRENT buffer. The fixed 420x500 canvas is
+ * letterboxed at (0,0); when the window is larger the surrounding margins are
+ * cleared to black each frame in render().
+ */
+static i32 g_clip_w = WIN_W;
+static i32 g_clip_h = WIN_H;
+
 static void fill_rect(u32 *buf, u32 stride_px,
                       i32 x, i32 y, i32 w, i32 h, u32 color)
 {
     i32 x1 = x < 0 ? 0 : x;
     i32 y1 = y < 0 ? 0 : y;
-    i32 x2 = x + w; if (x2 > WIN_W) x2 = WIN_W;
-    i32 y2 = y + h; if (y2 > WIN_H) y2 = WIN_H;
+    i32 x2 = x + w; if (x2 > g_clip_w) x2 = g_clip_w;
+    i32 y2 = y + h; if (y2 > g_clip_h) y2 = g_clip_h;
     if (x1 >= x2 || y1 >= y2) return;
     for (i32 yy = y1; yy < y2; yy++) {
         u32 *row = buf + (u32)yy * stride_px;
@@ -425,13 +435,19 @@ static void draw_centered_str(u32 *buf, u32 stride_px,
     i32 tw_text = font_text_width(s);
     i32 x = tx + (tw - tw_text) / 2;
     i32 y = ty + (th - FONT_H) / 2;
-    font_draw_string(buf, (i32)stride_px, WIN_W, WIN_H, x, y, s, color);
+    font_draw_string(buf, (i32)stride_px, g_clip_w, g_clip_h, x, y, s, color);
 }
 
 /* ---- render ---- */
 static void render(u32 *buf, u32 stride_px)
 {
-    /* 1. Background */
+    /* 0. Letterbox: clear the WHOLE live surface to black first so any margins
+     *    left over from a window grow/snap are never stale garbage. Bounded to
+     *    the current surface via g_clip_w/g_clip_h. */
+    if (g_clip_w > WIN_W || g_clip_h > WIN_H)
+        fill_rect(buf, stride_px, 0, 0, g_clip_w, g_clip_h, 0xFF000000u);
+
+    /* 1. Background (fixed 420x500 canvas, clamped to the live surface). */
     fill_rect(buf, stride_px, 0, 0, WIN_W, WIN_H, COL_BG);
 
     /* 2. Header strip */
@@ -439,7 +455,7 @@ static void render(u32 *buf, u32 stride_px)
 
     /* Title "2048" on left */
     {
-        font_draw_string(buf, (i32)stride_px, WIN_W, WIN_H,
+        font_draw_string(buf, (i32)stride_px, g_clip_w, g_clip_h,
                          8, (HEADER_H - FONT_H) / 2, "2048", COL_WHITE);
     }
 
@@ -454,7 +470,7 @@ static void render(u32 *buf, u32 stride_px)
         for (i32 i = 0; i < nlen; i++) score_str[n++] = num[i];
         score_str[n] = '\0';
         i32 sw = font_text_width(score_str);
-        font_draw_string(buf, (i32)stride_px, WIN_W, WIN_H,
+        font_draw_string(buf, (i32)stride_px, g_clip_w, g_clip_h,
                          WIN_W - sw - 8, (HEADER_H - FONT_H) / 2,
                          score_str, COL_WHITE);
     }
@@ -499,11 +515,11 @@ static void render(u32 *buf, u32 stride_px)
         i32 w1 = font_text_width(msg1);
         i32 w2 = font_text_width(msg2);
         i32 w3 = font_text_width(msg3);
-        font_draw_string(buf, (i32)stride_px, WIN_W, WIN_H,
+        font_draw_string(buf, (i32)stride_px, g_clip_w, g_clip_h,
                          (WIN_W - w1)/2, cy,      msg1, 0xFFFFD700u);
-        font_draw_string(buf, (i32)stride_px, WIN_W, WIN_H,
+        font_draw_string(buf, (i32)stride_px, g_clip_w, g_clip_h,
                          (WIN_W - w2)/2, cy + 20, msg2, COL_WHITE);
-        font_draw_string(buf, (i32)stride_px, WIN_W, WIN_H,
+        font_draw_string(buf, (i32)stride_px, g_clip_w, g_clip_h,
                          (WIN_W - w3)/2, cy + 36, msg3, COL_WHITE);
     }
 
@@ -531,13 +547,13 @@ static void render(u32 *buf, u32 stride_px)
         i32 w2  = font_text_width(msg2);
         i32 w3  = font_text_width(msg3);
 
-        font_draw_string(buf, (i32)stride_px, WIN_W, WIN_H,
+        font_draw_string(buf, (i32)stride_px, g_clip_w, g_clip_h,
                          (WIN_W - w1)/2,  cy,      msg1,       0xFFFF6B6Bu);
-        font_draw_string(buf, (i32)stride_px, WIN_W, WIN_H,
+        font_draw_string(buf, (i32)stride_px, g_clip_w, g_clip_h,
                          (WIN_W - wsl)/2, cy + 20, score_line, 0xFFFFD700u);
-        font_draw_string(buf, (i32)stride_px, WIN_W, WIN_H,
+        font_draw_string(buf, (i32)stride_px, g_clip_w, g_clip_h,
                          (WIN_W - w2)/2,  cy + 40, msg2,       COL_WHITE);
-        font_draw_string(buf, (i32)stride_px, WIN_W, WIN_H,
+        font_draw_string(buf, (i32)stride_px, g_clip_w, g_clip_h,
                          (WIN_W - w3)/2,  cy + 56, msg3,       COL_WHITE);
     }
 }
@@ -560,6 +576,10 @@ void _start(void)
 
     u32 stride_px = win->stride / 4u;
 
+    /* Live surface bounds for clipping (fixed canvas is letterboxed at 0,0). */
+    g_clip_w = (i32)win->w;
+    g_clip_h = (i32)win->h;
+
     /* Seed RNG and init game. */
     u64 now = (u64)sc(SYS_GET_TICKS_MS, 0, 0, 0, 0, 0, 0);
     game_init(now);
@@ -570,6 +590,15 @@ void _start(void)
         /* Drain input. */
         int kind, a, b, c_ev;
         while (wl_poll_event(win, &kind, &a, &b, &c_ev)) {
+            if (kind == WL_EVENT_RESIZE) {
+                /* The library already reallocated/updated win->{w,h,stride,
+                 * pixels}. Re-read them so every subsequent pixel write is
+                 * bounded to the CURRENT surface with the CURRENT stride. */
+                stride_px = win->stride / 4u;
+                g_clip_w  = (i32)win->w;
+                g_clip_h  = (i32)win->h;
+                continue;
+            }
             if (kind != WL_EVENT_KEY || b != 1) continue;  /* key-down only */
 
             /* Restart key works in any state. */

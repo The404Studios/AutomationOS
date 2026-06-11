@@ -119,6 +119,16 @@ int  e1000_init(void);
  */
 bool e1000_present(void);
 
+/*
+ * e1000_pch_deferred_bringup() -- E1000-PCH-0B: complete the risky half of a
+ * PCH (82577LM-class) bring-up that e1000_init() deferred at boot (CTRL_RST
+ * under SWFLAG, PHY MDIO dance, DMA rings). Invoked post-desktop via the
+ * SYS_NET_CONFIG NIC_BRINGUP flag (the nicup tool); re-runnable -- every
+ * abort leaves the NIC link-down and the machine healthy.
+ * Returns 0 = NIC up, -1 = aborted (retry later), -2 = nothing deferred.
+ */
+int  e1000_pch_deferred_bringup(void);
+
 /* ------------------------------------------------------------------ */
 /* MAC address                                                         */
 /* ------------------------------------------------------------------ */
@@ -190,5 +200,17 @@ int  e1000_tx(const void* frame, uint16_t len);
  *     }
  */
 int  e1000_rx_poll(void* buf, uint16_t buf_len);
+
+/*
+ * e1000_transmit_batch() -- send multiple frames with a single doorbell.
+ *
+ * `frames` is an array of pointers to raw Ethernet frames, `lengths` holds
+ * the corresponding byte counts, and `count` is the number of frames.
+ * A single MMIO TDT write kicks the entire batch, amortising the PCIe
+ * round-trip.  Returns the number of frames actually queued (may be less
+ * than `count` if the TX ring is full).
+ */
+int  e1000_transmit_batch(const void* const* frames, const uint16_t* lengths,
+                          uint32_t count);
 
 #endif /* E1000_H */

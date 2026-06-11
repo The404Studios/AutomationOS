@@ -72,10 +72,15 @@ int power_profile_apply(power_profile_t profile) {
     for (uint32_t i = 0; i < power_global.num_cpus; i++) {
         cpufreq_set_governor(i, config->cpu_governor);
 
-        // Apply frequency limit
+        // Apply frequency limit derived from hardware max (not current max,
+        // which would ratchet down on repeated profile application)
         cpufreq_policy_t* policy = cpufreq_get_policy(i);
         if (policy) {
-            policy->max_freq_mhz = (policy->max_freq_mhz * config->cpu_max_freq_percent) / 100;
+            uint32_t hw_max = policy->min_freq_mhz;  // fallback
+            if (policy->available_freqs && policy->num_freqs > 0) {
+                hw_max = policy->available_freqs[policy->num_freqs - 1];
+            }
+            policy->max_freq_mhz = (hw_max * config->cpu_max_freq_percent) / 100;
         }
     }
 

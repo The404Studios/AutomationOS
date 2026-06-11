@@ -143,6 +143,14 @@ static void *shm_attach(uint32_t shm_id) {
 int ipc_handle_create_window(fb_compositor_t *comp, ipc_message_t *msg) {
     create_window_request_t *req = IPC_MSG_GET_PAYLOAD(msg, create_window_request_t);
 
+    // Cap untrusted dimensions BEFORE they size the SHM segment (WINDOW_SURFACE_SIZE
+    // below) and the window pixel buffer, so neither can overflow and the segment
+    // capacity matches the window's recorded surface_capacity_pixels.
+    if (req->width  == 0) req->width  = 1;
+    if (req->height == 0) req->height = 1;
+    if (req->width  > WINDOW_MAX_DIM) req->width  = WINDOW_MAX_DIM;
+    if (req->height > WINDOW_MAX_DIM) req->height = WINDOW_MAX_DIM;
+
     // Generate window ID
     static uint32_t next_window_id = 1;
     uint32_t window_id = next_window_id++;

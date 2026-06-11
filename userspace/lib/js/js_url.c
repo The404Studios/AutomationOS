@@ -116,6 +116,16 @@ static void url_strcat(char *dst, const char *src)
     while ((*dst++ = *src++));
 }
 
+/* Bounded strcat: appends at most `n` bytes from `src` to `dst`, where
+ * `dsz` is the total capacity of `dst` (including NUL). */
+static void url_strcat_n(char *dst, js_usize dsz, const char *src)
+{
+    js_usize i = 0;
+    while (i < dsz && dst[i]) i++;
+    while (i < dsz - 1 && *src) { dst[i++] = *src++; }
+    if (i < dsz) dst[i] = '\0';
+}
+
 static js_usize url_uitoa(unsigned int v, char *buf)
 {
     if (v == 0) { buf[0]='0'; buf[1]='\0'; return 1; }
@@ -506,16 +516,16 @@ static void url_resolve(url_parsed *out, const url_parsed *base,
 /* Write href into caller-supplied buf (len bytes).  Returns 0. */
 static int url_href_buf(const url_parsed *u, char *buf, js_usize bufsz)
 {
+    if (bufsz == 0) return 0;
     buf[0] = '\0';
-    if (u->scheme[0]) { url_strcat(buf, u->scheme); url_strcat(buf, "://"); }
+    if (u->scheme[0]) { url_strcat_n(buf, bufsz, u->scheme); url_strcat_n(buf, bufsz, "://"); }
     if (u->host[0]) {
-        url_strcat(buf, u->host);
-        if (u->port[0]) { url_strcat(buf, ":"); url_strcat(buf, u->port); }
+        url_strcat_n(buf, bufsz, u->host);
+        if (u->port[0]) { url_strcat_n(buf, bufsz, ":"); url_strcat_n(buf, bufsz, u->port); }
     }
-    url_strcat(buf, u->pathname[0] ? u->pathname : "/");
-    if (u->search[0]) url_strcat(buf, u->search);
-    if (u->hash[0])   url_strcat(buf, u->hash);
-    (void)bufsz;
+    url_strcat_n(buf, bufsz, u->pathname[0] ? u->pathname : "/");
+    if (u->search[0]) url_strcat_n(buf, bufsz, u->search);
+    if (u->hash[0])   url_strcat_n(buf, bufsz, u->hash);
     return 0;
 }
 
@@ -539,14 +549,15 @@ static const char *url_href_arena(js_vm *vm, const url_parsed *u)
 
 static const char *url_origin_arena(js_vm *vm, const url_parsed *u)
 {
-    char *buf = (char *)js_arena_alloc(vm, 64+3+256+1+8+1);
+    const js_usize cap = 64+3+256+1+8+1;
+    char *buf = (char *)js_arena_alloc(vm, cap);
     if (!buf) return "";
     buf[0] = '\0';
     if (!u->scheme[0]) { url_strcpy(buf, "null"); return buf; }
-    url_strcat(buf, u->scheme);
-    url_strcat(buf, "://");
-    url_strcat(buf, u->host);
-    if (u->port[0]) { url_strcat(buf, ":"); url_strcat(buf, u->port); }
+    url_strcat_n(buf, cap, u->scheme);
+    url_strcat_n(buf, cap, "://");
+    url_strcat_n(buf, cap, u->host);
+    if (u->port[0]) { url_strcat_n(buf, cap, ":"); url_strcat_n(buf, cap, u->port); }
     return buf;
 }
 
@@ -855,13 +866,18 @@ static js_value url_prop_get(js_vm *vm, void *self, const char *prop)
         return js_native_make_string(vm, url_href_arena(vm, u));
     if (url_streq(prop, "protocol")) {
         if (!u->scheme[0]) return js_native_make_string(vm, "");
-        char buf[68]; url_strcpy(buf, u->scheme); url_strcat(buf, ":");
+        char buf[68]; buf[0] = '\0';
+        url_strcat_n(buf, sizeof(buf), u->scheme);
+        url_strcat_n(buf, sizeof(buf), ":");
         return js_native_make_string(vm, buf);
     }
     if (url_streq(prop, "host")) {
         if (!u->host[0]) return js_native_make_string(vm, "");
         if (!u->port[0]) return js_native_make_string(vm, u->host);
-        char buf[270]; url_strcpy(buf, u->host); url_strcat(buf, ":"); url_strcat(buf, u->port);
+        char buf[270]; buf[0] = '\0';
+        url_strcat_n(buf, sizeof(buf), u->host);
+        url_strcat_n(buf, sizeof(buf), ":");
+        url_strcat_n(buf, sizeof(buf), u->port);
         return js_native_make_string(vm, buf);
     }
     if (url_streq(prop, "hostname")) return js_native_make_string(vm, u->host);

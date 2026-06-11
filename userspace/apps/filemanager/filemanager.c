@@ -87,6 +87,7 @@ __attribute__((noreturn)) void __stack_chk_fail(void)
 #define SYS_RENAME   35
 #define SYS_GET_TICKS_MS 40
 #define SYS_MKDIR    67
+#define SYS_UNLINK   34
 
 #define O_RDONLY     0x0000
 
@@ -140,6 +141,18 @@ typedef struct {
 /* Freestanding string helpers                                             */
 /* ----------------------------------------------------------------------- */
 static unsigned long s_len(const char *s) { unsigned long n = 0; while (s[n]) n++; return n; }
+
+/* Case-insensitive lexicographic compare; returns <0, 0, >0. */
+static int s_icmp(const char *a, const char *b)
+{
+    while (*a && *b) {
+        char ca = (*a >= 'A' && *a <= 'Z') ? (char)(*a + 32) : *a;
+        char cb = (*b >= 'A' && *b <= 'Z') ? (char)(*b + 32) : *b;
+        if (ca != cb) return (int)(unsigned char)ca - (int)(unsigned char)cb;
+        a++; b++;
+    }
+    return (int)(unsigned char)*a - (int)(unsigned char)*b;
+}
 
 static void s_cpy(char *dst, const char *src, int n)
 {
@@ -442,9 +455,17 @@ static unsigned long long g_prev_size;
 static char g_prev_text[2048];       /* first bytes of the file            */
 static int  g_prev_len;
 
+/* Breadcrumb segment hit regions (filled during draw_address). */
+#define BREAD_MAX 16
+static int  g_bread_n;                      /* number of clickable segments  */
+static int  g_bread_x[BREAD_MAX];           /* segment x start               */
+static int  g_bread_w[BREAD_MAX];           /* segment pixel width            */
+static int  g_bread_y;                      /* common y (top of text)         */
+static char g_bread_path[BREAD_MAX][PATHLEN]; /* accumulated path for each   */
+
 /* Grid metrics. */
 #define CELL_W   132
-#define CELL_H   104
+#define CELL_H   116
 #define ICON_DY  10
 #define PAD_X    18
 #define PAD_Y    12
@@ -474,7 +495,7 @@ static char entry_glyph(const entry_t *e)
 }
 
 /* ----------------------------------------------------------------------- */
-/* Directory scan -> g_ent (dirs first, then files; both insertion order)  */
+/* Directory scan -> g_ent (dirs first, then files; alphabetical)         */
 /* ----------------------------------------------------------------------- */
 NO_SSP static void do_scan(const char *path)
 {
@@ -489,8 +510,7 @@ NO_SSP static void do_scan(const char *path)
         return;
     }
 
-    /* First pass: directories. Second pass would need rewind; instead we
-     * collect everything then stable-partition dirs to the front. */
+    /* Collect all entries; sort step below will order them. */
     struct dirent ent;
     while (g_nent < MAXENT) {
         long r = sc(SYS_READDIR, fd, (long)&ent, 0);
@@ -512,17 +532,21 @@ NO_SSP static void do_scan(const char *path)
     }
     sc(SYS_CLOSEDIR, fd, 0, 0);
 
-    /* Stable partition: directories first. */
-    for (int i = 0; i < g_nent; i++) {
-        if (g_ent[i].type == DT_DIR) continue;
-        /* find next dir after i */
-        int j = i + 1;
-        while (j < g_nent && g_ent[j].type != DT_DIR) j++;
-        if (j < g_nent) {
-            entry_t tmp = g_ent[j];
-            for (int k = j; k > i; k--) g_ent[k] = g_ent[k - 1];
-            g_ent[i] = tmp;
-        } else break;
+    /* Sort: directories first, then files; alphabetical within each group.
+     * Simple insertion sort (MAXENT is small). */
+    for (int i = 1; i < g_nent; i++) {
+        entry_t key = g_ent[i];
+        int j = i - 1;
+        while (j >= 0) {
+            /* dirs before files; within same type, alphabetical */
+            int ka = (key.type == DT_DIR) ? 0 : 1;
+            int ja = (g_ent[j].type == DT_DIR) ? 0 : 1;
+            if (ja > ka || (ja == ka && s_icmp(g_ent[j].name, key.name) > 0)) {
+                g_ent[j + 1] = g_ent[j];
+                j--;
+            } else break;
+        }
+        g_ent[j + 1] = key;
     }
 
     char nb[16]; fmt_int(nb, g_nent);
@@ -814,7 +838,7 @@ NO_SSP static void draw_toolbar(void)
     hline(0, TOOLBAR_H - 1, FBW, COL_BORDER);
 }
 
-/* Breadcrumb address bar: "> Home / a / b". */
+/* Breadcrumb address bar: "> Home / a / b" with clickable segments. */
 NO_SSP static void draw_address(void)
 {
     int y = TOOLBAR_H;
@@ -825,16 +849,29 @@ NO_SSP static void draw_address(void)
     round_outline(bx, by, FBW - 320, 24, 6, COL_BORDER);
 
     int tx = bx + 10, ty = by + 4;
-    /* leading home chip */
+    g_bread_n = 0;
+    g_bread_y = ty;
+
+    /* leading ">" chip */
     text(tx, ty, ">", COL_TEXTDIM);
     tx += FONT_W + 6;
+
+    /* "Home" = root "/" segment (always clickable) */
+    int hw = 4 * FONT_W;
+    text(tx, ty, "Home", COL_TEXT);
+    if (g_bread_n < BREAD_MAX) {
+        g_bread_x[g_bread_n] = tx;
+        g_bread_w[g_bread_n] = hw;
+        s_cpy(g_bread_path[g_bread_n], "/", PATHLEN);
+        g_bread_n++;
+    }
+    tx += hw;
 
     /* split g_cwd on '/' */
     const char *p = g_cwd;
     if (*p == '/') p++;
     char seg[NAMELEN];
-    text(tx, ty, "Home", COL_TEXT);
-    tx += 4 * FONT_W;
+    char accum[PATHLEN]; s_cpy(accum, "", PATHLEN);
     while (*p) {
         int i = 0;
         while (*p && *p != '/' && i < NAMELEN - 1) seg[i++] = *p++;
@@ -844,7 +881,17 @@ NO_SSP static void draw_address(void)
         text(tx, ty, " / ", COL_TEXTDIM); tx += 3 * FONT_W;
         int segw = i * FONT_W;
         if (tx + segw > bx + (FBW - 320) - 12) { text(tx, ty, "..", COL_TEXTDIM); break; }
-        text(tx, ty, seg, COL_TEXT); tx += segw;
+        /* accumulate path for this segment */
+        s_cat(accum, "/", PATHLEN);
+        s_cat(accum, seg, PATHLEN);
+        text(tx, ty, seg, COL_TEXT);
+        if (g_bread_n < BREAD_MAX) {
+            g_bread_x[g_bread_n] = tx;
+            g_bread_w[g_bread_n] = segw;
+            s_cpy(g_bread_path[g_bread_n], accum, PATHLEN);
+            g_bread_n++;
+        }
+        tx += segw;
     }
 
     hline(0, y + ADDR_H - 1, FBW, COL_BORDER);
@@ -942,6 +989,11 @@ NO_SSP static void draw_grid(void)
                     l2[bi] = '\0';
                     text_center(cx, ly - 8, CELL_W - 8, l1, COL_TEXT);
                     text_center(cx, ly + 8, CELL_W - 8, l2, COL_TEXT);
+                }
+                /* File size below the name (files only; dirs show nothing) */
+                if (e->type != DT_DIR) {
+                    char szb[24]; fmt_size(szb, e->size);
+                    text_center(cx, ly + (tw <= maxw ? 18 : 24), CELL_W - 8, szb, COL_TEXTDIM);
                 }
             }
         }
@@ -1041,6 +1093,7 @@ NO_SSP static void render(void)
 #define KEY_LSHIFT    42
 #define KEY_RSHIFT    54
 #define KEY_F2        60
+#define KEY_DELETE    111
 #define KEY_SPACE     57
 #define KEY_DOT       52
 #define KEY_MINUS     12
@@ -1097,6 +1150,19 @@ NO_SSP static void on_click(int mx, int my)
         if (in_rect(mx, my, BTN_FWD_X, NAVBTN_Y, NAVBTN_W, NAVBTN_H)) { hist_forward(); return; }
         if (in_rect(mx, my, BTN_UP_X, NAVBTN_Y, NAVBTN_W, NAVBTN_H))  { go_up(); return; }
         if (in_rect(mx, my, NEWF_X, NEWF_Y, NEWF_W, NEWF_H))          { new_folder(); return; }
+        return;
+    }
+
+    /* Address bar breadcrumb clicks. */
+    if (my >= TOOLBAR_H && my < TOOLBAR_H + ADDR_H) {
+        if (g_renaming) commit_rename();
+        for (int bi = 0; bi < g_bread_n; bi++) {
+            if (mx >= g_bread_x[bi] && mx < g_bread_x[bi] + g_bread_w[bi] &&
+                my >= g_bread_y - 2 && my < g_bread_y + FONT_H + 2) {
+                navigate(g_bread_path[bi]);
+                return;
+            }
+        }
         return;
     }
 
@@ -1166,6 +1232,18 @@ NO_SSP static void on_key(int kc, int pressed, int *shift)
         case KEY_F2:
             if (g_sel >= 0) { g_renaming = 1; s_cpy(g_renbuf, g_ent[g_sel].name, NAMELEN); g_renlen = (int)s_len(g_renbuf); g_dirty = 1; }
             break;
+        case KEY_DELETE:
+            /* Delete the selected file (not directories -- too dangerous without
+             * recursive rmdir, and SYS_UNLINK only handles files). */
+            if (g_sel >= 0 && g_ent[g_sel].type != DT_DIR) {
+                s_zero(g_pathbuf, PATHLEN);
+                path_join(g_pathbuf, PATHLEN, g_cwd, g_ent[g_sel].name);
+                sc(SYS_UNLINK, (long)g_pathbuf, 0, 0);
+                g_sel = -1;
+                do_scan(g_cwd);
+                g_dirty = 1;
+            }
+            break;
         case 105: /* left arrow */ if (g_sel > 0) { g_sel--; ensure_visible(g_sel); g_dirty = 1; } break;
         case 106: /* right arrow */ if (g_sel < g_nent - 1) { g_sel++; ensure_visible(g_sel); g_dirty = 1; } break;
         case 103: /* up arrow */ { int c = grid_cols(); if (g_sel - c >= 0) { g_sel -= c; ensure_visible(g_sel); g_dirty = 1; } } break;
@@ -1177,7 +1255,11 @@ NO_SSP static void on_key(int kc, int pressed, int *shift)
 /* ----------------------------------------------------------------------- */
 /* Entry point                                                             */
 /* ----------------------------------------------------------------------- */
-NO_SSP void _start(void)
+/* crt0-linked: the kernel lays out argc/argv and crt0 calls main(argc, argv).
+ * argv[1], when present, is the directory to open (e.g. the compositor passes
+ * "/Desktop/<folder>" when a desktop folder icon is double-clicked). With no
+ * argument we start at "/". */
+NO_SSP int main(int argc, char **argv)
 {
     serial("[FILES] Windows 11 explorer starting\n");
 
@@ -1190,8 +1272,9 @@ NO_SSP void _start(void)
     FBH = (int)g_win->h;
     FBS = (int)(g_win->stride / 4);
 
-    s_cpy(g_cwd, "/", PATHLEN);
-    navigate("/");
+    const char *start = (argc > 1 && argv[1] && argv[1][0]) ? argv[1] : "/";
+    s_cpy(g_cwd, start, PATHLEN);
+    navigate(start);
 
     int prev_btn = 0;
     int shift = 0;

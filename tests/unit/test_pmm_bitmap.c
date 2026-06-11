@@ -427,7 +427,7 @@ void _start(void) {
     _puts("=== PMM Bitmap + Contiguous Allocator Unit Tests ===\n");
 
     /* Try to allocate arena at a fixed address that fits inside the bitmap
-     * (needs to be < BITMAP_TOTAL_PAGES * PAGE_SIZE = 4 GB).
+     * (needs to be < BITMAP_TOTAL_PAGES * PAGE_SIZE = 16 GB).
      * We try 0x1000000 (16 MB) for 16 MB of arena = PFNs 0x1000..0x4FFF.
      */
     unsigned long arena_size = 16UL * 1024 * 1024;  /* 16 MB */
@@ -447,7 +447,7 @@ void _start(void) {
 
     if (arena_pfn + 4096 > BITMAP_TOTAL_PAGES) {
         _puts("SKIP: arena PFNs outside bitmap range, cannot run arena tests\n");
-        _puts("  (need arena at phys < 4 GB; MAP_FIXED_NOREPLACE refused)\n");
+        _puts("  (need arena at phys < 16 GB; MAP_FIXED_NOREPLACE refused)\n");
         /* Still run bitmap-only tests */
         test_bitmap_helpers();
         _puts("\n=== Results: ");

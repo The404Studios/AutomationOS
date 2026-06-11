@@ -154,7 +154,7 @@ typedef struct {
     u64 free_mem;
     u64 uptime_ms;
     u32 proc_count;
-    u32 _pad;
+    u32 heap_used_kb;  /* kernel heap usage in KiB */
 } sysinfo_t;
 
 /* -------------------------------------------------------------------------
@@ -309,9 +309,11 @@ static sysinfo_t baseline;             /* sampled when test starts      */
 static i64   baseline_valid  = 0;
 static i64   last_free_mem   = 0;
 static i32   last_proc_count = 0;
+static i32   last_heap_kb    = 0;      /* last sampled heap usage (KiB) */
 static i64   leak_cycles     = 0;      /* sampling counter              */
 static i64   warn_mem        = 0;      /* 1 = potential memory leak     */
 static i64   warn_proc       = 0;      /* 1 = potential proc leak       */
+static i64   warn_heap       = 0;      /* 1 = potential heap leak       */
 
 /* General cycle counter. */
 static i64   cycle = 0;
@@ -493,6 +495,7 @@ static void update_leak_watch(void)
 
     last_free_mem   = (i64)si.free_mem;
     last_proc_count = (i32)si.proc_count;
+    last_heap_kb    = (i32)si.heap_used_kb;
 
     if (!baseline_valid) return;
 
@@ -504,6 +507,13 @@ static void update_leak_watch(void)
     warn_mem  = (mem_delta  > (i64)LEAK_MEM_THRESH)  ? 1 : 0;
     /* Process leak: more procs than at baseline (accounting for sr_pid). */
     warn_proc = (proc_delta > LEAK_PROC_THRESH) ? 1 : 0;
+
+    /* Heap leak: if heap usage grew by more than 512 KiB over baseline,
+     * something is probably leaking kernel allocations. */
+    if (si.heap_used_kb > 0 && baseline.heap_used_kb > 0) {
+        i32 heap_delta = (i32)si.heap_used_kb - (i32)baseline.heap_used_kb;
+        warn_heap = (heap_delta > 512) ? 1 : 0;
+    }
 }
 
 /* -------------------------------------------------------------------------
@@ -532,9 +542,9 @@ static void stress_tick(void)
         sysinfo_t si;
         sc(SYS_SYSINFO, (i64)&si, 0, 0);
 
-        char buf[128];
+        char buf[192];
         char *p = buf, *e = buf + sizeof(buf);
-        char n1[24], n2[24], n3[24], n4[24], n5[24];
+        char n1[24], n2[24], n3[24], n4[24], n5[24], n6[24];
         p = append(p, "[STRESS] cycle=",      e);
         p = append(p, itoa(cycle, n1, 24),    e);
         p = append(p, " spawns=",             e);
@@ -545,6 +555,8 @@ static void stress_tick(void)
         p = append(p, itoa((i64)si.free_mem, n4, 24), e);
         p = append(p, " proc=",               e);
         p = append(p, itoa((i64)si.proc_count, n5, 24), e);
+        p = append(p, " heap_kb=",            e);
+        p = append(p, itoa((i64)si.heap_used_kb, n6, 24), e);
         p = append(p, "\n",                   e);
         print(buf);
     }
@@ -580,6 +592,12 @@ static void render(wl_window *win, i32 mx, i32 my,
     u32  bh   = win->h;
     u32  spx  = win->stride / 4u;
     char tmp1[32], tmp2[32];
+
+    /* Report area height derived from the LIVE window height so the panel
+     * reflows on resize/maximize instead of using the fixed-size constant.
+     * Clamp to >=0 in case a very short window puts REPORT_Y past the bottom. */
+    i32 report_h = (i32)bh - REPORT_Y;
+    if (report_h < 0) report_h = 0;
 
     /* ---- Background ---- */
     fill_rect(buf, bw, bh, spx, 0, 0, (i32)bw, (i32)bh, C_BG);
@@ -625,7 +643,7 @@ static void render(wl_window *win, i32 mx, i32 my,
                               "+", C_BTN_HOVER, mx, my);
 
     /* ---- Report panel ---- */
-    fill_rect(buf, bw, bh, spx, 0, REPORT_Y, (i32)bw, REPORT_H, C_PANEL);
+    fill_rect(buf, bw, bh, spx, 0, REPORT_Y, (i32)bw, report_h, C_PANEL);
 
     /* Two-column layout: left = counters, right = leak watch. */
     i32 col2 = (i32)bw / 2 + 8;
@@ -684,7 +702,7 @@ static void render(wl_window *win, i32 mx, i32 my,
     i32 ry2  = REPORT_Y + 10;
 
     /* Vertical divider. */
-    fill_rect(buf, bw, bh, spx, col2 - 4, REPORT_Y, 1, REPORT_H, C_SEP);
+    fill_rect(buf, bw, bh, spx, col2 - 4, REPORT_Y, 1, report_h, C_SEP);
 
     draw_text(buf, spx, bw, bh, col2, ry2, "LEAK WATCH", C_ACCENT);
     ry2 += lh;
@@ -725,12 +743,23 @@ static void render(wl_window *win, i32 mx, i32 my,
                   fmt_i64((i64)proc_delta, tmp1, 32), pd_col);
         ry2 += lh;
 
+        /* Heap usage (new: shows kernel heap KiB from SYS_SYSINFO). */
+        if (si.heap_used_kb > 0) {
+            draw_text(buf, spx, bw, bh, col2, ry2, "Heap delta:", C_TEXT_DIM);
+            ry2 += lh;
+            i32 heap_delta = (i32)si.heap_used_kb - (i32)baseline.heap_used_kb;
+            u32 hd_col = (heap_delta > 512) ? C_WARN : C_PASS;
+            draw_text(buf, spx, bw, bh, col2 + 8, ry2,
+                      fmt_i64((i64)heap_delta, tmp1, 32), hd_col);
+            ry2 += lh;
+        }
+
         /* Overall status badge. */
         ry2 += 6;
         hline(buf, bw, bh, spx, col2, ry2, (i32)bw - col2 - 8, C_SEP);
         ry2 += 8;
 
-        int any_warn = warn_mem || warn_proc;
+        int any_warn = warn_mem || warn_proc || warn_heap;
         u32 badge_col  = any_warn ? C_WARN : C_PASS;
         const char *badge_str = any_warn ? "STATUS: WARNING" : "STATUS: PASS";
         draw_text(buf, spx, bw, bh, col2, ry2, badge_str, badge_col);
@@ -744,6 +773,11 @@ static void render(wl_window *win, i32 mx, i32 my,
         if (warn_proc) {
             draw_text(buf, spx, bw, bh, col2 + 8, ry2,
                       "! PROC LEAK SUSPECTED", C_ERR);
+            ry2 += lh;
+        }
+        if (warn_heap) {
+            draw_text(buf, spx, bw, bh, col2 + 8, ry2,
+                      "! HEAP LEAK SUSPECTED", C_ERR);
         }
     } else {
         draw_text(buf, spx, bw, bh, col2, ry2,
@@ -825,6 +859,7 @@ void _start(void)
                         baseline_valid = 1;
                         warn_mem  = 0;
                         warn_proc = 0;
+                        warn_heap = 0;
                         cycle     = 0;
                         running   = 1;
                         print("[STRESS] test started\n");

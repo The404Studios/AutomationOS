@@ -49,13 +49,14 @@ typedef unsigned long long u64;
 #define FD_STDOUT    1
 
 /* -----------------------------------------------------------------------
- * sysinfo_t -- byte-for-byte mirror of userspace/lib/aictl/aictl.h.
+ * sysinfo_t -- byte-for-byte mirror of kernel/include/procapi.h (32 bytes).
  * --------------------------------------------------------------------- */
 typedef struct {
     u64 total_mem;   /* total physical memory in bytes */
     u64 free_mem;    /* free physical memory in bytes  */
     u64 uptime_ms;   /* milliseconds since boot        */
     u32 proc_count;  /* total live processes           */
+    u32 _pad;        /* reserved, always 0             */
 } sysinfo_t;
 
 /* -----------------------------------------------------------------------

@@ -7,6 +7,37 @@
 
 #define KERNEL_STACK_SIZE 8192
 
+// ---------------------------------------------------------------------------
+// Kernel-stack canary -- detect stack overflow / corruption before it causes
+// a silent GPF or data corruption during context switch or timer IRQ.
+//
+// STACK_CANARY_PLANT(proc) writes the sentinel at the BOTTOM of the process's
+// kernel stack (the first 8 bytes, which are the last to be overwritten on
+// overflow). STACK_CANARY_CHECK(proc) verifies it; on mismatch it prints a
+// diagnostic and kernel_panic()s before the corrupted stack can cause a
+// harder-to-debug crash. Called from process_create/thread_create (plant) and
+// context_switch / timer_handler (check).
+// ---------------------------------------------------------------------------
+#define STACK_CANARY_VALUE  0xDEAD57AC0CA4A47FULL  /* "DEAD STACK CANARY" */
+
+#define STACK_CANARY_PLANT(proc) do {                                      \
+    if ((proc) && (proc)->kernel_stack) {                                   \
+        *(volatile uint64_t*)((proc)->kernel_stack) = STACK_CANARY_VALUE;   \
+    }                                                                       \
+} while (0)
+
+#define STACK_CANARY_CHECK(proc) do {                                      \
+    if ((proc) && (proc)->kernel_stack &&                                   \
+        *(volatile uint64_t*)((proc)->kernel_stack) != STACK_CANARY_VALUE) {\
+        kprintf("[CANARY] STACK OVERFLOW detected in '%s' (PID %u) "       \
+                "canary=0x%016llx expected=0x%016llx\n",                    \
+                (proc)->name, (proc)->pid,                                  \
+                (unsigned long long)*(volatile uint64_t*)(proc)->kernel_stack,\
+                (unsigned long long)STACK_CANARY_VALUE);                     \
+        kernel_panic("kernel stack canary corrupted");                      \
+    }                                                                       \
+} while (0)
+
 // O(1) Scheduler constants
 #define SCHED_PRIORITY_LEVELS 140  // 140 priority queues (0-139, Linux O(1) pattern)
 #define SCHED_BITMAP_WORDS 3       // ceil(140/64) = 3 uint64_t words for bitmap
@@ -26,6 +57,47 @@ typedef enum {
     PROCESS_BLOCKED,
     PROCESS_TERMINATED
 } process_state_t;
+
+// F3-2: sentinel for process_t.pinned_cpu meaning "not pinned to any CPU". Defined
+// here (NOT smp.h) because sched.h declares pinned_cpu and is included by every PCB
+// construction site, whereas scheduler.c/process.c do NOT include smp.h. UINT32_MAX
+// comes from types.h. Distinct NAME from ownership.h's OWN_CPU_NONE (no collision;
+// the numeric coincidence at 0xFFFFFFFF is harmless). #ifndef-guarded defensively.
+#ifndef CPU_NONE
+#define CPU_NONE  UINT32_MAX   /* pinned_cpu sentinel: task is NOT pinned */
+
+// ===========================================================================
+// SMP-PROFILE-0: the typed scheduling intent (docs/SCHEDULER_POLICY_LAYER.md).
+// ===========================================================================
+// sched_class_t: WHAT a task is, declared as data instead of inferred from
+// hand placements. PROFILE-0 lands the TYPES and the reads; no class changes
+// behavior yet (NORMAL and BATCH both route home CPU0; PINNED_RT's pin was
+// already honored via pinned_cpu). The ordering is deliberate:
+//   - NORMAL = 0 so a memset-zeroed PCB defaults correctly (the F3-2 lesson).
+//   - INTERACTIVE / RECOVERY are RESERVED for laws 4/6 (latency protection,
+//     recovery-outranks-normal); declared now so the enum never reshuffles.
+typedef enum {
+    SCHED_CLASS_NORMAL      = 0,   // default; home CPU0
+    SCHED_CLASS_BATCH       = 1,   // PROFILE-0: data only -- routes home like
+                                   // NORMAL until F3-7 lights layer 3
+    SCHED_CLASS_PINNED_RT   = 2,   // explicitly pinned worker (cpu1hello, the
+                                   // F2 kthread); the pin is the law-2 input
+    SCHED_CLASS_INTERACTIVE = 3,   // RESERVED (law 4) -- no consumer yet
+    SCHED_CLASS_RECOVERY    = 4,   // RESERVED (law 6) -- no consumer yet
+} sched_class_t;
+
+// cpu_role_t: WHAT a CPU is for (the other half of layer 2's class x role).
+typedef enum {
+    CPU_ROLE_GENERAL       = 0,    // CPU0: desktop, syscalls, everything
+    CPU_ROLE_PINNED_WORKER = 1,    // CPU1: explicitly placed workloads only
+} cpu_role_t;
+
+// The per-task profile embedded in process_t (gated, end-of-struct). Loose
+// F3-2 fields (allowed_cpus/pinned_cpu) are NOT relocated in PROFILE-0.
+typedef struct {
+    sched_class_t sched_class;     // memset(0) == SCHED_CLASS_NORMAL
+} sched_profile_t;
+#endif
 
 // ---------------------------------------------------------------------------
 // wait_object_t — the single blocking primitive (engine in waitqueue.c).
@@ -175,6 +247,15 @@ typedef struct process {
     // avoid a circular include of vfs.h from sched.h.
     struct vfs_file* fd_table[1024 /* == VFS_MAX_FDS */];
 
+    // CHANNEL-0: capability handle table (shared-ring channels). Handle is a
+    // process-local index (1..CH_MAX_HANDLES-1; 0 = "none") -> {channel, end
+    // (master/slave), rights}. Zeroed by the memset in process_create /
+    // thread_create. stdio_chan[fd] = the handle bound to fd0/1/2 (0 = unbound
+    // -> serial/ps2 as before). Cleaned up by channel_cleanup_process() at
+    // teardown. After the CPU context, so appending here is layout-safe.
+    struct { void* ch; uint8_t end; uint32_t rights; } ch_handles[32 /* == CH_MAX_HANDLES */];
+    uint8_t stdio_chan[3];
+
     // Blocking waitpid(): a parent with no terminated child sleeps on this queue;
     // a child's sys_exit() wakes it. Pointer (lazily kmalloc'd on first wait) so
     // process_t need not see the full wait_queue_t definition (which appears
@@ -266,6 +347,124 @@ typedef struct process {
     // also fine (wo_ensure_init lazily inits a zeroed object).
     int thread_retval;
     wait_object_t thread_join_wo;
+
+    // Per-process shared memory attachment list. Each successful shmat() adds a
+    // shm_attachment_t node to this singly-linked list; shmdt() removes it. On
+    // process teardown shm_cleanup_process() walks this list instead of scanning
+    // the entire global shm_attaches[] array, making cleanup O(n) where n is the
+    // number of attachments THIS process holds (typically 1-5) instead of O(128).
+    // Appended at the END to keep the assembler's hardcoded context offset valid.
+    struct shm_attachment* shm_attachments;
+
+    // Reap-claim flag (#9 zombie-leak fix). 0 = the zombie's CREATION ref has not
+    // yet been claimed; a single reaper transitions it 0->1 via __atomic_exchange_n
+    // and ONLY that winner releases the creation ref (reap_claim_release). Lets the
+    // waitpid table-scan, a targeted thread_join, and init all observe the same
+    // zombie while exactly one releases the creation ref (no double-free). memset-
+    // zeroed by process_create()/thread_create(). Appended at the END to keep the
+    // assembler's hardcoded PROCESS_CONTEXT_OFFSET (16) valid.
+    volatile int reaped;
+
+    // Stable process identity (#10 wrong-wake-on-PID-reuse fix). PIDs are recycled
+    // from the bitmap on death, so pid ALONE is not a stable identity: a recycled
+    // PID can make an unrelated new process impersonate a dead parent/child. INVARIANT:
+    // identity == (pid, create_seq). create_seq is a monotonic stamp assigned under
+    // process_table_lock at create; parent_seq snapshots the CREATOR's create_seq so a
+    // child carries its real parent's identity. A reaper/wake validates
+    // parent->create_seq == child->parent_seq before acting, so a recycled PID can
+    // never be mistaken for the original. Reparent-to-init rewrites BOTH parent_pid=1
+    // and parent_seq=<init's create_seq> so the check holds uniformly for orphans.
+    // memset-zeroed by process_create()/thread_create(); appended at the END to keep
+    // the assembler's hardcoded PROCESS_CONTEXT_OFFSET (16) valid.
+    uint64_t create_seq;
+    uint64_t parent_seq;
+
+    // Futex wait key (FUTEX-B wrong-waiter-wake fix). When this process is parked in
+    // futex_wait, this holds the PHYSICAL address of the futex word it is waiting on;
+    // otherwise 0. futex_wake walks the hash bucket's waiter list and re-readies only
+    // waiters whose futex_key matches the woken address, so two distinct futex words
+    // that hash-collide into one bucket no longer wake each other. Set in futex_wait
+    // before the waiter is linked, cleared on resume. memset-zeroed by
+    // process_create()/thread_create(); appended at the END to keep the assembler's
+    // hardcoded PROCESS_CONTEXT_OFFSET (16) valid. Non-futex waiters keep it 0, so a
+    // (nonzero) futex key never matches them.
+    uint64_t futex_key;
+
+    // Join target (#48 killed-while-blocked join-ref leak fix). While this thread is
+    // blocked in sys_thread_join, it holds a process_get_by_pid(+1) reference on the
+    // thread it is joining; join_target points at that target (else NULL). If the
+    // joiner is KILLED while blocked, its sys_thread_join cleanup never runs (its stack
+    // never resumes), so that reference would leak and the target would become an
+    // unreapable zombie. process_destroy() releases join_target at reap to plug that.
+    // A normally-completed join clears join_target before reaping its target, so it is
+    // NULL for every non-joining process. memset-zeroed by process_create()/
+    // thread_create(); appended at the END to preserve the assembler's hardcoded
+    // PROCESS_CONTEXT_OFFSET (16).
+    struct process* join_target;
+
+    // Per-CPU runqueue membership (F3-1 per-CPU rq_lock). Records WHICH cpu's
+    // runqueue this task is currently linked on. VALID iff on_queue==1; left STALE
+    // when on_queue==0 (exactly like wait_on/futex_key -- readers MUST gate on
+    // on_queue first). Set inside the SAME rq_lock critical section that sets
+    // on_queue=1 and calls runqueue_enqueue, so (on_queue, queued_cpu, physical
+    // link) are always mutually consistent under that cpu's rq_lock. Lets the
+    // F3-0 validators turn "task X is on cpu C's runqueue" into a checkable
+    // invariant (membership must land on cpus[queued_cpu] and on NO OTHER cpu --
+    // the cross-cpu double-enqueue race signature). At N=1 it is always 0 (cpu0).
+    // memset-zeroed by process_create()/thread_create(); appended at the END to
+    // preserve the assembler's hardcoded PROCESS_CONTEXT_OFFSET (16).
+    uint32_t queued_cpu;
+
+    // CPU affinity model (F3-2). allowed_cpus is a bitmask: bit N set => this task MAY
+    // be enqueued on CPU N. pinned_cpu, when != CPU_NONE, REQUIRES the task run only on
+    // that CPU (the invariant allowed_cpus == (1ULL<<pinned_cpu) is expected). F3-2
+    // policy: normal tasks get allowed_cpus = (1ULL<<0) (CPU0-only) + pinned_cpu =
+    // CPU_NONE; the lone CPU1 test kthread gets allowed_cpus = (1ULL<<1), pinned_cpu = 1.
+    // Stored as a plain uint64_t (NOT cpumask_t) so sched.h need not include smp.h, and
+    // scheduler.c tests it with raw bit ops (it deliberately avoids including smp.h).
+    // THE TRAP: memset(proc,0) leaves allowed_cpus=0 (== allowed on NO cpu -> the
+    // validator trips for EVERY task) and pinned_cpu=0 (== pinned to CPU0, NOT the
+    // unpinned sentinel). So EVERY PCB construction site MUST set BOTH explicitly after
+    // its memset (process_create covers every ctor that funnels through it; thread_create
+    // sets its own). Appended at the END to preserve PROCESS_CONTEXT_OFFSET (16). NOTE:
+    // a uint64 mask addresses cpu0..63 while MAX_CPUS=256 -- irrelevant for F3-2 (cpu0/1),
+    // documented for a future >cpu63 brick.
+    uint64_t allowed_cpus;
+    uint32_t pinned_cpu;   // CPU_NONE if not pinned
+
+    // SIGSTOP/SIGCONT discipline: SIGCONT must only resume a process that was
+    // stopped by SIGSTOP, NOT an arbitrary BLOCKED process (e.g. one sleeping
+    // in sys_sleep or waiting on a futex). SIGSTOP sets stopped_by_signal = 1;
+    // SIGCONT checks it and only resumes if set. Cleared on resume. Without
+    // this, sending SIGCONT to any BLOCKED process would incorrectly wake it.
+    // memset-zeroed by process_create()/thread_create().
+    int stopped_by_signal;
+
+#if defined(SMP_SCHED) && defined(SMP_SCHED_DISPATCH)
+    // SMP-PROFILE-0: the typed scheduling intent (SCHEDULER_POLICY_LAYER's
+    // sched_profile_t row). AT THE END of the struct (the F3-1 new-field law)
+    // and GATED so non-dispatch builds keep a byte-identical process_t layout.
+    // memset(0) => sched_class == SCHED_CLASS_NORMAL, DELIBERATELY (the F3-2
+    // memset-trap lesson: the zero default must be the correct default).
+    // PROFILE-0 is data + observation only: choose_cpu reads the class but
+    // NORMAL and BATCH both still route home CPU0; nothing migrates. The
+    // F3-2 loose fields (allowed_cpus/pinned_cpu above) deliberately STAY
+    // loose this brick -- relocating them into p->sched touches every ctor/
+    // validator/seam site and is its own future checkpoint.
+    sched_profile_t sched;
+
+#ifdef SMP_RUNMASK
+    // SMP-RUNMASK-0: which CPUs this task ACTUALLY ran on -- bit N set the
+    // first time cpu_set_current_thread() dispatches it on CPU N. The TRUE
+    // pin-model invariant is audited on THIS (per-CR3 aggregated), not on
+    // the declared allowed_cpus mask: a multi-mask task that only ever runs
+    // on one CPU is fine (batchdemo); the same address space EXECUTING on
+    // two CPUs is the real TLB hazard. memset(0) == "never ran" (correct).
+    // Gated separately from p->sched so every pre-RUNMASK profile keeps a
+    // byte-identical process_t layout.
+    uint32_t ran_on_cpus;
+#endif
+#endif
 } process_t;
 
 // Global pointer to current process (for PE loader and other subsystems)
@@ -273,8 +472,20 @@ extern process_t* current_process;
 
 // Process table management
 void process_init(void);
+void process_cleanup(void);  // Teardown counterpart: terminate all live processes
 process_t* process_create(const char* name, void* entry_point);
+void process_adopt_pid0(process_t* proc);   // re-home a process onto reserved PID 0 (idle thread)
 void process_destroy(process_t* proc);
+
+// Release the CREATION reference of a terminated process EXACTLY ONCE, even when
+// several reapers (a waitpid table-scan, a targeted thread_join, init) race on the
+// same zombie. Uses a CAS (__atomic_exchange_n) on proc->reaped: only the reaper
+// that transitions reaped 0->1 drops the creation ref; losers no-op. Does NOT
+// touch any get_by_pid reference -- the caller still drops its own ref afterwards
+// (via process_destroy() or process_unref()). Call this IMMEDIATELY BEFORE
+// process_destroy(zombie) at a reaper site, or before the final process_unref() in
+// process_cleanup(). [#9 zombie/PID leak]
+void reap_claim_release(process_t* proc);
 
 // ----------------------------------------------------------------------------
 // Threads (kernel/core/sched/process.c)
@@ -298,8 +509,44 @@ void process_ref(process_t* proc);      // Increment reference count
 void process_unref(process_t* proc);    // Decrement reference count (frees if 0)
 void process_on_terminate(process_t* child);  // wake parent's waitpid + drain own wait queue
 process_t* process_get_by_pid(uint32_t pid);
-process_t* process_get_current(void);
+process_t* process_get_by_name(const char* needle);  // Find first live process by name substring (ref'd)
+
+// SMP-F3-6: THE placement seam (docs/SCHEDULER_POLICY_LAYER.md). Answers
+// "which CPU should this task run on?" -- hard legality, then pin/role, then
+// the home-CPU0 stub (no balancing until F3-7). ADVISORY: the mandatory F3-2
+// enqueue gate in scheduler_add_process_to_cpu stays the backstop. Defined
+// only under SMP_SCHED && SMP_SCHED_DISPATCH (the only builds where placement
+// has more than one answer).
+uint32_t scheduler_choose_cpu(process_t* p);
+void scheduler_choosecpu_selftest(void);
+
+// SMP-PROFILE-0: THE named placement funnel (the policy doc's submit-task
+// pipeline): legal mask -> scheduler_choose_cpu -> legality re-assert (policy
+// cannot escape legality) -> scheduler_add_process_to_cpu (the proven, gated
+// enqueue sink). Returns the CPU the task was placed on. Every placement that
+// used choose_cpu directly now goes through here -- one NAMED funnel.
+uint32_t scheduler_submit_task(process_t* p);
+void scheduler_profile_selftest(void);
+cpu_role_t scheduler_cpu_role(uint32_t cpu);
+// Inlined: process_get_current is on the syscall dispatch hot path (called for
+// every SYS_GETPID, SYS_YIELD, and the table-lookup fallback). A cross-TU
+// function call costs ~5 cycles; inlining a global-load is a single MOV.
+//
+// F3-4 (adapted to this inline): THE LAW -- "current" is CPU-LOCAL. Under
+// SMP_SCHED_DISPATCH (the only build where CPU1 can RUN a task) the resolver
+// routes via cpus[cpu_id()].current_thread so a syscall/exit on the AP
+// operates on CPU1's actual task, NOT the global current_process (which still
+// names CPU0's). Default/SMP_FOUNDATION builds keep the single-MOV global
+// load: cpu_id()==0 always there and process_set_current() holds the per-cpu
+// slot in lockstep -- same value, cheaper path, default build byte-identical.
+#ifdef SMP_SCHED_DISPATCH
+process_t* cpu_get_current_thread(void);   /* fwd (also declared below) */
+static inline process_t* process_get_current(void) { return cpu_get_current_thread(); }
+#else
+static inline process_t* process_get_current(void) { return current_process; }
+#endif
 void process_set_current(process_t* proc);
+int process_set_ready(process_t* proc); // Validated CREATED/BLOCKED->READY transition (ret 0=OK, -1=rejected)
 
 // Userspace-facing process snapshot record (SYS_PROCLIST ABI). MUST stay 64 bytes.
 // The first 48 bytes are the original layout (pid/parent_pid/state/flags/name) so
@@ -326,8 +573,27 @@ int process_list(proc_info_t* out, int max);
 // during the critical section of a context switch (GPF-001 fix)
 extern volatile int scheduler_in_switch;
 
+// SMP foundation brick 4: keep the per-CPU cpu_t.current_thread field (in
+// scheduler.c's cpus[cpu_id()]) in lockstep with the shared current_process
+// global. Called from process_set_current() -- the single dispatch chokepoint.
+// At CPU count == 1 (cpu_id()==0) this is a non-observable extra store into
+// cpus[0]; it exists so bricks 5+ can read this_cpu()->current_thread directly.
+void cpu_set_current_thread(process_t* proc);
+// F3-4: the inverse resolver -- this_cpu()->current_thread (per-CPU "current").
+process_t* cpu_get_current_thread(void);
+// F3-5: HOME-ROUTED wake enqueue -- the woken task goes to ITS cpu (pin, else
+// CPU0), never the WAKER's. The wake-side replacement for scheduler_add_process
+// (which is this_cpu()-based and cross-CPU-unsafe from the AP).
+void scheduler_add_process_home(process_t* proc);
+#if defined(SMP_SCHED) && defined(SMP_SCHED_DISPATCH)
+// F3-5: the AP-safe cooperative scheduler (yield + the dying path) -- exposed
+// for the CPU1 syscall routing in schedule()/sys_yield and the F2 kthread.
+void ap_cooperative_schedule(void);
+#endif
+
 // Scheduler
 void scheduler_init(void);
+void scheduler_shutdown(void);  // Teardown: drain runqueues, release locks, clear sleep list
 void scheduler_add_process(process_t* proc);
 // Cooperative-yield re-queue with priority weighting. Use INSTEAD of
 // scheduler_add_process() from sys_yield(): a process with above-normal priority
@@ -340,7 +606,26 @@ void scheduler_yield_requeue(process_t* proc);
 void scheduler_remove_process(process_t* proc);
 void schedule(void);  // Scheduler tick - called from timer interrupt
 process_t* scheduler_pick_next(void);
+process_t* scheduler_idle_thread(void);   // the per-CPU idle fallback (NOT a queued process)
 void scheduler_start(void) NORETURN;  // Start scheduler (does not return)
+
+#ifdef SMP_SCHED
+// SMP scheduler Brick D: populate a secondary CPU's per-CPU slot (runqueues +
+// idle thread + online). Call on the BSP AFTER /sbin/init has PID 1. Returns 1 ok.
+int scheduler_init_secondary_cpu(uint32_t cpu, uint32_t apic_id);
+// Brick F: enqueue `proc` onto a SPECIFIC CPU's runqueue (cross-CPU affinity pin).
+void scheduler_add_process_to_cpu(process_t* proc, uint32_t cpu);
+#endif
+
+#if defined(SMP_SCHED) && defined(SMP_SCHED_DISPATCH)
+// SMP scheduler Brick F: the AP-safe dispatcher for CPU1 (scheduler mode). NEVER
+// touches the global current_process; NEVER does a PIC EOI. See scheduler.c.
+void ap_scheduler_loop(void) NORETURN;            // CPU1's top-level scheduler loop
+void ap_cooperative_schedule(void);               // CPU1 voluntary yield/idle check
+void ap_schedule_from_irq(interrupt_frame_t* frame); // CPU1 LAPIC-timer preemption
+void ap_spawn_test_kthread(void);                 // F2: pin one kernel thread to CPU1
+void context_prime_fpu(process_t* to);            // F3 fix D6: AP-safe FPU prime (context.c)
+#endif
 
 // Cooperative dispatch helper (scheduler.c). A cooperative resume site
 // (sys_yield / schedule / wq_block_current, all in ring 0 inside a syscall)
@@ -379,6 +664,18 @@ void sleep_list_wake_due(uint64_t now);
 void scheduler_tick(void);                                    // Called on timer tick for load balancing
 void scheduler_get_load_stats(uint32_t* loads, uint32_t max_cpus);  // Get per-CPU load
 void scheduler_print_stats(void);                            // Print load balancing statistics
+
+// Per-CPU Statistics and Diagnostics (scheduler.c)
+// Forward declaration of cpu_stats_t (defined in scheduler.c)
+typedef struct cpu_stats cpu_stats_t;
+
+uint32_t scheduler_get_ready_count(uint32_t cpu_id);          // Get ready_count for specific CPU
+uint32_t scheduler_get_current_ready_count(void);             // Get ready_count for current CPU
+void scheduler_reset_ready_count(uint32_t cpu_id);            // Reset ready_count for specific CPU
+int scheduler_get_cpu_stats(uint32_t cpu_id, cpu_stats_t* out_stats);  // Get per-CPU stats
+void scheduler_reset_cpu_stats(uint32_t cpu_id);              // Reset stats for specific CPU
+void scheduler_reset_all_cpu_stats(void);                     // Reset stats for all CPUs
+int scheduler_validate_ready_count(uint32_t cpu_id);          // Validate ready_count integrity
 
 // Context switching
 void context_switch(process_t* from, process_t* to);
@@ -456,6 +753,17 @@ void wait_object_init(wait_object_t* wo);
 // (not a hard IRQ; interrupts enabled).
 int wait_object_block(wait_object_t* wo, uint64_t deadline_or_0);
 
+// FUTEX-A lost-wakeup fix: enqueue-and-recheck under wo->lock (the SAME lock the wake
+// path takes), as a two-step prepare/commit so the value test, the link, and the
+// BLOCKED store are atomic w.r.t. a concurrent futex_wake. wait_object_prepare_futex
+// returns 1 (current is now linked on wo, tagged with `key`, and BLOCKED -- caller MUST
+// then call wait_object_park_committed) or 0 (*uaddr != val: nothing linked, caller
+// returns EAGAIN). wait_object_park_committed deschedules an already-linked,
+// already-BLOCKED waiter and returns 1 if signal-woken. Futex-only; generic blockers
+// keep using wait_object_block.
+int wait_object_prepare_futex(wait_object_t* wo, int* uaddr, int val, uint64_t key);
+int wait_object_park_committed(wait_object_t* wo);
+
 // Wake the wait_object's waiters: wake_all==0 wakes exactly one (FIFO), nonzero
 // wakes all. Each woken waiter is unlinked, marked PROCESS_READY and handed to
 // scheduler_add_process(). Returns the number of processes woken.
@@ -463,6 +771,14 @@ int wait_object_signal(wait_object_t* wo, int wake_all);
 
 // Number of processes currently parked on wo.
 int wait_object_count(wait_object_t* wo);
+
+// Force-unlink `proc` from `wo` if it is currently linked there, dropping the
+// object's reference on it. Idempotent: a no-op (and NO unref) if proc was already
+// removed by a concurrent signal/timer. Used by the kill paths to reclaim the
+// object-ref of a process killed while BLOCKED on this wait_object, so the PCB
+// collapses to a reapable zombie instead of leaking. Returns 1 if it unlinked-and-
+// unref'd, else 0. [#9 kill-while-blocked leak]
+int wait_object_abort(wait_object_t* wo, process_t* proc);
 
 // ===========================================================================
 // Wait queues — thin compatibility wrapper over wait_object_t
@@ -489,6 +805,13 @@ void wq_block_current(wait_queue_t* wq);
 // Wake exactly one waiter (FIFO). Returns the woken process (ref NOT taken) or
 // NULL if the queue was empty.
 process_t* wq_wake_one(wait_queue_t* wq);
+
+// Wake exactly one waiter whose process_t.futex_key == key (FIFO among matchers),
+// skipping (leaving linked) non-matching waiters. Returns the woken process (ref NOT
+// taken) or NULL if no live matching waiter. Used by futex_wake so a hash-bucket
+// collision between two distinct futex addresses cannot wake the wrong waiter; the
+// unfiltered wq_wake_one is unchanged for waitpid/epoll. [FUTEX-B]
+process_t* wq_wake_one_key(wait_queue_t* wq, uint64_t key);
 
 // Wake all waiters. Returns the number of processes woken.
 int wq_wake_all(wait_queue_t* wq);

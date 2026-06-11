@@ -312,15 +312,24 @@ static u32 bench_syscall_ns(void)
 
 /* -------------------------------------------------------------------------
  * Drawing primitives.
+ *
+ * The fixed WIN_W x WIN_H layout is letterboxed inside whatever surface the
+ * compositor gives us. g_clip_w / g_clip_h hold the CURRENT effective clip
+ * bounds = min(layout extent, live win->{w,h}); every primitive clips to them
+ * so a SMALLER (resized) window can never write past the (re)mapped buffer,
+ * while a LARGER window simply leaves the extra margin painted with COL_BG.
+ * They are refreshed from win->{w,h} once per frame in _start before drawing.
  * ----------------------------------------------------------------------- */
+static i32 g_clip_w = WIN_W;
+static i32 g_clip_h = WIN_H;
 
 static void fill_rect(u32 *buf, u32 stride_px,
                       i32 x, i32 y, i32 w, i32 h, u32 color)
 {
     i32 x1 = x < 0 ? 0 : x;
     i32 y1 = y < 0 ? 0 : y;
-    i32 x2 = x + w; if (x2 > WIN_W) x2 = WIN_W;
-    i32 y2 = y + h; if (y2 > WIN_H) y2 = WIN_H;
+    i32 x2 = x + w; if (x2 > g_clip_w) x2 = g_clip_w;
+    i32 y2 = y + h; if (y2 > g_clip_h) y2 = g_clip_h;
     if (x1 >= x2 || y1 >= y2) return;
     for (i32 yy = y1; yy < y2; yy++) {
         u32 *row = buf + (u32)yy * stride_px;
@@ -347,8 +356,10 @@ static void draw_rect_border(u32 *buf, u32 stride_px,
 static int draw_str(u32 *buf, u32 stride_px, i32 x, i32 y,
                     const char *s, u32 color)
 {
+    /* Clip glyphs to the live surface (g_clip_*), not the fixed layout, so
+     * text never writes past a shrunken/reallocated buffer. */
     return font_draw_string((unsigned int *)buf, (int)stride_px,
-                            WIN_W, WIN_H, x, y, s, color);
+                            g_clip_w, g_clip_h, x, y, s, color);
 }
 
 /* -------------------------------------------------------------------------
@@ -573,6 +584,14 @@ void _start(void)
 
     u32 stride_px = win->stride / 4u;
 
+    /* The compositor may resize/maximize the window. We keep the fixed
+     * WIN_W x WIN_H benchmark layout (letterbox) and simply repaint the FULL
+     * new surface to COL_BG each frame so resized margins are never garbage.
+     * `need_clear` forces a full-surface clear on the next frame after a
+     * resize. The drawing primitives clip to min(WIN_*, win->*) so a SMALLER
+     * window can never write past the (possibly reallocated) buffer. */
+    int need_clear = 1;
+
     /* Benchmark results (start zeroed). */
     bench_results_t results = {0, 0, 0, 0, 0, 0};
 
@@ -587,8 +606,15 @@ void _start(void)
         /* Drain compositor events (pointer/key). */
         int kind, ea, eb, ec;
         while (wl_poll_event(win, &kind, &ea, &eb, &ec)) {
-            /* No interactive input needed for a benchmark; discard. */
-            (void)kind; (void)ea; (void)eb; (void)ec;
+            if (kind == WL_EVENT_RESIZE) {
+                /* Library already reallocated the buffer and updated
+                 * win->{w,h,stride,pixels}. Refresh our cached stride and
+                 * force a full-surface clear so the new margins are painted. */
+                stride_px  = win->stride / 4u;
+                need_clear = 1;
+            }
+            /* No other interactive input needed for a benchmark; discard. */
+            (void)ea; (void)eb; (void)ec;
         }
 
         /* Run benchmarks every ~5 seconds. */
@@ -619,6 +645,24 @@ void _start(void)
             results.fps = fps_frames;
             fps_frames  = 0;
             fps_window  = now;
+        }
+
+        /* Refresh clip bounds from the live window each frame: the fixed
+         * WIN_W x WIN_H layout is clamped to whatever surface we currently
+         * have so no primitive can write past win->{w,h} via stride_px. */
+        g_clip_w = (i32)win->w < WIN_W ? (i32)win->w : WIN_W;
+        g_clip_h = (i32)win->h < WIN_H ? (i32)win->h : WIN_H;
+
+        /* On (re)size, the new margins around the fixed layout are stale
+         * garbage; clear the ENTIRE surface to COL_BG once, bounded to the
+         * live win->{w,h} using the live stride. */
+        if (need_clear) {
+            for (u32 yy = 0; yy < win->h; yy++) {
+                u32 *row = win->pixels + (u64)yy * stride_px;
+                for (u32 xx = 0; xx < win->w; xx++)
+                    row[xx] = COL_BG;
+            }
+            need_clear = 0;
         }
 
         /* Render. */

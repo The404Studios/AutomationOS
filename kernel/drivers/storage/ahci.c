@@ -161,7 +161,7 @@ ahci_controller_t* ahci_probe_controller(pci_device_t* pci_dev) {
 
     uint64_t abar_phys = pci_get_bar(pci_dev, 5);
     if (!abar_phys) {
-        kprintf("[AHCI] BAR5 (ABAR) not present\n");
+        kprintf("[AHCI] BAR5 (ABAR) not present - controller initialization failed\n");
         kfree(controller);
         return NULL;
     }
@@ -206,7 +206,7 @@ bool ahci_init_controller(ahci_controller_t* controller) {
     // Reset HBA (GHC.HR self-clears when done).
     hba->ghc |= AHCI_GHC_HR;
     if (!ahci_wait_until((volatile uint32_t*)&hba->ghc, AHCI_GHC_HR, 0, AHCI_TIMEOUT_MS)) {
-        kprintf("[AHCI] HBA reset timeout\n");
+        kprintf("[AHCI] HBA reset timeout - controller may be unresponsive or disabled in BIOS\n");
         return false;
     }
 
@@ -216,7 +216,10 @@ bool ahci_init_controller(ahci_controller_t* controller) {
     // Bring up every implemented port; stop at the first usable SATA disk for
     // our single-device block model.
     for (uint8_t i = 0; i < AHCI_MAX_PORTS; i++) {
-        if (!(controller->ports_implemented & (1u << i))) continue;
+        if (!(controller->ports_implemented & (1u << i))) {
+            // Port not implemented in hardware - this is normal, skip silently
+            continue;
+        }
         if (ahci_init_port(controller, i)) {
             if (!g_blk_port && !controller->ports[i].is_atapi) {
                 g_blk_port = &controller->ports[i];
@@ -245,7 +248,7 @@ bool ahci_init_port(ahci_controller_t* controller, uint8_t port_num) {
 
     // Stop the command engine before reprogramming pointers.
     if (!ahci_port_stop_cmd(port)) {
-        kprintf("[AHCI] Port %u: stop cmd timeout\n", port_num);
+        kprintf("[AHCI] Port %u: Command engine stop timeout - controller may need reset\n", port_num);
         return false;
     }
 
@@ -254,7 +257,7 @@ bool ahci_init_port(ahci_controller_t* controller, uint8_t port_num) {
     port->rx_fis   = (ahci_rx_fis_t*)dma_alloc_page();       // 256B, page-aligned
     port->dma_bounce = dma_alloc_page();                     // 1 sector scratch
     if (!port->cmd_list || !port->rx_fis || !port->dma_bounce) {
-        kprintf("[AHCI] Port %u: DMA alloc failed\n", port_num);
+        kprintf("[AHCI] Port %u: DMA memory allocation failed - insufficient physical RAM\n", port_num);
         return false;
     }
 
@@ -262,7 +265,7 @@ bool ahci_init_port(ahci_controller_t* controller, uint8_t port_num) {
     for (int i = 0; i < AHCI_MAX_CMD_SLOTS; i++) {
         port->cmd_tables[i] = (ahci_cmd_table_t*)dma_alloc_page();
         if (!port->cmd_tables[i]) {
-            kprintf("[AHCI] Port %u: cmd table %d alloc failed\n", port_num, i);
+            kprintf("[AHCI] Port %u: Command table %d allocation failed - insufficient physical RAM\n", port_num, i);
             return false;
         }
     }
@@ -295,20 +298,20 @@ bool ahci_init_port(ahci_controller_t* controller, uint8_t port_num) {
     if (!ahci_wait_until((volatile uint32_t*)&port->regs->tfd,
                          AHCI_PORT_TFD_STS_BSY | AHCI_PORT_TFD_STS_DRQ, 0,
                          AHCI_SPINUP_TIMEOUT_MS)) {
-        kprintf("[AHCI] Port %u: device not ready (tfd=0x%08x)\n",
+        kprintf("[AHCI] Port %u: AHCI device timeout (tfd=0x%08x) - check SATA cable or BIOS settings\n",
                 port_num, port->regs->tfd);
         return false;
     }
 
     // Start the command engine.
     if (!ahci_port_start_cmd(port)) {
-        kprintf("[AHCI] Port %u: start cmd timeout\n", port_num);
+        kprintf("[AHCI] Port %u: Command engine start timeout - port initialization failed\n", port_num);
         return false;
     }
 
     if (!ahci_port_detect_device(port)) return false;
     if (!ahci_port_identify(port)) {
-        kprintf("[AHCI] Port %u: IDENTIFY failed\n", port_num);
+        kprintf("[AHCI] Port %u: Drive IDENTIFY command failed - verify drive is functional\n", port_num);
         return false;
     }
 
@@ -360,7 +363,7 @@ bool ahci_port_detect_device(ahci_port_t* port) {
             port->is_atapi = true;
             return true;
         default:
-            kprintf("[AHCI] Port %u: unsupported signature 0x%08x\n",
+            kprintf("[AHCI] Port %u: Unsupported device signature 0x%08x - not a standard SATA/ATAPI device\n",
                     port->port_num, sig);
             return false;
     }
@@ -400,13 +403,13 @@ bool ahci_port_wait_cmd(ahci_port_t* port, int slot, uint32_t timeout_ms) {
     uint32_t slot_mask = (1u << slot);
     if (!ahci_wait_until((volatile uint32_t*)&port->regs->ci,
                          slot_mask, 0, timeout_ms)) {
-        kprintf("[AHCI] Port %u: cmd timeout (slot %d, ci=0x%08x is=0x%08x tfd=0x%08x)\n",
+        kprintf("[AHCI] Port %u: Command timeout (slot %d, ci=0x%08x is=0x%08x tfd=0x%08x) - drive may be hung or cable faulty\n",
                 port->port_num, slot, port->regs->ci, port->regs->is, port->regs->tfd);
         return false;
     }
     if (port->regs->is & AHCI_PORT_INT_TFES) {
         uint32_t tfd = port->regs->tfd;
-        kprintf("[AHCI] Port %u: task file error (tfd=0x%08x)\n", port->port_num, tfd);
+        kprintf("[AHCI] Port %u: Task file error (tfd=0x%08x) - ATA command failed, check drive health\n", port->port_num, tfd);
         port->regs->is = AHCI_PORT_INT_TFES;
         port->error_count++;
         port->last_error = tfd;
@@ -476,7 +479,27 @@ bool ahci_port_identify(ahci_port_t* port) {
     } else {
         port->sectors = ((uint32_t)id[61] << 16) | id[60];
     }
+    /*
+     * Determine logical sector size.  Word 106 bit 12 indicates that
+     * words 117-118 contain a valid logical sector size (in 16-bit words).
+     * If the bit is clear (legacy drives, QEMU's default virtio-blk /
+     * AHCI emulation) the sector size is the traditional 512 bytes.
+     */
     port->sector_size = 512;
+    if ((id[106] & (1u << 12)) && !(id[106] & (1u << 15))) {
+        uint32_t words_per_sector = ((uint32_t)id[118] << 16) | id[117];
+        if (words_per_sector > 0 && words_per_sector <= 32768) {
+            port->sector_size = words_per_sector * 2;   /* 16-bit words -> bytes */
+        }
+    }
+    /* port->dma_bounce is a single page (dma_alloc_page); a device-reported
+     * logical sector larger than a page would overflow it in BOTH the per-sector
+     * bounce memcpy (ahci_read/write_sectors) and the PRDT DMA (dbc = ssz-1),
+     * giving a hostile/buggy drive an out-of-bounds write into kernel memory.
+     * Cap to the bounce size; real drives are 512 or 4096. */
+    if (port->sector_size > 4096) {
+        port->sector_size = 512;
+    }
 
     port->supports_ncq = (id[76] & (1 << 8)) &&
                          g_ahci_controller && g_ahci_controller->supports_ncq;
@@ -495,6 +518,8 @@ bool ahci_port_identify(ahci_port_t* port) {
 static bool ahci_rw_one(ahci_port_t* port, uint64_t lba, void* dma_buf, bool write) {
     int slot = ahci_port_alloc_slot(port);
     if (slot < 0) return false;
+
+    uint32_t ssz = port->sector_size ? port->sector_size : 512;
 
     ahci_cmd_header_t* hdr = &port->cmd_list[slot];
     hdr->cfl   = sizeof(fis_reg_h2d_t) / 4;
@@ -520,7 +545,7 @@ static bool ahci_rw_one(ahci_port_t* port, uint64_t lba, void* dma_buf, bool wri
     fis->counth = 0;
 
     tbl->prdt[0].dba = dma_phys(dma_buf);
-    tbl->prdt[0].dbc = 512 - 1;
+    tbl->prdt[0].dbc = ssz - 1;   /* actual sector size, not hardcoded 512 */
     tbl->prdt[0].i   = 0;
 
     wmb();
@@ -532,15 +557,21 @@ static bool ahci_rw_one(ahci_port_t* port, uint64_t lba, void* dma_buf, bool wri
 
 bool ahci_read_sectors(ahci_port_t* port, uint64_t lba, uint32_t count, void* buffer) {
     if (!port || !port->device_present || count == 0) return false;
-    if (lba + count > port->sectors) return false;
+    // Overflow-safe range check: `lba + count` (uint64) wraps when lba is within
+    // `count` of UINT64_MAX, making a wrapped-small sum pass the old `> sectors` test
+    // and slip an out-of-range LBA past the guard. count>=1 here (count==0 rejected
+    // above) and the first clause short-circuits before the subtraction, so
+    // `sectors - count` never underflows.
+    if (count > port->sectors || lba > port->sectors - count) return false;
 
+    uint32_t ssz = port->sector_size ? port->sector_size : 512;
     uint8_t* dst = (uint8_t*)buffer;
     for (uint32_t s = 0; s < count; s++) {
         if (!ahci_rw_one(port, lba + s, port->dma_bounce, /*write=*/false)) {
             if (g_ahci_controller) g_ahci_controller->total_errors++;
             return false;
         }
-        memcpy(dst + s * 512, port->dma_bounce, 512);
+        memcpy(dst + (uint64_t)s * ssz, port->dma_bounce, ssz);
         if (g_ahci_controller) g_ahci_controller->total_reads++;
     }
     return true;
@@ -548,11 +579,17 @@ bool ahci_read_sectors(ahci_port_t* port, uint64_t lba, uint32_t count, void* bu
 
 bool ahci_write_sectors(ahci_port_t* port, uint64_t lba, uint32_t count, const void* buffer) {
     if (!port || !port->device_present || count == 0) return false;
-    if (lba + count > port->sectors) return false;
+    // Overflow-safe range check: `lba + count` (uint64) wraps when lba is within
+    // `count` of UINT64_MAX, making a wrapped-small sum pass the old `> sectors` test
+    // and slip an out-of-range LBA past the guard. count>=1 here (count==0 rejected
+    // above) and the first clause short-circuits before the subtraction, so
+    // `sectors - count` never underflows.
+    if (count > port->sectors || lba > port->sectors - count) return false;
 
+    uint32_t ssz = port->sector_size ? port->sector_size : 512;
     const uint8_t* src = (const uint8_t*)buffer;
     for (uint32_t s = 0; s < count; s++) {
-        memcpy(port->dma_bounce, src + s * 512, 512);
+        memcpy(port->dma_bounce, src + (uint64_t)s * ssz, ssz);
         if (!ahci_rw_one(port, lba + s, port->dma_bounce, /*write=*/true)) {
             if (g_ahci_controller) g_ahci_controller->total_errors++;
             return false;
@@ -630,7 +667,7 @@ int ahci_init(void) {
                                        PCI_SUBCLASS_AHCI,
                                        PCI_PROG_IF_AHCI);
     if (!dev) {
-        kprintf("[AHCI] No AHCI controller found\n");
+        kprintf("[AHCI] No AHCI controller found - check BIOS SATA mode settings (must be AHCI, not IDE)\n");
         return -1;
     }
     kprintf("[AHCI] Found controller %04x:%04x (bus %u dev %u fn %u)\n",
@@ -638,15 +675,15 @@ int ahci_init(void) {
 
     g_ahci_controller = ahci_probe_controller(dev);
     if (!g_ahci_controller) {
-        kprintf("[AHCI] probe failed\n");
+        kprintf("[AHCI] Controller probe failed - memory allocation or BAR access error\n");
         return -2;
     }
     if (!ahci_init_controller(g_ahci_controller)) {
-        kprintf("[AHCI] controller init failed\n");
+        kprintf("[AHCI] Controller initialization failed - reset or handoff error\n");
         return -3;
     }
     if (!g_blk_port || !g_blk_port->device_present) {
-        kprintf("[AHCI] No usable SATA disk found\n");
+        kprintf("[AHCI] No usable SATA disk found - verify drive is connected and powered\n");
         return -4;
     }
 

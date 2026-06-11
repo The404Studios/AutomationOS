@@ -19,13 +19,60 @@ cc() { gcc $CF -c "$1" -o "$2"; }
 # cooperative init is built byte-for-byte as before (no burners ever spawned).
 INIT_EXTRA=""
 if [ "${STRESS:-0}" = "1" ]; then
-    INIT_EXTRA="-DPREEMPT_STRESS"
+    INIT_EXTRA="$INIT_EXTRA -DPREEMPT_STRESS"
     echo "*** STRESS build: init compiled with -DPREEMPT_STRESS (spawns cpuburners) ***"
+fi
+# GAMETEST=1 adds -DGAMETEST_RUN to the init compile ONLY, so init spawns
+# sbin/gametest (the spawn+survive harness over all games + key apps). Unset =>
+# the normal boot is byte-for-byte unchanged.
+if [ "${IDE:-0}" = "1" ]; then
+    INIT_EXTRA="$INIT_EXTRA -DIDE_AUTOSTART"
+    echo "*** IDE build: init compiled with -DIDE_AUTOSTART (auto-opens sbin/ide) ***"
+fi
+if [ "${GAMETEST:-0}" = "1" ]; then
+    INIT_EXTRA="$INIT_EXTRA -DGAMETEST_RUN"
+    echo "*** GAMETEST build: init compiled with -DGAMETEST_RUN (spawns sbin/gametest) ***"
+fi
+# DESKTOP_MINIMAL=1: init spawns ONLY the persistent desktop apps and skips the
+# ~70 self-test programs (the boot "storm"). This is the T410 desktop profile --
+# fast/smooth/low-churn boot, no long no-yield compute blocks freezing the
+# cooperative scheduler, no process-churn stressing the PCID teardown path.
+if [ "${DESKTOP_MINIMAL:-0}" = "1" ]; then
+    INIT_EXTRA="$INIT_EXTRA -DDESKTOP_MINIMAL"
+    echo "*** DESKTOP_MINIMAL build: init spawns desktop apps only (no self-test storm) ***"
+fi
+# SELFHEAL=1 wires the userspace desktop self-heal: the compositor publishes a
+# per-frame heartbeat into a SysV SHM page, init creates+owns that page and spawns
+# sbin/cwatchdog (the recovery supervisor). Threads -DSELFHEAL into the compositor
+# AND init compiles and builds+ships sbin/cwatchdog. Unset => none of it is
+# compiled or shipped, and the default initrd is byte-for-byte unchanged.
+SELFHEAL_EXTRA=""
+if [ "${SELFHEAL:-0}" = "1" ]; then
+    SELFHEAL_EXTRA="-DSELFHEAL"
+    INIT_EXTRA="$INIT_EXTRA -DSELFHEAL"
+    echo "*** SELFHEAL build: compositor heartbeat + init + sbin/cwatchdog (-DSELFHEAL) ***"
+fi
+# FREEZE_TEST=1 (+ FREEZE_MODE=0 blocking | 1 tight-loop) adds a ONE-SHOT forced
+# freeze to the compositor for the recovery PROOF (scripts/selfheal_smoke.sh).
+# The freeze hook lives inside the SELFHEAL machinery, so FREEZE_TEST implies
+# SELFHEAL. Never set in a shipping build.
+FREEZE_EXTRA=""
+if [ "${FREEZE_TEST:-0}" = "1" ]; then
+    FREEZE_EXTRA="-DSELFHEAL_FREEZE -DFREEZE_MODE=${FREEZE_MODE:-0}"
+    case "$SELFHEAL_EXTRA" in
+        *-DSELFHEAL*) ;;
+        *) SELFHEAL_EXTRA="-DSELFHEAL"; INIT_EXTRA="$INIT_EXTRA -DSELFHEAL";;
+    esac
+    echo "*** FREEZE_TEST build: compositor self-freeze mode=${FREEZE_MODE:-0} (implies SELFHEAL) ***"
 fi
 
 echo "[all] shared libs..."
 cc userspace/lib/font/bitfont.c /tmp/bf.o
+cc userspace/lib/font2/font2.c /tmp/font2.o   # scaled (2x) text renderer for IDE/chrome
 cc userspace/lib/wl/wl_client.c /tmp/wlc.o
+# g3d: software 3D rasterizer (Q16.16 fixed-point vec3/mat4 + z-buffer triangle
+# fill). No GPU; renders into the wl window's ARGB32 buffer. Used by cube3d + ray.
+cc userspace/lib/g3d/g3d.c      /tmp/g3d.o
 cc userspace/lib/ui/ui.c        /tmp/ui.o
 cc userspace/lib/keymap/keymap.c /tmp/keymap.o
 cc userspace/lib/game/game.c    /tmp/game.o
@@ -34,8 +81,8 @@ cc userspace/lib/audio/audio.c  /tmp/audio.o
 cc userspace/lib/icon/icon.c    /tmp/icon.o
 
 echo "[all] compositor (m8: right-side dock w/ hover-magnify, folders, bounce) + init..."
-cc userspace/compositor/compositor_m8.c /tmp/cm6.o
-$LD /tmp/cm6.o /tmp/bf.o /tmp/icon.o -o /tmp/comp.elf
+gcc $CF $SELFHEAL_EXTRA $FREEZE_EXTRA -c userspace/compositor/compositor_m8.c -o /tmp/cm6.o
+$LD /tmp/cm6.o /tmp/bf.o /tmp/font2.o /tmp/icon.o -o /tmp/comp.elf
 gcc $CF $INIT_EXTRA -c userspace/init/main.c -o /tmp/init.o
 $LD /tmp/init.o -o /tmp/init.elf
 # forktest: standalone fork/CoW correctness probe (no libs), spawned by init.
@@ -45,6 +92,17 @@ $LD /tmp/forktest.o -o /tmp/forktest.elf
 # shared address space + independent stacks + independent FPU across 4 threads.
 cc userspace/apps/threadtest/threadtest.c /tmp/threadtest.o
 $LD /tmp/threadtest.o -o /tmp/threadtest.elf
+# reaploop: PID-recycling probe -- fork+reap a trivial child 300x (> MAX_PROCESSES
+# == 256). Prints REAPLOOP: PASS iff the PID pool never exhausts (the #9 reap fix).
+cc userspace/apps/reaploop/reaploop.c /tmp/reaploop.o
+$LD /tmp/reaploop.o -o /tmp/reaploop.elf
+# cwatchdog: SELFHEAL desktop recovery supervisor (sbin/cwatchdog). Bare _start,
+# no libs/crt0. Built + shipped ONLY under SELFHEAL=1 (init spawns it only under
+# -DSELFHEAL), so the default initrd is byte-for-byte unchanged.
+if [ "${SELFHEAL:-0}" = "1" ]; then
+    cc userspace/apps/cwatchdog/cwatchdog.c /tmp/cwatchdog.o
+    $LD /tmp/cwatchdog.o -o /tmp/cwatchdog.elf
+fi
 
 # AI-native layer + standard tools (self-contained freestanding apps, no libs).
 # aibroker = the capability-gated AI command broker (/sbin); the rest are /bin
@@ -62,6 +120,48 @@ cc userspace/apps/tar/tar.c     /tmp/tar.o;     $LD /tmp/crt0.o /tmp/tar.o     -
 cc userspace/apps/pkg/pkg.c     /tmp/pkg.o;     $LD /tmp/crt0.o /tmp/pkg.o     -o /tmp/pkg.elf
 cc userspace/apps/make/make.c   /tmp/make.o;    $LD /tmp/crt0.o /tmp/make.o    -o /tmp/make.elf
 cc userspace/apps/argvtest/argvtest.c /tmp/argvtest.o; $LD /tmp/crt0.o /tmp/argvtest.o -o /tmp/argvtest.elf
+# msgtest: CHANNEL-0 P5b proof -- a userspace CH_MSG send/recv round-trip via a
+# self-spawned bound child (also proves EAGAIN + EMSGSIZE). crt0-linked; uses
+# userspace/lib/channel.h. Prints MSGTEST: PASS/FAIL to serial.
+cc userspace/apps/msgtest/msgtest.c /tmp/msgtest.o; $LD /tmp/crt0.o /tmp/msgtest.o -o /tmp/msgtest.elf
+# rpctest: AGENT-RPC-0 P6a proof -- encode/decode/validate the TOOL_RUN/TOOL_RESULT
+# wire schema (userspace/lib/agent_rpc.h). Schema only, no channels. Prints
+# RPCTEST: PASS/FAIL to serial.
+cc userspace/apps/rpctest/rpctest.c /tmp/rpctest.o; $LD /tmp/crt0.o /tmp/rpctest.o -o /tmp/rpctest.elf
+# toolrun: AGENT-RPC-0 P6b proof -- a path-only TOOL_RUN runner. Self-spawns an
+# agent+runner; the runner spawns /bin/free with stdout bound to a byte channel,
+# drains it, and returns TOOL_RESULT. Prints TOOLRUN/RUNNER lines to serial.
+cc userspace/apps/toolrun/toolrun.c /tmp/toolrun.o; $LD /tmp/crt0.o /tmp/toolrun.o -o /tmp/toolrun.elf
+# echoproof: deterministic 17-byte stdout for the P6c capability proof (spawned
+# by the toolrun runner; the agent byte-compares the exact bytes it reads).
+cc userspace/apps/echoproof/echoproof.c /tmp/echoproof.o; $LD /tmp/crt0.o /tmp/echoproof.o -o /tmp/echoproof.elf
+# echoargs: prints its argv (one entry per line) for the P6d vector proof (spawned
+# by the toolrun runner via SYS_SPAWN_EX_ARGV; the agent verifies argv arrived intact).
+cc userspace/apps/echoargs/echoargs.c /tmp/echoargs.o; $LD /tmp/crt0.o /tmp/echoargs.o -o /tmp/echoargs.elf
+# agenthost: AGENT-HOST-0 -- the first agent that RIDES the AGENT-RPC-0 rail. One
+# host loop: TOOL_RUN -> TOOL_RESULT -> accept stdout_token -> read exact stdout ->
+# structured verdict; plus a malformed TOOL_RUN is rejected. Prints AGENTHOST: PASS.
+cc userspace/apps/agenthost/agenthost.c /tmp/agenthost.o; $LD /tmp/crt0.o /tmp/agenthost.o -o /tmp/agenthost.elf
+# TOOLSET-0: small sandboxed tools (read_file/list_dir/stat) + the host that drives
+# a safe whitelisted tool surface over the rail (sbin/toolset_host).
+cc userspace/apps/tool_read/tool_read.c   /tmp/tool_read.o;   $LD /tmp/crt0.o /tmp/tool_read.o   -o /tmp/tool_read.elf
+cc userspace/apps/tool_ls/tool_ls.c       /tmp/tool_ls.o;     $LD /tmp/crt0.o /tmp/tool_ls.o     -o /tmp/tool_ls.elf
+cc userspace/apps/tool_stat/tool_stat.c   /tmp/tool_stat.o;   $LD /tmp/crt0.o /tmp/tool_stat.o   -o /tmp/tool_stat.elf
+cc userspace/apps/toolset_host/toolset_host.c /tmp/toolset_host.o; $LD /tmp/crt0.o /tmp/toolset_host.o -o /tmp/toolset_host.elf
+# CHAINLAYER-HOST-0: model-in-the-loop tool decision -- a (stub) model chooses a
+# tool as JSON, the host parses+validates it (whitelist + path policy), the tool
+# runs over the rail, the model sees the result and answers. Prints CHAINHOST: PASS.
+cc userspace/apps/chainhost/chainhost.c /tmp/chainhost.o; $LD /tmp/crt0.o /tmp/chainhost.o -o /tmp/chainhost.elf
+# MODEL-BRIDGE-0: the model seam fed by an EXTERNAL endpoint (TCP 10.0.2.2:8431,
+# scripts/model_server_stub.py standing in for llama.cpp). Same parser/whitelist/
+# policy/runner as chainhost; SKIPs (bounded) when net/endpoint absent.
+cc userspace/apps/modelbridge/modelbridge.c /tmp/modelbridge.o; $LD /tmp/crt0.o /tmp/modelbridge.o -o /tmp/modelbridge.elf
+# INITRD-ALIAS-0 regression pair: initrdp (tiny pristine reader) + initrdalias
+# (16 MiB-pad big-image + mmap-heavy reader; spawns initrdp; prints the
+# INITRD-ALIAS verdict). Both compare the initrd-staged t.png byte-for-byte
+# against the embedded generated fixture (b2_img_fixtures.h).
+cc userspace/apps/initrdp/initrdp.c /tmp/initrdp.o; $LD /tmp/crt0.o /tmp/initrdp.o -o /tmp/initrdp.elf
+cc userspace/apps/initrdalias/initrdalias.c /tmp/initrdalias.o; $LD /tmp/crt0.o /tmp/initrdalias.o -o /tmp/initrdalias.elf
 # floattest: proves ring-3 float/SSE at runtime (scalar + 2x2 matmul + reduction).
 cc userspace/apps/floattest/floattest.c /tmp/floattest.o; $LD /tmp/crt0.o /tmp/floattest.o -o /tmp/floattest.elf
 # sleeptest: proves SYS_SLEEP is a real, ms-granularity, BLOCKING sleep (measures
@@ -78,6 +178,10 @@ cc userspace/apps/cpuburn/cpuburn.c /tmp/cpuburn.o; $LD /tmp/crt0.o /tmp/cpuburn
 # low*1.3. Works in BOTH the cooperative and preemptive builds. crt0-linked;
 # includes userspace/lib/sched_class.h (named classes + sched_setclass()).
 cc userspace/apps/prioritytest/prioritytest.c /tmp/prioritytest.o; $LD /tmp/crt0.o /tmp/prioritytest.o -o /tmp/prioritytest.elf
+# gametest: spawn+survive harness over all 16 games + key desktop apps (verifies
+# each actually runs its init+render loop without crashing). init spawns it only
+# under -DGAMETEST_RUN (GAMETEST=1). crt0-linked.
+cc userspace/apps/gametest/gametest.c /tmp/gametest.o; $LD /tmp/crt0.o /tmp/gametest.o -o /tmp/gametest.elf
 # matbench: SIMD float matmul benchmark -- scalar baseline vs hand-vectorized SSE
 # (gcc v4sf), with a correctness check + a measured speedup. First tensor-runtime brick.
 cc userspace/apps/matbench/matbench.c /tmp/matbench.o; $LD /tmp/crt0.o /tmp/matbench.o -o /tmp/matbench.elf
@@ -116,6 +220,16 @@ cc userspace/apps/gzip/gzip.c     /tmp/gzip.o;    $LD /tmp/crt0.o /tmp/gzip.o /t
 cc userspace/apps/nettest/nettest.c /tmp/nettest.o; $LD /tmp/nettest.o -o /tmp/nettest.elf
 # sockettest: userspace BSD-socket probe (UDP sendto + bounded recv + TCP alloc).
 cc userspace/apps/sockettest/sockettest.c /tmp/sockettest.o; $LD /tmp/sockettest.o -o /tmp/sockettest.elf
+# cpu1offload: userspace -> CPU1 matmul offload probe (the userspace coprocessor
+# bridge). On the SMP kernel it offloads an int matmul to CPU1 via SYS_CPU1_OFFLOAD
+# and prints "CPU1OFFLOAD: PASS ... by_apic=1"; on the DEFAULT kernel the syscall
+# is unregistered, so it prints "CPU1OFFLOAD: SKIP" and exits cleanly (harmless).
+# Bare _start (no crt0), like nettest/sockettest.
+cc userspace/apps/cpu1offload/cpu1offload.c /tmp/cpu1offload.o; $LD /tmp/cpu1offload.o -o /tmp/cpu1offload.elf
+# smpstress: 2-CPU dispatch STRESS harness (the SMP proving ground). Drives the CPU1
+# coprocessor mailbox thousands of times via SYS_CPU1_OFFLOAD, verifying every result.
+# "SMPSTRESS: PASS ..." on the SMP kernel; "SMPSTRESS: SKIP single CPU" on default.
+cc userspace/apps/smpstress/smpstress.c /tmp/smpstress.o; $LD /tmp/smpstress.o -o /tmp/smpstress.elf
 # Overhaul-syscall verification probes (bare _start; exercise futex/epoll/
 # sendfile/perf/batch against the kernel's real ABI). Each prints "<NAME>: PASS".
 for t in futextest epolltest sendfiletest perftest batchtest; do
@@ -181,6 +295,21 @@ $LD /tmp/libtest.o /tmp/json.o /tmp/dhcp.o \
     /tmp/img_bmp.o /tmp/img_png.o /tmp/img_gif.o /tmp/img_codec.o /tmp/deflate.o /tmp/lstring.o -o /tmp/libtest.elf
 # dhcpc: obtain + print a DHCP lease (crt0+main; links dhcp).
 cc userspace/apps/dhcpc/dhcpc.c /tmp/dhcpc.o; $LD /tmp/crt0.o /tmp/dhcpc.o /tmp/dhcp.o -o /tmp/dhcpc.elf
+# autodhcp: auto-DHCP on boot -- sleeps 2s, checks link, runs DHCP if up.
+cc userspace/apps/autodhcp/autodhcp.c /tmp/autodhcp.o; $LD /tmp/crt0.o /tmp/autodhcp.o /tmp/dhcp.o -o /tmp/autodhcp.elf
+# nicup: E1000-PCH-0B post-desktop trigger for the deferred T410 NIC bring-up.
+# Clean no-op on QEMU/non-PCH machines; tiny, shipped always.
+cc userspace/apps/nicup/nicup.c /tmp/nicup.o; $LD /tmp/crt0.o /tmp/nicup.o -o /tmp/nicup.elf
+# cpu1hello: SMP-F3-5 first-ring-3-on-CPU1 workload. Shipped always (tiny);
+# only the SMP_SCHED_DISPATCH kernel ever spawns it (pinned to CPU1).
+cc userspace/tests/cpu1hello.c /tmp/cpu1hello.o; $LD /tmp/crt0.o /tmp/cpu1hello.o -o /tmp/cpu1hello.elf
+# bklstorm: SMP-H1 60s two-CPU syscall storm. Shipped always (tiny);
+# only the SMP_BKL kernel ever spawns it (one pinned CPU1 + one CPU0).
+cc userspace/tests/bklstorm.c /tmp/bklstorm.o; $LD /tmp/crt0.o /tmp/bklstorm.o -o /tmp/bklstorm.elf
+# batchdemo: SMP-F3-7 first ordinary BATCH-class workload on CPU1. Shipped
+# always (tiny); only the SMP_BATCH kernel ever spawns it (unpinned, the
+# choose_cpu batch branch routes it).
+cc userspace/tests/batchdemo.c /tmp/batchdemo.o; $LD /tmp/crt0.o /tmp/batchdemo.o -o /tmp/batchdemo.elf
 # apidemo: fetch http(s) URL + pretty-print JSON (crt0+main; HTTPS + json).
 cc userspace/apps/apidemo/apidemo.c /tmp/apidemo.o; $LD /tmp/crt0.o /tmp/apidemo.o /tmp/json.o $HTTPS_OBJS -o /tmp/apidemo.elf
 
@@ -203,6 +332,11 @@ cc userspace/apps/js/js.c /tmp/js.o; $LD /tmp/crt0.o /tmp/js.o $JS_OBJS /tmp/lst
 # disjoint additions over the existing tree -- the legacy `browser` stays.
 # ----------------------------------------------------------------------------
 echo "[all] browser wave: DOM/HTML/CSS/Layout libs + selftests..."
+# BROWSER2-IMG-0: generate the embedded fixture header BEFORE browser2 compiles
+# (the same bytes also go into the initrd during staging, below; the embedded
+# copies exist because in-OS VFS reads of initrd-backed files return zeros in
+# mmap-heavy processes -- the per-process aliasing kernel bug, own brick).
+python3 scripts/gen_img_fixtures.py /tmp/imgfx_hdr userspace/apps/browser2/b2_img_fixtures.h
 cc userspace/libc/malloc.c              /tmp/lmalloc.o
 cc userspace/libc/syscall.c             /tmp/lsyscall.o
 cc userspace/lib/dom/dom.c              /tmp/dom.o
@@ -243,10 +377,12 @@ $LD /tmp/crt0.o /tmp/webtest.o $WEB_OBJS $JS_OBJS $JS_WEB_OBJS $HTTPS_OBJS -o /t
 # browser2: GUI browser that renders DOM + runs <script> tags (full pipeline + HTTPS + wl/font).
 # browser2_ui.o / browser2_anim.o: the chrome/toolbar UI + tab-strip animation
 # helpers (split out so the render core stays focused); both link into browser2.
+# BROWSER2-IMG-0: + the imgcodec decoders (PNG/GIF/BMP) for <img> rendering
+# (inflate comes from $HTTPS_OBJS' deflate.o -- do NOT add it twice).
 cc userspace/apps/browser2/browser2.c       /tmp/browser2.o
 cc userspace/apps/browser2/browser2_ui.c    /tmp/browser2_ui.o
 cc userspace/apps/browser2/browser2_anim.c  /tmp/browser2_anim.o
-$LD /tmp/crt0.o /tmp/browser2.o $WEB_OBJS $JS_OBJS $JS_WEB_OBJS $HTTPS_OBJS /tmp/wlc.o /tmp/bf.o /tmp/browser2_ui.o /tmp/browser2_anim.o -o /tmp/browser2.elf
+$LD /tmp/crt0.o /tmp/browser2.o $WEB_OBJS $JS_OBJS $JS_WEB_OBJS $HTTPS_OBJS /tmp/img_bmp.o /tmp/img_png.o /tmp/img_gif.o /tmp/img_codec.o /tmp/wlc.o /tmp/bf.o /tmp/browser2_ui.o /tmp/browser2_anim.o -o /tmp/browser2.elf
 # webapitest: pure JS web-API selftest (timers/fetch/storage/console/url). Links
 # the same web+JS+HTTPS object set as webtest (js_fetch.o references http/https).
 cc userspace/apps/webapitest/webapitest.c /tmp/webapitest.o
@@ -256,10 +392,20 @@ $LD /tmp/crt0.o /tmp/webapitest.o $WEB_OBJS $JS_OBJS $JS_WEB_OBJS $HTTPS_OBJS -o
 echo "[all] net tools (ping/nc)..."
 cc userspace/apps/ping/ping.c /tmp/ping.o; $LD /tmp/crt0.o /tmp/ping.o /tmp/dns.o -o /tmp/ping.elf
 cc userspace/apps/nc/nc.c     /tmp/nc.o;   $LD /tmp/crt0.o /tmp/nc.o   /tmp/dns.o -o /tmp/nc.elf
+# sophisticated networking tools (read the wired stack: e1000 + ARP/IP/UDP/TCP + sockets)
+cc userspace/apps/netinfo/netinfo.c /tmp/netinfo.o; $LD /tmp/crt0.o /tmp/netinfo.o            -o /tmp/netinfo.elf
+cc userspace/apps/netscan/netscan.c /tmp/netscan.o; $LD /tmp/crt0.o /tmp/netscan.o /tmp/dns.o -o /tmp/netscan.elf
+cc userspace/apps/tcping/tcping.c   /tmp/tcping.o;  $LD /tmp/crt0.o /tmp/tcping.o  /tmp/dns.o -o /tmp/tcping.elf
+cc userspace/apps/dig/dig.c         /tmp/dig.o;     $LD /tmp/crt0.o /tmp/dig.o                -o /tmp/dig.elf
+cc userspace/apps/httpget/httpget.c /tmp/httpget.o; $LD /tmp/crt0.o /tmp/httpget.o /tmp/dns.o -o /tmp/httpget.elf
+cc userspace/apps/pktmon/pktmon.c   /tmp/pktmon.o;  $LD /tmp/crt0.o /tmp/pktmon.o             -o /tmp/pktmon.elf
+cc userspace/apps/httpd/httpd.c     /tmp/httpd.o;   $LD /tmp/crt0.o /tmp/httpd.o              -o /tmp/httpd.elf
+cc userspace/apps/traceroute/traceroute.c /tmp/traceroute.o; $LD /tmp/crt0.o /tmp/traceroute.o /tmp/dns.o -o /tmp/traceroute.elf
+cc userspace/apps/arp/arp.c         /tmp/arp.o;     $LD /tmp/crt0.o /tmp/arp.o     /tmp/dns.o -o /tmp/arp.elf
 
 # ---- coreutils expansion + system info (argv-aware, crt0-linked) ----
 echo "[all] coreutils expansion..."
-for t in grep head tail sort uniq cut tr nl du touch basename dirname uname hostname whoami date less hexdump; do
+for t in grep head tail sort uniq cut tr nl du touch basename dirname uname hostname whoami date less hexdump lspci; do
     cc userspace/apps/$t/$t.c /tmp/$t.o
     $LD /tmp/crt0.o /tmp/$t.o -o /tmp/$t.elf
 done
@@ -267,7 +413,7 @@ done
 # Toolkit apps: <app> + ui + wl + bitfont
 build_ui_app() {   # $1=src $2=name
     cc "$1" /tmp/$2.o
-    $LD /tmp/$2.o /tmp/ui.o /tmp/wlc.o /tmp/bf.o -o /tmp/$2.elf
+    $LD /tmp/$2.o /tmp/ui.o /tmp/wlc.o /tmp/bf.o /tmp/font2.o -o /tmp/$2.elf
 }
 # wl-direct apps: <app> + wl + bitfont
 build_wl_app() {   # $1=src $2=name
@@ -281,7 +427,12 @@ build_game_app() { # $1=src $2=name
 }
 
 echo "[all] toolkit apps..."
-build_ui_app userspace/apps/filemanager/filemanager.c filemanager
+# filemanager is argv-aware: it opens the directory passed as argv[1] (the
+# compositor passes "/Desktop/<folder>" when a desktop folder icon is double-
+# clicked). So it is crt0-linked + main(argc,argv), NOT bare _start like the
+# other toolkit apps below.
+cc userspace/apps/filemanager/filemanager.c /tmp/filemanager.o
+$LD /tmp/crt0.o /tmp/filemanager.o /tmp/ui.o /tmp/wlc.o /tmp/bf.o /tmp/font2.o -o /tmp/filemanager.elf
 build_ui_app userspace/apps/calculator/calculator.c   calculator
 build_ui_app userspace/apps/clock/clock.c             clock
 build_ui_app userspace/apps/sysinfo/sysinfo.c         sysinfo
@@ -297,7 +448,7 @@ build_ui_app userspace/apps/controlcenter/controlcenter.c controlcenter
 echo "[all] network apps (netman + browser)..."
 # netman: network manager (ui toolkit + dns lib). Links like a ui app + dns.o.
 cc userspace/apps/netman/netman.c /tmp/netman.o
-$LD /tmp/netman.o /tmp/ui.o /tmp/wlc.o /tmp/bf.o /tmp/dns.o -o /tmp/netman.elf
+$LD /tmp/netman.o /tmp/ui.o /tmp/wlc.o /tmp/bf.o /tmp/font2.o /tmp/dns.o -o /tmp/netman.elf
 # browser: wl-direct web browser (HTTP + HTTPS + simplified HTML render). Links
 # the full HTTPS stack (http+dns+deflate+tlsconn+crypto/tls) + wl+bf.
 cc userspace/apps/browser/browser.c /tmp/browser.o
@@ -311,6 +462,15 @@ $LD /tmp/terminal.o /tmp/sh_git.o /tmp/wlc.o /tmp/bf.o /tmp/keymap.o -o /tmp/ter
 build_wl_app userspace/apps/editor/editor.c           editor
 build_wl_app userspace/apps/snake/snake.c             snake
 build_wl_app userspace/apps/asteroids/asteroids.c     asteroids
+# cube3d / ray: software 3D (g3d lib). They need wl + bitfont + g3d, so they do
+# NOT fit build_wl_app (which omits g3d.o) -- link explicitly.
+cc userspace/apps/cube3d/cube3d.c /tmp/cube3d.o
+$LD /tmp/cube3d.o /tmp/wlc.o /tmp/bf.o /tmp/g3d.o -o /tmp/cube3d.elf
+cc userspace/apps/ray/ray.c       /tmp/ray.o
+$LD /tmp/ray.o    /tmp/wlc.o /tmp/bf.o /tmp/g3d.o -o /tmp/ray.elf
+# derby: 3D demolition derby (g3d arena + AI). Same link set as cube3d.
+cc userspace/apps/derby/derby.c   /tmp/derby.o
+$LD /tmp/derby.o  /tmp/wlc.o /tmp/bf.o /tmp/g3d.o -o /tmp/derby.elf
 build_wl_app userspace/apps/sudoku/sudoku.c           sudoku
 build_wl_app userspace/apps/pacman/pacman.c           pacman
 build_wl_app userspace/apps/clockapp/clockapp.c       clockapp
@@ -323,6 +483,7 @@ build_wl_app userspace/apps/synth/synth.c             synth
 build_wl_app userspace/apps/tetris/tetris.c           tetris
 build_wl_app userspace/apps/game2048/game2048.c       game2048
 build_wl_app userspace/apps/bubbletd/bubbletd.c       bubbletd
+build_wl_app userspace/apps/zombietd/zombietd.c       zombietd
 build_wl_app userspace/apps/sheet/sheet.c             sheet
 build_wl_app userspace/apps/notes/notes.c             notes
 build_wl_app userspace/apps/calendar/calendar.c       calendar
@@ -347,7 +508,7 @@ build_wl_app userspace/apps/stress/stress.c           stress
 
 echo "[all] lib-linked apps (aictl / audio)..."
 cc userspace/apps/procmon/procmon.c   /tmp/procmon.o
-$LD /tmp/procmon.o /tmp/aictl.o /tmp/ui.o /tmp/wlc.o /tmp/bf.o -o /tmp/procmon.elf
+$LD /tmp/procmon.o /tmp/aictl.o /tmp/ui.o /tmp/wlc.o /tmp/bf.o /tmp/font2.o -o /tmp/procmon.elf
 cc userspace/apps/soundtest/soundtest.c /tmp/soundtest.o
 $LD /tmp/soundtest.o /tmp/audio.o /tmp/wlc.o /tmp/bf.o -o /tmp/soundtest.elf
 cc userspace/apps/musicplayer/musicplayer.c /tmp/musicplayer.o
@@ -366,10 +527,10 @@ else
 fi
 
 echo "[all] IDE (Semantic LEGO Map)..."
-IDE_SRCS="ide ide_sys ide_gfx ide_lex ide_ast ide_pcore ide_pdecl ide_pstmt ide_pexpr ide_astprint ide_parse ide_semantic ide_explorer ide_funcs ide_map ide_codeview ide_inspector ide_runtime ide_chrome ide_gen elf_write as_x64 cc_type cc_codegen cc_expr tc_driver ide_build ide_editor ide_term"
+IDE_SRCS="ide ide_sys ide_gfx ide_lex ide_ast ide_pcore ide_pdecl ide_pstmt ide_pexpr ide_astprint ide_parse ide_semantic ide_explorer ide_funcs ide_map ide_codeview ide_inspector ide_runtime ide_chrome ide_gen elf_write as_x64 cc_type cc_codegen cc_expr tc_driver ide_build ide_editor ide_term ide_library ide_complete ide_config ide_project"
 IDE_OBJS=""
 for s in $IDE_SRCS; do cc userspace/apps/ide/$s.c /tmp/ide_$s.o; IDE_OBJS="$IDE_OBJS /tmp/ide_$s.o"; done
-$LD $IDE_OBJS /tmp/wlc.o /tmp/bf.o /tmp/keymap.o -o /tmp/ide.elf
+$LD $IDE_OBJS /tmp/wlc.o /tmp/bf.o /tmp/font2.o /tmp/keymap.o -o /tmp/ide.elf
 
 # cc: the on-device C compiler (the self-hosting flagship). It is a thin driver
 # that REUSES the IDE's verified toolchain objects (lexer/parser/codegen/
@@ -386,17 +547,26 @@ $LD /tmp/crt0.o /tmp/cc.o \
     -o /tmp/cc.elf
 
 echo "[all] canary check (all must be 0):"
-for e in comp init filemanager calculator clock sysinfo settings sysmon uidemo dateapp applauncher taskman terminal editor snake paint synth tetris game2048 sheet notes calendar stopwatch mines piano dashboard welcome bench breakout pong invaders procmon soundtest solitaire aiconsole screenshot stress musicplayer ide bubbletd pacman clockapp forktest threadtest matmuljobs aibroker sed awk tar pkg make meminfo argvtest floattest sleeptest prioritytest matbench tensortest cpuburn blk ps kill free uptime find diff cmp tee wcx xargs gzip cc nettest sockettest wget netman browser cryptotest libtest ping nc grep head tail sort uniq cut tr nl du touch basename dirname uname hostname whoami date less hexdump tlsprobe certtool dhcpc apidemo js futextest epolltest sendfiletest perftest batchtest domtest htmltest csstest layouttest webtest browser2 webapitest; do
+for e in comp init filemanager calculator clock sysinfo settings sysmon uidemo dateapp applauncher taskman terminal editor snake paint synth tetris game2048 sheet notes calendar stopwatch mines piano dashboard welcome bench breakout pong invaders procmon soundtest solitaire aiconsole screenshot stress musicplayer ide bubbletd zombietd pacman clockapp forktest threadtest reaploop matmuljobs aibroker sed awk tar pkg make meminfo argvtest msgtest rpctest toolrun echoproof echoargs agenthost tool_read tool_ls tool_stat toolset_host chainhost modelbridge initrdp initrdalias floattest sleeptest prioritytest matbench tensortest cpuburn blk ps kill free uptime find diff cmp tee wcx xargs gzip cc nettest sockettest cpu1offload smpstress wget netman browser cryptotest libtest ping nc netinfo netscan tcping dig httpget pktmon httpd traceroute arp grep head tail sort uniq cut tr nl du touch basename dirname uname hostname whoami date less hexdump lspci tlsprobe certtool dhcpc autodhcp apidemo js futextest epolltest sendfiletest perftest batchtest domtest htmltest csstest layouttest webtest browser2 webapitest cube3d ray chess asteroids sudoku photos startmenu controlcenter gametest; do
     n=$(objdump -d /tmp/$e.elf 2>/dev/null | grep -c "fs:0x28" || true)
     echo "  $e=$n"
 done
 
 echo "[all] packaging initrd..."
-rm -rf /tmp/ird && mkdir -p /tmp/ird
-( cd /tmp/ird && tar xf /mnt/c/Users/wilde/Desktop/Kernel/iso/boot/initrd.img )
+rm -rf /tmp/ird && mkdir -p /tmp/ird/sbin /tmp/ird/bin
+# Seed from the existing initrd if it is present and non-empty (preserves any
+# static files baked into a prior image). The explicit mkdir above guarantees
+# sbin/ and bin/ exist even when iso/boot/initrd.img is the empty bootstrap stub
+# (fresh checkout / cleaned tree) — otherwise the first `cp ... /tmp/ird/sbin/`
+# below fails with "No such file or directory" and the whole initrd is empty.
+( cd /tmp/ird && tar xf /mnt/c/Users/wilde/Desktop/Kernel/iso/boot/initrd.img 2>/dev/null || true )
+# SELFHEAL gating: the seed above can carry an sbin/cwatchdog left by a PRIOR
+# SELFHEAL build. On a non-SELFHEAL build, drop it so the default initrd never
+# ships the watchdog (preserves the byte-for-byte-unchanged default image).
+if [ "${SELFHEAL:-0}" != "1" ]; then rm -f /tmp/ird/sbin/cwatchdog; fi
 cp /tmp/comp.elf /tmp/ird/sbin/compositor
 cp /tmp/init.elf /tmp/ird/sbin/init
-for e in filemanager calculator clock sysinfo settings sysmon uidemo dateapp applauncher taskman terminal editor snake paint synth tetris game2048 sheet notes calendar stopwatch mines piano dashboard welcome bench breakout pong invaders procmon soundtest solitaire aiconsole screenshot stress musicplayer ide bubbletd startmenu controlcenter chess asteroids sudoku photos pacman clockapp forktest threadtest matmuljobs; do
+for e in filemanager calculator clock sysinfo settings sysmon uidemo dateapp applauncher taskman terminal editor snake paint synth tetris game2048 sheet notes calendar stopwatch mines piano dashboard welcome bench breakout pong invaders procmon soundtest solitaire aiconsole screenshot stress musicplayer ide bubbletd startmenu controlcenter chess asteroids sudoku photos pacman clockapp zombietd forktest threadtest reaploop matmuljobs cube3d ray derby; do
     cp /tmp/$e.elf /tmp/ird/sbin/$e
 done
 [ "$IV_OK" = "1" ] && cp /tmp/imageviewer.elf /tmp/ird/sbin/imageviewer
@@ -411,11 +581,42 @@ cp /tmp/pkg.elf      /tmp/ird/bin/pkg
 cp /tmp/make.elf     /tmp/ird/bin/make
 cp /tmp/meminfo.elf  /tmp/ird/bin/meminfo
 cp /tmp/argvtest.elf /tmp/ird/sbin/argvtest
+# msgtest -> /sbin (init spawns it at boot; it self-spawns sbin/msgtest as a
+# bound child for the CHANNEL-0 P5b CH_MSG round-trip proof).
+cp /tmp/msgtest.elf /tmp/ird/sbin/msgtest
+# rpctest -> /sbin (init spawns it; AGENT-RPC-0 P6a schema encode/decode selftest).
+cp /tmp/rpctest.elf /tmp/ird/sbin/rpctest
+# toolrun -> /sbin (init spawns it; AGENT-RPC-0 P6b/P6c TOOL_RUN runner proof).
+cp /tmp/toolrun.elf /tmp/ird/sbin/toolrun
+# echoproof -> /sbin (spawned by the toolrun runner; P6c deterministic stdout).
+cp /tmp/echoproof.elf /tmp/ird/sbin/echoproof
+# echoargs -> /sbin (spawned by the toolrun/agenthost runner; argv-vector echo).
+cp /tmp/echoargs.elf /tmp/ird/sbin/echoargs
+# agenthost -> /sbin (init spawns it; AGENT-HOST-0 the first agent riding the rail).
+cp /tmp/agenthost.elf /tmp/ird/sbin/agenthost
+# TOOLSET-0 -> /sbin (toolset_host spawned by init; the tools spawned by its runner).
+cp /tmp/tool_read.elf /tmp/ird/sbin/tool_read
+cp /tmp/tool_ls.elf   /tmp/ird/sbin/tool_ls
+cp /tmp/tool_stat.elf /tmp/ird/sbin/tool_stat
+cp /tmp/toolset_host.elf /tmp/ird/sbin/toolset_host
+# CHAINLAYER-HOST-0 -> /sbin (init spawns it; the model seam over the tool surface).
+cp /tmp/chainhost.elf /tmp/ird/sbin/chainhost
+# MODEL-BRIDGE-0 -> /sbin (init spawns it; the seam fed by the external endpoint).
+cp /tmp/modelbridge.elf /tmp/ird/sbin/modelbridge
+# INITRD-ALIAS-0 regression pair -> /sbin (init spawns initrdalias; it spawns initrdp).
+cp /tmp/initrdp.elf /tmp/ird/sbin/initrdp
+cp /tmp/initrdalias.elf /tmp/ird/sbin/initrdalias
+# TOOLSET-0 test fixture: a small file with KNOWN content (15 bytes) for read_file/stat.
+mkdir -p /tmp/ird/etc && printf 'TOOLSET-0-FILE\n' > /tmp/ird/etc/toolset0.txt
+# BROWSER2-IMG-0 fixtures: deterministic PNG/GIF/BMP (+ a wider-than-viewport
+# big.png) for the about:imgtest acceptance page; missing.png stays missing.
+python3 scripts/gen_img_fixtures.py /tmp/ird/etc/imgtest
 cp /tmp/floattest.elf /tmp/ird/sbin/floattest
 cp /tmp/sleeptest.elf /tmp/ird/sbin/sleeptest
 # prioritytest -> /sbin (init spawns it after the boot storm drains). Proves
 # priority classes shift CPU share by comparing two children's cpu_ticks.
 cp /tmp/prioritytest.elf /tmp/ird/sbin/prioritytest
+cp /tmp/gametest.elf /tmp/ird/sbin/gametest
 # cpuburn -> /sbin (init spawns sbin/cpuburn under PREEMPT_STRESS). Shipped in
 # every initrd but only spawned by a STRESS=1 init, so it is inert otherwise.
 cp /tmp/cpuburn.elf /tmp/ird/sbin/cpuburn
@@ -431,6 +632,22 @@ cp /tmp/gzip.elf /tmp/ird/bin/gunzip
 # nettest lives in /sbin (init spawns it like the other on-boot probes).
 cp /tmp/nettest.elf /tmp/ird/sbin/nettest
 cp /tmp/sockettest.elf /tmp/ird/sbin/sockettest
+# autodhcp -> /sbin (init spawns it at boot; sleeps 2s, checks link, auto-DHCP if up).
+cp /tmp/autodhcp.elf /tmp/ird/sbin/autodhcp
+# nicup -> /bin (operator-run trigger for the deferred PCH NIC bring-up; QEMU no-op).
+cp /tmp/nicup.elf /tmp/ird/bin/nicup
+# cpu1hello -> /sbin (SMP-F3-5; inert unless the SMP_SCHED_DISPATCH kernel spawns it).
+cp /tmp/cpu1hello.elf /tmp/ird/sbin/cpu1hello
+# bklstorm -> /sbin (SMP-H1; inert unless the SMP_BKL kernel spawns it).
+cp /tmp/bklstorm.elf /tmp/ird/sbin/bklstorm
+# batchdemo -> /sbin (SMP-F3-7; inert unless the SMP_BATCH kernel spawns it).
+cp /tmp/batchdemo.elf /tmp/ird/sbin/batchdemo
+# cpu1offload -> /sbin (init spawns it at boot; prints PASS on SMP, SKIP on default).
+cp /tmp/cpu1offload.elf /tmp/ird/sbin/cpu1offload
+# smpstress -> /sbin (init spawns it; PASS on SMP after thousands of CPU1 jobs, SKIP on default).
+cp /tmp/smpstress.elf /tmp/ird/sbin/smpstress
+# cwatchdog only exists under SELFHEAL=1; if-guard keeps `set -e` happy on default.
+if [ "${SELFHEAL:-0}" = "1" ]; then cp /tmp/cwatchdog.elf /tmp/ird/sbin/cwatchdog; fi
 # overhaul-syscall verification probes -> /sbin (init spawns them at boot)
 for t in futextest epolltest sendfiletest perftest batchtest; do
     cp /tmp/$t.elf /tmp/ird/sbin/$t
@@ -444,7 +661,7 @@ cp /tmp/wget.elf    /tmp/ird/bin/wget
 cp /tmp/netman.elf  /tmp/ird/sbin/netman
 cp /tmp/browser.elf /tmp/ird/sbin/browser
 # net tools + coreutils expansion -> /bin (shell-spawnable).
-for t in ping nc grep head tail sort uniq cut tr nl du touch basename dirname uname hostname whoami date less hexdump tlsprobe certtool dhcpc apidemo js; do
+for t in ping nc netinfo netscan tcping dig httpget pktmon httpd traceroute arp grep head tail sort uniq cut tr nl du touch basename dirname uname hostname whoami date less hexdump lspci tlsprobe certtool dhcpc apidemo js; do
     cp /tmp/$t.elf /tmp/ird/bin/$t
 done
 # KAT self-test harnesses -> /sbin (init spawns them at boot).
@@ -459,9 +676,21 @@ cp userspace/apps/ide/sample/towerdefense/*.h /tmp/ird/usr/src/towerdefense/ 2>/
 # Native-toolchain sample programs (the IDE compiles + runs these on-device)
 mkdir -p /tmp/ird/usr/src/native
 cp userspace/apps/ide/sample/native/* /tmp/ird/usr/src/native/ 2>/dev/null || true
+# Demolition Derby 3D: the runnable game (sbin/derby) AND an IDE project so the
+# Semantic LEGO Map can visualize its car/AI/physics/render structure.
+mkdir -p /tmp/ird/usr/src/derby
+cp userspace/apps/derby/derby.c /tmp/ird/usr/src/derby/ 2>/dev/null || true
+# IDE "complex" library: editable disk snippets (*.snip) loaded at IDE startup
+# (built-in core lives in ide_library.c; this dir extends it without recompiling).
+mkdir -p /tmp/ird/usr/lib/snippets
+cp userspace/apps/ide/snippets/*.snip /tmp/ird/usr/lib/snippets/ 2>/dev/null || true
 # Bubble Defense as an IDE project, + a Desktop folder for compiled output
 mkdir -p /tmp/ird/usr/src/bubbledefense
 cp userspace/apps/bubbletd/bubbletd.c /tmp/ird/usr/src/bubbledefense/ 2>/dev/null || true
+# Zombie Bastion game source = the featured IDE example project (opened by default;
+# the IDE lists+opens both .c and .asm under it and parses it into the LEGO map).
+mkdir -p /tmp/ird/usr/src/zombiebastion
+cp userspace/apps/zombietd/zombietd.c /tmp/ird/usr/src/zombiebastion/ 2>/dev/null || true
 
 # IDE "New Project" templates (game / app / service starters) -> /usr/src/templates
 mkdir -p /tmp/ird/usr/src/templates/gamestarter /tmp/ird/usr/src/templates/appstarter /tmp/ird/usr/src/templates/servicestarter
@@ -469,10 +698,53 @@ cp userspace/apps/ide/sample/gamestarter/*    /tmp/ird/usr/src/templates/gamesta
 cp userspace/apps/ide/sample/appstarter/*     /tmp/ird/usr/src/templates/appstarter/     2>/dev/null || true
 cp userspace/apps/ide/sample/servicestarter/* /tmp/ird/usr/src/templates/servicestarter/ 2>/dev/null || true
 mkdir -p /tmp/ird/Desktop
+# Zombie Bastion: a Desktop FOLDER holding the game ELF. The compositor shows
+# /Desktop entries as icons; a folder opens the filemanager, where the .elf can
+# be launched. (The dock "Zt" icon launches it directly too.)
+mkdir -p /tmp/ird/Desktop/ZombieBastion
+cp /tmp/zombietd.elf /tmp/ird/Desktop/ZombieBastion/zombietd.elf 2>/dev/null || true
+# Ensure the ISO staging tree exists before writing the initrd into it. iso/ is
+# gitignored and is normally present from a prior build, but a cleaned/wiped tree
+# (or a stray tool that removed build artifacts) would otherwise make the tar -cf
+# below fail with "Cannot open: No such file or directory" and abort the build.
+mkdir -p iso/boot/grub
 ( cd /tmp/ird && tar --format=ustar --owner=0 --group=0 -cf /mnt/c/Users/wilde/Desktop/Kernel/iso/boot/initrd.img . )
 
 echo "[all] installing fresh kernel into ISO tree..."
-cp build/kernel.elf iso/boot/kernel.elf
+# Kernel selection. Write-combining is always compiled into the default kernel
+# (fb_enable_write_combining runs at boot, bails safely if no free MTRR).
+# FB_WC=1 is no longer needed -- kept as a no-op for back-compat.
+KERNEL_FOR_ISO="build/kernel.elf"
+# SMP=1 installs the SMP_FOUNDATION kernel (build/kernel-smp.elf from
+# `SMP=1 bash scripts/quick_build.sh`) so the desktop runs on the multi-core kernel
+# (needs QEMU -smp 2 / real >=2-core hardware).
+if [ "${SMP:-0}" = "1" ]; then
+    KERNEL_FOR_ISO="build/kernel-smp.elf"
+    if [ ! -f "$KERNEL_FOR_ISO" ]; then
+        echo "*** SMP=1 but $KERNEL_FOR_ISO missing -- run 'SMP=1 bash scripts/quick_build.sh' first ***"
+        exit 1
+    fi
+    echo "*** SMP build: installing SMP_FOUNDATION kernel $KERNEL_FOR_ISO into ISO ***"
+fi
+cp "$KERNEL_FOR_ISO" iso/boot/kernel.elf
+
+# Write grub.cfg fresh each build. iso/ is gitignored, so build_all.sh is the
+# tracked source of truth for the boot config. gfxpayload requests the T410's
+# native 1280x800 first, then falls back (1024x768 -> auto) so a framebuffer is
+# always set even on a VBE that lacks native. Pairs with boot.asm's multiboot
+# header video request (also 1280x800).
+echo "[all] writing grub.cfg (native-res request + fallback chain)..."
+mkdir -p iso/boot/grub
+cat > iso/boot/grub/grub.cfg <<'GRUBCFG'
+set timeout=0
+set default=0
+
+menuentry 'AutomationOS' {
+    set gfxpayload=1280x800x32,1280x800,1024x768x32,1024x768,auto
+    multiboot /boot/kernel.elf
+    module /boot/initrd.img
+}
+GRUBCFG
 
 echo "[all] rebuilding ISO..."
 grub-mkrescue -o build/automationos.iso iso/ 2>/dev/null

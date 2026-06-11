@@ -191,11 +191,13 @@ static int decode_entity(const char **pp, const char *end, char *out /* >=4 */)
                 else if (c >= 'A' && c <= 'F') d = c - 'A' + 10;
                 else break;
                 val = val * 16 + (unsigned long)d;
+                if (val >= 0x110000) val = 0x110000; /* cap at Unicode max+1 */
                 q++;
             }
         } else {
             while (q < end && *q >= '0' && *q <= '9') {
                 val = val * 10 + (unsigned long)(*q - '0');
+                if (val >= 0x110000) val = 0x110000; /* cap at Unicode max+1 */
                 q++;
             }
         }
@@ -954,11 +956,16 @@ static const char *attr_value(const struct dom_node *el, const char *name)
     return 0;
 }
 
-static void collect_scripts(const struct dom_node *n,
+/* Maximum recursion depth for collect_scripts to prevent stack overflow
+ * on pathologically deep DOM trees. */
+#define COLLECT_SCRIPTS_MAX_DEPTH 256
+
+static void collect_scripts_r(const struct dom_node *n,
                             char ***srcs_out, int *srcs_cap, int *srcs_len,
-                            char ***inl_out,  int *inl_cap,  int *inl_len)
+                            char ***inl_out,  int *inl_cap,  int *inl_len,
+                            int depth)
 {
-    if (!n) return;
+    if (!n || depth >= COLLECT_SCRIPTS_MAX_DEPTH) return;
     if (n->type == DOM_NODE_ELEMENT && n->tag && strcmp(n->tag, "script") == 0) {
         const char *src = attr_value(n, "src");
         if (src && src[0]) {
@@ -992,8 +999,16 @@ static void collect_scripts(const struct dom_node *n,
         }
     }
     for (struct dom_node *c = n->first_child; c; c = c->next_sibling) {
-        collect_scripts(c, srcs_out, srcs_cap, srcs_len, inl_out, inl_cap, inl_len);
+        collect_scripts_r(c, srcs_out, srcs_cap, srcs_len, inl_out, inl_cap, inl_len, depth + 1);
     }
+}
+
+/* Public-facing wrapper that starts recursion at depth 0. */
+static void collect_scripts(const struct dom_node *n,
+                            char ***srcs_out, int *srcs_cap, int *srcs_len,
+                            char ***inl_out,  int *inl_cap,  int *inl_len)
+{
+    collect_scripts_r(n, srcs_out, srcs_cap, srcs_len, inl_out, inl_cap, inl_len, 0);
 }
 
 char **html_get_script_srcs(const struct dom_document *doc, int *count_out)

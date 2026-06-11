@@ -381,8 +381,8 @@ static void cmd_ip(void)
     char buf[20];
 
     /* link status */
-    cur_color = info.link_up ? OK_COLOR : ERROR_COLOR;
-    grid_puts(info.link_up ? "Link: UP\n" : "Link: DOWN\n");
+    cur_color = info.up ? OK_COLOR : ERROR_COLOR;
+    grid_puts(info.up ? "Link: UP\n" : "Link: DOWN\n");
     cur_color = FG_COLOR;
 
     /* IP */

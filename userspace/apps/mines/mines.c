@@ -193,6 +193,14 @@ static int revealed_count = 0;        /* non-mine cells revealed */
 /* Previous pointer info for right-click edge detection. */
 static i32 prev_buttons = 0;
 
+/* Live surface geometry, refreshed from win->{w,h,stride} every frame so a
+ * compositor resize (Maximize/snap) never leaves us writing past the buffer
+ * with a stale stride.  The board is a FIXED WIN_W x WIN_H canvas; on a larger
+ * window we letterbox (clear the margins) and on a smaller window every write
+ * is clipped to these live bounds so we cannot overflow. */
+static i32 g_clip_w = WIN_W;   /* current buffer width  in pixels */
+static i32 g_clip_h = WIN_H;   /* current buffer height in pixels */
+
 /* -----------------------------------------------------------------------
  * Drawing primitives.
  * --------------------------------------------------------------------- */
@@ -200,10 +208,10 @@ static void fill_rect(u32 *buf, u32 stride_px,
                       i32 x, i32 y, i32 w, i32 h, u32 color)
 {
     for (i32 yy = y; yy < y + h; yy++) {
-        if (yy < 0 || yy >= (i32)WIN_H) continue;
+        if (yy < 0 || yy >= g_clip_h) continue;
         u32 *row = buf + (u32)yy * stride_px;
         for (i32 xx = x; xx < x + w; xx++) {
-            if (xx < 0 || xx >= (i32)WIN_W) continue;
+            if (xx < 0 || xx >= g_clip_w) continue;
             row[xx] = color;
         }
     }
@@ -266,7 +274,7 @@ static void draw_mine_symbol(u32 *buf, u32 stride_px, i32 cx, i32 cy)
         for (i32 dx = -r; dx <= r; dx++) {
             if (dx*dx + dy*dy <= r*r) {
                 i32 px = cx + dx, py = cy + dy;
-                if (px >= 0 && px < (i32)WIN_W && py >= 0 && py < (i32)WIN_H)
+                if (px >= 0 && px < g_clip_w && py >= 0 && py < g_clip_h)
                     buf[(u32)py * stride_px + (u32)px] = C_BLACK;
             }
         }
@@ -278,7 +286,7 @@ static void draw_mine_symbol(u32 *buf, u32 stride_px, i32 cx, i32 cy)
         };
         for (int p = 0; p < 4; p++) {
             i32 px = pts[p][0], py = pts[p][1];
-            if (px >= 0 && px < (i32)WIN_W && py >= 0 && py < (i32)WIN_H)
+            if (px >= 0 && px < g_clip_w && py >= 0 && py < g_clip_h)
                 buf[(u32)py * stride_px + (u32)px] = C_BLACK;
         }
     }
@@ -290,13 +298,13 @@ static void draw_mine_symbol(u32 *buf, u32 stride_px, i32 cx, i32 cy)
         };
         for (int p = 0; p < 4; p++) {
             i32 px = pts[p][0], py = pts[p][1];
-            if (px >= 0 && px < (i32)WIN_W && py >= 0 && py < (i32)WIN_H)
+            if (px >= 0 && px < g_clip_w && py >= 0 && py < g_clip_h)
                 buf[(u32)py * stride_px + (u32)px] = C_BLACK;
         }
     }
     /* Highlight dot */
     i32 hx = cx - 2, hy = cy - 2;
-    if (hx >= 0 && hy >= 0 && hx < (i32)WIN_W && hy < (i32)WIN_H)
+    if (hx >= 0 && hy >= 0 && hx < g_clip_w && hy < g_clip_h)
         buf[(u32)hy * stride_px + (u32)hx] = C_WHITE;
 }
 
@@ -306,7 +314,7 @@ static void draw_flag_symbol(u32 *buf, u32 stride_px, i32 cx, i32 cy)
     /* Pole: vertical line */
     for (i32 i = -10; i <= 6; i++) {
         i32 py = cy + i;
-        if (py >= 0 && py < (i32)WIN_H && cx >= 0 && cx < (i32)WIN_W)
+        if (py >= 0 && py < g_clip_h && cx >= 0 && cx < g_clip_w)
             buf[(u32)py * stride_px + (u32)cx] = C_BLACK;
     }
     /* Flag triangle */
@@ -314,14 +322,14 @@ static void draw_flag_symbol(u32 *buf, u32 stride_px, i32 cx, i32 cy)
         i32 py = cy - 10 + row;
         for (i32 col = 0; col <= row && col < 8; col++) {
             i32 px = cx + 1 + col;
-            if (px >= 0 && px < (i32)WIN_W && py >= 0 && py < (i32)WIN_H)
+            if (px >= 0 && px < g_clip_w && py >= 0 && py < g_clip_h)
                 buf[(u32)py * stride_px + (u32)px] = C_FLAG;
         }
     }
     /* Base */
     for (i32 dx = -4; dx <= 4; dx++) {
         i32 px = cx + dx, py = cy + 7;
-        if (px >= 0 && px < (i32)WIN_W && py >= 0 && py < (i32)WIN_H)
+        if (px >= 0 && px < g_clip_w && py >= 0 && py < g_clip_h)
             buf[(u32)py * stride_px + (u32)px] = C_BLACK;
     }
 }
@@ -352,7 +360,7 @@ static void render_cell(u32 *buf, u32 stride_px, int row, int col, int show_mine
                 /* Center text: FONT_W=8, FONT_H=16 */
                 i32 tx = x + (CELL_SIZE - FONT_W) / 2;
                 i32 ty = y + (CELL_SIZE - FONT_H) / 2;
-                font_draw_string(buf, (int)stride_px, WIN_W, WIN_H,
+                font_draw_string(buf, (int)stride_px, g_clip_w, g_clip_h,
                                  tx, ty, nbuf, NUM_COLOR[num]);
             }
         }
@@ -384,7 +392,7 @@ static void render_header(u32 *buf, u32 stride_px)
     int remaining = NUM_MINES - flags_placed;
     char cbuf[12];
     itoa(remaining, cbuf);
-    font_draw_string(buf, (int)stride_px, WIN_W, WIN_H,
+    font_draw_string(buf, (int)stride_px, g_clip_w, g_clip_h,
                      6, HEADER_H/2 - FONT_H/2, cbuf, 0xFFFF4444u);
 
     /* Status / restart button (center) */
@@ -409,7 +417,7 @@ static void render_header(u32 *buf, u32 stride_px)
     vline(buf, stride_px, BTN_X+BTN_W-1, BTN_Y,          BTN_H, C_SHADOW);
 
     int lw = font_text_width(label);
-    font_draw_string(buf, (int)stride_px, WIN_W, WIN_H,
+    font_draw_string(buf, (int)stride_px, g_clip_w, g_clip_h,
                      BTN_X + (BTN_W - lw) / 2,
                      BTN_Y + (BTN_H - FONT_H) / 2,
                      label, btn_text_color);
@@ -417,9 +425,27 @@ static void render_header(u32 *buf, u32 stride_px)
 
 /* -----------------------------------------------------------------------
  * Full redraw.
+ *
+ * Re-reads the live surface geometry from `win` so a compositor resize is
+ * handled with zero stale state: stride is recomputed, the clip bounds are
+ * refreshed, and the WHOLE buffer is cleared to black first (letterbox) so
+ * the margins around the fixed WIN_W x WIN_H board are never garbage.  The
+ * board is then drawn at the top-left; every primitive clips to g_clip_w/h.
  * --------------------------------------------------------------------- */
-static void render_all(u32 *buf, u32 stride_px)
+static void render_all(wl_window *win)
 {
+    u32 stride_px = win->stride / 4u;
+
+    /* Live clip bounds: clamp so a SMALLER window can never overflow the
+     * fixed-canvas blit, and a LARGER window gets its full surface cleared. */
+    g_clip_w = (i32)win->w;
+    g_clip_h = (i32)win->h;
+
+    u32 *buf = win->pixels;
+
+    /* Clear the FULL current surface (letterbox margins) before drawing. */
+    fill_rect(buf, stride_px, 0, 0, g_clip_w, g_clip_h, C_BLACK);
+
     int show_mines = (game_state == GS_LOSE);
     render_header(buf, stride_px);
     for (int r = 0; r < ROWS; r++)
@@ -633,10 +659,8 @@ void _start(void)
         for (;;) sc(SYS_YIELD, 0, 0, 0);
     }
 
-    u32 stride_px = win->stride / 4u;
-
     board_reset();
-    render_all(win->pixels, stride_px);
+    render_all(win);   /* reads live win->{w,h,stride,pixels} */
     wl_commit(win);
 
     /* Main event loop. */
@@ -645,6 +669,14 @@ void _start(void)
         int dirty = 0;
 
         while (wl_poll_event(win, &kind, &ea, &eb, &ec)) {
+            if (kind == WL_EVENT_RESIZE) {
+                /* The library already reallocated the buffer and updated
+                 * win->{w,h,stride,pixels}.  We just need a full redraw:
+                 * render_all() re-reads the live geometry, clears the WHOLE
+                 * new surface (letterbox margins) and re-blits the board. */
+                dirty = 1;
+                continue;
+            }
             if (kind != WL_EVENT_POINTER) continue;
 
             i32 mx      = (i32)ea;
@@ -686,7 +718,7 @@ void _start(void)
         }
 
         if (dirty) {
-            render_all(win->pixels, stride_px);
+            render_all(win);   /* re-reads live geometry; safe after resize */
             wl_commit(win);
         }
 

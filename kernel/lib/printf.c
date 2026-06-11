@@ -102,8 +102,10 @@ static int buf_print_signed(kbuf_t* b, int64_t val, int min_width, char pad_char
     if (val < 0) {
         buf_putc(b, '-');
         count++;
-        val = -val;
         if (min_width > 0) min_width--;
+        /* unsigned negate is UB-free for INT64_MIN (where -val would overflow) */
+        count += buf_print_number_padded(b, -(uint64_t)val, 10, min_width, pad_char, 0);
+        return count;
     }
     count += buf_print_number_padded(b, (uint64_t)val, 10, min_width, pad_char, 0);
     return count;
@@ -134,6 +136,11 @@ int kprintf(const char* format, ...) {
 
         /* --- flags --- */
         char pad_char = ' ';
+        int left_align = 0;
+        if (*p == '-') {
+            left_align = 1;
+            p++;
+        }
         if (*p == '0') {
             pad_char = '0';
             p++;
@@ -182,13 +189,22 @@ int kprintf(const char* format, ...) {
                 const char* str = __builtin_va_arg(args, const char*);
                 if (!str) str = "(null)";
                 int slen = (int)strlen(str);
-                /* Right-pad with spaces to width before the string */
-                for (int i = slen; i < width; i++) {
-                    buf_putc(&b, ' ');
-                    count++;
+                if (!left_align) {
+                    /* Right-align: pad with spaces before the string */
+                    for (int i = slen; i < width; i++) {
+                        buf_putc(&b, ' ');
+                        count++;
+                    }
                 }
                 buf_write(&b, str, (size_t)slen);
                 count += slen;
+                if (left_align) {
+                    /* Left-align: pad with spaces after the string */
+                    for (int i = slen; i < width; i++) {
+                        buf_putc(&b, ' ');
+                        count++;
+                    }
+                }
                 break;
             }
             case 'c': {
@@ -277,9 +293,36 @@ int kprintf(const char* format, ...) {
 
     __builtin_va_end(args);
 
+#ifdef SMP_BATCH
+    /* SMP-F3-7: cross-CPU serial LINE lock. With BATCH-class work live on
+     * CPU1, both CPUs kprintf concurrently and the per-byte UART interleave
+     * SHREDS whole lines ("[INIT] Process 16 exited with status [SYSCALL]
+     * sys_stat...") -- which destroyed acceptance evidence (the batchdemo
+     * reap line) before it destroyed anything else. Each formatted line is
+     * already ONE buffer; serializing the single serial_write below makes
+     * lines atomic across CPUs. BOUNDED + best-effort: a same-CPU IRQ that
+     * kprintfs while this CPU holds the lock must not self-deadlock, so on
+     * spin exhaustion we proceed UNSERIALIZED (= today's behavior, a
+     * shredded line) rather than hang. Gated so every non-BATCH build keeps
+     * byte-identical printf.c code. */
+    {
+        static volatile uint32_t kprintf_line_lock = 0;
+        uint64_t spins = 0;
+        int got = 1;
+        while (__atomic_test_and_set(&kprintf_line_lock, __ATOMIC_ACQUIRE)) {
+            if (++spins > 3000000ULL) { got = 0; break; }
+            __asm__ volatile("pause" ::: "memory");
+        }
+        if (b.pos > 0)
+            serial_write(b.buf, b.pos);
+        if (got)
+            __atomic_clear(&kprintf_line_lock, __ATOMIC_RELEASE);
+    }
+#else
     /* Single batched write — one LSR poll loop amortised over the whole line */
     if (b.pos > 0)
         serial_write(b.buf, b.pos);
+#endif
 
     return count;
 }

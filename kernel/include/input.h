@@ -87,6 +87,8 @@ typedef enum {
 #define KEY_F10             68
 #define KEY_NUMLOCK         69
 #define KEY_SCROLLLOCK      70
+#define KEY_F11             87
+#define KEY_F12             88
 
 // Relative Axes (for mouse)
 #define REL_X               0
@@ -227,6 +229,12 @@ void input_report_rel(input_device_t* dev, uint16_t axis, int32_t value);
 void input_report_abs(input_device_t* dev, uint16_t axis, int32_t value);
 void input_sync(input_device_t* dev);
 int input_get_event(input_event_t* event);
+
+// Stuck-key prevention: release all currently tracked held keys.
+void input_release_all_keys(input_device_t* dev);
+
+// Return the cumulative count of dropped events (overflow).
+uint32_t input_get_overflow_count(void);
 
 // Event device (evdev) interface
 void evdev_init(void);

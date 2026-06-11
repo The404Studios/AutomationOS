@@ -140,7 +140,6 @@ typedef struct {
     u8  hour;
     u8  min;
     u8  sec;
-    u8  _pad;
 } rtc_time_t;
 
 /* =========================================================================
@@ -183,14 +182,23 @@ typedef struct {
 
 /* =========================================================================
  * Drawing primitives.
+ *
+ * Live clip bounds: these track the CURRENT window size (win->w/win->h) and
+ * are refreshed every frame (and on WL_EVENT_RESIZE) before any drawing. All
+ * pixel writes clamp to these so a resize to a smaller window can never run
+ * past the reallocated buffer, and a larger window is fully painted.
+ * The fixed 420x420 layout is letterboxed inside this live surface.
  * ========================================================================= */
+static i32 g_clip_w = WIN_W;
+static i32 g_clip_h = WIN_H;
+
 static void fill_rect(u32 *buf, u32 stride_px,
                       i32 x, i32 y, i32 w, i32 h, u32 color)
 {
     i32 x1 = x < 0 ? 0 : x;
     i32 y1 = y < 0 ? 0 : y;
-    i32 x2 = x + w; if (x2 > WIN_W) x2 = WIN_W;
-    i32 y2 = y + h; if (y2 > WIN_H) y2 = WIN_H;
+    i32 x2 = x + w; if (x2 > g_clip_w) x2 = g_clip_w;
+    i32 y2 = y + h; if (y2 > g_clip_h) y2 = g_clip_h;
     for (i32 yy = y1; yy < y2; yy++) {
         u32 *row = buf + (u32)yy * stride_px;
         for (i32 xx = x1; xx < x2; xx++)
@@ -219,10 +227,10 @@ static void draw_border(u32 *buf, u32 stride_px,
     vline(buf, stride_px, x + w - 1, y, h, color);
 }
 
-/* Set a pixel (clamped). */
+/* Set a pixel (clamped to live bounds). */
 static void pset(u32 *buf, u32 stride_px, i32 x, i32 y, u32 color)
 {
-    if (x < 0 || x >= WIN_W || y < 0 || y >= WIN_H) return;
+    if (x < 0 || x >= g_clip_w || y < 0 || y >= g_clip_h) return;
     buf[(u32)y * stride_px + (u32)x] = color;
 }
 
@@ -305,7 +313,7 @@ static void fill_circle_large(u32 *buf, u32 stride_px,
     i32 r2 = r * r;
     for (i32 dy = -r; dy <= r; dy++) {
         i32 y = cy + dy;
-        if (y < 0 || y >= WIN_H) continue;
+        if (y < 0 || y >= g_clip_h) continue;
         /* compute dx range: dx^2 <= r2 - dy^2 */
         i32 lim = r2 - dy*dy;
         /* integer sqrt approximation (Newton) */
@@ -416,12 +424,33 @@ void _start(void)
     int kind, ea, eb, ec;
     for (;;) {
 
+        /* ---- Refresh live geometry every frame ----
+         * The fixed 420x420 layout is letterboxed inside the current window
+         * surface. win->pixels is read fresh in every draw call below, so we
+         * only need to re-cache stride and the clip bounds here; this also
+         * covers the case where a WL_EVENT_RESIZE was handled this frame. */
+        stride_px = win->stride / 4u;
+        g_clip_w  = (i32)win->w;
+        g_clip_h  = (i32)win->h;
+
         /* ---- Current displayed time ---- */
         i64 now_tick = sc(SYS_GET_TICKS_MS, 0, 0, 0);
         i64 disp_ms  = elapsed_ms + (running ? (now_tick - start_tick) : 0);
 
         /* ---- Drain events ---- */
         while (wl_poll_event(win, &kind, &ea, &eb, &ec)) {
+
+            if (kind == WL_EVENT_RESIZE) {
+                /* Library already reallocated the buffer and updated
+                 * win->{w,h,stride,pixels}. Just re-cache stride + clip
+                 * bounds so every subsequent write stays in-bounds; the
+                 * next frame re-letterboxes the fixed layout and clears
+                 * the full new surface. */
+                stride_px = win->stride / 4u;
+                g_clip_w  = (i32)win->w;
+                g_clip_h  = (i32)win->h;
+                continue;
+            }
 
             if (kind == WL_EVENT_KEY && ec == 0 /* check b=pressed */) {
                 /* eb = pressed flag */
@@ -511,8 +540,9 @@ void _start(void)
          * RENDER
          * ================================================================== */
 
-        /* Background */
-        fill_rect(win->pixels, stride_px, 0, 0, WIN_W, WIN_H, COL_BG);
+        /* Background: clear the FULL live surface (letterbox margins included)
+         * so a Maximize/snap to a larger window leaves no stale garbage. */
+        fill_rect(win->pixels, stride_px, 0, 0, g_clip_w, g_clip_h, COL_BG);
 
         /* ---- Tab bar ---- */
         /* Stopwatch tab */
@@ -524,7 +554,7 @@ void _start(void)
             int tw = font_text_width(lbl);
             int tx = TAB_SW_X + (TAB_SW_W - tw) / 2;
             int ty = (TAB_H - FONT_H) / 2;
-            font_draw_string(win->pixels, (int)stride_px, WIN_W, WIN_H,
+            font_draw_string(win->pixels, (int)stride_px, g_clip_w, g_clip_h,
                              tx, ty, lbl, COL_TEXT);
         }
         /* Active indicator bar */
@@ -541,7 +571,7 @@ void _start(void)
                 int tw = font_text_width(lbl);
                 int tx = TAB_CL_X + (TAB_CL_W - tw) / 2;
                 int ty = (TAB_H - FONT_H) / 2;
-                font_draw_string(win->pixels, (int)stride_px, WIN_W, WIN_H,
+                font_draw_string(win->pixels, (int)stride_px, g_clip_w, g_clip_h,
                                  tx, ty, lbl, COL_TEXT);
             }
             if (tab == TAB_CLOCK)
@@ -619,7 +649,7 @@ void _start(void)
                             running ? COL_ACCENT_RUN : COL_SEP);
                 const char *lbl = running ? "STOP" : "START";
                 int lw = font_text_width(lbl);
-                font_draw_string(win->pixels, (int)stride_px, WIN_W, WIN_H,
+                font_draw_string(win->pixels, (int)stride_px, g_clip_w, g_clip_h,
                                  BTN_SS_X + (BTN_SS_W - lw) / 2,
                                  BTN_Y + (BTN_H - FONT_H) / 2,
                                  lbl,
@@ -633,7 +663,7 @@ void _start(void)
                             BTN_RS_X, BTN_Y, BTN_RS_W, BTN_H, COL_SEP);
                 const char *lbl = "RESET";
                 int lw = font_text_width(lbl);
-                font_draw_string(win->pixels, (int)stride_px, WIN_W, WIN_H,
+                font_draw_string(win->pixels, (int)stride_px, g_clip_w, g_clip_h,
                                  BTN_RS_X + (BTN_RS_W - lw) / 2,
                                  BTN_Y + (BTN_H - FONT_H) / 2,
                                  lbl, COL_BTN_TXT);
@@ -648,7 +678,7 @@ void _start(void)
                 const char *lbl = "LAP";
                 int lw = font_text_width(lbl);
                 u32 ltxt = (running && lap_count < MAX_LAPS) ? COL_BTN_TXT : COL_TEXT_DIM;
-                font_draw_string(win->pixels, (int)stride_px, WIN_W, WIN_H,
+                font_draw_string(win->pixels, (int)stride_px, g_clip_w, g_clip_h,
                                  BTN_LP_X + (BTN_LP_W - lw) / 2,
                                  BTN_Y + (BTN_H - FONT_H) / 2,
                                  lbl, ltxt);
@@ -658,9 +688,9 @@ void _start(void)
             int lap_y0 = BTN_Y + BTN_H + 14;
             if (lap_count > 0) {
                 /* Header */
-                font_draw_string(win->pixels, (int)stride_px, WIN_W, WIN_H,
+                font_draw_string(win->pixels, (int)stride_px, g_clip_w, g_clip_h,
                                  24, lap_y0, "LAP", COL_TEXT_DIM);
-                font_draw_string(win->pixels, (int)stride_px, WIN_W, WIN_H,
+                font_draw_string(win->pixels, (int)stride_px, g_clip_w, g_clip_h,
                                  WIN_W - 100, lap_y0, "TIME", COL_TEXT_DIM);
                 hline(win->pixels, stride_px,
                       20, lap_y0 + FONT_H + 2, WIN_W - 40, COL_SEP);
@@ -677,13 +707,13 @@ void _start(void)
                     nbuf[0] = 'L'; nbuf[1] = 'a'; nbuf[2] = 'p'; nbuf[3] = ' ';
                     int_to_dec(nbuf + 4, li + 1, 2);
                     nbuf[6] = '\0';
-                    font_draw_string(win->pixels, (int)stride_px, WIN_W, WIN_H,
+                    font_draw_string(win->pixels, (int)stride_px, g_clip_w, g_clip_h,
                                      28, ry + 1, nbuf, COL_TEXT_DIM);
                     /* Lap time */
                     char ltbuf[16];
                     ms_to_mmsscs(ltbuf, lap_ms[li]);
                     int ltw = font_text_width(ltbuf);
-                    font_draw_string(win->pixels, (int)stride_px, WIN_W, WIN_H,
+                    font_draw_string(win->pixels, (int)stride_px, g_clip_w, g_clip_h,
                                      WIN_W - 20 - ltw, ry + 1, ltbuf, COL_LAP_TXT);
                 }
             }
@@ -735,7 +765,7 @@ void _start(void)
                 int_to_dec(dbuf + 8, (i32)rtc.day, 2);
                 dbuf[10] = '\0';
                 int dtw = font_text_width(dbuf);
-                font_draw_string(win->pixels, (int)stride_px, WIN_W, WIN_H,
+                font_draw_string(win->pixels, (int)stride_px, g_clip_w, g_clip_h,
                                  (WIN_W - dtw) / 2,
                                  ty + FONT_H * scale + 4,
                                  dbuf, COL_TEXT_DIM);

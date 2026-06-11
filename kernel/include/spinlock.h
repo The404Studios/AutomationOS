@@ -6,22 +6,30 @@
 // Spinlock structure (must be initialized to 0/unlocked)
 typedef struct {
     volatile uint32_t lock;
-    uint32_t owner_cpu;             // CPU that owns the lock
-    const char* name;               // Lock name for debugging
+#ifdef SPINLOCK_DEBUG
+    uint32_t owner_cpu;             // CPU that owns the lock (debug only)
+    const char* name;               // Lock name for debugging (debug only)
+#endif
 } spinlock_t;
 
 // Initialize spinlock
 static inline void spin_lock_init(spinlock_t* lock) {
     lock->lock = 0;
+#ifdef SPINLOCK_DEBUG
     lock->owner_cpu = 0xFFFFFFFF;
     lock->name = NULL;
+#endif
 }
 
 // Initialize named spinlock
 static inline void spin_lock_init_named(spinlock_t* lock, const char* name) {
     lock->lock = 0;
+#ifdef SPINLOCK_DEBUG
     lock->owner_cpu = 0xFFFFFFFF;
     lock->name = name;
+#else
+    (void)name;
+#endif
 }
 
 // Acquire spinlock (busy-wait until acquired)
@@ -40,7 +48,9 @@ static inline bool spin_trylock(spinlock_t* lock) {
 
 // Release spinlock
 static inline void spin_unlock(spinlock_t* lock) {
+#ifdef SPINLOCK_DEBUG
     lock->owner_cpu = 0xFFFFFFFF;
+#endif
     __atomic_clear(&lock->lock, __ATOMIC_RELEASE);
 }
 

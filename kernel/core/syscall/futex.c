@@ -70,11 +70,13 @@
 #define FUTEX_HASHSIZE  (1 << FUTEX_HASHBITS)
 #define FUTEX_HASHMASK  (FUTEX_HASHSIZE - 1)
 
-// Per-bucket futex wait queue
+// Per-bucket futex wait queue. The bucket holds ONLY the wait_object queue: all
+// serialization (value test + enqueue + wake) is on the wait_object's own lock
+// (wq.wobj.lock), so wait and wake share a single lock domain (FUTEX-A). The old
+// per-bucket spinlock (only ever guarded the value test, on a DIFFERENT lock than the
+// enqueue) and the `addr` scalar (written, never read) were both vestigial and removed.
 typedef struct futex_bucket {
     wait_queue_t wq;
-    spinlock_t lock;
-    uint64_t addr;      // Physical address of futex word (for collision detection)
 } futex_bucket_t;
 
 // Global futex hash table
@@ -85,8 +87,6 @@ static int futex_initialized = 0;
 void futex_init(void) {
     for (int i = 0; i < FUTEX_HASHSIZE; i++) {
         wq_init(&futex_table[i].wq);
-        spin_lock_init(&futex_table[i].lock);
-        futex_table[i].addr = 0;
     }
     futex_initialized = 1;
     kprintf("[FUTEX] Initialized futex subsystem (%d hash buckets)\n", FUTEX_HASHSIZE);
@@ -129,28 +129,35 @@ static uint64_t futex_get_phys_addr(void* uaddr) {
     uint64_t virt = (uint64_t)uaddr;
     uint64_t cr3 = read_cr3() & ~0xFFFULL;
 
+    // Require PAGE_USER as well as PAGE_PRESENT at every level: a futex word must be in
+    // a USER-accessible page. Without this, a present-but-kernel-only or PROT_NONE page
+    // in the user VA range would resolve to a physical address the process must not be
+    // able to wait/wake on (it could then park on, or be woken via, a frame outside its
+    // rights). Returning 0 here makes futex_wait/wake fail with EFAULT.
+    const uint64_t PUSER = PAGE_PRESENT | PAGE_USER;
+
     // PML4 index
     uint64_t pml4_idx = (virt >> 39) & 0x1FF;
     uint64_t* pml4 = (uint64_t*)cr3;
-    if (!(pml4[pml4_idx] & PAGE_PRESENT)) {
+    if ((pml4[pml4_idx] & PUSER) != PUSER) {
         return 0;
     }
 
     // PDPT index
     uint64_t pdpt_idx = (virt >> 30) & 0x1FF;
     uint64_t* pdpt = (uint64_t*)(pml4[pml4_idx] & ~0xFFFULL);
-    if (!(pdpt[pdpt_idx] & PAGE_PRESENT)) {
+    if ((pdpt[pdpt_idx] & PUSER) != PUSER) {
         return 0;
     }
 
     // PD index
     uint64_t pd_idx = (virt >> 21) & 0x1FF;
     uint64_t* pd = (uint64_t*)(pdpt[pdpt_idx] & ~0xFFFULL);
-    if (!(pd[pd_idx] & PAGE_PRESENT)) {
+    if ((pd[pd_idx] & PUSER) != PUSER) {
         return 0;
     }
 
-    // Check for 2MB huge page
+    // Check for 2MB huge page (PAGE_USER already verified at the PD level above)
     if (pd[pd_idx] & (1ULL << 7)) {
         uint64_t phys_base = pd[pd_idx] & ~0x1FFFFFULL;
         uint64_t offset = virt & 0x1FFFFF;
@@ -160,7 +167,7 @@ static uint64_t futex_get_phys_addr(void* uaddr) {
     // PT index (4KB page)
     uint64_t pt_idx = (virt >> 12) & 0x1FF;
     uint64_t* pt = (uint64_t*)(pd[pd_idx] & ~0xFFFULL);
-    if (!(pt[pt_idx] & PAGE_PRESENT)) {
+    if ((pt[pt_idx] & PUSER) != PUSER) {
         return 0;
     }
 
@@ -189,43 +196,27 @@ static int64_t futex_wait(int* uaddr, int val) {
     uint32_t bucket_idx = futex_hash(phys_addr);
     futex_bucket_t* bucket = &futex_table[bucket_idx];
 
-    // Acquire bucket lock
-    uint64_t flags;
-    spin_lock_irqsave(&bucket->lock, &flags);
-
-    // CRITICAL: Check value AFTER enqueuing to prevent lost wakeups
-    // If we checked before enqueuing, a wakeup could occur between the check
-    // and enqueue, causing us to sleep forever
-    //
-    // Correct ordering (Linux futex algorithm):
-    //   1. Enqueue on wait queue
-    //   2. Atomic load of *uaddr
-    //   3. If *uaddr != val: dequeue and return EAGAIN
-    //   4. Otherwise: release lock and sleep
-    //
-    // This ensures that any wakeup after we read the value will wake us.
-
-    // Read current value atomically
-    int current_val = __atomic_load_n(uaddr, __ATOMIC_SEQ_CST);
-
-    if (current_val != val) {
-        // Value changed, don't sleep
-        spin_unlock_irqrestore(&bucket->lock, flags);
-        return EAGAIN;  // Spurious wakeup / value mismatch
+    // CRITICAL ordering (FUTEX-A lost-wakeup fix): the value test, the enqueue, and the
+    // BLOCKED store must all happen under the SAME lock that futex_wake takes -- here the
+    // wait_object's own lock (bucket->wq.wobj.lock), which wo_pop_head_matching acquires.
+    // The old code tested *uaddr under a SEPARATE bucket->lock and then released it BEFORE
+    // wq_block_current linked the waiter (under wo->lock), so a wake landing in that gap
+    // found an empty queue and was lost (latent on cooperative-uniprocessor, live on
+    // SMP/PREEMPT). wait_object_prepare_futex does the test+link+BLOCKED atomically:
+    //   - returns 1: current is linked, tagged with phys_addr (FUTEX-B key), and BLOCKED
+    //     -> deschedule via wait_object_park_committed (no relink);
+    //   - returns 0: *uaddr already changed -> nothing linked, return EAGAIN.
+    // bucket->lock is no longer needed and has been removed.
+    if (!wait_object_prepare_futex(&bucket->wq.wobj, uaddr, val, phys_addr)) {
+        return EAGAIN;  // value mismatch -> do not sleep
     }
 
-    // Value matches, prepare to sleep
-    // Store physical address in bucket (for debugging / collision detection)
-    bucket->addr = phys_addr;
+    wait_object_park_committed(&bucket->wq.wobj);
 
-    // Release bucket lock before blocking
-    spin_unlock_irqrestore(&bucket->lock, flags);
-
-    // Block on wait queue
-    // This marks the process PROCESS_BLOCKED and switches to another process
-    wq_block_current(&bucket->wq);
-
-    // Resumed here after wakeup
+    // Resumed here after wakeup. Clear the futex key so a later non-futex block
+    // (waitpid/sleep) is never mistaken for a futex waiter.
+    process_t* self = process_get_current();
+    if (self) self->futex_key = 0;
     return 0;
 }
 
@@ -249,25 +240,24 @@ static int64_t futex_wake(int* uaddr, int nr_wake) {
     uint32_t bucket_idx = futex_hash(phys_addr);
     futex_bucket_t* bucket = &futex_table[bucket_idx];
 
-    // Wake up to nr_wake waiters
+    // Wake up to nr_wake waiters PARKED ON THIS ADDRESS. wq_wake_one_key filters by
+    // process_t.futex_key == phys_addr, so a waiter that hash-collided into this bucket
+    // on a different address is skipped (left blocked) rather than spuriously woken
+    // (FUTEX-B). INT32_MAX is the broadcast (wake-all-on-this-key) case.
     int woken = 0;
 
-    if (nr_wake == 1) {
-        // Common case: wake one waiter
-        if (wq_wake_one(&bucket->wq) != NULL) {
-            woken = 1;
+    if (nr_wake == INT32_MAX) {
+        // Wake all waiters on this key (not the whole bucket).
+        while (wq_wake_one_key(&bucket->wq, phys_addr) != NULL) {
+            woken++;
         }
-    } else if (nr_wake > 1) {
-        // Wake multiple waiters
+    } else if (nr_wake >= 1) {
         for (int i = 0; i < nr_wake; i++) {
-            if (wq_wake_one(&bucket->wq) == NULL) {
-                break;  // No more waiters
+            if (wq_wake_one_key(&bucket->wq, phys_addr) == NULL) {
+                break;  // No more matching waiters
             }
             woken++;
         }
-    } else if (nr_wake == INT32_MAX) {
-        // Wake all waiters (broadcast)
-        woken = wq_wake_all(&bucket->wq);
     }
 
     return woken;

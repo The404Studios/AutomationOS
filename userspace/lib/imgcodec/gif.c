@@ -261,12 +261,14 @@ int gif_decode(const unsigned char *data, unsigned long len,
             /* first code after a clear: must be a literal */
             if (code >= clear_code) return IMG_ERR_CORRUPT;
             first_byte = lzw_suffix[code];
+            if (sp >= GIF_MAX_CODES) return IMG_ERR_CORRUPT;   /* guard like 282/288 */
             lzw_stack[sp++] = (u8)first_byte;
             old_code = code;
         } else {
             int in_code = code;
             if (code >= next_code) {
                 /* KwKwK case: emit previous string + its first byte */
+                if (sp >= GIF_MAX_CODES) return IMG_ERR_CORRUPT;   /* guard like 282/288 */
                 lzw_stack[sp++] = (u8)first_byte;
                 code = old_code;
             }

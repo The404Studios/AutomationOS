@@ -8,6 +8,36 @@
 // External syscall entry point from syscall.asm
 extern void syscall_entry(void);
 
+#ifdef SMP_SCHED
+/* SMP scheduler Brick C: CPU1's own SYSCALL entry point (per-CPU LSTAR). See the
+ * long rationale in syscall.asm -- CPU0 uses syscall_entry (kernel_rsp_save_arr[0]),
+ * CPU1 uses this (kernel_rsp_save_arr[1]); no swapgs, no cross-CPU clobber. */
+extern void syscall_entry_cpu1(void);
+
+/* Initialize the AP's (CPU1's) SYSCALL/SYSRET MSRs. STAR/LSTAR/FMASK/EFER are
+ * PER-CPU, so the AP must program its own (the BSP's syscall_msr_init only set the
+ * BSP's). LSTAR points at syscall_entry_cpu1 so CPU1 loads kernel_rsp_save_arr[1].
+ * Called from ap_main() (Brick C) so CPU1 is ready the moment it runs ring-3 code
+ * (Brick F). Harmless now: CPU1 issues no SYSCALL until it dispatches a process. */
+void syscall_msr_init_ap(void) {
+    uint64_t efer = rdmsr(0xC0000080);          // IA32_EFER
+    efer |= 1;                                  // SCE (System Call Enable)
+    // NXE (No-Execute Enable, bit 11) is PER-CPU. The BSP enables it in paging_init,
+    // but the AP trampoline does NOT -- so without this, the NX bit (63) that the
+    // kernel sets on data mappings (incl. the higher-half DIRECT MAP) is a RESERVED
+    // bit on CPU1. CPU1 then takes a reserved-bit #PF the instant it reads a kmalloc'd
+    // offload operand via PHYS_TO_DIRECT in matmul_band_n (err=0x8 RESERVED-BIT) -- the
+    // smpstress crash long misattributed to a direct-map "alias" coherence problem.
+    efer |= (1ULL << 11);                       // NXE -- match the BSP
+    wrmsr(0xC0000080, efer);
+
+    uint64_t star = ((uint64_t)0x10 << 48) | ((uint64_t)0x08 << 32);
+    wrmsr(MSR_STAR, star);
+    wrmsr(MSR_LSTAR, (uint64_t)syscall_entry_cpu1);
+    wrmsr(MSR_FMASK, 0x200);                    // clear IF during syscall
+}
+#endif /* SMP_SCHED */
+
 void syscall_msr_init(void) {
     kprintf("[SYSCALL] Initializing SYSCALL/SYSRET MSRs...\n");
 
@@ -42,6 +72,9 @@ void syscall_msr_init(void) {
     uint64_t fmask = 0x200;  // Clear IF (bit 9)
     wrmsr(MSR_FMASK, fmask);
     kprintf("[SYSCALL]   IA32_FMASK = 0x%016llX (clear IF)\n", fmask);
+
+    /* Brick C note: the BSP's LSTAR is syscall_entry (kernel_rsp_save_arr[0]); CPU1
+     * sets its own LSTAR to syscall_entry_cpu1 in ap_main via syscall_msr_init_ap. */
 
     kprintf("[SYSCALL] SYSCALL/SYSRET MSRs initialized successfully\n");
 }

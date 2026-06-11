@@ -38,6 +38,15 @@ void tlb_handle_ipi_flush(void) {
     /* No IPIs on a single CPU. */
 }
 
+void tlb_flush_all_contexts_local(void) {
+    /* On single-CPU: just reload CR3 to flush all TLB entries. */
+    write_cr3(read_cr3());
+}
+
+void tlb_handle_ipi_flush_all_contexts(void) {
+    /* No IPIs on a single CPU. */
+}
+
 void tlb_print_stats(void) {
     kprintf("[TLB] single-CPU: no shootdown statistics\n");
 }

@@ -7,8 +7,33 @@
 
 #include <stdint.h>
 
-#define GFX_FW 8     /* font cell width  (bitfont 8x16) */
-#define GFX_FH 16    /* font cell height                */
+/* RUNTIME UI text scale. The base bitmap font is 8x16; the glyph cell is
+ * (8,16) * g_ui_pct/100, rendered via font2_draw_cell_clip (fractional, bounds-
+ * safe). Making these RUNTIME vars (not #defines) lets the user zoom the whole
+ * IDE live with Ctrl+mouse-wheel / Ctrl +/-/0 -- the layout reflows because every
+ * panel derives its geometry from GFX_FW/GFX_FH each frame. The macro aliases keep
+ * all ~150 existing call sites unchanged. Default 138% => an 11x22 cell (readable
+ * on a 1024x768 panel, between the too-small 8x16 and the too-big 16x32). */
+extern int g_ui_pct;     /* zoom percent of the 8x16 base, 50..250           */
+extern int g_gfx_fw;     /* current cell width  (4..20)                      */
+extern int g_gfx_fh;     /* current cell height (8..40)                      */
+void gfx_set_scale(int pct);   /* clamp pct to [50,250], recompute the cell   */
+#define GFX_FW g_gfx_fw
+#define GFX_FH g_gfx_fh
+
+/* IDE behaviour knobs (Settings panel). Runtime vars so changes apply live;
+ * defined in ide_gfx.c, edited via ide_inspector.c, persisted by ide_config.c. */
+extern int g_tab_width;    /* soft-tab / tab-stop width (>=1)                   */
+extern int g_blink_ms;     /* caret blink half-period (ms)                      */
+extern int g_ac_visible;   /* max autocomplete rows shown (<= AC_MAX_MATCHES)   */
+extern int g_ac_minpfx;    /* min typed prefix before the popup opens           */
+extern int g_map_pan_step; /* LEGO map keyboard pan step (px)                   */
+extern int g_autocomplete; /* 1 = autocomplete enabled                          */
+extern int g_anno_gutter;  /* 1 = code-view semantic annotation gutter          */
+extern int g_line_numbers; /* 1 = line-number gutter visible                    */
+extern int g_auto_indent;  /* 1 = auto-indent new lines                         */
+extern int g_live_reparse; /* 1 = re-parse model on every edit (experimental)   */
+extern int g_theme_mode;   /* 0 = dark (default); persisted, themed later        */
 
 typedef struct {
     uint32_t* px;    /* ARGB32 pixels        */

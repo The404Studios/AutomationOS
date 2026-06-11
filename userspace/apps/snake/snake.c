@@ -161,14 +161,24 @@ static u32 lcg_rand(void)
 
 /* ---- draw helpers ---- */
 
-/* fill_rect: pixel rectangle into ARGB32 buffer; stride_px = pixels/row */
+/*
+ * Letterbox clamp bounds, refreshed every frame from the live window so a
+ * SMALLER window cannot overflow the buffer and a LARGER window's margins
+ * are bounded by the real surface. The fixed 480x480 canvas is blitted at
+ * the top-left; writes are clamped to min(canvas, window).
+ */
+static i32 g_clip_w = WIN_W;   /* = min(WIN_W, win->w) */
+static i32 g_clip_h = WIN_H;   /* = min(WIN_H, win->h) */
+
+/* fill_rect: pixel rectangle into ARGB32 buffer; stride_px = pixels/row.
+ * Clamped to the current window via g_clip_w/g_clip_h (set per frame). */
 static void fill_rect(u32 *buf, u32 stride_px,
                       i32 x, i32 y, i32 w, i32 h, u32 color)
 {
     i32 x1 = x < 0 ? 0 : x;
     i32 y1 = y < 0 ? 0 : y;
-    i32 x2 = x + w; if (x2 > WIN_W) x2 = WIN_W;
-    i32 y2 = y + h; if (y2 > WIN_H) y2 = WIN_H;
+    i32 x2 = x + w; if (x2 > g_clip_w) x2 = g_clip_w;
+    i32 y2 = y + h; if (y2 > g_clip_h) y2 = g_clip_h;
     if (x1 >= x2 || y1 >= y2) return;
     for (i32 yy = y1; yy < y2; yy++) {
         u32 *row = buf + (u32)yy * stride_px;
@@ -295,9 +305,27 @@ static void game_tick(void)
 }
 
 /* ---- render ---- */
-static void render(u32 *buf, u32 stride_px)
+/*
+ * win_w/win_h/stride_px are the LIVE window geometry (re-read each frame).
+ * The play canvas is a fixed 480x480 grid blitted at the top-left; on a
+ * resized (maximized/snapped) window we letterbox: clear the WHOLE surface
+ * to the background so the margins around the canvas are never stale garbage.
+ */
+static void render(u32 *buf, u32 stride_px, i32 win_w, i32 win_h)
 {
-    /* 1. Clear full window. */
+    /* 0. Letterbox: paint the ENTIRE live surface to the background first so
+     *    margins beyond the fixed 480x480 canvas are clean. Bounded to the
+     *    live window using the live stride -- no overflow on a smaller window. */
+    {
+        i32 fw = win_w < 0 ? 0 : win_w;
+        i32 fh = win_h < 0 ? 0 : win_h;
+        for (i32 yy = 0; yy < fh; yy++) {
+            u32 *row = buf + (u32)yy * stride_px;
+            for (i32 xx = 0; xx < fw; xx++) row[xx] = COL_BG;
+        }
+    }
+
+    /* 1. Clear full window (canvas region, clamped to min(canvas,window)). */
     fill_rect(buf, stride_px, 0, 0, WIN_W, WIN_H, COL_BG);
 
     /* 2. HUD strip. */
@@ -314,7 +342,7 @@ static void render(u32 *buf, u32 stride_px)
         i32 nlen = fmt_u32(num, g_score);
         for (i32 i = 0; i < nlen; i++) score_str[n++] = num[i];
         score_str[n] = '\0';
-        font_draw_string(buf, (i32)stride_px, WIN_W, WIN_H,
+        font_draw_string(buf, (i32)stride_px, g_clip_w, g_clip_h,
                          4, 2, score_str, COL_WHITE);
     }
 
@@ -363,7 +391,7 @@ static void render(u32 *buf, u32 stride_px)
         i32 rw = font_text_width(restart_msg);
         i32 ry = WIN_H / 2;
 
-        font_draw_string(buf, (i32)stride_px, WIN_W, WIN_H,
+        font_draw_string(buf, (i32)stride_px, g_clip_w, g_clip_h,
                          (WIN_W - ow) / 2, ry - 20, over_msg, COL_RED);
 
         /* Final score line. */
@@ -376,11 +404,11 @@ static void render(u32 *buf, u32 stride_px)
             for (i32 i = 0; i < nlen; i++) final_score[n++] = num[i];
             final_score[n] = '\0';
             i32 sw = font_text_width(final_score);
-            font_draw_string(buf, (i32)stride_px, WIN_W, WIN_H,
+            font_draw_string(buf, (i32)stride_px, g_clip_w, g_clip_h,
                              (WIN_W - sw) / 2, ry, final_score, COL_YELLOW);
         }
 
-        font_draw_string(buf, (i32)stride_px, WIN_W, WIN_H,
+        font_draw_string(buf, (i32)stride_px, g_clip_w, g_clip_h,
                          (WIN_W - rw) / 2, ry + 20, restart_msg, COL_WHITE);
     }
 
@@ -394,9 +422,9 @@ static void render(u32 *buf, u32 stride_px)
         i32 pm_w = font_text_width(pause_msg);
         i32 rm_w = font_text_width(resume_msg);
         i32 mid_y = WIN_H / 2;
-        font_draw_string(buf, (i32)stride_px, WIN_W, WIN_H,
+        font_draw_string(buf, (i32)stride_px, g_clip_w, g_clip_h,
                          (WIN_W - pm_w) / 2, mid_y - 10, pause_msg, COL_YELLOW);
-        font_draw_string(buf, (i32)stride_px, WIN_W, WIN_H,
+        font_draw_string(buf, (i32)stride_px, g_clip_w, g_clip_h,
                          (WIN_W - rm_w) / 2, mid_y + 10, resume_msg, COL_WHITE);
     }
 }
@@ -418,6 +446,10 @@ void _start(void)
     }
 
     u32 stride_px = win->stride / 4u;
+
+    /* Letterbox clamp = min(fixed canvas, live window). Refreshed each frame. */
+    g_clip_w = (i32)win->w < WIN_W ? (i32)win->w : WIN_W;
+    g_clip_h = (i32)win->h < WIN_H ? (i32)win->h : WIN_H;
 
     /* Seed and init the game. */
     u64 now = (u64)sc(SYS_GET_TICKS_MS, 0, 0, 0, 0, 0, 0);
@@ -470,6 +502,15 @@ void _start(void)
                     }
                     break;
                 }
+            } else if (kind == WL_EVENT_RESIZE) {
+                /* The library has ALREADY reallocated the buffer and updated
+                 * win->{w,h,stride,pixels}. We keep the fixed 480x480 canvas
+                 * and letterbox it: just refresh our cached stride + clamp
+                 * bounds so the next render clears the full new surface and
+                 * never writes past the (possibly smaller) buffer. */
+                stride_px = win->stride / 4u;
+                g_clip_w = (i32)win->w < WIN_W ? (i32)win->w : WIN_W;
+                g_clip_h = (i32)win->h < WIN_H ? (i32)win->h : WIN_H;
             }
         }
 
@@ -489,8 +530,13 @@ void _start(void)
             }
         }
 
-        /* Render and commit. */
-        render(win->pixels, stride_px);
+        /* Render and commit. Re-read live geometry every frame so all pixel
+         * writes are bounded to the CURRENT win->w/h using the CURRENT stride
+         * (defends even if a resize lands without a polled event this frame). */
+        stride_px = win->stride / 4u;
+        g_clip_w = (i32)win->w < WIN_W ? (i32)win->w : WIN_W;
+        g_clip_h = (i32)win->h < WIN_H ? (i32)win->h : WIN_H;
+        render(win->pixels, stride_px, (i32)win->w, (i32)win->h);
         wl_commit(win);
 
         sc(SYS_YIELD, 0, 0, 0, 0, 0, 0);

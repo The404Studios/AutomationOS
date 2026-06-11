@@ -8,6 +8,219 @@
 #include "../include/drivers.h"
 #include "../include/types.h"
 
+/* =========================================================================
+ * Write-Combining (WC) framebuffer acceleration  --  always compiled
+ * =========================================================================
+ *
+ * WHY: On the ThinkPad T410 the firmware maps the linear framebuffer UNCACHED
+ * (UC). Every pixel store to a full-screen game therefore round-trips to the
+ * GPU as a single non-buffered write -> ~10 fps. Marking the FB region
+ * Write-Combining (WC) lets the CPU coalesce many small stores into burst
+ * writes across the PCIe link, which on real hardware is a multi-x speedup
+ * for the whole compositor/desktop.
+ *
+ * HOW: We program a single VARIABLE-RANGE MTRR (Memory Type Range Register)
+ * to cover the FB physical range with memory type WC (0x01). We find a FREE
+ * variable MTRR (PHYSMASK valid bit clear) so we never clobber a firmware
+ * MTRR that is already in use.
+ *
+ * SAFETY: The function bails cleanly if: base/size are zero, VCNT==0, the FB
+ * base is not power-of-two-alignable, or all variable MTRRs are already in
+ * use by firmware.  It never clobbers an occupied slot.  In QEMU the FB is
+ * already cached, so WC is redundant but harmless -- it only proves the code
+ * path runs and the kernel still boots cleanly.
+ *
+ * NOTE: MTRR overlap rules say UC WINS. If the firmware has already placed a
+ * variable (or fixed) MTRR marking this region UC, our WC MTRR will NOT take
+ * effect (the effective type stays UC). The serial log prints a reminder.
+ * ========================================================================= */
+
+#include "../include/kernel.h"   /* kprintf */
+#include "../include/x86_64.h"   /* rdmsr / wrmsr / read_cr0 / write_cr0 / cli / sti */
+
+/* --- IA32 MTRR MSR architecture (Intel SDM Vol 3A, 11.11) --------------- */
+#define IA32_MTRRCAP            0x000000FE  /* RO: VCNT (bits 7:0), FIX (10), WC (8), SMRR (11) */
+#define IA32_MTRR_DEF_TYPE      0x000002FF  /* default type + E (bit 11) + FE (bit 10)         */
+#define IA32_MTRR_PHYSBASE(n)   (0x00000200 + (n) * 2)  /* base | type (bits 7:0)              */
+#define IA32_MTRR_PHYSMASK(n)   (0x00000201 + (n) * 2)  /* mask | V (bit 11)                   */
+
+#define MTRR_TYPE_WC            0x01ULL     /* Write-Combining memory type    */
+#define MTRR_DEFTYPE_E          (1ULL << 11)/* MTRRs enable bit in DEF_TYPE   */
+#define MTRR_PHYSMASK_VALID     (1ULL << 11)/* "this variable MTRR is in use" */
+#define MTRR_PHYSBASE_ADDR_MASK 0xFFFFFFFFFFFFF000ULL  /* base address bits   */
+
+/* CR0.CD (bit 30) = Cache Disable, CR0.NW (bit 29) = Not-Write-through. The
+ * SDM MTRR-modification sequence requires CD=1,NW=0 (caches off) around the
+ * MSR writes, with a WBINVD before and after. */
+#define CR0_CD                  (1ULL << 30)
+#define CR0_NW                  (1ULL << 29)
+
+/* Round v UP to the next power of two (v assumed > 0 and <= 2^62). Returns v
+ * unchanged when it is already a power of two. */
+static uint64_t fb_wc_po2_up(uint64_t v) {
+    if (v == 0) return 1;
+    uint64_t p = 1;
+    while (p < v) {
+        p <<= 1;
+    }
+    return p;
+}
+
+/* Query the CPU's physical-address width via CPUID 0x80000008 (EAX bits 7:0).
+ * Returns a PHYSMASK with the low `maxphysaddr` bits set above bit 12, used to
+ * mask the MTRR PHYSMASK to the architectural width. Falls back to 36 bits
+ * (mask 0x0000000FFFFFF000) if the leaf is unsupported -- the conservative
+ * legacy default that is valid on virtually all x86_64 parts. */
+static uint64_t fb_wc_physmask_bits(void) {
+    uint32_t eax = 0, ebx = 0, ecx = 0, edx = 0;
+    uint8_t  phys_bits = 36;  /* safe default */
+
+    /* Is extended leaf 0x80000008 available? Check max extended leaf first. */
+    __asm__ volatile("cpuid"
+                     : "=a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx)
+                     : "a"(0x80000000U));
+    if (eax >= 0x80000008U) {
+        __asm__ volatile("cpuid"
+                         : "=a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx)
+                         : "a"(0x80000008U));
+        uint8_t reported = (uint8_t)(eax & 0xFF);
+        if (reported >= 32 && reported <= 52) {  /* sanity bound */
+            phys_bits = reported;
+        }
+    }
+
+    /* Mask = bits [phys_bits-1 : 12] set. */
+    uint64_t full = (phys_bits >= 64) ? ~0ULL : ((1ULL << phys_bits) - 1ULL);
+    return full & MTRR_PHYSBASE_ADDR_MASK;
+}
+
+/**
+ * fb_enable_write_combining -- mark [base, base+size) Write-Combining via a
+ * free variable-range MTRR.  Always compiled; runtime-safe.
+ *
+ * @param base  physical base of the framebuffer (e.g. 0xFD000000 on the T410)
+ * @param size  framebuffer byte size (pitch * height, ~4 MB at 1280x800x4)
+ *
+ * Steps (Intel SDM Vol 3A "MTRR Considerations"):
+ *   1. Read IA32_MTRRCAP to get VCNT (number of variable MTRRs).
+ *   2. Compute a power-of-two range that COVERS the FB and is BASE-ALIGNED to
+ *      that power of two (an MTRR requirement). If base is not aligned to the
+ *      chosen size, LOG and BAIL -- we never force a misaligned MTRR.
+ *   3. Find a FREE variable MTRR (PHYSMASK.V == 0); never clobber one in use.
+ *   4. Enter the no-caching window (CR0.CD=1, NW=0, WBINVD, disable MTRRs),
+ *      write PHYSBASE=base|WC and PHYSMASK=~(size-1)&physmask|V, then re-enable
+ *      MTRRs, WBINVD, restore CR0. Interrupts are disabled across the change.
+ *   5. Log the slot/base/size/type so the serial log proves it took.
+ */
+void fb_enable_write_combining(uint64_t base, uint64_t size) {
+    if (!base || !size) {
+        kprintf("[FB-WC] skip: invalid base/size (base=0x%lx size=0x%lx)\n",
+                (unsigned long)base, (unsigned long)size);
+        return;
+    }
+
+    /* --- 1. variable MTRR count --------------------------------------- */
+    uint64_t cap   = rdmsr(IA32_MTRRCAP);
+    uint32_t vcnt  = (uint32_t)(cap & 0xFF);
+    if (vcnt == 0) {
+        kprintf("[FB-WC] skip: CPU reports 0 variable MTRRs (cap=0x%lx)\n",
+                (unsigned long)cap);
+        return;
+    }
+
+    /* --- 2. power-of-two range that covers the FB, base-aligned ------- */
+    uint64_t po2 = fb_wc_po2_up(size);
+    /* MTRR base must be aligned to the range size. If the FB base is not
+     * aligned to po2, the smallest legal covering MTRR would have to be the
+     * largest power-of-two that DOES divide base AND still covers size. If no
+     * such single MTRR exists (base poorly aligned), we refuse rather than
+     * mark the wrong physical range WC. */
+    if (base & (po2 - 1)) {
+        /* Base not aligned to the covering po2. Try growing po2 until base is
+         * aligned to it (this also keeps coverage, since po2 only increases),
+         * but cap the growth so we never mark a huge unrelated region WC. A
+         * 4 MB FB at 0xFD000000 is already 64 MB-aligned, so the common case
+         * needs no growth at all. */
+        uint64_t grown = po2;
+        int bailed = 1;
+        for (int i = 0; i < 8; i++) {     /* allow up to 256x growth */
+            if ((base & (grown - 1)) == 0) { bailed = 0; break; }
+            grown <<= 1;
+        }
+        if (bailed) {
+            kprintf("[FB-WC] BAIL: FB base 0x%lx not alignable to a covering "
+                    "power-of-two (size=0x%lx, po2=0x%lx). Not forcing a "
+                    "misaligned MTRR.\n",
+                    (unsigned long)base, (unsigned long)size,
+                    (unsigned long)po2);
+            return;
+        }
+        po2 = grown;
+    }
+
+    /* --- 3. find a FREE variable MTRR (PHYSMASK.V == 0) --------------- */
+    int slot = -1;
+    for (uint32_t i = 0; i < vcnt; i++) {
+        uint64_t mask = rdmsr(IA32_MTRR_PHYSMASK(i));
+        if (!(mask & MTRR_PHYSMASK_VALID)) {
+            slot = (int)i;
+            break;
+        }
+    }
+    if (slot < 0) {
+        kprintf("[FB-WC] BAIL: no free variable MTRR (all %u in use by "
+                "firmware)\n", vcnt);
+        return;
+    }
+
+    /* --- build the PHYSBASE/PHYSMASK values --------------------------- */
+    uint64_t physmask_bits = fb_wc_physmask_bits();
+    uint64_t physbase = (base & MTRR_PHYSBASE_ADDR_MASK) | MTRR_TYPE_WC;
+    uint64_t physmask = ((~(po2 - 1ULL)) & physmask_bits) | MTRR_PHYSMASK_VALID;
+
+    /* --- 4. apply under the SDM MTRR-modification protocol ------------ */
+    /* Disable interrupts across the whole change. */
+    cli();
+
+    /* a) Enter no-fill cache mode: set CR0.CD, clear CR0.NW. */
+    uint64_t cr0_saved = read_cr0();
+    uint64_t cr0_nocache = (cr0_saved | CR0_CD) & ~CR0_NW;
+    write_cr0(cr0_nocache);
+
+    /* b) Flush caches and TLBs (WBINVD then reload CR3). */
+    __asm__ volatile("wbinvd" ::: "memory");
+    write_cr3(read_cr3());
+
+    /* c) Disable MTRRs (clear DEF_TYPE.E) so the table is inert while edited. */
+    uint64_t deftype_saved = rdmsr(IA32_MTRR_DEF_TYPE);
+    wrmsr(IA32_MTRR_DEF_TYPE, deftype_saved & ~MTRR_DEFTYPE_E);
+
+    /* d) Program the chosen variable MTRR pair. */
+    wrmsr(IA32_MTRR_PHYSBASE(slot), physbase);
+    wrmsr(IA32_MTRR_PHYSMASK(slot), physmask);
+
+    /* e) Re-enable MTRRs (restore DEF_TYPE, with E set as before). */
+    wrmsr(IA32_MTRR_DEF_TYPE, deftype_saved | MTRR_DEFTYPE_E);
+
+    /* f) Flush again, then restore CR0 (exit no-fill mode). */
+    __asm__ volatile("wbinvd" ::: "memory");
+    write_cr3(read_cr3());
+    write_cr0(cr0_saved);
+
+    sti();
+
+    /* --- 5. log proof that it took ----------------------------------- */
+    kprintf("[FB-WC] Write-Combining enabled: MTRR slot %d  "
+            "base=0x%lx size=0x%lx (po2=0x%lx) type=WC(0x01)\n",
+            slot, (unsigned long)base, (unsigned long)size,
+            (unsigned long)po2);
+    kprintf("[FB-WC]   PHYSBASE[%d]=0x%lx PHYSMASK[%d]=0x%lx (physmask_bits=0x%lx)\n",
+            slot, (unsigned long)physbase, slot, (unsigned long)physmask,
+            (unsigned long)physmask_bits);
+    kprintf("[FB-WC]   NOTE: if firmware already marks this region UC, UC wins "
+            "on overlap and WC will not take effect.\n");
+}
+
 // Framebuffer state
 static struct {
     uint32_t* buffer;
@@ -247,6 +460,40 @@ void framebuffer_init(uint64_t fb_addr, uint32_t width, uint32_t height, uint32_
         return;
     }
 
+    /*
+     * T410 SAFETY: validate the framebuffer geometry and address before we
+     * declare it initialised. A bogus/corrupted multiboot tag could cause the
+     * kernel to write to an unmapped or MMIO address, triple-faulting the boot.
+     *
+     * Sanity bounds:
+     *   - width/height:  must be <= 8192 (covers 8K displays with margin)
+     *   - pitch:         must be >= width*4 for a 32-bpp linear FB and
+     *                    <= 64K (absurd otherwise)
+     *   - fb_addr:       the 64-bit physical address must be below 16 GB (the
+     *                    upper bound of the kernel's identity map, set by
+     *                    vmm_init + the 0x40000000 explicit-map path in
+     *                    kernel.c). On real Intel HD Graphics (Ironlake on the
+     *                    T410) the MMIO aperture base is typically 0xC0000000-
+     *                    0xFD000000 (~3.0-4.0 GB), well within range.
+     *   - computed size: pitch * height must not overflow 32 bits (max ~4 GB).
+     */
+    if (width > 8192 || height > 8192) {
+        /* Bogus geometry from multiboot -- refuse to initialise. */
+        return;
+    }
+    if (pitch < width * 4 || pitch > 65536) {
+        return;
+    }
+    uint64_t fb_size = (uint64_t)pitch * height;
+    if (fb_size > 0x10000000ULL) {
+        /* >256 MB framebuffer -- clearly bogus. */
+        return;
+    }
+    /* The identity map extends to 16 GB; reject anything beyond that. */
+    if (fb_addr + fb_size > 0x400000000ULL) {
+        return;
+    }
+
     fb_state.phys_base  = fb_addr;
     fb_state.buffer     = (uint32_t*)(uintptr_t)fb_addr;
     fb_state.width      = width;
@@ -481,4 +728,146 @@ int framebuffer_get_info(fb_info_t* out) {
     out->pitch     = fb_state.pitch;
     out->bpp       = fb_state.bpp;
     return 0;
+}
+
+/* =========================================================================
+ * Boot / recovery loading animation -- a "fluid circle": a comet of orbiting
+ * filled discs. Pure 32-bit integer math (no float, no 64-bit division in the
+ * hot path -> no libgcc soft-float; verified by the no-float link gate). The
+ * sin LUT + isqrt are copies of the compositor's (compositor_m8.c) so the
+ * kernel boot spinner and the userspace recovery overlay animate identically.
+ * The kernel cannot read back the framebuffer (no alpha blend), so the comet
+ * trail DARKENS toward the known splash background instead of true alpha.
+ * ========================================================================= */
+
+/* sin(deg)*256, Q8 fixed point. Mirrors compositor_m8.c sin_q/cos_q. */
+static const int32_t FB_SINQ_TBL[19] = {  /* sin(0..90 by 5 deg) * 256 */
+      0,  22,  44,  66,  88, 109, 128, 147, 165, 181,
+    196, 209, 221, 231, 240, 247, 252, 255, 256
+};
+static int32_t fb_sin_q(int32_t deg) {
+    deg %= 360; if (deg < 0) deg += 360;
+    int32_t sign = 1;
+    if (deg >= 180) { deg -= 180; sign = -1; }
+    if (deg > 90) deg = 180 - deg;
+    int32_t i = deg / 5;
+    int32_t frac = deg - i * 5;
+    int32_t a = FB_SINQ_TBL[i];
+    int32_t b = FB_SINQ_TBL[i + 1];
+    return sign * (a + (b - a) * frac / 5);
+}
+static int32_t fb_cos_q(int32_t deg) { return fb_sin_q(deg + 90); }
+
+/* Integer sqrt (Newton). 32-bit divides only -> hardware idiv, no libgcc. */
+static uint32_t fb_isqrt32(uint32_t n) {
+    if (n == 0) return 0;
+    uint32_t x = n, y = (x + 1u) / 2u;
+    while (y < x) { x = y; y = (x + n / x) / 2u; }
+    return x;
+}
+
+/* TSC read (rdtsc in perf.h is a static inline with no linkable symbol; carry a
+ * private copy, same as page_cache_test.c, so the spinner has a clock pre-PIT). */
+static inline uint64_t fb_rdtsc(void) {
+    uint32_t lo, hi;
+    __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi));
+    return ((uint64_t)hi << 32) | lo;
+}
+
+/* Linear blend of two 0x00RRGGBB colors: t in [0,256], 0 -> a, 256 -> b. */
+static uint32_t fb_blend_rgb(uint32_t a, uint32_t b, int32_t t) {
+    if (t <= 0)   return a;
+    if (t >= 256) return b;
+    uint32_t inv = (uint32_t)(256 - t);
+    uint32_t r = (((a >> 16) & 0xFF) * inv + ((b >> 16) & 0xFF) * (uint32_t)t) >> 8;
+    uint32_t g = (((a >>  8) & 0xFF) * inv + ((b >>  8) & 0xFF) * (uint32_t)t) >> 8;
+    uint32_t bl= ((( a       & 0xFF) * inv + ( b        & 0xFF) * (uint32_t)t)) >> 8;
+    return (r << 16) | (g << 8) | bl;
+}
+
+/* Filled disc centered at (cx,cy), radius r, via per-row hlines (clipped). */
+void framebuffer_fill_circle(int cx, int cy, int r, uint32_t color) {
+    if (!fb_state.initialized || r <= 0) return;
+    int32_t r2 = r * r;
+    for (int32_t dy = -r; dy <= r; dy++) {
+        int32_t y = cy + dy;
+        if (y < 0) continue;
+        if (y >= (int32_t)fb_state.height) break;
+        int32_t half = (int32_t)fb_isqrt32((uint32_t)(r2 - dy * dy));
+        int32_t x0 = cx - half;
+        int32_t len = 2 * half + 1;
+        if (x0 < 0) { len += x0; x0 = 0; }
+        if (len <= 0) continue;
+        framebuffer_draw_hline((uint32_t)x0, (uint32_t)y, (uint32_t)len, color);
+    }
+}
+
+/* The "fluid circle": NDOTS filled discs orbiting (cx,cy) at radius R, driven by
+ * one phase angle. The head (i=0) is full base_color + full size; trailing dots
+ * fade toward the splash bg and taper, reading as a comet/spinner. */
+#define FB_SPIN_BG    0x00101826u   /* must match the boot splash background */
+#define FB_SPIN_DOTS  8
+void framebuffer_draw_fluid_circle(int cx, int cy, int R, int dot_r,
+                                   int phase_deg, uint32_t base_color) {
+    for (int i = 0; i < FB_SPIN_DOTS; i++) {
+        int32_t a  = phase_deg - i * (360 / FB_SPIN_DOTS);
+        int32_t x  = cx + R * fb_cos_q(a) / 256;
+        int32_t y  = cy + R * fb_sin_q(a) / 256;
+        uint32_t col = fb_blend_rgb(base_color, FB_SPIN_BG, i * 256 / FB_SPIN_DOTS);
+        int rr = dot_r - (i * dot_r) / (2 * FB_SPIN_DOTS);
+        if (rr < 1) rr = 1;
+        framebuffer_fill_circle(x, y, rr, col);
+    }
+}
+
+/* Bounded boot loading spinner: an rdtsc-timed ~60fps loop drawing the fluid
+ * circle BELOW the splash title for `duration_ms`. Boot is single-threaded with
+ * IRQs off here (pre-scheduler, pre-PIT), so rdtsc is the only clock -- same
+ * ~3GHz convention as the kernel's SMP heartbeat window. Erases only a small box
+ * around the spinner each frame (NOT a full clear -- full clears are slow on
+ * UC-mapped framebuffers) and never touches the splash text above it. */
+void framebuffer_boot_spinner(uint32_t duration_ms) {
+    if (!fb_state.initialized) return;
+    const uint64_t TSC_PER_US = 3000ULL;            /* ~3 GHz, matches kernel.c */
+    const uint64_t FRAME_TSC  = 16ULL * 1000ULL * TSC_PER_US;   /* ~16 ms */
+    int cx  = (int)fb_state.width / 2;
+    int cy  = (int)fb_state.height / 2 + 90;        /* below the splash title */
+    int R   = 26, dot_r = 6;
+    int box = R + dot_r + 4;
+    uint64_t start = fb_rdtsc();
+    uint64_t total = (uint64_t)duration_ms * 1000ULL * TSC_PER_US;
+    uint64_t next_frame = 0;
+    while ((fb_rdtsc() - start) < total) {
+        uint64_t now = fb_rdtsc() - start;
+        if (now < next_frame) continue;
+        next_frame = now + FRAME_TSC;
+        int phase = (int)((now / TSC_PER_US / 1500ULL) % 360ULL);  /* ~1.8 rot/s */
+        framebuffer_draw_rect((uint32_t)(cx - box), (uint32_t)(cy - box),
+                              (uint32_t)(2 * box), (uint32_t)(2 * box), FB_SPIN_BG);
+        framebuffer_draw_fluid_circle(cx, cy, R, dot_r, phase, 0x009FC8FFu);
+    }
+}
+
+/**
+ * Blank the framebuffer by writing all-black pixels.
+ *
+ * On LCD panels with PWM backlight (like the T410's 1280x800 CCFL), writing
+ * all-zero pixels reduces power draw because the backlight doesn't have to
+ * fight the panel's transmittance for bright pixels. On LED-backlit panels
+ * the saving is modest (~0.3W) but still real. The compositor will repaint
+ * on the next input event or timer, so unblanking is automatic.
+ *
+ * Returns 0 on success, -1 if framebuffer is not initialized.
+ */
+int framebuffer_blank(void) {
+    if (!fb_state.initialized) return -1;
+    framebuffer_clear(0x00000000);
+    return 0;
+}
+
+/**
+ * Returns 1 if the framebuffer has been initialized, 0 otherwise.
+ */
+int framebuffer_is_initialized(void) {
+    return fb_state.initialized ? 1 : 0;
 }

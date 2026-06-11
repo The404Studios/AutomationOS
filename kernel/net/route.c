@@ -12,6 +12,7 @@
  */
 
 #include "../include/route.h"
+#include "../include/netif.h"    /* route_info_t for route_get_table() */
 #include "../include/net.h"
 #include "../include/types.h"
 #include "../include/kernel.h"
@@ -175,4 +176,23 @@ void route_print(void) {
                 (r->iface >> 24) & 0xFF, (r->iface >> 16) & 0xFF,
                 (r->iface >> 8) & 0xFF, r->iface & 0xFF);
     }
+}
+
+/* ------------------------------------------------------------------ */
+/* Route table export (used by SYS_ROUTE_TABLE syscall)                */
+/* ------------------------------------------------------------------ */
+int route_get_table(route_info_t* out, int max) {
+    if (!out || max <= 0) return 0;
+
+    int n = 0;
+    for (int i = 0; i < ROUTE_MAX && n < max; i++) {
+        if (g_rtable.routes[i].valid) {
+            out[n].dest    = g_rtable.routes[i].dest;
+            out[n].mask    = g_rtable.routes[i].mask;
+            out[n].gateway = g_rtable.routes[i].gateway;
+            out[n].iface_ip = g_rtable.routes[i].iface;
+            n++;
+        }
+    }
+    return n;
 }

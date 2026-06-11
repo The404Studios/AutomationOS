@@ -223,6 +223,7 @@ int filter_processes(process_info_t* procs, int count, const char* filter) {
         for (size_t j = 0; haystack[j]; j++) {
             bool submatch = true;
             for (size_t k = 0; needle[k]; k++) {
+                if (!haystack[j + k]) { submatch = false; break; }
                 char c1 = haystack[j + k];
                 char c2 = needle[k];
                 if (c1 >= 'A' && c1 <= 'Z') c1 += 32;

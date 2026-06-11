@@ -344,9 +344,12 @@ context_load_irq:
     ; RFLAGS: force IF=1 so the resumed process runs with interrupts enabled
     ; (otherwise a process preempted with IF momentarily clear could resume
     ; with timers masked and never be preempted again).
+    ; Clear DF (bit 10): SysV ABI requires DF=0 at function entry; a stale
+    ; DF=1 makes REP MOVS run backwards -> memory corruption on real hardware.
     mov rax, [rdi + CONTEXT_RFLAGS]
     or  rax, 0x200                   ; IF = 1
     and rax, ~0x100                  ; TF = 0 (never single-step on resume)
+    and rax, ~0x400                  ; DF = 0 (SysV ABI: DF clear at entry)
     mov [rsi + IFRAME_RFLAGS], rax
 
     ; Segment selectors for the iretq frame. The IRQ switch path is only used
@@ -438,11 +441,12 @@ context_switch_to_iretq:
     ; Build the ring-3 IRETQ frame on the CURRENT (caller's) kernel stack.
     ; Hardware pops, top→bottom: SS, RSP, RFLAGS, CS, RIP. We push in reverse.
     ; SS=0x1B / CS=0x23 are the ring-3 (RPL=3) user selectors; RFLAGS gets IF=1
-    ; (run with interrupts enabled) and TF=0 (no single-step), matching
-    ; context_load_irq / enter_usermode.
+    ; (run with interrupts enabled), TF=0 (no single-step), and DF=0 (SysV ABI),
+    ; matching context_load_irq / enter_usermode.
     mov rax, [rsi + CONTEXT_RFLAGS]
     or  rax, 0x200                    ; IF = 1
     and rax, ~0x100                   ; TF = 0
+    and rax, ~0x400                   ; DF = 0 (SysV ABI: DF clear at entry)
     mov r11, rax                      ; r11 = ring-3 RFLAGS (restored below via frame)
 
     push qword 0x1B                   ; SS

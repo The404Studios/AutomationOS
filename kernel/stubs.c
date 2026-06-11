@@ -25,6 +25,17 @@ void uts_namespace_set_domainname(void* ns, const char* name) { (void)ns; (void)
  * today, so these are correct: CPU 0, no preemptive tick. vfs_sync_all() is a
  * no-op flush (called from the panic path). Defining them here lets the kernel
  * link without dragging in the deferred SMP subsystem. */
+/* Under SMP_SCHED the REAL cpu_id() (xAPIC id -> logical id) lives in
+ * kernel/arch/x86_64/ap_boot.c. #ifndef it out here so the link has exactly one
+ * definition. Without SMP_SCHED (default + plain SMP=1 coprocessor build) this
+ * single-CPU stub stands. */
+#ifndef SMP_SCHED
 uint32_t cpu_id(void) { return 0; }
+#endif
 void     scheduler_tick(void) { }
 void     vfs_sync_all(void) { }
+
+/* T410 thermal safety: thermal.c has deep deps (power.c -> cpufreq -> ...).
+ * The full power subsystem is not compiled yet, so stub the pit.c call-site.
+ * On real hardware this is a no-op until the power subsystem is wired up. */
+void     thermal_safety_tick(void) { }

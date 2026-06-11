@@ -104,6 +104,10 @@ wl_window *wl_create_window(wl_u32 w, wl_u32 h, const char *title) {
     long va = sc(SYS_SHMAT, shm_id, 0, 0, 0, 0, 0);
     if (va < 0) {
         wl_print("[WL] shmat failed\n");
+        /* The segment is unattached; it persists until process exit (owned by us).
+         * Not a cross-process leak, but clean it up for hygiene. The kernel has
+         * no shmctl in the freestanding syscall table yet, so we can't IPC_RMID.
+         * This is a bounded leak cleaned up at process exit. */
         return 0;
     }
 
@@ -135,6 +139,10 @@ wl_window *wl_create_window(wl_u32 w, wl_u32 h, const char *title) {
     long sr = sc(SYS_MSGSND, g_inbox_qid, (long)&req, msgsz, 0, 0, 0);
     if (sr < 0) {
         wl_print("[WL] msgsnd(CREATE) failed\n");
+        /* Detach the SHM we just mapped -- the CREATE never reached the
+         * compositor, so only we hold a reference. */
+        sc(SYS_SHMDT, va, 0, 0, 0, 0, 0);
+        g_window.pixels = 0;
         return 0;
     }
 
@@ -152,6 +160,11 @@ wl_window *wl_create_window(wl_u32 w, wl_u32 h, const char *title) {
         if (rr >= 0) break;
         if (++spins > WL_CREATE_MAX_SPINS) {
             wl_print("[WL] wl_create_window: timed out waiting for compositor\n");
+            /* The CREATE was already sent; the compositor may or may not have
+             * processed it.  Detach our mapping so at least our side doesn't
+             * keep the SHM segment alive after we report failure. */
+            sc(SYS_SHMDT, va, 0, 0, 0, 0, 0);
+            g_window.pixels = 0;
             return 0;
         }
         sc(SYS_YIELD, 0, 0, 0, 0, 0, 0);
@@ -159,6 +172,79 @@ wl_window *wl_create_window(wl_u32 w, wl_u32 h, const char *title) {
 
     g_window.win_id = evt.win_id;
     return &g_window;
+}
+
+/* Reallocate the window's pixel buffer to w x h in response to a compositor
+ * WL_EVT_CONFIGURE (e.g. maximize). Allocates a NEW shm segment, maps it, points
+ * g_window at it, tells the compositor the new shm_id (WL_REQ_RESIZE), then
+ * detaches the OLD mapping. The old SHM segment stays alive until the compositor
+ * also detaches it (it re-attaches on WL_REQ_RESIZE), so there is no torn read. */
+static void wl_resize_buffer(wl_u32 w, wl_u32 h) {
+    if (w == 0 || h == 0 || w > 4096u || h > 4096u) return;
+    if (w == g_window.w && h == g_window.h) return;          /* no-op */
+
+    wl_u32 stride = w * 4u;
+    unsigned long bytes = (unsigned long)stride * (unsigned long)h;
+
+    long shm_id = sc(SYS_SHMGET, IPC_PRIVATE, (long)bytes, IPC_CREAT | 0666, 0, 0, 0);
+    if (shm_id < 0) { wl_print("[WL] resize shmget failed\n"); return; }
+    long va = sc(SYS_SHMAT, shm_id, 0, 0, 0, 0, 0);
+    if (va < 0) { wl_print("[WL] resize shmat failed\n"); return; }
+
+    /* Save old mapping so we can detach it AFTER adopting the new one.
+     * This fixes the per-resize SHM leak: each resize used to leave the old
+     * segment attached until process exit, accumulating kernel SHM attach-count
+     * and virtual address space. */
+    wl_u32 *old_pixels = g_window.pixels;
+
+    /* Point the window at the new buffer BEFORE notifying so the app's next draw
+     * lands in the buffer the compositor is about to map. */
+    g_window.shm_id = (int)shm_id;
+    g_window.w      = w;
+    g_window.h      = h;
+    g_window.stride = stride;
+    g_window.pixels = (wl_u32 *)va;
+
+    wl_resize_req req;
+    req.mtype  = WL_REQ_RESIZE;
+    req.win_id = g_window.win_id;
+    req.shm_id = (int)shm_id;
+    req.w      = w;
+    req.h      = h;
+    req.stride = stride;
+    long msgsz = (long)(sizeof(req) - sizeof(long));
+    sc(SYS_MSGSND, g_inbox_qid, (long)&req, msgsz, 0, 0, 0);
+
+    /* Detach the OLD mapping after the compositor has been notified. Any well-
+     * behaved client re-reads win->pixels each frame (already pointing at the
+     * new buffer), so the old mapping is unreferenced.  An app that CACHED the
+     * old pointer will fault -- but that is a client bug (caching a moving
+     * pointer across a resize event), and the alternative (leaking one SHM
+     * segment per resize until process exit) is worse for system health. */
+    if (old_pixels) {
+        sc(SYS_SHMDT, (long)old_pixels, 0, 0, 0, 0, 0);
+    }
+}
+
+void wl_destroy(wl_window *win) {
+    if (!win || win->win_id < 0) return;
+
+    /* Tell the compositor to close this window (animated). */
+    wl_destroy_req req;
+    req.mtype  = WL_REQ_DESTROY;
+    req.win_id = win->win_id;
+    long msgsz = (long)(sizeof(req) - sizeof(long));
+    sc(SYS_MSGSND, g_inbox_qid, (long)&req, msgsz, 0, 0, 0);
+
+    /* Detach the SHM pixel buffer so the kernel can free the segment once the
+     * compositor also detaches (in destroy_slot).  Without this, the client's
+     * attach kept the segment alive until process exit -- a leak on any
+     * open/close cycle where the process survives (e.g. a launcher). */
+    if (win->pixels) {
+        sc(SYS_SHMDT, (long)win->pixels, 0, 0, 0, 0, 0);
+        win->pixels = 0;
+    }
+    win->win_id = -1;
 }
 
 void wl_commit(wl_window *win) {
@@ -176,6 +262,30 @@ void wl_commit(wl_window *win) {
     sc(SYS_MSGSND, g_inbox_qid, (long)&req, msgsz, 0, 0, 0);
 }
 
+void wl_commit_damage(wl_window *win, unsigned int x, unsigned int y,
+                      unsigned int w, unsigned int h) {
+    if (!win || win->win_id < 0) return;
+
+    /* Clamp the damage rect to the surface bounds so the compositor never reads
+     * outside the SHM pixel buffer.  A fully-clipped (zero-area) rect is a
+     * no-op -- skip the IPC round-trip entirely. */
+    if (x >= win->w || y >= win->h) return;
+    if (x + w > win->w) w = win->w - x;
+    if (y + h > win->h) h = win->h - y;
+    if (w == 0 || h == 0) return;
+
+    wl_commit_req req;
+    req.mtype  = WL_REQ_COMMIT;
+    req.win_id = win->win_id;
+    req.x = x;
+    req.y = y;
+    req.w = w;
+    req.h = h;
+
+    long msgsz = (long)(sizeof(req) - sizeof(long));
+    sc(SYS_MSGSND, g_inbox_qid, (long)&req, msgsz, 0, 0, 0);
+}
+
 int wl_poll_event(wl_window *win, int *kind, int *a, int *b, int *c) {
     (void)win;
     if (g_reply_qid < 0) return 0;
@@ -183,20 +293,38 @@ int wl_poll_event(wl_window *win, int *kind, int *a, int *b, int *c) {
     /* Receive the first pending event of ANY type (type 0), non-blocking.
        The largest event payload determines the receive buffer size. */
     union {
-        long           mtype;
-        wl_pointer_evt ptr;
-        wl_key_evt     key;
+        long             mtype;
+        wl_pointer_evt   ptr;
+        wl_key_evt       key;
+        wl_configure_evt cfg;
     } ev;
 
     long want = (long)(sizeof(ev) - sizeof(long));
     long rr = sc(SYS_MSGRCV, g_reply_qid, (long)&ev, want, 0, IPC_NOWAIT, 0);
     if (rr < 0) return 0;       /* ENOMSG / nothing pending */
 
+    if (ev.mtype == WL_EVT_CONFIGURE) {
+        /* Compositor wants us at a new size: reallocate the buffer, then report
+         * WL_EVENT_RESIZE so the app can invalidate any cached geometry. */
+        wl_resize_buffer(ev.cfg.w, ev.cfg.h);
+        if (kind) *kind = WL_EVENT_RESIZE;
+        if (a) *a = (int)g_window.w;
+        if (b) *b = (int)g_window.h;
+        if (c) *c = 0;
+        return 1;
+    }
+
     if (ev.mtype == WL_EVT_POINTER) {
         if (kind) *kind = WL_EVENT_POINTER;
         if (a) *a = ev.ptr.x;
         if (b) *b = ev.ptr.y;
         if (c) *c = ev.ptr.buttons;
+        /* Encode wheel in high bits of 'c' for backward compatibility:
+         * bits 0-15: buttons, bits 16-31: signed wheel delta */
+        if (c && ev.ptr.wheel != 0) {
+            int wheel_packed = (ev.ptr.wheel & 0xFFFF) << 16;
+            *c = (*c & 0xFFFF) | wheel_packed;
+        }
         return 1;
     }
     if (ev.mtype == WL_EVT_KEY) {

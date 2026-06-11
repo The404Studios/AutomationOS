@@ -62,7 +62,11 @@ bool block_read(block_device_t* dev, uint64_t lba, uint32_t count, void* buffer)
         return false;
     }
 
-    if (lba + count > dev->sector_count) {
+    /* overflow-safe: `lba + count` (uint64) wraps when lba is within count of
+     * UINT64_MAX, making a wrapped-small sum pass the old `> sector_count` test
+     * and slip an out-of-range LBA through to the driver callback. count>=0 and
+     * the first clause short-circuits so `sector_count - count` never underflows. */
+    if (count > dev->sector_count || lba > dev->sector_count - count) {
         kprintf("[BLOCK] Read out of bounds: LBA %llu, count %u, max %llu\n",
                 lba, count, dev->sector_count);
         return false;
@@ -86,7 +90,11 @@ bool block_write(block_device_t* dev, uint64_t lba, uint32_t count, const void* 
         return false;
     }
 
-    if (lba + count > dev->sector_count) {
+    /* overflow-safe: `lba + count` (uint64) wraps when lba is within count of
+     * UINT64_MAX, making a wrapped-small sum pass the old `> sector_count` test
+     * and slip an out-of-range LBA through to the driver callback. count>=0 and
+     * the first clause short-circuits so `sector_count - count` never underflows. */
+    if (count > dev->sector_count || lba > dev->sector_count - count) {
         kprintf("[BLOCK] Write out of bounds: LBA %llu, count %u, max %llu\n",
                 lba, count, dev->sector_count);
         return false;

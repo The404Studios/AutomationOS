@@ -35,14 +35,23 @@
 #define TH_PENDING     TH_TEXT_FAINT
 
 /* ---- layout (pixels) ---- */
-#define IDE_W          950
-#define IDE_H          680
-#define TOPBAR_H       26    /* VIZ tab bar              */
-#define STATUS_H       22    /* bottom shortcuts bar     */
-#define LEFT_W         210   /* explorer + funcs column  */
-#define RIGHT_W        260   /* inspector column         */
-#define RUNTIME_H      96     /* bottom runtime-flow strip*/
-#define ROW_H          18    /* list row height          */
+/* IDE_W/IDE_H are the default window size, kept <= a 1024x768 panel so the IDE
+ * never opens larger than the physical screen (the app also clamps to the live
+ * work area). The text-sensitive constants below DERIVE from the runtime cell
+ * (GFX_FW/GFX_FH), so when the user zooms (Ctrl+wheel) the WHOLE layout reflows
+ * coherently -- rows, bars and side columns all track the glyph size. */
+/* Open WIDE so the IDE fills a typical 1280-wide screen on launch (the old 1024
+ * left the IDE narrow + scrunched on a 1280 desktop; the compositor clamps an
+ * over-large request to the display, and the IDE reflows to win->w/h every frame
+ * via the resize protocol). Height fits a 720p work area with the dock visible. */
+#define IDE_W          1180
+#define IDE_H          688
+#define TOPBAR_H       (GFX_FH + 8)    /* VIZ tab bar (fits one glyph + pad)  */
+#define STATUS_H       (GFX_FH + 4)    /* bottom shortcuts bar                */
+#define LEFT_W         (20 * GFX_FW)   /* explorer column (~20 chars, ~200px @ 130%) */
+#define RIGHT_W        (27 * GFX_FW)   /* inspector column (~27 chars)        */
+#define RUNTIME_H      (5  * GFX_FH)   /* bottom runtime-flow strip (~5 rows) */
+#define ROW_H          (GFX_FH + 2)    /* list row height (tighter for density) */
 #define PAD            6
 
 /* port-type -> accent colour mapping helper (inline) */

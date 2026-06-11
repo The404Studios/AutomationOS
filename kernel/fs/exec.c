@@ -157,7 +157,7 @@ process_t* exec_create_process(const char* path, const char* name,
     // For now, we'll handle this in the assembly context switch code
 
     // Mark as ready to run
-    proc->state = PROCESS_READY;
+    process_set_ready(proc);
 
     EXEC_LOG("[EXEC] Process created: PID=%d entry=0x%016lx stack=0x%016lx\n",
             proc->pid, entry, stack);
@@ -232,6 +232,15 @@ static void elf_cleanup_failed_load(process_t* proc) {
  * BSS-zeroed, so the very first (init) load with no spawn sees "" -> argv=[name]. */
 char g_exec_spawn_args[256];
 
+/* AGENT-RPC-0 P6d: an explicit argv VECTOR for the next exec, set by
+ * SYS_SPAWN_EX_ARGV. When g_exec_spawn_argv_len > 0, g_exec_spawn_argv holds the
+ * extra entries argv[1..] as NUL-separated bytes (each entry kept intact -- split
+ * ONLY on NUL, never on whitespace), and the legacy whitespace-split of
+ * g_exec_spawn_args is bypassed. argv[0] is always the explicit `name` (path).
+ * Consumed (length zeroed) when the argv frame is built. */
+char g_exec_spawn_argv[256];
+int  g_exec_spawn_argv_len;
+
 int elf_load_and_exec(void* elf_data, size_t elf_size, const char* name) {
     if (!elf_data || elf_size == 0 || !name) {
         EXEC_LOG("[EXEC] Invalid parameters to elf_load_and_exec\n");
@@ -300,8 +309,14 @@ int elf_load_and_exec(void* elf_data, size_t elf_size, const char* name) {
     // Target the PROCESS's PML4 for all user page mappings
     paging_set_target(proc->context.cr3);
 
-    // Load PT_LOAD segments into process address space
+    // Load PT_LOAD segments into process address space, with overlap detection.
+    // A crafted ELF with overlapping PT_LOAD segments could overwrite previously
+    // loaded code/data or bypass W^X by replacing a read-only code page.
     const elf64_phdr_t* phdr = (const elf64_phdr_t*)((uint8_t*)elf_data + ehdr->e_phoff);
+
+#define EXEC_MAX_LOAD_SEGMENTS 16
+    struct { uint64_t start; uint64_t end; } exec_loaded[EXEC_MAX_LOAD_SEGMENTS];
+    int exec_n_loaded = 0;
 
     for (int i = 0; i < ehdr->e_phnum; i++) {
         EXEC_LOG("[EXEC]   Segment %d: type=0x%x offset=0x%lx filesz=0x%lx memsz=0x%lx\n",
@@ -317,10 +332,27 @@ int elf_load_and_exec(void* elf_data, size_t elf_size, const char* name) {
                 elf_cleanup_failed_load(proc);
                 return ELF_ERR_INVALID;
             }
-            // Calculate aligned boundaries
+            // Calculate aligned boundaries (with ALIGN_UP overflow guard)
             uint64_t vaddr_start = ALIGN_DOWN(phdr[i].p_vaddr, PAGE_SIZE);
-            uint64_t vaddr_end = ALIGN_UP(phdr[i].p_vaddr + phdr[i].p_memsz, PAGE_SIZE);
+            uint64_t raw_end = phdr[i].p_vaddr + phdr[i].p_memsz;
+            uint64_t vaddr_end = ALIGN_UP(raw_end, PAGE_SIZE);
+            if (vaddr_end < raw_end) {
+                EXEC_LOG("[EXEC] ERROR: seg %d ALIGN_UP overflow\n", i);
+                elf_cleanup_failed_load(proc);
+                return ELF_ERR_INVALID;
+            }
             uint64_t num_pages = (vaddr_end - vaddr_start) / PAGE_SIZE;
+
+            // Segment overlap detection: reject overlapping PT_LOAD segments
+            for (int j = 0; j < exec_n_loaded; j++) {
+                if (vaddr_start < exec_loaded[j].end && vaddr_end > exec_loaded[j].start) {
+                    EXEC_LOG("[EXEC] ERROR: seg %d [0x%lx,0x%lx) overlaps seg [0x%lx,0x%lx)\n",
+                            i, vaddr_start, vaddr_end,
+                            exec_loaded[j].start, exec_loaded[j].end);
+                    elf_cleanup_failed_load(proc);
+                    return ELF_ERR_INVALID;
+                }
+            }
 
             EXEC_LOG("[EXEC]   Loading PT_LOAD segment %d:\n", i);
             EXEC_LOG("[EXEC]     Virtual address: 0x%016lx (aligned: 0x%016lx - 0x%016lx)\n",
@@ -332,10 +364,18 @@ int elf_load_and_exec(void* elf_data, size_t elf_size, const char* name) {
                     (phdr[i].p_flags & PF_W) ? "W" : "-",
                     (phdr[i].p_flags & PF_X) ? "X" : "-");
 
-            // Validate segment is in user space
-            if (vaddr_start >= 0x0000800000000000ULL) {
-                EXEC_LOG("[EXEC]   ERROR: Segment vaddr 0x%016lx is outside user space\n",
-                        vaddr_start);
+            // Validate segment is in user space. BOTH the start AND the page-aligned
+            // END must be below the user/kernel split (0x0000800000000000): a crafted
+            // PT_LOAD that STARTS in user space but EXTENDS past it (large p_memsz)
+            // would otherwise pass a start-only check, and the mapping loop below would
+            // install PTEs for KERNEL virtual addresses, corrupting the process's
+            // kernel-half page tables. The overflow guard above already prevents
+            // vaddr_end from wrapping, so this strict comparison is sound. Mirrors the
+            // companion loader elf_loader.c, which already checks both ends.
+            if (vaddr_start >= 0x0000800000000000ULL ||
+                vaddr_end   >  0x0000800000000000ULL) {
+                EXEC_LOG("[EXEC]   ERROR: Segment [0x%016lx,0x%016lx) leaves user space\n",
+                        vaddr_start, vaddr_end);
                 elf_cleanup_failed_load(proc);
                 return ELF_ERR_PERM;
             }
@@ -365,9 +405,18 @@ int elf_load_and_exec(void* elf_data, size_t elf_size, const char* name) {
             //     plus PAGE_WRITE iff PF_W. Data is writable but never executes.
             // PAGE_NX is inert until EFER.NXE is enabled in paging_init().
             uint64_t page_flags = PAGE_PRESENT | PAGE_USER;
-            if (phdr[i].p_flags & PF_X) {
-                // Executable segment: RX. Never writable (W^X), no NX bit.
-                // (If a toolchain ever emits W+X we still strip W here.)
+            if ((phdr[i].p_flags & PF_X) && (phdr[i].p_flags & PF_W)) {
+                // SINGLE R|W|X PT_LOAD: the on-device toolchain (the IDE's native
+                // compiler) emits ONE segment holding code AND mutable .data + string
+                // literals, so we must honor BOTH X and W -- otherwise every global /
+                // string write faults and the freshly-built program "won't run". Map
+                // it RWX. Gated on the W&&X signature so it does NOT relax W^X for the
+                // normal two-PT_LOAD apps below (whose .text is X-not-W and .data is
+                // W-not-X). Acceptable here: these are the user's own locally-built
+                // programs, and the alternative is they cannot run at all.
+                page_flags |= PAGE_WRITE;   // executable AND writable
+            } else if (phdr[i].p_flags & PF_X) {
+                // Pure code segment: RX. Never writable (W^X), no NX bit.
             } else {
                 // Non-executable segment: mark NX, add write only if PF_W.
                 page_flags |= PAGE_NX;
@@ -453,11 +502,39 @@ int elf_load_and_exec(void* elf_data, size_t elf_size, const char* name) {
                     // proc CR3 (paging_set_target(proc->cr3) is in effect); this only
                     // reads page-table memory and is unaffected by the live CR3 switch.
                     uint64_t pte = paging_get_pte(vaddr);
+                    // SAFETY (kernel self-protection): if phase 1's vmm_map_page()
+                    // did NOT install a private 4KB frame for this page — it ran out
+                    // of memory backing a very large segment, so the page is STILL
+                    // the inherited 2MB identity huge page (PS bit 7) or not present
+                    // (pte==0) — then `dphys` below would be the IDENTITY physical of
+                    // vaddr, i.e. KERNEL RAM. A big app's BSS VA range (photos: 35MB,
+                    // VA 0x208000..0x2405728) overlaps the low physical RAM where the
+                    // kernel heap/slabs live, so a memset/memcpy through such a dphys
+                    // scribbles the kernel (seen: slab headers zeroed -> SLABDIAG ->
+                    // kmalloc #GP). Never populate via a non-private frame; abort the
+                    // load cleanly so the kernel stays intact.
+                    if ((pte & 0x1) == 0 || (pte & (1ULL << 7))) {
+                        write_cr3(caller_cr3);
+                        kprintf("[EXEC] PROTECT: seg %d page %lu/%lu vaddr=%p not backed by a "
+                                "private frame (pte=0x%lx); segment too large for free RAM — "
+                                "failing load (kernel protected)\n",
+                                i, j, num_pages, (void*)vaddr, pte);
+                        elf_cleanup_failed_load(proc);
+                        return ELF_ERR_NOMEM;
+                    }
                     // Mask off BOTH the low flag bits AND the high flag bits.
                     // ~0xFFF alone leaves bit 63 (PAGE_NX) set for NX data pages,
                     // producing a non-canonical pointer that #GPs on the store
                     // below; use the architectural phys-addr mask instead.
                     uint8_t* dphys = (uint8_t*)(pte & 0x000FFFFFFFFFF000ULL);  // identity-mapped
+
+                    // [SLABPROBE] ground-truth: does this BSS page's identity physical
+                    // point at a LIVE slab page (so the memset below corrupts it)?
+                    if (*(volatile uint64_t*)dphys == 0x51AB0BACE51AB0BULL) {
+                        kprintf("[SLABPROBE] exec '%s' seg %d pg %lu ZEROING LIVE SLAB "
+                                "dphys=%p va=%p pte=0x%lx\n", proc->name, i, j,
+                                (void*)dphys, (void*)vaddr, (unsigned long)pte);
+                    }
 
                     uint64_t page_lo = j * PAGE_SIZE;              // region offset of page start
                     uint64_t page_hi = page_lo + PAGE_SIZE;        // region offset of page end
@@ -503,6 +580,13 @@ int elf_load_and_exec(void* elf_data, size_t elf_size, const char* name) {
             };
             vma_add(proc, &seg_vma);
 
+            // Record this segment for overlap detection
+            if (exec_n_loaded < EXEC_MAX_LOAD_SEGMENTS) {
+                exec_loaded[exec_n_loaded].start = vaddr_start;
+                exec_loaded[exec_n_loaded].end = vaddr_end;
+                exec_n_loaded++;
+            }
+
             EXEC_LOG("[EXEC]   Segment %d loaded (filesz=0x%lx, %lu pages)\n",
                     i, filesz, num_pages);
         }
@@ -543,7 +627,14 @@ int elf_load_and_exec(void* elf_data, size_t elf_size, const char* name) {
             elf_cleanup_failed_load(proc);
             return ELF_ERR_NOMEM;
         }
-        memset(phys_page, 0, PAGE_SIZE);
+        // Zero the freshly-allocated frame via the DIRECT MAP. The active CR3 here is
+        // the CALLER's (a PROCESS CR3 whenever a running process spawns this exec).
+        // A process CR3's low identity map can be split/partial/mutated and need NOT
+        // cover a HIGH physical frame, so a raw memset(phys_page) -- phys==virt --
+        // #PFs (THE churn crash). PHYS_TO_DIRECT() resolves through PML4[256], the
+        // shared higher-half alias present + immutable in EVERY CR3 -- always mapped,
+        // no CR3 switch.
+        memset(PHYS_TO_DIRECT(phys_page), 0, PAGE_SIZE);
         // Stack is writable data: W + NX (never executable).
         vmm_map_page((void*)top_page, phys_page, PAGE_PRESENT | PAGE_WRITE | PAGE_USER | PAGE_NX);
         stack_top_phys = phys_page;
@@ -563,13 +654,33 @@ int elf_load_and_exec(void* elf_data, size_t elf_size, const char* name) {
 
         // Stack is writable data: W + NX (never executable).
         vmm_map_page((void*)vaddr, phys_page, PAGE_PRESENT | PAGE_WRITE | PAGE_USER | PAGE_NX);
-        memset(phys_page, 0, PAGE_SIZE);
+        // Zero via the DIRECT MAP (always mapped on any CR3; see LAZY branch note).
+        memset(PHYS_TO_DIRECT(phys_page), 0, PAGE_SIZE);
 
         if (i == 0 || i == num_stack_pages - 1) {
             EXEC_LOG("[EXEC]   Stack page %lu: vaddr=0x%016lx -> phys=%p\n", i, vaddr, phys_page);
         }
     }
 #endif
+
+    // Install a guard page immediately below the stack. This page is never
+    // faulted in -- any access to it (stack overflow) is detected by the
+    // page-fault handler via VMA_FLAG_GUARD and kills the process cleanly
+    // instead of silently corrupting adjacent mappings.
+    if (stack_bottom >= PAGE_SIZE) {
+        vma_t guard_vma = {
+            .vaddr    = stack_bottom - PAGE_SIZE,
+            .length   = PAGE_SIZE,
+            .perm     = 0,              // no permissions -- any access faults
+            .flags    = VMA_FLAG_GUARD,
+            .backing  = VMA_ANON,
+            .file_ptr = 0,
+            .file_off = 0,
+            .file_sz  = 0,
+            .next     = NULL,
+        };
+        vma_add(proc, &guard_vma);
+    }
 
     // Record the stack as an anonymous, grow-down VMA. With LAZY_ANON_STACK the
     // not-present pages below the top are faulted in on first write via this
@@ -595,9 +706,14 @@ int elf_load_and_exec(void* elf_data, size_t elf_size, const char* name) {
     // no physical handle to the top page, fall back to the old empty frame.
     uint64_t stack_ptr;
     if (stack_top_phys) {
+        // The argv frame is written THROUGH the stack-top frame (U2P below). Same
+        // wrong-CR3 hazard as the stack memset above: under the caller's process CR3
+        // a high frame need not be identity-mapped. Address it via the DIRECT MAP
+        // (PML4[256], shared + present in every CR3) instead of the raw phys -- no
+        // CR3 switch needed.
         enum { EXEC_MAX_ARGS = 16 };
         uint64_t top   = USER_STACK_TOP;                       // exclusive end
-        uint64_t pbase = (uint64_t)(uintptr_t)stack_top_phys;  // phys of [top-4096, top)
+        uint64_t pbase = (uint64_t)(uintptr_t)PHYS_TO_DIRECT(stack_top_phys); // direct-map alias of [top-4096, top)
         uint64_t pfloor = top - PAGE_SIZE;                     // low bound of the page
         #define U2P(uva) ((char*)(uintptr_t)(pbase + ((uva) - pfloor)))
 
@@ -614,8 +730,26 @@ int elf_load_and_exec(void* elf_data, size_t elf_size, const char* name) {
                 argv_uva[argc++] = u; cur = u;
             }
         }
-        /* argv[1..] = whitespace-separated tokens of g_exec_spawn_args. */
-        {
+        /* argv[1..]: P6d -- if an explicit argv VECTOR was staged, split ONLY on
+         * NUL (each entry intact: multi-word args + shell metacharacters survive
+         * as literal bytes). Otherwise, the legacy whitespace-split of the
+         * command-line string. The two are mutually exclusive (SYS_SPAWN_EX_ARGV
+         * stages the vector AND leaves g_exec_spawn_args empty). */
+        if (g_exec_spawn_argv_len > 0) {
+            const char* a = g_exec_spawn_argv;
+            int n = g_exec_spawn_argv_len, i = 0;
+            while (i < n && argc < EXEC_MAX_ARGS) {
+                int s = i;
+                while (i < n && a[i] != '\0') i++;          /* one entry [s, i)        */
+                uint64_t l = (uint64_t)(i - s);
+                uint64_t u = (cur - (l + 1)) & ~0x7ULL;
+                if (u <= pfloor + (uint64_t)(argc + 4) * 8) break;
+                for (uint64_t k = 0; k < l; k++) U2P(u)[k] = a[s + k];
+                U2P(u)[l] = '\0';
+                argv_uva[argc++] = u; cur = u;
+                i++;                                        /* skip the NUL separator  */
+            }
+        } else {
             const char* a = g_exec_spawn_args;
             int i = 0;
             while (a[i] && argc < EXEC_MAX_ARGS) {
@@ -642,6 +776,7 @@ int elf_load_and_exec(void* elf_data, size_t elf_size, const char* name) {
         stack_ptr = frame_uva;
         #undef U2P
         g_exec_spawn_args[0] = '\0';   // consume: don't leak args to the next spawn
+        g_exec_spawn_argv_len = 0;     // consume the P6d vector too
         EXEC_LOG("[EXEC] Stack setup complete, RSP=0x%016lx argc=%d argv0=\"%s\"\n",
                 stack_ptr, argc, name);
     } else {
@@ -681,8 +816,16 @@ int elf_load_and_exec(void* elf_data, size_t elf_size, const char* name) {
     EXEC_LOG("[EXEC]   User entry=0x%016lx stack=0x%016lx\n", ehdr->e_entry, stack_ptr);
     EXEC_LOG("[EXEC]   Kernel RSP=0x%016lx CR3=0x%016lx\n", proc->context.rsp, proc->context.cr3);
 
+    // CHANNEL-0 P2: install any parent-supplied stdio channels into the child
+    // (slave end, narrowed rights). No-op for a plain SYS_SPAWN (g_exec_stdio is
+    // empty). Done here -- child fully built, not yet scheduled.
+    {
+        extern void channel_install_spawn_stdio(struct process* child);
+        channel_install_spawn_stdio(proc);
+    }
+
     // Mark as ready to run
-    proc->state = PROCESS_READY;
+    process_set_ready(proc);
     EXEC_LOG("[EXEC] Process state set to READY\n");
 
     // Add to scheduler

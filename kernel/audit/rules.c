@@ -37,9 +37,12 @@ static int simple_strcmp(const char* s1, const char* s2) {
     return *s1 - *s2;
 }
 
-// Simple glob match (for path patterns)
-static bool path_matches_pattern(const char* path, const char* pattern) {
+// Simple glob match (for path patterns) with depth limit
+#define GLOB_MAX_DEPTH 16
+
+static bool path_matches_pattern_depth(const char* path, const char* pattern, int depth) {
     if (!path || !pattern) return false;
+    if (depth >= GLOB_MAX_DEPTH) return false;
 
     while (*pattern) {
         if (*pattern == '*') {
@@ -47,7 +50,7 @@ static bool path_matches_pattern(const char* path, const char* pattern) {
             if (!*pattern) return true;
 
             while (*path) {
-                if (path_matches_pattern(path, pattern)) {
+                if (path_matches_pattern_depth(path, pattern, depth + 1)) {
                     return true;
                 }
                 path++;
@@ -62,6 +65,10 @@ static bool path_matches_pattern(const char* path, const char* pattern) {
     }
 
     return *path == '\0';
+}
+
+static bool path_matches_pattern(const char* path, const char* pattern) {
+    return path_matches_pattern_depth(path, pattern, 0);
 }
 
 void audit_rules_init(void) {
@@ -142,17 +149,16 @@ int audit_rule_add(audit_rule_t* rule) {
         return -1;
     }
 
-    spin_lock(&rules_lock);
-
-    // Allocate new rule
+    // Allocate BEFORE acquiring lock to avoid sleeping under spinlock
     audit_rule_t* new_rule = (audit_rule_t*)kmalloc(sizeof(audit_rule_t));
     if (!new_rule) {
-        spin_unlock(&rules_lock);
         return -1;
     }
 
     // Copy rule data
     memcpy(new_rule, rule, sizeof(audit_rule_t));
+
+    spin_lock(&rules_lock);
 
     // Assign ID if not provided
     if (new_rule->id == 0) {
@@ -173,26 +179,32 @@ int audit_rule_add(audit_rule_t* rule) {
 }
 
 int audit_rule_delete(uint32_t rule_id) {
+    audit_rule_t* to_delete = NULL;
+
     spin_lock(&rules_lock);
 
     audit_rule_t** current = &rule_list_head;
 
     while (*current) {
         if ((*current)->id == rule_id) {
-            audit_rule_t* to_delete = *current;
+            to_delete = *current;
             *current = (*current)->next;
-            kfree(to_delete);
             rule_count--;
-
-            spin_unlock(&rules_lock);
-            kprintf("[AUDIT] Deleted rule ID %u\n", rule_id);
-            return 0;
+            break;
         }
 
         current = &(*current)->next;
     }
 
     spin_unlock(&rules_lock);
+
+    // Free AFTER releasing lock to avoid kfree under spinlock
+    if (to_delete) {
+        kfree(to_delete);
+        kprintf("[AUDIT] Deleted rule ID %u\n", rule_id);
+        return 0;
+    }
+
     return -1;  // Rule not found
 }
 

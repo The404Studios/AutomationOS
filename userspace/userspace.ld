@@ -23,8 +23,19 @@ PHDRS
 
 SECTIONS
 {
-    /* Load userspace at 2MB (0x200000) */
-    . = 0x200000;
+    /* Load userspace at 8MB (0x800000).
+     *
+     * CRITICAL: this MUST sit ABOVE the entire kernel image. The kernel is loaded
+     * at 1MB and its .bss now extends to ~4.6MB (the PMM bitmap, net reassembly
+     * buffers, pty/vfs/ipc tables, etc.). Each process deep-copies the kernel's
+     * low identity map and then the ELF loader splits/overwrites the 2MB PDEs at
+     * the user load base to map private user frames. If the user base (0x200000)
+     * overlapped kernel .bss, those user frames would SHADOW kernel globals like
+     * current_process when running under the process CR3 -> "Trampoline: no
+     * current process" / silent NULL reads -> crash on first dispatch. Basing at
+     * 8MB keeps user frames clear of the kernel image (ends ~4.6MB) and below the
+     * rescued initrd (16MB). 2MB-aligned so it lands on a clean huge-page PDE. */
+    . = 0x800000;
 
     /* ---- text segment (RX): code + read-only data ---- */
     .text : {

@@ -323,7 +323,24 @@ void _start(void)
         /* Drain all pending events before rendering. */
         int kind, ea, eb, ec;
         while (wl_poll_event(win, &kind, &ea, &eb, &ec)) {
-            if (kind == WL_EVENT_POINTER) {
+            if (kind == WL_EVENT_RESIZE) {
+                /* The library has ALREADY reallocated the buffer and updated
+                 * win->{w,h,stride,pixels}.  Our cached stride_px is now
+                 * stale -- refresh it so every subsequent pixel write is
+                 * bounded to the CURRENT surface.  The old drawing pixels did
+                 * not survive the realloc, so repaint the full new surface:
+                 * white canvas below the toolbar (the toolbar itself is
+                 * redrawn at the bottom of the frame loop).  Clearing the
+                 * whole 0..w / 0..h area leaves no stale garbage in any new
+                 * margins after a Maximize / snap. */
+                stride_px = win->stride / 4u;
+                fill_rect(win->pixels, win->w, win->h, stride_px,
+                          0, 0, (i32)win->w, (i32)win->h, CANVAS_BG);
+                /* Any in-progress stroke is invalidated by the realloc. */
+                drawing = 0;
+                prev_x  = -1;
+                prev_y  = -1;
+            } else if (kind == WL_EVENT_POINTER) {
                 i32 mx = (i32)ea;
                 i32 my = (i32)eb;
                 int btn_left = (ec & 1);   /* bit 0 = left button */

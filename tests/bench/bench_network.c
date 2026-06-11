@@ -21,8 +21,7 @@
 #define SYS_ACCEPT   78
 #define SYS_GET_TICKS_MS 40
 
-// Socket types
-#define AF_INET 2
+// Socket types (kernel ABI: SYS_SOCKET arg1 is type, NOT address family)
 #define SOCK_STREAM 1
 #define SOCK_DGRAM 2
 
@@ -83,17 +82,8 @@ static inline uint64_t get_ticks_ms(void) {
     return syscall0(SYS_GET_TICKS_MS);
 }
 
-// Simple sockaddr_in structure
-typedef struct {
-    uint16_t sin_family;
-    uint16_t sin_port;
-    uint32_t sin_addr;
-    uint8_t  sin_zero[8];
-} sockaddr_in_t;
-
-static inline uint16_t htons(uint16_t hostshort) {
-    return ((hostshort & 0xFF) << 8) | ((hostshort >> 8) & 0xFF);
-}
+/* sockaddr_in_t and htons removed -- this kernel's SYS_BIND takes
+ * (fd, port_host_order), not a sockaddr struct. */
 
 /**
  * Benchmark TCP loopback throughput
@@ -103,20 +93,17 @@ void bench_tcp_loopback(void) {
     printf("================================\n");
 
     // Create server socket
-    int server_sock = syscall3(SYS_SOCKET, AF_INET, SOCK_STREAM, 0);
+    // Kernel ABI: SYS_SOCKET(type) -- arg1 = SOCK_STREAM(1) or SOCK_DGRAM(2)
+    int server_sock = syscall1(SYS_SOCKET, SOCK_STREAM);
     if (server_sock < 0) {
         printf("[ERROR] Failed to create server socket: %d\n", server_sock);
         printf("[INFO] Network stack may not be fully implemented\n");
         return;
     }
 
-    // Bind to 127.0.0.1:8080
-    sockaddr_in_t server_addr = {0};
-    server_addr.sin_family = AF_INET;
-    server_addr.sin_port = htons(8080);
-    server_addr.sin_addr = 0x7F000001;  // 127.0.0.1 in network byte order
-
-    int ret = syscall3(SYS_BIND, server_sock, (uint64_t)&server_addr, sizeof(server_addr));
+    // Bind to port 8080
+    // Kernel ABI: SYS_BIND(fd, port) -- port in host byte order
+    int ret = syscall2(SYS_BIND, server_sock, 8080);
     if (ret < 0) {
         printf("[ERROR] Failed to bind: %d\n", ret);
         syscall1(SYS_CLOSE_SK, server_sock);
@@ -124,6 +111,7 @@ void bench_tcp_loopback(void) {
     }
 
     // Listen
+    // Kernel ABI: SYS_LISTEN(fd, backlog)
     ret = syscall2(SYS_LISTEN, server_sock, 1);
     if (ret < 0) {
         printf("[ERROR] Failed to listen: %d\n", ret);
@@ -143,7 +131,7 @@ void bench_tcp_loopback(void) {
     uint64_t start = rdtsc_fence();
 
     for (int i = 0; i < iterations; i++) {
-        int sock = syscall3(SYS_SOCKET, AF_INET, SOCK_STREAM, 0);
+        int sock = syscall1(SYS_SOCKET, SOCK_STREAM);
         if (sock >= 0) {
             syscall1(SYS_CLOSE_SK, sock);
         }
@@ -174,7 +162,7 @@ void bench_socket_creation(void) {
     // TCP sockets
     for (int i = 0; i < iterations; i++) {
         uint64_t start = rdtsc_fence();
-        int sock = syscall3(SYS_SOCKET, AF_INET, SOCK_STREAM, 0);
+        int sock = syscall1(SYS_SOCKET, SOCK_STREAM);
         uint64_t end = rdtscp();
 
         if (sock >= 0) {
@@ -186,7 +174,7 @@ void bench_socket_creation(void) {
     // UDP sockets
     for (int i = 0; i < iterations; i++) {
         uint64_t start = rdtsc_fence();
-        int sock = syscall3(SYS_SOCKET, AF_INET, SOCK_DGRAM, 0);
+        int sock = syscall1(SYS_SOCKET, SOCK_DGRAM);
         uint64_t end = rdtscp();
 
         if (sock >= 0) {
@@ -209,7 +197,7 @@ void bench_buffer_operations(void) {
     printf("\n[BENCH] Send/Recv Buffer Operations\n");
     printf("====================================\n");
 
-    int sock = syscall3(SYS_SOCKET, AF_INET, SOCK_DGRAM, 0);
+    int sock = syscall1(SYS_SOCKET, SOCK_DGRAM);
     if (sock < 0) {
         printf("[ERROR] Failed to create socket\n");
         return;
@@ -262,7 +250,7 @@ void bench_throughput_estimate(void) {
     const int packets = 1000;
     const size_t total_bytes = packet_size * packets;
 
-    int sock = syscall3(SYS_SOCKET, AF_INET, SOCK_DGRAM, 0);
+    int sock = syscall1(SYS_SOCKET, SOCK_DGRAM);
     if (sock < 0) {
         printf("[ERROR] Failed to create socket\n");
         return;

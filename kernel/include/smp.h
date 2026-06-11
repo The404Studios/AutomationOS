@@ -38,7 +38,10 @@ typedef enum {
 struct process;
 struct runqueue;
 
-// Per-CPU data structure (one per CPU)
+// Per-CPU data structure (one per CPU).
+// Cache-line aligned (64B) to prevent false sharing between CPUs on SMP.
+// Without this, adjacent percpu_data_t entries in the percpu_data[] array can
+// share a cache line, causing cross-CPU cache-line bouncing on every tick/IRQ.
 typedef struct {
     uint32_t cpu_id;                    // Logical CPU ID (0, 1, 2, ...)
     uint32_t apic_id;                   // Local APIC ID
@@ -78,7 +81,16 @@ typedef struct {
     uint64_t page_cache_hits;           // Cache hit count
     uint64_t page_cache_misses;         // Cache miss count
     spinlock_t page_cache_lock;         // Cache lock
-} percpu_data_t;
+
+    // Health monitoring (leak detection + stall detection)
+    struct {
+        uint32_t ownership_allocs;      // Total ownership allocations
+        uint32_t ownership_frees;       // Total ownership frees
+        uint32_t ownership_leaks;       // Detected leaks (allocs - frees)
+        volatile uint64_t heartbeat;    // Incremented by timer tick (for stall detection)
+        uint64_t last_heartbeat;        // Previous heartbeat value (for stall detection)
+    } health;
+} __attribute__((aligned(64))) percpu_data_t;
 
 // CPU information structure
 typedef struct {

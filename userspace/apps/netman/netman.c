@@ -65,14 +65,24 @@ static long sc(long n, long a1, long a2, long a3, long a4, long a5)
 }
 
 /* -----------------------------------------------------------------------
- * Kernel payload for SYS_NET_INFO (filled by the kernel, read here).
- * ip / gateway are in HOST byte order.
+ * Kernel payload for SYS_NET_INFO -- MUST match kernel net_info_ext_t
+ * (kernel/include/netif.h). ip / gateway are in HOST byte order.
  * --------------------------------------------------------------------- */
 typedef struct {
+    char           ifname[16];
     unsigned char  mac[6];
     unsigned char  _pad[2];
     unsigned int   ip;
+    unsigned int   netmask;
     unsigned int   gateway;
+    unsigned int   dns;
+    unsigned char  up;
+    unsigned char  dhcp_active;
+    unsigned char  _pad2[6];
+    unsigned long long tx_packets;
+    unsigned long long rx_packets;
+    unsigned long long tx_bytes;
+    unsigned long long rx_bytes;
 } net_info_t;
 
 /* -----------------------------------------------------------------------

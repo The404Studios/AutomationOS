@@ -193,14 +193,24 @@ usb_device_t* usb_allocate_device(void) {
     return dev;
 }
 
+// Maximum endpoints per device -- must match the endpoints[] array size in usb.h.
+#define USB_MAX_ENDPOINTS 32
+
 // Free USB device
 void usb_free_device(usb_device_t* device) {
     if (!device) return;
 
+    // Cap at the array size to prevent an out-of-bounds walk if
+    // num_endpoints was corrupted by a malicious/broken descriptor.
+    uint8_t ep_count = device->num_endpoints;
+    if (ep_count > USB_MAX_ENDPOINTS)
+        ep_count = USB_MAX_ENDPOINTS;
+
     // Free endpoints
-    for (uint8_t i = 0; i < device->num_endpoints; i++) {
+    for (uint8_t i = 0; i < ep_count; i++) {
         if (device->endpoints[i]) {
             kfree(device->endpoints[i]);
+            device->endpoints[i] = NULL;
         }
     }
 

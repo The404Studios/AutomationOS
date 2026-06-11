@@ -2,6 +2,9 @@
 #include "../../include/kernel.h"
 #include "../../include/sched.h"
 #include "../../include/vma.h"
+#ifdef SMP_SCHED
+#include "../../include/lapic_constants.h"  /* AP_LAPIC_TIMER_VECTOR (Brick E) */
+#endif
 
 #define IDT_ENTRIES 256
 
@@ -89,11 +92,19 @@ extern void irq15(void);
 extern void irq0_preempt(void);
 #endif
 
+#ifdef SMP_SCHED
+// SMP scheduler Brick E: CPU1's LAPIC timer ISR (vector 0x40) and the LAPIC
+// spurious ISR (vector 0xFF). Shared IDT gates; only CPU1 (with an armed LAPIC
+// timer + sti) actually triggers them. See interrupt.asm.
+extern void ap_lapic_timer_isr(void);
+extern void ap_spurious_isr(void);
+#endif
+
 // External assembly function to load IDT
 extern void idt_flush(uint64_t idt_ptr);
 
 // Set an IDT gate
-static void idt_set_gate(uint8_t num, uint64_t handler, uint16_t selector, uint8_t flags) {
+void idt_set_gate(uint8_t num, uint64_t handler, uint16_t selector, uint8_t flags) {
     idt[num].offset_low = handler & 0xFFFF;
     idt[num].offset_mid = (handler >> 16) & 0xFFFF;
     idt[num].offset_high = (handler >> 32) & 0xFFFFFFFF;
@@ -103,6 +114,18 @@ static void idt_set_gate(uint8_t num, uint64_t handler, uint16_t selector, uint8
     idt[num].type_attr = flags;
     idt[num].zero = 0;
 }
+
+#ifdef SMP_IPI
+// Is an IDT gate already claimed? (non-zero handler offset). SMP-G0: ipi_init
+// verifies each IPI vector is FREE before claiming it -- a silent idt_set_gate
+// over a live vector (the original IPI block sat dead-on the CPU1 LAPIC timer
+// gate at 0x40) kills the prior owner with no diagnostic. Gated so every
+// non-SMP_IPI build (default AND the frozen F3-5 SMP config) stays
+// byte-for-byte unchanged.
+int idt_gate_present(uint8_t num) {
+    return (idt[num].offset_low | idt[num].offset_mid | idt[num].offset_high) != 0;
+}
+#endif
 
 // Route the fault vectors that must NOT run on a possibly-corrupt kernel stack
 // onto IST1: #DF (8) and NMI (2). Without this a kernel-stack overflow that
@@ -236,6 +259,15 @@ void idt_init(void) {
     idt_set_gate(46, (uint64_t)irq14, 0x08, IDT_GATE_INTERRUPT);
     idt_set_gate(47, (uint64_t)irq15, 0x08, IDT_GATE_INTERRUPT);
 
+#ifdef SMP_SCHED
+    // Brick E: CPU1 LAPIC timer (0x40) + LAPIC spurious (0xFF). Both are interrupt
+    // gates on the kernel code selector. The BSP never fires these (its LAPIC timer
+    // stays masked; it uses PIC irq0). Installed here so they exist in the shared
+    // IDT before CPU1 arms its timer and does sti.
+    idt_set_gate(AP_LAPIC_TIMER_VECTOR, (uint64_t)ap_lapic_timer_isr, 0x08, IDT_GATE_INTERRUPT);
+    idt_set_gate(0xFF, (uint64_t)ap_spurious_isr, 0x08, IDT_GATE_INTERRUPT);
+#endif
+
     // Load IDT
     idt_flush((uint64_t)&idt_ptr);
 
@@ -333,6 +365,7 @@ static void print_page_fault_details(uint64_t err_code, uint64_t cr2) {
     } else {
         kprintf("Permission violation\n");
     }
+
 }
 
 // Decode GPF error code
@@ -357,9 +390,56 @@ static void print_gpf_details(uint64_t err_code) {
 }
 
 // Exception handler
+#ifdef SLAB_WATCH
+// Debug-branch slab-corruption watchpoint: arm one of DR0-3 as an 8-byte WRITE
+// breakpoint on `va` (a live slab's magic word, identity alias). The #DB handler
+// below logs the exact RIP that stray-writes a zero over it. The pre-existing
+// corruptor writes via the IDENTITY map (it predates the direct map), so identity
+// VAs suffice -- freeing all 4 DRs to watch 4 distinct slab pages.
+void slab_arm_watch(int dr, uint64_t va) {
+    static volatile uint64_t dr7_accum = 0;
+    switch (dr & 3) {
+        case 0: __asm__ volatile("mov %0, %%dr0" :: "r"(va) : "memory"); break;
+        case 1: __asm__ volatile("mov %0, %%dr1" :: "r"(va) : "memory"); break;
+        case 2: __asm__ volatile("mov %0, %%dr2" :: "r"(va) : "memory"); break;
+        case 3: __asm__ volatile("mov %0, %%dr3" :: "r"(va) : "memory"); break;
+    }
+    // Ln enable (bit 2n); R/Wn=01 write (bit 16+4n); LENn=10 8-byte (bit 18+4n).
+    dr7_accum |= (1ULL << (2 * (dr & 3)))
+               | (1ULL << (16 + 4 * (dr & 3)))
+               | (2ULL << (18 + 4 * (dr & 3)));
+    __asm__ volatile("mov %0, %%dr7" :: "r"(dr7_accum) : "memory");
+}
+#endif
+
 void exception_handler(uint64_t int_no, uint64_t err_code, uint64_t rip, uint64_t cs) {
     // Check if exception came from user mode (CS & 3 == 3)
     bool user_mode = (cs & 0x3) == 0x3;
+
+#ifdef SLAB_WATCH
+    // SLAB-WATCH: a hardware data breakpoint (DR0 identity / DR1 direct-map) fired ->
+    // log the writer RIP + CR3 + the value now at the watched magic, clear DR6, and
+    // RESUME (a watchpoint trap is NOT fatal). newval==0 == the corruptor caught.
+    if (int_no == 1) {
+        uint64_t dr6, dr0, dr1, dr2, dr3, cr3;
+        __asm__ volatile("mov %%dr6,%0; mov %%dr0,%1; mov %%dr1,%2; mov %%dr2,%3; mov %%dr3,%4; mov %%cr3,%5"
+                         : "=r"(dr6), "=r"(dr0), "=r"(dr1), "=r"(dr2), "=r"(dr3), "=r"(cr3));
+        uint64_t hit = (dr6 & 1) ? dr0 : (dr6 & 2) ? dr1 : (dr6 & 4) ? dr2 : (dr6 & 8) ? dr3 : 0;
+        if (hit) {
+            uint64_t newval = *(volatile uint64_t*)hit;
+            kprintf("[SLABWATCH] WRITE slab-magic @0x%lx rip=0x%lx cr3=0x%lx newval=0x%lx\n",
+                    (unsigned long)hit, (unsigned long)rip, (unsigned long)cr3,
+                    (unsigned long)newval);
+            // Once the magic is no longer SLAB_MAGIC, the corruptor was just caught --
+            // DISARM (clear DR7) so we log it exactly once, not on every later reuse.
+            if (newval != 0x51AB0BACE51AB0BULL) {
+                __asm__ volatile("mov %0, %%dr7" :: "r"(0UL) : "memory");
+            }
+        }
+        __asm__ volatile("mov %0, %%dr6" :: "r"(0UL));   // clear DR6 status
+        return;  // resume the interrupted instruction stream
+    }
+#endif
 
     // Recoverable page fault: try to fault the page in from the VMA layer BEFORE
     // printing the diagnostic banner or killing. Under the default EAGER load

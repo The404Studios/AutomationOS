@@ -93,6 +93,15 @@ static void print(const char *m)
 #define WIN_W   600
 #define WIN_H   460
 
+/* Current surface size in pixels. Initialized to the creation size and
+ * refreshed from win->w/win->h every frame (and on WL_EVENT_RESIZE) so all
+ * clamps and layout use the LIVE buffer dimensions. A resize (Maximize/snap)
+ * changes win->{w,h,stride,pixels}; every pixel write below is bounded to
+ * these so a smaller window cannot overflow and a larger one has no stale
+ * margins. */
+static i32 g_w = WIN_W;
+static i32 g_h = WIN_H;
+
 /* -------------------------------------------------------------------------
  * Color palette.
  * ----------------------------------------------------------------------- */
@@ -130,8 +139,8 @@ static void fill_rect(u32 *buf, i32 stride_px,
 {
     i32 x1 = x < 0 ? 0 : x;
     i32 y1 = y < 0 ? 0 : y;
-    i32 x2 = x + w; if (x2 > WIN_W) x2 = WIN_W;
-    i32 y2 = y + h; if (y2 > WIN_H) y2 = WIN_H;
+    i32 x2 = x + w; if (x2 > g_w) x2 = g_w;
+    i32 y2 = y + h; if (y2 > g_h) y2 = g_h;
     if (x1 >= x2 || y1 >= y2) return;
     for (i32 yy = y1; yy < y2; yy++) {
         u32 *row = buf + yy * stride_px;
@@ -161,19 +170,19 @@ static void fill_rrect(u32 *buf, i32 stride_px,
                 /* top-left corner */
                 i32 px, py;
                 px = x + r - 1 - dx; py = y + r - 1 - dy;
-                if (px >= 0 && px < WIN_W && py >= 0 && py < WIN_H)
+                if (px >= 0 && px < g_w && py >= 0 && py < g_h)
                     buf[py * stride_px + px] = color;
                 /* top-right corner */
                 px = x + w - r + dx; py = y + r - 1 - dy;
-                if (px >= 0 && px < WIN_W && py >= 0 && py < WIN_H)
+                if (px >= 0 && px < g_w && py >= 0 && py < g_h)
                     buf[py * stride_px + px] = color;
                 /* bottom-left corner */
                 px = x + r - 1 - dx; py = y + h - r + dy;
-                if (px >= 0 && px < WIN_W && py >= 0 && py < WIN_H)
+                if (px >= 0 && px < g_w && py >= 0 && py < g_h)
                     buf[py * stride_px + px] = color;
                 /* bottom-right corner */
                 px = x + w - r + dx; py = y + h - r + dy;
-                if (px >= 0 && px < WIN_W && py >= 0 && py < WIN_H)
+                if (px >= 0 && px < g_w && py >= 0 && py < g_h)
                     buf[py * stride_px + px] = color;
             }
         }
@@ -205,16 +214,16 @@ static void draw_rrect_border(u32 *buf, i32 stride_px,
             if (outer <= r2_outer + 1 && inner > r_inner * r_inner) {
                 i32 px, py;
                 px = x + dx;           py = y + dy;
-                if (px >= 0 && px < WIN_W && py >= 0 && py < WIN_H)
+                if (px >= 0 && px < g_w && py >= 0 && py < g_h)
                     buf[py * stride_px + px] = color;
                 px = x + w - 1 - dx;  py = y + dy;
-                if (px >= 0 && px < WIN_W && py >= 0 && py < WIN_H)
+                if (px >= 0 && px < g_w && py >= 0 && py < g_h)
                     buf[py * stride_px + px] = color;
                 px = x + dx;           py = y + h - 1 - dy;
-                if (px >= 0 && px < WIN_W && py >= 0 && py < WIN_H)
+                if (px >= 0 && px < g_w && py >= 0 && py < g_h)
                     buf[py * stride_px + px] = color;
                 px = x + w - 1 - dx;  py = y + h - 1 - dy;
-                if (px >= 0 && px < WIN_W && py >= 0 && py < WIN_H)
+                if (px >= 0 && px < g_w && py >= 0 && py < g_h)
                     buf[py * stride_px + px] = color;
             }
         }
@@ -314,15 +323,15 @@ static void draw_shimmer(u32 *buf, i32 stride_px, u64 ms)
     /* Shimmer lives under the title area.  Y coordinate is fixed. */
     i32 sy = 112; /* just under the 2x title */
 
-    /* Phase: 0..WIN_W over SHIMMER_PERIOD_MS, then wraps. */
+    /* Phase: 0..g_w over SHIMMER_PERIOD_MS, then wraps. */
     i32 phase = (i32)((ms % (u64)SHIMMER_PERIOD_MS) *
-                      (u64)(WIN_W + SHIMMER_W) / (u64)SHIMMER_PERIOD_MS)
+                      (u64)(g_w + SHIMMER_W) / (u64)SHIMMER_PERIOD_MS)
                 - SHIMMER_W;
 
     /* Draw the shimmer gradient: bright in the center, fading at edges. */
     for (i32 dx = 0; dx < SHIMMER_W; dx++) {
         i32 px = phase + dx;
-        if (px < 0 || px >= WIN_W) continue;
+        if (px < 0 || px >= g_w) continue;
 
         /* Brightness: 0 at edges, 255 at center */
         i32 dist_center = dx - SHIMMER_W / 2;
@@ -335,7 +344,7 @@ static void draw_shimmer(u32 *buf, i32 stride_px, u64 ms)
 
         for (i32 dy = 0; dy < SHIMMER_H; dy++) {
             i32 py = sy + dy;
-            if (py < 0 || py >= WIN_H) continue;
+            if (py < 0 || py >= g_h) continue;
             /* Mix 50% shimmer over existing pixel. */
             u32 existing = buf[py * stride_px + px];
             u32 er = (existing >> 16) & 0xFF;
@@ -360,7 +369,7 @@ static void draw_section_heading(u32 *buf, i32 stride_px,
 {
     /* Colored bar: 3px wide, full font height + 2. */
     fill_rect(buf, stride_px, x, y - 1, 3, FONT_H + 2, accent);
-    font_draw_string(buf, stride_px, WIN_W, WIN_H,
+    font_draw_string(buf, stride_px, g_w, g_h,
                      x + 7, y, label, accent);
 }
 
@@ -369,21 +378,22 @@ static void draw_section_heading(u32 *buf, i32 stride_px,
  * ----------------------------------------------------------------------- */
 static void draw_frame(u32 *buf, i32 stride_px, u64 ms)
 {
-    /* --- Background fill --- */
-    fill_rect(buf, stride_px, 0, 0, WIN_W, WIN_H, COL_BG);
+    /* --- Background fill (clears the FULL current surface; no stale margins
+     * after a resize) --- */
+    fill_rect(buf, stride_px, 0, 0, g_w, g_h, COL_BG);
 
     /* ================================================================
      * HERO HEADER (y=0..135)
      * ============================================================== */
     i32 header_h = 136;
-    fill_rrect(buf, stride_px, 0, 0, WIN_W, header_h, 0, COL_HEADER_BG);
+    fill_rrect(buf, stride_px, 0, 0, g_w, header_h, 0, COL_HEADER_BG);
 
     /* Title: "Welcome to AutomationOS" rendered 2x (16x32 per glyph).
      * At 2x scale, each char is 16px wide, 32px tall.
      * String width = font_text_width_2x("Welcome to AutomationOS") */
     const char *title = "Welcome to AutomationOS";
     i32 title_w = font_text_width_2x(title);
-    i32 title_x = (WIN_W - title_w) / 2;
+    i32 title_x = (g_w - title_w) / 2;
     i32 title_y = 28;
     font_draw_string_2x(buf, stride_px, title_x, title_y, title, COL_TITLE);
 
@@ -393,13 +403,13 @@ static void draw_frame(u32 *buf, i32 stride_px, u64 ms)
     /* Subtitle at normal 1x scale. */
     const char *subtitle = "A desktop built from scratch";
     i32 sub_w = font_text_width(subtitle);
-    i32 sub_x = (WIN_W - sub_w) / 2;
+    i32 sub_x = (g_w - sub_w) / 2;
     i32 sub_y = title_y + 32 + 12;  /* 32px glyph height + 12px gap */
-    font_draw_string(buf, stride_px, WIN_W, WIN_H,
+    font_draw_string(buf, stride_px, g_w, g_h,
                      sub_x, sub_y, subtitle, COL_SUBTITLE);
 
     /* Thin separator below header. */
-    hline(buf, stride_px, 16, header_h, WIN_W - 32, COL_SEP);
+    hline(buf, stride_px, 16, header_h, g_w - 32, COL_SEP);
 
     /* ================================================================
      * KEYBOARD SHORTCUTS CARD (left column)
@@ -408,7 +418,7 @@ static void draw_frame(u32 *buf, i32 stride_px, u64 ms)
     i32 col1_x = pad;
     i32 col1_w = 270;
     i32 cards_y = header_h + 10;
-    i32 card_h  = WIN_H - cards_y - pad;
+    i32 card_h  = g_h - cards_y - pad;
 
     fill_rrect(buf, stride_px,
                col1_x, cards_y, col1_w, card_h, 8, COL_CARD);
@@ -439,15 +449,15 @@ static void draw_frame(u32 *buf, i32 stride_px, u64 ms)
         fill_rrect(buf, stride_px,
                    col1_x + 14, row_y - 2, kw, FONT_H + 4, 3,
                    0xFF1E2438u);
-        font_draw_string(buf, stride_px, WIN_W, WIN_H,
+        font_draw_string(buf, stride_px, g_w, g_h,
                          col1_x + 18, row_y, shortcuts[i].key, COL_KEY);
 
         /* Separator dash */
-        font_draw_string(buf, stride_px, WIN_W, WIN_H,
+        font_draw_string(buf, stride_px, g_w, g_h,
                          col1_x + 14 + kw + 4, row_y, "->", COL_CARD_BORDER);
 
         /* Description */
-        font_draw_string(buf, stride_px, WIN_W, WIN_H,
+        font_draw_string(buf, stride_px, g_w, g_h,
                          col1_x + 14 + kw + 26, row_y, shortcuts[i].desc, COL_BODY);
     }
 
@@ -455,7 +465,7 @@ static void draw_frame(u32 *buf, i32 stride_px, u64 ms)
      * APPS CARD (right column)
      * ============================================================== */
     i32 col2_x = col1_x + col1_w + pad;
-    i32 col2_w = WIN_W - col2_x - pad;
+    i32 col2_w = g_w - col2_x - pad;
 
     fill_rrect(buf, stride_px,
                col2_x, cards_y, col2_w, card_h, 8, COL_CARD);
@@ -487,13 +497,13 @@ static void draw_frame(u32 *buf, i32 stride_px, u64 ms)
 
         /* Column A */
         fill_rect(buf, stride_px, dot_x, row_y + 5, 5, 5, COL_APP);
-        font_draw_string(buf, stride_px, WIN_W, WIN_H,
+        font_draw_string(buf, stride_px, g_w, g_h,
                          name_x, row_y, apps_col_a[i], COL_BODY);
 
         /* Column B */
         fill_rect(buf, stride_px,
                   dot_x + col_b_offset, row_y + 5, 5, 5, COL_APP);
-        font_draw_string(buf, stride_px, WIN_W, WIN_H,
+        font_draw_string(buf, stride_px, g_w, g_h,
                          name_x + col_b_offset, row_y, apps_col_b[i], COL_BODY);
     }
 
@@ -502,7 +512,7 @@ static void draw_frame(u32 *buf, i32 stride_px, u64 ms)
     /* Thin separator above hint. */
     hline(buf, stride_px,
           col2_x + 8, hint_y - 6, col2_w - 16, COL_SEP);
-    font_draw_string(buf, stride_px, WIN_W, WIN_H,
+    font_draw_string(buf, stride_px, g_w, g_h,
                      col2_x + 14, hint_y,
                      "Use the App Launcher to start any app",
                      COL_SUBTITLE);
@@ -528,20 +538,38 @@ void _start(void)
 
     print("[WELCOME] window created\n");
 
+    /* Live geometry. Initialized from the created window and refreshed every
+     * frame (and on WL_EVENT_RESIZE) from win->{w,h,stride}, which the library
+     * updates -- buffer included -- before the resize event surfaces. */
+    g_w = (i32)win->w;
+    g_h = (i32)win->h;
     i32 stride_px = (i32)(win->stride / 4u);
 
     /* Frame loop. */
     for (;;) {
-        /* Drain events (we don't act on them, but flush the queue). */
+        /* Drain events. We only act on resize; flush the rest. */
         int kind, ea, eb, ec;
         while (wl_poll_event(win, &kind, &ea, &eb, &ec)) {
-            /* No interactive behavior needed for a welcome screen. */
+            if (kind == WL_EVENT_RESIZE) {
+                /* The library already reallocated the buffer and updated
+                 * win->{w,h,stride,pixels}. Re-cache geometry so this frame's
+                 * clamps and layout match the new surface exactly. */
+                g_w = (i32)win->w;
+                g_h = (i32)win->h;
+                stride_px = (i32)(win->stride / 4u);
+            }
         }
+
+        /* Defensive re-read: stay in sync with the live window even if a
+         * resize arrived without a discrete event. */
+        g_w = (i32)win->w;
+        g_h = (i32)win->h;
+        stride_px = (i32)(win->stride / 4u);
 
         /* Get current time for the shimmer animation. */
         u64 ms = (u64)sc(SYS_GET_TICKS_MS, 0, 0, 0);
 
-        /* Render the full frame. */
+        /* Render the full frame into the live buffer. */
         draw_frame(win->pixels, stride_px, ms);
 
         wl_commit(win);

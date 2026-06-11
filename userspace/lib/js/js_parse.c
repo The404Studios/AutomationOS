@@ -37,7 +37,13 @@ typedef struct {
     js_vm   *vm;
     js_lexer lx;
     int      error;
+    int      depth;   /* native recursion depth through the expression parser */
 } parser;
+
+/* Cap expression-parser nesting so adversarial input (e.g. tens of thousands
+ * of '(' or prefix '!') cannot overflow the ~64KB user stack. Every nesting
+ * level passes through parse_unary, so the guard lives there. */
+#define JS_PARSE_MAX_DEPTH 64
 
 /* ------------------------------------------------------------------ */
 /*  Error reporting                                                    */
@@ -108,6 +114,7 @@ static js_node *parse_expr(parser *p);            /* full (with comma) */
 static js_node *parse_assign(parser *p);          /* no comma          */
 static js_node *parse_binary(parser *p, int min_prec);
 static js_node *parse_unary(parser *p);
+static js_node *parse_unary_inner(parser *p);
 static js_node *parse_postfix(parser *p);
 static js_node *parse_call_member(parser *p, js_node *base);
 static js_node *parse_primary(parser *p);
@@ -216,6 +223,21 @@ static js_node *parse_binary(parser *p, int min_prec)
 }
 
 static js_node *parse_unary(parser *p)
+{
+    /* depth-guarded entry (see JS_PARSE_MAX_DEPTH). Bail with a parse error
+     * rather than recurse past the cap and overflow the user stack. */
+    js_node *r;
+    if (++p->depth > JS_PARSE_MAX_DEPTH) {
+        p->depth--;
+        p_err(p, "expression too deeply nested");
+        return NULL;
+    }
+    r = parse_unary_inner(p);
+    p->depth--;
+    return r;
+}
+
+static js_node *parse_unary_inner(parser *p)
 {
     js_tok_kind k = kind(p);
     switch (k) {
@@ -888,6 +910,7 @@ js_node *js_parse_program(js_vm *vm, const char *src, js_usize len)
     parser p;
     p.vm = vm;
     p.error = 0;
+    p.depth = 0;
     g_parse_err[0] = 0;
     js_lex_init(&p.lx, vm, src, len);
 

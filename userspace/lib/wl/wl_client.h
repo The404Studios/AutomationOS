@@ -40,6 +40,10 @@ typedef struct {
 /* Event kinds reported by wl_poll_event() via *kind (mirror WL_EVT_*). */
 #define WL_EVENT_POINTER 2   /* a=x, b=y, c=buttons   */
 #define WL_EVENT_KEY     3   /* a=keycode, b=pressed  */
+#define WL_EVENT_RESIZE  4   /* a=new_w, b=new_h; win->{w,h,stride,pixels} ALREADY
+                              * updated by the library (it reallocated the buffer).
+                              * Apps that re-read win->w/h each frame need no action;
+                              * apps caching geometry should invalidate it here. */
 
 /*
  * Connect to the compositor.
@@ -56,8 +60,24 @@ int wl_connect(void);
  */
 wl_window *wl_create_window(wl_u32 w, wl_u32 h, const char *title);
 
+/*
+ * Destroy the window: send WL_REQ_DESTROY to the compositor, detach the SHM
+ * pixel buffer. After this call the win pointer is invalid for drawing.
+ * If the client crashes without calling this, the compositor's
+ * reap_dead_windows() will clean up on the next liveness sweep.
+ */
+void wl_destroy(wl_window *win);
+
 /* Commit the current buffer contents (full-surface damage) as a new frame. */
 void wl_commit(wl_window *win);
+
+/* Commit a partial damage rect: only the region (x,y,w,h) is sent to the
+ * compositor. Coordinates are clamped to the surface bounds; a zero-area or
+ * fully-out-of-bounds rect is silently ignored. Use this instead of wl_commit()
+ * when only a small portion of the surface changed (e.g. a cursor blink) to
+ * reduce compositor recomposite cost. */
+void wl_commit_damage(wl_window *win, unsigned int x, unsigned int y,
+                      unsigned int w, unsigned int h);
 
 /*
  * Non-blocking event poll.

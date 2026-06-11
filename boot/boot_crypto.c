@@ -162,9 +162,10 @@ int boot_rsa_verify(const boot_rsa_key_t* key, const uint8_t* hash,
     // 2. Implement simple modexp for e=65537
     // 3. Or rely on UEFI Secure Boot signature validation
 
-    // For now, return success if signature format is valid
-    // This should be replaced with actual cryptographic verification
-    return 0;
+    // No actual cryptographic verification implemented yet.
+    // SECURITY: return FAILURE (-1) until real RSA modexp is implemented.
+    // Returning 0 (success) here would let any signature pass.
+    return -1;
 }
 
 // Embedded trusted key (placeholder - will be replaced at build time)

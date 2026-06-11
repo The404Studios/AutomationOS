@@ -10,11 +10,15 @@ extern ipi_handle_reschedule
 extern ipi_handle_tlb_flush
 extern ipi_handle_function_call
 extern ipi_handle_stop
+extern ipi_handle_tlb_flush_all
+extern ipi_handle_tlb_flush_page
 
 global ipi_reschedule_handler
 global ipi_tlb_flush_handler
 global ipi_function_call_handler
 global ipi_stop_handler
+global ipi_tlb_flush_all_handler
+global ipi_tlb_flush_page_handler
 
 ; Common IPI handler prologue
 %macro IPI_HANDLER_PROLOGUE 0
@@ -55,25 +59,25 @@ global ipi_stop_handler
     iretq
 %endmacro
 
-; IPI_RESCHEDULE handler (vector 0x40)
+; IPI_RESCHEDULE handler (vector 0x50)
 ipi_reschedule_handler:
     IPI_HANDLER_PROLOGUE
     call ipi_handle_reschedule
     IPI_HANDLER_EPILOGUE
 
-; IPI_TLB_FLUSH handler (vector 0x41)
+; IPI_TLB_FLUSH handler (vector 0x51)
 ipi_tlb_flush_handler:
     IPI_HANDLER_PROLOGUE
     call ipi_handle_tlb_flush
     IPI_HANDLER_EPILOGUE
 
-; IPI_FUNCTION_CALL handler (vector 0x42)
+; IPI_FUNCTION_CALL handler (vector 0x52)
 ipi_function_call_handler:
     IPI_HANDLER_PROLOGUE
     call ipi_handle_function_call
     IPI_HANDLER_EPILOGUE
 
-; IPI_STOP handler (vector 0x43)
+; IPI_STOP handler (vector 0x53)
 ipi_stop_handler:
     IPI_HANDLER_PROLOGUE
     call ipi_handle_stop
@@ -82,3 +86,18 @@ ipi_stop_handler:
 .halt:
     hlt
     jmp .halt
+
+; IPI_TLB_FLUSH_ALL handler (vector 0x55)
+ipi_tlb_flush_all_handler:
+    IPI_HANDLER_PROLOGUE
+    call ipi_handle_tlb_flush_all
+    IPI_HANDLER_EPILOGUE
+
+; IPI_TLB_FLUSH_PAGE handler (vector 0x57) -- SMP-G2, the stash-mined SMP-R0
+; harvest: bounded kernel-range invlpg shootdown. The C handler reads the
+; request block (tlbshoot_addr/npages in ipi.c's low .bss), invlpg's the
+; range (full CR3 reload fallback), and acks.
+ipi_tlb_flush_page_handler:
+    IPI_HANDLER_PROLOGUE
+    call ipi_handle_tlb_flush_page
+    IPI_HANDLER_EPILOGUE

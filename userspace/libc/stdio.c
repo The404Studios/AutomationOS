@@ -446,10 +446,10 @@ FILE* fopen(const char* filename, const char* mode) {
     stream->buf_count = 0;
     stream->buf_mode = _IOFBF;  // Default to fully buffered
 
-    if (flags & O_RDONLY || flags & O_RDWR) {
+    if ((flags & 0x3) == O_RDONLY || (flags & O_RDWR)) {
         stream->flags |= _FILE_READ;
     }
-    if (flags & O_WRONLY || flags & O_RDWR) {
+    if ((flags & 0x3) == O_WRONLY || (flags & O_RDWR)) {
         stream->flags |= _FILE_WRITE;
     }
 
@@ -501,6 +501,12 @@ size_t fread(void* ptr, size_t size, size_t nmemb, FILE* stream) {
     }
 
     if (!(stream->flags & _FILE_READ)) {
+        stream->error = 1;
+        return 0;
+    }
+
+    // Overflow check: size * nmemb must not wrap
+    if (nmemb > ((size_t)-1) / size) {
         stream->error = 1;
         return 0;
     }
@@ -566,6 +572,12 @@ size_t fwrite(const void* ptr, size_t size, size_t nmemb, FILE* stream) {
     }
 
     if (!(stream->flags & _FILE_WRITE)) {
+        stream->error = 1;
+        return 0;
+    }
+
+    // Overflow check: size * nmemb must not wrap
+    if (nmemb > ((size_t)-1) / size) {
         stream->error = 1;
         return 0;
     }

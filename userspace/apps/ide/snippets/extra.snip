@@ -1,0 +1,22 @@
+SNIPPET:name=clamp
+TRIGGER:clampfn
+CATEGORY:data
+LABEL:clamp(v, lo, hi) helper
+BODY:static int ${1:clampi}(int v, int lo, int hi) {
+    return v < lo ? lo : (v > hi ? hi : v);
+}$0
+END
+
+SNIPPET:name=arrlen
+TRIGGER:arrlen
+CATEGORY:c
+LABEL:ARRLEN macro
+BODY:#define ARRLEN(a) ((int)(sizeof(a) / sizeof((a)[0])))$0
+END
+
+SNIPPET:name=spawnproc
+TRIGGER:spawnproc
+CATEGORY:net
+LABEL:spawn a background process
+BODY:long ${1:pid} = ide_sc(16 /* SYS_SPAWN */, (long)${2:"sbin/app"}, 0, 0, 0, 0, 0);$0
+END

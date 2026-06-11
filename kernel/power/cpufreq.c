@@ -76,6 +76,9 @@ static uint32_t get_cpu_frequency_hw(uint32_t cpu) {
  * Apply governor policy
  */
 static void cpufreq_apply_governor(uint32_t cpu) {
+    if (!power_global.cpu_policies || cpu >= power_global.num_cpus) {
+        return;
+    }
     cpufreq_policy_t* policy = &power_global.cpu_policies[cpu];
 
     switch (policy->governor) {
@@ -173,17 +176,22 @@ int cpufreq_set_frequency(uint32_t cpu, uint32_t freq_mhz) {
 
     // Find closest available frequency
     uint32_t closest = policy->min_freq_mhz;
-    uint32_t min_diff = (uint32_t)-1;
 
-    for (uint32_t i = 0; i < policy->num_freqs; i++) {
-        uint32_t diff = (freq_mhz > policy->available_freqs[i]) ?
-                        (freq_mhz - policy->available_freqs[i]) :
-                        (policy->available_freqs[i] - freq_mhz);
+    if (policy->available_freqs && policy->num_freqs > 0) {
+        uint32_t min_diff = (uint32_t)-1;
 
-        if (diff < min_diff) {
-            min_diff = diff;
-            closest = policy->available_freqs[i];
+        for (uint32_t i = 0; i < policy->num_freqs; i++) {
+            uint32_t diff = (freq_mhz > policy->available_freqs[i]) ?
+                            (freq_mhz - policy->available_freqs[i]) :
+                            (policy->available_freqs[i] - freq_mhz);
+
+            if (diff < min_diff) {
+                min_diff = diff;
+                closest = policy->available_freqs[i];
+            }
         }
+    } else {
+        closest = freq_mhz;  // No freq table, use clamped value directly
     }
 
     // Set frequency in hardware

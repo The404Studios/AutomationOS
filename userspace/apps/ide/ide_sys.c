@@ -41,6 +41,13 @@ int ide_read_file(const char* path, char* buf, int cap) {
         total += (int)n;
     }
     ide_sc(SYS_CLOSE, fd, 0, 0, 0, 0, 0);
+    /* Strip CR (\r): CRLF files would otherwise render a box glyph at each line
+     * end (the bitfont boxes any byte outside 0x20..0x7E) and skew caret cols. */
+    {
+        int w = 0;
+        for (int r = 0; r < total; r++) if (buf[r] != '\r') buf[w++] = buf[r];
+        total = w;
+    }
     return total;
 }
 

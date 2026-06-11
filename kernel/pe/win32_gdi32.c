@@ -18,6 +18,7 @@ typedef struct device_context {
     int height;
     void *framebuffer;
     bool in_paint;
+    struct device_context *next;
 } device_context_t;
 
 static device_context_t *dc_list = NULL;
@@ -51,6 +52,10 @@ static device_context_t* dc_create(HWND hwnd) {
     // Allocate framebuffer (simple RGB buffer)
     dc->framebuffer = malloc(dc->width * dc->height * 4);
 
+    // Add to linked list
+    dc->next = dc_list;
+    dc_list = dc;
+
     mutex_unlock(&dc_lock);
 
     return dc;
@@ -68,7 +73,7 @@ static device_context_t* dc_find(HDC hdc) {
             mutex_unlock(&dc_lock);
             return dc;
         }
-        dc = (device_context_t *)((uint8_t *)dc + sizeof(device_context_t));
+        dc = dc->next;
     }
 
     mutex_unlock(&dc_lock);
@@ -321,7 +326,7 @@ void gdi32_print_contexts(void) {
                dc->width, dc->height,
                dc->in_paint ? "painting" : "idle");
 
-        dc = (device_context_t *)((uint8_t *)dc + sizeof(device_context_t));
+        dc = dc->next;
         count++;
     }
 

@@ -499,7 +499,18 @@ static void game_step(void)
 
 /* ============================================================
  *  Rendering
+ *  ----------------------------------------------------------
+ *  The maze is a FIXED-size canvas (WIN_W x WIN_H). To survive the
+ *  compositor Maximize/snap (which reallocates win->pixels and changes
+ *  win->{w,h,stride}), we draw the fixed canvas into a static backbuffer
+ *  whose stride is always WIN_W, then LETTERBOX-blit it into the live
+ *  window surface. present() re-reads win->{w,h,stride,pixels} fresh every
+ *  frame, clears the WHOLE surface to black, and clamps the blit to
+ *  min(canvas, window) so neither a larger nor smaller window can produce
+ *  stale margins or an out-of-bounds write.
  * ============================================================ */
+static u32 g_canvas[WIN_W * WIN_H];   /* fixed-size backbuffer, stride = WIN_W */
+
 static void fill_rect(u32 *buf, u32 stride, i32 x, i32 y, i32 w, i32 h, u32 color)
 {
     i32 x1 = x < 0 ? 0 : x;
@@ -653,8 +664,11 @@ static void draw_centered(u32 *buf, u32 stride, i32 y, const char *s, u32 color)
                      (WIN_W - w) / 2, y, s, color);
 }
 
-static void render(u32 *buf, u32 stride)
+/* Draw the whole game into the fixed-size backbuffer (stride == WIN_W). */
+static void render(void)
 {
+    u32 *buf = g_canvas;
+    u32  stride = WIN_W;
     /* Field + HUD. */
     fill_rect(buf, stride, 0, 0, WIN_W, WIN_H, COL_BG);
     fill_rect(buf, stride, 0, 0, WIN_W, HUD_H, COL_HUD_BG);
@@ -720,6 +734,37 @@ static void render(u32 *buf, u32 stride)
     }
 }
 
+/* Letterbox the fixed canvas into the live window surface.
+ *
+ * Re-reads win->{w,h,stride,pixels} fresh (they change on a compositor
+ * resize/maximize), clears the FULL current surface to black so the margins
+ * around the fixed maze never show stale garbage, then blits the canvas at
+ * the top-left clamped to min(canvas, window). Every write is bounded to the
+ * CURRENT win->w/win->h via the CURRENT stride, so neither a larger nor a
+ * smaller window can overflow the (possibly reallocated) buffer. */
+static void present(wl_window *win)
+{
+    u32 *dst    = win->pixels;
+    u32  dstr   = win->stride / 4u;   /* pixels per row, current */
+    i32  win_w  = (i32)win->w;
+    i32  win_h  = (i32)win->h;
+
+    /* Clear the whole current surface (0..win_w, 0..win_h). */
+    for (i32 y = 0; y < win_h; y++) {
+        u32 *row = dst + (u32)y * dstr;
+        for (i32 x = 0; x < win_w; x++) row[x] = COL_BG;
+    }
+
+    /* Blit the fixed canvas, clamped so a smaller window can't overflow. */
+    i32 cw = WIN_W < win_w ? WIN_W : win_w;
+    i32 ch = WIN_H < win_h ? WIN_H : win_h;
+    for (i32 y = 0; y < ch; y++) {
+        u32 *drow = dst      + (u32)y * dstr;
+        u32 *srow = g_canvas + (u32)y * WIN_W;
+        for (i32 x = 0; x < cw; x++) drow[x] = srow[x];
+    }
+}
+
 /* ============================================================
  *  Entry point
  * ============================================================ */
@@ -736,8 +781,6 @@ void _start(void)
         print("[PACMAN] wl_create_window FAILED\n");
         for (;;) sc(SYS_YIELD, 0, 0, 0, 0, 0, 0);
     }
-    u32 stride = win->stride / 4u;
-
     u64 now = (u64)sc(SYS_GET_TICKS_MS, 0, 0, 0, 0, 0, 0);
     game_init(now);
     g_want_dir = g_pac.dir;
@@ -751,6 +794,12 @@ void _start(void)
         /* Drain input. */
         int kind, a, b, c_ev;
         while (wl_poll_event(win, &kind, &a, &b, &c_ev)) {
+            /* Compositor resize/maximize: the library has ALREADY reallocated
+             * the buffer and updated win->{w,h,stride,pixels}. We cache no
+             * geometry -- present() re-reads it and clears the full surface --
+             * so there is nothing to free or reallocate here. The next
+             * present() letterboxes the fixed maze into the new size. */
+            if (kind == WL_EVENT_RESIZE) continue;
             if (kind != WL_EVENT_KEY || b != 1) continue;  /* key-down only */
             switch (a) {
             case KEY_ESC:
@@ -786,7 +835,8 @@ void _start(void)
             }
         }
 
-        render(win->pixels, stride);
+        render();           /* draw into the fixed backbuffer            */
+        present(win);       /* letterbox-blit into the live surface      */
         wl_commit(win);
         sc(SYS_YIELD, 0, 0, 0, 0, 0, 0);
     }

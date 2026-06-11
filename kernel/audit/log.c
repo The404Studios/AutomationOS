@@ -16,9 +16,9 @@ static audit_buffer_t* global_audit_buffer = NULL;
 static audit_config_t global_audit_config;
 audit_stats_t audit_stats;
 
-// Rate limiting state
-static uint64_t last_rate_check = 0;
-static uint32_t events_this_second = 0;
+// Rate limiting state (volatile for atomic operations)
+static volatile uint64_t last_rate_check = 0;
+static volatile uint32_t events_this_second = 0;
 
 // Forward declarations
 extern int audit_buffer_write(audit_buffer_t* buffer, audit_event_t* event);
@@ -92,14 +92,19 @@ int audit_log(audit_event_type_t type, audit_result_t result,
     // Check rate limit
     uint64_t now = audit_get_timestamp();
     if (global_audit_config.rate_limit > 0) {
-        if ((now - last_rate_check) > 1000000000ULL) {  // 1 second
-            last_rate_check = now;
-            events_this_second = 0;
+        uint64_t prev = __atomic_load_n(&last_rate_check, __ATOMIC_ACQUIRE);
+        if ((now - prev) > 1000000000ULL) {  // 1 second
+            // Only the CPU that wins the CAS resets the counter; others skip.
+            if (__atomic_compare_exchange_n(&last_rate_check, &prev, now,
+                                            false, __ATOMIC_ACQ_REL,
+                                            __ATOMIC_ACQUIRE)) {
+                __atomic_store_n(&events_this_second, 0, __ATOMIC_RELEASE);
+            }
         }
 
-        events_this_second++;
-        if (events_this_second > global_audit_config.rate_limit) {
-            audit_stats.events_filtered++;
+        uint32_t n = __atomic_add_fetch(&events_this_second, 1, __ATOMIC_ACQ_REL);
+        if (n > global_audit_config.rate_limit) {
+            __atomic_add_fetch(&audit_stats.events_filtered, 1, __ATOMIC_RELAXED);
             return -1;  // Rate limit exceeded
         }
     }
@@ -141,32 +146,32 @@ int audit_log_event(audit_event_t* event) {
 
     // Filter event
     if (!audit_filter_should_log(event)) {
-        audit_stats.events_filtered++;
+        __atomic_add_fetch(&audit_stats.events_filtered, 1, __ATOMIC_RELAXED);
         return 0;
     }
 
     // Evaluate rules
     audit_action_t action = audit_rules_evaluate(event);
     if (action == AUDIT_ACTION_IGNORE) {
-        audit_stats.events_filtered++;
+        __atomic_add_fetch(&audit_stats.events_filtered, 1, __ATOMIC_RELAXED);
         return 0;
     }
 
     // Write to ring buffer
     int result = audit_buffer_write(global_audit_buffer, event);
     if (result != 0) {
-        audit_stats.events_dropped++;
+        __atomic_add_fetch(&audit_stats.events_dropped, 1, __ATOMIC_RELAXED);
         return -1;
     }
 
-    audit_stats.total_events++;
+    __atomic_add_fetch(&audit_stats.total_events, 1, __ATOMIC_RELAXED);
 
     // Write to disk if enabled
     if (global_audit_config.log_to_disk) {
         if (audit_write_to_disk(event) == 0) {
-            audit_stats.disk_writes++;
+            __atomic_add_fetch(&audit_stats.disk_writes, 1, __ATOMIC_RELAXED);
         } else {
-            audit_stats.disk_errors++;
+            __atomic_add_fetch(&audit_stats.disk_errors, 1, __ATOMIC_RELAXED);
         }
     }
 

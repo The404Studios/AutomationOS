@@ -5,6 +5,14 @@
  * High-performance implementations using 64-bit word operations.
  *
  * Strategy for memcpy / memset / memmove:
+ *  Small/medium (< 4KB): 64-bit word stores, 4x unrolled, dst-aligned.
+ *  Large (>= 4KB):       REP MOVSB / REP STOSB (ERMS fast path).
+ *     On CPUs with ERMS (Enhanced REP MOVSB/STOSB, Ivy Bridge+) the
+ *     microcode performs a cache-line-aware burst copy that matches or
+ *     exceeds hand-coded loops for large sizes. On pre-ERMS CPUs REP
+ *     MOVSB is still correct, just slower; the threshold is high enough
+ *     (4KB) that the loop overhead is negligible either way.
+ *
  *  1. Byte-wise head: advance dst to the next 8-byte boundary (0-7 bytes).
  *  2. Word body:      copy/set using uint64_t (8 bytes per iteration),
  *                     4x unrolled for instruction-level parallelism.
@@ -21,6 +29,31 @@
 
 #include "../include/types.h"
 
+/* Threshold above which REP MOVSB/STOSB is faster than the unrolled loop.
+ * 4KB is a conservative crossover; on ERMS CPUs the microcode is optimal for
+ * any size >= ~256B, but the unrolled loop has lower startup overhead below 4KB.
+ * For the compositor back-buffer blit (4-8MB) this is a multi-x speedup. */
+#define ERMS_THRESHOLD  4096
+
+/* ─────────────────────────────────────────────────────────────────────────
+ * ERMS runtime gate — CPUID-verified, default OFF.
+ *
+ * ERMS (Enhanced REP MOVSB/STOSB) is an Ivy-Bridge-2012 feature
+ * (CPUID.07H:EBX[bit 9]). The T410's 2010 Westmere i5-520M does NOT have it:
+ * on that CPU `rep movsb` still WORKS but is *slower* than the unrolled word
+ * loop below — so taking the REP path there is pure downside, with the added
+ * hazard that a stale Direction Flag in early boot makes it copy backwards
+ * and corrupt memory.
+ *
+ * This flag defaults to 0 so that (a) every memcpy/memset during EARLY BOOT —
+ * before any CPU feature detection has run — uses the portable loop, and
+ * (b) any pre-ERMS CPU uses the portable loop FOREVER. cpu_features_init()
+ * sets it to 1 ONLY after CPUID proves ERMS is present. Correctness never
+ * depends on detection timing: until the flag flips, the safe path is taken.
+ * Defined here (not in cpu_features.c) so string.c links standalone in the
+ * host unit tests too. ──────────────────────────────────────────────────── */
+volatile int g_string_erms_ok = 0;
+
 /* -----------------------------------------------------------------------
  * memcpy — non-overlapping memory copy
  * ----------------------------------------------------------------------- */
@@ -29,6 +62,30 @@ void* memcpy(void* dest, const void* src, size_t n) {
     const uint8_t* s = (const uint8_t*)src;
 
     if (!n) return dest;
+
+    /* --- Large copy: delegate to REP MOVSB (ERMS fast string) ---
+     * REP MOVSB with ERMS performs a cache-line-aware burst copy that is
+     * optimal for page-sized and larger transfers (framebuffer blits, page
+     * zeroing, ELF segment copies). Uses DF=0 (forward, the SysV default). */
+    if (g_string_erms_ok && n >= ERMS_THRESHOLD) {
+        /* CRITICAL: `cld` before the string op. REP MOVSB copies in the
+         * direction of EFLAGS.DF. The SysV ABI guarantees DF=0 on C function
+         * entry, but EARLY BOOT is different: GRUB/Multiboot hands off with DF
+         * undefined, and this memcpy runs (via page-table setup, framebuffer
+         * blit, ELF load) before any code has forced DF=0. A stale DF=1 makes
+         * REP MOVSB copy BACKWARDS from d/s, corrupting the 4KB below the
+         * destination — on the T410 this manifested as a glitched boot console
+         * and a hard freeze before userspace. cld is one cheap byte; always
+         * emit it. (cc is implicitly clobbered on x86 GCC asm.) */
+        __asm__ volatile(
+            "cld\n\t"
+            "rep movsb"
+            : "+D"(d), "+S"(s), "+c"(n)
+            :
+            : "memory"
+        );
+        return dest;
+    }
 
     /* --- Head: align dst to 8-byte boundary --- */
     while (((uintptr_t)d & 7) && n) {
@@ -80,13 +137,31 @@ void* memset(void* dest, int val, size_t n) {
 
     if (!n) return dest;
 
+    /* --- Large fill: delegate to REP STOSB (ERMS fast string) ---
+     * REP STOSB with ERMS stores the AL byte in a cache-line-aware burst.
+     * This is optimal for page-zero, back-buffer clear, and BSS init. */
+    if (g_string_erms_ok && n >= ERMS_THRESHOLD) {
+        /* cld for the same DF-safety reason as memcpy above: memset(page,0,4096)
+         * runs during early page-table setup and the framebuffer clear, both
+         * before DF is guaranteed 0. Gated OFF by default; never taken on the
+         * pre-ERMS Westmere T410. */
+        __asm__ volatile(
+            "cld\n\t"
+            "rep stosb"
+            : "+D"(d), "+c"(n)
+            : "a"(byte_val)
+            : "memory"
+        );
+        return dest;
+    }
+
     /* --- Head: align dst to 8-byte boundary --- */
     while (((uintptr_t)d & 7) && n) {
         *d++ = byte_val;
         n--;
     }
 
-    /* --- Build 64-bit broadcast pattern (e.g. 0x42 → 0x4242424242424242) --- */
+    /* --- Build 64-bit broadcast pattern (e.g. 0x42 -> 0x4242424242424242) --- */
     uint64_t pattern = (uint64_t)byte_val;
     pattern |= pattern <<  8;
     pattern |= pattern << 16;
@@ -397,7 +472,7 @@ int vsnprintf(char* buf, size_t size, const char* fmt, __builtin_va_list args) {
 
             char tmp[24]; int ti = 0;
             uint64_t uval;
-            if (val < 0) { PUTC('-'); uval = (uint64_t)(-val); width--; }
+            if (val < 0) { PUTC('-'); uval = -(uint64_t)val; width--; }  /* unsigned negate: UB-free for INT64_MIN */
             else           uval = (uint64_t)val;
             if (uval == 0) tmp[ti++] = '0';
             else while (uval) { tmp[ti++] = '0' + (uval % 10); uval /= 10; }

@@ -417,12 +417,12 @@ typedef struct {
 static Enemy g_enemy[MAX_ENEMIES];
 static i32   g_enemy_count = 0;   /* current live count (for fast checks) */
 
-/* per-tier stats */
-static i32 tier_hp(i32 t)    { static const i32 v[6] = {0,1,2,3,5,8};   return v[t]; }
-static i32 tier_speed(i32 t) { static const i32 v[6] = {0,80,110,140,170,210}; return v[t]; } /* FP/tick-ish */
-static i32 tier_reward(i32 t){ static const i32 v[6] = {0,2,3,5,8,12};  return v[t]; }
-static i32 tier_lives(i32 t) { static const i32 v[6] = {0,1,1,2,3,4};   return v[t]; }
-static i32 tier_radius(i32 t){ static const i32 v[6] = {0,10,12,14,16,18}; return v[t]; }
+/* per-tier stats (bounds-guarded: t outside [0,5] returns 0, never an OOB read) */
+static i32 tier_hp(i32 t)    { static const i32 v[6] = {0,1,2,3,5,8};   return ((unsigned)t < 6) ? v[t] : 0; }
+static i32 tier_speed(i32 t) { static const i32 v[6] = {0,80,110,140,170,210}; return ((unsigned)t < 6) ? v[t] : 0; } /* FP/tick-ish */
+static i32 tier_reward(i32 t){ static const i32 v[6] = {0,2,3,5,8,12};  return ((unsigned)t < 6) ? v[t] : 0; }
+static i32 tier_lives(i32 t) { static const i32 v[6] = {0,1,1,2,3,4};   return ((unsigned)t < 6) ? v[t] : 0; }
+static i32 tier_radius(i32 t){ static const i32 v[6] = {0,10,12,14,16,18}; return ((unsigned)t < 6) ? v[t] : 0; }
 
 static i32 spawn_enemy(i32 tier, i32 dist_fp)
 {
@@ -1055,6 +1055,14 @@ static void draw_palette(Canvas *c)
 
 static void render(Canvas *c)
 {
+    /* Letterbox: clear the WHOLE current surface (which may be larger than the
+     * fixed WIN_W x WIN_H canvas after a Maximize/snap) so no stale garbage is
+     * left in the margins around the fixed game canvas. All draws below are
+     * clamped to c->w/c->h by the primitives, so the fixed-layout content is
+     * simply blitted at the top-left and any extra space stays black. */
+    if (c->w > WIN_W || c->h > WIN_H)
+        fill_rect(c, 0, 0, c->w, c->h, COL_BLACK);
+
     /* field background: grass checker */
     fill_rect(c, 0, FIELD_Y, WIN_W, FIELD_H, COL_GRASS);
     for (i32 yy = FIELD_Y; yy < PALETTE_Y; yy += 40) {
@@ -1248,6 +1256,17 @@ void _start(void)
                 prev_btn = btn;
             } else if (kind == WL_EVENT_KEY) {
                 if (eb == 1) handle_key(ea);   /* eb = pressed */
+            } else if (kind == WL_EVENT_RESIZE) {
+                /* The library has ALREADY reallocated the buffer and updated
+                 * win->{w,h,stride,pixels}. Refresh the cached canvas so every
+                 * subsequent pixel write is bounded to the CURRENT surface with
+                 * the CURRENT stride (a smaller window clamps; a larger one gets
+                 * its full surface cleared each frame -- see render()). This is a
+                 * fixed-canvas game, so the layout is NOT scaled (letterboxed). */
+                cv.buf    = win->pixels;
+                cv.stride = (i32)(win->stride / 4u);
+                cv.w      = (i32)win->w;
+                cv.h      = (i32)win->h;
             }
         }
 

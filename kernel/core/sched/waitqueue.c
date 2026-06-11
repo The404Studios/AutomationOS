@@ -66,30 +66,12 @@ static void wo_ensure_init(wait_object_t* wo) {
     }
 }
 
-// Link `proc` at the tail of wo's intrusive FIFO waiter list and take the
-// object's reference on it. Caller holds no locks; we take wo->lock internally.
-static void wo_link_tail(wait_object_t* wo, process_t* proc) {
-    // The object owns a reference to the parked process. Without this, killing a
-    // process while it is BLOCKED (sys_kill sets state=TERMINATED but leaves it
-    // linked here, since scheduler_remove_process is a no-op for a non-queued
-    // process) would drop the last ref and free the PCB — leaving this list
-    // pointing at freed memory. The ref keeps the PCB alive until it is unlinked
-    // (and unref'd) by a later signal or the timer scan.
-    process_ref(proc);
-
-    uint64_t flags;
-    spin_lock_irqsave(&wo->lock, &flags);
-    proc->wait_on = wo;
-    proc->wait_next = NULL;
-    if (wo->tail) {
-        wo->tail->wait_next = proc;
-        wo->tail = proc;
-    } else {
-        wo->waiters = proc;
-        wo->tail = proc;
-    }
-    spin_unlock_irqrestore(&wo->lock, flags);
-}
+// (wo_link_tail was formerly here as a helper that linked a waiter at the tail
+// of wo's intrusive FIFO waiter list under wo->lock and took the object's
+// reference on it. REMOVED: both call sites (wait_object_block and
+// wait_object_prepare_futex) now inline its body so they can hold wo->lock
+// across the link AND the PROCESS_BLOCKED store, closing the lost-wakeup
+// window that the old separate lock-then-set-BLOCKED sequence had.)
 
 // Unlink `proc` from wo if it is currently linked there. Returns 1 if it was
 // found-and-removed (caller then owns the dropped object-ref and must unref),
@@ -122,6 +104,25 @@ static int wo_unlink(wait_object_t* wo, process_t* proc) {
     return 0;
 }
 
+// Force-unlink `proc` from `wo` if (and only if) it is currently linked there,
+// dropping the object-ref it holds. Idempotent: a no-op (and NO unref) if proc was
+// already removed by a concurrent signal/timer. Used by the kill paths to reclaim
+// the object-ref of a process killed while BLOCKED on this wait_object, so the PCB
+// collapses to a reapable zombie instead of leaking. wo_unlink takes wo->lock
+// IRQ-safe internally; callers hold no locks. IRQ-safety: a hard-IRQ
+// wait_object_signal racing us either pops proc first (then we find nothing and do
+// nothing) or runs after our unlink (then it finds nothing) -- wo->lock serializes
+// the two, and exactly one of them drops the single object-ref. [#9]
+int wait_object_abort(wait_object_t* wo, process_t* proc) {
+    if (!wo || !proc) return 0;
+    wo_ensure_init(wo);
+    if (wo_unlink(wo, proc)) {
+        process_unref(proc);   // release the stranded object-ref exactly once
+        return 1;
+    }
+    return 0;
+}
+
 // Pop the head waiter (FIFO). Returns the parked process still holding the
 // object's reference (caller must unref), or NULL if empty.
 static process_t* wo_pop_head(wait_object_t* wo) {
@@ -142,44 +143,67 @@ static process_t* wo_pop_head(wait_object_t* wo) {
     return p;
 }
 
-int wait_object_block(wait_object_t* wo, uint64_t deadline_or_0) {
-    if (!wo) return 0;
-    wo_ensure_init(wo);
-
-    process_t* current = process_get_current();
-    if (!current) {
-        kprintf("[WAIT] wait_object_block: no current process\n");
-        return 0;
+// Pop the first waiter (FIFO order) whose process_t.futex_key matches `key`, skipping
+// (leaving linked) any non-matching waiters. Returns the parked process still holding
+// the object's reference (caller must unref), or NULL if no waiter matches. Same lock
+// discipline as wo_pop_head -- the whole list walk + unlink is under wo->lock so an
+// IRQ wakeup can never observe a half-linked node. Used by futex's key-filtered wake
+// (FUTEX-B): two distinct futex addresses colliding into one hash bucket share this
+// list, and only the waiter parked on the woken address must be re-readied.
+static process_t* wo_pop_head_matching(wait_object_t* wo, uint64_t key) {
+    uint64_t flags;
+    spin_lock_irqsave(&wo->lock, &flags);
+    process_t* prev = NULL;
+    process_t* it = wo->waiters;
+    while (it) {
+        if (it->futex_key == key) {
+            if (prev) {
+                prev->wait_next = it->wait_next;
+            } else {
+                wo->waiters = it->wait_next;
+            }
+            if (wo->tail == it) {
+                wo->tail = prev;
+            }
+            it->wait_next = NULL;
+            it->wait_on = NULL;
+            spin_unlock_irqrestore(&wo->lock, flags);
+            return it;
+        }
+        prev = it;
+        it = it->wait_next;
     }
+    spin_unlock_irqrestore(&wo->lock, flags);
+    return NULL;
+}
 
-    // Record the waiter BEFORE marking blocked / switching away, so a wakeup
-    // (signal or timer) racing in right after we set state cannot miss us.
-    // (Wakeups also take the object/sleep locks, and re-readying a not-yet-
-    // switched-out process is safe: it goes back on the ready queue and we never
-    // actually sleep.)
-    wo_link_tail(wo, current);
-
-    // Timer-armed wait: also park on the global sleep list with the deadline, so
-    // the per-tick scan (sleep_list_wake_due) can wake us if the timeout fires
-    // before any signal. sleep_list_push brackets the list mutation with
-    // cli/restore so the timer IRQ can't observe a half-linked node.
-    if (deadline_or_0 != 0) {
-        current->wake_deadline = deadline_or_0;
-        sleep_list_push(current);
-    }
-
-    current->state = PROCESS_BLOCKED;
-
+// Deschedule a waiter that is ALREADY linked onto `wo` and ALREADY marked
+// PROCESS_BLOCKED: pick a successor, idle if none is runnable, switch, and on resume
+// tear down any residual linkage. This is the common "park core" shared by
+// wait_object_block (which links + sets BLOCKED itself) and the futex prepare/commit
+// path (which links + sets BLOCKED under wo->lock to close the FUTEX-A lost-wakeup
+// window). Returns 1 if woken by a signal (wait_object_signal already popped us), 0 if
+// by the timer/other. Runs in `current`'s own context; touches no stale locals.
+static int wo_park_and_cleanup(wait_object_t* wo, process_t* current) {
     // Switch to another runnable process. Mirror sys_yield()/cooperative
     // context_switch exactly: pick a successor, hand it the CPU. The current
     // (blocked) process is NOT re-added to the ready queue, so it will not run
     // again until a signal or the timer re-readies it.
+    process_t* idle = scheduler_idle_thread();
     process_t* next = scheduler_pick_next();
 
     // If nothing is runnable, idle until something becomes ready (an IRQ wakeup —
     // a signal-side scheduler_add_process or the timer scan — re-readies a
     // process). We must re-enable interrupts to make progress.
-    while (next == NULL) {
+    //
+    // scheduler_pick_next() returns the IDLE THREAD (never NULL) when both
+    // runqueues are empty. In this cooperative path we must NOT switch into it:
+    // the idle thread runs `sti;hlt` forever in ring 0 and never calls schedule(),
+    // so a later IRQ that re-readies us would never switch back — a permanent hang,
+    // and cooperative_switch_to() into idle's synthetic never-run context can fault
+    // outright. So treat `idle` exactly like "nothing runnable": halt HERE on our
+    // own kernel stack and re-check pick_next() after each IRQ wakeup.
+    while (next == NULL || next == idle) {
         __asm__ volatile("sti; hlt; cli" ::: "memory");
         // If we ourselves were woken in the meantime, stop idling and resume.
         if (current->state != PROCESS_BLOCKED) {
@@ -188,7 +212,7 @@ int wait_object_block(wait_object_t* wo, uint64_t deadline_or_0) {
         next = scheduler_pick_next();
     }
 
-    if (next != NULL && next != current) {
+    if (next != NULL && next != idle && next != current) {
         next->state = PROCESS_RUNNING;
         process_set_current(next);
 
@@ -198,6 +222,16 @@ int wait_object_block(wait_object_t* wo, uint64_t deadline_or_0) {
         // and routes RESUME_IRETQ successors (timer-preempted ring-3 tasks, e.g.
         // CPU burners) through iretq so a blocking task can hand off to them.
         current->resume_mode = RESUME_CRETURN;
+        // LEAK-FIX: drop the outgoing process's "running" ref before the switch.
+        // The process is BLOCKED with ref >= 3 (creation + running + object-ref
+        // from the inline link in wait_object_block), so this will not free the process. Without this,
+        // the running ref accumulates through every block/wake/re-pick cycle,
+        // causing the same ref-count leak as the yield/preemption paths. After
+        // this drop: ref = creation(1) + object-ref(1) = 2; when the waker re-
+        // readies it (scheduler_add +1, process_unref of object-ref -1) the
+        // result is creation(1) + queue(1) = 2 -> re-pick transfers queue ref ->
+        // creation(1) + running(1) = 2. Stable.
+        process_unref(current);
         cooperative_switch_to(current, next);
         // Resumed here after a wakeup. (Stale locals above are NOT touched.)
     } else if (next == current) {
@@ -234,6 +268,113 @@ int wait_object_block(wait_object_t* wo, uint64_t deadline_or_0) {
     return woke_by_signal;
 }
 
+int wait_object_block(wait_object_t* wo, uint64_t deadline_or_0) {
+    if (!wo) return 0;
+    wo_ensure_init(wo);
+
+    process_t* current = process_get_current();
+    if (!current) {
+        kprintf("[WAIT] wait_object_block: no current process\n");
+        return 0;
+    }
+
+    // LOST-WAKEUP FIX: link the waiter AND set PROCESS_BLOCKED under a SINGLE
+    // wo->lock hold, so a concurrent waker (wo_wake_one_proc) cannot pop us
+    // while state is still RUNNING and silently discard the wakeup. This mirrors
+    // the discipline in wait_object_prepare_futex (FUTEX-A fix). The old code
+    // called wo_link_tail() (which takes+drops wo->lock) and then set BLOCKED
+    // outside the lock -- a waker racing into that gap would pop our node, see
+    // state != BLOCKED, call process_unref + continue, and the wakeup was lost.
+    //
+    // Inline the wo_link_tail body here so we can hold wo->lock across both the
+    // link and the state transition:
+    process_ref(current);   // the object owns one reference on the parked waiter
+
+    {
+        uint64_t flags;
+        spin_lock_irqsave(&wo->lock, &flags);
+        current->wait_on   = wo;
+        current->wait_next = NULL;
+        if (wo->tail) {
+            wo->tail->wait_next = current;
+            wo->tail = current;
+        } else {
+            wo->waiters = current;
+            wo->tail    = current;
+        }
+        current->state = PROCESS_BLOCKED;
+        spin_unlock_irqrestore(&wo->lock, flags);
+    }
+
+    // Timer-armed wait: also park on the global sleep list with the deadline, so
+    // the per-tick scan (sleep_list_wake_due) can wake us if the timeout fires
+    // before any signal. sleep_list_push brackets the list mutation with
+    // cli/restore so the timer IRQ can't observe a half-linked node. Safe after
+    // releasing wo->lock: state is already BLOCKED, so the timer scan will
+    // correctly find us as a valid waiter.
+    if (deadline_or_0 != 0) {
+        current->wake_deadline = deadline_or_0;
+        sleep_list_push(current);
+    }
+
+    return wo_park_and_cleanup(wo, current);
+}
+
+// FUTEX-A: close the futex check-then-block lost-wakeup. Atomically, under wo->lock
+// (the SAME lock futex_wake's wo_pop_head_matching takes), re-read the futex word and:
+//   - if *uaddr still == val: link `current` at the tail of `wo`, tag it with `key`,
+//     mark it PROCESS_BLOCKED, and return 1 -- the caller then parks via
+//     wait_object_park_committed();
+//   - if *uaddr already changed: link nothing and return 0 -- the caller returns EAGAIN.
+// Because the value test, the link, and the BLOCKED store all happen under one lock, a
+// concurrent futex_wake can neither be lost in a gap between the test and the link, nor
+// observe a half-committed (linked-but-not-BLOCKED) waiter. This is futex-specific but
+// lives here because it must mutate the intrusive waiter list under wo->lock. The
+// inline link mirrors wo_link_tail's body (process_ref + tail append) exactly.
+int wait_object_prepare_futex(wait_object_t* wo, int* uaddr, int val, uint64_t key) {
+    if (!wo || !uaddr) return 0;
+    wo_ensure_init(wo);
+
+    process_t* current = process_get_current();
+    if (!current) return 0;
+
+    uint64_t flags;
+    spin_lock_irqsave(&wo->lock, &flags);
+    // SMAP bracket: uaddr is a user-space pointer. When CR4.SMAP is enabled,
+    // the kernel cannot read user pages without RFLAGS.AC set. Open the
+    // window for this single atomic load and close it immediately after.
+    stac();
+    int uval = __atomic_load_n(uaddr, __ATOMIC_SEQ_CST);
+    clac();
+    if (uval != val) {
+        spin_unlock_irqrestore(&wo->lock, flags);
+        return 0;   // value changed under the lock -> EAGAIN, nothing linked
+    }
+    // Link current at the tail (wo_link_tail body, inlined: we already hold wo->lock).
+    process_ref(current);            // the object owns one reference on the parked waiter
+    current->futex_key = key;
+    current->wait_on   = wo;
+    current->wait_next = NULL;
+    if (wo->tail) {
+        wo->tail->wait_next = current;
+        wo->tail = current;
+    } else {
+        wo->waiters = current;
+        wo->tail = current;
+    }
+    current->state = PROCESS_BLOCKED;
+    spin_unlock_irqrestore(&wo->lock, flags);
+    return 1;
+}
+
+int wait_object_park_committed(wait_object_t* wo) {
+    if (!wo) return 0;
+    process_t* current = process_get_current();
+    if (!current) return 0;
+    // The caller already linked us and set BLOCKED (under wo->lock); just deschedule.
+    return wo_park_and_cleanup(wo, current);
+}
+
 // Wake exactly one waiter (FIFO), skipping any that already moved on (killed).
 // Returns the re-readied process (the object's ref on it has been released — the
 // scheduler now holds one; the returned pointer is "ref NOT taken" per the old
@@ -254,8 +395,36 @@ static process_t* wo_wake_one_proc(wait_object_t* wo) {
         sleep_list_remove(proc);
         proc->wake_deadline = 0;
 
-        proc->state = PROCESS_READY;
-        scheduler_add_process(proc);  // takes its own reference
+        process_set_ready(proc);
+        // F3-5: HOME-routed -- the woken task goes to ITS cpu, never the
+        // WAKER's. A CPU1 exit waking its CPU0 parent (init in waitpid) must
+        // not enqueue the parent on cpus[1].
+        scheduler_add_process_home(proc);  // takes its own reference
+        process_unref(proc);          // release the object-ref; scheduler holds one
+        return proc;
+    }
+    return NULL;
+}
+
+// Wake exactly one waiter whose futex_key == key (FIFO among matchers), skipping any
+// that already moved on (killed). Mirrors wo_wake_one_proc's re-ready + ref discipline
+// exactly, but pops by key via wo_pop_head_matching. Returns the re-readied process
+// (object-ref released; the scheduler holds one) or NULL if no live matching waiter.
+static process_t* wo_wake_one_matching(wait_object_t* wo, uint64_t key) {
+    process_t* proc;
+    while ((proc = wo_pop_head_matching(wo, key)) != NULL) {  // holds the object's ref
+        // Skip a waiter that already moved on (killed: TERMINATED but still linked).
+        if (proc->state != PROCESS_BLOCKED) {
+            process_unref(proc);
+            continue;
+        }
+        // A timer-armed waiter may also be on the sleep list; take it off so the timer
+        // can't also "wake" it after we've re-readied it.
+        sleep_list_remove(proc);
+        proc->wake_deadline = 0;
+
+        process_set_ready(proc);
+        scheduler_add_process_home(proc);  // F3-5: home-routed (see above)
         process_unref(proc);          // release the object-ref; scheduler holds one
         return proc;
     }
@@ -319,6 +488,15 @@ process_t* wq_wake_one(wait_queue_t* wq) {
     // held only already-dead waiters. futex_wake tests non-NULL == "woke one";
     // child_wait/epoll ignore the return.
     return wo_wake_one_proc(&wq->wobj);
+}
+
+process_t* wq_wake_one_key(wait_queue_t* wq, uint64_t key) {
+    if (!wq) return NULL;
+    wo_ensure_init(&wq->wobj);
+    // Same "ref NOT taken" contract as wq_wake_one, but only a waiter whose
+    // futex_key == key is re-readied -- so a futex_wake on address X never wakes a
+    // waiter parked on a different address Y that hash-collided into the same bucket.
+    return wo_wake_one_matching(&wq->wobj, key);
 }
 
 int wq_wake_all(wait_queue_t* wq) {

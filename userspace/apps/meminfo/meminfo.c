@@ -146,12 +146,13 @@ typedef struct {
     char name[32];
 } proc_detail_t;
 
-/* System-wide statistics from SYS_SYSINFO. */
+/* System-wide statistics from SYS_SYSINFO (must match kernel procapi.h: 32 bytes). */
 typedef struct {
-    u64 total_mem;     /* total physical memory in bytes */
-    u64 free_mem;      /* free physical memory in bytes  */
-    u64 uptime_ms;     /* milliseconds since boot        */
-    u32 proc_count;    /* total live processes           */
+    u64 total_mem;     /* total physical memory in bytes    */
+    u64 free_mem;      /* free physical memory in bytes     */
+    u64 uptime_ms;     /* milliseconds since boot           */
+    u32 proc_count;    /* total live processes              */
+    u32 heap_used_kb;  /* kernel heap usage in KiB (0=old)  */
 } sysinfo_t;
 
 /* -----------------------------------------------------------------------
@@ -310,6 +311,14 @@ void _start(void)
         buf_puts(g_report, &pos, REPORT_CAP, "Processes    : ");
         buf_putu(g_report, &pos, REPORT_CAP, (u64)info.proc_count);
         buf_putc(g_report, &pos, REPORT_CAP, '\n');
+
+        /* Kernel heap usage (available when heap_used_kb > 0; older kernels
+         * return 0 here because the field was reserved padding). */
+        if (info.heap_used_kb > 0) {
+            buf_puts(g_report, &pos, REPORT_CAP, "Heap used    : ");
+            buf_putu(g_report, &pos, REPORT_CAP, (u64)info.heap_used_kb);
+            buf_puts(g_report, &pos, REPORT_CAP, " KiB\n");
+        }
     } else {
         /* Degrade gracefully -- SYS_SYSINFO not wired or errored. */
         buf_puts(g_report, &pos, REPORT_CAP, "Memory total : n/a\n");

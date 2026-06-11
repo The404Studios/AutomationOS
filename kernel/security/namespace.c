@@ -2,9 +2,10 @@
 #include "../include/kernel.h"
 #include "../include/mem.h"
 #include "../include/sched.h"
+#include "../include/string.h"
 
-// Global namespace ID counter
-static uint32_t next_namespace_id = 1;
+// Global namespace ID counter (non-static: referenced as extern by ns_pid/ns_ipc/ns_net/ns_uts/ns_mount)
+uint32_t next_namespace_id = 1;
 
 // Global root namespaces (shared by all processes by default)
 static namespace_container_t* root_container = NULL;
@@ -145,6 +146,9 @@ namespace_container_t* namespace_clone_container(namespace_container_t* parent, 
     if (!ns) {
         return NULL;
     }
+
+    // Zero-initialize so error_cleanup does not act on uninitialized pointers
+    memset(ns, 0, sizeof(namespace_container_t));
 
     // Clone or share PID namespace
     if (flags & CLONE_NEWPID) {

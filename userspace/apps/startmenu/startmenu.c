@@ -51,8 +51,8 @@
 #define SYS_EXIT      0
 #define SYS_WRITE     3
 #define SYS_SPAWN     16
-#define SYS_POWEROFF  41
-#define SYS_REBOOT    42
+#define SYS_POWEROFF  46
+#define SYS_REBOOT    47
 
 /* -------------------------------------------------------------------------
  * Inline syscall (3-arg; no fs:0x28 canary -- -fno-stack-protector)

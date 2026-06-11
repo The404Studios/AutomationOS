@@ -2,24 +2,31 @@
 
 > Warm memory. Refresh per checkpoint. One active brick at a time.
 
-## SMP-RUNMASK-0 — OPEN (branch `brick/smp-runmask-0`, off frozen `brick/smp-f3-7-batchclass`) — fix the audit before the desktop depends on it
-- **why (user):** "DESKTOP-SPLIT will lean hard on the audit. The audit needs to be correct
-  before the desktop starts depending on it. The old heuristic (multi-CPU allowed mask =
-  danger) is now too crude. The real invariant is: address space ACTUALLY RAN on more than one
-  CPU = danger." Standalone micro-brick, NOT buried in DESKTOP-SPLIT.
-- **user-set scope:** add `p->ran_on_cpus` under SMP_SCHED_DISPATCH · set the bit on every
-  ACTUAL dispatch/switch-in · replace/extend tlb_pinning_audit (declared multi-mask OK; actual
-  multi-CPU execution of the same address space FAILS loudly) · batchdemo (mask CPU0|CPU1, ran
-  only on CPU1) passes · a synthetic forced cross-CPU same-mm case FAILS the audit · no
-  scheduler policy change · no desktop split.
-- **acceptance (user-set):** `RUNMASK: PASS declared_multimask_ok=1 actual_single_cpu=1
-  forced_crosscpu_detected=1 tlb_neg_valid=1`.
-- **design notes (work the hazards):** threads share an mm — the true unit is the ADDRESS
-  SPACE, so the audit aggregates ran_on_cpus per CR3, not per PCB · batchdemo EXITS in <1 s, so
-  live-walk audits miss it — record (allowed, ran) at exit-time for multimask processes ·
-  the forced case is PLANTED on a live PCB (set both bits, audit must detect, restore) — never
-  actually run one mm on two CPUs · field + hooks gated SMP_RUNMASK so every frozen profile
-  stays byte-identical (the field rides at the END of process_t with p->sched).
+## SMP-RUNMASK-0 — LANDED (commit `16482d8`, branch `brick/smp-runmask-0`, awaiting review/push) — the audit audits reality
+- **THE EXACT ACCEPTANCE HIT:** `RUNMASK: PASS declared_multimask_ok=1 actual_single_cpu=1
+  forced_crosscpu_detected=1 tlb_neg_valid=1` — the central evidence is the exit record
+  `[RUNMASK] exit record: 'batchdemo' allowed=0x3 ran=0x2 single_cpu=1` (a declared multimask
+  process that ACTUALLY ran on exactly one CPU); the planted cross-CPU footprint on init was
+  caught loudly (exactly ONE violation line in the whole boot) and the restore re-verified
+  clean; TLBSHOOT_NEG keeps its exact prefix with `(RUNMASK upgrade:` semantics; the ENTIRE
+  ladder green. Record: [`bricks/SMP-RUNMASK-0.md`](bricks/SMP-RUNMASK-0.md) · proof
+  `scripts/runmask_smoke.sh`.
+- **what landed:** `p->ran_on_cpus` (gated, end-of-struct) stamped at BOTH dispatch
+  chokepoints (process_set_current = BSP; ap_cooperative_schedule's switch commit = CPU1) ·
+  `runmask_audit_crosscpu()` aggregates PER CR3 (the address space is the unit, threads share
+  an mm; kernel-CR3 residents exempt — that's G2's domain) · exit-boundary recording for dying
+  multimask processes (batchdemo lives ~50 ms; live walks can never see it) · the planted
+  forced case (detect + restore, one mm never actually runs on two CPUs).
+- **EN-ROUTE FIND — THE __LINE__-SHIFT TRAP (the keeper):** the first hook placement (inside
+  cpu_set_current_thread, scheduler.c:181) broke DEFAULT byte-identity even though the code
+  was #ifdef'd out — the preprocessor counts lines in FALSE branches, so the 9 inserted lines
+  shifted the __LINE__ values inside the ASSERT_ALWAYS calls at scheduler.c:321–345. Found by
+  object-level bisection (md5 per .o: only c_scheduler.o differed). RULE: default-compiled
+  files with __LINE__ users tolerate gated insertions only BELOW their last __LINE__ site.
+  Stamps relocated; default `6f99ed9f` re-verified; ladder re-proven.
+- **boundary held:** no scheduler policy change (the stamps observe, never route) · no desktop
+  split.
+- **next:** DESKTOP-SPLIT — its forcing function is now armed and audits reality.
 
 ## SMP-F3-7 BATCH-CLASS — FROZEN / COMPLETE (pushed `f260177`, ls-remote verified; user: "the first brick where CPU1 is useful for a normal workload class, not just a pinned proof task... The serial line lock is especially worth keeping — SMP proofs depend on readable logs") — ordinary work runs on CPU1 under typed intent
 - **THE EXACT ACCEPTANCE HIT (4th run; 3 failures root-caused en route):** `BATCHCLASS: PASS

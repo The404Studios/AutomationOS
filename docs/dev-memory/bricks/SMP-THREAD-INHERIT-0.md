@@ -10,10 +10,10 @@
 
 ```yaml
 brick: SMP-THREAD-INHERIT-0
-status: complete (LANDED local; awaiting push word)
+status: FROZEN+PUSHED (origin/brick/smp-thread-inherit-0 @ d3a0b78, ls-remote verified)
 branch: brick/smp-thread-inherit-0
 base: brick/desktop-split-0 (db795bf, the frozen DESKTOP-SPLIT-0 freeze head)
-commits: [fc62123 (feat), <docs>]
+commits: [fc62123 (feat), d3a0b78 (docs + law 20)]
 acceptance: "THREADINHERIT: PASS batch_parent_cpu1=1 workers_same_cpu=1 sched_inherit=1 runmask_clean=1 desktop_cpu0=1 matmuljobs_ready=1 no_allowlist_expansion=1 soak=30m panic=0 invariant=0"
 proof: scripts/threadinherit_smoke.sh (full stack + SMP_DSPLIT + SMP_THREAD_INHERIT, qemu -smp 2, 30-min soak)
 profile: SMP=1 SMP_SCHED=1 SMP_SCHED_DISPATCH=1 SMP_IPI=1 SMP_BKL=1 SMP_BATCH=1 SMP_RUNMASK=1 SMP_DSPLIT=1 SMP_THREAD_INHERIT=1

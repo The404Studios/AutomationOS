@@ -40,10 +40,11 @@
 - **queued behind it (user-set):** SMP-MATMUL-BATCH-0 (allowlist matmuljobs after this proves
   shared-mm safety) · SMP-CPU1-PREEMPT-0 (CPU1-local BATCH preemption only) · SMP-PERMM-TLBSHOOT-0
   (real per-mm remote invalidation, replaces the TLBSHOOT_NEG pin assumption).
-- **status:** LANDED local (fc62123 feat + docs; off db795bf; AWAITING PUSH WORD). Full 30-min
-  soak hit the exact acceptance on the ATOMIC-detector kernel: parent+2 workers all ran=0x2,
-  mm_single_cpu=1, desktop ran=0x1, matmuljobs_ready=1 + unrouted, all walls green, 64 windows,
-  0 panic/invariant, default 6f99ed9f. Record: [`bricks/SMP-THREAD-INHERIT-0.md`](bricks/SMP-THREAD-INHERIT-0.md).
+- **status:** FROZEN+PUSHED (origin/`brick/smp-thread-inherit-0` @ `d3a0b78`, ls-remote verified;
+  `fc62123` feat + `d3a0b78` docs+law20, unsquashed). Full 30-min soak hit the exact acceptance on
+  the ATOMIC-detector kernel: parent+2 workers all ran=0x2, mm_single_cpu=1, desktop ran=0x1,
+  matmuljobs_ready=1 + unrouted, all walls green, 64 windows, 0 panic/invariant, default byte-
+  identical 6f99ed9f. Record: [`bricks/SMP-THREAD-INHERIT-0.md`](bricks/SMP-THREAD-INHERIT-0.md).
   NEW LAW 20 = a shared cross-CPU DETECTOR field must update atomically (locked OR), never a plain
   read-modify-write -- the detector must be no weaker than the concurrency hazard it catches.
 

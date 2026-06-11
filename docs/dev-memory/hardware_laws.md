@@ -103,6 +103,14 @@ signal: a model that internalizes these is *useful* on this OS; one that doesn't
     changes with zero semantic delta. Bisect such breaks at the object level (md5 per .o,
     diff the two builds — minutes, not hours). Insert gated code BELOW a file's last __LINE__
     user, or hook at a call site in a __LINE__-free file instead.
+20. **A shared cross-CPU DETECTOR field must update atomically — never a plain read-modify-write
+    (user-set at SMP-THREAD-INHERIT-0).** When a field exists to catch a concurrency hazard (e.g.
+    `mm_place->ran_on_cpus`, the "one address space on two CPUs" detector), the writers ARE the
+    racing CPUs the field detects. A plain `|=` is a read-modify-write that two CPUs can tear,
+    losing one CPU's bit — and the lost bit is exactly the evidence of the bug, so the detector
+    hides the very thing it exists to catch. Use a locked OR (`__atomic_fetch_or`, SEQ_CST). The
+    detector must be no weaker than the hazard. (Per-task fields with a single concurrent writer —
+    a task is never on two CPUs at once — do NOT need this; only genuinely shared fields do.)
 
 ## Reviewer checklist (a stricter role that can say "no")
 

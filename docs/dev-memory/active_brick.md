@@ -18,8 +18,43 @@
   address space actually executes on two CPUs without per-mm shootdown — so this brick can be
   proven by adding a threaded BATCH app and showing its threads + parent share one CPU's run
   history (no `[RUNMASK] VIOLATION` beyond the planted one).
-- **status:** OPEN — awaiting the user's go for implementation. Will branch from the
-  DESKTOP-SPLIT-0 freeze head.
+- **EXACT ACCEPTANCE (user-set):** `THREADINHERIT: PASS batch_parent_cpu1=1 workers_same_cpu=1
+  sched_inherit=1 runmask_clean=1 desktop_cpu0=1 matmuljobs_ready=1 no_allowlist_expansion=1
+  soak=30m panic=0 invariant=0`
+- **the mechanism (user-set, NOT name-special-casing):** the address space here = `context.cr3` +
+  a heap-shared `as_refcount` (no mm struct). Add a SHARED `mm_placement { home_cpu, ran_on_cpus,
+  sched_class }` tied to the as_refcount lifetime (alloc in process_create, pointer-shared in
+  thread_create, freed on last_user). Rule: ONE mm = ONE execution CPU until per-mm shootdown
+  exists. thread_create INHERITS: allowed_cpus = 1<<home_cpu (NARROW, never widen), pinned_cpu =
+  home_cpu, sched_class = mm's class. home_cpu set at the LEADER's scheduler_submit_task (= where
+  it placed). Dispatch stamps OR cpu into both p->ran_on_cpus and p->mm_place->ran_on_cpus.
+- **proof vehicle:** kernel-spawned `threadprobe` (BATCH→CPU1 like batchdemo, NOT on the sys_spawn
+  allowlist) with 2 persistent worker threads; the [THREADINHERIT] observation + ran_on_cpus
+  ground truth prove parent+workers all CPU1. `threadinherit_selftest` proves the inherit predicate
+  (a BATCH-CPU1 parent's thread inherits CPU1+BATCH = matmuljobs_ready) without routing matmuljobs.
+- **gate:** SMP_THREAD_INHERIT (nested under SMP_RUNMASK). Default + all pre-inherit builds stay
+  byte-identical (6f99ed9f). __LINE__-safe: process.c/handlers.c/kernel.c have NO __LINE__ users;
+  scheduler.c edits all sit BELOW its last ASSERT_ALWAYS (line 336).
+- **HARD NO's (user-set):** no allowlist expansion · no work stealing · no general migration · no
+  global PREEMPT · no general per-mm shootdown · no desktop policy expansion.
+- **queued behind it (user-set):** SMP-MATMUL-BATCH-0 (allowlist matmuljobs after this proves
+  shared-mm safety) · SMP-CPU1-PREEMPT-0 (CPU1-local BATCH preemption only) · SMP-PERMM-TLBSHOOT-0
+  (real per-mm remote invalidation, replaces the TLBSHOOT_NEG pin assumption).
+- **status:** LANDED local (fc62123 feat + docs; off db795bf; AWAITING PUSH WORD). Full 30-min
+  soak hit the exact acceptance on the ATOMIC-detector kernel: parent+2 workers all ran=0x2,
+  mm_single_cpu=1, desktop ran=0x1, matmuljobs_ready=1 + unrouted, all walls green, 64 windows,
+  0 panic/invariant, default 6f99ed9f. Record: [`bricks/SMP-THREAD-INHERIT-0.md`](bricks/SMP-THREAD-INHERIT-0.md).
+  NEW LAW 20 = a shared cross-CPU DETECTOR field must update atomically (locked OR), never a plain
+  read-modify-write -- the detector must be no weaker than the concurrency hazard it catches.
+
+## SMP-MATMUL-BATCH-0 — OPEN (the reward brick, user-set after THREAD-INHERIT) — matmuljobs can finally join the BATCH allowlist
+- **scope:** with shared-mm safety proven (THREAD-INHERIT), add matmuljobs to the BATCH allowlist;
+  its SYS_THREAD_CREATE worker threads inherit its CPU1 placement, so the whole threaded job runs
+  wholly on the worker core under the RUNMASK audit (zero new violations).
+- **HARD NO's (carry forward):** no work stealing · no general migration · no per-mm shootdown · no
+  global PREEMPT. The two further-out bricks: SMP-CPU1-PREEMPT-0 (CPU1-local BATCH preemption only)
+  then SMP-PERMM-TLBSHOOT-0 (real per-mm remote invalidation, retires the TLBSHOOT_NEG assumption).
+- **status:** OPEN — awaiting the user's go. Will branch from the THREAD-INHERIT freeze head.
 
 ## DESKTOP-SPLIT-0 — FROZEN+PUSHED (origin/`brick/desktop-split-0` @ `3adfca7`, ls-remote verified; commits `0eb41ed` feat + `3adfca7` docs, unsquashed; user: "a real two-core operating system milestone") — the desktop now USES both CPUs
 - **THE EXACT ACCEPTANCE HIT (run 3, from the committed proof vehicle itself):**

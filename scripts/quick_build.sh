@@ -243,6 +243,23 @@ if [ "${SMP:-0}" = "1" ]; then
         CFLAGS="$CFLAGS -DSMP_BATCH"
         echo "*** SMP_BATCH build: BATCH-class CPU1 routing live (SMP-F3-7) ***"
     fi
+
+    # =========================================================================
+    # SMP_RUNMASK (SMP-RUNMASK-0) -- sub-gate, REQUIRES SMP=1. The audit
+    # audits REALITY: p->ran_on_cpus is stamped at the single dispatch
+    # chokepoint (cpu_set_current_thread) and the TLB pin audit aggregates it
+    # per CR3 -- a declared multi-CPU mask is now OK (batchdemo); the same
+    # ADDRESS SPACE actually executing on >1 CPU fails loudly. The forced
+    # case is a planted footprint on a live PCB (detect + restore). When
+    # UNSET: no -DSMP_RUNMASK, no new field, the G2 mask heuristic stands,
+    # every other build byte-for-byte unchanged. Acceptance profile:
+    #   SMP=1 SMP_SCHED=1 SMP_SCHED_DISPATCH=1 SMP_IPI=1 SMP_BKL=1 \
+    #   SMP_BATCH=1 SMP_RUNMASK=1
+    # =========================================================================
+    if [ "${SMP_RUNMASK:-0}" = "1" ]; then
+        CFLAGS="$CFLAGS -DSMP_RUNMASK"
+        echo "*** SMP_RUNMASK build: execution-reality pin audit live (SMP-RUNMASK-0) ***"
+    fi
 fi
 
 # =============================================================================

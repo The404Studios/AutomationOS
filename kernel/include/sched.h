@@ -452,6 +452,18 @@ typedef struct process {
     // loose this brick -- relocating them into p->sched touches every ctor/
     // validator/seam site and is its own future checkpoint.
     sched_profile_t sched;
+
+#ifdef SMP_RUNMASK
+    // SMP-RUNMASK-0: which CPUs this task ACTUALLY ran on -- bit N set the
+    // first time cpu_set_current_thread() dispatches it on CPU N. The TRUE
+    // pin-model invariant is audited on THIS (per-CR3 aggregated), not on
+    // the declared allowed_cpus mask: a multi-mask task that only ever runs
+    // on one CPU is fine (batchdemo); the same address space EXECUTING on
+    // two CPUs is the real TLB hazard. memset(0) == "never ran" (correct).
+    // Gated separately from p->sched so every pre-RUNMASK profile keeps a
+    // byte-identical process_t layout.
+    uint32_t ran_on_cpus;
+#endif
 #endif
 } process_t;
 

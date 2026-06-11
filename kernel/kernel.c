@@ -1347,6 +1347,15 @@ void kernel_main(void* raw_info) {
                                 scheduler_batchclass_selftest();
                             }
 #endif
+#ifdef SMP_RUNMASK
+                            /* SMP-RUNMASK-0: the audit audits reality --
+                             * baseline clean, a PLANTED cross-CPU footprint
+                             * is detected loudly, restore is clean. */
+                            {
+                                extern void runmask_selftest(void);
+                                runmask_selftest();
+                            }
+#endif
                             /* Brick F2: pin ONE ring-0 kernel test thread to CPU1.
                              * CPU1's ap_scheduler_loop context-switches into it on
                              * the next tick. Spin briefly on the BSP, then read

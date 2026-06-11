@@ -152,6 +152,10 @@ static volatile uint32_t tlbshoot_ack    = 0;   /* remote handler increments    
 static spinlock_t        tlbshoot_lock;         /* dedicated in-flight serializer */
 volatile uint32_t g_tlb_invariant_violations = 0;
 void tlb_invariant_violation(const char* what);
+#ifdef SMP_RUNMASK
+int  runmask_audit_crosscpu(int* checked_out);   /* defined below the selftest */
+void runmask_selftest(void);
+#endif
 
 // Initialize IPI subsystem. BSP context, after lapic_init(), BEFORE
 // try_start_cpu1() -- the IDT is shared, so the gates must exist before CPU1
@@ -842,6 +846,24 @@ void tlb_shootdown_selftest(void) {
             (kernel_flush && acked && bounded && invariant) ? "PASS" : "FAIL",
             kernel_flush, acked, bounded, invariant, (unsigned long)us);
 
+#ifdef SMP_RUNMASK
+    /* -------- the negative proof, RUNMASK-0 UPGRADE: audit EXECUTION
+     * REALITY, not declared masks. A multi-CPU allowed_cpus is now fine
+     * (batchdemo); the real TLB hazard is the same ADDRESS SPACE having
+     * actually RUN on more than one CPU -- which runmask_audit_crosscpu()
+     * detects by aggregating ran_on_cpus per CR3 across live processes.
+     * The acceptance line keeps its exact prefix so every frozen smoke's
+     * grep -qF stays true. -------- */
+    {
+        int checked = 0;
+        int cross = runmask_audit_crosscpu(&checked);
+        kprintf("TLBSHOOT_NEG: %s no_user_crossflush_needed_under_pinning=%d "
+                "(RUNMASK upgrade: procs_checked=%d cross_cpu_mms=%d; "
+                "declared multimask OK)\n",
+                (cross == 0 && checked > 0) ? "PASS" : "FAIL",
+                (cross == 0 && checked > 0) ? 1 : 0, checked, cross);
+    }
+#else
     /* -------- the negative proof: the pin model makes user cross-flush
      * unnecessary. Walk every live process; ANY multi-CPU affinity mask
      * breaks the assumption and FAILS this gate (the loud forcing function
@@ -873,7 +895,101 @@ void tlb_shootdown_selftest(void) {
                 (multi == 0 && checked > 0) ? "PASS" : "FAIL",
                 (multi == 0 && checked > 0) ? 1 : 0, checked, multi);
     }
+#endif
 }
+
+#ifdef SMP_RUNMASK
+/* ===========================================================================
+ * SMP-RUNMASK-0 -- the audit audits REALITY.
+ * ===========================================================================
+ * The G2 mask heuristic (multi-CPU allowed_cpus = danger) went stale the day
+ * F3-7 shipped the first legitimate multimask task. The TRUE invariant:
+ *   an ADDRESS SPACE that actually executed on >1 CPU = the TLB hazard.
+ * ran_on_cpus is stamped at the single dispatch chokepoint
+ * (cpu_set_current_thread); this audit aggregates it per CR3 (threads share
+ * an mm -- the address space, not the PCB, is the unit) across live
+ * processes. Kernel-CR3 residents (idle threads, kthreads) are EXCLUDED:
+ * the kernel address space legitimately runs on every CPU and is exactly
+ * what the G2 kernel-range shootdown protects.
+ * =========================================================================== */
+volatile uint32_t g_runmask_exit_multimask = 0;  /* dying multimask processes  */
+volatile uint32_t g_runmask_exit_crosscpu  = 0;  /* ...that ran on >1 CPU (BAD) */
+
+#define RUNMASK_MAX_MMS 128
+static uint64_t runmask_a_cr3[RUNMASK_MAX_MMS];   /* low .bss scratch */
+static uint32_t runmask_a_ran[RUNMASK_MAX_MMS];
+
+/* Walk live processes, aggregate ran_on_cpus per user CR3, count address
+ * spaces that executed on >1 CPU (each reported LOUDLY). checked_out gets
+ * the number of live user processes walked. Returns the violation count. */
+int runmask_audit_crosscpu(int* checked_out) {
+    uint64_t kernel_cr3 = read_cr3();   /* BSP kernel context == the shared kernel space */
+    int n = 0, checked = 0, viol = 0;
+
+    for (uint32_t pid = 1; pid < 256; pid++) {
+        process_t* p = process_get_by_pid(pid);
+        if (!p) continue;
+        uint64_t cr3 = p->context.cr3;
+        if (cr3 == 0 || cr3 == kernel_cr3) {   /* kernel-space resident: exempt */
+            process_unref(p);
+            continue;
+        }
+        checked++;
+        int i;
+        for (i = 0; i < n; i++) {
+            if (runmask_a_cr3[i] == cr3) break;
+        }
+        if (i == n && n < RUNMASK_MAX_MMS) {
+            runmask_a_cr3[n] = cr3;
+            runmask_a_ran[n] = 0;
+            n++;
+        }
+        if (i < n) runmask_a_ran[i] |= p->ran_on_cpus;
+        process_unref(p);
+    }
+
+    for (int i = 0; i < n; i++) {
+        uint32_t r = runmask_a_ran[i];
+        int bits = 0;
+        for (uint32_t rr = r; rr; rr &= (rr - 1)) bits++;
+        if (bits > 1) {
+            viol++;
+            kprintf("[RUNMASK] VIOLATION: address space cr3=0x%llx EXECUTED on "
+                    "%d CPUs (ran=0x%x) -- user cross-flush now REQUIRED\n",
+                    (unsigned long long)runmask_a_cr3[i], bits, r);
+        }
+    }
+
+    if (checked_out) *checked_out = checked;
+    return viol;
+}
+
+/* The forced-detection proof: PLANT a cross-CPU footprint on a live PCB
+ * (init), assert the audit catches it, restore, assert clean again. Never
+ * actually runs one mm on two CPUs -- the plant IS the synthetic case. */
+void runmask_selftest(void) {
+    int c0 = 0, c1 = 0, c2 = 0;
+    int v0 = runmask_audit_crosscpu(&c0);            /* baseline: clean      */
+
+    int planted = 0, detected = 0;
+    process_t* ini = process_get_by_pid(1);
+    if (ini) {
+        uint32_t save = ini->ran_on_cpus;
+        ini->ran_on_cpus = 0x3;                      /* the forced case      */
+        planted = 1;
+        detected = (runmask_audit_crosscpu(&c1) == v0 + 1);
+        ini->ran_on_cpus = save;                     /* restore reality      */
+        process_unref(ini);
+    }
+    int restored_clean = (runmask_audit_crosscpu(&c2) == v0);
+
+    int pass = (v0 == 0) && planted && detected && restored_clean && (c0 > 0);
+    kprintf("RUNMASK-CORE: %s baseline_clean=%d forced_crosscpu_detected=%d "
+            "restored_clean=%d (user_procs=%d)\n",
+            pass ? "PASS" : "FAIL",
+            (v0 == 0) ? 1 : 0, detected, restored_clean, c0);
+}
+#endif /* SMP_RUNMASK */
 
 // Print IPI statistics
 void ipi_print_stats(void) {

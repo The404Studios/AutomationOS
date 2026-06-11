@@ -1266,6 +1266,14 @@ void ap_cooperative_schedule(void) {
     }
 
     cpu_set_current_thread(next);             // cpus[1].current_thread = next (per-CPU)
+#ifdef SMP_RUNMASK
+    // SMP-RUNMASK-0: record REALITY -- this is CPU1's only dispatch path, so
+    // the stamp here + the one in process_set_current (the BSP chokepoint)
+    // covers every dispatch. NOT in cpu_set_current_thread itself: an insert
+    // there sits ABOVE the file's ASSERT_ALWAYS lines and the __LINE__ shift
+    // breaks default-build byte-identity (the law-2 discipline).
+    next->ran_on_cpus |= (1u << cpu_id());
+#endif
     if (next != cpu->idle_thread) next->state = PROCESS_RUNNING;
 
     // Point CPU1's TSS.RSP0 + SYSCALL kernel stack at `next`'s kernel stack (no-op

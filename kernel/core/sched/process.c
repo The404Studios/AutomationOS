@@ -529,6 +529,32 @@ void process_ref(process_t* proc) {
 void process_on_terminate(process_t* child) {
     if (!child) return;
 
+#ifdef SMP_RUNMASK
+    // SMP-RUNMASK-0: record the (declared, actual) CPU footprint of every
+    // dying MULTI-MASK process. The audit walk only sees LIVE processes, and
+    // the interesting multimask tasks (batchdemo: ~50 ms lifetime) die long
+    // before any late walk -- so the proof evidence is captured at the exit
+    // boundary. One serial line per multimask exit (rare by construction)
+    // + counters for the smoke. Runs on whichever CPU executes the exit
+    // (CPU1 for batchdemo) -- safe: scalar reads of the dying PCB we already
+    // hold, and kprintf lines are cross-CPU atomic since the F3-7 line lock.
+    {
+        uint64_t m = child->allowed_cpus;
+        if (m & (m - 1)) {                       /* declared on >1 CPU */
+            int bits = 0;
+            for (uint32_t r = child->ran_on_cpus; r; r &= (r - 1)) bits++;
+            extern volatile uint32_t g_runmask_exit_multimask;
+            extern volatile uint32_t g_runmask_exit_crosscpu;
+            g_runmask_exit_multimask++;
+            if (bits > 1) g_runmask_exit_crosscpu++;
+            kprintf("[RUNMASK] exit record: pid=%d '%s' allowed=0x%llx "
+                    "ran=0x%x single_cpu=%d\n",
+                    child->pid, child->name, (unsigned long long)m,
+                    child->ran_on_cpus, (bits <= 1) ? 1 : 0);
+        }
+    }
+#endif
+
     // ---- Phase A: reparent this dying process's own children to init (PID 1).
     //
     // LOCKED DESIGN (#9): orphans are reparented-to-init; NO process self-reaps.
@@ -967,6 +993,13 @@ void process_set_current(process_t* proc) {
         // AND preemptive resume/first-dispatch): count one context switch per
         // dispatch. Counter only; does not alter switch logic.
         proc->ctx_switches++;
+#ifdef SMP_RUNMASK
+        // SMP-RUNMASK-0: record REALITY at the BSP dispatch chokepoint (the
+        // CPU1 path stamps in ap_cooperative_schedule -- it does not come
+        // through here). ran_on_cpus is the ground truth the TLB pin audit
+        // aggregates per CR3: declared masks may lie, this bit cannot.
+        proc->ran_on_cpus |= (1u << cpu_id());
+#endif
     }
 }
 

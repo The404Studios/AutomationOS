@@ -241,7 +241,18 @@ static void ce_addr(Cg* g, const AstNode* e, int depth)
             cc_emit2(g, "mov rax, ", e->name);
             return;
         }
-        cc_error(g, e->span.start_line, "unknown identifier (lvalue)");
+        {
+            /* Showcase-audit QoL: NAME the identifier. The anonymous form
+             * ("unknown identifier (lvalue)" x12) made the towerdefense
+             * build failure unreadable; "unknown identifier 'towers'" makes
+             * the missing-#include root cause obvious at a glance.
+             * TcDiag.msg is 120 bytes -- CC_NAME+24 fits. */
+            char m[CC_NAME + 40];
+            ce_copy(m, (int)sizeof(m), "unknown identifier '");
+            ce_cat(m, (int)sizeof(m), e->name ? e->name : "?");
+            ce_cat(m, (int)sizeof(m), "' (lvalue)");
+            cc_error(g, e->span.start_line, m);
+        }
         cc_emit(g, "mov rax, 0");
         return;
     }

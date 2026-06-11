@@ -2646,8 +2646,26 @@ static void handle_key(Ide* a, int keycode, int pressed) {
         return;
     }
 
-    /* ESC always exits (matches the LEGO workspace's original behaviour). */
-    if (keycode == KEY_ESC) { ide_exit(0); return; }
+    /* ESC is an EDITING key first and an exit key last (showcase-audit fix).
+     * The old global "ESC always exits" sat ABOVE the editor routing, so an
+     * Esc meant to close the completion popup quit the WHOLE IDE -- exit(0),
+     * mid-session, discarding unsaved work (caught on camera: the popup shot
+     * showed UNSAVED ~12, the next shot showed the bare desktop). Contract:
+     *   WS_EDITOR: close the completion popup if open; otherwise INERT --
+     *              an editor never quits on Esc.
+     *   WS_LEGO:   Esc exits as it always did -- UNLESS the buffer is dirty,
+     *              in which case it jumps to the editor instead (the UNSAVED
+     *              chip in the status bar is the explanation; Ctrl+S, then
+     *              Esc from the LEGO view, exits as before). */
+    if (keycode == KEY_ESC) {
+        if (a->ws == WS_EDITOR) {
+            if (a->editor.ac_active) a->editor.ac_active = 0;
+            return;
+        }
+        if (ide_editor_dirty(a)) { a->ws = WS_EDITOR; return; }
+        ide_exit(0);
+        return;
+    }
 
     /* ============ EDITOR workspace: route typing to editor/terminal/explorer ======= */
     if (a->ws == WS_EDITOR) {

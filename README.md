@@ -48,7 +48,7 @@ itself, wired into an IDE with a Ctrl+B build button.
 
 ### Self-hosting toolchain
 - **`cc`** — an on-device C compiler (`userspace/apps/cc`) that lexes, parses, type-checks, generates x86-64, assembles, and writes ELF, entirely on the running OS
-- An **IDE** (`userspace/apps/ide`) with a file tree, a syntax-highlighting editor, an integrated terminal, and **Ctrl+B** to build the open project with `cc`
+- The **Semantic LEGO IDE** (`userspace/apps/ide`) — designed as a *prosthetic working memory for programmers with aphantasia*: a live semantic map of functions-as-bricks with state ports and dashed-red **absent** cards, a project-wide coherence score, ONE selection model syncing editor↔map↔inspector↔breadcrumb, plus file tree, syntax-highlighting editor, project-symbol completion, integrated terminal, and **Ctrl+B** on-device builds → **[full showcase with screenshots](docs/IDE_SEMANTIC_LEGO.md)**
 - The compiler reuses the IDE's verified toolchain objects (lexer/parser/codegen/assembler/ELF writer), so the editor and the compiler share one front end
 
 ### Browser & networking

@@ -2,14 +2,28 @@
 
 > Warm memory. Refresh per checkpoint. One active brick at a time.
 
-## DESKTOP-SPLIT-0 — OPEN (branch `brick/desktop-split-0`, off frozen `brick/smp-runmask-0`) — the desktop starts leaning on both CPUs
-- **user-set scope (narrow):** compositor/input/shell stay CPU0 · a BATCH/app ALLOWLIST may run
-  CPU1 · the RUNMASK audit must stay green · TLBSHOOT_NEG must stay green · the BKL storm must
-  stay green · desktop FPS >= baseline · a 30-minute soak: 0 panic, 0 invariant.
-- **the inherited safety net (why this is now possible):** typed BATCH routing (F3-7) + the BKL
-  wall (H1) + the execution-reality audit (RUNMASK-0, law 18) + kernel-range shootdown (G2) +
-  IPI wake (G1). Every wall was built for exactly this brick.
-- **status:** OPEN — awaiting the user's go for implementation.
+## DESKTOP-SPLIT-0 — LANDED local (branch `brick/desktop-split-0`, off frozen `brick/smp-runmask-0` @ 7e458fb; commits `0eb41ed` feat + docs; AWAITING PUSH WORD) — the desktop now USES both CPUs
+- **THE EXACT ACCEPTANCE HIT (run 3, from the committed proof vehicle itself):**
+  `DESKTOPSPLIT: PASS cpu0_desktop=1 cpu1_batch=1 fps_within_tolerance=1 runmask=1 tlb_neg=1 bkl=1
+  soak=30m panic=0 invariant=0`. The five load-bearing lines: sys_spawn `sbin/batchdemo` PID 26 →
+  BATCH allowlist → the seam chose cpu1; exit record `ran=0x2 single_cpu=1`; all six desktop-core
+  procs (compositor/terminal/filemanager/netman/browser/ide) observed `ran=0x1`, none on CPU1.
+  Record: [`bricks/DESKTOP-SPLIT-0.md`](bricks/DESKTOP-SPLIT-0.md) · proof `scripts/dsplit_smoke.sh`.
+- **what landed (all #ifdef SMP_DSPLIT):** the boring allowlist `{ batchdemo, bklstorm }` re-placed
+  as BATCH through `scheduler_submit_task` at the sys_spawn seam (handlers.c) · the `[DSPLIT]
+  observed:` execution-history walk (health_monitor.c) · init spawns batchdemo (the userspace
+  sys_spawn trigger) · `[COMP] fps window` print (compositor_m8.c) · SMP_DSPLIT gate (quick_build).
+  matmuljobs EXCLUDED (threaded → one mm on two CPUs = the per-mm shootdown hazard RUNMASK guards).
+- **the FPS gate change (user-set):** `fps_ge_baseline` (max-vs-max) was too brittle at the ~10fps
+  cap — run 2 "failed" at 99 vs 100, one quantum inside host jitter (baseline max swung 89..100 on
+  the SAME kernel; an uncorrelated 13-min mid-soak dip). Replaced by `fps_within_tolerance` =
+  split first-9-window median ≥ 90% of baseline first-9-window median. 3 soaks: run1 appeared
+  faster, run2 94.9%, run3 97.9%. **Honest claim: the split does NOT hurt the desktop within
+  tolerance — NOT a speedup.** The earlier "98 vs 89 faster" read was the same host noise pointing
+  the other way.
+- **byte-identity:** default `6f99ed9f` hash-equal; the two comment corrections were line-neutral.
+- **status:** LANDED local, all walls green over 30 min, 0 panic / 0 invariant. Awaiting the user's
+  push word (house rule: never push without the say-so).
 
 ## COMPOSITOR-ICON-GHOST-0 — PARKED (user-set at the IDE-FORGE freeze) — the remaining outer-titlebar icon residue
 - **scope when picked up:** eliminate the residue (the window-frame area is compositor-drawn,

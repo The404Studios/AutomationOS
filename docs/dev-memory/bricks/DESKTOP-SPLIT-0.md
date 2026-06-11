@@ -8,10 +8,10 @@
 
 ```yaml
 brick: DESKTOP-SPLIT-0
-status: complete
+status: FROZEN+PUSHED (origin/brick/desktop-split-0 @ 3adfca7, ls-remote verified)
 branch: brick/desktop-split-0
 base: brick/smp-runmask-0 (7e458fb, the frozen RUNMASK head)
-commits: [0eb41ed (feat), <docs>]
+commits: [0eb41ed (feat), 3adfca7 (docs)]
 acceptance: "DESKTOPSPLIT: PASS cpu0_desktop=1 cpu1_batch=1 fps_within_tolerance=1 runmask=1 tlb_neg=1 bkl=1 soak=30m panic=0 invariant=0"
 proof: scripts/dsplit_smoke.sh (full stack + SMP_DSPLIT=1, qemu -smp 2, baseline boot + 30-min soak)
 profile: SMP=1 SMP_SCHED=1 SMP_SCHED_DISPATCH=1 SMP_IPI=1 SMP_BKL=1 SMP_BATCH=1 SMP_RUNMASK=1 SMP_DSPLIT=1

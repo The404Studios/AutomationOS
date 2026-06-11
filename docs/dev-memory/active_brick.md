@@ -2,7 +2,26 @@
 
 > Warm memory. Refresh per checkpoint. One active brick at a time.
 
-## DESKTOP-SPLIT-0 — LANDED local (branch `brick/desktop-split-0`, off frozen `brick/smp-runmask-0` @ 7e458fb; commits `0eb41ed` feat + docs; AWAITING PUSH WORD) — the desktop now USES both CPUs
+## SMP-THREAD-INHERIT-0 — OPEN (the parked follow-up, user-set after the DESKTOP-SPLIT-0 freeze) — threads inherit their parent's placement so threaded BATCH can be eligible safely
+- **user-set scope (narrow):** a threaded BATCH job's worker threads INHERIT the parent's
+  placement/profile correctly (allowed_cpus + sched_class + pinned/role), so the whole address
+  space lands on ONE CPU and the RUNMASK audit stays clean · this makes matmuljobs ELIGIBLE for
+  the allowlist SAFELY (the address space no longer spans two CPUs by ctor accident).
+- **HARD NO's (user-set):** NO desktop-split policy expansion yet (do not add to the allowlist in
+  this brick) · NO work stealing · NO general migration · NO global PREEMPT.
+- **why this is the right next brick:** it is the single gate between "one allowlisted
+  single-threaded app on CPU1" and "a real threaded workload safely spanning a core under the
+  RUNMASK audit". Today thread_create sets ctor-default CPU0-only (F3-2), so a BATCH parent on
+  CPU1 + CPU0 threads = one mm on two CPUs = the exact hazard RUNMASK catches. The fix is
+  placement INHERITANCE at the thread_create funnel.
+- **the forcing function already armed:** RUNMASK-0 (law 18) will fail LOUDLY the moment any
+  address space actually executes on two CPUs without per-mm shootdown — so this brick can be
+  proven by adding a threaded BATCH app and showing its threads + parent share one CPU's run
+  history (no `[RUNMASK] VIOLATION` beyond the planted one).
+- **status:** OPEN — awaiting the user's go for implementation. Will branch from the
+  DESKTOP-SPLIT-0 freeze head.
+
+## DESKTOP-SPLIT-0 — FROZEN+PUSHED (origin/`brick/desktop-split-0` @ `3adfca7`, ls-remote verified; commits `0eb41ed` feat + `3adfca7` docs, unsquashed; user: "a real two-core operating system milestone") — the desktop now USES both CPUs
 - **THE EXACT ACCEPTANCE HIT (run 3, from the committed proof vehicle itself):**
   `DESKTOPSPLIT: PASS cpu0_desktop=1 cpu1_batch=1 fps_within_tolerance=1 runmask=1 tlb_neg=1 bkl=1
   soak=30m panic=0 invariant=0`. The five load-bearing lines: sys_spawn `sbin/batchdemo` PID 26 →
@@ -22,8 +41,10 @@
   tolerance — NOT a speedup.** The earlier "98 vs 89 faster" read was the same host noise pointing
   the other way.
 - **byte-identity:** default `6f99ed9f` hash-equal; the two comment corrections were line-neutral.
-- **status:** LANDED local, all walls green over 30 min, 0 panic / 0 invariant. Awaiting the user's
-  push word (house rule: never push without the say-so).
+- **status:** FROZEN+PUSHED (3adfca7, ls-remote verified), all walls green over 30 min, 0 panic /
+  0 invariant. The user's approval: "a real two-core operating system milestone... CPU1 is doing
+  useful allowlisted work, CPU0 remains the desktop core." Next = SMP-THREAD-INHERIT-0 BEFORE any
+  allowlist expansion.
 
 ## COMPOSITOR-ICON-GHOST-0 — PARKED (user-set at the IDE-FORGE freeze) — the remaining outer-titlebar icon residue
 - **scope when picked up:** eliminate the residue (the window-frame area is compositor-drawn,

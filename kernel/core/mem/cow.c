@@ -38,8 +38,14 @@
 #define COW_PHYS_MASK 0x000FFFFFFFFFF000ULL
 #define COW_MAX_OWNERS 255            // uint8_t saturation
 
-// One byte per 4KB frame, covering the same 4 GB PFN space as the PMM bitmap.
-#define COW_TABLE_ENTRIES (1UL << 20) // 2^20 frames = 4 GB / 4 KB
+// One byte per 4KB frame, covering the SAME 16 GB PFN space as the PMM bitmap
+// (pmm.c BITMAP_TOTAL_PAGES = 1<<22). These MUST match: a CoW page on a frame
+// ABOVE the table's reach gets no refcount, so cow_handle_write() would treat a
+// genuinely SHARED high frame as sole-owner and re-grant write IN PLACE -> parent
+// and child silently corrupt the same page, and cow_unref() would free a
+// still-shared frame (use-after-free). Latent under QEMU's small RAM but live on
+// >4 GB machines. [audit P1: keep in lockstep with PMM_BITMAP]
+#define COW_TABLE_ENTRIES (1UL << 22) // 2^22 frames = 16 GB / 4 KB
 
 static uint8_t*  cow_table = NULL;     // refcount[pfn] (extra owners)
 static uint64_t  cow_table_len = 0;    // number of entries (0 => CoW disabled)

@@ -194,6 +194,13 @@ void _start(void) {
     print("[INIT] Spawning forktest...\n");
     spawn("sbin/forktest");
 
+    // SIG-FULL-0 (B8) signal-delivery probe: installs a SIGUSR1 handler, raises
+    // it to self (handler runs + resumes), proves blocked-signal pending/unblock,
+    // default-terminate in a child, and bad-handler fail-safe. Prints SIGTEST
+    // RESULT to serial, exits. Gated with the rest of the self-test boot.
+    print("[INIT] Spawning sigtest...\n");
+    spawn("sbin/sigtest");
+
     // real-threads probe: spawns 4 threads that SHARE this process's address
     // space but have independent stacks + FPU state, joins them, and prints
     // THREADTEST: PASS/FAIL. Proves shared memory, independent stacks, and

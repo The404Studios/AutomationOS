@@ -72,6 +72,11 @@ void syscall_init(void) {
 
     // Signal syscalls
     syscall_table[SYS_KILL] = sys_kill;
+    // SIG-FULL-0 (B8): handler delivery / masks / sigreturn
+    syscall_table[SYS_RT_SIGACTION]   = sys_rt_sigaction;
+    syscall_table[SYS_RT_SIGPROCMASK] = sys_rt_sigprocmask;
+    syscall_table[SYS_RT_SIGRETURN]   = sys_rt_sigreturn;
+    syscall_table[SYS_SIGPENDING]     = sys_sigpending;
 
     // Priority syscalls
     syscall_table[SYS_NICE] = sys_nice;

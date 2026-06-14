@@ -115,6 +115,10 @@
 #define SYS_CH_GRANT   104  // AGENT-RPC-0 P6c: grant a one-shot read-only CH_BYTE capability to a pid
 #define SYS_CH_ACCEPT  105  // AGENT-RPC-0 P6c: accept a grant -> a read-only local handle
 #define SYS_SPAWN_EX_ARGV 106 // AGENT-RPC-0 P6d: spawn with an explicit argv VECTOR (NUL-separated argv[1..])
+#define SYS_RT_SIGACTION   107 // SIG-FULL-0 (B8): install a signal handler/disposition (sig, handler, restorer)
+#define SYS_RT_SIGPROCMASK 108 // SIG-FULL-0: block/unblock signals (how: 0=BLOCK 1=UNBLOCK 2=SETMASK)
+#define SYS_RT_SIGRETURN   109 // SIG-FULL-0: return from a signal handler -> restore the saved user frame
+#define SYS_SIGPENDING     110 // SIG-FULL-0: return the pending-signal bitset (observability)
 #define SYS_VMA_TEST    200 // VMA red-black tree testing and benchmarking
 
 // ---- SMP coprocessor offload (GATED: only registered under SMP_FOUNDATION) ----
@@ -218,6 +222,15 @@ int64_t sys_msgctl(uint64_t msqid, uint64_t cmd, uint64_t buf,
 // Signal syscalls
 int64_t sys_kill(uint64_t pid, uint64_t sig, uint64_t arg3,
                  uint64_t arg4, uint64_t arg5, uint64_t arg6);
+// SIG-FULL-0 (B8): signal handlers / masks / sigreturn (kernel/core/signal/kill.c)
+int64_t sys_rt_sigaction(uint64_t sig, uint64_t handler, uint64_t restorer,
+                         uint64_t a4, uint64_t a5, uint64_t a6);
+int64_t sys_rt_sigprocmask(uint64_t how, uint64_t set, uint64_t oldset,
+                           uint64_t a4, uint64_t a5, uint64_t a6);
+int64_t sys_rt_sigreturn(uint64_t a1, uint64_t a2, uint64_t a3,
+                         uint64_t a4, uint64_t a5, uint64_t a6);
+int64_t sys_sigpending(uint64_t a1, uint64_t a2, uint64_t a3,
+                       uint64_t a4, uint64_t a5, uint64_t a6);
 
 // Priority syscalls
 int64_t sys_nice(uint64_t pid, uint64_t increment, uint64_t arg3,

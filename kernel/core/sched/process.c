@@ -468,6 +468,14 @@ process_t* thread_create(process_t* parent, uint64_t entry, uint64_t arg,
     t->resume_mode = RESUME_CRETURN;     // first run via the trampoline `ret` path
     t->uid = parent->uid;
     t->gid = parent->gid;
+    // SIG-FULL-0 / audit P1: a thread SHARES the process's signal dispositions
+    // (in POSIX, handlers + restorer are process-wide) and inherits the creating
+    // thread's mask — the memset above zeroed them, so a handler installed before
+    // the thread was created would otherwise never fire in the thread. sig_pending
+    // stays 0 (pending signals are per-thread).
+    for (int _s = 0; _s < 32; _s++) t->sig_handlers[_s] = parent->sig_handlers[_s];
+    t->sig_mask     = parent->sig_mask;
+    t->sig_restorer = parent->sig_restorer;
     t->time_slice = SCHED_QUANTUM_TICKS;
     t->total_time = 0;
     t->priority = parent->priority;      // inherit scheduling class
@@ -674,9 +682,20 @@ void process_on_terminate(process_t* child) {
             // match it; otherwise require the stable-identity match. The pid-1
             // wildcard also covers the (unreachable in normal boot) init-absent
             // reparent edge where an orphan's parent_seq stayed 0.
-            if ((child->parent_pid == 1 || parent->create_seq == child->parent_seq)
-                && parent->child_wait) {
-                wq_wake_one((wait_queue_t*)parent->child_wait);
+            if (child->parent_pid == 1 || parent->create_seq == child->parent_seq) {
+                // SIG-FULL-0 (B8): a terminating child raises SIGCHLD on its REAL
+                // parent incarnation (same #10 identity guard as the wake). The
+                // default disposition of SIGCHLD is "ignore" (signal_default_action),
+                // so a parent with no SIGCHLD handler is unaffected — it is just set
+                // pending and consumed at the parent's next return-to-user, with no
+                // observable effect. A parent that installs a SIGCHLD handler (a real
+                // shell) sees the child-exit notification there. Plain |= matches the
+                // existing single-ring-3-CPU sig model in sys_kill (SMP must make the
+                // pending word atomic, tracked with the g_sig_frame per-CPU note).
+                parent->sig_pending |= (1ull << 17);   // 17 == SIGCHLD
+                if (parent->child_wait) {
+                    wq_wake_one((wait_queue_t*)parent->child_wait);
+                }
             }
             process_unref(parent);
         }

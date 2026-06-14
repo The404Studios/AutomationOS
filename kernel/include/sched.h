@@ -505,6 +505,20 @@ typedef struct process {
 #endif
 #endif
 #endif
+
+    // SIG-FULL-0 (B8): per-process signal state. Ungated core feature, appended
+    // at the very END so the asm-hardcoded cpu_context offset stays valid; all
+    // zeroed by the memset in process_create()/thread_create() (=> SIG_DFL,
+    // empty mask, nothing pending). Indexed by signal number 1..31:
+    //   sig_handlers[s] = user handler VA   (0 = SIG_DFL, 1 = SIG_IGN)
+    //   sig_mask    bit (1ull<<s) set => signal s is blocked
+    //   sig_pending bit (1ull<<s) set => signal s is pending
+    //   sig_restorer = user trampoline VA that issues SYS_RT_SIGRETURN (the
+    //   address a delivered handler returns to). Captured from rt_sigaction.
+    uint64_t sig_handlers[32];
+    uint64_t sig_mask;
+    uint64_t sig_pending;
+    uint64_t sig_restorer;
 } process_t;
 
 // Global pointer to current process (for PE loader and other subsystems)

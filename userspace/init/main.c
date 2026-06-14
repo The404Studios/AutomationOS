@@ -201,6 +201,12 @@ void _start(void) {
     print("[INIT] Spawning sigtest...\n");
     spawn("sbin/sigtest");
 
+    // POLL-SELECT-0 (B10) probe: poll()/select() over real fd readiness (a
+    // ready file vs an idle socket, a timeout, a mixed set) + epoll level/edge.
+    // Prints POLLSELFTEST RESULT to serial, exits.
+    print("[INIT] Spawning pollselftest...\n");
+    spawn("sbin/pollselftest");
+
     // real-threads probe: spawns 4 threads that SHARE this process's address
     // space but have independent stacks + FPU state, joins them, and prints
     // THREADTEST: PASS/FAIL. Proves shared memory, independent stacks, and

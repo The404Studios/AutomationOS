@@ -6,6 +6,7 @@
 #include "../../include/net.h"   // sys_net_info / sys_net_send / sys_net_recv prototypes
 #include "../../include/netif.h" // sys_net_config prototype
 #include "../../include/socket.h" // sys_sock_* (BSD socket) prototypes
+#include "../../include/poll.h"   // POLL-SELECT-0: sys_poll / sys_select prototypes
 #include "../../include/audio.h" // audio_beep (SYS_BEEP target)
 #include "../../include/acpi.h"  // power_off / power_reboot (SYS_POWEROFF/REBOOT)
 #include "../../include/pci.h"   // sys_pci_list (SYS_PCI_LIST=92)
@@ -205,6 +206,11 @@ void syscall_init(void) {
     syscall_table[SYS_EPOLL_CREATE] = sys_epoll_create;
     syscall_table[SYS_EPOLL_CTL]    = sys_epoll_ctl;
     syscall_table[SYS_EPOLL_WAIT]   = sys_epoll_wait;
+
+    // POLL-SELECT-0 (B10): poll(2) / select(2) over the unified fd-readiness
+    // probe (kernel/core/syscall/poll.c). Additive; unregistered before this.
+    syscall_table[SYS_POLL]   = sys_poll;
+    syscall_table[SYS_SELECT] = sys_select;
 
     // CHANNEL-0: capability-backed shared-ring channels (kernel/ipc/channel.c).
     // Additive -- every existing program is byte-for-byte unchanged (unregistered

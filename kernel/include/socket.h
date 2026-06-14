@@ -225,6 +225,16 @@ void sock_init(void);
  */
 int sock_poll(void);
 
+/* POLL-SELECT-0: non-destructive readiness probe for poll()/select()/epoll.
+ * Returns -1 if `fd` is not a live socket; otherwise a bitmask of the bits
+ * below describing the socket's CURRENT state (no data is consumed). Caller is
+ * expected to have pumped the stack (sock_poll) first so RX state is current. */
+#define SOCKPOLL_READ   0x1   /* RX data queued, or EOF/peer-FIN (a read won't block) */
+#define SOCKPOLL_WRITE  0x2   /* send window open (a write won't block)               */
+#define SOCKPOLL_HUP    0x4   /* connection closing/closed (peer FIN seen)            */
+#define SOCKPOLL_ERR    0x8   /* connection reset / error                             */
+int sock_poll_bits(int fd);
+
 /* Create a socket. type = SOCK_STREAM (TCP) or SOCK_DGRAM (UDP). Returns a
  * non-negative descriptor, or a negative SOCK_E* error. */
 int sock_socket(int type);

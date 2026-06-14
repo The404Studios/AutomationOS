@@ -119,6 +119,8 @@
 #define SYS_RT_SIGPROCMASK 108 // SIG-FULL-0: block/unblock signals (how: 0=BLOCK 1=UNBLOCK 2=SETMASK)
 #define SYS_RT_SIGRETURN   109 // SIG-FULL-0: return from a signal handler -> restore the saved user frame
 #define SYS_SIGPENDING     110 // SIG-FULL-0: return the pending-signal bitset (observability)
+#define SYS_POLL           111 // POLL-SELECT-0 (B10): poll(fds, nfds, timeout_ms)
+#define SYS_SELECT         112 // POLL-SELECT-0 (B10): select(nfds, rfds, wfds, efds, timeval*)
 #define SYS_VMA_TEST    200 // VMA red-black tree testing and benchmarking
 
 // ---- SMP coprocessor offload (GATED: only registered under SMP_FOUNDATION) ----

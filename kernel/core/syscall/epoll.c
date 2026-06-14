@@ -31,6 +31,7 @@
 #include "../../include/string.h"
 #include "../../include/drivers.h"  // timer_get_ticks_ms
 #include "../../include/spinlock.h"
+#include "../../include/poll.h"     // POLL-SELECT-0: fd_poll_state / poll_pump / poll_sleep_slice
 
 /* ------------------------------------------------------------------ */
 /* Constants and structures                                            */
@@ -191,27 +192,23 @@ static void epoll_add_ready(epoll_instance_t* ep, int fd, uint32_t new_state) {
 }
 
 /* ------------------------------------------------------------------ */
-/* Helper: poll socket state (readable/writable/error)                */
+/* Helper: is any watched fd currently ready? (side-effect-free probe) */
+/* Used by fd_poll_state() so an epoll fd can itself be poll()'d. The   */
+/* EPOLL* bits are numerically identical to the POLL* bits, so          */
+/* fd_poll_state() output is reused directly with no translation.       */
 /* ------------------------------------------------------------------ */
-
-static uint32_t epoll_poll_socket(int fd) {
-    uint32_t state = 0;
-
-    // Use sock_recv/sock_send with PEEK semantics to check state
-    // For now, simplified: always assume sockets are readable/writable
-    // (full integration with socket layer would query rx_used/tx_free)
-
-    // HACK: for demonstration, call sock_poll() once to pump the network
-    // This is NOT thread-safe in a real kernel, but works for single-threaded demo
-    extern int sock_poll(void);
-    sock_poll();
-
-    // SIMPLIFIED: always report EPOLLIN for now
-    // Real implementation would check sock->rx_used > 0 for TCP,
-    // sock->dq_count > 0 for UDP
-    state |= EPOLLIN;
-
-    return state;
+int epoll_has_ready(int epfd) {
+    epoll_instance_t* ep = epoll_from_fd(epfd);
+    if (!ep) return 0;
+    int ready = 0;
+    spin_lock(&ep->lock);
+    for (int i = 0; i < EPOLL_MAX_WATCHES; i++) {
+        if (ep->watches[i].fd == -1) continue;
+        uint32_t want = ep->watches[i].events | EPOLLERR | EPOLLHUP;
+        if (fd_poll_state(ep->watches[i].fd) & want) { ready = 1; break; }
+    }
+    spin_unlock(&ep->lock);
+    return ready;
 }
 
 /* ------------------------------------------------------------------ */
@@ -368,69 +365,52 @@ int64_t sys_epoll_wait(uint64_t epfd_arg, uint64_t events_ptr,
     epoll_instance_t* ep = epoll_from_fd(epfd);
     if (!ep) return EBADF;
 
-    uint64_t start_ms = timer_get_ticks_ms();
-    uint64_t deadline_ms = (timeout_ms == (uint64_t)-1) ? UINT64_MAX :
-                           start_ms + timeout_ms;
+    // timeout_ms: (uint64_t)-1 == infinite, 0 == return immediately, else ms.
+    int infinite  = (timeout_ms == (uint64_t)-1);
+    int immediate = (timeout_ms == 0);
+    uint64_t deadline = infinite ? 0 : timer_get_ticks() + timeout_ms;
 
-    while (1) {
+    // POLL-SELECT-0: scan each watch against the REAL readiness probe
+    // (fd_poll_state) every wait — no more "always EPOLLIN" fake, no sock_poll
+    // pump-hack inside the readiness check (poll_pump centralizes RX advance).
+    // Level-triggered by default; a watch with EPOLLET set reports only the
+    // bits that newly asserted since its last_state.
+    for (;;) {
+        poll_pump();                       // advance network RX once per wait
+
         spin_lock(&ep->lock);
+        int n = 0;
+        for (int i = 0; i < EPOLL_MAX_WATCHES && n < maxevents; i++) {
+            epoll_watch_t* w = &ep->watches[i];
+            if (w->fd == -1) continue;
 
-        // Poll all watched sockets for new events
-        for (int i = 0; i < EPOLL_MAX_WATCHES; i++) {
-            if (ep->watches[i].fd == -1) continue;
+            uint32_t want = w->events | EPOLLERR | EPOLLHUP;   // err/hup always
+            uint32_t st   = fd_poll_state(w->fd) & want;
 
-            uint32_t state = epoll_poll_socket(ep->watches[i].fd);
-            epoll_add_ready(ep, ep->watches[i].fd, state);
-        }
+            uint32_t report = (w->events & EPOLLET)
+                            ? (st & ~w->last_state)   // edge: only new bits
+                            : st;                     // level: while ready
+            w->last_state = st;
+            if (!report) continue;
 
-        // Return ready events if any
-        if (ep->ready_count > 0) {
-            int nevents = ep->ready_count < maxevents ? ep->ready_count : maxevents;
-
-            // Copy events to userspace
-            for (int i = 0; i < nevents; i++) {
-                epoll_event_t event;
-                ready_event_t* re = &ep->ready_events[ep->ready_head];
-                event.events = re->events;
-                event.data = re->data;
-
-                if (copy_to_user((void*)(events_ptr + i * sizeof(epoll_event_t)),
-                                &event, sizeof(event)) != 0) {
-                    spin_unlock(&ep->lock);
-                    return EFAULT;
-                }
-
-                ep->ready_head = (ep->ready_head + 1) % EPOLL_MAX_EVENTS;
-                ep->ready_count--;
+            epoll_event_t ev;
+            ev.events = report;
+            ev.data   = w->user_data;
+            if (copy_to_user((void*)(events_ptr + (uint64_t)n * sizeof(ev)),
+                             &ev, sizeof(ev)) != 0) {
+                spin_unlock(&ep->lock);
+                return EFAULT;
             }
-
-            spin_unlock(&ep->lock);
-            return nevents;
+            n++;
         }
-
-        // Check timeout
-        uint64_t now_ms = timer_get_ticks_ms();
-        if (now_ms >= deadline_ms) {
-            spin_unlock(&ep->lock);
-            return 0;  // timeout, no events
-        }
-
-        // Block on wait queue (releases lock, sleeps, reacquires on wakeup)
-        // NOTE: this is simplified; real implementation would need to release
-        // spinlock before blocking and reacquire after
         spin_unlock(&ep->lock);
 
-        // Sleep for a short interval to poll again (simplified)
-        // Real implementation would use wq_block_current(&ep->wait_queue)
-        // but that requires more scheduler integration
-        extern void timer_sleep(uint32_t ms);
-        timer_sleep(1);
+        if (n > 0 || immediate) return n;
+        if (!infinite && timer_get_ticks() >= deadline) return 0;  // timed out
 
-        // Re-check timeout after sleep
-        now_ms = timer_get_ticks_ms();
-        if (now_ms >= deadline_ms) {
-            return 0;  // timeout
-        }
+        uint64_t until = timer_get_ticks() + 5;   // 5ms re-check slice (yields)
+        if (!infinite && until > deadline) until = deadline;
+        poll_sleep_slice(until);
     }
 }
 

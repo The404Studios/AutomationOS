@@ -390,6 +390,29 @@ int sock_poll(void) {
     return frames;
 }
 
+/* POLL-SELECT-0: non-destructive readiness of a socket fd. See socket.h.
+ * Returns -1 if fd is not a live socket. Pure reads of the socket state — no
+ * data dequeued, no timers advanced (the caller pumps sock_poll separately). */
+int sock_poll_bits(int fd) {
+    sock_t* so = sock_from_fd(fd);
+    if (!so) return -1;
+    int bits = 0;
+    if (so->type == SOCK_DGRAM) {
+        if (so->dq_count > 0) bits |= SOCKPOLL_READ;
+        bits |= SOCKPOLL_WRITE;                 /* UDP is connectionless: always sendable */
+        return bits;
+    }
+    /* TCP */
+    if (so->reset) { bits |= SOCKPOLL_ERR | SOCKPOLL_READ; }
+    if (so->rx_used > 0) bits |= SOCKPOLL_READ; /* buffered stream bytes */
+    if (so->state == TCP_ESTABLISHED && so->snd_wnd > 0) bits |= SOCKPOLL_WRITE;
+    if (so->state == TCP_CLOSE_WAIT) {
+        /* peer sent FIN: a read returns EOF (won't block) and the stream is hanging up */
+        bits |= SOCKPOLL_READ | SOCKPOLL_HUP;
+    }
+    return bits;
+}
+
 /* ------------------------------------------------------------------ */
 /* Public API                                                          */
 /* ------------------------------------------------------------------ */

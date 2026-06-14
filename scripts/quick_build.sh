@@ -589,6 +589,7 @@ compile kernel/core/mem/vma_rbtree.c          c_vma_rbtree
 compile kernel/core/syscall/futex.c           c_futex
 compile kernel/core/syscall/sendfile.c        c_sendfile
 compile kernel/core/syscall/epoll.c           c_epoll
+compile kernel/core/syscall/poll.c            c_poll
 compile kernel/core/syscall/batch.c           c_batch
 compile kernel/core/syscall/vma_test.c        c_vma_test
 

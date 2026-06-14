@@ -1057,6 +1057,13 @@ void process_set_current(process_t* proc) {
         // AND preemptive resume/first-dispatch): count one context switch per
         // dispatch. Counter only; does not alter switch logic.
         proc->ctx_switches++;
+        // SCHED-INSTRUMENT-0: if this dispatch is a blocked task finally getting
+        // the CPU, record its ready->run latency — the metric that decides whether
+        // the IRQ-path fairness handoff is worth modifying the IRQ tail. PREEMPTIVE-
+        // gated so the cooperative default dispatch path is unchanged (byte-identical).
+#ifdef PREEMPTIVE
+        sched_instr_dispatch(proc);
+#endif
 #ifdef SMP_RUNMASK
         // SMP-RUNMASK-0: record REALITY at the BSP dispatch chokepoint (the
         // CPU1 path stamps in ap_cooperative_schedule -- it does not come

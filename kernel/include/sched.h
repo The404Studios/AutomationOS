@@ -223,6 +223,9 @@ typedef struct process {
     //                 the cooperative build; schedule_from_irq() in PREEMPTIVE).
     uint64_t ctx_switches;           // Number of times this process was dispatched
     uint64_t cpu_ticks;              // Timer ticks observed while this process was running
+    uint64_t wake_tick;              // SCHED-INSTRUMENT-0: tick a blocked task became
+                                     // runnable (0 = none pending); cleared at dispatch
+                                     // to measure ready->run latency under PREEMPT
     int32_t priority;                // Process priority (nice value: -20 to +19)
     struct process* next;            // Next process in queue
     char name[64];                   // Process name
@@ -584,6 +587,9 @@ static inline process_t* process_get_current(void) { return current_process; }
 #endif
 void process_set_current(process_t* proc);
 int process_set_ready(process_t* proc); // Validated CREATED/BLOCKED->READY transition (ret 0=OK, -1=rejected)
+// SCHED-INSTRUMENT-0: wakeup-latency measurement (defs in scheduler.c).
+void sched_instr_wake(process_t* p);     // stamp ready tick on a blocked->runnable task
+void sched_instr_dispatch(process_t* p); // at dispatch: record ready->run latency
 
 // Userspace-facing process snapshot record (SYS_PROCLIST ABI). MUST stay 64 bytes.
 // The first 48 bytes are the original layout (pid/parent_pid/state/flags/name) so

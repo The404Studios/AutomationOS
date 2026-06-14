@@ -396,6 +396,9 @@ static process_t* wo_wake_one_proc(wait_object_t* wo) {
         proc->wake_deadline = 0;
 
         process_set_ready(proc);
+#ifdef PREEMPTIVE
+        sched_instr_wake(proc);   // SCHED-INSTRUMENT-0: stamp ready tick (futex/waitpid/poll wake)
+#endif
         // F3-5: HOME-routed -- the woken task goes to ITS cpu, never the
         // WAKER's. A CPU1 exit waking its CPU0 parent (init in waitpid) must
         // not enqueue the parent on cpus[1].
@@ -424,6 +427,9 @@ static process_t* wo_wake_one_matching(wait_object_t* wo, uint64_t key) {
         proc->wake_deadline = 0;
 
         process_set_ready(proc);
+#ifdef PREEMPTIVE
+        sched_instr_wake(proc);   // SCHED-INSTRUMENT-0: stamp ready tick (futex/waitpid/poll wake)
+#endif
         scheduler_add_process_home(proc);  // F3-5: home-routed (see above)
         process_unref(proc);          // release the object-ref; scheduler holds one
         return proc;

@@ -2,6 +2,7 @@
 #include "../../include/kernel.h"
 #include "../../include/sched.h"
 #include "../../include/mem.h"
+#include "../../include/vma.h"     /* vma_t / vma_add — fork VMA inheritance */
 #include "../../include/kref.h"
 #include "../../include/drivers.h"
 #include "../../include/vfs.h"
@@ -357,6 +358,20 @@ int64_t sys_fork(uint64_t arg1, uint64_t arg2, uint64_t arg3,
         kprintf("[SYSCALL] sys_fork: address-space copy failed\n");
         process_destroy(child);
         return ENOMEM;
+    }
+
+    // ── Inherit the parent's VMA records (AUDIT FIX) ───────────────
+    // fork_copy_user_pages() above copies only the currently-PRESENT frames.
+    // The not-present LAZY regions (the GROWSDOWN anon stack — exec installs
+    // only its top page eagerly — guard pages, file-backed code) are backed
+    // SOLELY by the per-process VMA list. Without copying it, the child's
+    // vma_list is NULL (process_create zeroes the PCB), so the first demand
+    // fault (e.g. the child growing its stack > 1 page) finds no covering VMA
+    // in handle_page_fault() and is mis-killed as a segfault. vma_add()
+    // value-copies each descriptor; file-backed VMAs share the immutable
+    // initrd-image file pointers, so this is safe.
+    for (const vma_t* v = parent->vma_list; v != NULL; v = v->next) {
+        vma_add(child, v);
     }
 
     // ── Build a fresh IRETQ frame at the top of the child's kernel stack ──

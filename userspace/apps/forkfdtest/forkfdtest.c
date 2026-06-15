@@ -61,6 +61,47 @@ static void outnum(long v) {
     out(p);
 }
 
+// fork_fd_offset_independent: fork deep-copies the vfs_file_t, so parent and
+// child hold INDEPENDENT offsets over a SHARED inode. No lseek() exists, so prove
+// it by byte position: parent writes a 5-byte prefix (its offset -> 5), forks;
+// the child writes 1 byte at ITS inherited offset 5; the parent (after reap)
+// writes 1 byte at ITS offset -- which must still be 5 if offsets are
+// independent, OVERWRITING the child's byte -> final "01234P" (6 bytes). A SHARED
+// offset would have advanced to 6, appending -> "01234CP" (7 bytes). Returns 1 if
+// independent, 0 if shared/unexpected, <0 on a setup error.
+static int offset_independent_test(void) {
+    long fd = sc6(SYS_OPEN, (long)"/tmp/forkoff.txt", O_CREAT | O_RDWR | O_TRUNC,
+                  0644, 0, 0);
+    if (fd < 3) return -1;
+    if (sc3(SYS_WRITE, fd, (long)"01234", 5) != 5) { sc1(SYS_CLOSE, fd); return -2; }
+
+    long cpid = sc0(SYS_FORK);
+    if (cpid < 0) { sc1(SYS_CLOSE, fd); return -3; }
+    if (cpid == 0) {
+        sc3(SYS_WRITE, fd, (long)"C", 1);   // child writes at its own offset (5)
+        sc1(SYS_CLOSE, fd);
+        sc3(SYS_EXIT, 0, 0, 0);
+        for (;;) {}
+    }
+
+    int status = -1; long w = -1;
+    for (int t = 0; t < 2000000 && w != cpid; t++) {
+        w = sc3(SYS_WAITPID, cpid, (long)&status, 0);
+        if (w != cpid) sc0(SYS_YIELD);
+    }
+    if (w != cpid) { sc1(SYS_CLOSE, fd); return -4; }
+    if (sc3(SYS_WRITE, fd, (long)"P", 1) != 1) { sc1(SYS_CLOSE, fd); return -5; }
+    sc1(SYS_CLOSE, fd);
+
+    long rfd = sc6(SYS_OPEN, (long)"/tmp/forkoff.txt", O_RDWR, 0644, 0, 0);
+    if (rfd < 3) return -6;
+    char buf[16]; for (int k = 0; k < 16; k++) buf[k] = 0;
+    long n = sc3(SYS_READ, rfd, (long)buf, 15);
+    sc1(SYS_CLOSE, rfd);
+    if (n == 6 && buf[5] == 'P') return 1;   // independent (parent overwrote child)
+    return 0;                                 // shared offset (appended) or unexpected
+}
+
 void _start(void) {
     out("FORKFDTEST: start\n");
 
@@ -137,11 +178,13 @@ void _start(void) {
         }
     }
 
-    int ok = setup_ok && child_inherit_ok && parent_live_ok;
+    int offset_ok = offset_independent_test();
+    int ok = setup_ok && child_inherit_ok && parent_live_ok && (offset_ok == 1);
     out("FORKFDTEST: iters="); outnum(i);
     out(" setup_open=");        outnum(setup_ok);
     out(" child_inherited_fd="); outnum(child_inherit_ok);
     out(" parent_unpoisoned=");  outnum(parent_live_ok);
+    out(" offset_independent=");  outnum(offset_ok);
     if (!ok) { out(" first_fail_iter="); outnum(first_fail_iter);
                out(" detail=");          outnum(first_fail_det); }
     out("\n");

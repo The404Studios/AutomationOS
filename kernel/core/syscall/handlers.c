@@ -276,17 +276,34 @@ fail:
 // kernel stack (RIP/CS=0x23/RFLAGS/RSP/SS=0x1B). Without the data-segment loads
 // the child would run ring 3 with stale kernel selectors in DS/ES.
 static void __attribute__((naked)) fork_do_iretq(void) {
-    // Preserve RAX across the segment loads: it holds the child's fork() return
-    // value (0). `mov $0x1B,%ax` would clobber AX and make the child see a
-    // non-zero fork() result (taking the parent branch). push/pop keeps it intact
-    // (and is robust if fork later inherits the full parent register set).
+    // FORK-REGS-INHERIT-0: resume the child with the PARENT's full GP register
+    // set (only RAX differs -- the child's fork() returns 0). sys_fork cloned the
+    // parent's trapped syscall register frame onto the child's kernel stack just
+    // below this iretq frame, with the RAX slot forced to 0. Restore every GP reg
+    // from that frame, then iretq to ring 3. The cooperative context switch leaves
+    // r12-r14 holding stale temporaries, so this stack restore is deliberately
+    // switch-independent. Load the ring-3 data selectors first (iretq does not
+    // reload DS/ES/FS/GS); the AX clobber is harmless -- RAX is popped afterwards.
     __asm__ volatile(
-        "push %rax\n\t"
         "mov $0x1B, %ax\n\t"
         "mov %ax, %ds\n\t"
         "mov %ax, %es\n\t"
         "mov %ax, %fs\n\t"
         "mov %ax, %gs\n\t"
+        "pop %rdi\n\t"
+        "pop %rsi\n\t"
+        "pop %rdx\n\t"
+        "pop %rcx\n\t"
+        "pop %r8\n\t"
+        "pop %r9\n\t"
+        "pop %r10\n\t"
+        "pop %r11\n\t"
+        "pop %rbx\n\t"
+        "pop %rbp\n\t"
+        "pop %r12\n\t"
+        "pop %r13\n\t"
+        "pop %r14\n\t"
+        "pop %r15\n\t"
         "pop %rax\n\t"
         "iretq\n\t"
     );
@@ -373,39 +390,71 @@ int64_t sys_fork(uint64_t arg1, uint64_t arg2, uint64_t arg3,
     for (const vma_t* v = parent->vma_list; v != NULL; v = v->next) {
         vma_add(child, v);
     }
+    // ---- Inherit the parent's FULL register frame (FORK-REGS-INHERIT-0) ----
+    // POSIX fork: the child resumes as if fork() returned 0; every other
+    // user-visible register must match the parent at the syscall boundary.
+    // syscall_entry (syscall.asm) saved the parent's complete register file on its
+    // kernel stack at p_kstop-8..-120 (push order: user_rsp, rcx/RIP, r11/RFLAGS,
+    // rbx, rbp, r12, r13, r14, r15, r10, r9, r8, rdx, rsi, rdi). Clone it onto the
+    // child's kernel stack so fork_do_iretq restores it; only RAX differs (0). The
+    // cooperative switch uses r12-r14 as temporaries, so we restore the FULL frame
+    // from the stack (switch-independent) rather than relying on cpu_context_t.
+    uint64_t p_rbx = *(uint64_t*)(p_kstop - 32);
+    uint64_t p_rbp = *(uint64_t*)(p_kstop - 40);
+    uint64_t p_r12 = *(uint64_t*)(p_kstop - 48);
+    uint64_t p_r13 = *(uint64_t*)(p_kstop - 56);
+    uint64_t p_r14 = *(uint64_t*)(p_kstop - 64);
+    uint64_t p_r15 = *(uint64_t*)(p_kstop - 72);
+    uint64_t p_r10 = *(uint64_t*)(p_kstop - 80);
+    uint64_t p_r9  = *(uint64_t*)(p_kstop - 88);
+    uint64_t p_r8  = *(uint64_t*)(p_kstop - 96);
+    uint64_t p_rdx = *(uint64_t*)(p_kstop - 104);
+    uint64_t p_rsi = *(uint64_t*)(p_kstop - 112);
+    uint64_t p_rdi = *(uint64_t*)(p_kstop - 120);
 
-    // ── Build a fresh IRETQ frame at the top of the child's kernel stack ──
-    // The child will run for the first time via fork_do_iretq, which pops
-    // SS / RSP / RFLAGS / CS / RIP and lands in user mode with RAX = 0.
-    // This kernel's GDT is SYSRET-compatible: user DATA=0x1B, user CODE=0x23
-    // (see usermode.asm). The iretq frame must therefore carry CS=0x23 and
-    // SS=0x1B — the original code had them swapped (CS=0x1B), which made iretq
-    // reject CS (a data selector) with #GP err=0x18 the first time the child ran.
-    // Sanitize RFLAGS exactly like enter_usermode: clear TF (no single-step),
-    // clear DF (SysV ABI: DF=0 at function entry), force IF=1, clear IOPL so
-    // the child has no I/O privilege.
-    user_rflags = (user_rflags & ~0x100ULL & ~0x400ULL & ~0x3000ULL) | 0x200ULL;
+    // Sanitize the child's user RFLAGS like enter_usermode: clear TF (no single-
+    // step), clear DF (SysV ABI: DF=0 at entry), force IF=1, clear IOPL. The raw
+    // parent RFLAGS still seeds the r11 slot (SYSCALL clobbers r11=RFLAGS).
+    uint64_t child_rflags = (user_rflags & ~0x100ULL & ~0x400ULL & ~0x3000ULL) | 0x200ULL;
 
+    // Child kernel stack: 5-qword IRETQ frame on top, and below it (popped first
+    // by fork_do_iretq) the 15-qword GP frame with RAX=0. GDT is SYSRET-compatible:
+    // user DATA=0x1B, user CODE=0x23 (usermode.asm).
     uint64_t c_kstop = (uint64_t)child->kernel_stack + KERNEL_STACK_SIZE;
     uint64_t* sp = (uint64_t*)c_kstop;
 
-    *--sp = 0x1B;            // SS     – user data segment, RPL 3
-    *--sp = user_rsp;        // RSP    – parent's user stack pointer
-    *--sp = user_rflags;     // RFLAGS – sanitized copy of the fork caller's
-    *--sp = 0x23;            // CS     – user code segment, RPL 3
-    *--sp = user_rip;        // RIP    – instruction after fork() syscall
+    *--sp = 0x1B;            // SS     user data segment, RPL 3
+    *--sp = user_rsp;        // RSP    parent's user stack pointer
+    *--sp = child_rflags;    // RFLAGS sanitized copy of the fork caller's
+    *--sp = 0x23;            // CS     user code segment, RPL 3
+    *--sp = user_rip;        // RIP    instruction after fork() syscall
+    // GP frame: pushed so fork_do_iretq pops rdi first ... rax last.
+    *--sp = 0;               // rax    child's fork() return value
+    *--sp = p_r15;
+    *--sp = p_r14;
+    *--sp = p_r13;
+    *--sp = p_r12;
+    *--sp = p_rbp;
+    *--sp = p_rbx;
+    *--sp = user_rflags;     // r11    SYSCALL-clobbered (raw parent RFLAGS)
+    *--sp = p_r10;
+    *--sp = p_r9;
+    *--sp = p_r8;
+    *--sp = user_rip;        // rcx    SYSCALL-clobbered (raw parent RIP)
+    *--sp = p_rdx;
+    *--sp = p_rsi;
+    *--sp = p_rdi;
 
-    // ── Set up CPU context for first context-switch ────────────────
-    // Preserve the child's CR3 (set by process_create) before zeroing.
+    // Set up CPU context for the first context-switch. Preserve the child's CR3
+    // (set by process_create). fork_do_iretq overwrites every GP reg from the
+    // stack frame above, so only rsp/rip/cr3/rflags here matter (the cooperative
+    // switch's GP restore from context is immediately discarded).
     uint64_t child_cr3 = child->context.cr3;
-
-    // Zero the context; most GP regs will be overwritten by IRETQ anyway.
     memset(&child->context, 0, sizeof(cpu_context_t));
-    child->context.rax    = 0;                        // child sees 0
-    child->context.cr3    = child_cr3;                // child's own PML4
-    child->context.rsp    = (uint64_t)sp;             // point at IRETQ frame
-    child->context.rip    = (uint64_t)fork_do_iretq;  // first instruction
-    child->context.rflags = 0x202;                    // IF enabled
+    child->context.cr3    = child_cr3;
+    child->context.rsp    = (uint64_t)sp;
+    child->context.rip    = (uint64_t)fork_do_iretq;
+    child->context.rflags = 0x202;
 
     // Stash user entry/rsp for the scheduler if it ever inspects them.
     child->user_entry = user_rip;

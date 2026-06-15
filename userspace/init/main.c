@@ -207,6 +207,11 @@ void _start(void) {
     print("[INIT] Spawning pollselftest...\n");
     spawn("sbin/pollselftest");
 
+
+    // FORK-REGS-INHERIT-0 probe: a fork()ed child must resume with the
+    // parent callee-saved registers intact. Prints FORKREGTEST RESULT.
+    print("[INIT] Spawning forkregtest...\n");
+    spawn("sbin/forkregtest");
     // real-threads probe: spawns 4 threads that SHARE this process's address
     // space but have independent stacks + FPU state, joins them, and prints
     // THREADTEST: PASS/FAIL. Proves shared memory, independent stacks, and

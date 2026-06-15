@@ -261,6 +261,10 @@ vfs_file_t* vfs_fd_get(int fd);
  * struct process is forward-declared to avoid pulling sched.h into vfs.h. */
 struct process;
 void vfs_close_all_fds(struct process* proc);
+/* fork(): deep-copy regular-file fds from src into dst (FORK-FD-TABLE-0). Fails
+ * closed if a live fd is not copy-safe (device/private/dentry-backed); sys_fork
+ * then fails the fork with rollback. See vfs.c for the exact ownership rules. */
+int vfs_dup_fd_table(struct process* dst, struct process* src);
 
 // Simple in-memory filesystem (for initrd)
 vfs_superblock_t* vfs_create_ramfs(void);

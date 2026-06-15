@@ -390,6 +390,22 @@ int64_t sys_fork(uint64_t arg1, uint64_t arg2, uint64_t arg3,
     for (const vma_t* v = parent->vma_list; v != NULL; v = v->next) {
         vma_add(child, v);
     }
+    // ---- Inherit the parent's regular-file fd table (FORK-FD-TABLE-0) ----
+    // POSIX fork() shares open file descriptors with the child. Deep-copy each
+    // copy-safe ramfs/inode-backed fd into an INDEPENDENT vfs_file_t (shared
+    // inode w/ bumped ref, own offset). vfs_dup_fd_table FAILS CLOSED if the
+    // parent holds a device/private-state/dentry-backed fd that cannot be safely
+    // cloned -- rolling back the whole child rather than silently dropping it.
+    {
+        extern int vfs_dup_fd_table(struct process* dst, struct process* src);
+        int fdrc = vfs_dup_fd_table(child, parent);
+        if (fdrc < 0) {
+            kprintf("[SYSCALL] sys_fork: fd-table inherit failed (rc=%d)\n", fdrc);
+            process_destroy(child);
+            return fdrc;
+        }
+    }
+
     // ---- Inherit the parent's FULL register frame (FORK-REGS-INHERIT-0) ----
     // POSIX fork: the child resumes as if fork() returned 0; every other
     // user-visible register must match the parent at the syscall boundary.

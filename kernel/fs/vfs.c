@@ -12,6 +12,7 @@
 #include "../include/sched.h"  /* process_get_current() for per-process fd tables */
 #include "../include/page_cache.h"  /* Unified page cache */
 #include "../include/fs_registry.h"  /* Filesystem type registry */
+#include "../include/errno.h"  /* ENOMEM / EOPNOTSUPP for fork fd-table dup */
 
 // Mount point structure
 typedef struct vfs_mount {
@@ -404,6 +405,84 @@ void vfs_close_all_fds(struct process* proc) {
         kfree(file);
         t[fd] = NULL;
     }
+}
+/**
+ * vfs_file_clone_for_fork -- allocate an INDEPENDENT vfs_file_t for fork() that
+ * shares the underlying inode (ref bumped) but owns its own offset + ref_count,
+ * mirroring exactly how vfs_fd_free()/vfs_close_all_fds() drop ownership.
+ *
+ * Returns NULL if the file is not provably copy-safe (the caller MUST then fail
+ * the fork rather than silently drop the fd) or on allocation failure. Copy-safe
+ * means a plain ramfs/inode-backed regular file:
+ *   - inode != NULL          something to share
+ *   - dentry == NULL         vfs_dentry_free() ignores ref_count and uncondition-
+ *                            ally frees + inode_puts, so a shared dentry would
+ *                            double-free on the 2nd close; vfs_open() never sets it
+ *   - ops == &ramfs_file_ops ramfs_close() is a no-op and ramfs carries no per-
+ *                            open private_data that close() frees
+ *
+ * Device nodes are intentionally REJECTED: their ops->open() allocates per-open
+ * driver state (e.g. evdev's evdev_client_t in file->private_data) that
+ * ops->close() frees and that is NOT refcounted -- pointer-copying it across an
+ * independently-closing child would double-free / use-after-free, and we must not
+ * replay ops->open() for the clone. ext2/fat32 ops are rejected by the same
+ * conservatism. Lifting this needs either a real vfs_file refcount honored by
+ * every close path or a per-driver .dup hook.
+ */
+static vfs_file_t* vfs_file_clone_for_fork(vfs_file_t* src) {
+    if (!src) return NULL;
+    if (!src->inode || src->dentry || src->ops != &ramfs_file_ops) {
+        return NULL;  /* not provably copy-safe */
+    }
+    vfs_file_t* nf = (vfs_file_t*)kmalloc(sizeof(vfs_file_t));
+    if (!nf) return NULL;
+    *nf = *src;                 /* inode, offset, flags, mode, ops, ra_*; ramfs
+                                 * private_data is unused + never freed by close */
+    nf->dentry = NULL;          /* guaranteed already; be explicit */
+    nf->ref_count = 1;          /* independent open file */
+    vfs_inode_get(nf->inode);   /* extra inode ref; the child's own close drops it */
+    return nf;
+}
+
+/**
+ * vfs_dup_fd_table -- deep-copy src's regular-file fd table into dst for fork().
+ * fds 0/1/2 are stdio (out of band, never in the table) so start at 3.
+ *
+ * FAIL-CLOSED: if any live fd is not copy-safe (device / private-state / dentry-
+ * backed) this unwinds every fd already cloned into dst and returns an error so
+ * the caller fails the fork -- it never silently drops an fd or shares unsafe
+ * state. Returns 0 on success, ENOMEM on allocation failure, EOPNOTSUPP if a
+ * live fd is not inheritable.
+ */
+int vfs_dup_fd_table(struct process* dst, struct process* src) {
+    if (!dst || !src) return EINVAL;
+    vfs_file_t** st = (vfs_file_t**)src->fd_table;
+    vfs_file_t** dt = (vfs_file_t**)dst->fd_table;
+
+    for (int fd = 3; fd < VFS_MAX_FDS; fd++) {
+        vfs_file_t* sf = st[fd];
+        if (!sf) continue;
+
+        vfs_file_t* nf = vfs_file_clone_for_fork(sf);
+        if (!nf) {
+            int unsafe = (sf->inode && (sf->dentry || sf->ops != &ramfs_file_ops));
+            kprintf("[VFS] fork: fd %d not inheritable (%s); failing fork\n",
+                    fd, unsafe ? "device/private/dentry-backed" : "out of memory");
+            /* Unwind clones already placed in dst, mirroring vfs_fd_free's inode
+             * drop. Clones never replayed ops->open and never carry a dentry, so
+             * no ops->close / dentry path is needed (and must not run). */
+            for (int j = 3; j < fd; j++) {
+                vfs_file_t* cf = dt[j];
+                if (!cf) continue;
+                if (cf->inode) vfs_inode_put(cf->inode);
+                kfree(cf);
+                dt[j] = NULL;
+            }
+            return unsafe ? EOPNOTSUPP : ENOMEM;
+        }
+        dt[fd] = nf;
+    }
+    return 0;
 }
 
 /**

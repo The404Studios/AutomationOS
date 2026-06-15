@@ -207,6 +207,12 @@ void _start(void) {
     print("[INIT] Spawning pollselftest...\n");
     spawn("sbin/pollselftest");
 
+    // fork-fd-table inheritance probe: parent opens a ramfs file, forks,
+    // the child writes through the INHERITED fd, then the parent writes
+    // through the same still-live fd after reaping. Prints FORKFDTEST
+    // RESULT to serial, exits.
+    print("[INIT] Spawning forkfdtest...\n");
+    spawn("sbin/forkfdtest");
 
     // FORK-REGS-INHERIT-0 probe: a fork()ed child must resume with the
     // parent callee-saved registers intact. Prints FORKREGTEST RESULT.

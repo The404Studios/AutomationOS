@@ -850,6 +850,15 @@ int64_t sys_close(uint64_t fd, uint64_t arg2, uint64_t arg3,
     kprintf("[SYSCALL] sys_close: fd=%d\n", (int)fd);
 #endif
 
+    // AUDIT FIX: epoll fds are encoded 0x10000+idx (>= MAX_FDS), so the check
+    // below would reject close(epfd) with EBADF and leak the instance forever.
+    // Route the epoll fd range to the epoll reclaimer instead. (Literal range to
+    // keep handlers.c free of an epoll.h dependency; matches EPOLL_MAX_INSTANCES.)
+    if (fd >= 0x10000 && fd < 0x10000 + 64) {
+        extern int epoll_close(int epfd);
+        return epoll_close((int)fd);
+    }
+
     // Validate file descriptor
     if (fd >= MAX_FDS) {
         kprintf("[SYSCALL] sys_close: Invalid file descriptor %d\n", (int)fd);

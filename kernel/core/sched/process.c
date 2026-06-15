@@ -831,6 +831,13 @@ void process_unref(process_t* proc) {
         extern void sock_cleanup_process(uint32_t pid);
         sock_cleanup_process(proc->pid);
 
+        // AUDIT FIX: reclaim epoll instances owned by the dying process. epoll
+        // fds (encoded 0x10000+idx) never pass through vfs_close_all_fds, so a
+        // process that exits with an open epoll fd would otherwise leak one of
+        // the 64 system-wide instances forever. Mirrors sock_cleanup_process.
+        extern void epoll_cleanup_process(uint32_t pid);
+        epoll_cleanup_process(proc->pid);
+
         // Free the lazily-allocated waitpid wait queue, if any.
         if (proc->child_wait) {
             kfree(proc->child_wait);

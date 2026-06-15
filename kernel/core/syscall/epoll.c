@@ -11,12 +11,15 @@
  * socket becomes readable), not while it remains readable. Applications must drain
  * all available data/events when notified to avoid missing future wakeups.
  *
- * Design:
- *  - Each epoll instance is a file descriptor that tracks a set of "interest" fds.
- *  - When a monitored socket becomes readable/writable, the epoll instance records
- *    the event and wakes any threads blocked in epoll_wait().
- *  - Uses wait_queue infrastructure for blocking/wakeup (same as futex/waitpid).
- *  - O(1) wakeup: only threads waiting on epoll instances with ready events wake.
+ * Design (POLL-SELECT-0, pull-based):
+ *  - Each epoll instance is an fd (encoded 0x10000+idx) tracking a set of
+ *    "interest" fds.
+ *  - epoll_wait() re-scans the interest set against fd_poll_state() each wait,
+ *    sleeping a short slice via poll_sleep_slice() until something is ready or
+ *    the timeout expires. Level-triggered by default; EPOLLET reports only the
+ *    bits newly asserted since a watch's last_state. Readiness is PULLED, not
+ *    pushed — there is no event ring or wait_queue (that scaffolding was dead
+ *    and was removed; see the epoll_instance struct note).
  *
  * Scope: kernel/core/syscall/epoll.c (new).
  */
@@ -67,25 +70,17 @@ typedef struct epoll_watch {
     uint32_t last_state;     // last reported state (for edge-trigger detection)
 } epoll_watch_t;
 
-// Ready event entry (ring buffer)
-typedef struct {
-    uint32_t events;    // triggered events
-    uint64_t data;      // user data from watch
-} ready_event_t;
-
-// epoll instance descriptor
+// epoll instance descriptor. AUDIT FIX: the ready_events ring + wait_queue +
+// epoll_add_ready/epoll_notify_socket scaffolding was DEAD — sys_epoll_wait
+// re-scans the watch set against fd_poll_state() each wait (level/edge) and
+// never read the ring nor blocked on the queue, and epoll_notify_socket had no
+// caller. Removed (~2 KB/instance, ~130 KB across the 64-slot table) so the
+// struct describes the actual pull-based model.
 typedef struct epoll_instance {
     bool used;                           // slot in use?
-    spinlock_t lock;                     // protects watches/ready_events
+    uint32_t owner_pid;                  // creating process (AUDIT FIX: exit reclaim)
+    spinlock_t lock;                     // protects watches
     epoll_watch_t watches[EPOLL_MAX_WATCHES];
-
-    // Ready event ring (edge-triggered: an event is added when state changes)
-    ready_event_t ready_events[EPOLL_MAX_EVENTS];
-    int ready_head;                      // next slot to read
-    int ready_tail;                      // next slot to write
-    int ready_count;                     // number of ready events
-
-    wait_queue_t wait_queue;             // processes blocked in epoll_wait
 } epoll_instance_t;
 
 /* ------------------------------------------------------------------ */
@@ -118,7 +113,6 @@ void epoll_init(void) {
         epoll_instance_t* ep = &g_epoll_instances[i];
         ep->used = false;
         spin_lock_init(&ep->lock);
-        wq_init(&ep->wait_queue);
 
         // Mark all watch slots as unused
         for (int j = 0; j < EPOLL_MAX_WATCHES; j++) {
@@ -160,35 +154,6 @@ static epoll_watch_t* epoll_find_watch(epoll_instance_t* ep, int fd) {
             return &ep->watches[i];
     }
     return NULL;
-}
-
-/* ------------------------------------------------------------------ */
-/* Helper: add ready event (edge-triggered: only if state changed)    */
-/* ------------------------------------------------------------------ */
-
-static void epoll_add_ready(epoll_instance_t* ep, int fd, uint32_t new_state) {
-    // Find the watch
-    epoll_watch_t* w = epoll_find_watch(ep, fd);
-    if (!w) return;
-
-    // Edge-triggered: only add event if state CHANGED
-    uint32_t triggered = (new_state & w->events) & ~w->last_state;
-    if (triggered == 0) return;  // no new events
-
-    w->last_state = new_state & w->events;
-
-    // Add to ready ring (drop if full)
-    if (ep->ready_count >= EPOLL_MAX_EVENTS) return;
-
-    ready_event_t* re = &ep->ready_events[ep->ready_tail];
-    re->events = triggered;
-    re->data = w->user_data;
-
-    ep->ready_tail = (ep->ready_tail + 1) % EPOLL_MAX_EVENTS;
-    ep->ready_count++;
-
-    // Wake one waiter (if any)
-    wq_wake_one(&ep->wait_queue);
 }
 
 /* ------------------------------------------------------------------ */
@@ -240,9 +205,7 @@ int64_t sys_epoll_create(uint64_t size_hint, uint64_t a2, uint64_t a3,
 
     epoll_instance_t* ep = &g_epoll_instances[idx];
     ep->used = true;
-    ep->ready_head = 0;
-    ep->ready_tail = 0;
-    ep->ready_count = 0;
+    { process_t* cur = process_get_current(); ep->owner_pid = cur ? cur->pid : 0; }
 
     // Clear all watches
     for (int i = 0; i < EPOLL_MAX_WATCHES; i++) {
@@ -415,25 +378,36 @@ int64_t sys_epoll_wait(uint64_t epfd_arg, uint64_t events_ptr,
 }
 
 /* ------------------------------------------------------------------ */
-/* Hook: notify epoll instances when socket state changes             */
+/* AUDIT FIX — instance reclamation. Mirrors sock_cleanup_process.     */
+/* Before this, close(epfd) returned EBADF (sys_close rejects fd >=    */
+/* MAX_FDS and an epoll fd is >= 0x10000) and nothing reclaimed an     */
+/* instance on process exit, so the 64 system-wide slots leaked        */
+/* permanently -> EMFILE for the whole system after 64 lifetime        */
+/* epoll_create()s (an unprivileged exhaustion DoS).                   */
 /* ------------------------------------------------------------------ */
 
-void epoll_notify_socket(int sockfd, uint32_t events) {
+static void epoll_release(epoll_instance_t* ep) {
+    spin_lock(&ep->lock);
+    for (int i = 0; i < EPOLL_MAX_WATCHES; i++) ep->watches[i].fd = -1;
+    ep->owner_pid = 0;
+    ep->used = false;
+    spin_unlock(&ep->lock);
+}
+
+// Release an epoll fd. Called from sys_close() for the 0x10000.. fd range.
+// Returns 0 on success, EBADF (positive, matching sys_close) for a bad epfd.
+int epoll_close(int epfd) {
+    epoll_instance_t* ep = epoll_from_fd(epfd);
+    if (!ep) return EBADF;
+    epoll_release(ep);
+    return 0;
+}
+
+// Reclaim every epoll instance owned by a dying process (process teardown).
+void epoll_cleanup_process(uint32_t pid) {
     if (!g_epoll_initialized) return;
-
-    // Scan all epoll instances for watches on this socket
-    spin_lock(&g_epoll_lock);
-
     for (int i = 0; i < EPOLL_MAX_INSTANCES; i++) {
-        if (!g_epoll_instances[i].used) continue;
-
-        epoll_instance_t* ep = &g_epoll_instances[i];
-        spin_lock(&ep->lock);
-
-        epoll_add_ready(ep, sockfd, events);
-
-        spin_unlock(&ep->lock);
+        if (g_epoll_instances[i].used && g_epoll_instances[i].owner_pid == pid)
+            epoll_release(&g_epoll_instances[i]);
     }
-
-    spin_unlock(&g_epoll_lock);
 }

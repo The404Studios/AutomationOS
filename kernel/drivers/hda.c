@@ -5,6 +5,7 @@
 #include "../include/types.h"
 #include "../include/drivers.h"   /* serial_write, serial_putchar, timer_get_ticks, timer_get_frequency */
 #include "../include/syscall.h"   /* sys_yield */
+#include "../include/sched.h"     /* process_get_current (boot-phase detect) */
 
 // Global HDA controller instance
 static hda_controller_t* g_hda_ctrl = NULL;
@@ -20,6 +21,19 @@ static int hda_wait_for_response(hda_controller_t* ctrl, uint32_t* response);
  * Simple millisecond delay (busy wait)
  */
 void hda_msleep(uint32_t ms) {
+    if (ms == 0) return;
+    /* Boot phase: hda_init() runs before sti() (kernel.c) with NO process yet,
+     * so the PIT (IRQ0) can't advance timer_get_ticks() while we hold the CPU,
+     * AND sys_yield has no process to switch to -- it would spin the full 4M cap
+     * below logging "no current process" to polled serial on EVERY iteration (a
+     * multi-second boot hog when an HDA controller is present, e.g. the T410).
+     * Use timer_sleep(), whose IF=0 path is a tick-independent bounded io-delay,
+     * instead of the logging yield-spin. SYS_BEEP (which DOES have a process)
+     * keeps the cooperative yield path below. */
+    if (process_get_current() == NULL) {
+        timer_sleep(ms);
+        return;
+    }
     // Assuming 1000 Hz timer, convert to ticks
     uint64_t start = timer_get_ticks();
     uint64_t end = start + (ms * timer_get_frequency() / 1000);

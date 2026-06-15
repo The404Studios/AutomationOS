@@ -50,8 +50,12 @@ typedef struct vma {
 struct process;
 
 // Record a VMA on a process (copies *desc). Does not touch page tables.
+// Returns 0 on success, -1 if the region could NOT be tracked (bad args / OOM).
+// Callers for whom an untracked region is a correctness bug (e.g. fork, which
+// would otherwise hand the child a partial VMA list and mis-kill its first
+// lazy fault) MUST check the return and fail closed.
 // Time complexity: O(log n) with RB-tree implementation
-void   vma_add(struct process* proc, const vma_t* desc);
+int    vma_add(struct process* proc, const vma_t* desc);
 
 // Return the VMA containing addr, or NULL.
 // Time complexity: O(log n) with RB-tree implementation

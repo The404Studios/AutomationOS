@@ -349,7 +349,13 @@ int64_t sys_fork(uint64_t arg1, uint64_t arg2, uint64_t arg3,
     //   KSTACK_TOP - 8  = user RSP
     //   KSTACK_TOP - 16 = user RIP (originally RCX)
     //   KSTACK_TOP - 24 = user RFLAGS (originally R11)
-    uint64_t p_kstop = (uint64_t)parent->kernel_stack + KERNEL_STACK_SIZE;
+    // Align down to 16 to match the ACTUAL entry RSP source of truth
+    // (kstack_top = (kernel_stack + KERNEL_STACK_SIZE) & ~0xF, set in context.c /
+    // cooperative_switch_to / tss_set_kernel_stack). A no-op today because the
+    // 8192-byte kernel stack is 16-aligned, but if the kernel-stack allocator ever
+    // returns an 8-aligned pointer, every p_kstop-N read below would be off-by-8
+    // and silently corrupt the entire inherited register set.
+    uint64_t p_kstop = ((uint64_t)parent->kernel_stack + KERNEL_STACK_SIZE) & ~0xFULL;
     uint64_t user_rsp    = *(uint64_t*)(p_kstop - 8);
     uint64_t user_rip    = *(uint64_t*)(p_kstop - 16);
     uint64_t user_rflags = *(uint64_t*)(p_kstop - 24);
@@ -387,8 +393,17 @@ int64_t sys_fork(uint64_t arg1, uint64_t arg2, uint64_t arg3,
     // in handle_page_fault() and is mis-killed as a segfault. vma_add()
     // value-copies each descriptor; file-backed VMAs share the immutable
     // initrd-image file pointers, so this is safe.
+    // FAIL CLOSED (like every other fork sub-step): if a descriptor cannot be
+    // recorded (OOM), tearing down the whole child beats handing it a partial
+    // VMA list -- a dropped lazy region (e.g. the GROWSDOWN stack) would mis-kill
+    // the child's first demand fault as a spurious segfault while fork wrongly
+    // reported success.
     for (const vma_t* v = parent->vma_list; v != NULL; v = v->next) {
-        vma_add(child, v);
+        if (vma_add(child, v) < 0) {
+            kprintf("[SYSCALL] sys_fork: VMA inherit failed (OOM); failing fork\n");
+            process_destroy(child);
+            return ENOMEM;
+        }
     }
     // ---- Inherit the parent's regular-file fd table (FORK-FD-TABLE-0) ----
     // POSIX fork() shares open file descriptors with the child. Deep-copy each

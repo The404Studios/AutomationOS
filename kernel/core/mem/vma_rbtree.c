@@ -26,15 +26,15 @@
 // Record a VMA on a process (copies *desc). O(1) prepend. Does not touch page
 // tables. The list is NULL-terminated; order is reverse-insertion (irrelevant
 // to all consumers, which either search by address or visit every node).
-void vma_add(struct process* proc, const vma_t* desc) {
+int vma_add(struct process* proc, const vma_t* desc) {
     if (!proc || !desc) {
-        return;
+        return -1;
     }
     vma_t* z = (vma_t*)kmalloc(sizeof(vma_t));
     if (!z) {
         kprintf("[VMA] WARN: kmalloc failed; region 0x%lx not tracked\n",
                 (unsigned long)desc->vaddr);
-        return;
+        return -1;
     }
     *z = *desc;
     z->left = NULL;
@@ -43,6 +43,7 @@ void vma_add(struct process* proc, const vma_t* desc) {
     z->color = VMA_RB_BLACK;
     z->next = proc->vma_list;   // prepend: new head's next = old head
     proc->vma_list = z;          // new head (proper NULL-terminated list)
+    return 0;
 }
 
 // Return the VMA containing addr, or NULL. O(n) over the (short) list.

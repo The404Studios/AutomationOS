@@ -4,6 +4,31 @@
 #include "syscall.h"
 #include "string.h"
 
+// AUDIT FIX: the kernel implements real signal delivery (SYS_RT_SIGACTION=107,
+// kernel/core/signal/kill.c). signal()/sigaction() below previously only wrote
+// the userspace table and NEVER registered with the kernel, so e.g. compositord's
+// sigaction(SIGTERM,...) / signal(SIGPIPE, SIG_IGN) never took effect and a kill
+// hard-terminated it instead of running its graceful-shutdown handler. Wire them
+// to the kernel ABI (identical to userspace/apps/sigtest/sigtest.c).
+#define SYS_RT_SIGACTION 107
+#define SYS_RT_SIGRETURN 109
+
+// Raw 3-arg syscall. syscall6() is a static-inline in syscall.c and not visible
+// from this TU, so use a local stub. Clobbers rcx/r11 per the SYSCALL ABI.
+static inline long __sig_sc(long n, long a1, long a2, long a3) {
+    long ret;
+    __asm__ volatile("syscall" : "=a"(ret)
+        : "a"(n), "D"(a1), "S"(a2), "d"(a3)
+        : "rcx", "r11", "memory");
+    return ret;
+}
+
+// The address a delivered handler returns to: issues SYS_RT_SIGRETURN to restore
+// the saved user frame (mirrors sigtest.c's restorer). naked => no prologue/epilogue.
+__attribute__((naked)) static void __libc_sigrestorer(void) {
+    __asm__ volatile("mov $109, %rax\n\t" "syscall\n\t" "ud2\n\t");
+}
+
 // Global signal handler table
 static sighandler_t signal_handlers[_NSIG];
 
@@ -61,9 +86,11 @@ sighandler_t signal(int signum, sighandler_t handler) {
     sighandler_t old_handler = signal_handlers[signum];
     signal_handlers[signum] = handler;
 
-    // In a real implementation, this would use a syscall to register
-    // the signal handler with the kernel
-    // For now, this is just a userspace-only implementation
+    // AUDIT FIX: register the disposition with the kernel. SIG_DFL(0)/SIG_IGN(1)
+    // pass straight through (kernel uses the same 0/1 encoding); a real handler
+    // VA is validated as canonical-user kernel-side. Keep the local table too —
+    // raise() consults it for in-process delivery.
+    __sig_sc(SYS_RT_SIGACTION, signum, (long)handler, (long)&__libc_sigrestorer);
 
     return old_handler;
 }
@@ -90,8 +117,9 @@ int sigaction(int signum, const struct sigaction* act, struct sigaction* oldact)
     // Set new action if provided
     if (act) {
         signal_handlers[signum] = act->sa_handler;
-        // In a real implementation, would also set sa_mask, sa_flags, etc.
-        // through a syscall
+        // AUDIT FIX: register with the kernel (see signal()). sa_mask/sa_flags
+        // are not yet propagated (SYS_RT_SIGACTION takes handler+restorer only).
+        __sig_sc(SYS_RT_SIGACTION, signum, (long)act->sa_handler, (long)&__libc_sigrestorer);
     }
 
     return 0;
@@ -152,7 +180,7 @@ int sigaddset(sigset_t* set, int signum) {
         return -1;
     }
 
-    *set |= (1UL << (signum - 1));
+    *set |= (1UL << signum);
     return 0;
 }
 
@@ -162,7 +190,7 @@ int sigdelset(sigset_t* set, int signum) {
         return -1;
     }
 
-    *set &= ~(1UL << (signum - 1));
+    *set &= ~(1UL << signum);
     return 0;
 }
 
@@ -172,7 +200,7 @@ int sigismember(const sigset_t* set, int signum) {
         return -1;
     }
 
-    return (*set & (1UL << (signum - 1))) ? 1 : 0;
+    return (*set & (1UL << signum)) ? 1 : 0;
 }
 
 // ============================================================================

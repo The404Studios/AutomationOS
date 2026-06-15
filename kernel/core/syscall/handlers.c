@@ -1321,6 +1321,21 @@ int64_t sys_map_file(uint64_t path, uint64_t out_addr, uint64_t out_size,
                 return EINVAL;
     }
 
+    // AUDIT FIX — unprivileged ring-3 -> ring-0 DoS guard. inode->data is a
+    // KERNEL virtual address (direct-map for initrd, kmalloc heap for ramfs),
+    // and vmm_map_page() ASSERT_ALWAYS-panics on a non-page-aligned phys arg.
+    // A ramfs file's kmalloc'd data is only 16-byte aligned, so any process can
+    // open()+write(odd_len)+map_file() and trip the assert, panicking the whole
+    // kernel. Reject a non-page-aligned data pointer (the abuse path always is)
+    // BEFORE it reaches vmm_map_page. (The full rework — initrd-only source,
+    // direct-map VA->phys translation, per-AS VA allocation + overlap check —
+    // is tracked separately; this stops the DoS.)
+    if (phys_data & (PAGE_SIZE - 1)) {
+        kprintf("[MAP_FILE] reject: data not page-aligned (0x%lx) for %s\n", phys_data, kpath);
+        vfs_inode_put(inode);
+        return EINVAL;
+    }
+
     // Calculate pages needed (round up to page boundary)
     uint64_t pages = (file_size + PAGE_SIZE - 1) / PAGE_SIZE;
 

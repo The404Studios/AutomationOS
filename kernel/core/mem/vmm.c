@@ -115,23 +115,36 @@ static bool is_user_address(uint64_t addr) {
 }
 
 /*
- * user_page_is_accessible - check whether a single 4KB page containing
- * `addr` is mapped and accessible in the current address space.
+ * user_page_is_accessible - check whether a single 4KB page containing `addr`
+ * is present AND user-accessible in the LIVE caller address space.
  *
- * Uses paging_get_pte() (declared above, implemented in paging.c) to do a
- * software page-table walk without touching the memory itself.  Returns true
- * when the PTE is present (bit 0 set).
- *
- * If paging_get_pte() is not yet available at link time (i.e. the symbol is
- * absent), copy_user_string falls back to address-range validation only — it
- * will not crash but may fault on a genuinely unmapped page.  The linker will
- * diagnose the missing symbol during build, so the integrator will know when
- * the helper needs to be added to paging.c.
+ * AUDIT FIX: this previously walked paging_get_pte()'s STALE software view
+ * (active_pml4 == kernel_pml4 during a syscall, since nobody calls
+ * paging_set_target() on the copy_user_string path), not the active CR3.  That
+ * diverges from the caller's real mappings for any user VA mapped after process
+ * creation (mmap'd path strings, lazy heap/stack): it false-rejected valid
+ * pages and — worse — could pass a page that is present in kernel_pml4's
+ * identity map but UNMAPPED in the live CR3, letting copy_user_string then
+ * #PF in ring 0.  Walk the live CR3 directly, exactly like
+ * user_range_is_accessible (the bulk copy_from/to_user primitive already does
+ * this), and require PAGE_USER so a kernel-only identity page is not accepted.
+ * Mask table pointers with ADDR_MASK (the NX bit 63 lives in entries).
  */
 static bool user_page_is_accessible(uint64_t addr) {
-    uint64_t pte = paging_get_pte(addr);
-    // PTE_PRESENT = bit 0.  A zero PTE means not mapped.
-    return (pte & 1ULL) != 0;
+    const uint64_t ADDR_MASK = 0x000FFFFFFFFFF000ULL;
+    const uint64_t required  = (uint64_t)(PAGE_PRESENT | PAGE_USER);
+    uint64_t* pml4 = (uint64_t*)(read_cr3() & ~0xFFFULL);
+    uint64_t va = addr & ~0xFFFULL;
+
+    uint64_t e = pml4[(va >> 39) & 0x1FF];
+    if (!(e & PAGE_PRESENT)) return false;
+    e = ((uint64_t*)(e & ADDR_MASK))[(va >> 30) & 0x1FF];
+    if (!(e & PAGE_PRESENT)) return false;
+    e = ((uint64_t*)(e & ADDR_MASK))[(va >> 21) & 0x1FF];
+    if (!(e & PAGE_PRESENT)) return false;
+    if (e & (1ULL << 7)) return (e & required) == required;   /* 2MB huge leaf */
+    e = ((uint64_t*)(e & ADDR_MASK))[(va >> 12) & 0x1FF];
+    return (e & required) == required;
 }
 
 /*

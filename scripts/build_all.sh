@@ -107,6 +107,11 @@ $LD /tmp/forkfdtest.o -o /tmp/forkfdtest.elf
 # FORKREGTEST RESULT: PASS iff fork() inherits the parent register set.
 cc userspace/apps/forkregtest/forkregtest.c /tmp/forkregtest.o
 $LD /tmp/forkregtest.o -o /tmp/forkregtest.elf
+# EXECVE-INPLACE-0: exectest driver (bare _start, no crt0 -- like forktest). It
+# execve()s sbin/execchild over its own image. (execchild is crt0-linked and
+# built below, after crt0.o is assembled.)
+cc userspace/apps/exectest/exectest.c /tmp/exectest.o
+$LD /tmp/exectest.o -o /tmp/exectest.elf
 # threadtest: standalone REAL-THREADS probe (no libs), spawned by init. Proves
 # shared address space + independent stacks + independent FPU across 4 threads.
 cc userspace/apps/threadtest/threadtest.c /tmp/threadtest.o
@@ -139,6 +144,9 @@ cc userspace/apps/tar/tar.c     /tmp/tar.o;     $LD /tmp/crt0.o /tmp/tar.o     -
 cc userspace/apps/pkg/pkg.c     /tmp/pkg.o;     $LD /tmp/crt0.o /tmp/pkg.o     -o /tmp/pkg.elf
 cc userspace/apps/make/make.c   /tmp/make.o;    $LD /tmp/crt0.o /tmp/make.o    -o /tmp/make.elf
 cc userspace/apps/argvtest/argvtest.c /tmp/argvtest.o; $LD /tmp/crt0.o /tmp/argvtest.o -o /tmp/argvtest.elf
+# EXECVE-INPLACE-0: execchild = the post-execve image, linked WITH crt0 so it gets
+# main(argc,argv,envp). Reached ONLY via exectest's execve().
+cc userspace/apps/execchild/execchild.c /tmp/execchild.o; $LD /tmp/crt0.o /tmp/execchild.o -o /tmp/execchild.elf
 # msgtest: CHANNEL-0 P5b proof -- a userspace CH_MSG send/recv round-trip via a
 # self-spawned bound child (also proves EAGAIN + EMSGSIZE). crt0-linked; uses
 # userspace/lib/channel.h. Prints MSGTEST: PASS/FAIL to serial.
@@ -570,7 +578,7 @@ $LD /tmp/crt0.o /tmp/cc.o \
     -o /tmp/cc.elf
 
 echo "[all] canary check (all must be 0):"
-for e in comp init filemanager calculator clock sysinfo settings sysmon uidemo dateapp applauncher taskman terminal editor snake paint synth tetris game2048 sheet notes calendar stopwatch mines piano dashboard welcome bench breakout pong invaders procmon soundtest solitaire aiconsole screenshot stress musicplayer ide bubbletd zombietd pacman clockapp forktest sigtest pollselftest threadtest reaploop forkfdtest forkregtest matmuljobs aibroker sed awk tar pkg make meminfo argvtest msgtest rpctest toolrun echoproof echoargs agenthost tool_read tool_ls tool_stat toolset_host chainhost modelbridge initrdp initrdalias floattest sleeptest prioritytest matbench tensortest cpuburn blk ps kill free uptime find diff cmp tee wcx xargs gzip cc nettest sockettest cpu1offload smpstress wget netman browser cryptotest libtest ping nc netinfo netscan tcping dig httpget pktmon httpd traceroute arp grep head tail sort uniq cut tr nl du touch basename dirname uname hostname whoami date less hexdump lspci tlsprobe certtool dhcpc autodhcp apidemo js futextest epolltest sendfiletest perftest batchtest domtest htmltest csstest layouttest webtest browser2 webapitest cube3d ray chess asteroids sudoku photos startmenu controlcenter gametest; do
+for e in comp init filemanager calculator clock sysinfo settings sysmon uidemo dateapp applauncher taskman terminal editor snake paint synth tetris game2048 sheet notes calendar stopwatch mines piano dashboard welcome bench breakout pong invaders procmon soundtest solitaire aiconsole screenshot stress musicplayer ide bubbletd zombietd pacman clockapp forktest sigtest pollselftest threadtest reaploop forkfdtest forkregtest matmuljobs aibroker sed awk tar pkg make meminfo argvtest msgtest rpctest toolrun echoproof echoargs agenthost tool_read tool_ls tool_stat toolset_host chainhost modelbridge initrdp initrdalias floattest sleeptest prioritytest matbench tensortest cpuburn blk ps kill free uptime find diff cmp tee wcx xargs gzip cc nettest sockettest cpu1offload smpstress wget netman browser cryptotest libtest ping nc netinfo netscan tcping dig httpget pktmon httpd traceroute arp grep head tail sort uniq cut tr nl du touch basename dirname uname hostname whoami date less hexdump lspci tlsprobe certtool dhcpc autodhcp apidemo js futextest epolltest sendfiletest perftest batchtest domtest htmltest csstest layouttest webtest browser2 webapitest cube3d ray chess asteroids sudoku photos startmenu controlcenter gametest exectest execchild; do
     n=$(objdump -d /tmp/$e.elf 2>/dev/null | grep -c "fs:0x28" || true)
     echo "  $e=$n"
 done
@@ -589,7 +597,7 @@ rm -rf /tmp/ird && mkdir -p /tmp/ird/sbin /tmp/ird/bin
 if [ "${SELFHEAL:-0}" != "1" ]; then rm -f /tmp/ird/sbin/cwatchdog; fi
 cp /tmp/comp.elf /tmp/ird/sbin/compositor
 cp /tmp/init.elf /tmp/ird/sbin/init
-for e in filemanager calculator clock sysinfo settings sysmon uidemo dateapp applauncher taskman terminal editor snake paint synth tetris game2048 sheet notes calendar stopwatch mines piano dashboard welcome bench breakout pong invaders procmon soundtest solitaire aiconsole screenshot stress musicplayer ide bubbletd startmenu controlcenter chess asteroids sudoku photos pacman clockapp zombietd forktest sigtest pollselftest threadtest reaploop forkfdtest forkregtest matmuljobs cube3d ray derby; do
+for e in filemanager calculator clock sysinfo settings sysmon uidemo dateapp applauncher taskman terminal editor snake paint synth tetris game2048 sheet notes calendar stopwatch mines piano dashboard welcome bench breakout pong invaders procmon soundtest solitaire aiconsole screenshot stress musicplayer ide bubbletd startmenu controlcenter chess asteroids sudoku photos pacman clockapp zombietd forktest sigtest pollselftest threadtest reaploop forkfdtest forkregtest matmuljobs cube3d ray derby exectest; do
     cp /tmp/$e.elf /tmp/ird/sbin/$e
 done
 [ "$IV_OK" = "1" ] && cp /tmp/imageviewer.elf /tmp/ird/sbin/imageviewer
@@ -604,6 +612,8 @@ cp /tmp/pkg.elf      /tmp/ird/bin/pkg
 cp /tmp/make.elf     /tmp/ird/bin/make
 cp /tmp/meminfo.elf  /tmp/ird/bin/meminfo
 cp /tmp/argvtest.elf /tmp/ird/sbin/argvtest
+# EXECVE-INPLACE-0: execchild -> /sbin (reached only via exectest's execve()).
+cp /tmp/execchild.elf /tmp/ird/sbin/execchild
 # msgtest -> /sbin (init spawns it at boot; it self-spawns sbin/msgtest as a
 # bound child for the CHANNEL-0 P5b CH_MSG round-trip proof).
 cp /tmp/msgtest.elf /tmp/ird/sbin/msgtest

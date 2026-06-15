@@ -73,6 +73,41 @@ void vma_clear(struct process* proc) {
     proc->vma_list = NULL;
 }
 
+// EXECVE-INPLACE-0: PCB-free prepend onto a detached list head. Mirrors vma_add()
+// exactly (same node init + O(1) prepend) but operates on *head, not a process.
+int vma_add_to_list(struct vma** head, const vma_t* desc) {
+    if (!head || !desc) {
+        return -1;
+    }
+    vma_t* z = (vma_t*)kmalloc(sizeof(vma_t));
+    if (!z) {
+        kprintf("[VMA] WARN: kmalloc failed; staged region 0x%lx not tracked\n",
+                (unsigned long)desc->vaddr);
+        return -1;
+    }
+    *z = *desc;
+    z->left = NULL;
+    z->right = NULL;
+    z->parent = NULL;
+    z->color = VMA_RB_BLACK;
+    z->next = *head;   // prepend onto the detached list
+    *head = z;
+    return 0;
+}
+
+// EXECVE-INPLACE-0: free a detached list passed BY VALUE (mirrors vma_clear's
+// walk-and-free). Used to discard a STAGED list on a failed exec, and to free the
+// OLD list after a successful transplant. Safe on a NULL/empty list. Does NOT
+// touch page tables (the caller frees the staged CR3 separately).
+void vma_free_list(struct vma* head) {
+    vma_t* v = head;
+    while (v != NULL) {
+        vma_t* next = v->next;
+        kfree(v);
+        v = next;
+    }
+}
+
 // Count VMAs (diagnostic).
 int vma_count(struct process* proc) {
     if (!proc) {

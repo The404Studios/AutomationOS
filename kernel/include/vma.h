@@ -65,6 +65,16 @@ vma_t* vma_find(struct process* proc, uint64_t addr);
 // Time complexity: O(n)
 void   vma_clear(struct process* proc);
 
+// EXECVE-INPLACE-0: PCB-FREE VMA list ops for staging an exec image into a
+// detached list before committing it onto `current`. A VMA list is a NULL-
+// terminated ->next chain (vma_rbtree.c). vma_add_to_list prepends a COPY of
+// *desc to the list whose head is *head (returns 0 ok, -1 on OOM, *head unchanged
+// on failure). vma_free_list frees every node of a detached list passed BY VALUE
+// (the caller nulls its own head). Same node format + prepend discipline as
+// vma_add()/vma_clear().
+int    vma_add_to_list(struct vma** head, const vma_t* desc);
+void   vma_free_list(struct vma* head);
+
 // Count the number of VMAs in the tree (diagnostic)
 int    vma_count(struct process* proc);
 

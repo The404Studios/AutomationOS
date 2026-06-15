@@ -241,6 +241,16 @@ char g_exec_spawn_args[256];
 char g_exec_spawn_argv[256];
 int  g_exec_spawn_argv_len;
 
+/* EXECVE-INPLACE-0: explicit envp VECTOR for the next exec, set by sys_execve's
+ * stage_envp_from_user() (copied from the caller's user space BEFORE its CR3
+ * switch). When g_exec_spawn_envp_len > 0, g_exec_spawn_envp holds the env entries
+ * as NUL-separated "KEY=VALUE" bytes (split ONLY on NUL); the worker emits them
+ * after the argv NULL terminator. Consumed (length zeroed) when the frame is
+ * built. BSS-zeroed, so a plain sys_spawn (which never sets it) builds an empty
+ * environment -- spawn frames are unchanged. */
+char g_exec_spawn_envp[256];
+int  g_exec_spawn_envp_len;
+
 int elf_load_and_exec(void* elf_data, size_t elf_size, const char* name) {
     if (!elf_data || elf_size == 0 || !name) {
         EXEC_LOG("[EXEC] Invalid parameters to elf_load_and_exec\n");
@@ -838,4 +848,316 @@ int elf_load_and_exec(void* elf_data, size_t elf_size, const char* name) {
     EXEC_LOG("[EXEC]   Process ready to execute\n");
 
     return proc->pid;
+}
+
+/* ============================================================================
+ * EXECVE-INPLACE-0: PCB-FREE ELF stager.
+ * ============================================================================
+ * A faithful, PCB-free copy of elf_load_and_exec's loader (validate + PT_LOAD
+ * load + stack/guard VMAs + argv/envp frame), targeting a caller-supplied
+ * `target_cr3` and recording VMAs onto a DETACHED list (*staged_vma_head) instead
+ * of a process. Returns {entry, rsp}. elf_load_and_exec is intentionally LEFT
+ * UNTOUCHED so the proven spawn path is byte-identical; this parallel worker adds
+ * ~the same loader plus envp emission, at the cost of duplicated lines (the
+ * lower-risk choice; dedup is a later brick).
+ *
+ * The populate phase re-asserts the kernel master CR3 around the memcpy/memset
+ * window (read_cr3()->kernel->restore), EXACTLY as elf_load_and_exec does, so the
+ * worker is correct regardless of the caller's live CR3 (sys_execve calls it on
+ * kernel CR3; a future spawn-via-worker would call it on a process CR3). Do NOT
+ * remove that wrapper -- it is what stops the initrd source from self-aliasing.
+ *
+ * VMAs are recorded via vma_add_to_list (detached). On ANY failure the worker
+ * frees the partial detached list, restores the prior mapping target, and returns
+ * a negative ELF_ERR_*; the CALLER owns destroying target_cr3.
+ */
+int elf_stage_into_cr3(void* elf_data, size_t elf_size, const char* argv0_name,
+                       uint64_t target_cr3, vma_t** staged_vma_head,
+                       uint64_t* out_entry, uint64_t* out_rsp) {
+    if (!elf_data || elf_size == 0 || !argv0_name || !target_cr3 ||
+        !staged_vma_head || !out_entry || !out_rsp) {
+        return ELF_ERR_INVALID;
+    }
+    *staged_vma_head = NULL;
+    const char* name = argv0_name;
+
+    if (elf_size < sizeof(elf64_ehdr_t)) return ELF_ERR_INVALID;
+    const elf64_ehdr_t* ehdr = (const elf64_ehdr_t*)elf_data;
+    if (!elf_validate_header(ehdr)) return ELF_ERR_INVALID;
+    if (ehdr->e_phnum > 1024) return ELF_ERR_INVALID;
+    if (ehdr->e_phentsize != sizeof(elf64_phdr_t)) return ELF_ERR_INVALID;
+    {
+        uint64_t phdr_end = (uint64_t)ehdr->e_phoff
+                          + (uint64_t)ehdr->e_phnum * (uint64_t)ehdr->e_phentsize;
+        if (phdr_end > elf_size) return ELF_ERR_INVALID;
+    }
+
+    /* Target the staging CR3; remember the prior target to restore it exactly. */
+    uint64_t saved_target = paging_get_target();
+    paging_set_target(target_cr3);
+
+    /* Failure macro: discard the detached list, restore the mapping target,
+     * return the error. The caller destroys target_cr3. */
+    #define STAGE_FAIL(err) do { vma_free_list(*staged_vma_head);              \
+                                 *staged_vma_head = NULL;                       \
+                                 paging_set_target_raw(saved_target);          \
+                                 return (err); } while (0)
+
+    const elf64_phdr_t* phdr =
+        (const elf64_phdr_t*)((uint8_t*)elf_data + ehdr->e_phoff);
+
+    struct { uint64_t start; uint64_t end; } stg_loaded[EXEC_MAX_LOAD_SEGMENTS];
+    int stg_n_loaded = 0;
+
+    for (int i = 0; i < ehdr->e_phnum; i++) {
+        if (phdr[i].p_type != PT_LOAD) continue;
+
+        if (phdr[i].p_memsz > 0 &&
+            phdr[i].p_vaddr + phdr[i].p_memsz < phdr[i].p_vaddr) {
+            STAGE_FAIL(ELF_ERR_INVALID);
+        }
+        uint64_t vaddr_start = ALIGN_DOWN(phdr[i].p_vaddr, PAGE_SIZE);
+        uint64_t raw_end     = phdr[i].p_vaddr + phdr[i].p_memsz;
+        uint64_t vaddr_end   = ALIGN_UP(raw_end, PAGE_SIZE);
+        if (vaddr_end < raw_end) STAGE_FAIL(ELF_ERR_INVALID);
+        uint64_t num_pages = (vaddr_end - vaddr_start) / PAGE_SIZE;
+
+        for (int j = 0; j < stg_n_loaded; j++) {
+            if (vaddr_start < stg_loaded[j].end && vaddr_end > stg_loaded[j].start) {
+                STAGE_FAIL(ELF_ERR_INVALID);
+            }
+        }
+        if (vaddr_start >= 0x0000800000000000ULL ||
+            vaddr_end   >  0x0000800000000000ULL) {
+            STAGE_FAIL(ELF_ERR_PERM);
+        }
+        if (phdr[i].p_filesz > phdr[i].p_memsz) STAGE_FAIL(ELF_ERR_INVALID);
+        if (phdr[i].p_offset > elf_size ||
+            phdr[i].p_filesz > elf_size - phdr[i].p_offset) {
+            STAGE_FAIL(ELF_ERR_INVALID);
+        }
+
+        uint64_t page_flags = PAGE_PRESENT | PAGE_USER;
+        if ((phdr[i].p_flags & PF_X) && (phdr[i].p_flags & PF_W)) {
+            page_flags |= PAGE_WRITE;            // single RWX PT_LOAD (on-device cc)
+        } else if (phdr[i].p_flags & PF_X) {
+            /* pure code: RX, no W, no NX */
+        } else {
+            page_flags |= PAGE_NX;
+            if (phdr[i].p_flags & PF_W) page_flags |= PAGE_WRITE;
+        }
+
+        uint64_t seg_off  = phdr[i].p_vaddr - vaddr_start;
+        uint64_t filesz   = phdr[i].p_filesz;
+        uint64_t file_end = seg_off + filesz;
+        uint64_t total    = num_pages * PAGE_SIZE;
+        const uint8_t* src = (const uint8_t*)elf_data + phdr[i].p_offset;
+
+        /* PHASE 1 -- allocate + map every page into target_cr3 (active_pml4 ==
+         * target). vmm_map_page splits the inherited huge identity page and
+         * installs the private frame, so call it unconditionally. */
+        for (uint64_t j = 0; j < num_pages; j++) {
+            uint64_t vaddr = vaddr_start + (j * PAGE_SIZE);
+            void* phys = pmm_alloc_page();
+            if (!phys) STAGE_FAIL(ELF_ERR_NOMEM);
+            vmm_map_page((void*)vaddr, phys, page_flags);
+        }
+
+        /* PHASE 2 -- populate via the identity map under the KERNEL master CR3
+         * (avoids the initrd source self-aliasing the load window). Resolve each
+         * frame via paging_get_pte (walks active_pml4 == target, a pure RAM read
+         * unaffected by the live CR3 switch). MUST keep the CR3 wrapper -- it is
+         * what makes the worker correct for any caller's live CR3. */
+        {
+            extern uint64_t paging_get_pte(uint64_t virt);
+            extern uint64_t paging_kernel_cr3(void);
+            uint64_t live_cr3 = read_cr3();
+            write_cr3(paging_kernel_cr3());
+            for (uint64_t j = 0; j < num_pages; j++) {
+                uint64_t vaddr = vaddr_start + (j * PAGE_SIZE);
+                uint64_t pte = paging_get_pte(vaddr);
+                if ((pte & 0x1) == 0 || (pte & (1ULL << 7))) {
+                    write_cr3(live_cr3);
+                    kprintf("[EXEC] PROTECT(stage): seg %d page %lu/%lu vaddr=%p not "
+                            "backed by a private frame (pte=0x%lx); failing load\n",
+                            i, j, num_pages, (void*)vaddr, pte);
+                    STAGE_FAIL(ELF_ERR_NOMEM);
+                }
+                uint8_t* dphys = (uint8_t*)(pte & 0x000FFFFFFFFFF000ULL);
+                uint64_t page_lo = j * PAGE_SIZE;
+                uint64_t page_hi = page_lo + PAGE_SIZE;
+                for (uint64_t off = page_lo; off < page_hi; ) {
+                    if (off < seg_off) {
+                        uint64_t end = seg_off < page_hi ? seg_off : page_hi;
+                        memset(dphys + (off - page_lo), 0, end - off);
+                        off = end;
+                    } else if (off < file_end) {
+                        uint64_t end = file_end < page_hi ? file_end : page_hi;
+                        memcpy(dphys + (off - page_lo), src + (off - seg_off), end - off);
+                        off = end;
+                    } else {
+                        memset(dphys + (off - page_lo), 0, page_hi - off);
+                        off = page_hi;
+                    }
+                }
+            }
+            write_cr3(live_cr3);
+        }
+
+        vma_t seg_vma = {
+            .vaddr    = vaddr_start,
+            .length   = total,
+            .perm     = VMA_R
+                      | ((phdr[i].p_flags & PF_W) ? VMA_W : 0)
+                      | ((phdr[i].p_flags & PF_X) ? VMA_X : 0),
+            .flags    = 0,
+            .backing  = VMA_FILE,
+            .file_ptr = elf_data,
+            .file_off = phdr[i].p_offset,
+            .file_sz  = filesz,
+            .next     = NULL,
+        };
+        if (vma_add_to_list(staged_vma_head, &seg_vma) != 0) STAGE_FAIL(ELF_ERR_NOMEM);
+
+        if (stg_n_loaded < EXEC_MAX_LOAD_SEGMENTS) {
+            stg_loaded[stg_n_loaded].start = vaddr_start;
+            stg_loaded[stg_n_loaded].end = vaddr_end;
+            stg_n_loaded++;
+        }
+    }
+
+    /* ---- user stack: eager top page, lazy-anon below (mirror of the loader) ---- */
+    uint64_t stack_bottom = USER_STACK_TOP - USER_STACK_SIZE;
+    void* stack_top_phys = NULL;
+    {
+        uint64_t top_page = USER_STACK_TOP - PAGE_SIZE;
+        void* phys_page = pmm_alloc_page();
+        if (!phys_page) STAGE_FAIL(ELF_ERR_NOMEM);
+        memset(PHYS_TO_DIRECT(phys_page), 0, PAGE_SIZE);
+        vmm_map_page((void*)top_page, phys_page,
+                     PAGE_PRESENT | PAGE_WRITE | PAGE_USER | PAGE_NX);
+        stack_top_phys = phys_page;
+    }
+
+    if (stack_bottom >= PAGE_SIZE) {
+        vma_t guard_vma = {
+            .vaddr = stack_bottom - PAGE_SIZE, .length = PAGE_SIZE, .perm = 0,
+            .flags = VMA_FLAG_GUARD, .backing = VMA_ANON,
+            .file_ptr = 0, .file_off = 0, .file_sz = 0, .next = NULL,
+        };
+        if (vma_add_to_list(staged_vma_head, &guard_vma) != 0) STAGE_FAIL(ELF_ERR_NOMEM);
+    }
+    {
+        vma_t stack_vma = {
+            .vaddr = stack_bottom, .length = USER_STACK_SIZE,
+            .perm = VMA_R | VMA_W, .flags = VMA_FLAG_GROWSDOWN, .backing = VMA_ANON,
+            .file_ptr = 0, .file_off = 0, .file_sz = 0, .next = NULL,
+        };
+        if (vma_add_to_list(staged_vma_head, &stack_vma) != 0) STAGE_FAIL(ELF_ERR_NOMEM);
+    }
+
+    /* ---- argv/envp frame: [argc][argv..][NULL][envp..][NULL] ---- */
+    uint64_t stack_ptr;
+    if (stack_top_phys) {
+        enum { STG_MAX_ARGS = 16, STG_MAX_ENVS = 16 };
+        uint64_t top    = USER_STACK_TOP;
+        uint64_t pbase  = (uint64_t)(uintptr_t)PHYS_TO_DIRECT(stack_top_phys);
+        uint64_t pfloor = top - PAGE_SIZE;
+        #define U2P(uva) ((char*)(uintptr_t)(pbase + ((uva) - pfloor)))
+
+        uint64_t argv_uva[STG_MAX_ARGS];
+        uint64_t envp_uva[STG_MAX_ENVS];
+        int argc = 0, envc = 0;
+        uint64_t cur = top;
+
+        /* argv[0] = name (the exec path). F10: reserve first; if it (plus the
+         * pointer-array headroom) cannot fit the top page, fail (-> -E2BIG/ENOMEM). */
+        {
+            uint64_t l = 0; while (name[l]) l++;
+            uint64_t u = (cur - (l + 1)) & ~0x7ULL;
+            if (u <= pfloor + 128) {
+                STAGE_FAIL(ELF_ERR_NOMEM);
+            }
+            for (uint64_t k = 0; k <= l; k++) U2P(u)[k] = name[k];
+            argv_uva[argc++] = u; cur = u;
+        }
+        /* argv[1..]: explicit vector (NUL-split) XOR legacy whitespace split. */
+        if (g_exec_spawn_argv_len > 0) {
+            const char* a = g_exec_spawn_argv;
+            int n = g_exec_spawn_argv_len, i = 0;
+            while (i < n && argc < STG_MAX_ARGS) {
+                int s = i;
+                while (i < n && a[i] != '\0') i++;
+                uint64_t l = (uint64_t)(i - s);
+                uint64_t u = (cur - (l + 1)) & ~0x7ULL;
+                if (u <= pfloor + (uint64_t)(argc + envc + 8) * 8) break;
+                for (uint64_t k = 0; k < l; k++) U2P(u)[k] = a[s + k];
+                U2P(u)[l] = '\0';
+                argv_uva[argc++] = u; cur = u;
+                i++;
+            }
+        } else {
+            const char* a = g_exec_spawn_args;
+            int i = 0;
+            while (a[i] && argc < STG_MAX_ARGS) {
+                while (a[i] == ' ' || a[i] == '\t') i++;
+                if (!a[i]) break;
+                int s = i;
+                while (a[i] && a[i] != ' ' && a[i] != '\t') i++;
+                uint64_t l = (uint64_t)(i - s);
+                uint64_t u = (cur - (l + 1)) & ~0x7ULL;
+                if (u <= pfloor + (uint64_t)(argc + envc + 8) * 8) break;
+                for (uint64_t k = 0; k < l; k++) U2P(u)[k] = a[s + k];
+                U2P(u)[l] = '\0';
+                argv_uva[argc++] = u; cur = u;
+            }
+        }
+        /* envp[0..]: NUL-separated "KEY=VALUE" from g_exec_spawn_envp. Trailing
+         * truncation is silent (matches the argv policy). */
+        if (g_exec_spawn_envp_len > 0) {
+            const char* e = g_exec_spawn_envp;
+            int n = g_exec_spawn_envp_len, i = 0;
+            while (i < n && envc < STG_MAX_ENVS) {
+                int s = i;
+                while (i < n && e[i] != '\0') i++;
+                uint64_t l = (uint64_t)(i - s);
+                uint64_t u = (cur - (l + 1)) & ~0x7ULL;
+                if (u <= pfloor + (uint64_t)(argc + envc + 8) * 8) break;
+                for (uint64_t k = 0; k < l; k++) U2P(u)[k] = e[s + k];
+                U2P(u)[l] = '\0';
+                envp_uva[envc++] = u; cur = u;
+                i++;
+            }
+        }
+        /* [argc][argv0..][NULL][envp0..][NULL], 16-aligned argc == initial RSP. */
+        uint64_t nwords = (uint64_t)(1 + argc + 1 + envc + 1);
+        uint64_t frame_uva = (cur - nwords * 8) & ~0xFULL;
+        if (frame_uva <= pfloor) {
+            STAGE_FAIL(ELF_ERR_NOMEM);
+        }
+        uint64_t* fr = (uint64_t*)U2P(frame_uva);
+        int w = 0;
+        fr[w++] = (uint64_t)argc;
+        for (int j = 0; j < argc; j++) fr[w++] = argv_uva[j];
+        fr[w++] = 0;                                    // argv terminator
+        for (int j = 0; j < envc; j++) fr[w++] = envp_uva[j];
+        fr[w++] = 0;                                    // envp terminator
+        stack_ptr = frame_uva;
+        #undef U2P
+    } else {
+        stack_ptr = (USER_STACK_TOP & ~0xFULL) - 16;    // fallback: empty frame
+    }
+
+    /* consume the staging globals unconditionally (both frame paths) so they
+     * never leak into a later spawn/exec. */
+    g_exec_spawn_args[0]  = '\0';
+    g_exec_spawn_argv_len = 0;
+    g_exec_spawn_envp_len = 0;
+
+    paging_set_target_raw(saved_target);                // restore exact target
+
+    *out_entry = ehdr->e_entry;
+    *out_rsp   = stack_ptr;
+    #undef STAGE_FAIL
+    return ELF_SUCCESS;
 }

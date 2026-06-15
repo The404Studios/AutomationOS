@@ -431,6 +431,20 @@ void paging_reset_target(void) {
     active_pml4 = kernel_pml4;
 }
 
+// EXECVE-INPLACE-0 (decision 9.1): save/restore the SOFTWARE mapping target
+// (active_pml4) around a transient stage-into-a-fresh-CR3 window. paging_get_target
+// returns the current target as a CR3-shaped value (PML4 physical base; active_pml4
+// is already stored masked), paging_set_target_raw restores it verbatim. This
+// hardens over a blind paging_reset_target()-to-kernel: it restores EXACTLY the
+// caller's prior target, not "whatever the kernel master is".
+uint64_t paging_get_target(void) {
+    return (uint64_t)active_pml4;
+}
+
+void paging_set_target_raw(uint64_t pml4_phys) {
+    active_pml4 = (page_table_t*)(pml4_phys & 0x000FFFFFFFFFF000ULL);
+}
+
 // ---------------------------------------------------------------------------
 // PAGINGALIAS coherence self-test (#20). Proves the direct map is STRUCTURALLY
 // INDEPENDENT of the splittable identity -- the invariant the fix establishes.

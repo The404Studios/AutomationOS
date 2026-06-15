@@ -25,7 +25,11 @@ void start_usermode(uint64_t entry, uint64_t stack);
 
 // Assembly function: enter user mode via IRETQ (defined in usermode.asm)
 // RDI = entry point, RSI = user stack pointer, RDX = process CR3
-extern void enter_usermode(uint64_t entry, uint64_t stack, uint64_t cr3);
+// EXECVE-INPLACE-0 (decision 9.5): noreturn -- enter_usermode zeroes the GP regs,
+// loads CR3, and IRETQs to ring 3; it never returns. Marking it lets GCC treat
+// sys_execve's commit tail-call as terminal (no fall-through codegen / warning).
+extern void enter_usermode(uint64_t entry, uint64_t stack, uint64_t cr3)
+    __attribute__((noreturn));
 
 // Get current privilege level (0 = kernel, 3 = user)
 uint8_t get_cpl(void);

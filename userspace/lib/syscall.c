@@ -42,8 +42,13 @@ long sys_fork(void) {
     return syscall(SYS_FORK, 0, 0, 0, 0, 0, 0);
 }
 
+long sys_execve(const char* path, char* const argv[], char* const envp[]) {
+    return syscall(SYS_EXECVE, (long)path, (long)argv, (long)envp, 0, 0, 0);
+}
+
+/* Back-compat 2-arg shim: legacy callers that pass no environment. */
 long sys_exec(const char* path, char* const argv[]) {
-    return syscall(SYS_EXECVE, (long)path, (long)argv, 0, 0, 0, 0);
+    return sys_execve(path, argv, 0);
 }
 
 long sys_wait(int* status) {

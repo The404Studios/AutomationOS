@@ -218,6 +218,15 @@ void _start(void) {
     // parent callee-saved registers intact. Prints FORKREGTEST RESULT.
     print("[INIT] Spawning forkregtest...\n");
     spawn("sbin/forkregtest");
+
+    // EXECVE-INPLACE-0 probe: exectest forks + execve("sbin/execchild") (same
+    // PID, fresh argv/envp), proves no stray 3rd process + a failed execve leaves
+    // the caller alive. Prints EXECTEST RESULT. NOTE: spawn ONLY exectest --
+    // execchild must be reached EXCLUSIVELY via execve (a direct spawn would make
+    // the C3 "no stray 3rd process" baseline non-zero).
+    print("[INIT] Spawning exectest...\n");
+    spawn("sbin/exectest");
+
     // real-threads probe: spawns 4 threads that SHARE this process's address
     // space but have independent stacks + FPU state, joins them, and prints
     // THREADTEST: PASS/FAIL. Proves shared memory, independent stacks, and

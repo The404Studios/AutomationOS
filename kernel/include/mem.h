@@ -139,6 +139,13 @@ void paging_set_target(uint64_t cr3);
 /* Reset mapping target to kernel PML4 */
 void paging_reset_target(void);
 
+/* EXECVE-INPLACE-0 (decision 9.1): get/set the raw active mapping target
+ * (active_pml4) as a CR3-shaped value (PML4 base; PCID/flag bits masked off), so
+ * a transient stage-into-fresh-CR3 window can save and restore the caller's exact
+ * target instead of blind-resetting to the kernel master. */
+uint64_t paging_get_target(void);
+void     paging_set_target_raw(uint64_t pml4_phys);
+
 /*
  * Map a contiguous SHARED physical range [paddr, paddr+size) at vaddr into the
  * address space `cr3` (e.g. framebuffer MMIO, shm segments). Saves/restores the

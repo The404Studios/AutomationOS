@@ -882,4 +882,15 @@ process_t* exec_create_process(const char* path, const char* name,
                                 int argc, char** argv);
 int exec_launch_init(void);
 
+// EXECVE-INPLACE-0: PCB-free ELF stager (kernel/fs/exec.c). Loads `elf_data` into
+// the already-created `target_cr3` (the caller pointed the mapping target at it
+// via paging_set_target), records VMAs onto a DETACHED list (*staged_vma_head),
+// and returns {entry, rsp}. Creates no process, frees nothing on success; on
+// failure frees only the detached list and returns a negative ELF_ERR_*. Reads
+// g_exec_spawn_argv/_args/_envp for argv[1..]/envp. The live CR3 on entry must be
+// the kernel master (the worker also re-asserts it around the populate window).
+int elf_stage_into_cr3(void* elf_data, size_t elf_size, const char* argv0_name,
+                       uint64_t target_cr3, struct vma** staged_vma_head,
+                       uint64_t* out_entry, uint64_t* out_rsp);
+
 #endif

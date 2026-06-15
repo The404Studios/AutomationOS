@@ -3,6 +3,7 @@
 #include "../../include/sched.h"
 #include "../../include/mem.h"
 #include "../../include/vma.h"     /* vma_t / vma_add — fork VMA inheritance */
+#include "../../include/elf.h"     /* ELF_SUCCESS / ELF_ERR_* — EXECVE-INPLACE-0 */
 #include "../../include/kref.h"
 #include "../../include/drivers.h"
 #include "../../include/vfs.h"
@@ -1052,13 +1053,254 @@ int64_t sys_read_event(uint64_t arg1, uint64_t arg2, uint64_t arg3,
     return (int64_t)(unsigned char)c;
 }
 
-// SYS_EXECVE - Execute program (replaces current process)
-// Minimal implementation: spawns new process, exits current
+// ===========================================================================
+// SYS_EXECVE - real in-place image replacement (EXECVE-INPLACE-0).
+// ===========================================================================
+// STAGE-BEFORE-DESTROY: build the new image into a FRESH CR3, and only on full
+// success transplant it onto `current` + switch CR3 (the single irreversible
+// instant) + free the OLD address space + IRETQ to the new entry. Every failure
+// is PRE-commit and leaves `current` byte-identical + runnable. sys_spawn is
+// untouched (still the new-process path). errno values are NEGATIVE.
+// See docs/dev-memory/bricks/EXECVE-INPLACE-0.md (§3/§4/§5).
+
+/* exec staging globals owned by exec.c. */
+extern char g_exec_spawn_args[256];
+extern char g_exec_spawn_argv[256];
+extern int  g_exec_spawn_argv_len;
+extern char g_exec_spawn_envp[256];
+extern int  g_exec_spawn_envp_len;
+
+/* Reset every exec staging channel so a prior aborted exec/spawn cannot leak
+ * argv/envp into this one. Called at entry + on every failure path. */
+static void clear_exec_staging(void) {
+    g_exec_spawn_args[0]  = '\0';
+    g_exec_spawn_argv[0]  = '\0';
+    g_exec_spawn_argv_len = 0;
+    g_exec_spawn_envp[0]  = '\0';
+    g_exec_spawn_envp_len = 0;
+}
+
+/* Copy argv[1..] from the user vector into g_exec_spawn_argv as NUL-separated
+ * entries (argv[0] is the path, handled as argv0_name -> skipped here). NULL argv
+ * => no extra args. Returns 0 ok / EFAULT on a bad pointer. Trailing truncation
+ * (256B buffer / 16 entries) is silent, matching spawn. */
+static int stage_argv_from_user(uint64_t uargv) {
+    g_exec_spawn_argv[0]  = '\0';
+    g_exec_spawn_argv_len = 0;
+    if (!uargv) return ESUCCESS;
+    int out = 0;
+    for (int i = 1; i < 16; i++) {            // skip argv[0]
+        uint64_t sp = 0;
+        if (copy_from_user(&sp, (const void*)(uargv + (uint64_t)i * 8),
+                           sizeof(sp)) != COPY_SUCCESS) {
+            return EFAULT;
+        }
+        if (sp == 0) break;                   // NULL terminator
+        char tmp[128];
+        if (copy_from_user(tmp, (const void*)sp, sizeof(tmp) - 1) != COPY_SUCCESS) {
+            return EFAULT;
+        }
+        tmp[127] = '\0';
+        int l = 0; while (tmp[l]) l++;
+        if (out + l + 1 > (int)sizeof(g_exec_spawn_argv)) break;
+        for (int k = 0; k < l; k++) g_exec_spawn_argv[out++] = tmp[k];
+        g_exec_spawn_argv[out++] = '\0';
+    }
+    g_exec_spawn_argv_len = out;
+    return ESUCCESS;
+}
+
+/* Copy envp[..] "KEY=VALUE" entries into g_exec_spawn_envp (NUL-separated). NULL
+ * envp => empty environment. Returns 0 ok / EFAULT on a bad pointer. */
+static int stage_envp_from_user(uint64_t uenvp) {
+    g_exec_spawn_envp[0]  = '\0';
+    g_exec_spawn_envp_len = 0;
+    if (!uenvp) return ESUCCESS;
+    int out = 0;
+    for (int i = 0; i < 16; i++) {
+        uint64_t sp = 0;
+        if (copy_from_user(&sp, (const void*)(uenvp + (uint64_t)i * 8),
+                           sizeof(sp)) != COPY_SUCCESS) {
+            return EFAULT;
+        }
+        if (sp == 0) break;
+        char tmp[128];
+        if (copy_from_user(tmp, (const void*)sp, sizeof(tmp) - 1) != COPY_SUCCESS) {
+            return EFAULT;
+        }
+        tmp[127] = '\0';
+        int l = 0; while (tmp[l]) l++;
+        if (out + l + 1 > (int)sizeof(g_exec_spawn_envp)) break;
+        for (int k = 0; k < l; k++) g_exec_spawn_envp[out++] = tmp[k];
+        g_exec_spawn_envp[out++] = '\0';
+    }
+    g_exec_spawn_envp_len = out;
+    return ESUCCESS;
+}
+
+/* execve resets catchable signal DISPOSITIONS to SIG_DFL + clears the restorer
+ * (POSIX), but KEEPS the blocked mask and pending set. */
+static void exec_reset_signal_dispositions(process_t* cur) {
+    for (int s = 0; s < 32; s++) cur->sig_handlers[s] = 0;  // 0 == SIG_DFL
+    cur->sig_restorer = 0;
+    // sig_mask + sig_pending preserved deliberately.
+}
+
 int64_t sys_execve(uint64_t path, uint64_t argv, uint64_t envp,
                    uint64_t arg4, uint64_t arg5, uint64_t arg6) {
-    (void)argv; (void)envp; (void)arg4; (void)arg5; (void)arg6;
+    (void)arg4; (void)arg5; (void)arg6;
+
+    extern void* initrd_get_file(const char* path, uint64_t* size_out);
+    extern uint64_t paging_kernel_cr3(void);
+    extern uint64_t paging_create_address_space(void);
+    extern void     paging_destroy_address_space(uint64_t cr3);
+    extern uint64_t paging_get_target(void);
+    extern void     paging_set_target(uint64_t cr3);
+    extern void     paging_set_target_raw(uint64_t pml4_phys);
+    extern void     vmm_as_release(uint64_t cr3);
+    extern void     vma_free_list(struct vma* head);
+    extern void     enter_usermode(uint64_t entry, uint64_t stack, uint64_t cr3)
+                        __attribute__((noreturn));
+    extern uint64_t kernel_rsp_save;
+
+    process_t* cur = process_get_current();
+    if (!cur)  return ESRCH;
     if (!path) return EFAULT;
-    return sys_spawn(path, 0, 0, 0, 0, 0);
+
+    // A0 (fail-closed): only the SOLE user of this address space may exec. A NULL
+    // as_refcount is pathological (a half-built PCB) -> refuse rather than guess.
+    if (!cur->as_refcount ||
+        __atomic_load_n(cur->as_refcount, __ATOMIC_SEQ_CST) != 1) {
+        return EINVAL;
+    }
+
+    clear_exec_staging();
+
+    // ---- PHASE A: copy-in under the CALLER's CR3 (all user reads here) ----
+    char kpath[128];
+    if (copy_from_user(kpath, (const void*)path, sizeof(kpath) - 1) != COPY_SUCCESS) {
+        clear_exec_staging();
+        return EFAULT;
+    }
+    kpath[127] = '\0';
+    const char* argv0_name = kpath;
+
+    int rc;
+    if ((rc = stage_argv_from_user(argv)) < 0) { clear_exec_staging(); return rc; }
+    if ((rc = stage_envp_from_user(envp)) < 0) { clear_exec_staging(); return rc; }
+
+    // ---- PHASE B: read+validate the ELF under the KERNEL CR3 (dodge the initrd
+    // identity-shadow the caller's process CR3 imposes on the load window) ----
+    uint64_t caller_cr3 = read_cr3();
+    write_cr3(paging_kernel_cr3());
+
+    uint64_t elf_size = 0;
+    void* elf_data = initrd_get_file(kpath, &elf_size);
+    void* heapbuf  = 0;                         // VFS-fallback buffer, freed pre-commit
+    if (!elf_data || elf_size == 0) {
+        elf_data = 0;
+        vfs_stat_t st;
+        if (vfs_stat(kpath, &st) == 0 && st.st_size > 0 &&
+            st.st_size < (16ULL * 1024 * 1024)) {
+            size_t sz = (size_t)st.st_size;
+            void* buf = kmalloc(sz);
+            if (buf) {
+                int vfd = vfs_open(kpath, 0 /* O_RDONLY */, 0);
+                if (vfd >= 0) {
+                    size_t got = 0; ssize_t n;
+                    while (got < sz &&
+                           (n = vfs_read(vfd, (char*)buf + got, sz - got)) > 0) {
+                        got += (size_t)n;
+                    }
+                    vfs_close(vfd);
+                    if (got > 0) { elf_data = buf; elf_size = got; heapbuf = buf; }
+                    else { kfree(buf); }
+                } else {
+                    kfree(buf);
+                }
+            }
+        }
+    }
+    if (!elf_data) {
+        write_cr3(caller_cr3);                  // R1-F9: restore caller CR3
+        clear_exec_staging();
+        return ENOENT;
+    }
+
+    // ---- PHASE C: STAGE into a FRESH CR3 (the OLD image stays untouched) ----
+    uint64_t new_cr3 = paging_create_address_space();
+    if (!new_cr3) {
+        if (heapbuf) kfree(heapbuf);
+        write_cr3(caller_cr3);
+        clear_exec_staging();
+        return ENOMEM;
+    }
+
+    // Stage. The worker pins/restores the mapping target internally; the live CR3
+    // stays the kernel master throughout (PHASE B switched to it).
+    vma_t*   staged_vma = 0;
+    uint64_t new_entry = 0, new_rsp = 0;
+    rc = elf_stage_into_cr3(elf_data, elf_size, argv0_name, new_cr3,
+                            &staged_vma, &new_entry, &new_rsp);
+
+    if (heapbuf) kfree(heapbuf);               // free the ELF SOURCE before commit
+
+    if (rc != ELF_SUCCESS) {
+        vma_free_list(staged_vma);             // value form; worker already nulled it
+        staged_vma = 0;
+        write_cr3(caller_cr3);                 // old image still RUNNABLE (R1-F9)
+        if (read_cr3() != caller_cr3) {
+            kernel_panic("sys_execve: failed to restore caller CR3 on abort");
+        }
+        vmm_as_release(new_cr3);               // INV-8 order for the failed AS
+        paging_destroy_address_space(new_cr3);
+        clear_exec_staging();
+        return (rc == ELF_ERR_NOMEM) ? ENOMEM : ENOEXEC;
+    }
+
+    // SHM detach is AS-independent (operates on proc->shm_attachments + the kernel
+    // id_table) and is the last heavyweight, lock-taking, heap-touching op. Do it
+    // PRE-commit so the cli window holds only field-stores + the swap + infallible
+    // teardown (review A1: the plan wrongly placed it inside the window).
+    shm_cleanup_process(cur);
+
+    // ===================== POINT OF NO RETURN =====================
+    __asm__ volatile("cli");
+    uint64_t old_cr3 = cur->context.cr3;
+    vma_t*   old_vma = cur->vma_list;
+
+    cur->context.cr3 = new_cr3;                // <-- irreversible
+    cur->vma_list    = staged_vma;
+    cur->user_entry  = new_entry;
+    cur->user_rsp    = new_rsp;
+
+    exec_reset_signal_dispositions(cur);       // SIG_DFL + clear restorer; keep mask
+
+    strncpy(cur->name, kpath, sizeof(cur->name) - 1);
+    cur->name[sizeof(cur->name) - 1] = '\0';
+    // as_refcount cell UNCHANGED (still ==1, now owns new_cr3): no leak/double-free.
+
+    uint64_t kstop = ((uint64_t)cur->kernel_stack + KERNEL_STACK_SIZE) & ~0xFULL;
+    tss_set_kernel_stack(kstop);               // sets TSS.RSP0 + kernel_rsp_save_arr[cpu]
+    kernel_rsp_save = kstop;                    // legacy global parity
+
+    // PCID-masked write_cr3 => FULL non-global flush (R2-1); the old identity is
+    // unshadowed BEFORE we walk it for destroy (INV-9).
+    write_cr3(new_cr3 & ~0xFFFULL);
+
+    vma_free_list(old_vma);                    // value form: free old VMA descriptors
+    vmm_as_release(old_cr3);                    // INV-8: release cursor slot, then
+    paging_destroy_address_space(old_cr3);     //        destroy (walks under new CR3)
+
+#ifdef SMP_BKL
+    // SYS_EXECVE is BKL-marked (bkl.c); the success path never returns to the
+    // dispatcher's bkl_release (syscall.c) -- release here or the next marked
+    // syscall deadlocks. (No-op on the default non-SMP build.)
+    { extern void bkl_release(void); bkl_release(); }
+#endif
+
+    enter_usermode(new_entry, new_rsp, new_cr3 & ~0xFFFULL);   // NEVER returns
+    __builtin_unreachable();
 }
 
 // SYS_WAITPID - Wait for child process to change state

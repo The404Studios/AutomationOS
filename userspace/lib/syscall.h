@@ -34,6 +34,7 @@ long sys_open(const char* path, int flags);
 long sys_close(int fd);
 void sys_exit(int code) __attribute__((noreturn));
 long sys_fork(void);
+long sys_execve(const char* path, char* const argv[], char* const envp[]);
 long sys_exec(const char* path, char* const argv[]);
 long sys_wait(int* status);
 long sys_getpid(void);

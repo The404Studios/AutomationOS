@@ -731,7 +731,19 @@ int copy_to_user(void* user_dst, const void* kernel_src, size_t n) {
     // writable before the memcpy, so a read-only or unmapped destination
     // cannot #PF the kernel in ring 0.
     if (!user_range_is_accessible(dst_addr, n, true)) {
-        return COPY_EFAULT;
+        // The writability check failed. The dominant benign cause is a
+        // copy-on-write page: a freshly-forked process whose target buffer is
+        // still the shared, read-only parent page (e.g. waitpid status, a
+        // poll()/select() fd set, a signal frame). A userspace store there would
+        // trap and the #PF handler would give it a private copy; do the same here
+        // so kernel-side writes don't spuriously EFAULT. cow_handle_write is a
+        // no-op on non-CoW / already-writable pages, so this only acts on the
+        // genuine CoW case; a truly read-only or unmapped page still fails below.
+        uint64_t pg, lo = dst_addr & ~0xFFFULL, hi = (dst_addr + n - 1) & ~0xFFFULL;
+        for (pg = lo; pg <= hi; pg += 0x1000) cow_handle_write(pg);
+        if (!user_range_is_accessible(dst_addr, n, true)) {
+            return COPY_EFAULT;
+        }
     }
 
     // Fast-path bulk copy (see copy_from_user comment above).

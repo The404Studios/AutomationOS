@@ -501,6 +501,50 @@ void sleep_list_remove(process_t* proc) {
 // BLOCKED sleepers: a process a signal already re-readied (and removed via
 // sleep_list_remove) is gone from this list, but the BLOCKED guard is kept as
 // defense in depth so a stray non-blocked node can never be doubly re-added.
+// =============================================================================
+// SCHED-INSTRUMENT-0 — measure the RESUME_CRETURN reject churn + wakeup latency
+// under PREEMPT, to decide (data-first) whether the IRQ-path fairness handoff is
+// worth modifying the highest-risk IRQ tail. COUNTERS ONLY — no scheduling change.
+//   g_irq_resume_rejects : the IRQ picked a RESUME_CRETURN successor it could not
+//                          iretq into and re-queued it (the latency/"starvation" path).
+//   g_irq_resume_dispatch: the IRQ productively dispatched a RESUME_IRETQ successor.
+//   g_wakeups_dispatched : a task that BLOCKED in sleep/wait/futex/poll finally got
+//                          the CPU; g_wake_latency_* is its ready->run delay (ticks=ms).
+// =============================================================================
+// PREEMPTIVE-gated: the ONLY readers (the g_irq_*++ sites + the [SCHEDSTAT] print)
+// live inside schedule_from_irq(), which is itself PREEMPTIVE-only, so the
+// cooperative default build emits NONE of this block. The file's ASSERT_ALWAYS
+// sites all sit ABOVE here (lines ~312-336), so gating introduces no __LINE__
+// shift -> cooperative scheduler.o stays byte-identical (law 19).
+#ifdef PREEMPTIVE
+volatile uint64_t g_irq_resume_rejects  = 0;
+volatile uint64_t g_irq_creturn_dispatch= 0;  // with the fix: IRQ dispatched a RESUME_CRETURN task (was a reject)
+volatile uint64_t g_irq_resume_dispatch = 0;
+volatile uint64_t g_wakeups_dispatched  = 0;
+volatile uint64_t g_wake_latency_sum    = 0;
+volatile uint64_t g_wake_latency_max    = 0;
+volatile uint64_t g_wake_count          = 0;
+
+// Stamp the tick a blocked task became runnable (keep the FIRST stamp until it is
+// dispatched, so latency spans the whole ready->run delay even across reject churn).
+void sched_instr_wake(struct process* p) {
+    extern uint64_t timer_get_ticks(void);
+    if (p && p->wake_tick == 0) p->wake_tick = timer_get_ticks();
+}
+// Called from process_set_current (the single dispatch chokepoint): if this task
+// was a pending wake, record its ready->run latency and clear the stamp.
+void sched_instr_dispatch(struct process* p) {
+    extern uint64_t timer_get_ticks(void);
+    if (!p || p->wake_tick == 0) return;
+    uint64_t lat = timer_get_ticks() - p->wake_tick;
+    p->wake_tick = 0;
+    g_wakeups_dispatched++;
+    g_wake_count++;
+    g_wake_latency_sum += lat;
+    if (lat > g_wake_latency_max) g_wake_latency_max = lat;
+}
+#endif // PREEMPTIVE (SCHED-INSTRUMENT-0 counters + helpers)
+
 void sleep_list_wake_due(uint64_t now) {
     uint64_t flags = save_flags_cli();
     process_t** link = &g_sleep_list;
@@ -514,6 +558,9 @@ void sleep_list_wake_due(uint64_t now) {
             it->sleep_next = NULL;
             if (it->state == PROCESS_BLOCKED) {
                 process_set_ready(it);
+#ifdef PREEMPTIVE
+                sched_instr_wake(it);   // SCHED-INSTRUMENT-0: stamp ready tick
+#endif
                 scheduler_add_process(it);
             }
             // *link now points at the successor; do NOT advance link.
@@ -939,6 +986,19 @@ uint32_t scheduler_submit_task(process_t* p) {
         }
     }
 
+#ifdef SMP_THREAD_INHERIT
+    // SMP-THREAD-INHERIT-0: the LEADER's placement IS the address space's home
+    // CPU. Record it so threads created later inherit + pin to this exact CPU
+    // (one mm, one execution CPU). Only the AS leader (is_thread==0) sets the
+    // home -- a thread's own submit must never move the mm out from under its
+    // siblings. Threads do not pass through here anyway (they use
+    // scheduler_add_process), but the guard makes the invariant explicit.
+    if (p->mm_place && !p->is_thread) {
+        p->mm_place->home_cpu    = target;
+        p->mm_place->sched_class = (uint32_t)p->sched.sched_class;
+    }
+#endif
+
     scheduler_add_process_to_cpu(p, target);
     return target;
 }
@@ -1103,6 +1163,50 @@ void scheduler_batchclass_selftest(void) {
             pinned_rt_cpu1, illegal_clamped);
 }
 #endif /* SMP_BATCH */
+
+#ifdef SMP_THREAD_INHERIT
+// SMP-THREAD-INHERIT-0 selftest: exercise the PRODUCTION inheritance predicate
+// (sched_thread_inherit_placement, the SAME function thread_create uses)
+// directly -- the boot queues never hold a BATCH-on-CPU1 threaded shape early
+// enough to be a non-vacuous proof, so we test the predicate on synthetic
+// shells (the affinity/choosecpu-selftest pattern). The two cases that matter:
+//   A. a BATCH address space placed on CPU1 (the matmuljobs shape): its thread
+//      MUST inherit allowed_cpus = CPU1-only + pinned_cpu = 1 + class BATCH
+//      (== one mm, one CPU; == the mechanism matmuljobs needs == ready).
+//   B. a NORMAL address space (home CPU0): its thread stays CPU0 (no regression
+//      for the desktop -- threads keep landing on CPU0).
+// process_t is too big for the stack -> static shells (zero-init by storage).
+void threadinherit_selftest(void) {
+    static process_t pa;          /* synthetic parent (AS leader) */
+    static process_t ch;          /* synthetic child thread       */
+    static mm_placement_t mp;     /* the parent's mm placement     */
+
+    /* case A: BATCH mm placed on CPU1 */
+    mp.home_cpu = 1; mp.ran_on_cpus = 0; mp.sched_class = (uint32_t)SCHED_CLASS_BATCH;
+    pa.mm_place = &mp;
+    sched_thread_inherit_placement(&pa, &ch);
+    int inherit_home  = (ch.pinned_cpu == 1) && (ch.allowed_cpus == (1ULL << 1));
+    int no_widen      = (ch.allowed_cpus == (1ULL << 1));   /* exactly CPU1, no extra bits */
+    int class_inherit = (ch.sched.sched_class == SCHED_CLASS_BATCH);
+
+    /* case B: NORMAL mm at home CPU0 -> thread stays CPU0 */
+    mp.home_cpu = 0; mp.sched_class = (uint32_t)SCHED_CLASS_NORMAL;
+    sched_thread_inherit_placement(&pa, &ch);
+    int normal_home = (ch.pinned_cpu == 0) && (ch.allowed_cpus == (1ULL << 0)) &&
+                      (ch.sched.sched_class == SCHED_CLASS_NORMAL);
+
+    /* matmuljobs_ready == the BATCH-CPU1 inherit mechanism is proven correct;
+     * the brick deliberately does NOT route matmuljobs (that is the next brick,
+     * SMP-MATMUL-BATCH-0). Readiness is the predicate, not the routing. */
+    int matmuljobs_ready = inherit_home && class_inherit;
+
+    int pass = inherit_home && no_widen && class_inherit && normal_home;
+    kprintf("THREADINHERIT-CORE: %s inherit_home=%d no_widen=%d class_inherit=%d "
+            "normal_home=%d matmuljobs_ready=%d\n",
+            pass ? "PASS" : "FAIL", inherit_home, no_widen, class_inherit,
+            normal_home, matmuljobs_ready);
+}
+#endif /* SMP_THREAD_INHERIT */
 #endif /* SMP_SCHED && SMP_SCHED_DISPATCH */
 
 // F3-5: HOME-ROUTED wake enqueue. Wake-side code (waitqueue signal/timer) used
@@ -1273,6 +1377,16 @@ void ap_cooperative_schedule(void) {
     // there sits ABOVE the file's ASSERT_ALWAYS lines and the __LINE__ shift
     // breaks default-build byte-identity (the law-2 discipline).
     next->ran_on_cpus |= (1u << cpu_id());
+#ifdef SMP_THREAD_INHERIT
+    // SMP-THREAD-INHERIT-0: fold CPU1's dispatch into the SHARED mm accumulator
+    // (popcount>1 across the leader + threads == one address space on >1 CPU).
+    // ATOMIC (locked OR): this shared cross-CPU DETECTOR must not lose a bit to
+    // a torn read-modify-write -- the very concurrency it catches would also
+    // corrupt a plain |=. See process_set_current for the full rationale.
+    if (next->mm_place)
+        __atomic_fetch_or(&next->mm_place->ran_on_cpus,
+                          (1u << cpu_id()), __ATOMIC_SEQ_CST);
+#endif
 #endif
     if (next != cpu->idle_thread) next->state = PROCESS_RUNNING;
 
@@ -2842,6 +2956,28 @@ void schedule_from_irq(interrupt_frame_t* frame) {
     extern uint64_t timer_get_ticks(void);
     sleep_list_wake_due(timer_get_ticks());
 
+#ifdef SCHED_DEBUG
+    // SCHED-INSTRUMENT-0: dump the reject/dispatch + wakeup-latency counters to
+    // serial every ~5 s. GATED behind SCHED_DEBUG so the default/perf build (incl.
+    // the eventual PREEMPT default) stays quiet; the counters themselves always
+    // increment (cheap), so they remain readable via a debugger/probe regardless.
+    {
+        static uint64_t last_stat = 0;
+        uint64_t t = timer_get_ticks();
+        if (t - last_stat >= 5000) {
+            last_stat = t;
+            uint64_t avg = g_wake_count ? (g_wake_latency_sum / g_wake_count) : 0;
+            kprintf("[SCHEDSTAT] t=%lu irq_rejects=%lu creturn_disp=%lu irq_dispatch=%lu "
+                    "wakeups=%lu wake_lat_max=%lu avg=%lu (ticks==ms)\n",
+                    (unsigned long)t, (unsigned long)g_irq_resume_rejects,
+                    (unsigned long)g_irq_creturn_dispatch,
+                    (unsigned long)g_irq_resume_dispatch,
+                    (unsigned long)g_wakeups_dispatched,
+                    (unsigned long)g_wake_latency_max, (unsigned long)avg);
+        }
+    }
+#endif
+
     process_t* current = process_get_current();
     if (current == NULL) {
         return;  // Nothing running yet; leave frame untouched.
@@ -3047,23 +3183,58 @@ void schedule_from_irq(interrupt_frame_t* frame) {
     }
 
     if (next->resume_mode != RESUME_IRETQ) {
-        // The incoming process is RESUME_CRETURN (kernel thread or yielded user
-        // process). We cannot resume it from the IRQ path (iretq can't jump to
-        // kernel code). Re-queue it and continue current... but if current is
-        // TERMINATED, we have a problem: we can't continue a dead process, and we
-        // can't switch to the kernel thread from here. This should only happen if
-        // the idle thread was picked (all user processes terminated), which means
-        // the system is shutting down. Panic rather than resuming a dead process.
-        if (current->state == PROCESS_TERMINATED) {
-            kernel_panic("schedule_from_irq: Cannot switch to kernel thread from "
-                         "IRQ when current is terminated (system shutting down?)");
+        // SCHED-FAIRNESS-0 (data-justified by SCHED-INSTRUMENT-0: ~80 rejects/s,
+        // wake-latency avg 1.67s / max 3.5s under heavy non-cooperative load).
+        // `next` is RESUME_CRETURN: a kernel thread (incl. idle), a task that
+        // BLOCKED in a syscall and was re-readied by a waker, or a just-SYS_YIELDed
+        // task — its saved context.rip is a KERNEL continuation, so we cannot iretq
+        // into it. (Brand-new never-run tasks, context.rip == trampoline, were
+        // already handled by the FIRST-DISPATCH block above, so this only sees valid
+        // kernel continuations.) The OLD code re-queued `next` and resumed the
+        // burner, starving woken tasks for seconds. FIX: HAND the CPU to `next` via
+        // a cooperative (kernel-continuation) switch from the IRQ.
+        //
+        // Save the interrupted ring-3 `current` as RESUME_IRETQ (the step-5 path:
+        // context_save_irq + re-enqueue + drop running ref; for a TERMINATED current
+        // just drop the ref), then cooperative_switch_to(NULL, next). from=NULL is
+        // ESSENTIAL: `current` is ALREADY iretq-saved (incl. its FPU via
+        // context_save_irq's fxsave64), so the cooperative path must NOT save a
+        // bogus kernel-continuation "from" over it (context_switch_asm honors
+        // from==NULL by skipping the save). `next` is RESUME_CRETURN, so
+        // cooperative_switch_to routes to context_switch (the `ret` path) and NEVER
+        // returns. The abandoned irq0_preempt frame on current's kernel stack is
+        // harmless (current resumes from its saved RESUME_IRETQ context; its stack
+        // is reset from TSS.RSP0 on its next entry). The PIC EOI was already sent at
+        // the top of this function, so switching away loses no tick.
+        // Designed + adversarially verified by a 10-agent workflow (4/4 SAFE).
+        g_irq_creturn_dispatch++;      // SCHED-INSTRUMENT-0: this used to be a reject
+        if (current->state != PROCESS_TERMINATED) {
+            context_save_irq(&current->context, frame);
+            current->resume_mode = RESUME_IRETQ;
+            current->need_resched = 0;
+            current->total_time++;
+            scheduler_add_process(current);   // re-queue (takes a fresh ref)
+            process_unref(current);           // drop the old running ref (queue holds one)
+        } else {
+            // TERMINATED current whose only successor is a kernel continuation
+            // (typically idle: all user processes exited). The OLD code PANICKED;
+            // instead hand off cooperatively with NO current-save (from=NULL): a
+            // dead process must never re-enter the ready queue. Drop its running
+            // ref; the creation ref keeps ref_count >= 1 so this can't free it here.
+            process_unref(current);
         }
-        scheduler_add_process(next);   // re-queue (takes a fresh ref)
-        process_unref(next);           // release pick_next's transferred ref
-        current->time_slice = priority_time_slice(current->priority);
-        current->need_resched = 0;
-        current->state = PROCESS_RUNNING;
-        return;  // frame untouched
+
+        next->state = PROCESS_RUNNING;
+        process_set_current(next);
+
+        // Cooperatively resume `next`. from=NULL (current already iretq-saved or
+        // dead). RESUME_CRETURN here -> routes to context_switch (sets next's
+        // TSS.RSP0 + kernel stack, switches CR3, fxrstor's next's FPU, then `ret`s
+        // into next's kernel continuation). DOES NOT RETURN.
+        cooperative_switch_to(NULL, next);
+
+        // Unreachable: cooperative_switch_to switched stacks into `next`.
+        kernel_panic("schedule_from_irq: cooperative_switch_to returned (reject)");
     }
 
     // 5) Save the OUTGOING process (unless it terminated — nothing to preserve).
@@ -3109,6 +3280,7 @@ void schedule_from_irq(interrupt_frame_t* frame) {
     // while context_load_irq's reads of next->context are on the current map.
     // next->context and the on-stack frame are both in identity-mapped kernel
     // memory shared across all address spaces, so they stay valid after CR3.
+    g_irq_resume_dispatch++;   // SCHED-INSTRUMENT-0: IRQ productively dispatched a RESUME_IRETQ task
     context_load_irq(&next->context, frame);
 
     // Switch address space last. PCID bit-63 preserve mirrors context_switch_asm.

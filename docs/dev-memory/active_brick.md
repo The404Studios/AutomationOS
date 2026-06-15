@@ -2,14 +2,85 @@
 
 > Warm memory. Refresh per checkpoint. One active brick at a time.
 
-## DESKTOP-SPLIT-0 — OPEN (branch `brick/desktop-split-0`, off frozen `brick/smp-runmask-0`) — the desktop starts leaning on both CPUs
-- **user-set scope (narrow):** compositor/input/shell stay CPU0 · a BATCH/app ALLOWLIST may run
-  CPU1 · the RUNMASK audit must stay green · TLBSHOOT_NEG must stay green · the BKL storm must
-  stay green · desktop FPS >= baseline · a 30-minute soak: 0 panic, 0 invariant.
-- **the inherited safety net (why this is now possible):** typed BATCH routing (F3-7) + the BKL
-  wall (H1) + the execution-reality audit (RUNMASK-0, law 18) + kernel-range shootdown (G2) +
-  IPI wake (G1). Every wall was built for exactly this brick.
-- **status:** OPEN — awaiting the user's go for implementation.
+## SMP-THREAD-INHERIT-0 — OPEN (the parked follow-up, user-set after the DESKTOP-SPLIT-0 freeze) — threads inherit their parent's placement so threaded BATCH can be eligible safely
+- **user-set scope (narrow):** a threaded BATCH job's worker threads INHERIT the parent's
+  placement/profile correctly (allowed_cpus + sched_class + pinned/role), so the whole address
+  space lands on ONE CPU and the RUNMASK audit stays clean · this makes matmuljobs ELIGIBLE for
+  the allowlist SAFELY (the address space no longer spans two CPUs by ctor accident).
+- **HARD NO's (user-set):** NO desktop-split policy expansion yet (do not add to the allowlist in
+  this brick) · NO work stealing · NO general migration · NO global PREEMPT.
+- **why this is the right next brick:** it is the single gate between "one allowlisted
+  single-threaded app on CPU1" and "a real threaded workload safely spanning a core under the
+  RUNMASK audit". Today thread_create sets ctor-default CPU0-only (F3-2), so a BATCH parent on
+  CPU1 + CPU0 threads = one mm on two CPUs = the exact hazard RUNMASK catches. The fix is
+  placement INHERITANCE at the thread_create funnel.
+- **the forcing function already armed:** RUNMASK-0 (law 18) will fail LOUDLY the moment any
+  address space actually executes on two CPUs without per-mm shootdown — so this brick can be
+  proven by adding a threaded BATCH app and showing its threads + parent share one CPU's run
+  history (no `[RUNMASK] VIOLATION` beyond the planted one).
+- **EXACT ACCEPTANCE (user-set):** `THREADINHERIT: PASS batch_parent_cpu1=1 workers_same_cpu=1
+  sched_inherit=1 runmask_clean=1 desktop_cpu0=1 matmuljobs_ready=1 no_allowlist_expansion=1
+  soak=30m panic=0 invariant=0`
+- **the mechanism (user-set, NOT name-special-casing):** the address space here = `context.cr3` +
+  a heap-shared `as_refcount` (no mm struct). Add a SHARED `mm_placement { home_cpu, ran_on_cpus,
+  sched_class }` tied to the as_refcount lifetime (alloc in process_create, pointer-shared in
+  thread_create, freed on last_user). Rule: ONE mm = ONE execution CPU until per-mm shootdown
+  exists. thread_create INHERITS: allowed_cpus = 1<<home_cpu (NARROW, never widen), pinned_cpu =
+  home_cpu, sched_class = mm's class. home_cpu set at the LEADER's scheduler_submit_task (= where
+  it placed). Dispatch stamps OR cpu into both p->ran_on_cpus and p->mm_place->ran_on_cpus.
+- **proof vehicle:** kernel-spawned `threadprobe` (BATCH→CPU1 like batchdemo, NOT on the sys_spawn
+  allowlist) with 2 persistent worker threads; the [THREADINHERIT] observation + ran_on_cpus
+  ground truth prove parent+workers all CPU1. `threadinherit_selftest` proves the inherit predicate
+  (a BATCH-CPU1 parent's thread inherits CPU1+BATCH = matmuljobs_ready) without routing matmuljobs.
+- **gate:** SMP_THREAD_INHERIT (nested under SMP_RUNMASK). Default + all pre-inherit builds stay
+  byte-identical (6f99ed9f). __LINE__-safe: process.c/handlers.c/kernel.c have NO __LINE__ users;
+  scheduler.c edits all sit BELOW its last ASSERT_ALWAYS (line 336).
+- **HARD NO's (user-set):** no allowlist expansion · no work stealing · no general migration · no
+  global PREEMPT · no general per-mm shootdown · no desktop policy expansion.
+- **queued behind it (user-set):** SMP-MATMUL-BATCH-0 (allowlist matmuljobs after this proves
+  shared-mm safety) · SMP-CPU1-PREEMPT-0 (CPU1-local BATCH preemption only) · SMP-PERMM-TLBSHOOT-0
+  (real per-mm remote invalidation, replaces the TLBSHOOT_NEG pin assumption).
+- **status:** FROZEN+PUSHED (origin/`brick/smp-thread-inherit-0` @ `d3a0b78`, ls-remote verified;
+  `fc62123` feat + `d3a0b78` docs+law20, unsquashed). Full 30-min soak hit the exact acceptance on
+  the ATOMIC-detector kernel: parent+2 workers all ran=0x2, mm_single_cpu=1, desktop ran=0x1,
+  matmuljobs_ready=1 + unrouted, all walls green, 64 windows, 0 panic/invariant, default byte-
+  identical 6f99ed9f. Record: [`bricks/SMP-THREAD-INHERIT-0.md`](bricks/SMP-THREAD-INHERIT-0.md).
+  NEW LAW 20 = a shared cross-CPU DETECTOR field must update atomically (locked OR), never a plain
+  read-modify-write -- the detector must be no weaker than the concurrency hazard it catches.
+
+## SMP-MATMUL-BATCH-0 — OPEN (the reward brick, user-set after THREAD-INHERIT) — matmuljobs can finally join the BATCH allowlist
+- **scope:** with shared-mm safety proven (THREAD-INHERIT), add matmuljobs to the BATCH allowlist;
+  its SYS_THREAD_CREATE worker threads inherit its CPU1 placement, so the whole threaded job runs
+  wholly on the worker core under the RUNMASK audit (zero new violations).
+- **HARD NO's (carry forward):** no work stealing · no general migration · no per-mm shootdown · no
+  global PREEMPT. The two further-out bricks: SMP-CPU1-PREEMPT-0 (CPU1-local BATCH preemption only)
+  then SMP-PERMM-TLBSHOOT-0 (real per-mm remote invalidation, retires the TLBSHOOT_NEG assumption).
+- **status:** OPEN — awaiting the user's go. Will branch from the THREAD-INHERIT freeze head.
+
+## DESKTOP-SPLIT-0 — FROZEN+PUSHED (origin/`brick/desktop-split-0` @ `3adfca7`, ls-remote verified; commits `0eb41ed` feat + `3adfca7` docs, unsquashed; user: "a real two-core operating system milestone") — the desktop now USES both CPUs
+- **THE EXACT ACCEPTANCE HIT (run 3, from the committed proof vehicle itself):**
+  `DESKTOPSPLIT: PASS cpu0_desktop=1 cpu1_batch=1 fps_within_tolerance=1 runmask=1 tlb_neg=1 bkl=1
+  soak=30m panic=0 invariant=0`. The five load-bearing lines: sys_spawn `sbin/batchdemo` PID 26 →
+  BATCH allowlist → the seam chose cpu1; exit record `ran=0x2 single_cpu=1`; all six desktop-core
+  procs (compositor/terminal/filemanager/netman/browser/ide) observed `ran=0x1`, none on CPU1.
+  Record: [`bricks/DESKTOP-SPLIT-0.md`](bricks/DESKTOP-SPLIT-0.md) · proof `scripts/dsplit_smoke.sh`.
+- **what landed (all #ifdef SMP_DSPLIT):** the boring allowlist `{ batchdemo, bklstorm }` re-placed
+  as BATCH through `scheduler_submit_task` at the sys_spawn seam (handlers.c) · the `[DSPLIT]
+  observed:` execution-history walk (health_monitor.c) · init spawns batchdemo (the userspace
+  sys_spawn trigger) · `[COMP] fps window` print (compositor_m8.c) · SMP_DSPLIT gate (quick_build).
+  matmuljobs EXCLUDED (threaded → one mm on two CPUs = the per-mm shootdown hazard RUNMASK guards).
+- **the FPS gate change (user-set):** `fps_ge_baseline` (max-vs-max) was too brittle at the ~10fps
+  cap — run 2 "failed" at 99 vs 100, one quantum inside host jitter (baseline max swung 89..100 on
+  the SAME kernel; an uncorrelated 13-min mid-soak dip). Replaced by `fps_within_tolerance` =
+  split first-9-window median ≥ 90% of baseline first-9-window median. 3 soaks: run1 appeared
+  faster, run2 94.9%, run3 97.9%. **Honest claim: the split does NOT hurt the desktop within
+  tolerance — NOT a speedup.** The earlier "98 vs 89 faster" read was the same host noise pointing
+  the other way.
+- **byte-identity:** default `6f99ed9f` hash-equal; the two comment corrections were line-neutral.
+- **status:** FROZEN+PUSHED (3adfca7, ls-remote verified), all walls green over 30 min, 0 panic /
+  0 invariant. The user's approval: "a real two-core operating system milestone... CPU1 is doing
+  useful allowlisted work, CPU0 remains the desktop core." Next = SMP-THREAD-INHERIT-0 BEFORE any
+  allowlist expansion.
 
 ## COMPOSITOR-ICON-GHOST-0 — PARKED (user-set at the IDE-FORGE freeze) — the remaining outer-titlebar icon residue
 - **scope when picked up:** eliminate the residue (the window-frame area is compositor-drawn,

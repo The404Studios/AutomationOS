@@ -99,6 +99,35 @@ typedef struct {
 } sched_profile_t;
 #endif
 
+#ifdef SMP_THREAD_INHERIT
+// ===========================================================================
+// SMP-THREAD-INHERIT-0: shared address-space placement (ONE mm = ONE CPU).
+// ===========================================================================
+// There is no mm struct here -- an address space IS context.cr3 + a heap-shared
+// as_refcount (every thread on the same CR3 shares both). mm_placement is the
+// matching SHARED descriptor: allocated fresh in process_create, pointer-copied
+// in thread_create, freed when the LAST AS user dies (the as_refcount==0 test).
+// It carries the address space's HOME CPU (threads inherit it and PIN there --
+// one mm runs on one CPU until per-mm TLB shootdown exists), the LIVE cross-CPU
+// run accumulator (ran_on_cpus OR'd at every dispatch of any thread of the mm;
+// popcount>1 == exactly the hazard the RUNMASK audit guards), and the mm's
+// scheduling class (threads inherit it). Plain uint32_t POD fields (not the
+// enum) so the descriptor stays trivially shareable across CPUs.
+typedef struct mm_placement {
+    uint32_t home_cpu;      // the ONE CPU this address space runs on (default 0 = CPU0)
+    uint32_t ran_on_cpus;   // OR of every CPU any thread of this mm has dispatched on
+    uint32_t sched_class;   // the mm's class; threads inherit it (a sched_class_t value)
+} mm_placement_t;
+
+// Apply address-space placement INHERITANCE to a freshly-created thread `t` from
+// its `parent`: t inherits the mm's home CPU and PINS to it (allowed_cpus =
+// 1<<home, pinned_cpu = home -- NARROWED, never widened) and inherits the mm's
+// class. Defined in process.c (which has no __LINE__ users); the threadinherit
+// selftest in scheduler.c calls the SAME function so the proof cannot diverge
+// from the production path.
+void sched_thread_inherit_placement(struct process* parent, struct process* t);
+#endif
+
 // ---------------------------------------------------------------------------
 // wait_object_t — the single blocking primitive (engine in waitqueue.c).
 // The full STRUCT layout is defined HERE (early) so process_t can embed a
@@ -194,6 +223,9 @@ typedef struct process {
     //                 the cooperative build; schedule_from_irq() in PREEMPTIVE).
     uint64_t ctx_switches;           // Number of times this process was dispatched
     uint64_t cpu_ticks;              // Timer ticks observed while this process was running
+    uint64_t wake_tick;              // SCHED-INSTRUMENT-0: tick a blocked task became
+                                     // runnable (0 = none pending); cleared at dispatch
+                                     // to measure ready->run latency under PREEMPT
     int32_t priority;                // Process priority (nice value: -20 to +19)
     struct process* next;            // Next process in queue
     char name[64];                   // Process name
@@ -463,8 +495,30 @@ typedef struct process {
     // Gated separately from p->sched so every pre-RUNMASK profile keeps a
     // byte-identical process_t layout.
     uint32_t ran_on_cpus;
+#ifdef SMP_THREAD_INHERIT
+    // SMP-THREAD-INHERIT-0: the SHARED address-space placement descriptor (see
+    // mm_placement_t above). Pointer SHARED by the AS leader + all its threads
+    // (exactly like as_refcount); NULL-tolerated everywhere (every reader guards
+    // it). At the END (the F3-1 new-field law) and double-gated so every
+    // pre-inherit build keeps a byte-identical process_t layout.
+    struct mm_placement* mm_place;
 #endif
 #endif
+#endif
+
+    // SIG-FULL-0 (B8): per-process signal state. Ungated core feature, appended
+    // at the very END so the asm-hardcoded cpu_context offset stays valid; all
+    // zeroed by the memset in process_create()/thread_create() (=> SIG_DFL,
+    // empty mask, nothing pending). Indexed by signal number 1..31:
+    //   sig_handlers[s] = user handler VA   (0 = SIG_DFL, 1 = SIG_IGN)
+    //   sig_mask    bit (1ull<<s) set => signal s is blocked
+    //   sig_pending bit (1ull<<s) set => signal s is pending
+    //   sig_restorer = user trampoline VA that issues SYS_RT_SIGRETURN (the
+    //   address a delivered handler returns to). Captured from rt_sigaction.
+    uint64_t sig_handlers[32];
+    uint64_t sig_mask;
+    uint64_t sig_pending;
+    uint64_t sig_restorer;
 } process_t;
 
 // Global pointer to current process (for PE loader and other subsystems)
@@ -547,6 +601,9 @@ static inline process_t* process_get_current(void) { return current_process; }
 #endif
 void process_set_current(process_t* proc);
 int process_set_ready(process_t* proc); // Validated CREATED/BLOCKED->READY transition (ret 0=OK, -1=rejected)
+// SCHED-INSTRUMENT-0: wakeup-latency measurement (defs in scheduler.c).
+void sched_instr_wake(process_t* p);     // stamp ready tick on a blocked->runnable task
+void sched_instr_dispatch(process_t* p); // at dispatch: record ready->run latency
 
 // Userspace-facing process snapshot record (SYS_PROCLIST ABI). MUST stay 64 bytes.
 // The first 48 bytes are the original layout (pid/parent_pid/state/flags/name) so

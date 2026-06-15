@@ -5,6 +5,8 @@
 global syscall_entry
 extern syscall_dispatch
 extern tss_get
+extern g_sig_frame              ; SIG-FULL-0: saved-frame ptr for sys_rt_sigreturn
+extern deliver_pending_signals  ; SIG-FULL-0: post-dispatch signal delivery
 
 section .text
 
@@ -55,8 +57,23 @@ section .text
     mov rsi, rdi    ; arg1
     mov rdi, rax    ; syscall_num
 
+    ; SIG-FULL-0: stash the saved-frame base (&rdi) for sys_rt_sigreturn.
+    lea rax, [rsp + 8]              ; arg6 at [rsp]; the GP frame starts at [rsp+8]
+    mov [rel g_sig_frame], rax
+
     call syscall_dispatch
     add rsp, 8
+
+    ; SIG-FULL-0: deliver one pending signal (may rewrite the saved frame).
+    ; The frame pointer is the LOCAL rsp (points at saved rdi after `add rsp,8`),
+    ; NOT the global g_sig_frame. g_sig_frame is clobbered by every other process's
+    ; syscall, so on the return of a BLOCKING syscall (waitpid/read/futex) it names
+    ; a stale frame -- using rsp delivers on the correct stack regardless of blocking.
+    mov rsi, rax                   ; arg2 = syscall return value
+    mov rdi, rsp                   ; arg1 = this syscall's GP frame (local, always valid)
+    push rax                       ; preserve retval across the C call
+    call deliver_pending_signals
+    pop rax
 
     pop rdi
     pop rsi
@@ -149,10 +166,25 @@ syscall_entry:
     mov rsi, rdi    ; arg1
     mov rdi, rax    ; syscall_num
 
+    ; SIG-FULL-0: stash the saved-frame base (&rdi) for sys_rt_sigreturn.
+    lea rax, [rsp + 8]              ; arg6 at [rsp]; the GP frame starts at [rsp+8]
+    mov [rel g_sig_frame], rax
+
     call syscall_dispatch
     add rsp, 8
 
     ; RAX = return value
+
+    ; SIG-FULL-0: deliver one pending signal (may rewrite the saved frame).
+    ; The frame pointer is the LOCAL rsp (points at saved rdi after `add rsp,8`),
+    ; NOT the global g_sig_frame. g_sig_frame is clobbered by every other process's
+    ; syscall, so on the return of a BLOCKING syscall (waitpid/read/futex) it names
+    ; a stale frame -- using rsp delivers on the correct stack regardless of blocking.
+    mov rsi, rax                   ; arg2 = syscall return value
+    mov rdi, rsp                   ; arg1 = this syscall's GP frame (local, always valid)
+    push rax                       ; preserve retval across the C call
+    call deliver_pending_signals
+    pop rax
 
     ; Restore user registers (reverse push order)
     pop rdi

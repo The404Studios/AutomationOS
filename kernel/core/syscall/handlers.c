@@ -1114,6 +1114,61 @@ int64_t sys_yield(uint64_t arg1, uint64_t arg2, uint64_t arg3,
     return ESUCCESS;
 }
 
+#ifdef SMP_DSPLIT
+/* ===========================================================================
+ * DESKTOP-SPLIT-0: the boring, explicit BATCH allowlist.
+ * ===========================================================================
+ * sys_spawn-created apps whose BASENAME matches this list are declared
+ * SCHED_CLASS_BATCH with a CPU0|CPU1 mask at the spawn seam, then re-placed
+ * through scheduler_submit_task -- the choose_cpu batch branch (F3-7) routes
+ * them to CPU1. Everything else (compositor, input, shell, every ordinary
+ * child) keeps the NORMAL/CPU0-only ctor defaults: this brick proves the
+ * SPLIT, not general balancing.
+ *
+ * MEMBERSHIP RULE (law 18 enforced at design time): SINGLE-THREADED apps
+ * only. matmuljobs was on the candidate list and is EXCLUDED -- its job
+ * queue creates SYS_THREAD_CREATE workers, and a parent on CPU1 with ctor-
+ * default CPU0 threads would put ONE ADDRESS SPACE on TWO CPUs: the exact
+ * hazard the RUNMASK audit exists to catch (it would fire, correctly).
+ * Threaded apps need placement INHERITANCE for threads (a future brick)
+ * before they can ever join this list. */
+static const char* const dsplit_allow[] = { "batchdemo", "bklstorm" };
+
+static int dsplit_basename_match(const char* kpath, const char* name) {
+    /* find the basename (after the last '/') */
+    const char* b = kpath;
+    for (const char* p = kpath; *p; p++)
+        if (*p == '/') b = p + 1;
+    /* exact match */
+    int i = 0;
+    while (b[i] && name[i] && b[i] == name[i]) i++;
+    return (b[i] == 0 && name[i] == 0);
+}
+
+/* Re-place an allowlisted, freshly spawned process as BATCH via THE seam.
+ * Same dequeue->declare->submit pattern the kernel-spawned CPU1 workloads
+ * use (kernel.c); runs BEFORE the child has ever been dispatched, so its
+ * ran_on_cpus history starts clean on whichever CPU the seam chooses. */
+static void dsplit_maybe_route(const char* kpath, int pid) {
+    int hit = 0;
+    for (unsigned i = 0; i < sizeof(dsplit_allow) / sizeof(dsplit_allow[0]); i++)
+        if (dsplit_basename_match(kpath, dsplit_allow[i])) { hit = 1; break; }
+    if (!hit) return;
+
+    process_t* p = process_get_by_pid((uint32_t)pid);
+    if (!p) return;
+    extern void scheduler_remove_process(process_t* proc);
+    scheduler_remove_process(p);
+    p->allowed_cpus       = ((uint64_t)1 << 0) | ((uint64_t)1 << 1);
+    p->pinned_cpu         = CPU_NONE;                /* the SEAM decides   */
+    p->sched.sched_class  = SCHED_CLASS_BATCH;
+    uint32_t target = scheduler_submit_task(p);
+    kprintf("[DSPLIT] '%s' PID %d -> BATCH allowlist, the seam chose cpu%u\n",
+            kpath, pid, target);
+    process_unref(p);
+}
+#endif /* SMP_DSPLIT */
+
 // SYS_SPAWN - Create new process from ELF path in initrd
 int64_t sys_spawn(uint64_t path, uint64_t arg2, uint64_t arg3,
                   uint64_t arg4, uint64_t arg5, uint64_t arg6) {
@@ -1205,6 +1260,12 @@ int64_t sys_spawn(uint64_t path, uint64_t arg2, uint64_t arg3,
         kprintf("[SPAWN] not found / load failed: '%s'\n", kpath);
         return ENOENT;  // file not found (ESRCH = "no such process" is misleading here)
     }
+
+#ifdef SMP_DSPLIT
+    /* DESKTOP-SPLIT-0: allowlisted apps re-place as BATCH through the seam
+     * (before first dispatch -- the child's run history starts clean). */
+    dsplit_maybe_route(kpath, pid);
+#endif
 
     kprintf("[SPAWN] Process '%s' created with PID %d\n", kpath, pid);
     return (int64_t)pid;

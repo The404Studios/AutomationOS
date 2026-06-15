@@ -194,6 +194,19 @@ void _start(void) {
     print("[INIT] Spawning forktest...\n");
     spawn("sbin/forktest");
 
+    // SIG-FULL-0 (B8) signal-delivery probe: installs a SIGUSR1 handler, raises
+    // it to self (handler runs + resumes), proves blocked-signal pending/unblock,
+    // default-terminate in a child, and bad-handler fail-safe. Prints SIGTEST
+    // RESULT to serial, exits. Gated with the rest of the self-test boot.
+    print("[INIT] Spawning sigtest...\n");
+    spawn("sbin/sigtest");
+
+    // POLL-SELECT-0 (B10) probe: poll()/select() over real fd readiness (a
+    // ready file vs an idle socket, a timeout, a mixed set) + epoll level/edge.
+    // Prints POLLSELFTEST RESULT to serial, exits.
+    print("[INIT] Spawning pollselftest...\n");
+    spawn("sbin/pollselftest");
+
     // real-threads probe: spawns 4 threads that SHARE this process's address
     // space but have independent stacks + FPU state, joins them, and prints
     // THREADTEST: PASS/FAIL. Proves shared memory, independent stacks, and
@@ -262,6 +275,15 @@ void _start(void) {
     // "matmuljobs: PASS result-matches-ref ...".
     print("[INIT] Spawning matmuljobs...\n");
     spawn("sbin/matmuljobs");
+
+    // batchdemo: a tiny single-threaded marked-syscall workload (3 marks +
+    // 48 FS reads + exit 7). On a default kernel it is just another quick
+    // test app on CPU0. On a DESKTOP-SPLIT kernel this spawn is THE userspace
+    // sys_spawn proof: the spawn syscall's BATCH allowlist declares it
+    // BATCH+multi-CPU and the scheduler seam routes it to CPU1 -- an ordinary
+    // userspace child doing ordinary work on the second core, under typed intent.
+    print("[INIT] Spawning batchdemo...\n");
+    spawn("sbin/batchdemo");
 
     // AI-native layer: the capability-gated command broker (crown jewel) runs a
     // self-test of its tool-bus + policy + ledger + rollback pipeline.

@@ -260,6 +260,46 @@ if [ "${SMP:-0}" = "1" ]; then
         CFLAGS="$CFLAGS -DSMP_RUNMASK"
         echo "*** SMP_RUNMASK build: execution-reality pin audit live (SMP-RUNMASK-0) ***"
     fi
+
+    # =========================================================================
+    # SMP_DSPLIT (DESKTOP-SPLIT-0) -- sub-gate, REQUIRES SMP=1 (acceptance
+    # profile = the FULL stack + SMP_RUNMASK). The milestone brick: desktop-
+    # spawned apps on a BORING, EXPLICIT allowlist (batchdemo, bklstorm --
+    # single-threaded only; matmuljobs is EXCLUDED because its worker THREADS
+    # would put one address space on two CPUs, the exact thing law 18
+    # forbids) are declared BATCH + multi-CPU at the sys_spawn seam, so the
+    # choose_cpu batch branch routes them to CPU1. Compositor/input/shell
+    # remain NORMAL/CPU0. A health-monitor one-shot prints the observed
+    # ran_on_cpus reality for the proof. When UNSET: byte-for-byte unchanged.
+    #   SMP=1 SMP_SCHED=1 SMP_SCHED_DISPATCH=1 SMP_IPI=1 SMP_BKL=1 \
+    #   SMP_BATCH=1 SMP_RUNMASK=1 SMP_DSPLIT=1 bash scripts/quick_build.sh
+    # =========================================================================
+    if [ "${SMP_DSPLIT:-0}" = "1" ]; then
+        CFLAGS="$CFLAGS -DSMP_DSPLIT"
+        echo "*** SMP_DSPLIT build: desktop-split allowlist live (DESKTOP-SPLIT-0) ***"
+    fi
+
+    # =========================================================================
+    # SMP_THREAD_INHERIT (SMP-THREAD-INHERIT-0) -- sub-gate, REQUIRES SMP=1
+    # (acceptance profile = the FULL stack + SMP_RUNMASK). Makes SHARED address
+    # spaces safe before more real workload lands on CPU1: a thread SHARES its
+    # parent's CR3, so it must run on the SAME CPU as the rest of that address
+    # space (one mm, one execution CPU) until per-mm TLB shootdown exists. Adds
+    # a shared mm_placement {home_cpu, ran_on_cpus, sched_class} tied to the
+    # as_refcount lifetime; thread_create INHERITS the mm's home CPU and PINS to
+    # it (never widens); dispatch stamps fold into the shared accumulator; a
+    # kernel-spawned threaded BATCH probe (threadprobe) proves parent+workers
+    # all run CPU1. Does NOT expand the sys_spawn allowlist and does NOT route
+    # matmuljobs (the predicate is proven ready; the routing is the next brick).
+    # When UNSET: no -DSMP_THREAD_INHERIT, no new field, threads keep the F3-2
+    # CPU0-only default, every other build byte-for-byte unchanged. Profile:
+    #   SMP=1 SMP_SCHED=1 SMP_SCHED_DISPATCH=1 SMP_IPI=1 SMP_BKL=1 \
+    #   SMP_BATCH=1 SMP_RUNMASK=1 SMP_THREAD_INHERIT=1 bash scripts/quick_build.sh
+    # =========================================================================
+    if [ "${SMP_THREAD_INHERIT:-0}" = "1" ]; then
+        CFLAGS="$CFLAGS -DSMP_THREAD_INHERIT"
+        echo "*** SMP_THREAD_INHERIT build: shared-mm placement inheritance live (SMP-THREAD-INHERIT-0) ***"
+    fi
 fi
 
 # =============================================================================
@@ -549,6 +589,7 @@ compile kernel/core/mem/vma_rbtree.c          c_vma_rbtree
 compile kernel/core/syscall/futex.c           c_futex
 compile kernel/core/syscall/sendfile.c        c_sendfile
 compile kernel/core/syscall/epoll.c           c_epoll
+compile kernel/core/syscall/poll.c            c_poll
 compile kernel/core/syscall/batch.c           c_batch
 compile kernel/core/syscall/vma_test.c        c_vma_test
 

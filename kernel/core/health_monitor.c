@@ -66,6 +66,113 @@ static void health_monitor_thread(void* arg) {
         /* Sample all CPUs */
         health_monitor_sample();
 
+#if defined(SMP_DSPLIT) && defined(SMP_RUNMASK)
+        /* DESKTOP-SPLIT-0 observation (one-shot, ~60s in = sample 12): print
+         * the OBSERVED ran_on_cpus reality for the proof -- the desktop core
+         * (compositor/init/terminal) must show ran=0x1 (CPU0 only) and at
+         * least one allowlisted BATCH app must have run with bit1 set. Reads
+         * scalar PCB fields via the ref-safe table API; prints once, costs
+         * nothing afterward (the T410 idle budget). */
+        {
+            static int dsplit_reported = 0;
+            static int dsplit_samples  = 0;
+            dsplit_samples++;
+            if (!dsplit_reported && dsplit_samples >= 12) {
+                dsplit_reported = 1;
+                extern process_t* process_get_by_pid(uint32_t pid);
+                extern void process_unref(process_t* proc);
+                int cpu1_users = 0;
+                for (uint32_t pid = 1; pid < 256; pid++) {
+                    process_t* p = process_get_by_pid(pid);
+                    if (!p) continue;
+                    uint32_t ran = p->ran_on_cpus;
+                    int core =
+                        (p->name[0]=='s' && p->name[1]=='b') /* sbin/...    */ ||
+                        p->pid == 1;                          /* init        */
+                    if (ran & 0x2u) cpu1_users++;
+                    if ((ran & 0x2u) || core) {
+                        kprintf("[DSPLIT] observed: pid=%d '%s' ran=0x%x\n",
+                                p->pid, p->name, ran);
+                    }
+                    process_unref(p);
+                }
+                kprintf("[DSPLIT] observation: live procs that ran on CPU1 = %d\n",
+                        cpu1_users);
+            }
+        }
+#endif
+#if defined(SMP_THREAD_INHERIT) && defined(SMP_RUNMASK)
+        /* SMP-THREAD-INHERIT-0 observation (one-shot, ~60s in = sample 12): the
+         * threaded BATCH probe. The parent (is_thread==0) AND both worker
+         * threads (is_thread==1, named "threadprobe-thr") must show ran=0x2
+         * (CPU1) with the SHARED mm accumulator never spanning two CPUs --
+         * proving the workers INHERITED the parent's CPU1 placement, not the
+         * CPU0 ctor default. All three are persistent CPU1 residents, so the
+         * live walk reliably catches them. Scalar PCB reads via the ref-safe
+         * table API; one-shot. */
+        {
+            static int ti_reported = 0;
+            static int ti_samples  = 0;
+            ti_samples++;
+            if (!ti_reported && ti_samples >= 12) {
+                ti_reported = 1;
+                extern process_t* process_get_by_pid(uint32_t pid);
+                extern void process_unref(process_t* proc);
+                int parent_found = 0, parent_cpu1 = 0, parent_batch = 0;
+                uint32_t mm_ran = 0, home = 99;
+                int workers = 0, workers_cpu1 = 0, workers_cpu0 = 0, workers_batch = 0;
+                for (uint32_t pid = 1; pid < 256; pid++) {
+                    process_t* p = process_get_by_pid(pid);
+                    if (!p) continue;
+                    /* name prefix "threadprobe" matches the parent AND its
+                     * "threadprobe-thr" worker threads. */
+                    const char* pref = "threadprobe";
+                    int match = 1;
+                    for (int k = 0; pref[k]; k++) {
+                        if (p->name[k] != pref[k]) { match = 0; break; }
+                    }
+                    if (match) {
+                        uint32_t ran = p->ran_on_cpus;
+                        int cls = (int)p->sched.sched_class;
+                        if (p->is_thread) {
+                            workers++;
+                            if (ran == 0x2u) workers_cpu1++;
+                            if (ran & 0x1u)  workers_cpu0++;
+                            if (cls == SCHED_CLASS_BATCH) workers_batch++;
+                            kprintf("[THREADINHERIT] observed: worker pid=%d "
+                                    "ran=0x%x class=%d\n", p->pid, ran, cls);
+                        } else {
+                            parent_found = 1;
+                            parent_cpu1  = (ran == 0x2u);
+                            parent_batch = (cls == SCHED_CLASS_BATCH);
+                            if (p->mm_place) {
+                                mm_ran = p->mm_place->ran_on_cpus;
+                                home   = p->mm_place->home_cpu;
+                            }
+                            kprintf("[THREADINHERIT] observed: parent '%s' pid=%d "
+                                    "ran=0x%x home_cpu=%u mm_ran=0x%x class=%d\n",
+                                    p->name, p->pid, ran, home, mm_ran, cls);
+                        }
+                    }
+                    process_unref(p);
+                }
+                int mm_bits = 0;
+                for (uint32_t r = mm_ran; r; r &= (r - 1)) mm_bits++;
+                int batch_parent_cpu1 = parent_found && parent_cpu1;
+                int workers_same_cpu  = (workers == 2) && (workers_cpu1 == 2) &&
+                                        (workers_cpu0 == 0);
+                int sched_inherit     = parent_batch && (workers == 2) &&
+                                        (workers_batch == 2);
+                int mm_single_cpu     = (mm_bits <= 1) && (home == 1);
+                kprintf("[THREADINHERIT] summary: batch_parent_cpu1=%d "
+                        "workers_same_cpu=%d sched_inherit=%d mm_single_cpu=%d "
+                        "workers=%d (cpu1=%d cpu0=%d)\n",
+                        batch_parent_cpu1, workers_same_cpu, sched_inherit,
+                        mm_single_cpu, workers, workers_cpu1, workers_cpu0);
+            }
+        }
+#endif
+
         /* Detect anomalies */
         bool stalls = health_monitor_detect_stalls();
         bool leaks = health_monitor_detect_leaks();

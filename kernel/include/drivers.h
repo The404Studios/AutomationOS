@@ -11,6 +11,7 @@ void serial_write(const char* str, size_t len);
 // PS/2 keyboard driver
 void ps2_init(void);
 char ps2_getchar(void);
+bool ps2_input_pending(void);   // non-consuming stdin readiness probe (poll/select)
 
 // Framebuffer geometry descriptor — used by framebuffer_get_info() and
 // the sys_fb_acquire syscall to export framebuffer info to userspace.

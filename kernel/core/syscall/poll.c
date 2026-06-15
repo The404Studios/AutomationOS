@@ -30,6 +30,10 @@
  * events. Declared here to avoid a header cycle. */
 extern int epoll_has_ready(int epfd);
 
+/* Non-consuming stdin readiness probe (defined in ps2.c, declared in drivers.h);
+ * extern'd here to avoid pulling the driver header into the syscall layer. */
+extern bool ps2_input_pending(void);
+
 /* Timer-only wait object shared by all polling sleeps. Nothing ever signals it,
  * so a waiter is only ever woken by its own deadline (then self-unlinks). */
 static wait_object_t g_poll_wobj = WAIT_OBJECT_INITIALIZER;
@@ -77,7 +81,7 @@ uint32_t fd_poll_state(int fd) {
 
     /* std streams (only when not shadowed by a same-numbered socket above) */
     if (fd == 1 || fd == 2) return POLLOUT;   /* stdout/stderr always writable */
-    if (fd == 0)            return 0;          /* stdin: no non-consuming probe wired yet */
+    if (fd == 0)            return ps2_input_pending() ? POLLIN : 0;  /* keyboard stdin readiness */
 
     return POLLNVAL;
 }

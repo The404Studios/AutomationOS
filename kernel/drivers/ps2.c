@@ -60,6 +60,20 @@ static volatile uint32_t kb_read_pos = 0;
 static volatile uint32_t kb_write_pos = 0;
 static bool ps2_initialized = false;
 
+/* Non-consuming readiness probe for poll()/select()/epoll on stdin (fd 0).
+ * True if a byte is queued in the keyboard ring OR sitting in the 8042 output
+ * buffer. Reads only the STATUS port (never the data port) so it does not
+ * consume input. The 8042 check is gated to keyboard-only OBF (excludes mouse
+ * data, bit 5) so a pending mouse byte cannot spuriously wake a stdin poller.
+ * kb_*_pos are volatile, so the two-index compare needs no IRQ guard (a torn
+ * read at worst yields a stale result for one poll slice and self-corrects). */
+bool ps2_input_pending(void) {
+    if (!ps2_initialized) return false;
+    if (kb_read_pos != kb_write_pos) return true;
+    return (inb(PS2_STATUS_PORT) & (PS2_STATUS_OUTPUT_FULL | PS2_STATUS_MOUSE_DATA))
+           == PS2_STATUS_OUTPUT_FULL;
+}
+
 // Scancode to ASCII translation table (US QWERTY, scancode set 1)
 // 0 means no ASCII equivalent (control keys, etc.)
 static const char scancode_to_ascii[128] = {

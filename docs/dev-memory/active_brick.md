@@ -48,14 +48,65 @@
   NEW LAW 20 = a shared cross-CPU DETECTOR field must update atomically (locked OR), never a plain
   read-modify-write -- the detector must be no weaker than the concurrency hazard it catches.
 
-## SMP-MATMUL-BATCH-0 — OPEN (the reward brick, user-set after THREAD-INHERIT) — matmuljobs can finally join the BATCH allowlist
-- **scope:** with shared-mm safety proven (THREAD-INHERIT), add matmuljobs to the BATCH allowlist;
-  its SYS_THREAD_CREATE worker threads inherit its CPU1 placement, so the whole threaded job runs
-  wholly on the worker core under the RUNMASK audit (zero new violations).
-- **HARD NO's (carry forward):** no work stealing · no general migration · no per-mm shootdown · no
-  global PREEMPT. The two further-out bricks: SMP-CPU1-PREEMPT-0 (CPU1-local BATCH preemption only)
-  then SMP-PERMM-TLBSHOOT-0 (real per-mm remote invalidation, retires the TLBSHOOT_NEG assumption).
-- **status:** OPEN — awaiting the user's go. Will branch from the THREAD-INHERIT freeze head.
+## SMP-MATMUL-BATCH-0 — FROZEN / COMPLETE (the reward brick after THREAD-INHERIT) — a real threaded CPU-heavy workload runs wholly on CPU1
+- **THE EXACT ACCEPTANCE HIT (authoritative run, from the committed smoke itself, -smp 2, 300s):**
+  `SMP-MATMUL-BATCH-0 PASS desktop_cpu0_only=1 batch_matmul_cpu1=1 thread_inherit_home_cpu=1
+  shared_mm_single_cpu=1 runmask_violation=0 default_byte_identical=1`. The load-bearing serial:
+  `[DSPLIT] 'sbin/matmuljobs' PID 34 -> BATCH allowlist, the seam chose cpu1` ·
+  `[MATMULBATCH] allowlisted: name=sbin/matmuljobs ... home_cpu=1 allowed=0x3 class=BATCH` ·
+  `matmuljobs: PASS result-matches-ref jobs=8/8 workers=2` · `[RUNMASK] exit record: pid=34
+  'sbin/matmuljobs' allowed=0x3 ran=0x2 single_cpu=1` (the whole address space ran ONLY on CPU1) ·
+  `[THREADINHERIT] summary: ... workers_same_cpu=1 sched_inherit=1 mm_single_cpu=1 (cpu1=2 cpu0=0)`
+  (the inheritance predicate matmuljobs reuses) · every desktop-core proc observed `ran=0x1`. All
+  SMP walls green (TLBSHOOT_NEG · 2 BKL storms · IPI 32/32 · IPILINK · TLBSHOOT), 0 SCHED+TLB
+  invariant, default kernel byte-identical (`32f2f69c`). Record:
+  [`bricks/SMP-MATMUL-BATCH-0.md`](bricks/SMP-MATMUL-BATCH-0.md) · proof
+  `build_test/smp_matmul_batch_smoke.sh`.
+- **what landed (all #ifdef SMP_DSPLIT, default byte-identical):** `dsplit_allow[]` gains
+  `"matmuljobs"` (was `{batchdemo, bklstorm}`) + the rewritten post-THREAD-INHERIT membership comment
+  (threaded apps eligible ONLY via the worker-thread inheritance predicate; no blanket "all threaded
+  on CPU1") · a `[MATMULBATCH]` audit probe in `dsplit_maybe_route` (name/home_cpu/allowed/class).
+  matmuljobs is already spawned by init (committed); its 8 row-band jobs drain on 2 worker threads
+  that inherit home_cpu=1 + BATCH (narrowed 0x2 mask), so one shared mm == one CPU.
+- **THE PROOF VEHICLE WAS REWRITTEN (the prior draft was broken):** the committed-but-uncommitted
+  draft smoke would have proven nothing — it (1) built WITHOUT `SMP_SCHED/SCHED_DISPATCH/IPI/BKL`
+  (CPU1 never dispatches), (2) ran `build_all.sh` which packs the DEFAULT kernel into the ISO (booted
+  the wrong kernel), (3) gated on literals the kernel never prints (`runmask_clean=1`, `33/33`), (4)
+  had its regression block after `exit` (dead code). Rebuilt on the proven `threadinherit_smoke.sh`
+  scaffold: full SMP stack + DSPLIT + THREAD_INHERIT, swap `kernel-smp.elf` into the ISO (restore
+  default after), gates keyed to REAL kernel strings, LINK gate, byte-identity md5.
+- **THREE EN-ROUTE FINDS (the keepers):**
+  1. **STALE BYTE-IDENTITY ANCHOR** — the pre-fork SMP bricks anchored on `6f99ed9f`, but the
+     fork/execve work (`f4e9420..e4c7c2d`) legitimately changed the DEFAULT kernel. The true HEAD
+     default is `32f2f69c` (verified by a clean-HEAD worktree build). This brick's changes are all
+     `#ifdef SMP_DSPLIT` and handlers.c has NO `__LINE__` users, so the default stays byte-identical
+     — and that byte-identity IS the regression proof (an unchanged default kernel has, by
+     construction, the identical smoke_boot result as HEAD; smoke_boot is now run only for info).
+  2. **KERNEL FAULT ≠ HANDLED USER FAULT** — an SMP placement brick proves the KERNEL stays healthy,
+     NOT that every unrelated user test app is bug-free. The gate now counts only FATAL kernel
+     (CPL=0) faults / triple faults / kernel panics / a CRITICAL proc killed by an exception — a
+     gracefully-handled CPL=3 user `#UD` (kernel terminates the process, system continues) is correct
+     behavior, not a failure.
+  3. **PRE-EXISTING sbin/sigtest #UD (flagged for a follow-up)** — HEAD's plain default boot already
+     throws ONE `Invalid Opcode (vector 6)` at user RIP 0x800079 in `sbin/sigtest` (kernel cleanly
+     terminates it; present in B7-era soak logs, NOT a fork/execve or matmul regression). It is the
+     `handled_user_faults=1` in the proof and is why smoke_boot scores 36/43 (the other 6: 4 SMP-only
+     /self-test markers absent in the default profile + 2 benign CoW page-faults from the fork proof
+     apps). **Candidate next micro-brick: SIGTEST-UD-0** (root-cause the user #UD; likely a
+     codegen/toolchain or stale-signal-ABI issue in sigtest, kernel side is robust).
+- **acceptance note (honesty):** the prior draft listed `smoke_boot=33/33`; that literal is
+  unreachable (smoke_boot now has 43 checks and HEAD itself scores 36/43 from pre-existing issues).
+  The real, STRONGER regression proof is `default_byte_identical=1` (this brick changes nothing in
+  the default kernel), so the printed acceptance uses that instead.
+- **HARD NO's held:** desktop/compositor/normal apps stay CPU0 · only explicit allowlist entries get
+  the multi-CPU BATCH mask · threads inherit the address-space home CPU (never widen) · a shared mm
+  never runs on two CPUs · no work stealing · no general migration · no per-mm shootdown · no global
+  PREEMPT.
+- **status:** committed local on `brick/smp-matmul-batch-0` (`13f671c` feat + this docs commit,
+  unsquashed; off `brick/smp-thread-inherit-0` HEAD `e4c7c2d`). Push pending (Windows PowerShell git).
+- **queued behind it (user-set):** SMP-CPU1-PREEMPT-0 (CPU1-local BATCH preemption only) ·
+  SMP-PERMM-TLBSHOOT-0 (real per-mm remote invalidation, retires the TLBSHOOT_NEG pin assumption) ·
+  SIGTEST-UD-0 (the pre-existing user #UD above).
 
 ## DESKTOP-SPLIT-0 — FROZEN+PUSHED (origin/`brick/desktop-split-0` @ `3adfca7`, ls-remote verified; commits `0eb41ed` feat + `3adfca7` docs, unsquashed; user: "a real two-core operating system milestone") — the desktop now USES both CPUs
 - **THE EXACT ACCEPTANCE HIT (run 3, from the committed proof vehicle itself):**

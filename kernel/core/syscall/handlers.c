@@ -1462,23 +1462,26 @@ int64_t sys_yield(uint64_t arg1, uint64_t arg2, uint64_t arg3,
 
 #ifdef SMP_DSPLIT
 /* ===========================================================================
- * DESKTOP-SPLIT-0: the boring, explicit BATCH allowlist.
+ * SMP-MATMUL-BATCH-0 (and prior DESKTOP-SPLIT-0): explicit BATCH allowlist.
  * ===========================================================================
  * sys_spawn-created apps whose BASENAME matches this list are declared
  * SCHED_CLASS_BATCH with a CPU0|CPU1 mask at the spawn seam, then re-placed
- * through scheduler_submit_task -- the choose_cpu batch branch (F3-7) routes
- * them to CPU1. Everything else (compositor, input, shell, every ordinary
- * child) keeps the NORMAL/CPU0-only ctor defaults: this brick proves the
- * SPLIT, not general balancing.
+ * through scheduler_submit_task -- the choose_cpu batch branch routes them
+ * to CPU1 (the PINNED_WORKER role).
  *
- * MEMBERSHIP RULE (law 18 enforced at design time): SINGLE-THREADED apps
- * only. matmuljobs was on the candidate list and is EXCLUDED -- its job
- * queue creates SYS_THREAD_CREATE workers, and a parent on CPU1 with ctor-
- * default CPU0 threads would put ONE ADDRESS SPACE on TWO CPUs: the exact
- * hazard the RUNMASK audit exists to catch (it would fire, correctly).
- * Threaded apps need placement INHERITANCE for threads (a future brick)
- * before they can ever join this list. */
-static const char* const dsplit_allow[] = { "batchdemo", "bklstorm" };
+ * Desktop / normal / compositor work stays CPU0-only (NORMAL class).
+ * Only names on this list get the multi-CPU BATCH mask.
+ *
+ * MEMBERSHIP RULE (post SMP-THREAD-INHERIT): threaded workloads are now
+ * eligible **only** because worker threads created via SYS_THREAD_CREATE
+ * inherit the leader's mm_place->home_cpu + sched_class (allowed_cpus is
+ * NARROWED to exactly that one CPU). This keeps the invariant: one shared
+ * address space == one execution CPU. matmuljobs (the threaded job-queue
+ * matmul) is the first real CPU-heavy threaded BATCH workload to join.
+ *
+ * DO NOT add arbitrary threaded apps. Only explicit allowlist entries that
+ * rely on the inheritance predicate. No blanket "all threaded on CPU1". */
+static const char* const dsplit_allow[] = { "batchdemo", "bklstorm", "matmuljobs" };
 
 static int dsplit_basename_match(const char* kpath, const char* name) {
     /* find the basename (after the last '/') */
@@ -1511,6 +1514,17 @@ static void dsplit_maybe_route(const char* kpath, int pid) {
     uint32_t target = scheduler_submit_task(p);
     kprintf("[DSPLIT] '%s' PID %d -> BATCH allowlist, the seam chose cpu%u\n",
             kpath, pid, target);
+
+    /* SMP-MATMUL-BATCH-0 audit probe (user-requested fields for the reward brick):
+     * process name, home CPU chosen by the seam, observed CPUs start clean,
+     * the mm_place (if present) will accumulate ran_on_cpus only on that home.
+     * The THREADINHERIT / RUNMASK summaries later in the boot will report the
+     * mm_single_cpu, violation counts, etc. for the full address space. */
+    if (dsplit_basename_match(kpath, "matmuljobs")) {
+        kprintf("[MATMULBATCH] allowlisted: name=%s pid=%d home_cpu=%u allowed=0x%llx class=BATCH\n",
+                kpath, pid, target, (unsigned long long)p->allowed_cpus);
+    }
+
     process_unref(p);
 }
 #endif /* SMP_DSPLIT */

@@ -1,0 +1,15 @@
+# Normalize line endings to LF in the repository. Stops the CRLF churn that
+# Windows editors introduce (every edited file otherwise warns "LF will be
+# replaced by CRLF"). Text files are stored LF in git; checkout is LF too.
+* text=auto eol=lf
+
+# Binary artifacts: never normalize.
+*.png binary
+*.ppm binary
+*.iso binary
+*.bin binary
+*.elf binary
+*.o   binary
+*.pem binary
+*.crt binary
+*.key binary

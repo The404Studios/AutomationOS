@@ -74,3 +74,35 @@ ANIMATION_*.md
 .task*tracker*
 .task*.md
 .phase*tracker*
+
+# --- agent-stabilize-0 cleanup: dev scratch (deleted from tree, keep ignored) ---
+*.bak
+_diff_*.txt
+/screenshots/
+
+# Root-level ALL-CAPS session notes (one-off design drafts, not project docs).
+# Anchored to root so nested docs/dev-memory/bricks/*.md stay tracked.
+/IDE_*.md
+/PANIC_*.md
+/TCP_*.md
+/HDA_*.md
+/GOTO_*.md
+/MOUSE_*.md
+/KEYBOARD_*.md
+/LEAK_*.md
+/IPI_*.md
+/RAPID_*.md
+/UX_*.md
+/IMPLEMENTATION_*.md
+/PMM_*.md
+
+# build_test one-off run outputs (underscore-prefixed). NOTE: the 3 tracked
+# harnesses _dsplit_runner.sh / _dsplit_verdict.sh / _ti_soak_runner.sh are .sh
+# and stay tracked; we only ignore loose output artifacts here.
+build_test/_*.out
+build_test/_*.tmp
+build_test/_*.patch
+
+# Python bytecode cache
+__pycache__/
+*.pyc

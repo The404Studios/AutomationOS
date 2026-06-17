@@ -286,6 +286,54 @@ int cc_member_offset(const char* struct_type, const char* field,
     return 0;                                    /* unknown field */
 }
 
+/* CC-STRUCTINIT-0: field-iteration accessors for emitting struct initializers
+ * by layout. All lazily build the registry exactly like cc_member_offset. */
+int cc_struct_nfields(const char* struct_type)
+{
+    char tag[CC_NAME];
+    CtStruct* s;
+    if (!ct_built) cc_build_struct_registry();
+    if (!struct_type) return 0;
+    ct_struct_tag(struct_type, tag, (int)sizeof(tag));
+    s = ct_find_struct(tag);
+    return s ? s->nfields : 0;
+}
+
+/* Field `idx`: writes its byte offset + size (1 or 8). 1 on success, 0 if the
+ * index is out of range or `struct_type` is not a known struct/union. */
+int cc_struct_field(const char* struct_type, int idx, int* offset_out, int* size_out)
+{
+    char tag[CC_NAME];
+    CtStruct* s;
+    if (!ct_built) cc_build_struct_registry();
+    if (!struct_type || idx < 0) return 0;
+    ct_struct_tag(struct_type, tag, (int)sizeof(tag));
+    s = ct_find_struct(tag);
+    if (!s || idx >= s->nfields) return 0;
+    if (offset_out) *offset_out = s->fields[idx].offset;
+    if (size_out)   *size_out   = s->fields[idx].size;
+    return 1;
+}
+
+/* Total bytes = max(field.offset + field.size); 0 if unknown. (No tail rounding
+ * to alignment -- sufficient for a single struct global's field-correct .data.) */
+int cc_struct_size(const char* struct_type)
+{
+    char tag[CC_NAME];
+    CtStruct* s;
+    int i, total = 0;
+    if (!ct_built) cc_build_struct_registry();
+    if (!struct_type) return 0;
+    ct_struct_tag(struct_type, tag, (int)sizeof(tag));
+    s = ct_find_struct(tag);
+    if (!s) return 0;
+    for (i = 0; i < s->nfields; i++) {
+        int end = s->fields[i].offset + s->fields[i].size;
+        if (end > total) total = end;
+    }
+    return total;
+}
+
 /* ---------------------------------------------------------------------- *
  *  AST-based variable-type recovery
  *

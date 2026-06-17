@@ -628,6 +628,36 @@ static void cc_collect_globals(Cg* g, const AstNode* tu)
                     }
                 }
             }
+            /* B3/B4: capture the initializer. C requires file-scope inits to be
+             * constant. A scalar folds to a value (B3); an array remembers its
+             * brace init-list and grows arrlen to the element count when the
+             * declared size was dropped to "[]" by the parser (B4). */
+            gl->has_init = 0;
+            gl->init_val = 0;
+            gl->init = 0;
+            if (c->first_child) {
+                if (c->first_child->kind == AST_INIT_LIST) {
+                    /* Aggregate brace-init (array OR struct). Keep the list; for
+                     * an array, grow arrlen to the element count when the size
+                     * was dropped to "[]". A struct's emission walks its layout
+                     * (cc_struct_*), so it needs no arrlen. */
+                    const AstNode* il = c->first_child;
+                    gl->init = il;
+                    if (gl->is_arr) {
+                        int ninit = 0;
+                        const AstNode* el;
+                        for (el = il->first_child; el; el = el->next) ninit++;
+                        if (gl->arrlen < ninit) gl->arrlen = ninit;
+                        if (gl->arrlen > CC_MAXARRLEN) gl->arrlen = CC_MAXARRLEN;
+                    }
+                } else if (!gl->is_arr) {
+                    long v;
+                    if (cc_const_eval(c->first_child, &v)) {
+                        gl->has_init = 1;
+                        gl->init_val = v;
+                    }
+                }
+            }
             g->nglobals++;
         }
     }
@@ -665,6 +695,34 @@ static void cc_emit_string_data(Cg* g, const CcStr* s)
     }
 }
 
+/* CC-STRUCTINIT-0: emit one struct global's .data by its field LAYOUT -- each
+ * field at its offset/size (db for 1-byte fields, dq for 8-byte), with alignment
+ * gaps and any tail padded with `db 0`. gl->init (an AST_INIT_LIST) supplies
+ * field values in declaration order; a missing or short list zero-fills the
+ * rest. This keeps every field at the exact offset cc_member_offset reports, so
+ * char/int mixes and packed-char runs read back correctly. */
+static void cc_emit_struct_global(Cg* g, CcGlobal* gl)
+{
+    int nf    = cc_struct_nfields(gl->type);
+    int total = cc_struct_size(gl->type);
+    int cur = 0, i;
+    const AstNode* el = gl->init ? gl->init->first_child : 0;
+
+    for (i = 0; i < nf; i++) {
+        int  off = 0, sz = 8;
+        long v = 0;
+        cc_struct_field(gl->type, i, &off, &sz);
+        while (cur < off) { cc_emit(g, "db 0"); cur++; }   /* alignment gap */
+        if (el) cc_const_eval(el, &v);                     /* 0 if non-constant */
+        if (sz == 1) cc_emit_num(g, "db ", v & 0xFF, "");
+        else         cc_emit_num(g, "dq ", v, "");
+        cur += sz;
+        if (el) el = el->next;
+    }
+    while (cur < total) { cc_emit(g, "db 0"); cur++; }     /* tail padding */
+    if (nf == 0) cc_emit(g, "dq 0");                       /* defensive: unknown */
+}
+
 static void cc_emit_data_section(Cg* g)
 {
     int i;
@@ -677,11 +735,23 @@ static void cc_emit_data_section(Cg* g)
         cc_emit2(g, gl->name, ":");
         if (gl->is_arr) {
             int count = gl->arrlen > 0 ? gl->arrlen : 1;
+            const AstNode* el = gl->init ? gl->init->first_child : 0;
             int k;
-            for (k = 0; k < count; k++)
-                cc_emit(g, "dq 0");
+            for (k = 0; k < count; k++) {
+                long v;
+                if (el && cc_const_eval(el, &v))   /* B4: emit the init value */
+                    cc_emit_num(g, "dq ", v, "");
+                else
+                    cc_emit(g, "dq 0");            /* unset elements zero-fill */
+                if (el) el = el->next;
+            }
+        } else if (cc_struct_nfields(gl->type) > 0) {
+            cc_emit_struct_global(g, gl);          /* CC-STRUCTINIT-0 */
         } else {
-            cc_emit(g, "dq 0");
+            if (gl->has_init)
+                cc_emit_num(g, "dq ", gl->init_val, "");
+            else
+                cc_emit(g, "dq 0");
         }
     }
 

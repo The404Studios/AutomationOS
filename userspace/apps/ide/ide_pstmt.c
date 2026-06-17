@@ -423,7 +423,8 @@ static AstNode* parse_stmt_inner(Parser* p) {
     if (starts_declaration(p)) {
         AstNode* n = mk(AST_DECL_STMT);
         AstNode* d = parse_declaration(p);             /* consumes its own ';' */
-        if (n && d) ast_add_child(n, d);
+        /* comma-declarators (int a, b;) arrive as a ->next sibling chain. */
+        while (d) { AstNode* nx = d->next; if (n) ast_add_child(n, d); d = nx; }
         if (n) set_span_to_here(p, n, start);
         return n ? n : mk_none(p, start);
     }

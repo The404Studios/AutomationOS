@@ -228,11 +228,13 @@ AstNode* parse_type_and_declarator(Parser* p, char* type_out, char* name_out) {
 
     /* ---- 4. array suffix/suffixes '[ ... ]' -------------------------- */
     while (at_punct(p, "[")) {
+        AstNode* dim = 0;
         adv(p);                              /* '[' */
         if (!at_punct(p, "]")) {
-            /* size expression: parse it (best-effort); value discarded. */
+            /* size expression: parse it (best-effort). Keep a constant literal
+             * size so the element count survives in the type string. */
             int before = p->pos;
-            parse_assignment(p);
+            dim = parse_assignment(p);
             if (p->pos == before) {          /* no progress -> skip defensively */
                 precover_to(p, "];");
             }
@@ -244,7 +246,25 @@ AstNode* parse_type_and_declarator(Parser* p, char* type_out, char* name_out) {
             precover_to(p, "];");
             if (at_punct(p, "]")) last = adv(p);
         }
-        d_append_str(ty, TYPE_CAP, "[]");
+        /* B4: preserve a constant integer dimension ("int [3]") so the backend
+         * can size the array; fall back to "[]" for unspecified/non-constant
+         * sizes (codegen then derives the length from the initializer list). */
+        {
+            int lit_ok = 0;
+            if (dim && dim->kind == AST_LITERAL && dim->name[0]) {
+                int j;
+                lit_ok = 1;
+                for (j = 0; dim->name[j]; j++)
+                    if (dim->name[j] < '0' || dim->name[j] > '9') { lit_ok = 0; break; }
+            }
+            if (lit_ok) {
+                d_append_str(ty, TYPE_CAP, "[");
+                d_append_str(ty, TYPE_CAP, dim->name);
+                d_append_str(ty, TYPE_CAP, "]");
+            } else {
+                d_append_str(ty, TYPE_CAP, "[]");
+            }
+        }
     }
 
     /* ---- emit -------------------------------------------------------- */
@@ -576,25 +596,64 @@ AstNode* parse_declaration(Parser* p) {
         if (p->pos == before) precover_to(p, ",;}");
     }
 
-    /* Additional comma-declarators: int a, b = 1, *c;  We richly model the
-     * first (already in `head`) and skip the rest up to ';' for simplicity,
-     * per the header's documented simplest strategy. */
-    while (eat_punct(p, ",")) {
-        char ty2[TYPE_CAP];
-        char nm2[NAME_CAP];
-        /* a comma-declarator shares the base specifiers; here we just parse a
-         * pointer/name/array tail and discard, ensuring forward progress. */
-        int before = p->pos;
-        while (at_punct(p, "*")) adv(p);
-        if (at(p, TK_ID)) adv(p);
-        while (at_punct(p, "[")) {
-            adv(p);
-            if (!at_punct(p, "]")) { int b = p->pos; parse_assignment(p); if (p->pos == b) precover_to(p, "];"); }
-            eat_punct(p, "]");
+    /* Additional comma-declarators: int a, b = 1, *c;  Each shares the base type
+     * specifier. Build a real AST_VAR_DECL for each and CHAIN it as a sibling of
+     * `head` via ->next, so the callers (TU loop / DECL_STMT) add EVERY
+     * declarator instead of dropping all but the first. (ast_add_child resets
+     * ->next, so callers save it before adding.) */
+    if (head) {
+        char base[TYPE_CAP];
+        AstNode* tail = head;
+        int bn;
+        /* Base specifier = head's type minus the first declarator's trailing
+         * pointer(s)/array: "int *" -> "int", "int[3]" -> "int". */
+        d_copyn(base, TYPE_CAP, head->type_str, d_strlen(head->type_str));
+        bn = d_strlen(base);
+        while (bn > 0) {
+            char c = base[bn - 1];
+            if (c == ' ' || c == '\t' || c == '*') { base[--bn] = '\0'; }
+            else if (c == ']') {
+                while (bn > 0 && base[bn - 1] != '[') base[--bn] = '\0';
+                if (bn > 0) base[--bn] = '\0';
+            } else break;
         }
-        if (eat_punct(p, "=")) parse_assignment(p);
-        (void)ty2; (void)nm2;
-        if (p->pos == before) { precover_to(p, ",;}"); if (!at_punct(p, ",")) break; }
+        while (bn > 0 && (base[bn - 1] == ' ' || base[bn - 1] == '\t')) base[--bn] = '\0';
+
+        while (eat_punct(p, ",")) {
+            char ty2[TYPE_CAP];
+            int before = p->pos;
+            int nptr = 0;
+            d_copyn(ty2, TYPE_CAP, base, d_strlen(base));
+            while (at_punct(p, "*")) { adv(p); nptr++; }
+            while (nptr-- > 0) d_append_str(ty2, TYPE_CAP, " *");
+            if (at(p, TK_ID)) {
+                Tok* id = adv(p);
+                AstNode* v = ast_new(AST_VAR_DECL);
+                while (at_punct(p, "[")) {     /* preserve a constant size, like the first declarator */
+                    AstNode* dim = 0;
+                    adv(p);
+                    if (!at_punct(p, "]")) { int b = p->pos; dim = parse_assignment(p); if (p->pos == b) precover_to(p, "];"); }
+                    eat_punct(p, "]");
+                    {
+                        int lit_ok = 0;
+                        if (dim && dim->kind == AST_LITERAL && dim->name[0]) {
+                            int j; lit_ok = 1;
+                            for (j = 0; dim->name[j]; j++)
+                                if (dim->name[j] < '0' || dim->name[j] > '9') { lit_ok = 0; break; }
+                        }
+                        if (lit_ok) { d_append_str(ty2, TYPE_CAP, "["); d_append_str(ty2, TYPE_CAP, dim->name); d_append_str(ty2, TYPE_CAP, "]"); }
+                        else d_append_str(ty2, TYPE_CAP, "[]");
+                    }
+                }
+                if (v) { d_setname(v, id->s, id->len); d_settype(v, ty2); }
+                if (eat_punct(p, "=")) {       /* optional per-declarator initializer */
+                    AstNode* init = parse_assignment(p);
+                    if (init && v) ast_add_child(v, init);
+                }
+                if (v) { tail->next = v; tail = v; }
+            }
+            if (p->pos == before) { precover_to(p, ",;}"); if (!at_punct(p, ",")) break; }
+        }
     }
 
     Tok* semi = pk(p);

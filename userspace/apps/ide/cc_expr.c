@@ -198,6 +198,75 @@ static const AstNode* ce_child(const AstNode* e, int n)
     return (n == 0) ? c : 0;
 }
 
+/* B3/B4 (CC-GLOBALINIT-0): fold a constant integer expression. C requires
+ * file-scope initializers to be constant expressions, so cc_collect_globals
+ * folds the initializer at compile time and emits the value into .data. Handles
+ * integer/char literals, the unary -/+/~/! operators, and the common binary
+ * operators. Returns 1 and writes *out on success; 0 if not a foldable integer
+ * constant (the caller then falls back to a zero initializer). */
+int cc_const_eval(const AstNode* e, long* out)
+{
+    if (!e || !out) return 0;
+
+    switch (e->kind) {
+    case AST_LITERAL:
+        if (e->name[0] == '"') return 0;        /* string literal: not an int */
+        *out = ce_parse_num(e->name);
+        return 1;
+
+    case AST_UNARY: {
+        long v;
+        const char* op = e->name;
+        const AstNode* a = ce_child(e, 0);
+        if (!op || !a || !cc_const_eval(a, &v)) return 0;
+        if (op[1] != 0) return 0;               /* only single-char prefix ops */
+        switch (op[0]) {
+        case '-': *out = -v; return 1;
+        case '+': *out =  v; return 1;
+        case '~': *out = ~v; return 1;
+        case '!': *out = !v; return 1;
+        default:  return 0;                     /* ++/-- etc: not a constant   */
+        }
+    }
+
+    case AST_BINARY: {
+        long a, b;
+        const char* op = e->name;
+        const AstNode* l = ce_child(e, 0);
+        const AstNode* r = ce_child(e, 1);
+        if (!op || !l || !r) return 0;
+        if (!cc_const_eval(l, &a) || !cc_const_eval(r, &b)) return 0;
+        if (op[1] == 0) {
+            switch (op[0]) {
+            case '+': *out = a + b; return 1;
+            case '-': *out = a - b; return 1;
+            case '*': *out = a * b; return 1;
+            case '/': if (b == 0) return 0; *out = a / b; return 1;
+            case '%': if (b == 0) return 0; *out = a % b; return 1;
+            case '&': *out = a & b; return 1;
+            case '|': *out = a | b; return 1;
+            case '^': *out = a ^ b; return 1;
+            case '<': *out = (a <  b); return 1;
+            case '>': *out = (a >  b); return 1;
+            default:  return 0;
+            }
+        }
+        if (op[0] == '<' && op[1] == '<' && op[2] == 0) { *out = a << b; return 1; }
+        if (op[0] == '>' && op[1] == '>' && op[2] == 0) { *out = a >> b; return 1; }
+        if (op[0] == '<' && op[1] == '=' && op[2] == 0) { *out = (a <= b); return 1; }
+        if (op[0] == '>' && op[1] == '=' && op[2] == 0) { *out = (a >= b); return 1; }
+        if (op[0] == '=' && op[1] == '=' && op[2] == 0) { *out = (a == b); return 1; }
+        if (op[0] == '!' && op[1] == '=' && op[2] == 0) { *out = (a != b); return 1; }
+        if (op[0] == '&' && op[1] == '&' && op[2] == 0) { *out = (a && b); return 1; }
+        if (op[0] == '|' && op[1] == '|' && op[2] == 0) { *out = (a || b); return 1; }
+        return 0;
+    }
+
+    default:
+        return 0;
+    }
+}
+
 /* Load through the address currently in rax, using the inferred type of e to
  * pick a byte (movzx) vs qword (mov) load. */
 static void ce_load_rax(Cg* g, const AstNode* e)
@@ -457,7 +526,19 @@ static void ce_expr(Cg* g, const AstNode* e, int depth)
     }
 
     /* -------------------------------------------------- lvalue rvalues */
-    case AST_IDENT:
+    case AST_IDENT: {
+        /* B4: an array name DECAYS to its address (it is not dereferenced).
+         * This is what makes a[i] index from the array base instead of from
+         * its first element mis-loaded as a pointer. */
+        CcGlobal* agl = cc_find_global(g, e->name);
+        if (agl && agl->is_arr) {
+            ce_addr(g, e, depth);               /* &array -> rax (no load) */
+            return;
+        }
+        ce_addr(g, e, depth);                   /* address -> rax */
+        ce_load_rax(g, e);                      /* load value -> rax */
+        return;
+    }
     case AST_INDEX:
     case AST_MEMBER: {
         ce_addr(g, e, depth);                   /* address -> rax */

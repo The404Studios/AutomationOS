@@ -34,7 +34,7 @@
 #define CC_MAXARRLEN   65536
 
 typedef struct { char name[CC_NAME]; int off; int size; } CcLocal;   /* off = -(bytes from rbp) */
-typedef struct { char name[CC_NAME]; char type[CC_NAME]; int size; int is_arr; int arrlen; } CcGlobal;
+typedef struct { char name[CC_NAME]; char type[CC_NAME]; int size; int is_arr; int arrlen; int has_init; long init_val; const AstNode* init; } CcGlobal;
 typedef struct { int id; char text[160]; int len; } CcStr;
 
 typedef struct {
@@ -65,6 +65,9 @@ void cc_error(Cg* g, int line, const char* msg);
 /* ---- expression codegen (cc_expr.c) ---- */
 void cg_expr(Cg* g, const AstNode* e);   /* evaluate rvalue -> RAX */
 void cg_addr(Cg* g, const AstNode* e);   /* lvalue address -> RAX  */
+/* Fold a constant integer expression (file-scope initializers must be constant).
+ * Returns 1 and writes *out on success; 0 if not a foldable integer constant. */
+int  cc_const_eval(const AstNode* e, long* out);
 
 /* ---- type helpers (cc_type.c) ---- */
 int  cc_sizeof_type(const char* type_str);  /* char/_Bool=1 else 8 */
@@ -85,6 +88,12 @@ void cc_infer_type(Cg* g, const AstNode* e, char* out, int cap);
 void cc_build_struct_registry(void);
 int  cc_member_offset(const char* struct_type, const char* field,
                       int* field_size_out);
+/* Struct-layout iteration (CC-STRUCTINIT-0): emit struct initializers by layout.
+ * nfields=0 means "not a known struct"; cc_struct_field writes offset+size (1/8);
+ * cc_struct_size = total bytes (max offset+size). All lazily build the registry. */
+int  cc_struct_nfields(const char* struct_type);
+int  cc_struct_field(const char* struct_type, int idx, int* offset_out, int* size_out);
+int  cc_struct_size(const char* struct_type);
 
 /* ---- program driver (cc_codegen.c) ---- */
 int  cc_gen_program(Cg* g, const AstNode* tu);  /* emit whole module; 1=ok */

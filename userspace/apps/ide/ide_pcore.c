@@ -273,7 +273,9 @@ AstNode* parse_translation_unit(Parser* p) {
 
         int before = p->pos;
         AstNode* d = parse_declaration(p);
-        if (d && tu) ast_add_child(tu, d);
+        /* A declaration may yield a ->next sibling chain (comma-declarators:
+         * int a, b;) -- add every node so no declarator is dropped. */
+        while (d) { AstNode* nx = d->next; if (tu) ast_add_child(tu, d); d = nx; }
 
         if (p->pos == before) adv(p);           /* guarantee forward progress */
     }

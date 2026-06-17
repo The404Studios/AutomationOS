@@ -17,7 +17,9 @@
 
 /* Schema version. Bump on ANY incompatible struct/field change; receivers MUST
  * reject a version they don't understand (forward-safety for future updates). */
-#define AGENT_RPC_VERSION 1
+#define AGENT_RPC_VERSION 2   /* v2: TOOL_ARGS_MAX 256->3072 so write_file can carry
+                               * base64 file content (the agent writes code). The packet
+                               * (16 hdr + sizeof(tool_run_t)=3208) stays under CH_PAGE=4096. */
 
 /* msg_packet_t.type values. The 0x01xx range is reserved for AGENT-RPC-0. */
 #define MSG_TOOL_RUN     0x0101u
@@ -25,7 +27,7 @@
 
 /* Bounded inline buffers so a whole packet stays well under one ring page. */
 #define TOOL_PATH_MAX 120
-#define TOOL_ARGS_MAX 256
+#define TOOL_ARGS_MAX 3072   /* v2: holds write_file's base64 content; packet < CH_PAGE */
 #define TOOL_ARGV_MAX 16    /* P6d: max entries in argv[1..] (the extra-args vector) */
 
 /* Per-message flags. */

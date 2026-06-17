@@ -33,7 +33,7 @@ extern void font2_draw_cell_clip(unsigned int *px, int stride, int maxw, int max
  * font2 at the scaled cell (g_ui_cw x g_ui_ch). Keeping the base FONT_W/FONT_H
  * for the widget-size MATH (then scaling once in attach_child) avoids double
  * scaling. 130% => 10x20, readable on a real panel. */
-#define UI_PCT     130
+#define UI_PCT     100   /* UI-CRISP-0: INTEGER native scale (no fractional blur) */
 #define UI_S(v)    (((v) * UI_PCT) / 100)
 #define UI_CELL_W  (8  * UI_PCT / 100)
 #define UI_CELL_H  (16 * UI_PCT / 100)
@@ -185,6 +185,12 @@ struct ui_widget {
     void       (*on_click)(void* ud);
     void        *ud;
 
+    /* DOCK-DND: opt-in drag source (ui_widget_set_draggable). When set, this
+     * widget's click is DEFERRED to release and a press+move fires on_drag once.
+     * Non-draggable widgets are unchanged (click fires on press). */
+    int          draggable;
+    void       (*on_drag)(void* ud);
+
     ui_widget_t *children[UI_MAX_CHILDREN];
     int          nchildren;
 
@@ -230,6 +236,11 @@ struct ui_app {
     /* Tracked cursor + left-button edge detection. */
     i32          cur_x, cur_y;
     int          btn_prev;   /* previous left-button state (0/1)          */
+
+    /* DOCK-DND: drag tracking for draggable widgets. */
+    i32          press_x, press_y;
+    ui_widget_t *drag_armed;   /* draggable widget pressed (click deferred) */
+    int          dragging;     /* on_drag already fired for this gesture    */
 
     /* Optional per-frame tick callback (NULL = disabled). */
     void       (*tick)(void* ud);
@@ -1042,7 +1053,12 @@ static int dispatch_click(ui_app_t* app, ui_widget_t* w, i32 px, i32 py) {
                 ui_widget_t* ch = w->children[i];
                 i32 saved_ay = ch->ay;
                 ch->ay -= w->sc_offset;
-                int hit = dispatch_click(app, ch, px, py);
+                /* UI-TOOLKIT-FIX-0: only dispatch to a child actually visible in
+                 * the viewport [w->ay, w->ay+w->ah) -- matching the render-path
+                 * clip (see UI_SCROLL render). Otherwise a click lands on an item
+                 * scrolled out of view. */
+                int visible = (ch->ay + ch->ah > w->ay) && (ch->ay < w->ay + w->ah);
+                int hit = visible ? dispatch_click(app, ch, px, py) : 0;
                 ch->ay = saved_ay;
                 if (hit) return 1;
             }
@@ -1157,6 +1173,26 @@ static void dispatch_key(ui_app_t* app, int keycode, int pressed) {
     }
 }
 
+/* Find the topmost DRAGGABLE widget whose rect contains (px,py), or NULL. */
+static ui_widget_t* draggable_at(ui_widget_t* w, i32 px, i32 py) {
+    for (int i = w->nchildren - 1; i >= 0; i--) {
+        ui_widget_t* hit = draggable_at(w->children[i], px, py);
+        if (hit) return hit;
+    }
+    if (w->draggable && px >= w->ax && px < w->ax + w->aw &&
+        py >= w->ay && py < w->ay + w->ah)
+        return w;
+    return (ui_widget_t*)0;
+}
+
+/* Mark a widget as a drag source: its click is deferred to release and a
+ * press+move fires on_drag(w->ud) once. Used for "drag a tile to the dock". */
+void ui_widget_set_draggable(ui_widget_t* w, void (*on_drag)(void* ud)) {
+    if (!w) return;
+    w->draggable = 1;
+    w->on_drag   = on_drag;
+}
+
 /* ---- event loop ---- */
 
 __attribute__((no_stack_protector))
@@ -1175,11 +1211,28 @@ void ui_app_run(ui_app_t* app) {
                 app->cur_y = b;
                 int btn = (c & 1) ? 1 : 0;   /* bit0 = left button */
                 if (btn && !app->btn_prev) {
-                    /* 0->1 press edge: click dispatch from root. */
-                    dispatch_click(app, app->root, app->cur_x, app->cur_y);
+                    /* 0->1 press edge. If a DRAGGABLE widget is under the cursor,
+                     * arm it and DEFER its click to release; otherwise dispatch
+                     * the click immediately (unchanged for non-draggable). */
+                    ui_widget_t* dw = draggable_at(app->root, app->cur_x, app->cur_y);
+                    if (dw) {
+                        app->drag_armed = dw;
+                        app->press_x = app->cur_x;
+                        app->press_y = app->cur_y;
+                        app->dragging = 0;
+                    } else {
+                        dispatch_click(app, app->root, app->cur_x, app->cur_y);
+                    }
                 }
                 if (!btn && app->btn_prev) {
-                    /* 1->0 release edge: clear drag state. */
+                    /* 1->0 release edge. A deferred draggable click fires now iff
+                     * it was NOT promoted to a drag. */
+                    if (app->drag_armed) {
+                        if (!app->dragging)
+                            dispatch_click(app, app->root, app->press_x, app->press_y);
+                        app->drag_armed = (ui_widget_t*)0;
+                        app->dragging = 0;
+                    }
                     dispatch_release(app->root);
                 }
                 app->btn_prev = btn;
@@ -1199,8 +1252,19 @@ void ui_app_run(ui_app_t* app) {
             }
         }
 
-        /* (1b) While LMB held, update drag state. */
+        /* (1b) While LMB held, update drag state. Promote an armed draggable
+         * widget to a drag once the cursor moves past a small threshold, and
+         * fire its on_drag exactly once (the start menu uses this to hand a tile
+         * off to the dock). */
         if (app->btn_prev) {
+            if (app->drag_armed && !app->dragging) {
+                i32 dx = app->cur_x - app->press_x, dy = app->cur_y - app->press_y;
+                if (dx * dx + dy * dy > 36) {
+                    app->dragging = 1;
+                    if (app->drag_armed->on_drag)
+                        app->drag_armed->on_drag(app->drag_armed->ud);
+                }
+            }
             dispatch_drag(app, app->root);
         }
 

@@ -92,6 +92,15 @@ void ui_widget_set_bg(ui_widget_t* w, unsigned int bg);
 void ui_widget_set_fg(ui_widget_t* w, unsigned int fg);
 
 /*
+ * Mark a widget as a DRAG SOURCE. Its on_click is then DEFERRED to button
+ * release (and only fires if the press was not promoted to a drag); once the
+ * cursor moves past a small threshold while pressed, on_drag(w->ud) fires
+ * exactly once. Non-draggable widgets are unchanged (click on press). Used to
+ * drag a launcher tile out to the dock. on_drag may be NULL.
+ */
+void ui_widget_set_draggable(ui_widget_t* w, void (*on_drag)(void* ud));
+
+/*
  * Register a per-frame tick callback.  Before each frame is rendered,
  * ui_app_run() will call tick(ud) so the application can update labels
  * (e.g. a live clock).  Pass tick=NULL to clear a previously set callback.

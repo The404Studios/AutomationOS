@@ -353,6 +353,13 @@ void _start(void) {
     print("[INIT] Spawning modelbridge...\n");
     spawn("sbin/modelbridge");
 
+    // CLAUDE-API-0: claudehost -- send a prompt to the host Claude broker over
+    // the slirp seam (10.0.2.2:8432) and print Claude's reply. SKIPs cleanly
+    // when net/broker absent. Run `python3 scripts/claude_broker.py` on the
+    // host (with ANTHROPIC_API_KEY set, for a real billed call) + boot -netdev.
+    print("[INIT] Spawning claudehost (USE Claude over the network)...\n");
+    spawn("sbin/claudehost");
+
     // cpu1offload: userspace -> CPU1 matmul offload probe. On the SMP kernel it
     // offloads an int matmul to CPU1 (the trusted coprocessor) via SYS_CPU1_OFFLOAD
     // and prints "CPU1OFFLOAD: PASS ... by_apic=1"; on the DEFAULT (single-core)
@@ -413,9 +420,9 @@ void _start(void) {
 
     // Network manager + web browser GUIs (open windows; user-facing net apps).
     // PERSISTENT desktop apps -- spawned in BOTH the full and minimal builds.
-    print("[INIT] Spawning netman + browser...\n");
+    print("[INIT] Spawning netman + browser2...\n");
     spawn("sbin/netman");
-    spawn("sbin/browser");
+    spawn("sbin/browser2");   // BROWSER-CONSOLIDATE-0: the one real (DOM/CSS/JS/HTTPS) browser
 
 #ifndef DESKTOP_MINIMAL
     // Browser wave (22-agent): per-layer selftests + the new DOM-rendering
@@ -427,7 +434,11 @@ void _start(void) {
     spawn("sbin/csstest");
     spawn("sbin/layouttest");
     spawn("sbin/webtest");
-    spawn("sbin/browser2");
+    // BROWSER-PERSIST-0: the pipeline self-test runs browser2 in bounded
+    // "--smoke" mode (render about:home once, print the verdict, exit) so it
+    // gates the web stack without leaving a second browser window open. The
+    // user-facing desktop browser above (line 425, no arg) stays persistent.
+    spawn_args("sbin/browser2", "--smoke");
     // BROWSER2-IMG-0: a second bounded browser2 run on the built-in
     // about:imgtest page (local PNG/GIF/BMP fixtures + a missing source +
     // a wider-than-viewport image). Prints "BROWSER2-IMG: PASS png=1 gif=1
@@ -500,6 +511,20 @@ void _start(void) {
 #endif  // !DESKTOP_MINIMAL (self-test storm, part B)
 
     print("[INIT] All services started!\n");
+
+#ifdef FAIRTEST
+    // SCHED-FAIRNESS-0 proof (build FAIRTEST=1 PREEMPT=1 DESKTOP_MINIMAL=1).
+    // Spawn pure non-syscalling ring-3 burners (sbin/pureburn) + a sleeper
+    // (sbin/fairwake). With no compositor and init about to block in waitpid on
+    // the never-exiting burners, NOTHING provides a cooperative-switch boundary,
+    // so fairwake's post-sleep RESUME_CRETURN wake is dispatchable ONLY via the
+    // IRQ-path fairness fix. It prints "FAIRWAKE: PASS" iff the fix works; under
+    // the old (buggy) scheduler it is starved forever and prints nothing.
+    print("[INIT] FAIRTEST: 2 pure burners + 1 sleeper...\n");
+    spawn_args("sbin/pureburn", "0");
+    spawn_args("sbin/pureburn", "1");
+    spawn("sbin/fairwake");
+#endif
 
 #ifdef GAMETEST_RUN
     /* Empirical "every app actually runs" harness: spawns each game + key app,

@@ -174,6 +174,8 @@ cc userspace/apps/agenthost/agenthost.c /tmp/agenthost.o; $LD /tmp/crt0.o /tmp/a
 cc userspace/apps/tool_read/tool_read.c   /tmp/tool_read.o;   $LD /tmp/crt0.o /tmp/tool_read.o   -o /tmp/tool_read.elf
 cc userspace/apps/tool_ls/tool_ls.c       /tmp/tool_ls.o;     $LD /tmp/crt0.o /tmp/tool_ls.o     -o /tmp/tool_ls.elf
 cc userspace/apps/tool_stat/tool_stat.c   /tmp/tool_stat.o;   $LD /tmp/crt0.o /tmp/tool_stat.o   -o /tmp/tool_stat.elf
+# CLAUDE-CODE-0: scripted code agent (write -> compile -> execute proof).
+cc userspace/apps/codeagent/codeagent.c   /tmp/codeagent.o;   $LD /tmp/crt0.o /tmp/codeagent.o   -o /tmp/codeagent.elf
 cc userspace/apps/toolset_host/toolset_host.c /tmp/toolset_host.o; $LD /tmp/crt0.o /tmp/toolset_host.o -o /tmp/toolset_host.elf
 # CHAINLAYER-HOST-0: model-in-the-loop tool decision -- a (stub) model chooses a
 # tool as JSON, the host parses+validates it (whitelist + path policy), the tool
@@ -183,6 +185,29 @@ cc userspace/apps/chainhost/chainhost.c /tmp/chainhost.o; $LD /tmp/crt0.o /tmp/c
 # scripts/model_server_stub.py standing in for llama.cpp). Same parser/whitelist/
 # policy/runner as chainhost; SKIPs (bounded) when net/endpoint absent.
 cc userspace/apps/modelbridge/modelbridge.c /tmp/modelbridge.o; $LD /tmp/crt0.o /tmp/modelbridge.o -o /tmp/modelbridge.elf
+# NEMOTRON-AGENT: agentd -- the OS-side MULTI-STEP agentic loop over a persistent
+# slirp connection to the host Nemotron broker (scripts/nemotron_broker.js [Puter
+# free] or nemotron_mock.py, TCP 10.0.2.2:8433). GOAL/TOOL/RESULT/DONE; every tool
+# gated (whitelist+path) then dispatched over the same P6c runner rail as modelbridge.
+cc userspace/apps/agentd/agentd.c /tmp/agentd.o; $LD /tmp/crt0.o /tmp/agentd.o -o /tmp/agentd.elf
+# NEMOTRON-AGENT Phase 2: the 10 GATED tools agentd dispatches (the hands). Each is a
+# freestanding argv-driven app that SELF-GATES (path_write_allowed) -- defense-in-depth
+# behind agentd's resolve_tool whitelist. run-open-code: tool_write/tool_cc/tool_exec;
+# files: tool_mkdir/tool_mv/tool_rm; apps/system: tool_spawn/tool_kill/tool_ps; tool_shell.
+cc userspace/apps/tool_write/tool_write.c /tmp/tool_write.o; $LD /tmp/crt0.o /tmp/tool_write.o -o /tmp/tool_write.elf
+cc userspace/apps/tool_cc/tool_cc.c       /tmp/tool_cc.o;    $LD /tmp/crt0.o /tmp/tool_cc.o    -o /tmp/tool_cc.elf
+cc userspace/apps/tool_exec/tool_exec.c   /tmp/tool_exec.o;  $LD /tmp/crt0.o /tmp/tool_exec.o  -o /tmp/tool_exec.elf
+cc userspace/apps/tool_mkdir/tool_mkdir.c /tmp/tool_mkdir.o; $LD /tmp/crt0.o /tmp/tool_mkdir.o -o /tmp/tool_mkdir.elf
+cc userspace/apps/tool_mv/tool_mv.c       /tmp/tool_mv.o;    $LD /tmp/crt0.o /tmp/tool_mv.o    -o /tmp/tool_mv.elf
+cc userspace/apps/tool_rm/tool_rm.c       /tmp/tool_rm.o;    $LD /tmp/crt0.o /tmp/tool_rm.o    -o /tmp/tool_rm.elf
+cc userspace/apps/tool_spawn/tool_spawn.c /tmp/tool_spawn.o; $LD /tmp/crt0.o /tmp/tool_spawn.o -o /tmp/tool_spawn.elf
+cc userspace/apps/tool_kill/tool_kill.c   /tmp/tool_kill.o;  $LD /tmp/crt0.o /tmp/tool_kill.o  -o /tmp/tool_kill.elf
+cc userspace/apps/tool_ps/tool_ps.c       /tmp/tool_ps.o;    $LD /tmp/crt0.o /tmp/tool_ps.o    -o /tmp/tool_ps.elf
+cc userspace/apps/tool_shell/tool_shell.c /tmp/tool_shell.o; $LD /tmp/crt0.o /tmp/tool_shell.o -o /tmp/tool_shell.elf
+# CLAUDE-API-0: claudehost -- raw TCP over the slirp seam to the host Claude
+# broker (scripts/claude_broker.py), which holds the API key + does the real
+# HTTPS to api.anthropic.com. Same socket-only link as modelbridge.
+cc userspace/apps/claudehost/claudehost.c /tmp/claudehost.o; $LD /tmp/crt0.o /tmp/claudehost.o -o /tmp/claudehost.elf
 # INITRD-ALIAS-0 regression pair: initrdp (tiny pristine reader) + initrdalias
 # (16 MiB-pad big-image + mmap-heavy reader; spawns initrdp; prints the
 # INITRD-ALIAS verdict). Both compare the initrd-staged t.png byte-for-byte
@@ -343,6 +368,8 @@ cc userspace/tests/batchdemo.c /tmp/batchdemo.o; $LD /tmp/crt0.o /tmp/batchdemo.
 cc userspace/tests/threadprobe.c /tmp/threadprobe.o; $LD /tmp/crt0.o /tmp/threadprobe.o -o /tmp/threadprobe.elf
 # apidemo: fetch http(s) URL + pretty-print JSON (crt0+main; HTTPS + json).
 cc userspace/apps/apidemo/apidemo.c /tmp/apidemo.o; $LD /tmp/crt0.o /tmp/apidemo.o /tmp/json.o $HTTPS_OBJS -o /tmp/apidemo.elf
+# gsignin: "Sign in with Google" via OAuth 2.0 Device Flow (RFC 8628); HTTPS POST + json.
+cc userspace/apps/gsignin/gsignin.c /tmp/gsignin.o; $LD /tmp/crt0.o /tmp/gsignin.o /tmp/json.o $HTTPS_OBJS -o /tmp/gsignin.elf
 
 # ---- JavaScript engine (from-scratch ES5-subset interpreter) ----
 echo "[all] JavaScript engine..."
@@ -475,15 +502,16 @@ build_ui_app userspace/apps/applauncher/applauncher.c applauncher
 build_ui_app userspace/apps/taskman/taskman.c         taskman
 build_ui_app userspace/apps/startmenu/startmenu.c     startmenu
 build_ui_app userspace/apps/controlcenter/controlcenter.c controlcenter
+# CLAUDE-APP-0: Claude chat window + Anthropic control panel (broker seam).
+build_ui_app userspace/apps/claudechat/claudechat.c   claudechat
+build_ui_app userspace/apps/anthropic/anthropic.c     anthropic
 
 echo "[all] network apps (netman + browser)..."
 # netman: network manager (ui toolkit + dns lib). Links like a ui app + dns.o.
 cc userspace/apps/netman/netman.c /tmp/netman.o
 $LD /tmp/netman.o /tmp/ui.o /tmp/wlc.o /tmp/bf.o /tmp/font2.o /tmp/dns.o -o /tmp/netman.elf
-# browser: wl-direct web browser (HTTP + HTTPS + simplified HTML render). Links
-# the full HTTPS stack (http+dns+deflate+tlsconn+crypto/tls) + wl+bf.
-cc userspace/apps/browser/browser.c /tmp/browser.o
-$LD /tmp/browser.o $HTTPS_OBJS /tmp/wlc.o /tmp/bf.o -o /tmp/browser.elf
+# BROWSER-CONSOLIDATE-0: the legacy text-only 'browser' (no DOM/CSS/JS) was REMOVED.
+# browser2 (full DOM/CSS/JS/layout/images + real HTTPS) is the one real browser.
 
 echo "[all] wl-direct apps..."
 # terminal: terminal_m3 + sh_git (native git-like VCS) + wl + bitfont
@@ -578,7 +606,7 @@ $LD /tmp/crt0.o /tmp/cc.o \
     -o /tmp/cc.elf
 
 echo "[all] canary check (all must be 0):"
-for e in comp init filemanager calculator clock sysinfo settings sysmon uidemo dateapp applauncher taskman terminal editor snake paint synth tetris game2048 sheet notes calendar stopwatch mines piano dashboard welcome bench breakout pong invaders procmon soundtest solitaire aiconsole screenshot stress musicplayer ide bubbletd zombietd pacman clockapp forktest sigtest pollselftest threadtest reaploop forkfdtest forkregtest matmuljobs aibroker sed awk tar pkg make meminfo argvtest msgtest rpctest toolrun echoproof echoargs agenthost tool_read tool_ls tool_stat toolset_host chainhost modelbridge initrdp initrdalias floattest sleeptest prioritytest matbench tensortest cpuburn blk ps kill free uptime find diff cmp tee wcx xargs gzip cc nettest sockettest cpu1offload smpstress wget netman browser cryptotest libtest ping nc netinfo netscan tcping dig httpget pktmon httpd traceroute arp grep head tail sort uniq cut tr nl du touch basename dirname uname hostname whoami date less hexdump lspci tlsprobe certtool dhcpc autodhcp apidemo js futextest epolltest sendfiletest perftest batchtest domtest htmltest csstest layouttest webtest browser2 webapitest cube3d ray chess asteroids sudoku photos startmenu controlcenter gametest exectest execchild; do
+for e in comp init filemanager calculator clock sysinfo settings sysmon uidemo dateapp applauncher taskman terminal editor snake paint synth tetris game2048 sheet notes calendar stopwatch mines piano dashboard welcome bench breakout pong invaders procmon soundtest solitaire aiconsole screenshot stress musicplayer ide bubbletd zombietd pacman clockapp forktest sigtest pollselftest threadtest reaploop forkfdtest forkregtest matmuljobs aibroker sed awk tar pkg make meminfo argvtest msgtest rpctest toolrun echoproof echoargs agenthost tool_read tool_ls tool_stat codeagent toolset_host chainhost modelbridge agentd tool_write tool_cc tool_exec tool_mkdir tool_mv tool_rm tool_spawn tool_kill tool_ps tool_shell claudehost initrdp initrdalias floattest sleeptest prioritytest matbench tensortest cpuburn blk ps kill free uptime find diff cmp tee wcx xargs gzip cc nettest sockettest cpu1offload smpstress wget netman cryptotest libtest ping nc netinfo netscan tcping dig httpget pktmon httpd traceroute arp grep head tail sort uniq cut tr nl du touch basename dirname uname hostname whoami date less hexdump lspci tlsprobe certtool dhcpc autodhcp apidemo gsignin js futextest epolltest sendfiletest perftest batchtest domtest htmltest csstest layouttest webtest browser2 webapitest cube3d ray chess asteroids sudoku photos startmenu controlcenter claudechat anthropic gametest exectest execchild; do
     n=$(objdump -d /tmp/$e.elf 2>/dev/null | grep -c "fs:0x28" || true)
     echo "  $e=$n"
 done
@@ -595,9 +623,12 @@ rm -rf /tmp/ird && mkdir -p /tmp/ird/sbin /tmp/ird/bin
 # SELFHEAL build. On a non-SELFHEAL build, drop it so the default initrd never
 # ships the watchdog (preserves the byte-for-byte-unchanged default image).
 if [ "${SELFHEAL:-0}" != "1" ]; then rm -f /tmp/ird/sbin/cwatchdog; fi
+# BROWSER-CONSOLIDATE-0: the seed above can carry the REMOVED legacy text-only
+# 'browser'; purge it so only browser2 (the real DOM/CSS/JS/HTTPS browser) ships.
+rm -f /tmp/ird/sbin/browser /tmp/ird/bin/browser
 cp /tmp/comp.elf /tmp/ird/sbin/compositor
 cp /tmp/init.elf /tmp/ird/sbin/init
-for e in filemanager calculator clock sysinfo settings sysmon uidemo dateapp applauncher taskman terminal editor snake paint synth tetris game2048 sheet notes calendar stopwatch mines piano dashboard welcome bench breakout pong invaders procmon soundtest solitaire aiconsole screenshot stress musicplayer ide bubbletd startmenu controlcenter chess asteroids sudoku photos pacman clockapp zombietd forktest sigtest pollselftest threadtest reaploop forkfdtest forkregtest matmuljobs cube3d ray derby exectest; do
+for e in filemanager calculator clock sysinfo settings sysmon uidemo dateapp applauncher taskman terminal editor snake paint synth tetris game2048 sheet notes calendar stopwatch mines piano dashboard welcome bench breakout pong invaders procmon soundtest solitaire aiconsole screenshot stress musicplayer ide bubbletd startmenu controlcenter claudechat anthropic chess asteroids sudoku photos pacman clockapp zombietd forktest sigtest pollselftest threadtest reaploop forkfdtest forkregtest matmuljobs cube3d ray derby exectest; do
     cp /tmp/$e.elf /tmp/ird/sbin/$e
 done
 [ "$IV_OK" = "1" ] && cp /tmp/imageviewer.elf /tmp/ird/sbin/imageviewer
@@ -631,11 +662,30 @@ cp /tmp/agenthost.elf /tmp/ird/sbin/agenthost
 cp /tmp/tool_read.elf /tmp/ird/sbin/tool_read
 cp /tmp/tool_ls.elf   /tmp/ird/sbin/tool_ls
 cp /tmp/tool_stat.elf /tmp/ird/sbin/tool_stat
+cp /tmp/codeagent.elf /tmp/ird/sbin/codeagent
 cp /tmp/toolset_host.elf /tmp/ird/sbin/toolset_host
 # CHAINLAYER-HOST-0 -> /sbin (init spawns it; the model seam over the tool surface).
 cp /tmp/chainhost.elf /tmp/ird/sbin/chainhost
 # MODEL-BRIDGE-0 -> /sbin (init spawns it; the seam fed by the external endpoint).
 cp /tmp/modelbridge.elf /tmp/ird/sbin/modelbridge
+# NEMOTRON-AGENT -> /sbin and /bin (the multi-step gated agent loop; runnable from
+# the terminal with a goal arg, also temp-spawnable at boot for the mock proof).
+cp /tmp/agentd.elf /tmp/ird/sbin/agentd
+cp /tmp/agentd.elf /tmp/ird/bin/agentd
+# NEMOTRON-AGENT Phase 2 gated tools -> /sbin (agentd's resolve_tool dispatches these).
+cp /tmp/tool_write.elf /tmp/ird/sbin/tool_write
+cp /tmp/tool_cc.elf    /tmp/ird/sbin/tool_cc
+cp /tmp/tool_exec.elf  /tmp/ird/sbin/tool_exec
+cp /tmp/tool_mkdir.elf /tmp/ird/sbin/tool_mkdir
+cp /tmp/tool_mv.elf    /tmp/ird/sbin/tool_mv
+cp /tmp/tool_rm.elf    /tmp/ird/sbin/tool_rm
+cp /tmp/tool_spawn.elf /tmp/ird/sbin/tool_spawn
+cp /tmp/tool_kill.elf  /tmp/ird/sbin/tool_kill
+cp /tmp/tool_ps.elf    /tmp/ird/sbin/tool_ps
+cp /tmp/tool_shell.elf /tmp/ird/sbin/tool_shell
+# CLAUDE-API-0 -> /sbin and /bin (init spawns it; also runnable from the terminal).
+cp /tmp/claudehost.elf /tmp/ird/sbin/claudehost
+cp /tmp/claudehost.elf /tmp/ird/bin/claudehost
 # INITRD-ALIAS-0 regression pair -> /sbin (init spawns initrdalias; it spawns initrdp).
 cp /tmp/initrdp.elf /tmp/ird/sbin/initrdp
 cp /tmp/initrdalias.elf /tmp/ird/sbin/initrdalias
@@ -691,12 +741,11 @@ done
 for t in domtest htmltest csstest layouttest webtest browser2 webapitest; do
     cp /tmp/$t.elf /tmp/ird/sbin/$t
 done
-# wget is a CLI tool (/bin); netman + browser are GUI apps (/sbin, dock-launchable).
+# wget is a CLI tool (/bin); netman is a GUI app (/sbin, dock-launchable).
 cp /tmp/wget.elf    /tmp/ird/bin/wget
 cp /tmp/netman.elf  /tmp/ird/sbin/netman
-cp /tmp/browser.elf /tmp/ird/sbin/browser
 # net tools + coreutils expansion -> /bin (shell-spawnable).
-for t in ping nc netinfo netscan tcping dig httpget pktmon httpd traceroute arp grep head tail sort uniq cut tr nl du touch basename dirname uname hostname whoami date less hexdump lspci tlsprobe certtool dhcpc apidemo js; do
+for t in ping nc netinfo netscan tcping dig httpget pktmon httpd traceroute arp grep head tail sort uniq cut tr nl du touch basename dirname uname hostname whoami date less hexdump lspci tlsprobe certtool dhcpc apidemo gsignin js; do
     cp /tmp/$t.elf /tmp/ird/bin/$t
 done
 # KAT self-test harnesses -> /sbin (init spawns them at boot).

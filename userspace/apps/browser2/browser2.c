@@ -1512,13 +1512,27 @@ int main(int argc, char **argv)
      * loads -- without the unstable startup fetch. argv[1] overrides. */
     const char *default_url = "about:home";
     (void)interactive;
+    /* BROWSER-PERSIST-0: a bare or desktop launch is a PERSISTENT interactive
+     * browser -- it stays open, the address bar navigates, scroll works, and
+     * it never auto-exits. The bounded render-once-then-exit self-test runs
+     * only for "--smoke" (the build's browser-pipeline check) and for the
+     * about:imgtest fixture (the BROWSER2-IMG-0 image check). */
+    int smoke = 0;
     if (argc >= 2 && argv[1] && argv[1][0]) {
-        b2_normalize_input(argv[1], url, URL_CAP);
+        if (b2_strncasecmp(argv[1], "--smoke", 7) == 0 && argv[1][7] == 0) {
+            smoke = 1;   /* bounded self-test on the default about:home page */
+            int i = 0;
+            while (default_url[i] && i < URL_CAP - 1) { url[i] = default_url[i]; i++; }
+            url[i] = 0;
+        } else {
+            b2_normalize_input(argv[1], url, URL_CAP);
+        }
     } else {
         int i = 0;
         while (default_url[i] && i < URL_CAP - 1) { url[i] = default_url[i]; i++; }
         url[i] = 0;
     }
+    if (b2_strncasecmp(url, "about:imgtest", 13) == 0 && url[13] == 0) smoke = 1;
 
     b2_puts("BROWSER2: fetching ");
     b2_puts(url);
@@ -1879,9 +1893,11 @@ int main(int argc, char **argv)
             reported = 1;
         }
 
-        /* -- 9f. Bounded exit + frame pacing (never block on input) -- */
+        /* -- 9f. Frame pacing (never block on input). In SMOKE mode the run
+         * is bounded by `deadline`; the persistent interactive browser never
+         * exits on a timer -- only the user (or a fatal teardown) ends it. -- */
         now = sc(SYS_GET_TICKS_MS, 0, 0, 0, 0, 0, 0);
-        if (now >= deadline) break;
+        if (smoke && now >= deadline) break;
 
         /* Pace to ~FRAME_MS by yielding; if the scroll is settling we keep
          * spinning for smoothness, otherwise yield to be a good citizen. */
@@ -1889,7 +1905,7 @@ int main(int argc, char **argv)
         do {
             sc(SYS_YIELD, 0, 0, 0, 0, 0, 0);
             now = sc(SYS_GET_TICKS_MS, 0, 0, 0, 0, 0, 0);
-        } while (now < frame_end && now < deadline);
+        } while (now < frame_end && (!smoke || now < deadline));
     }
 
     /* -- 10. Teardown ----------------------------------------------------- */

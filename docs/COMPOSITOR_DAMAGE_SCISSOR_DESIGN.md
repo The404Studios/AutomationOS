@@ -1,6 +1,12 @@
 # Compositor Damage-Scissor Design (IDE-open lag fix)
 
-**Status:** designed + adversarially reviewed (5 pitfalls resolved), NOT yet implemented.
+**Status:** IMPLEMENTED + ON by default (`COMP_DAMAGE_SCISSOR=1`) in `compositor_m8.c`.
+All 10 steps below landed: accumulator + helpers (~L281-322), rasterizer clamps in
+`fill_rect`/`blend_rect`/the blit loops/`cz_text`/`render_window_static`, per-message damage in
+`handle_commit` (~L4033), and frame-loop scissor activation with a full-screen cooldown (~L5603-5623).
+Verified 2026-06-13 (brick B6): both gate states compile and the gate changes codegen
+(`cm8` on/off `.o` md5 differ), so the clamps are live, not no-ops. (Original "not yet implemented"
+status was stale.)
 **Goal:** the desktop must stay fast when the IDE window is open. Today it drops to
 ~20 fps (~50 ms/frame) because `composite()` unconditionally re-blits **every** window
 (opaque blit + 4-layer soft-shadow + alpha) on every dirty frame, even when only the

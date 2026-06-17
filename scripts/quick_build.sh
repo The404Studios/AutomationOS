@@ -97,15 +97,20 @@ NASMFLAGS=""
 KERNEL_OUT="build/kernel.elf"
 
 # =============================================================================
-# OPT-IN PREEMPTIVE SCHEDULER (experimental). GATED behind the PREEMPT env var.
+# OPT-IN PREEMPTIVE SCHEDULER. GATED behind the PREEMPT env var.
 #   PREEMPT=1 bash scripts/quick_build.sh   ->  build/kernel-preempt.elf
-# When PREEMPT is UNSET this whole block is skipped and the build behaves
-# EXACTLY as before: cooperative scheduler, build/kernel.elf, no -DPREEMPTIVE.
-# We add -DPREEMPTIVE to BOTH the nasm flags (so interrupt.asm + context_switch.asm
-# assemble their %ifdef PREEMPTIVE blocks: irq0_preempt / context_save_irq /
-# context_load_irq) AND the gcc CFLAGS (so scheduler.c compiles schedule_from_irq
-# and idt.c points IDT[32] at irq0_preempt), and write to a SEPARATE output so
-# the normal build/kernel.elf is never touched by a preemptive build.
+#
+# B7 STATUS: PREEMPT-WAITSAFE-0 made the wait infra preemption-safe and a 30-min
+# soak passed, BUT the os-quality-sweep audit found a REMAINING fairness hole that
+# blocks making PREEMPT the default: schedule_from_irq (scheduler.c ~:3116) can
+# only resume a RESUME_IRETQ successor, so a just-woken/just-yielded RESUME_CRETURN
+# task is re-enqueued-but-never-dispatched behind a PURE non-syscalling ring-3
+# compute loop (the soak's cpuburn masked this via its heartbeat syscalls). The
+# default stays COOPERATIVE until that starvation is fixed (anti-starvation counter
+# / deferred cooperative handoff). -DPREEMPTIVE -> BOTH nasm (irq0_preempt /
+# context_save_irq / context_load_irq) AND gcc CFLAGS (schedule_from_irq, idt.c
+# IDT[32], handlers.c WAIT_RECHECK_MS timed blocks); separate output keeps the
+# default build/kernel.elf untouched.
 # =============================================================================
 if [ "${PREEMPT:-0}" = "1" ]; then
     CFLAGS="$CFLAGS -DPREEMPTIVE"

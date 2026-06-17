@@ -44,6 +44,7 @@
  */
 
 #include "../../lib/ui/ui.h"
+#include "../../include/dockdnd.h"   /* DOCK-DND-1: Start-menu -> dock handoff */
 
 /* -------------------------------------------------------------------------
  * Syscall numbers (kernel/include/syscall.h)
@@ -51,8 +52,13 @@
 #define SYS_EXIT      0
 #define SYS_WRITE     3
 #define SYS_SPAWN     16
+#define SYS_SHMGET    18
+#define SYS_SHMAT     19
 #define SYS_POWEROFF  46
 #define SYS_REBOOT    47
+
+/* DOCK-DND-1: the compositor-owned drag handoff page (attached lookup-only). */
+static volatile dockdnd_shm_t *g_dnd = (volatile dockdnd_shm_t *)0;
 
 /* -------------------------------------------------------------------------
  * Inline syscall (3-arg; no fs:0x28 canary -- -fno-stack-protector)
@@ -144,15 +150,17 @@ static void k_strncpy_pad(char *dst, const char *src, int dstsz)
 #define TILE_W       62
 #define TILE_H       62
 #define TILE_GAP      6
-#define PIN_ROWS      4   /* 8 cols * 4 rows = 32 pinned slots */
+#define PIN_ROWS      5   /* CLAUDE-APP-0: 5th row holds Claude + Anthropic (2 tiles) */
 
 /* Grid origin: centre the 8-column grid */
 #define GRID_TOTAL_W  (PIN_COLS * TILE_W + (PIN_COLS - 1) * TILE_GAP)
 #define GRID_X_ORIGIN ((WIN_W - GRID_TOTAL_W) / 2)   /* = (600-520)/2 = 40 */
 
-/* "Recommended" section (one row, scrollable) */
-#define REC_LABEL_Y  352
-#define REC_GRID_Y   372
+/* "Recommended" section (one row, scrollable).
+ * CLAUDE-APP-0: shifted down 68px to clear the new 5th pinned row (Y 352-414).
+ * REC now spans ~440-498, still above the power row at Y=508 (bottom 544 < 560). */
+#define REC_LABEL_Y  420
+#define REC_GRID_Y   440
 #define REC_ROWS      2
 #define REC_TILE_W    86
 #define REC_TILE_H    26
@@ -179,13 +187,13 @@ typedef struct {
  * Pulled from applauncher.c + extended with additional apps discovered in
  * the build list.  Icon colours loosely follow Win-11 accent palette.
  * ----------------------------------------------------------------------- */
-#define PIN_COUNT 32
+#define PIN_COUNT 34   /* CLAUDE-APP-0: 32 + Claude chat + Anthropic panel */
 
 static app_entry_t g_pinned[PIN_COUNT];
 
 static const char *PIN_PATHS[PIN_COUNT] = {
     /* row 0 */
-    "sbin/terminal",    "sbin/filemanager", "sbin/browser",     "sbin/ide",
+    "sbin/terminal",    "sbin/filemanager", "sbin/browser2",    "sbin/ide",
     "sbin/settings",    "sbin/calculator",  "sbin/clock",       "sbin/paint",
     /* row 1 */
     "sbin/editor",      "sbin/sysmon",      "sbin/mines",       "sbin/game2048",
@@ -196,6 +204,8 @@ static const char *PIN_PATHS[PIN_COUNT] = {
     /* row 3 */
     "sbin/taskman",     "sbin/sysinfo",     "sbin/procmon",     "sbin/soundtest",
     "sbin/gallery",     "sbin/screenshot",  "sbin/dateapp",     "sbin/powermenu",
+    /* row 4 -- CLAUDE-APP-0 */
+    "sbin/claudechat",  "sbin/anthropic",
 };
 static const char *PIN_LABELS[PIN_COUNT] = {
     "Terminal", "Files",   "Browser", "IDE",
@@ -206,12 +216,14 @@ static const char *PIN_LABELS[PIN_COUNT] = {
     "Tracker",  "Kanban",  "Reader",  "Bench",
     "TaskMgr",  "SysInfo", "ProcMon", "Sound",
     "Gallery",  "Screenshot","Date",  "Power",
+    "Claude",   "Anthropic",
 };
 static const char PIN_ICON_CHAR[PIN_COUNT] = {
     'T','F','B','I',  'S','#','O','P',
     'E','M','X','2',  'K','G','V','J',
     'N','C','m','A',  'k','K','R','~',
     'Z','?','@','!',  'L','Q','D','^',
+    'C','A',
 };
 static const unsigned int PIN_ICON_COL[PIN_COUNT] = {
     0xFF0078D4, 0xFF107C10, 0xFFFF7700, 0xFF5C2D91,
@@ -222,6 +234,7 @@ static const unsigned int PIN_ICON_COL[PIN_COUNT] = {
     0xFF744DA9, 0xFF0099BC, 0xFFA4262C, 0xFF555555,
     0xFF555555, 0xFF0078D4, 0xFF107C10, 0xFF5C2D91,
     0xFF744DA9, 0xFF555555, 0xFFD83B01, 0xFFC50F1F,
+    0xFFD97757, 0xFFB8865A,
 };
 
 /* -------------------------------------------------------------------------
@@ -272,6 +285,33 @@ static void on_pin_click(void *ud)
     serial_print("\n");
     sc(SYS_SPAWN, (long)e->path, 0L, 0L);
     sc(SYS_EXIT,  0L, 0L, 0L);
+}
+
+/* DOCK-DND-1: the user started DRAGGING a tile. Hand the app off to the
+ * compositor via the SHM page (it owns the cursor + dock) and close the menu;
+ * the compositor renders the drag ghost and, on release over the dock, pins it. */
+static void on_tile_drag(void *ud)
+{
+    app_entry_t *e = (app_entry_t *)ud;
+    if (!g_dnd || g_dnd->magic != DOCKDND_MAGIC) {
+        /* no handoff page -> fall back to launching (don't strand the user) */
+        sc(SYS_SPAWN, (long)e->path, 0L, 0L);
+        sc(SYS_EXIT,  0L, 0L, 0L);
+        return;
+    }
+    g_dnd->active = 0;                                   /* fill fields first */
+    int i = 0;
+    for (; i < 63 && e->path[i]; i++) g_dnd->path[i] = e->path[i];
+    g_dnd->path[i]  = 0;
+    g_dnd->label[0] = e->icon_char;
+    g_dnd->label[1] = 0;
+    g_dnd->color    = e->icon_color;
+    g_dnd->claimed  = 0;
+    g_dnd->active   = 1;                                  /* publish LAST */
+    serial_print("[STARTMENU] drag-to-dock ");
+    serial_print(e->path);
+    serial_print("\n");
+    sc(SYS_EXIT, 0L, 0L, 0L);   /* compositor now owns the drag ghost + drop */
 }
 
 /* Power row */
@@ -352,6 +392,16 @@ static void on_tick_full(void *ud)
 void _start(void)
 {
     serial_print("[STARTMENU] starting\n");
+
+    /* DOCK-DND-1: attach the compositor-owned drag handoff page (lookup-only:
+     * the compositor created it; we never IPC_CREAT here). */
+    {
+        long id = sc(SYS_SHMGET, (long)DOCKDND_SHM_KEY, (long)DOCKDND_SHM_SIZE, 0);
+        if (id >= 0) {
+            long p = sc(SYS_SHMAT, id, 0, 0);
+            if (p > 0) g_dnd = (volatile dockdnd_shm_t *)p;
+        }
+    }
 
     /* Populate app tables */
     for (int i = 0; i < PIN_COUNT; i++) {
@@ -437,9 +487,11 @@ void _start(void)
             g_pin_label_w[i] = ui_label(tile, lx, 42, g_pinned[i].label,
                                         COL_SUBTEXT);
 
-            /* Invisible click button covering the whole tile */
-            ui_button(tile, 0, 0, TILE_W, TILE_H, "",
+            /* Invisible click button covering the whole tile. Also a DRAG
+             * source (DOCK-DND-1): drag the tile onto the dock to pin the app. */
+            ui_widget_t *btn = ui_button(tile, 0, 0, TILE_W, TILE_H, "",
                       on_pin_click, (void *)&g_pinned[i]);
+            ui_widget_set_draggable(btn, on_tile_drag);
         }
     }
 

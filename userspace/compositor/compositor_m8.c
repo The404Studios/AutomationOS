@@ -839,10 +839,13 @@ static int32_t g_task_w = 0;   /* 0 = not yet computed (set before first use) */
  * M8: RIGHT-SIDE MACOS-STYLE VERTICAL DOCK
  * ====================================================================== */
 #define RDOCK_W          44    /* width of the right dock strip (px) — T410 fit */
-#define RDOCK_ICON_BASE  36    /* base (non-magnified) icon tile size (px)    */
-#define RDOCK_PAD         4    /* gap between icon tiles (px)                 */
+#define RDOCK_ICON_BASE  32    /* base (non-magnified) icon tile size (px)    */
+#define RDOCK_PAD         3    /* gap between icon tiles (px)                 */
 #define RDOCK_CORNER      8    /* rounded corner radius for icon tiles        */
-#define RDOCK_MARGIN_TOP 40    /* top margin inside the dock strip            */
+#define RDOCK_MARGIN_TOP 28    /* top margin inside the dock strip            */
+/* DESKTOP-REVAMP-0: icon 36->32 / pad 4->3 / margin 40->28 tightens the strip so
+ * 17 app icons + 2 folders (19 slots, stride 35) fit above the taskbar on the
+ * 800px-tall screen -- room for the new Claude + Anthropic dock icons. */
 
 /* Magnification parameters (fixed-point, all in Q8 / integers):
  *   scale = 1 + (MAX_EXTRA/256) * max(0, 1 - dy/INFLUENCE)
@@ -871,7 +874,7 @@ static int32_t g_task_w = 0;   /* 0 = not yet computed (set before first use) */
 #define RDOCK_FAN_SPARKLES    8   /* sparkle dots drawn around a hovered icon */
 
 /* Number of app entries and folders */
-#define RDOCK_NICONS  15
+#define RDOCK_NICONS  17   /* DESKTOP-REVAMP-0: +Claude chat +Anthropic panel */
 #define RDOCK_NFOLDERS 2
 
 /* App descriptor */
@@ -899,7 +902,7 @@ static const rdock_app_t rdock_apps[RDOCK_NICONS] = {
     { "Te", "sbin/terminal",    0xFF1E6FB5u },  /* 0  Terminal   */
     { "Fi", "sbin/filemanager", 0xFF2E8B57u },  /* 1  Files      */
     { "Id", "sbin/ide",         0xFF2D6A8Bu },  /* 2  IDE        */
-    { "Wb", "sbin/browser",     0xFF1565C0u },  /* 3  Browser    */
+    { "Wb", "sbin/browser2",    0xFF1565C0u },  /* 3  Browser    */
     { "Nm", "sbin/netman",      0xFF00897Bu },  /* 4  NetManager */
     { "St", "sbin/settings",    0xFF444466u },  /* 5  Settings   */
     { "Ca", "sbin/calculator",  0xFF555577u },  /* 6  Calculator */
@@ -911,6 +914,8 @@ static const rdock_app_t rdock_apps[RDOCK_NICONS] = {
     { "Pm", "sbin/pacman",      0xFFFFD60Au },  /* 12 Pac-Man    */
     { "C+", "sbin/clockapp",    0xFF0067C0u },  /* 13 Clock+     */
     { "Db", "sbin/derby",       0xFFD35400u },  /* 14 Derby 3D   */
+    { "Cc", "sbin/claudechat",  0xFFD97757u },  /* 15 Claude     */
+    { "An", "sbin/anthropic",   0xFFB8865Au },  /* 16 Anthropic  */
 };
 
 /* ---- Folder table (Games + Tools); members[] index into rdock_apps[] ---- */
@@ -972,12 +977,68 @@ static const char *g_menu_path[MENU_MAX];
 static int         g_menu_action[MENU_MAX];
 static int32_t menu_height(void) { return MENU_HDR_H + g_menu_n * MENU_ROW_H + 6; }
 
-static rdock_icon_state_t   g_rdock_icons[RDOCK_TOTAL];
-static rdock_folder_state_t g_rdock_folders[RDOCK_NFOLDERS];
+/* ---- Drag-and-drop dock (DOCK-DND-0): the const rdock_apps[]/rdock_folders[]
+ * are the SEED; the live dock is mutable so the user can drag icons, combine
+ * them into new boxes, and select them. Folders become runtime-mutable and the
+ * per-icon STATE arrays are oversized to a capacity so new boxes fit. ---- */
+#define DOCK_FOLDERS_MAX  8                          /* incl. the 2 seed folders */
+#define DOCK_MEMBERS_MAX  12                         /* apps a box can hold      */
+#define RDOCK_CAP  (RDOCK_NICONS + DOCK_FOLDERS_MAX) /* per-icon state capacity  */
+
+/* Mutable folder (seeded from the const rdock_folder_t at init). A member is
+ * either a catalog app (members[m] = index into rdock_apps[]) or, for an app
+ * dragged in from the Start menu, a free path (members[m] = -1, mpath[m] set). */
+typedef struct {
+    char     label[4];
+    uint32_t color;
+    int      members[DOCK_MEMBERS_MAX];          /* catalog index, or -1        */
+    char     mpath[DOCK_MEMBERS_MAX][64];        /* spawn path for members[m]==-1 */
+    int      nmembers;
+} dock_folder_t;
+
+static dock_folder_t g_folders[DOCK_FOLDERS_MAX];
+static int           g_nfolders = 0;                 /* live folder count        */
+static int           g_app_hidden[RDOCK_NICONS];     /* 1 = filed inside a box   */
+
+static rdock_icon_state_t   g_rdock_icons[RDOCK_CAP];
+static rdock_folder_state_t g_rdock_folders[DOCK_FOLDERS_MAX];
 static int32_t              g_rdock_hovered = -1;  /* -1 or index 0..TOTAL-1 */
 
 /* Which folder popover is open (-1 = none). Only one at a time. */
 static int32_t g_rdock_open_folder = -1;
+
+/* Live iteration bound over the idx space: apps 0..RDOCK_NICONS-1, then folders
+ * RDOCK_NICONS..RDOCK_NICONS+g_nfolders-1. Hidden apps are skipped by callers. */
+static int rdock_idx_end(void) { return RDOCK_NICONS + g_nfolders; }
+
+/* ---- DOCK-DND-0 drag + selection state (all inert until a drag begins) ---- */
+static int     g_dock_drag      = -1;   /* idx currently being dragged, or -1   */
+static int     g_dock_press_idx = -1;   /* idx pressed (pending click-or-drag)  */
+static int32_t g_dock_press_x = 0, g_dock_press_y = 0;  /* press position       */
+static int32_t g_dock_drag_x  = 0, g_dock_drag_y  = 0;  /* live ghost CENTER     */
+static int     g_dock_drop_tgt   = -1;  /* idx the ghost hovers as a drop target */
+static long    g_dock_drop_anim  = 0;   /* SYS_GET_TICKS_MS of the last drop pop */
+static int     g_dock_selected[RDOCK_CAP];   /* 1 = selected (highlighted)       */
+
+/* DOCK-DND-1: Start-menu -> dock drag handoff over a well-known SHM page. */
+#include "../include/dockdnd.h"
+#ifndef SYS_SHMGET
+#define SYS_SHMGET  18
+#endif
+static volatile dockdnd_shm_t *g_dnd = (volatile dockdnd_shm_t *)0;
+static int g_pinned_folder = -1;   /* idx of the auto-created "Pinned" box, or -1 */
+static int dock_path_ok(const char *p);   /* validate an SHM-sourced spawn path */
+
+/* The spawn path of folder [fidx] member [m]: a catalog app, or a Start-menu
+ * app dragged in (free path). Returns NULL if the slot is empty. */
+static const char *folder_member_path(int fidx, int m) {
+    dock_folder_t *f = &g_folders[fidx];
+    if (m < 0 || m >= f->nmembers) return (const char *)0;
+    int mi = f->members[m];
+    if (mi >= 0 && mi < RDOCK_NICONS) return rdock_apps[mi].path;
+    if (f->mpath[m][0]) return f->mpath[m];
+    return (const char *)0;
+}
 
 /* ====================================================================== *
  *  M8: DESKTOP ICONS  ("/Desktop" contents as labeled wallpaper icons)   *
@@ -1126,7 +1187,7 @@ static int g_cell_h = 20;
 #define FONT_W g_cell_w
 #define FONT_H g_cell_h
 static void cz_set_scale(int pct) {
-    if (pct < 50) pct = 50;
+    if (pct < 100) pct = 100;   /* UI-CRISP-0: integer-only (100/200); no fractional blur */
     if (pct > 200) pct = 200;
     g_ui_pct = pct;
     g_cell_w = 8  * pct / 100;
@@ -1584,7 +1645,7 @@ static void anim_tick(long now) {
         if (win->phase != PH_NONE || win->fade_alpha < 255) { mark_dirty(); break; }
     }
     if (g_toast_dur_ms > 0) mark_dirty();
-    for (int fi = 0; fi < RDOCK_NFOLDERS; fi++) {
+    for (int fi = 0; fi < g_nfolders; fi++) {
         rdock_folder_state_t *fs = &g_rdock_folders[fi];
         if (fs->open || fs->anim_closing || fs->anim_t > 0) {
             mark_dirty();
@@ -1598,7 +1659,7 @@ static void anim_tick(long now) {
             break;
         }
     }
-    for (int i = 0; i < RDOCK_TOTAL; i++) {
+    for (int i = 0; i < rdock_idx_end(); i++) {
         /* magnify scale still easing toward its target == visible motion */
         if (g_rdock_icons[i].bounce_active ||
             g_rdock_icons[i].scale_q8 != g_rdock_icons[i].scale_target) {
@@ -2762,7 +2823,11 @@ static int point_in(int32_t px, int32_t py, int32_t x, int32_t y, int32_t w, int
 static int rdock_visual_slot(int idx) {
     if (idx >= RDOCK_NICONS)               /* folder -> top */
         return idx - RDOCK_NICONS;
-    return RDOCK_NFOLDERS + idx;           /* app -> below the folders */
+    /* app -> below all live folders; count only VISIBLE (un-filed) apps before
+     * it so the strip closes the gap when an app is filed into a box. */
+    int slot = g_nfolders;
+    for (int i = 0; i < idx; i++) if (!g_app_hidden[i]) slot++;
+    return slot;
 }
 
 /* Return the un-magnified Y center of icon slot [idx] in the dock strip.
@@ -2850,7 +2915,7 @@ static int32_t rdock_bounce_offset(int slot, long now) {
 static void rdock_update_scales(int32_t cursor_x, int32_t cursor_y, uint32_t W) {
     int32_t strip_x = rdock_strip_x(W);
     int on_dock = (cursor_x >= strip_x);
-    for (int i = 0; i < RDOCK_TOTAL; i++) {
+    for (int i = 0; i < rdock_idx_end(); i++) {
         int32_t target;
         if (on_dock) {
             target = rdock_mag_scale(i, cursor_y);
@@ -2872,7 +2937,7 @@ static void rdock_update_scales(int32_t cursor_x, int32_t cursor_y, uint32_t W) 
 /* ---- Draw a 2x2 mini-grid inside a tile for folder icons ---- */
 static void draw_folder_grid(uint32_t *buf, uint32_t bw, uint32_t bh, uint32_t stride,
                              int32_t tx, int32_t ty, int32_t tsz, int fidx) {
-    const rdock_folder_t *f = &rdock_folders[fidx];
+    dock_folder_t *f = &g_folders[fidx];
     int32_t inner = tsz / 2 - 4;
     if (inner < 4) inner = 4;
     /* 2x2 sub-tiles */
@@ -2885,9 +2950,9 @@ static void draw_folder_grid(uint32_t *buf, uint32_t bw, uint32_t bh, uint32_t s
         int32_t gx = tx + 3 + gox[m] * (inner + 2);
         int32_t gy = ty + 3 + goy[m] * (inner + 2);
         /* member procedural icon (draws its own tile background) */
-        if (f->members[m] >= 0 && f->members[m] < RDOCK_NICONS) {
-            icon_for_app(buf, (int)stride, gx, gy, inner,
-                         rdock_apps[f->members[m]].path + 5);  /* skip "sbin/" */
+        const char *mp = folder_member_path(fidx, m);
+        if (mp) {
+            icon_for_app(buf, (int)stride, gx, gy, inner, mp + 5);  /* skip "sbin/" */
         } else {
             fill_round_rect(buf, bw, bh, stride, gx, gy, inner, inner, 3, gcols[m]);
         }
@@ -2918,10 +2983,10 @@ static void draw_folder_grid(uint32_t *buf, uint32_t bw, uint32_t bh, uint32_t s
 static int rdock_fan_member_rect(int fidx, int m, int32_t anim_t256, long now,
                                  uint32_t W, uint32_t H,
                                  int32_t *ox, int32_t *oy, int32_t *otile, int *omi) {
-    const rdock_folder_t *f = &rdock_folders[fidx];
+    dock_folder_t *f = &g_folders[fidx];
     if (m < 0 || m >= f->nmembers) return 0;
     int mi = f->members[m];
-    if (mi < 0 || mi >= RDOCK_NICONS) return 0;
+    if (!folder_member_path(fidx, m)) return 0;   /* catalog OR free-path member */
 
     int32_t tile = RDOCK_FAN_TILE;
     int dock_idx = RDOCK_NICONS + fidx;
@@ -3013,7 +3078,7 @@ static void rdock_draw_sparkles(uint32_t *buf, uint32_t bw, uint32_t bh, uint32_
 static void draw_folder_fanout(uint32_t *buf, uint32_t bw, uint32_t bh, uint32_t stride,
                                int fidx, uint32_t W, uint32_t H,
                                int32_t anim_t256, int32_t cur_x, int32_t cur_y, long now) {
-    const rdock_folder_t *f = &rdock_folders[fidx];
+    dock_folder_t *f = &g_folders[fidx];
     if (anim_t256 <= 0) return;
 
     for (int m = 0; m < f->nmembers; m++) {
@@ -3028,8 +3093,11 @@ static void draw_folder_fanout(uint32_t *buf, uint32_t bw, uint32_t bh, uint32_t
         if (hovered) rdock_draw_sparkles(buf, bw, bh, stride, x, y, tile, now);
 
         /* floating member icon (draws its own tile background, now safely
-         * clamped fully inside the buffer) */
-        icon_for_app(buf, (int)stride, x, y, tile, rdock_apps[mi].path + 5);
+         * clamped fully inside the buffer). Member may be a catalog app or a
+         * Start-menu app dragged in (free path). */
+        (void)mi;
+        const char *mp = folder_member_path(fidx, m);
+        icon_for_app(buf, (int)stride, x, y, tile, (mp ? mp : "sbin/x") + 5);
 
         /* hover ring to make the focused member pop */
         if (hovered)
@@ -3051,7 +3119,9 @@ static void render_right_dock(uint32_t *buf, uint32_t w, uint32_t h, uint32_t st
 
     g_rdock_hovered = -1;
 
-    for (int i = 0; i < RDOCK_TOTAL; i++) {
+    for (int i = 0; i < rdock_idx_end(); i++) {
+        if (i < RDOCK_NICONS && g_app_hidden[i]) continue;  /* filed into a box */
+        if (i == g_dock_drag) continue;                     /* drawn as the ghost */
         int32_t sz   = rdock_scaled_sz(g_rdock_icons[i].scale_q8);
         int32_t ty   = rdock_icon_top(i);
         int32_t tx   = rdock_icon_x(w, sz);
@@ -3088,7 +3158,7 @@ static void render_right_dock(uint32_t *buf, uint32_t w, uint32_t h, uint32_t st
 
         if (is_folder) {
             int fi = i - RDOCK_NICONS;
-            tile_col = rdock_folders[fi].color;
+            tile_col = g_folders[fi].color;
         } else {
             tile_col = rdock_apps[i].color;
         }
@@ -3113,6 +3183,12 @@ static void render_right_dock(uint32_t *buf, uint32_t w, uint32_t h, uint32_t st
             icon_for_app(buf, (int)stride, tx, ty, sz, rdock_apps[i].path + 5);
         }
 
+        /* DOCK-DND-0: selection ring (toggled with Alt+click) */
+        if (i < RDOCK_NICONS && g_dock_selected[i]) {
+            stroke_rect(buf, w, h, stride, tx - 2, ty - 2, sz + 4, sz + 4, COL_ACCENT);
+            stroke_rect(buf, w, h, stride, tx - 3, ty - 3, sz + 6, sz + 6, COL_ACCENT);
+        }
+
         /* tooltip: show full name to the LEFT when hovered */
         if (hovered && !is_folder) {
             const char *tip = rdock_apps[i].path + 5;  /* skip "sbin/" */
@@ -3131,7 +3207,7 @@ static void render_right_dock(uint32_t *buf, uint32_t w, uint32_t h, uint32_t st
     }
 
     /* ---- draw open folders as rainbow fan-outs ---- */
-    for (int fi = 0; fi < RDOCK_NFOLDERS; fi++) {
+    for (int fi = 0; fi < g_nfolders; fi++) {
         rdock_folder_state_t *fs = &g_rdock_folders[fi];
         if (!fs->open && fs->anim_t <= 0) continue;
 
@@ -3152,10 +3228,213 @@ static void render_right_dock(uint32_t *buf, uint32_t w, uint32_t h, uint32_t st
         draw_folder_fanout(buf, w, h, stride, fi, w, h, fs->anim_t,
                            cur_x, cur_y, now);
     }
+
+    /* ---- DOCK-DND-0: drop-target ring + the dragged ghost (drawn on top) ---- */
+    if (g_dock_drag >= 0 && g_dock_drag < RDOCK_NICONS) {
+        if (g_dock_drop_tgt >= 0) {
+            int32_t tsz = rdock_scaled_sz(g_rdock_icons[g_dock_drop_tgt].scale_q8);
+            int32_t tty = rdock_icon_top(g_dock_drop_tgt);
+            int32_t ttx = rdock_icon_x(w, tsz) - rdock_bounce_offset(g_dock_drop_tgt, now);
+            if (ttx + tsz > (int32_t)w) ttx = (int32_t)w - tsz;
+            if (ttx < 0) ttx = 0;
+            /* a glowing rounded ring to say "drop here to make/extend a box" */
+            blend_rect(buf, w, h, stride, ttx - 4, tty - 4, tsz + 8, tsz + 8, 0x6047A0FFu);
+            stroke_rect(buf, w, h, stride, ttx - 4, tty - 4, tsz + 8, tsz + 8, COL_ACCENT);
+        }
+        /* the dragged icon, enlarged, following (and centered on) the cursor */
+        int32_t gsz = RDOCK_ICON_BASE + 12;
+        int32_t gx  = g_dock_drag_x - gsz / 2;
+        int32_t gy  = g_dock_drag_y - gsz / 2;
+        if (gx + gsz > (int32_t)w) gx = (int32_t)w - gsz;
+        if (gy + gsz > (int32_t)h) gy = (int32_t)h - gsz;
+        if (gx < 0) gx = 0;
+        if (gy < 0) gy = 0;
+        blend_rect(buf, w, h, stride, gx + 3, gy + 4, gsz, gsz, 0x50000000u);  /* shadow */
+        icon_for_app(buf, (int)stride, gx, gy, gsz, rdock_apps[g_dock_drag].path + 5);
+    }
+
+    /* DOCK-DND-1: ghost for a Start-menu app being dragged in (handed off via
+     * SHM). Highlight the dock strip as the drop zone. */
+    if (g_dnd && g_dnd->magic == DOCKDND_MAGIC && g_dnd->active && !g_dnd->claimed) {
+        if (cur_x >= rdock_strip_x(w))
+            blend_rect(buf, w, h, stride, rdock_strip_x(w), PANEL_H, RDOCK_W,
+                       (int32_t)h - PANEL_H - DOCK_H, 0x4047A0FFu);
+        int32_t gsz = RDOCK_ICON_BASE + 12;
+        int32_t gx = cur_x - gsz / 2, gy = cur_y - gsz / 2;
+        if (gx + gsz > (int32_t)w) gx = (int32_t)w - gsz;
+        if (gy + gsz > (int32_t)h) gy = (int32_t)h - gsz;
+        if (gx < 0) gx = 0;
+        if (gy < 0) gy = 0;
+        blend_rect(buf, w, h, stride, gx + 3, gy + 4, gsz, gsz, 0x50000000u);
+        char gp[64]; int gi = 0;
+        for (; gi < 63 && g_dnd->path[gi]; gi++) gp[gi] = g_dnd->path[gi];
+        gp[gi] = 0;
+        /* only deref past the "sbin/"/"bin/" prefix for a validated path */
+        icon_for_app(buf, (int)stride, gx, gy, gsz, dock_path_ok(gp) ? gp + 5 : "x");
+    }
 }
 
 /* ---- Hit-test + spawn for the right dock on left-click ---- */
 /* Returns 1 if the click was consumed by the right dock, else 0. */
+/* Return the dock STRIP icon idx under (cx,cy), or -1. Mirrors the render
+ * geometry so hit-test == draw. Skips filed + currently-dragged icons. */
+static int rdock_icon_at(int32_t cx, int32_t cy, uint32_t W, long now) {
+    if (cx < rdock_strip_x(W)) return -1;
+    for (int i = 0; i < rdock_idx_end(); i++) {
+        if (i < RDOCK_NICONS && g_app_hidden[i]) continue;
+        if (i == g_dock_drag) continue;
+        int32_t sz = rdock_scaled_sz(g_rdock_icons[i].scale_q8);
+        int32_t ty = rdock_icon_top(i);
+        int32_t tx = rdock_icon_x(W, sz) - rdock_bounce_offset(i, now);
+        if (point_in(cx, cy, tx, ty, sz, sz)) return i;
+    }
+    return -1;
+}
+
+/* The click action for strip icon [i]: toggle a folder open/closed, or spawn an
+ * app. Called on release when the press was NOT promoted to a drag. */
+static void dock_activate(int i, long now) {
+    if (i >= RDOCK_NICONS) {                       /* folder: toggle the fan-out */
+        int fi = i - RDOCK_NICONS;
+        rdock_folder_state_t *fs = &g_rdock_folders[fi];
+        if (fs->open || (!fs->anim_closing && fs->anim_t > 0)) {
+            fs->anim_closing = 1; fs->anim_start = now; g_rdock_open_folder = -1;
+        } else {
+            if (g_rdock_open_folder >= 0 && g_rdock_open_folder != fi) {
+                rdock_folder_state_t *ofs = &g_rdock_folders[g_rdock_open_folder];
+                ofs->anim_closing = 1; ofs->anim_start = now;
+            }
+            fs->open = 1; fs->anim_closing = 0; fs->anim_start = now; fs->anim_t = 0;
+            g_rdock_open_folder = fi;
+        }
+    } else {
+        syscall(SYS_SPAWN, (long)rdock_apps[i].path, 0, 0);
+    }
+    g_rdock_icons[i].bounce_active = 1;
+    g_rdock_icons[i].bounce_start  = now;
+}
+
+/* File app[app] (plus any selected apps) into existing folder [fi]. */
+static void dock_file_into_folder(int app, int fi, long now) {
+    dock_folder_t *f = &g_folders[fi];
+    int add[DOCK_MEMBERS_MAX], na = 0;
+    add[na++] = app;
+    for (int i = 0; i < RDOCK_NICONS; i++)
+        if (g_dock_selected[i] && i != app && !g_app_hidden[i] && na < DOCK_MEMBERS_MAX)
+            add[na++] = i;
+    for (int k = 0; k < na && f->nmembers < DOCK_MEMBERS_MAX; k++) {
+        int dup = 0;
+        for (int m = 0; m < f->nmembers; m++) if (f->members[m] == add[k]) dup = 1;
+        if (dup) continue;
+        f->members[f->nmembers++] = add[k];
+        g_app_hidden[add[k]]   = 1;
+        g_dock_selected[add[k]] = 0;
+    }
+    int idx = RDOCK_NICONS + fi;
+    g_rdock_icons[idx].bounce_active = 1;
+    g_rdock_icons[idx].bounce_start  = now;
+    g_dock_drop_anim = now;
+}
+
+/* Combine app[a] + app[b] (plus any selected apps) into a NEW box/folder. */
+static void dock_combine_into_box(int a, int b, long now) {
+    if (g_nfolders >= DOCK_FOLDERS_MAX) { dock_file_into_folder(a, 0, now); return; }
+    int fi = g_nfolders;
+    dock_folder_t *f = &g_folders[fi];
+    f->label[0] = 'B'; f->label[1] = 'x'; f->label[2] = 0; f->label[3] = 0;
+    f->color    = 0xFF3A4A6Cu;
+    f->nmembers = 0;
+    int add[DOCK_MEMBERS_MAX], na = 0;
+    add[na++] = b;
+    add[na++] = a;
+    for (int i = 0; i < RDOCK_NICONS; i++)
+        if (g_dock_selected[i] && i != a && i != b && !g_app_hidden[i] && na < DOCK_MEMBERS_MAX)
+            add[na++] = i;
+    for (int k = 0; k < na && f->nmembers < DOCK_MEMBERS_MAX; k++) {
+        f->members[f->nmembers++] = add[k];
+        g_app_hidden[add[k]]   = 1;
+        g_dock_selected[add[k]] = 0;
+    }
+    int idx = RDOCK_NICONS + fi;
+    g_rdock_icons[idx].scale_q8 = 256; g_rdock_icons[idx].scale_target = 256;
+    g_rdock_icons[idx].bounce_active = 1; g_rdock_icons[idx].bounce_start = now;
+    g_rdock_folders[fi].open = 0; g_rdock_folders[fi].anim_t = 0;
+    g_rdock_folders[fi].anim_closing = 0; g_rdock_folders[fi].anim_start = 0;
+    g_nfolders++;
+    g_dock_drop_anim = now;
+}
+
+/* Resolve a drag drop: onto a folder = file it; onto another app = make a box;
+ * elsewhere = snap back (no-op). */
+static void dock_drop(int drag, int tgt, uint32_t W, long now) {
+    (void)W;
+    if (drag < 0 || drag >= RDOCK_NICONS) return;   /* only apps are draggable   */
+    if (tgt < 0 || tgt == drag) return;             /* dropped on nothing        */
+    if (tgt >= RDOCK_NICONS) dock_file_into_folder(drag, tgt - RDOCK_NICONS, now);
+    else                     dock_combine_into_box(drag, tgt, now);
+}
+
+/* Accept only "sbin/<name>" / "bin/<name>" with no traversal or non-printables,
+ * so a write to the (attacker-influenceable) handoff SHM cannot make the dock
+ * spawn an arbitrary binary. Requires NUL-termination within 64 bytes. */
+static int dock_path_ok(const char *p) {
+    if (!p) return 0;
+    int sbin = (p[0]=='s' && p[1]=='b' && p[2]=='i' && p[3]=='n' && p[4]=='/');
+    int bin  = (p[0]=='b' && p[1]=='i' && p[2]=='n' && p[3]=='/');
+    if (!sbin && !bin) return 0;
+    int n = 0;
+    for (; p[n]; n++) {
+        if (n >= 63) return 0;                        /* must NUL-terminate < 64 */
+        if (p[n] < 0x20 || p[n] > 0x7e) return 0;     /* printable ASCII only    */
+        if (p[n] == '.' && p[n + 1] == '.') return 0; /* no path traversal       */
+        if (p[n] == '/' && p[n + 1] == '/') return 0;
+    }
+    return (n >= 5);
+}
+
+/* DOCK-DND-1: pin a Start-menu app (free path) into the dock's "Pinned" box,
+ * creating the box on first use. Dedups by path; animated bounce on add. The
+ * path is validated (allowlist) because it originates from the handoff SHM. */
+static void dock_pin_path(const char *path, uint32_t color, long now) {
+    if (!dock_path_ok(path)) { print("[DOCK] reject pin (bad path)\n"); return; }
+    int fi;
+    if (g_pinned_folder >= 0 && g_pinned_folder < g_nfolders) {
+        fi = g_pinned_folder;
+    } else {
+        if (g_nfolders >= DOCK_FOLDERS_MAX) return;
+        fi = g_nfolders++;
+        g_pinned_folder = fi;
+        dock_folder_t *nf = &g_folders[fi];
+        nf->label[0] = 'P'; nf->label[1] = 'n'; nf->label[2] = 0; nf->label[3] = 0;
+        nf->color    = color ? color : 0xFF2E6B4Fu;
+        nf->nmembers = 0;
+        int idx = RDOCK_NICONS + fi;
+        g_rdock_icons[idx].scale_q8 = 256; g_rdock_icons[idx].scale_target = 256;
+        g_rdock_folders[fi].open = 0; g_rdock_folders[fi].anim_t = 0;
+        g_rdock_folders[fi].anim_closing = 0; g_rdock_folders[fi].anim_start = 0;
+    }
+    dock_folder_t *f = &g_folders[fi];
+    for (int k = 0; k < f->nmembers; k++) {           /* dedup by path */
+        const char *p = folder_member_path(fi, k);
+        int same = (p != 0);
+        for (int j = 0; same && (path[j] || p[j]); j++) if (path[j] != p[j]) same = 0;
+        if (same) {
+            g_rdock_icons[RDOCK_NICONS + fi].bounce_active = 1;
+            g_rdock_icons[RDOCK_NICONS + fi].bounce_start  = now;
+            return;
+        }
+    }
+    if (f->nmembers >= DOCK_MEMBERS_MAX) return;
+    int m = f->nmembers;
+    f->members[m] = -1;
+    int i = 0; while (path[i] && i < 63) { f->mpath[m][i] = path[i]; i++; } f->mpath[m][i] = 0;
+    f->nmembers++;
+    g_rdock_icons[RDOCK_NICONS + fi].bounce_active = 1;
+    g_rdock_icons[RDOCK_NICONS + fi].bounce_start  = now;
+    g_dock_drop_anim = now;
+    print("[DOCK] pinned "); print(path); print(" -> box\n");
+}
+
 static int rdock_handle_click(int32_t cx, int32_t cy, uint32_t W, long now) {
     int32_t strip_x = rdock_strip_x(W);
 
@@ -3166,22 +3445,23 @@ static int rdock_handle_click(int32_t cx, int32_t cy, uint32_t W, long now) {
 
         /* 1) Did the click land on a fanned-out member icon? Use the IDENTICAL
          * clamped geometry as the renderer so hit-test == what is drawn. */
-        for (int fi = 0; fi < RDOCK_NFOLDERS; fi++) {
+        for (int fi = 0; fi < g_nfolders; fi++) {
             rdock_folder_state_t *fs = &g_rdock_folders[fi];
             if (!fs->open && fs->anim_t <= 0) continue;
             any_open = 1;
-            const rdock_folder_t *f = &rdock_folders[fi];
+            dock_folder_t *f = &g_folders[fi];
             for (int m = 0; m < f->nmembers; m++) {
                 int32_t x, y, tile; int mi;
                 if (!rdock_fan_member_rect(fi, m, fs->anim_t, now,
                                            g_fb_w, g_fb_h, &x, &y, &tile, &mi))
                     continue;
                 if (point_in(cx, cy, x, y, tile, tile)) {
-                    print("[SHELL] dock folder spawn: ");
-                    print(rdock_apps[mi].path);
-                    print("\n");
-                    long r = syscall(SYS_SPAWN, (long)rdock_apps[mi].path, 0, 0);
-                    if (r < 0) { print("[SHELL] spawn fail r="); print_num(r); print("\n"); }
+                    (void)mi;
+                    const char *mp = folder_member_path(fi, m);
+                    if (mp) {
+                        print("[SHELL] dock folder spawn: "); print(mp); print("\n");
+                        syscall(SYS_SPAWN, (long)mp, 0, 0);
+                    }
                     /* bounce the folder tile to acknowledge the launch */
                     g_rdock_icons[RDOCK_NICONS + fi].bounce_active = 1;
                     g_rdock_icons[RDOCK_NICONS + fi].bounce_start  = now;
@@ -3192,7 +3472,7 @@ static int rdock_handle_click(int32_t cx, int32_t cy, uint32_t W, long now) {
 
         /* 2) Click elsewhere while a fan is open: close it (reverse anim). */
         if (any_open) {
-            for (int fi = 0; fi < RDOCK_NFOLDERS; fi++) {
+            for (int fi = 0; fi < g_nfolders; fi++) {
                 rdock_folder_state_t *fs = &g_rdock_folders[fi];
                 if (fs->open || fs->anim_t > 0) {
                     fs->anim_closing = 1;
@@ -3205,52 +3485,19 @@ static int rdock_handle_click(int32_t cx, int32_t cy, uint32_t W, long now) {
         return 0;
     }
 
-    /* Click on the dock strip: hit-test each icon using magnified rect */
-    for (int i = 0; i < RDOCK_TOTAL; i++) {
+    /* Click on the dock strip: ARM a press on the hit icon. The actual action
+     * (launch / folder toggle, an Alt+click select, or a drag-to-combine) is
+     * resolved on RELEASE in handle_mouse's dock-drag block. */
+    for (int i = 0; i < rdock_idx_end(); i++) {
+        if (i < RDOCK_NICONS && g_app_hidden[i]) continue;  /* filed into a box */
         int32_t sz   = rdock_scaled_sz(g_rdock_icons[i].scale_q8);
         int32_t ty   = rdock_icon_top(i);
-        int32_t tx   = rdock_icon_x(W, sz);
-        int32_t boff = rdock_bounce_offset(i, now);
-        tx -= boff;
-
+        int32_t tx   = rdock_icon_x(W, sz) - rdock_bounce_offset(i, now);
         if (!point_in(cx, cy, tx, ty, sz, sz)) continue;
-
-        int is_folder = (i >= RDOCK_NICONS);
-        if (is_folder) {
-            int fi = i - RDOCK_NICONS;
-            rdock_folder_state_t *fs = &g_rdock_folders[fi];
-            if (fs->open || (!fs->anim_closing && fs->anim_t > 0)) {
-                /* collapse */
-                fs->anim_closing = 1;
-                fs->anim_start   = now;
-                g_rdock_open_folder = -1;
-            } else {
-                /* close any other open folder */
-                if (g_rdock_open_folder >= 0 && g_rdock_open_folder != fi) {
-                    rdock_folder_state_t *ofs = &g_rdock_folders[g_rdock_open_folder];
-                    ofs->anim_closing = 1;
-                    ofs->anim_start   = now;
-                }
-                /* open this folder */
-                fs->open         = 1;
-                fs->anim_closing = 0;
-                fs->anim_start   = now;
-                fs->anim_t       = 0;
-                g_rdock_open_folder = fi;
-            }
-            /* bounce */
-            g_rdock_icons[i].bounce_active = 1;
-            g_rdock_icons[i].bounce_start  = now;
-            print("[SHELL] dock folder toggle fi="); print_num(fi); print("\n");
-        } else {
-            /* spawn the app */
-            print("[SHELL] dock launch: "); print(rdock_apps[i].path); print("\n");
-            long r = syscall(SYS_SPAWN, (long)rdock_apps[i].path, 0, 0);
-            if (r < 0) { print("[SHELL] spawn fail r="); print_num(r); print("\n"); }
-            /* start bounce */
-            g_rdock_icons[i].bounce_active = 1;
-            g_rdock_icons[i].bounce_start  = now;
-        }
+        g_dock_press_idx = i;
+        g_dock_press_x   = cx;
+        g_dock_press_y   = cy;
+        g_dock_drag      = -1;
         return 1;
     }
     return 1;  /* consumed: any click on the strip is dock territory */
@@ -4351,7 +4598,7 @@ static void send_pointer_to_focus(void) {
      * notch; the next composite re-renders all chrome at the new cell. Works even
      * with no focused window (zoom from the bare desktop). */
     if (g_alt_held && g_wheel_delta != 0) {
-        cz_set_scale(g_ui_pct + (g_wheel_delta > 0 ? 10 : -10));
+        cz_set_scale(g_ui_pct + (g_wheel_delta > 0 ? 100 : -100));  /* UI-CRISP-0: integer 100<->200 */
         g_wheel_delta = 0;
         mark_dirty();
     }
@@ -5143,6 +5390,65 @@ static void handle_mouse(uint32_t W, uint32_t H) {
         return;                                  /* drag owns the pointer   */
     }
 
+    /* ---- DOCK-DND-1: a drag handed off from the Start menu via SHM. The
+     * compositor owns the cursor + the dock, so it renders the ghost (in
+     * render_right_dock) and resolves the drop here: over the dock = pin into
+     * the "Pinned" box; elsewhere = cancel. ---- */
+    if (g_dnd && g_dnd->magic == DOCKDND_MAGIC && g_dnd->active && !g_dnd->claimed) {
+        long dnow = syscall(SYS_GET_TICKS_MS, 0, 0, 0);
+        if (left) { mark_dirty(); g_prev_buttons = g_buttons; return; }
+        if (cx >= rdock_strip_x(W)) {
+            char p[64]; int i = 0;
+            for (; i < 63 && g_dnd->path[i]; i++) p[i] = g_dnd->path[i];
+            p[i] = 0;
+            dock_pin_path(p, g_dnd->color, dnow);
+        } else {
+            print("[DOCK] start-menu drag cancelled (off dock)\n");
+        }
+        g_dnd->active  = 0;
+        g_dnd->claimed = 1;
+        mark_dirty();
+        g_prev_buttons = g_buttons;
+        return;
+    }
+
+    /* ---- DOCK-DND-0: dock icon drag. Armed by rdock_handle_click on a strip
+     * press; here we track the held drag and resolve on release: a drag onto
+     * another app makes a new box, onto a folder files it; a non-drag press is a
+     * launch / folder-toggle, or an Alt+click selection toggle. ---- */
+    if (g_dock_press_idx >= 0 || g_dock_drag >= 0) {
+        long dnow = syscall(SYS_GET_TICKS_MS, 0, 0, 0);
+        if (left) {
+            int32_t ddx = cx - g_dock_press_x, ddy = cy - g_dock_press_y;
+            if (g_dock_drag < 0 && (ddx * ddx + ddy * ddy) > 36) {  /* >6px = drag */
+                g_dock_drag = g_dock_press_idx;
+                print("[DOCK] drag start idx="); print_num(g_dock_drag); print("\n");
+            }
+            if (g_dock_drag >= 0) {
+                g_dock_drag_x = cx; g_dock_drag_y = cy;
+                int t = rdock_icon_at(cx, cy, W, dnow);
+                g_dock_drop_tgt = (t == g_dock_drag) ? -1 : t;
+            }
+            mark_dirty();
+            g_prev_buttons = g_buttons;
+            return;
+        }
+        if (g_dock_drag >= 0) {
+            print("[DOCK] drop drag="); print_num(g_dock_drag);
+            print(" tgt="); print_num(g_dock_drop_tgt); print("\n");
+            dock_drop(g_dock_drag, g_dock_drop_tgt, W, dnow);
+        } else if (g_dock_press_idx >= 0) {
+            if (g_alt_held && g_dock_press_idx < RDOCK_NICONS)
+                g_dock_selected[g_dock_press_idx] = !g_dock_selected[g_dock_press_idx];
+            else
+                dock_activate(g_dock_press_idx, dnow);
+        }
+        g_dock_press_idx = -1; g_dock_drag = -1; g_dock_drop_tgt = -1;
+        mark_dirty();
+        g_prev_buttons = g_buttons;
+        return;
+    }
+
     /* Click dispatch is driven by the per-event latch (set in pump_input), not a
      * frame-level button edge — a quick click whose press+release arrive in one
      * input batch would otherwise be lost. Hit-test at the latched press pos. */
@@ -5345,20 +5651,55 @@ void _start(void) {
     g_mru_count = 0;                                /* M6: empty MRU ring        */
 
     /* M8: initialise right-dock state */
-    for (int i = 0; i < RDOCK_TOTAL; i++) {
+    for (int i = 0; i < RDOCK_CAP; i++) {
         g_rdock_icons[i].scale_q8      = 256;
         g_rdock_icons[i].scale_target  = 256;
         g_rdock_icons[i].bounce_active = 0;
         g_rdock_icons[i].bounce_start  = 0;
     }
-    for (int fi = 0; fi < RDOCK_NFOLDERS; fi++) {
+    for (int fi = 0; fi < DOCK_FOLDERS_MAX; fi++) {
         g_rdock_folders[fi].open         = 0;
         g_rdock_folders[fi].anim_t       = 0;
         g_rdock_folders[fi].anim_start   = 0;
         g_rdock_folders[fi].anim_closing = 0;
     }
+    /* DOCK-DND-0: seed the mutable folder table from the const rdock_folders[];
+     * g_app_hidden stays all-0 so the initial dock is byte-identical to before. */
+    g_nfolders = RDOCK_NFOLDERS;
+    for (int fi = 0; fi < g_nfolders; fi++) {
+        const rdock_folder_t *s = &rdock_folders[fi];
+        int li = 0;
+        while (s->label && s->label[li] && li < 3) { g_folders[fi].label[li] = s->label[li]; li++; }
+        g_folders[fi].label[li] = 0;
+        g_folders[fi].color    = s->color;
+        g_folders[fi].nmembers = s->nmembers;
+        for (int m = 0; m < s->nmembers && m < DOCK_MEMBERS_MAX; m++)
+            g_folders[fi].members[m] = s->members[m];
+    }
+    for (int i = 0; i < RDOCK_NICONS; i++) g_app_hidden[i] = 0;
     g_rdock_hovered     = -1;
     g_rdock_open_folder = -1;
+
+    /* DOCK-DND-1: create + own the Start-menu -> dock drag handoff page (the
+     * Start menu attaches lookup-only and writes a pending drag here). */
+    {
+        /* 0600: owner-only. The producer (Start menu) is a same-UID init child,
+         * so it still attaches; a different non-root UID cannot inject a drag.
+         * Defense-in-depth only -- the real arbitrary-spawn guard is the path
+         * allowlist in dock_pin_path (the SHM path is attacker-influenceable). */
+        long id = sc6(SYS_SHMGET, (long)DOCKDND_SHM_KEY, (long)DOCKDND_SHM_SIZE,
+                      (long)(IPC_CREAT | 0600), 0, 0, 0);
+        if (id >= 0) {
+            long p = sc6(SYS_SHMAT, id, 0, 0, 0, 0, 0);
+            if (p > 0) {
+                g_dnd = (volatile dockdnd_shm_t *)p;
+                volatile char *z = (volatile char *)p;      /* sys_shmget won't zero */
+                for (int i = 0; i < (int)sizeof(dockdnd_shm_t); i++) z[i] = 0;
+                g_dnd->magic = DOCKDND_MAGIC;
+                print("[SHELL] DOCK-DND: handoff page ready\n");
+            }
+        }
+    }
 
     /* 1. Acquire the framebuffer. */
     fb_acquire_t fb;
@@ -5384,10 +5725,12 @@ void _start(void) {
      * is still too small). Alt+wheel zooms live (floor 50%, ceiling 200%). All
      * chrome bar heights derive from FONT_H so they track automatically. Larger
      * displays keep 130% (10x20). */
-    if (W <= 1280 && H <= 800)
-        cz_set_scale(65);
-    else
-        cz_set_scale(130);
+    /* UI-CRISP-0: INTEGER native scale at every resolution. The old 65%/130%
+     * fractional scales made font2 nearest-neighbor-replicate the 8x16 glyph
+     * unevenly = blur. 100% (8x16) is artifact-free; Alt+wheel zooms to 200%
+     * (also integer/crisp). Chrome bar heights derive from FONT_H and re-track. */
+    (void)W; (void)H;
+    cz_set_scale(100);
     print("[SHELL] UI scale "); print_num(g_ui_pct); print("% cell ");
     print_num(g_cell_w); print("x"); print_num(g_cell_h); print("\n");
 

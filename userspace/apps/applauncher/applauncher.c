@@ -145,7 +145,7 @@ typedef struct {
  *   row 3: 2048      Sheet       Notes       Date
  * --------------------------------------------------------------------- */
 
-#define APP_COUNT 16
+#define APP_COUNT 18   /* CLAUDE-APP-0: + Claude chat + Anthropic panel (5th row) */
 
 /*
  * Static storage for all app entries.  The path[] arrays sit in .bss
@@ -173,6 +173,8 @@ static const char * const APP_LABELS[APP_COUNT] = {
     "Sheet",       /* 13 sbin/sheet       */
     "Notes",       /* 14 sbin/notes       */
     "Date",        /* 15 sbin/dateapp     */
+    "Claude",      /* 16 sbin/claudechat  */
+    "Anthropic",   /* 17 sbin/anthropic   */
 };
 
 /* Relative initrd paths -- no leading slash (initrd lookup is relative). */
@@ -193,6 +195,8 @@ static const char * const APP_PATHS[APP_COUNT] = {
     "sbin/sheet",
     "sbin/notes",
     "sbin/dateapp",
+    "sbin/claudechat",
+    "sbin/anthropic",
 };
 
 /* -----------------------------------------------------------------------
@@ -266,7 +270,7 @@ static void on_launch(void *ud)
  * --------------------------------------------------------------------- */
 
 #define WIN_W  520
-#define WIN_H  420
+#define WIN_H  460   /* CLAUDE-APP-0: room for the 5th row (Claude + Anthropic) */
 
 #define COLS   4
 #define BTN_W  112
@@ -301,19 +305,24 @@ void _start(void)
     /* Header label: "Applications" centred-ish near the top. */
     ui_label(root, 196, 14, "Applications", 0xFFAEAEB2);
 
-    /* ---- Build the 4x4 button grid ---- */
-    for (int i = 0; i < APP_COUNT; i++) {
-        int col = i % COLS;        /* 0 .. 3 */
-        int row = i / COLS;        /* 0 .. 3 */
-
-        ui_button(root,
-                  COL_X(col),
-                  ROW_Y(row),
-                  BTN_W,
-                  BTN_H,
-                  APP_LABELS[i],
-                  on_launch,
-                  (void *)&g_apps[i]);
+    /* ---- Build the button grid as nested ROW CONTAINERS ----
+     * The toolkit caps EVERY widget at UI_MAX_CHILDREN (16, ui.c). Attaching all
+     * APP_COUNT buttons + the header directly to root silently DROPS the apps
+     * past the 15th (attach_child returns -1, ui_button returns NULL) -- which is
+     * exactly why Date/Claude/Anthropic never appeared. Wrap each row in a
+     * transparent panel (bg == the window bg 0xFF1C1C1E, so invisible): root then
+     * holds 1 label + ceil(APP_COUNT/COLS) row panels, and each row holds <= COLS
+     * buttons -- both well under the cap. (Mirrors startmenu's row_box pattern.) */
+    int nrows = (APP_COUNT + COLS - 1) / COLS;
+    for (int r = 0; r < nrows; r++) {
+        ui_widget_t *row_box = ui_panel(root, GRID_X, ROW_Y(r),
+                                        COLS * (BTN_W + GAP), BTN_H, 0xFF1C1C1E);
+        for (int c = 0; c < COLS; c++) {
+            int i = r * COLS + c;
+            if (i >= APP_COUNT) break;
+            ui_button(row_box, c * (BTN_W + GAP), 0, BTN_W, BTN_H,
+                      APP_LABELS[i], on_launch, (void *)&g_apps[i]);
+        }
     }
 
     /* ---- Enter the event loop (never returns) ---- */

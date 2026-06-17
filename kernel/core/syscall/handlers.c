@@ -23,6 +23,16 @@
 // External serial driver functions
 extern void serial_write(const char* str, size_t len);
 
+// PREEMPT-WAITSAFE-0: in the PREEMPTIVE build a check-then-block loop's scan and
+// its block are NOT atomic — a timer IRQ in the gap lets the awaited event fire
+// its wake BEFORE we enqueue, so the wake is lost and we would block forever
+// (the cooperative build has no such gap; the scan+block are atomic). At those
+// sites we replace the indefinite block with a self-healing TIMED block: a real
+// signal still wakes us immediately, but a MISSED wake is recovered when the
+// deadline re-readies us and the loop re-scans. WAIT_RECHECK_MS bounds that
+// recovery latency (PIT is 1000 Hz, so 1 tick == 1 ms).
+#define WAIT_RECHECK_MS 25
+
 // cleanup helper for heap-allocated path buffers. A 4096-byte path buffer on
 // the kernel stack, combined with the VFS chain's own buffers (vfs_mkdir_recursive
 // -> vfs_mkdir -> vfs_path_lookup, each 4096B), overflows the 8KB kernel stack
@@ -654,7 +664,15 @@ int64_t sys_thread_join(uint64_t tid, uint64_t retval_out, uint64_t arg3,
     // already TERMINATED we skip the block entirely; otherwise we block on its
     // join object and thread_exit's wait_object_signal wakes us.
     while (target->state != PROCESS_TERMINATED) {
+#ifdef PREEMPTIVE
+        // PREEMPT-WAITSAFE-0: self-healing timed block (see WAIT_RECHECK_MS). A
+        // real thread_exit signal still wakes us at once; a wake lost to the
+        // scan/block gap is recovered when the deadline re-checks the while.
+        (void)wait_object_block(&target->thread_join_wo,
+                                timer_get_ticks() + WAIT_RECHECK_MS);
+#else
         (void)wait_object_block(&target->thread_join_wo, 0);
+#endif
         // Re-loop to re-check the state (defensive against spurious wakeups).
     }
 
@@ -1065,7 +1083,7 @@ int64_t sys_read_event(uint64_t arg1, uint64_t arg2, uint64_t arg3,
 
 /* exec staging globals owned by exec.c. */
 extern char g_exec_spawn_args[256];
-extern char g_exec_spawn_argv[256];
+extern char g_exec_spawn_argv[4096];   /* lockstep with exec.c (v2: holds base64 content) */
 extern int  g_exec_spawn_argv_len;
 extern char g_exec_spawn_envp[256];
 extern int  g_exec_spawn_envp_len;
@@ -1390,7 +1408,18 @@ int64_t sys_waitpid(uint64_t pid, uint64_t status_ptr, uint64_t options,
         if (!current->child_wait) {
             return 0;   // OOM: fall back to non-blocking (caller retries/yields)
         }
+#ifdef PREEMPTIVE
+        // PREEMPT-WAITSAFE-0: the scan above and this block are NOT atomic under
+        // preemption — a child can exit + wq_wake_one() us in the gap before we
+        // enqueue, losing the wake and hanging us forever. Self-heal with a TIMED
+        // block: a real child-exit signal still wakes us immediately; a missed
+        // wake is recovered when the deadline re-readies us and the for-loop
+        // re-scans and finds the zombie. (Cooperative keeps the atomic block.)
+        (void)wait_object_block(&((wait_queue_t*)current->child_wait)->wobj,
+                                timer_get_ticks() + WAIT_RECHECK_MS);
+#else
         wq_block_current((wait_queue_t*)current->child_wait);
+#endif
         // Resumed after a child exited -> loop re-scans.
     }
 }
@@ -1537,7 +1566,13 @@ int64_t sys_spawn(uint64_t path, uint64_t arg2, uint64_t arg3,
     if (!path) return EFAULT;
 
     char kpath[128];
-    if (copy_from_user(kpath, (const void*)path, sizeof(kpath) - 1) != COPY_SUCCESS) {
+    /* NUL-bounded copy (like sys_unlink/sys_rename): the path frequently comes from
+     * argv on the user stack near USER_STACK_TOP, where a fixed sizeof-1 copy_from_user
+     * overruns the top of the mapped stack and faults EFAULT even though the string
+     * itself is fully mapped. copy_user_string stops at the NUL. (Bug surfaced by the
+     * agent tool rail: tool_exec spawns an argv-derived /tmp path; a .rodata literal
+     * path -- as in codeagent -- happened to dodge it.) */
+    if (copy_user_string(kpath, (const void*)path, sizeof(kpath)) != COPY_SUCCESS) {
         return EFAULT;
     }
     kpath[127] = '\0';

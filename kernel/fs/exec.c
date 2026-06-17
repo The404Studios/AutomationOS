@@ -238,7 +238,11 @@ char g_exec_spawn_args[256];
  * ONLY on NUL, never on whitespace), and the legacy whitespace-split of
  * g_exec_spawn_args is bypassed. argv[0] is always the explicit `name` (path).
  * Consumed (length zeroed) when the argv frame is built. */
-char g_exec_spawn_argv[256];
+/* 4096 (was 256): the agent rail (AGENT-RPC-0 v2) carries write_file's base64 file
+ * content as an argv entry, which a 256B vector could not hold. Walked NUL-split
+ * straight onto the child's 8MB user stack -- no kernel-stack temp -- so the larger
+ * buffer is safe. Kept in lockstep with the externs in handlers.c/channel.c. */
+char g_exec_spawn_argv[4096];
 int  g_exec_spawn_argv_len;
 
 /* EXECVE-INPLACE-0: explicit envp VECTOR for the next exec, set by sys_execve's

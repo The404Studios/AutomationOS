@@ -441,12 +441,12 @@ int64_t sys_spawn_ex(uint64_t path, uint64_t args, uint64_t stdin_h, uint64_t st
 int64_t sys_spawn_ex_argv(uint64_t path, uint64_t argv_buf, uint64_t argv_len,
                           uint64_t stdin_h, uint64_t stdout_h, uint64_t stderr_h) {
     process_t* cur = process_get_current();
-    extern char g_exec_spawn_argv[256];
+    extern char g_exec_spawn_argv[4096];   /* lockstep with exec.c (v2: holds base64 content) */
     extern int  g_exec_spawn_argv_len;
     g_exec_spawn_argv_len = 0;
     uint32_t n = (uint32_t)argv_len;
     if (n > 0) {
-        if (n > 255) return E2BIG;                         /* bounded vector buffer */
+        if (n > 4095) return E2BIG;                        /* bounded vector buffer */
         /* copy the NUL-bearing vector NOW, under the caller's CR3 (before sys_spawn
          * switches to the kernel CR3 for the initrd lookup). */
         if (copy_from_user(g_exec_spawn_argv, (const void*)argv_buf, n) != COPY_SUCCESS)

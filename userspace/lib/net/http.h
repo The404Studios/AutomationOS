@@ -250,6 +250,41 @@ long https_get_range(const char *host, unsigned short port, const char *path,
                      char *out_body, unsigned long out_cap, int *out_status);
 
 /*
+ * http_request -- general HTTP/HTTPS request with an arbitrary method, an
+ * optional request body, and optional extra request headers.
+ *
+ *   method        : "GET", "POST", ... (NULL/"" => "GET").
+ *   extra_headers : additional CRLF-terminated header lines, or NULL. Use this
+ *                   for "Authorization: Bearer <tok>\r\n", "Cookie: ...\r\n", etc.
+ *   content_type  : Content-Type for the body (used only when body != NULL),
+ *                   e.g. "application/x-www-form-urlencoded".
+ *   body,body_len : request body bytes (NULL/0 for none). Content-Length is added.
+ *   flags         : HTTP_F_* bits (HTTP_F_TLS for HTTPS).
+ *
+ * A GET follows redirects (HTTP_MAX_REDIRECTS); a non-GET does NOT (OAuth token
+ * endpoints answer directly). Returns body bytes (>= 0) or an HTTP_ERR_* code.
+ */
+long http_request(const char *host, unsigned short port, const char *path,
+                  const char *method, const char *extra_headers,
+                  const char *content_type, const unsigned char *body,
+                  long body_len, unsigned int flags,
+                  char *out_body, unsigned long out_cap, int *out_status);
+
+/*
+ * http_post / https_post -- POST a request body over plain TCP / TLS.
+ * Convenience wrappers over http_request (HTTP_F_TLS set for https_post).
+ * extra_headers may be NULL. Returns body bytes (>= 0) or an HTTP_ERR_* code.
+ */
+long http_post(const char *host, unsigned short port, const char *path,
+               const char *content_type, const unsigned char *body, long body_len,
+               const char *extra_headers,
+               char *out_body, unsigned long out_cap, int *out_status);
+long https_post(const char *host, unsigned short port, const char *path,
+                const char *content_type, const unsigned char *body, long body_len,
+                const char *extra_headers,
+                char *out_body, unsigned long out_cap, int *out_status);
+
+/*
  * http_selftest -- offline parser / keep-alive / range-header self-test.
  *
  * Builds a synthetic HTTP response in a stack buffer, exercises the internal

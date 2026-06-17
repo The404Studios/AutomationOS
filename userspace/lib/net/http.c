@@ -609,6 +609,8 @@ static void ka_put(netconn *nc, const char *host, unsigned short port, int is_tl
 static long http_fetch_raw(const char *host, unsigned short port,
                            const char *path, int use_tls,
                            const char *req_extra,
+                           const char *method,
+                           const unsigned char *body, long body_len,
                            unsigned char *raw, long raw_cap,
                            int *p_body_off, struct http_meta *meta,
                            unsigned long deadline)
@@ -642,9 +644,14 @@ static long http_fetch_raw(const char *host, unsigned short port,
      * understand the preference.  If the caller supplies extra headers
      * (e.g. a Range header) they are injected here.
      */
-    char req[1536];
+    /* Header block (request line + Host/Accept-Encoding/Connection + caller's
+     * req_extra such as a long Authorization: Bearer token). The request BODY is
+     * sent separately below, so this only needs to hold headers. 4 KiB leaves
+     * room for ~2 KiB bearer tokens. */
+    char req[4096];
     int  rp = 0;
-    buf_puts(req, &rp, (int)sizeof(req), "GET ");
+    buf_puts(req, &rp, (int)sizeof(req), (method && method[0]) ? method : "GET");
+    buf_puts(req, &rp, (int)sizeof(req), " ");
     buf_puts(req, &rp, (int)sizeof(req), path);
     buf_puts(req, &rp, (int)sizeof(req), " HTTP/1.1\r\nHost: ");
     buf_puts(req, &rp, (int)sizeof(req), host);
@@ -653,6 +660,13 @@ static long http_fetch_raw(const char *host, unsigned short port,
              "Connection: keep-alive\r\n");
     if (req_extra && req_extra[0]) {
         buf_puts(req, &rp, (int)sizeof(req), req_extra);
+    }
+    /* POST/PUT body: advertise its length so the server reads exactly it; the
+     * body bytes are sent right after the header block (see below). */
+    if (body && body_len > 0) {
+        buf_puts(req, &rp, (int)sizeof(req), "Content-Length: ");
+        buf_putulong(req, &rp, (int)sizeof(req), (unsigned long)body_len);
+        buf_puts(req, &rp, (int)sizeof(req), "\r\n");
     }
     buf_puts(req, &rp, (int)sizeof(req), "\r\n");
     int reqlen = rp;
@@ -675,6 +689,35 @@ static long http_fetch_raw(const char *host, unsigned short port,
                 }
                 sc_yield();
                 if (++guard > HTTP_POLL_MAX) {
+                    netconn_close(&g_nc);
+                    netconn_set_deadline(0);
+                    return HTTP_ERR_SEND;
+                }
+            } else {
+                netconn_close(&g_nc);
+                netconn_set_deadline(0);
+                return HTTP_ERR_SEND;
+            }
+        }
+    }
+
+    /* ---- send the request body (POST/PUT) right after the header block ---- */
+    if (body && body_len > 0) {
+        long boff = 0; int bguard = 0;
+        while (boff < body_len) {
+            long s = netconn_write(&g_nc, body + boff,
+                                   (unsigned long)(body_len - boff));
+            if (s > 0) {
+                boff += (int)s;
+                bguard = 0;
+            } else if (s == EAGAIN_NEG) {
+                if (deadline_passed(deadline)) {
+                    netconn_close(&g_nc);
+                    netconn_set_deadline(0);
+                    return HTTP_ERR_TIMEO;
+                }
+                sc_yield();
+                if (++bguard > HTTP_POLL_MAX) {
                     netconn_close(&g_nc);
                     netconn_set_deadline(0);
                     return HTTP_ERR_SEND;
@@ -999,7 +1042,9 @@ static long finalize_body(unsigned char *raw, long raw_len, int body_off,
 static long http_do_get(const char *host, unsigned short port, const char *path,
                         char *out_body, unsigned long out_cap, int *out_status,
                         int max_redirects, unsigned int flags,
-                        const char *extra_hdr, unsigned long timeout_ms)
+                        const char *extra_hdr, unsigned long timeout_ms,
+                        const char *method,
+                        const unsigned char *body, long body_len)
 {
     if (out_status) *out_status = 0;
     if (!host || !path || !out_body) return HTTP_ERR_INVAL;
@@ -1040,9 +1085,15 @@ static long http_do_get(const char *host, unsigned short port, const char *path,
         /* On redirect hops after the first, do not send the Range header --
          * range requests follow redirects to the final URL and start fresh. */
         const char *hdr_to_send = (hops == 0) ? extra_hdr : (const char *)0;
+        /* Method + body apply to the FIRST hop only; a redirect is re-issued as
+         * a bodyless GET (the safe 302->GET default; the OAuth POSTs do not
+         * redirect). */
+        const char          *m_send  = (hops == 0) ? method : (const char *)0;
+        const unsigned char *b_send  = (hops == 0) ? body : (const unsigned char *)0;
+        long                 bl_send = (hops == 0) ? body_len : 0;
 
         long raw_len = http_fetch_raw(cur_host, cur_port, cur_path, cur_tls,
-                                      hdr_to_send,
+                                      hdr_to_send, m_send, b_send, bl_send,
                                       raw, (long)sizeof(raw),
                                       &body_off, &meta, deadline);
         if (raw_len < 0) return raw_len;        /* propagate HTTP_ERR_* */
@@ -1100,7 +1151,8 @@ long http_get_ex(const char *host, unsigned short port, const char *path,
 {
     return http_do_get(host, port, path, out_body, out_cap, out_status,
                        max_redirects, flags, (const char *)0,
-                       0 /* default timeout */);
+                       0 /* default timeout */,
+                       "GET", (const unsigned char *)0, 0);
 }
 
 long http_get_timeout_ex(const char *host, unsigned short port, const char *path,
@@ -1109,7 +1161,8 @@ long http_get_timeout_ex(const char *host, unsigned short port, const char *path
                          unsigned long timeout_ms)
 {
     return http_do_get(host, port, path, out_body, out_cap, out_status,
-                       max_redirects, flags, (const char *)0, timeout_ms);
+                       max_redirects, flags, (const char *)0, timeout_ms,
+                       "GET", (const unsigned char *)0, 0);
 }
 
 long http_get(const char *host, unsigned short port, const char *path,
@@ -1152,7 +1205,8 @@ long http_get_range(const char *host, unsigned short port, const char *path,
 
     return http_do_get(host, port, path, out_body, out_cap, out_status,
                        HTTP_MAX_REDIRECTS, 0 /* plain HTTP */, range_hdr,
-                       0 /* default timeout */);
+                       0 /* default timeout */,
+                       "GET", (const unsigned char *)0, 0);
 }
 
 long https_get_range(const char *host, unsigned short port, const char *path,
@@ -1174,7 +1228,74 @@ long https_get_range(const char *host, unsigned short port, const char *path,
 
     return http_do_get(host, port, path, out_body, out_cap, out_status,
                        HTTP_MAX_REDIRECTS, HTTP_F_TLS, range_hdr,
-                       0 /* default timeout */);
+                       0 /* default timeout */,
+                       "GET", (const unsigned char *)0, 0);
+}
+
+/* ---- HTTP/HTTPS request with method + body + extra headers (POST, etc.) -- */
+
+/*
+ * http_request -- general request: arbitrary method, optional request body, and
+ * optional extra request headers (already CRLF-terminated, e.g.
+ * "Authorization: Bearer X\r\n").  For a body, content_type is sent as the
+ * Content-Type header and Content-Length is added automatically.  flags takes
+ * the HTTP_F_* bits (HTTP_F_TLS for HTTPS).  Redirects are NOT followed for a
+ * non-GET request (OAuth endpoints return their JSON directly); pass method
+ * "GET" to get the normal redirect-following behaviour.  Returns body bytes
+ * (>= 0) or an HTTP_ERR_* code.  Fully bounded.
+ */
+long http_request(const char *host, unsigned short port, const char *path,
+                  const char *method, const char *extra_headers,
+                  const char *content_type, const unsigned char *body,
+                  long body_len, unsigned int flags,
+                  char *out_body, unsigned long out_cap, int *out_status)
+{
+    if (!host || !path || !out_body) return HTTP_ERR_INVAL;
+
+    /* Assemble the extra-header block: Content-Type (when a body is present)
+     * followed by any caller-supplied header lines.  Both are already / will be
+     * CRLF-terminated. */
+    char hdr[2048];
+    int  hp = 0;
+    if (body && body_len > 0 && content_type && content_type[0]) {
+        buf_puts(hdr, &hp, (int)sizeof(hdr), "Content-Type: ");
+        buf_puts(hdr, &hp, (int)sizeof(hdr), content_type);
+        buf_puts(hdr, &hp, (int)sizeof(hdr), "\r\n");
+    }
+    if (extra_headers && extra_headers[0]) {
+        buf_puts(hdr, &hp, (int)sizeof(hdr), extra_headers);
+    }
+    if (hp >= (int)sizeof(hdr) - 1) return HTTP_ERR_INVAL;
+    hdr[hp] = '\0';
+
+    int is_get = !method || !method[0] ||
+                 (method[0] == 'G' && method[1] == 'E' && method[2] == 'T' && method[3] == 0);
+    int max_redir = is_get ? HTTP_MAX_REDIRECTS : 0;
+
+    return http_do_get(host, port, path, out_body, out_cap, out_status,
+                       max_redir, flags, (hp > 0) ? hdr : (const char *)0,
+                       0 /* default timeout */,
+                       (method && method[0]) ? method : "GET", body, body_len);
+}
+
+/* http_post / https_post -- POST a body (plain TCP / TLS).  extra_headers may be
+ * NULL.  Convenience wrappers over http_request. */
+long http_post(const char *host, unsigned short port, const char *path,
+               const char *content_type, const unsigned char *body, long body_len,
+               const char *extra_headers,
+               char *out_body, unsigned long out_cap, int *out_status)
+{
+    return http_request(host, port, path, "POST", extra_headers, content_type,
+                        body, body_len, 0, out_body, out_cap, out_status);
+}
+
+long https_post(const char *host, unsigned short port, const char *path,
+                const char *content_type, const unsigned char *body, long body_len,
+                const char *extra_headers,
+                char *out_body, unsigned long out_cap, int *out_status)
+{
+    return http_request(host, port, path, "POST", extra_headers, content_type,
+                        body, body_len, HTTP_F_TLS, out_body, out_cap, out_status);
 }
 
 /* ---- offline self-test ------------------------------------------------- */

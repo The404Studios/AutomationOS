@@ -369,6 +369,15 @@ void _start(void) {
     print("[INIT] Spawning agentd (Nemotron gated OS-automation agent)...\n");
     spawn("sbin/agentd");
 
+#ifdef COCKPIT_PROOF
+    // AGENTCOCKPIT-0 headless seam proof: launch the cockpit in --proof mode so it
+    // auto-posts a goal + auto-RUNs with no human (build_test/run_cockpit.sh asserts the
+    // cockpit<->agentd markers). Gated behind COCKPIT_PROOF so a normal boot NEVER auto-runs
+    // it -- the cockpit otherwise stays launchable from the dock/start menu.
+    print("[INIT] COCKPIT_PROOF: launching sbin/cockpit --proof...\n");
+    spawn_args("sbin/cockpit", "--proof");
+#endif
+
     // cpu1offload: userspace -> CPU1 matmul offload probe. On the SMP kernel it
     // offloads an int matmul to CPU1 (the trusted coprocessor) via SYS_CPU1_OFFLOAD
     // and prints "CPU1OFFLOAD: PASS ... by_apic=1"; on the DEFAULT (single-core)

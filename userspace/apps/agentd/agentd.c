@@ -48,6 +48,34 @@
 #define MAX_STEPS   16            /* bounded ReAct loop                              */
 #define NET_WAIT_MAX 3000000
 
+/* ---- AGENTCOCKPIT-0: optional cockpit GUI seam (status + control over a SHM page) ----
+ * agentd attaches the page LOOKUP-ONLY. When it is ABSENT (no cockpit running) g_cp stays
+ * NULL and EVERY cockpit branch below is skipped -- so agentd behaves byte-identically to a
+ * no-cockpit boot (all existing mock proofs: hostile/codetask/gui are unaffected). */
+#define SYS_SHMGET_N 18
+#define SYS_SHMAT_N  19
+#define SYS_OPEN_N    4
+#define SYS_READ_N    2
+#define SYS_CLOSE_N   5
+#define AGENTCOCKPIT_SHM_KEY  0x41434B50u
+#define AGENTCOCKPIT_SHM_SIZE 4096u
+#define AGENTCOCKPIT_MAGIC    0x41434B01u
+#define AC_STATE_IDLE 0
+#define AC_STATE_RUNNING 1
+#define AC_STATE_CONFIRM 2
+#define AC_STATE_DONE 3
+#define AC_STATE_STOPPED 4
+#define AC_CONFIRM_NONE 0
+#define AC_CONFIRM_ALLOW 1
+#define AC_CONFIRM_DENY 2
+typedef struct {
+    unsigned int magic, goal_seq, stop, grant_full, confirm;
+    char goal[256];
+    unsigned int state, step, run_seq;
+    char tool[32]; char args[256]; char last[256];
+} agentcockpit_shm_t;
+static agentcockpit_shm_t* g_cp = 0;
+
 static unsigned slen(const char* s){ unsigned n=0; while(s&&s[n]) n++; return n; }
 static void outfd(int fd,const char* s){ long r,n=(long)slen(s);
     __asm__ volatile("syscall":"=a"(r):"a"((long)SYS_WRITE),"D"((long)fd),"S"((long)s),"d"(n):"rcx","r11","memory"); (void)r; }
@@ -87,6 +115,53 @@ static int recv_line(long fd, char* buf, int cap){
     buf[total]=0; return total>0?total:-1;
 }
 
+/* ---- AGENTCOCKPIT-0 helpers. All are no-ops unless a cockpit page is attached. ---- */
+static void cp_attach(void){
+    long id=_ch_sc(SYS_SHMGET_N,(long)AGENTCOCKPIT_SHM_KEY,(long)AGENTCOCKPIT_SHM_SIZE,0,0,0,0);
+    if(id<0) return;
+    long p=_ch_sc(SYS_SHMAT_N,id,0,0,0,0,0);
+    if(p<=0) return;
+    agentcockpit_shm_t* cp=(agentcockpit_shm_t*)p;
+    if(cp->magic!=AGENTCOCKPIT_MAGIC) return;   /* page not published yet -> stay headless */
+    g_cp=cp;
+}
+static void cp_setstr(char* dst,unsigned cap,const char* s){ unsigned i=0; for(;s&&s[i]&&i<cap-1;i++) dst[i]=s[i]; dst[i]=0; }
+static int is_confirm_tool(const char* t){
+    return streq(t,"remove")||streq(t,"spawn")||streq(t,"kill")||streq(t,"mouse")||streq(t,"key"); }
+/* pre-mutation snapshot -> /var/snapshots/<base>.<seq> (ramfs => in-session rollback only).
+ * Only when a cockpit session is active; non-fatal (logs + continues on any error). */
+static void pre_snapshot(const char* path,unsigned seq){
+    if(!g_cp || !path || !path[0]) return;
+    static char sb[8192]; long n=0;
+    long fd=_ch_sc(SYS_OPEN_N,(long)path,0,0,0,0,0);                 /* O_RDONLY */
+    if(fd>=0){ n=_ch_sc(SYS_READ_N,fd,(long)sb,sizeof(sb)-1,0,0,0); if(n<0)n=0; _ch_sc(SYS_CLOSE_N,fd,0,0,0,0,0); }
+    const char* base=path; for(unsigned i=0;path[i];i++) if(path[i]=='/') base=path+i+1;
+    static char sp[256]; char* d=sp; const char* pre="/var/snapshots/";
+    while(*pre) *d++=*pre++; const char* b=base; while(*b && d<sp+sizeof(sp)-16) *d++=*b++;
+    *d++='.'; { unsigned v=seq; char t[12]; int i=0; if(!v)t[i++]='0'; while(v){t[i++]=(char)('0'+v%10);v/=10;} while(i) *d++=t[--i]; } *d=0;
+    long o=_ch_sc(SYS_OPEN_N,(long)sp,0x41,0600,0,0,0);             /* O_WRONLY|O_CREAT */
+    if(o<0){ outfd(2,"AGENTD: snapshot open-fail\n"); return; }
+    if(n>0) _ch_sc(SYS_WRITE,o,(long)sb,n,0,0,0);
+    _ch_sc(SYS_CLOSE_N,o,0,0,0,0,0);
+}
+/* CONFIRM gate: 1=allow, 0=deny. Auto-allow when no cockpit / not CONFIRM-class / grant_full.
+ * Else park in CONFIRM and bounded-poll the cockpit's Allow/Deny (iteration-capped per LAW:
+ * any wall-clock wait needs a cap). STOP or timeout => deny (fail-safe). */
+static int confirm_gate(const char* tool,const char* args,unsigned step){
+    if(!g_cp || !is_confirm_tool(tool) || g_cp->grant_full) return 1;
+    g_cp->state=AC_STATE_CONFIRM; g_cp->step=step;
+    cp_setstr(g_cp->tool,sizeof(g_cp->tool),tool); cp_setstr(g_cp->args,sizeof(g_cp->args),args);
+    g_cp->confirm=AC_CONFIRM_NONE;
+    for(long it=0; it<2000000; it++){
+        if(g_cp->stop) return 0;
+        unsigned c=g_cp->confirm;
+        if(c==AC_CONFIRM_ALLOW){ g_cp->confirm=AC_CONFIRM_NONE; g_cp->state=AC_STATE_RUNNING; return 1; }
+        if(c==AC_CONFIRM_DENY){  g_cp->confirm=AC_CONFIRM_NONE; g_cp->state=AC_STATE_RUNNING; return 0; }
+        yield();
+    }
+    g_cp->state=AC_STATE_RUNNING; return 0;
+}
+
 /* ---- whitelist + path gate ---- the FIRST line of defense: only a known tool name
  * resolves to a program; everything else is rejected before any dispatch. Each tool
  * ALSO self-gates its paths (path_write_allowed), so the policy is defended twice. */
@@ -104,6 +179,7 @@ static const char* resolve_tool(const char* name){
     if(streq(name,"mkdir"))     return "sbin/tool_mkdir";
     if(streq(name,"move"))      return "sbin/tool_mv";
     if(streq(name,"remove"))    return "sbin/tool_rm";
+    if(streq(name,"rollback"))  return "sbin/tool_rollback";   /* C3: restore a file from its snapshot */
     /* Phase 2 apps/system */
     if(streq(name,"spawn"))     return "sbin/tool_spawn";
     if(streq(name,"kill"))      return "sbin/tool_kill";
@@ -207,6 +283,7 @@ static int dispatch(int ctrl, unsigned long rid, const char* prog,
 }
 
 static int host_mode(const char* goal){
+    cp_attach();                 /* AGENTCOCKPIT-0: attach lookup-only; g_cp NULL if no cockpit */
     if(!net_ready()){ outfd(1,"AGENTD: SKIP no_net\n"); return 0; }
     long fd=_ch_sc(SYS_SOCKET,SOCK_STREAM,0,0,0,0,0);
     if(fd<0){ outfd(1,"AGENTD: SKIP no_socket\n"); return 0; }
@@ -226,6 +303,7 @@ static int host_mode(const char* goal){
     /* GOAL */
     send_all(fd,"GOAL ",5); send_all(fd,goal,(long)slen(goal)); send_all(fd,"\n",1);
     outfd(1,"AGENTD: GOAL sent; running gated agent loop\n");
+    if(g_cp){ g_cp->run_seq=g_cp->goal_seq; g_cp->state=AC_STATE_RUNNING; g_cp->step=0; }
 
     /* line/args/buf are multi-KB -- keep them in BSS, NOT on the tiny userspace stack
      * (single-threaded, one tool in flight at a time, so reuse across iterations is safe). */
@@ -233,6 +311,7 @@ static int host_mode(const char* goal){
     static char args[LINE_CAP];
     unsigned long rid=1; int steps=0, done=0;
     for(int step=0; step<MAX_STEPS; step++){
+        if(g_cp && g_cp->stop){ g_cp->state=AC_STATE_STOPPED; outfd(1,"AGENTD: STOP (operator)\n"); break; }
         int ll=recv_line(fd,line,sizeof(line));
         if(ll<0){ outfd(1,"AGENTD: broker closed\n"); break; }
         if(eqn(line,"DONE",4)){ outfd(1,"AGENTD: DONE "); outfd(1,line+ (line[4]==' '?5:4)); outfd(1,"\n"); done=1; break; }
@@ -263,6 +342,18 @@ static int host_mode(const char* goal){
             continue;
         }
         outfd(1,"AGENTD: TOOL "); outfd(1,tool); outfd(1," "); outfd(1,ac>0?av[0]:""); outfd(1,"\n");
+        /* cockpit status: publish the current step/tool/args (no-op without a cockpit) */
+        if(g_cp){ g_cp->state=AC_STATE_RUNNING; g_cp->step=(unsigned)steps;
+                  cp_setstr(g_cp->tool,sizeof(g_cp->tool),tool);
+                  cp_setstr(g_cp->args,sizeof(g_cp->args),ac>0?av[0]:""); }
+        /* CONFIRM gate: dangerous tools wait for the operator's Allow/Deny (unless grant_full) */
+        if(!confirm_gate(tool, ac>0?av[0]:"", (unsigned)steps)){
+            outfd(1,"AGENTD: CONFIRM-DENY tool="); outfd(1,tool); outfd(1,"\n");
+            send_all(fd,"RESULT [denied by operator]\n",28);
+            continue;
+        }
+        /* pre-mutation snapshot for rollback (cockpit session only) */
+        if(streq(tool,"write_file")||streq(tool,"remove")) pre_snapshot(ac>0?av[0]:0,(unsigned)steps);
         static char buf[1024]; int bl=0, ec=-999;
         if(dispatch(ctrl,rid++,prog,av,ac,buf,sizeof(buf)-1,&bl,&ec)){
             if(bl<0) bl=0; if(bl>(int)sizeof(buf)-1) bl=sizeof(buf)-1; buf[bl]=0;
@@ -277,7 +368,9 @@ static int host_mode(const char* goal){
         } else {
             send_all(fd,"RESULT [tool execution failed]\n",31);
         }
+        if(g_cp && bl>0) cp_setstr(g_cp->last,sizeof(g_cp->last),buf);  /* publish last result */
     }
+    if(g_cp) g_cp->state = done ? AC_STATE_DONE : AC_STATE_STOPPED;
 
     { ch_msg_hdr sh; sh.type=MSG_SHUTDOWN; sh.flags=0; sh.len=0; sh.request_id=999; ch_sendmsg(ctrl,&sh,(const void*)0); }
     ch_close(ctrl); _ch_sc(SYS_CLOSE_SK,fd,0,0,0,0,0);

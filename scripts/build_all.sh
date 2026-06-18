@@ -33,6 +33,13 @@ if [ "${GAMETEST:-0}" = "1" ]; then
     INIT_EXTRA="$INIT_EXTRA -DGAMETEST_RUN"
     echo "*** GAMETEST build: init compiled with -DGAMETEST_RUN (spawns sbin/gametest) ***"
 fi
+# COCKPIT_PROOF=1: init auto-launches sbin/cockpit --proof so build_test/run_cockpit.sh can
+# verify the cockpit<->agentd seam headlessly. OFF by default -- a normal boot never auto-runs
+# the proof; the cockpit stays launchable from the dock for interactive use.
+if [ "${COCKPIT_PROOF:-0}" = "1" ]; then
+    INIT_EXTRA="$INIT_EXTRA -DCOCKPIT_PROOF"
+    echo "*** COCKPIT_PROOF build: init auto-launches sbin/cockpit --proof (headless seam proof) ***"
+fi
 # DESKTOP_MINIMAL=1: init spawns ONLY the persistent desktop apps and skips the
 # ~70 self-test programs (the boot "storm"). This is the T410 desktop profile --
 # fast/smooth/low-churn boot, no long no-yield compute blocks freezing the
@@ -207,6 +214,8 @@ cc userspace/apps/tool_shell/tool_shell.c /tmp/tool_shell.o; $LD /tmp/crt0.o /tm
 # SYNTHINPUT-0: synthetic input tools (mouse/keyboard) -- the agent drives the GUI via these.
 cc userspace/apps/tool_mouse/tool_mouse.c /tmp/tool_mouse.o; $LD /tmp/crt0.o /tmp/tool_mouse.o -o /tmp/tool_mouse.elf
 cc userspace/apps/tool_key/tool_key.c     /tmp/tool_key.o;   $LD /tmp/crt0.o /tmp/tool_key.o   -o /tmp/tool_key.elf
+# C3: tool_rollback -- restore a file from its /var/snapshots/<base>.<seq> snapshot.
+cc userspace/apps/tool_rollback/tool_rollback.c /tmp/tool_rollback.o; $LD /tmp/crt0.o /tmp/tool_rollback.o -o /tmp/tool_rollback.elf
 # CLAUDE-API-0: claudehost -- raw TCP over the slirp seam to the host Claude
 # broker (scripts/claude_broker.py), which holds the API key + does the real
 # HTTPS to api.anthropic.com. Same socket-only link as modelbridge.
@@ -494,6 +503,10 @@ echo "[all] toolkit apps..."
 # other toolkit apps below.
 cc userspace/apps/filemanager/filemanager.c /tmp/filemanager.o
 $LD /tmp/crt0.o /tmp/filemanager.o /tmp/ui.o /tmp/wlc.o /tmp/bf.o /tmp/font2.o -o /tmp/filemanager.elf
+# AGENTCOCKPIT-0: the cockpit is argv-aware (--proof), so link it WITH crt0 like filemanager
+# (NOT build_ui_app, whose bare _start gets no argc/argv).
+cc userspace/apps/cockpit/cockpit.c /tmp/cockpit.o
+$LD /tmp/crt0.o /tmp/cockpit.o /tmp/ui.o /tmp/wlc.o /tmp/bf.o /tmp/font2.o -o /tmp/cockpit.elf
 build_ui_app userspace/apps/calculator/calculator.c   calculator
 build_ui_app userspace/apps/clock/clock.c             clock
 build_ui_app userspace/apps/sysinfo/sysinfo.c         sysinfo
@@ -609,7 +622,7 @@ $LD /tmp/crt0.o /tmp/cc.o \
     -o /tmp/cc.elf
 
 echo "[all] canary check (all must be 0):"
-for e in comp init filemanager calculator clock sysinfo settings sysmon uidemo dateapp applauncher taskman terminal editor snake paint synth tetris game2048 sheet notes calendar stopwatch mines piano dashboard welcome bench breakout pong invaders procmon soundtest solitaire aiconsole screenshot stress musicplayer ide bubbletd zombietd pacman clockapp forktest sigtest pollselftest threadtest reaploop forkfdtest forkregtest matmuljobs aibroker sed awk tar pkg make meminfo argvtest msgtest rpctest toolrun echoproof echoargs agenthost tool_read tool_ls tool_stat codeagent toolset_host chainhost modelbridge agentd tool_write tool_cc tool_exec tool_mkdir tool_mv tool_rm tool_spawn tool_kill tool_ps tool_shell tool_mouse tool_key claudehost initrdp initrdalias floattest sleeptest prioritytest matbench tensortest cpuburn blk ps kill free uptime find diff cmp tee wcx xargs gzip cc nettest sockettest cpu1offload smpstress wget netman cryptotest libtest ping nc netinfo netscan tcping dig httpget pktmon httpd traceroute arp grep head tail sort uniq cut tr nl du touch basename dirname uname hostname whoami date less hexdump lspci tlsprobe certtool dhcpc autodhcp apidemo gsignin js futextest epolltest sendfiletest perftest batchtest domtest htmltest csstest layouttest webtest browser2 webapitest cube3d ray chess asteroids sudoku photos startmenu controlcenter claudechat anthropic gametest exectest execchild; do
+for e in comp init filemanager calculator clock sysinfo settings sysmon uidemo dateapp applauncher taskman terminal editor snake paint synth tetris game2048 sheet notes calendar stopwatch mines piano dashboard welcome bench breakout pong invaders procmon soundtest solitaire aiconsole screenshot stress musicplayer ide bubbletd zombietd pacman clockapp forktest sigtest pollselftest threadtest reaploop forkfdtest forkregtest matmuljobs aibroker sed awk tar pkg make meminfo argvtest msgtest rpctest toolrun echoproof echoargs agenthost tool_read tool_ls tool_stat codeagent toolset_host chainhost modelbridge agentd tool_write tool_cc tool_exec tool_mkdir tool_mv tool_rm tool_spawn tool_kill tool_ps tool_shell tool_mouse tool_key tool_rollback cockpit claudehost initrdp initrdalias floattest sleeptest prioritytest matbench tensortest cpuburn blk ps kill free uptime find diff cmp tee wcx xargs gzip cc nettest sockettest cpu1offload smpstress wget netman cryptotest libtest ping nc netinfo netscan tcping dig httpget pktmon httpd traceroute arp grep head tail sort uniq cut tr nl du touch basename dirname uname hostname whoami date less hexdump lspci tlsprobe certtool dhcpc autodhcp apidemo gsignin js futextest epolltest sendfiletest perftest batchtest domtest htmltest csstest layouttest webtest browser2 webapitest cube3d ray chess asteroids sudoku photos startmenu controlcenter claudechat anthropic gametest exectest execchild; do
     n=$(objdump -d /tmp/$e.elf 2>/dev/null | grep -c "fs:0x28" || true)
     echo "  $e=$n"
 done
@@ -688,6 +701,8 @@ cp /tmp/tool_ps.elf    /tmp/ird/sbin/tool_ps
 cp /tmp/tool_shell.elf /tmp/ird/sbin/tool_shell
 cp /tmp/tool_mouse.elf /tmp/ird/sbin/tool_mouse
 cp /tmp/tool_key.elf   /tmp/ird/sbin/tool_key
+cp /tmp/tool_rollback.elf /tmp/ird/sbin/tool_rollback
+cp /tmp/cockpit.elf    /tmp/ird/sbin/cockpit
 # CLAUDE-API-0 -> /sbin and /bin (init spawns it; also runnable from the terminal).
 cp /tmp/claudehost.elf /tmp/ird/sbin/claudehost
 cp /tmp/claudehost.elf /tmp/ird/bin/claudehost

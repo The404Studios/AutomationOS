@@ -103,6 +103,33 @@ bricks, deletes dev scratch, and pins a green build+smoke baseline before any ne
   cockpit GUI (D2: new `cockpit.c` extending the anthropic/ui.h pattern, spawns agentd + parses its
   serial, Allow/Deny/grant-full/STOP). Apply these next.
 
+## Cockpit (D2) + CONFIRM gate (C5) — the human-facing surface, PROVEN
+- **Ring-desync BUGFIX (a29a373 follow-up):** the synthetic-input SPSC ring desynced — producers
+  kept `head` in `[0,QMAX)` (`% QMAX`) but `pump_synth_input` advanced `tail` UNBOUNDED, so after
+  ~64 events `tail!=head` stayed true forever → stale-event replay (cursor jitter/stuck keys). Fixed:
+  consumer now masks `tail = (tail+1) & (QMAX-1)`. (Found by the adversarial review of a29a373.)
+- **Cockpit seam (`agentcockpit.h`, KEY 0x41434B50):** the cockpit OWNS a 0600 SHM page (control:
+  goal/goal_seq/stop/grant_full/confirm; status: state/step/tool/args/last). agentd attaches it
+  LOOKUP-ONLY: **absent → g_cp NULL → byte-identical to today** (every existing proof still passes —
+  verified: hostile DENY/DENY/TOOL/PASS steps=3 unchanged).
+- **`cockpit.c`** (new UI app, crt0-linked like filemanager for `--proof` argv): goal textbox,
+  RUN/STOP, scroll step-log, Allow/Deny + grant-full checkbox; RUN posts goal+spawns agentd; per-frame
+  tick reads status + streams steps; `--proof` auto-posts a goal + auto-RUNs headlessly.
+- **agentd integration:** cp_attach + per-step status writes + STOP check + a CONFIRM gate on the
+  CONFIRM-class tools (remove/spawn/kill/mouse/key — wait for Allow/Deny unless grant_full, bounded-
+  poll, fail-safe deny on timeout/STOP) + pre_snapshot (write_file/remove → /var/snapshots/<base>.<seq>,
+  ramfs = in-session). All g_cp-guarded.
+- **C3 `tool_rollback`** (new, on the rail): restores a file from its latest snapshot.
+- **Build/boot wiring:** cockpit + tool_rollback compiled (canary 0), staged, canary-listed; a
+  `COCKPIT_PROOF` build flag gates an init `spawn_args("sbin/cockpit","--proof")` for the headless test
+  (default boot never auto-runs it). `build_test/run_cockpit.sh`.
+- **PROVEN (`run_cockpit.sh`, COCKPIT_PROOF=1):** `[INIT] COCKPIT_PROOF: launching sbin/cockpit
+  --proof` → `[COCKPIT] proof: posted goal seq=1` → `AGENTD: GOAL sent` → `TOOL list_dir` → `AGENTD:
+  PASS loop_completed` (+ `[COCKPIT] step N: <tool>` proves STATUS-back). smoke_boot 43/43, no
+  regression. **`COCKPIT: PASS` — cockpit↔agentd seam proven headlessly (no human).**
+- **Designs READY (not yet applied):** C2 O_NOFOLLOW (exact 11-edit vfs.c patch, O_NOFOLLOW=0x100,
+  final-component-only), C4 ledger FNV-1a hash-chain + ledgerver (exact aibroker.c edits). Apply next.
+
 ## Next (this branch, in order)
 - **Phase C** — harden the gate: `/etc/ai/policy.json`, O_NOFOLLOW symlink defense, rollback
   ownership, ledger integrity, CONFIRM + grant-full, multi-line-result hardening, adversarial verify.

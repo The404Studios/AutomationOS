@@ -416,7 +416,23 @@ static const char *basename_of(const char *path)
  *   <ticks_ms> tool=<t> args=<a> risk=<r> decision=<ALLOW/DENY/APPROVE> result=<ok/err>
  * ====================================================================== */
 #define LEDGER_PATH "/var/log/ai/actions.log"
-static char g_ledger_line[1024];
+static char g_ledger_line[2048];   /* widened for the C4 hash-chain fields */
+
+/* C4: tamper-evident hash-chain over the ledger. Each line carries seq + a 64-bit FNV-1a
+ * hash of (prev_hash_hex || the record fields || seq); any edit to a past line breaks the
+ * chain at verify time (sbin/ledgerver). /var is ramfs => in-session integrity only. */
+static u64 g_ledger_seq  = 0ULL;
+static u64 g_ledger_prev = 0xcbf29ce484222325ULL;   /* FNV-1a offset basis (chain seed) */
+static u64 fnv1a(const char *p, int n){
+    u64 h = 0xcbf29ce484222325ULL;
+    for(int i=0;i<n;i++){ h ^= (unsigned char)p[i]; h *= 0x100000001b3ULL; }
+    return h;
+}
+static void u64_to_hex16(u64 v, char *buf){
+    static const char hx[] = "0123456789abcdef";
+    for(int i=15;i>=0;i--){ buf[i]=hx[v & 0xf]; v >>= 4; }
+    buf[16]=0;
+}
 
 static void ledger_record(const char *tool, const char *args,
                           int decision, const char *result)
@@ -436,6 +452,24 @@ static void ledger_record(const char *tool, const char *args,
     k_strlcat(g_ledger_line, ledger_decision(decision), sizeof(g_ledger_line));
     k_strlcat(g_ledger_line, " result=", sizeof(g_ledger_line));
     k_strlcat(g_ledger_line, result ? result : "-", sizeof(g_ledger_line));
+
+    /* C4 hash-chain: append seq, then hash=FNV1a(prev_hex || <line-so-far incl seq>). */
+    {
+        char seqs[24]; u64_to_dec(g_ledger_seq, seqs);
+        k_strlcat(g_ledger_line, " seq=", sizeof(g_ledger_line));
+        k_strlcat(g_ledger_line, seqs, sizeof(g_ledger_line));
+        static char chain[2048]; char prevh[17];
+        u64_to_hex16(g_ledger_prev, prevh);
+        chain[0] = 0;
+        k_strlcat(chain, prevh, sizeof(chain));
+        k_strlcat(chain, " ", sizeof(chain));
+        k_strlcat(chain, g_ledger_line, sizeof(chain));   /* prev_hex || ticks..seq (no hash yet) */
+        int clen = 0; while(clen < (int)sizeof(chain) && chain[clen]) clen++;
+        char hh[17]; u64 h = fnv1a(chain, clen); u64_to_hex16(h, hh);
+        k_strlcat(g_ledger_line, " hash=", sizeof(g_ledger_line));
+        k_strlcat(g_ledger_line, hh, sizeof(g_ledger_line));
+        g_ledger_prev = h; g_ledger_seq++;
+    }
     k_strlcat(g_ledger_line, "\n", sizeof(g_ledger_line));
 
     append_line(LEDGER_PATH, g_ledger_line);

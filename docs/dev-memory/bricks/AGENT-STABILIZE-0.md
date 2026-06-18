@@ -127,8 +127,17 @@ bricks, deletes dev scratch, and pins a green build+smoke baseline before any ne
   --proof` → `[COCKPIT] proof: posted goal seq=1` → `AGENTD: GOAL sent` → `TOOL list_dir` → `AGENTD:
   PASS loop_completed` (+ `[COCKPIT] step N: <tool>` proves STATUS-back). smoke_boot 43/43, no
   regression. **`COCKPIT: PASS` — cockpit↔agentd seam proven headlessly (no human).**
-- **Designs READY (not yet applied):** C2 O_NOFOLLOW (exact 11-edit vfs.c patch, O_NOFOLLOW=0x100,
-  final-component-only), C4 ledger FNV-1a hash-chain + ledgerver (exact aibroker.c edits). Apply next.
+- **C4 ledger hash-chain DONE + PROVEN:** aibroker's `ledger_record` now appends `seq=<n> hash=<16hex>`
+  where hash=FNV1a(prev_hex || fields || seq); new freestanding `sbin/ledgerver` re-reads
+  /var/log/ai/actions.log and recomputes the chain. Boot proof: **`LEDGER: VERIFIED records=10`**
+  (init spawns ledgerver after "All services started"); smoke_boot 43/43. /var is ramfs => in-session
+  integrity only.
+- **C2 O_NOFOLLOW DEFERRED (low priority):** exact patch in hand (O_NOFOLLOW=0x100, final-component-only
+  in vfs.c, tool opens), BUT the adversarial review confirmed the symlink hole is currently
+  UNREACHABLE (no whitelisted tool can create a symlink), so it defends a theoretical attack at HIGH
+  kernel-regression risk. Note: the round-1 patch is incomplete (threads `flags` through the resolver
+  but never wires vfs_open's open-flags into it) -- finish that before applying. Park until a
+  symlink-creating capability lands.
 
 ## Next (this branch, in order)
 - **Phase C** — harden the gate: `/etc/ai/policy.json`, O_NOFOLLOW symlink defense, rollback

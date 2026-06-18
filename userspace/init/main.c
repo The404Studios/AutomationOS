@@ -530,6 +530,11 @@ void _start(void) {
 
     print("[INIT] All services started!\n");
 
+    // C4: verify the agent audit ledger's tamper-evident hash-chain (aibroker writes it
+    // during its boot self-test). Prints "LEDGER: VERIFIED records=N" / "TAMPERED line=K"
+    // / "EMPTY". A quick read-verify-exit; harmless on every boot.
+    spawn("sbin/ledgerver");
+
 #ifdef FAIRTEST
     // SCHED-FAIRNESS-0 proof (build FAIRTEST=1 PREEMPT=1 DESKTOP_MINIMAL=1).
     // Spawn pure non-syscalling ring-3 burners (sbin/pureburn) + a sleeper

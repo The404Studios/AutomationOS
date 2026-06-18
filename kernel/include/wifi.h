@@ -78,4 +78,11 @@ struct netif* netif_get_wifi_default(void);
  * (registers nothing). Prints "WIFISEAM: PASS ...". */
 void wifi_seam_selftest(void);
 
+/* WIFI-SYS: SYS_WLAN_* syscall handlers (kernel/net/wlansyscall.c). */
+int64_t sys_wlan_scan(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t);
+int64_t sys_wlan_connect(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t);
+int64_t sys_wlan_status(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t);
+int64_t sys_wlan_disconnect(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t);
+int64_t sys_wlan_set_key(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t);
+
 #endif /* WIFI_H */

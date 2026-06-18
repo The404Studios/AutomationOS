@@ -440,6 +440,7 @@ void _start(void) {
     // PERSISTENT desktop apps -- spawned in BOTH the full and minimal builds.
     print("[INIT] Spawning netman + browser2...\n");
     spawn("sbin/netman");
+    spawn("sbin/wlanctl");    // WIFI-SYS M1: one-shot SYS_WLAN_SCAN probe (prints the AP list, or ENOTSUP with no wifi); exits
     spawn("sbin/browser2");   // BROWSER-CONSOLIDATE-0: the one real (DOM/CSS/JS/HTTPS) browser
 
 #ifndef DESKTOP_MINIMAL

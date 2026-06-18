@@ -121,6 +121,12 @@
 #define SYS_SIGPENDING     110 // SIG-FULL-0: return the pending-signal bitset (observability)
 #define SYS_POLL           111 // POLL-SELECT-0 (B10): poll(fds, nfds, timeout_ms)
 #define SYS_SELECT         112 // POLL-SELECT-0 (B10): select(nfds, rfds, wfds, efds, timeval*)
+// WiFi control plane (SYS_WLAN_*) -- kernel/net/wlansyscall.c + uapi/wlan.h
+#define SYS_WLAN_SCAN       113 // scan for APs -> array of uapi_wlan_bss_t
+#define SYS_WLAN_CONNECT    114 // join an SSID (uapi_wlan_connect_t)
+#define SYS_WLAN_STATUS     115 // association state (uapi_wlan_status_t)
+#define SYS_WLAN_DISCONNECT 116 // disconnect
+#define SYS_WLAN_SET_KEY    117 // supplicant installs PTK/GTK (uapi_wlan_setkey_t)
 #define SYS_VMA_TEST    200 // VMA red-black tree testing and benchmarking
 
 // ---- SMP coprocessor offload (GATED: only registered under SMP_FOUNDATION) ----

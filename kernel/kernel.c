@@ -1046,9 +1046,18 @@ void kernel_main(void* raw_info) {
     sock_init();
 
     // WIFI-SEAM: one-shot proof the wifi_ops seam compiled + resolves. Prints
-    // "WIFISEAM: PASS ..." (registers nothing; eth0.wifi stays NULL).
+    // "WIFISEAM: PASS ..." (registers nothing; eth0.wifi stays NULL). Runs
+    // BEFORE any wifi backend registers, so its wifi_default==none holds.
     extern void wifi_seam_selftest(void);
     wifi_seam_selftest();
+
+#ifdef WIFI_SIM
+    // WIFI-SIM: register the simulated wlan0 backend (fixed AP list + simulated
+    // connect) so the whole scan->connect->DHCP flow runs in QEMU with no radio.
+    // The real iwlwifi driver replaces this behind the same wifi_ops seam.
+    extern void wifisim_init(void);
+    wifisim_init();
+#endif
 
 #ifdef NET_SELFTEST
     // NET-P1-A0: the deterministic in-kernel net test rig proof. Runs once,

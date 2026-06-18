@@ -43,6 +43,16 @@ if [ "${PCH_NIC:-0}" = "1" ]; then
     CFLAGS="$CFLAGS -DE1000_PCH_NIC"
     echo "*** PCH_NIC build: 82577LM PCH NIC bring-up ENABLED (T410 boot risk) ***"
 fi
+# WIFI_SIM=1: compile the simulated WiFi backend (wifisim) so a fake "wlan0" with
+# a fixed AP list + a simulated connect appears, exercising the whole
+# scan->connect->DHCP flow + the Network Manager GUI in QEMU with NO real radio.
+# The real iwlwifi driver replaces it behind the same wifi_ops seam. Default OFF
+# -> the default kernel has the SYS_WLAN_* syscalls (returning ENOTSUP) but no
+# wifi interface. QEMU has no real wifi, so this is the only wifi during dev.
+if [ "${WIFI_SIM:-0}" = "1" ]; then
+    CFLAGS="$CFLAGS -DWIFI_SIM"
+    echo "*** WIFI_SIM build: simulated wlan0 backend compiled (scan/connect demo) ***"
+fi
 
 # ─────────────────────────────────────────────────────────────────────────────
 # OPT-IN: the NET-P1-A0 in-kernel network test rig.
@@ -505,6 +515,13 @@ compile kernel/drivers/audio/audio_tone.c     c_audio_tone
 compile kernel/net/route.c                    c_route
 compile kernel/net/netif.c                   c_netif
 compile kernel/net/netsyscall.c              c_netsyscall
+# WIFI-SYS: the SYS_WLAN_* control-plane syscalls (always compiled; they return
+# ENOTSUP when no wifi interface is registered).
+compile kernel/net/wlansyscall.c             c_wlansyscall
+# WIFI-SIM: the simulated wlan0 backend (only under -DWIFI_SIM).
+if [ "${WIFI_SIM:-0}" = "1" ]; then
+    compile kernel/drivers/net/wireless/sim/wifisim.c  c_wifisim
+fi
 # BSD-ish sockets (UDP + active-open TCP) on top of net.c. The ~338KB socket
 # table now lives in kmalloc (see socket.c), NOT .bss, so these are safe to link.
 compile kernel/net/socket.c                  c_socket

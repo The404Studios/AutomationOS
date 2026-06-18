@@ -5,6 +5,7 @@
 #include "../../include/sched.h"
 #include "../../include/net.h"   // sys_net_info / sys_net_send / sys_net_recv prototypes
 #include "../../include/netif.h" // sys_net_config prototype
+#include "../../include/wifi.h"   // WIFI-SYS: sys_wlan_* prototypes
 #include "../../include/socket.h" // sys_sock_* (BSD socket) prototypes
 #include "../../include/poll.h"   // POLL-SELECT-0: sys_poll / sys_select prototypes
 #include "../../include/audio.h" // audio_beep (SYS_BEEP target)
@@ -175,6 +176,13 @@ void syscall_init(void) {
     syscall_table[SYS_NET_CONFIG]  = (syscall_handler_t)sys_net_config;
     syscall_table[SYS_ROUTE_TABLE] = (syscall_handler_t)sys_route_table;
     syscall_table[SYS_ARP_TABLE]   = (syscall_handler_t)sys_arp_table;
+
+    // WiFi control plane (SYS_WLAN_*) -- dispatch through netif_t.wifi (wifi_ops)
+    syscall_table[SYS_WLAN_SCAN]       = (syscall_handler_t)sys_wlan_scan;
+    syscall_table[SYS_WLAN_CONNECT]    = (syscall_handler_t)sys_wlan_connect;
+    syscall_table[SYS_WLAN_STATUS]     = (syscall_handler_t)sys_wlan_status;
+    syscall_table[SYS_WLAN_DISCONNECT] = (syscall_handler_t)sys_wlan_disconnect;
+    syscall_table[SYS_WLAN_SET_KEY]    = (syscall_handler_t)sys_wlan_set_key;
 
     // PCI device list (lspci userspace tool)
     syscall_table[SYS_PCI_LIST]    = (syscall_handler_t)sys_pci_list;

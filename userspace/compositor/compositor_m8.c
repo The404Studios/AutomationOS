@@ -874,7 +874,7 @@ static int32_t g_task_w = 0;   /* 0 = not yet computed (set before first use) */
 #define RDOCK_FAN_SPARKLES    8   /* sparkle dots drawn around a hovered icon */
 
 /* Number of app entries and folders */
-#define RDOCK_NICONS  17   /* DESKTOP-REVAMP-0: +Claude chat +Anthropic panel */
+#define RDOCK_NICONS  18   /* DESKTOP-REVAMP-0: +Claude chat +Anthropic panel +Cockpit */
 #define RDOCK_NFOLDERS 2
 
 /* App descriptor */
@@ -916,6 +916,7 @@ static const rdock_app_t rdock_apps[RDOCK_NICONS] = {
     { "Db", "sbin/derby",       0xFFD35400u },  /* 14 Derby 3D   */
     { "Cc", "sbin/claudechat",  0xFFD97757u },  /* 15 Claude     */
     { "An", "sbin/anthropic",   0xFFB8865Au },  /* 16 Anthropic  */
+    { "Ck", "sbin/cockpit",     0xFF6B5B95u },  /* 17 Cockpit    -- the agent console */
 };
 
 /* ---- Folder table (Games + Tools); members[] index into rdock_apps[] ---- */

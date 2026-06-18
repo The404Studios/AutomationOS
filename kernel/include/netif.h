@@ -18,6 +18,8 @@
 #define NETIF_NAME_MAX  16
 #define NETIF_MAX        4
 
+struct wifi_ops;   /* WIFI-SEAM: forward decl; full def in wifi.h (by pointer) */
+
 /* ------------------------------------------------------------------ */
 /* Network interface descriptor                                        */
 /* ------------------------------------------------------------------ */
@@ -35,6 +37,11 @@ typedef struct netif {
     int  (*tx)(const void* frame, uint16_t len);
     int  (*rx_poll)(void* buf, uint16_t buf_len);
     int  (*get_mac)(uint8_t out[ETH_ALEN]);
+
+    /* WIFI-SEAM: WiFi control-plane ops, NULL for wired interfaces (eth0).
+     * Once associated, the wifi driver fills tx/rx_poll/get_mac above so the
+     * IP/socket/DHCP stack runs identically to wired. See wifi.h. */
+    struct wifi_ops* wifi;
 
     /* Traffic counters. */
     uint64_t tx_packets;

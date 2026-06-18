@@ -12,6 +12,8 @@
 #include "../include/net.h"
 #include "../include/kernel.h"
 #include "../include/string.h"
+#include "../include/wifi.h"   /* WIFI-SEAM: wifi_ops + netif_get_wifi_default */
+#include "../include/uapi/wlan.h" /* WIFI-SEAM: freeze + ABI-check the SYS_WLAN_* structs */
 
 /* ------------------------------------------------------------------ */
 /* Static registry                                                     */
@@ -88,4 +90,44 @@ void netif_sync_globals(void) {
 
     net_set_ip(nif->ip);
     net_set_gateway(nif->gateway);
+}
+
+/* ------------------------------------------------------------------ */
+/* WIFI-SEAM: the wifi HAL lookup + boot self-test                     */
+/* ------------------------------------------------------------------ */
+
+/*
+ * netif_get_wifi_default -- first registered interface carrying wifi_ops.
+ * Returns NULL until a wifi driver/backend (wifisim or iwlwifi) registers a
+ * wlan netif. The GUI/supplicant/SYS_WLAN_* path use this to find the radio.
+ */
+struct netif* netif_get_wifi_default(void) {
+    for (int i = 0; i < g_netif_count; i++) {
+        if (g_netifs[i].wifi) return &g_netifs[i];
+    }
+    return (struct netif*)0;
+}
+
+/*
+ * wifi_seam_selftest -- prove the seam compiled + wired, WITHOUT polluting the
+ * registry. Asserts: (1) the netif_t.wifi field exists and can hold ops;
+ * (2) wired interfaces (eth0) carry wifi==NULL; (3) the lookup resolves (NULL
+ * now, since no wifi backend is registered yet -- WIFI-SIM makes it non-NULL).
+ */
+void wifi_seam_selftest(void) {
+    static wifi_ops_t dummy;            /* zeroed; members are never called    */
+    netif_t probe;                      /* stack-local -- NOT registered        */
+    memset(&probe, 0, sizeof(probe));
+    probe.wifi = &dummy;
+
+    int field_ok   = (probe.wifi == &dummy);
+    netif_t* def   = netif_get_default();
+    int wired_null = (!def || def->wifi == (struct wifi_ops*)0);
+    int lookup_ok  = (netif_get_wifi_default() == (struct netif*)0);
+
+    if (field_ok && wired_null && lookup_ok)
+        kprintf("WIFISEAM: PASS field=ok wired_wifi=null wifi_default=none\n");
+    else
+        kprintf("WIFISEAM: FAIL field=%d wired_null=%d lookup=%d\n",
+                field_ok, wired_null, lookup_ok);
 }

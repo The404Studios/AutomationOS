@@ -1045,6 +1045,11 @@ void kernel_main(void* raw_info) {
     extern void sock_init(void);
     sock_init();
 
+    // WIFI-SEAM: one-shot proof the wifi_ops seam compiled + resolves. Prints
+    // "WIFISEAM: PASS ..." (registers nothing; eth0.wifi stays NULL).
+    extern void wifi_seam_selftest(void);
+    wifi_seam_selftest();
+
 #ifdef NET_SELFTEST
     // NET-P1-A0: the deterministic in-kernel net test rig proof. Runs once,
     // pre-userspace, prints the NETRIG marker, and fully resets the socket

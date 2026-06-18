@@ -61,6 +61,11 @@ bricks, deletes dev scratch, and pins a green build+smoke baseline before any ne
   - `AGENTD: DENY tool=delete_everything` — unknown destructive tool → whitelist DENY.
   - `AGENTD: DENY tool=read_file` (`/etc/../boot/grub.cfg`) — `..` traversal → path-policy DENY.
   - `AGENTD: TOOL read_file /etc/toolset0.txt` → `AGENTD: PASS loop_completed steps=3` — legit allowed.
+- **Positive end-to-end proof PASSES** (`run_agentd_codetask.sh`): the agent runs the full
+  run-open-code pipeline — `mkdir /tmp/agentproj` → `write_file m.c` (base64 over the v2 rail) →
+  `compile` (ON-DEVICE /bin/cc) → `execute /tmp/m.elf` → `ps` → `remove /etc/passwd` **DENIED** →
+  `AGENTD: PASS loop_completed steps=6`. This is the on-device validation of the cc commit that the
+  host-only `cc_regression_smoke.sh` could not give, plus the agent-rpc v2 base64 rail end-to-end.
 - **Rail assessment:** the live gate is already well-built — whitelist + `bad_path` run BEFORE any
   dispatch, tool stdout is newline-collapsed (closes the multi-line broker-desync vector), stdout
   flows over one-shot P6c capabilities. Remaining C items are ENHANCEMENTS, not open holes:

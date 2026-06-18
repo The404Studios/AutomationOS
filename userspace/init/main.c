@@ -360,6 +360,15 @@ void _start(void) {
     print("[INIT] Spawning claudehost (USE Claude over the network)...\n");
     spawn("sbin/claudehost");
 
+    // NEMOTRON-AGENT: agentd -- the OS-side gated agentic loop. Connects to the host
+    // model broker (10.0.2.2:8433) and runs a multi-step GOAL/TOOL/RESULT/DONE loop,
+    // dispatching only whitelisted tools through the path-traversal gate. SKIPs cleanly
+    // (AGENTD: SKIP no_net/no_broker) when no broker is up, so a normal boot is unaffected.
+    // Bring it to life with `python3 scripts/nemotron_mock.py` (zero-cost) or
+    // `node scripts/nemotron_broker.js` (live NVIDIA/Puter Nemotron) + boot -netdev.
+    print("[INIT] Spawning agentd (Nemotron gated OS-automation agent)...\n");
+    spawn("sbin/agentd");
+
     // cpu1offload: userspace -> CPU1 matmul offload probe. On the SMP kernel it
     // offloads an int matmul to CPU1 (the trusted coprocessor) via SYS_CPU1_OFFLOAD
     // and prints "CPU1OFFLOAD: PASS ... by_apic=1"; on the DEFAULT (single-core)

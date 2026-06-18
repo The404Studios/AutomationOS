@@ -52,6 +52,22 @@ bricks, deletes dev scratch, and pins a green build+smoke baseline before any ne
 - The agent broker port is **8433** (not 8431).
 - playful-boole "Phase 0" (temp applauncher spawn) was already done — `init/main.c` is clean.
 
+## Phase C progress — the gate is solid; agentd wired live
+- **Gap closed:** the committed agent system was DORMANT — `init/main.c` never spawned `agentd`,
+  so the feature wasn't live (the proof scripts boot the default ISO expecting it). Added the spawn
+  next to `claudehost`: net-gated and self-skipping (`AGENTD: SKIP no_net/no_broker`), so a normal
+  boot is unaffected; it comes alive when a broker is up on `10.0.2.2:8433`.
+- **C6 adversarial proof PASSES** (`run_agentd_hostile.sh`, hostile mock plays the attacker):
+  - `AGENTD: DENY tool=delete_everything` — unknown destructive tool → whitelist DENY.
+  - `AGENTD: DENY tool=read_file` (`/etc/../boot/grub.cfg`) — `..` traversal → path-policy DENY.
+  - `AGENTD: TOOL read_file /etc/toolset0.txt` → `AGENTD: PASS loop_completed steps=3` — legit allowed.
+- **Rail assessment:** the live gate is already well-built — whitelist + `bad_path` run BEFORE any
+  dispatch, tool stdout is newline-collapsed (closes the multi-line broker-desync vector), stdout
+  flows over one-shot P6c capabilities. Remaining C items are ENHANCEMENTS, not open holes:
+  externalized `/etc/ai/policy.json`, `O_NOFOLLOW` symlink defense (needs kernel support; low
+  exploitability today — no symlink-creating tool is whitelisted), tool-level rollback, ledger
+  integrity hash-chain.
+
 ## Next (this branch, in order)
 - **Phase C** — harden the gate: `/etc/ai/policy.json`, O_NOFOLLOW symlink defense, rollback
   ownership, ledger integrity, CONFIRM + grant-full, multi-line-result hardening, adversarial verify.

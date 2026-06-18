@@ -113,6 +113,8 @@ static int          g_box_y = 8;
 static unsigned g_last_step = 0xFFFFFFFFu;  /* force first step to render      */
 static unsigned g_last_state = 0xFFFFFFFFu;
 static int      g_started = 0;              /* a run has been posted at least once */
+static int      g_proof   = 0;              /* --proof: auto-drive RUN + the CONFIRM gate */
+static int cp_streq(const char *a, const char *b){ while(*a&&*b){ if(*a!=*b) return 0; a++; b++; } return *a==*b; }
 
 /* -- tiny freestanding helpers ---------------------------------------------- */
 static void u_to_dec(unsigned v, char *buf) {
@@ -262,6 +264,15 @@ static void on_tick(void *ud) {
 
     unsigned state = g_shm->state;
     unsigned step  = g_shm->step;
+
+    /* --proof: auto-drive the CONFIRM gate with NO human -- ALLOW file ops, DENY process
+     * spawns/kills. Fires whenever agentd is parked waiting (state==CONFIRM, no decision). */
+    if (g_proof && state == AC_STATE_CONFIRM && g_shm->confirm == AC_CONFIRM_NONE) {
+        const char *t = (const char *)g_shm->tool;
+        int deny = cp_streq(t, "spawn") || cp_streq(t, "kill");
+        g_shm->confirm = deny ? AC_CONFIRM_DENY : AC_CONFIRM_ALLOW;
+        out("[COCKPIT] auto-confirm "); out(deny ? "DENY " : "ALLOW "); out(t); out("\n");
+    }
 
     /* Append a new step line whenever `step` advances (agentd bumps it per
      * tool). Snapshot tool/args into locals -- agentd may rewrite them. */
@@ -424,8 +435,9 @@ int main(int argc, char **argv) {
     ui_checkbox(root, PAD + 232, CTLROW_Y + 6, "grant full (auto-allow)", 0,
                 on_grant_full, 0);
 
-    /* ---- --proof: auto-fill a goal + auto-RUN headlessly ---- */
+    /* ---- --proof: auto-fill a goal + auto-RUN headlessly (also auto-drives CONFIRM) ---- */
     if (g_shm && has_proof_arg(argc, argv)) {
+        g_proof = 1;
         const char *pg = "List /etc and read /etc/toolset0.txt";
         ui_textbox_set_text(g_goalbox, pg);
         post_goal(pg);

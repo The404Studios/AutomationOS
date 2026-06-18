@@ -139,6 +139,47 @@ bricks, deletes dev scratch, and pins a green build+smoke baseline before any ne
   but never wires vfs_open's open-flags into it) -- finish that before applying. Park until a
   symlink-creating capability lands.
 
+## 10-agent skeptical AUDIT + the hardening pass (the build had outrun the proof)
+After the fast build, a 10-agent adversarial audit found the architecture sound + the broader OS
+GREEN (no regressions; kernel/net/SMP untouched; smoke 43/43 honest; git clean, 15 commits intact
+but UNPUSHED) -- but the **human-in-the-loop safety model was asserted, not demonstrated**, plus real
+bugs hid behind mock proofs:
+- **The CONFIRM Allow/Deny gate had NEVER fired in any test** (the cockpit proof ran read-only tools;
+  the dangerous-tool proofs ran with NO cockpit -> auto-allow). Same for rollback/pre_snapshot/STOP/
+  grant_full.
+- **Cockpit goal truncated to its first word** -- it spawned agentd via space-split argv; the mock
+  ignores the goal so the proof passed while the feature was broken.
+- `rollback`/`move` mutate files but were NOT CONFIRM-class (vs policy.json). `confirm_gate` cleared
+  the decision AFTER announcing CONFIRM (lost-Allow race). `tool_key` ring index wasn't masked like
+  tool_mouse (latent OOB).
+
+**FIXES (this pass):** rollback+move -> is_confirm_tool; confirm_gate clears decision BEFORE announce;
+tool_key masks head/tail; agentd reads the FULL goal from `g_cp->goal` (untruncated) when a cockpit is
+attached; added `AGENTD: CONFIRM-WAIT/CONFIRM-ALLOW` markers.
+
+**KEYSTONE PROOF (`run_cockpit_confirm.sh`, NEMO_CONFIRM):** the cockpit (--proof) auto-ALLOWs file
+ops + auto-DENIES spawns. `COCKPIT-CONFIRM: PASS` --
+`CONFIRM-WAIT remove -> auto-confirm ALLOW -> CONFIRM-ALLOW remove`,
+`CONFIRM-WAIT spawn -> auto-confirm DENY -> CONFIRM-DENY spawn`,
+`rollback ALLOW -> TOOL_ROLLBACK: OK a.txt.3 -> read-back = v1` (proves CONFIRM both ways + rollback
++ pre_snapshot end-to-end). The audit's #1 gap is CLOSED.
+
+**HONEST deferred / known-limits (recorded, NOT overclaimed):**
+- **No-cockpit posture = autonomous mode**: with no cockpit attached, CONFIRM-class tools auto-run
+  (path+whitelist gated only). This is BY DESIGN (the user delegates by starting the agent unattended);
+  supervised mode = open the cockpit. Now explicit.
+- **SHM 0600 is uid-0 theater**: all agent procs run as uid 0, so the "owner-only" guard confers no
+  isolation -- a future tool that does raw shmget+write could set grant_full itself. Needs non-root
+  agents or a non-DAC guard. The 0600 comments are aspirational on this kernel.
+- **C4 ledger audits the LEGACY aibroker self-test, not the live agentd path** (agentd writes no
+  ledger). It's a public-seed checksum chain (not a keyed MAC) and unsanitized args allow newline/
+  field injection. Relabel its scope; don't claim it covers the live agent.
+- **policy.json is decorative for agentd** (gate is hardcoded resolve_tool/is_confirm_tool; editing
+  the file changes nothing live -- only aibroker loads it). Real next step: load policy in agentd.
+- **rollback basename-collision**: snapshots key on basename only -> `/a/x` and `/b/x` alias. Low
+  severity (only agent-written files, writable tree). Fix = full-path key.
+- Synthetic input >64 events + visible cursor/text effect still unproven (serial marker only).
+
 ## Next (this branch, in order)
 - **Phase C** — harden the gate: `/etc/ai/policy.json`, O_NOFOLLOW symlink defense, rollback
   ownership, ledger integrity, CONFIRM + grant-full, multi-line-result hardening, adversarial verify.

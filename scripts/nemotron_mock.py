@@ -82,12 +82,27 @@ GUI_STEPS = [
     ("mouse", "move\t-40\t30"),      # move again (proves repeated injection)
     ("badtool", "/etc/passwd"),      # bonus: an unknown tool must still DENY
 ]
+# CONFIRM plan (NEMO_CONFIRM=1): exercises the human-in-the-loop CONFIRM gate end-to-end
+# through a cockpit. The cockpit (--proof) auto-ALLOWS file ops and auto-DENIES process
+# spawns. Proves: CONFIRM Allow (remove runs), CONFIRM Deny (spawn blocked), pre_snapshot +
+# rollback (the removed file is restored from its snapshot and reads back as "v1").
+SMALL_B64 = base64.b64encode(b"v1\n").decode()
+CONFIRM_STEPS = [
+    ("mkdir",      "/tmp/cptest"),
+    ("write_file", "/tmp/cptest/a.txt\t" + SMALL_B64),   # snapshotted (cockpit attached)
+    ("remove",     "/tmp/cptest/a.txt"),                 # CONFIRM -> ALLOW -> file removed
+    ("spawn",      "sbin/tool_ps"),                       # CONFIRM -> DENY  -> not spawned
+    ("rollback",   "/tmp/cptest/a.txt"),                 # CONFIRM -> ALLOW -> restored from snapshot
+    ("read_file",  "/tmp/cptest/a.txt"),                 # read back -> "v1" proves rollback worked
+]
 if os.environ.get("NEMO_HOSTILE"):
     STEPS = HOSTILE_STEPS
 elif os.environ.get("NEMO_CODETASK"):
     STEPS = CODETASK_STEPS
 elif os.environ.get("NEMO_GUI"):
     STEPS = GUI_STEPS
+elif os.environ.get("NEMO_CONFIRM"):
+    STEPS = CONFIRM_STEPS
 
 
 def log(m):

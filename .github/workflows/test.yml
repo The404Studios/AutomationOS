@@ -179,10 +179,42 @@ jobs:
         path: build/serial-${{ matrix.qemu-config.name }}.log
         retention-days: 7
 
+  compiler-regression:
+    name: Compiler Regression (cc codegen)
+    runs-on: ubuntu-22.04
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Install dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y build-essential
+
+    - name: Run cc regression suite
+      run: bash build_test/cc_regression_smoke.sh
+
+  web-fuzz:
+    name: Web Stack Fuzz Smoke (HTML parser, ASan)
+    runs-on: ubuntu-22.04
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Install dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y build-essential python3
+
+    - name: Run web fuzz smoke
+      run: bash build_test/web_fuzz_smoke.sh
+
   test-summary:
     name: Test Summary
     runs-on: ubuntu-latest
-    needs: [unit-tests, integration-tests, qemu-tests]
+    needs: [unit-tests, integration-tests, qemu-tests, compiler-regression, web-fuzz]
     if: always()
 
     steps:
@@ -199,6 +231,8 @@ jobs:
         echo "## Results" >> test-summary.md
         echo "- Unit Tests: ${{ needs.unit-tests.result }}" >> test-summary.md
         echo "- Integration Tests: ${{ needs.integration-tests.result }}" >> test-summary.md
+        echo "- Compiler Regression: ${{ needs.compiler-regression.result }}" >> test-summary.md
+        echo "- Web Fuzz Smoke: ${{ needs.web-fuzz.result }}" >> test-summary.md
         echo "- QEMU Tests: ${{ needs.qemu-tests.result }}" >> test-summary.md
         echo "" >> test-summary.md
         echo "## Artifacts" >> test-summary.md
@@ -215,6 +249,8 @@ jobs:
       run: |
         if [[ "${{ needs.unit-tests.result }}" != "success" ]] || \
            [[ "${{ needs.integration-tests.result }}" != "success" ]] || \
+           [[ "${{ needs.compiler-regression.result }}" != "success" ]] || \
+           [[ "${{ needs.web-fuzz.result }}" != "success" ]] || \
            [[ "${{ needs.qemu-tests.result }}" != "success" ]]; then
           echo "ERROR: Tests failed"
           exit 1

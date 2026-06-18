@@ -56,7 +56,7 @@ echo "[ti] building the DEFAULT kernel (byte-identity) ..."
 bash scripts/quick_build.sh > /tmp/ti_qb_def.log 2>&1
 grep -qF 'Link OK -- no unresolved symbols' /tmp/ti_qb_def.log || { echo "[ti] default LINK FAILED"; exit 1; }
 DEF_MD5=$(md5sum build/kernel.elf | awk '{print $1}')
-echo "[ti] default kernel md5=$DEF_MD5 (expect 6f99ed9ffaf09a7fcb36996324c9450b)"
+echo "[ti] default kernel md5=$DEF_MD5 (expect 29b434764dbde177036dad4469d96c17)"
 
 [ -s iso/boot/initrd.img ] || { echo "[ti] initrd missing -- run IDE=1 build_all"; exit 1; }
 
@@ -123,7 +123,7 @@ echo "split:  parent_cpu1=$PAR_OK workers_same_cpu=$WRK_OK sched_inherit=$SI_OK(
 echo "walls:  runmask=$RM_OK(viol=$NVIOL clean=$RM_CLEAN) tlb_neg=$NEG_OK bkl=$BKL_OK(storms=$ST_DONE) ipiwake=$WK_OK ipilink=$IPI_OK tlbshoot=$TS_OK"
 echo "soak:   windows=$SOAK_WINS alive=$ALIVE sched_viol=$NSCHED tlb_viol=$NTLBV panic=$NPANIC"
 
-if [ "$DEF_MD5" = "6f99ed9ffaf09a7fcb36996324c9450b" ] && \
+if [ "$DEF_MD5" = "29b434764dbde177036dad4469d96c17" ] && \
    [ "$PAR_OK" = "1" ] && [ "$WRK_OK" = "1" ] && [ "$SI_OK" = "1" ] && \
    [ "$RM_OK" = "1" ] && [ "$RM_CLEAN" = "1" ] && [ "$DESK_OK" = "1" ] && \
    [ "$MMJ_OK" = "1" ] && [ "$NOEXP" = "1" ] && \

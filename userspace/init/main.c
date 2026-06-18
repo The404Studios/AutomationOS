@@ -441,6 +441,13 @@ void _start(void) {
     print("[INIT] Spawning netman + browser2...\n");
     spawn("sbin/netman");
     spawn("sbin/wlanctl");    // WIFI-SYS M1: one-shot SYS_WLAN_SCAN probe (prints the AP list, or ENOTSUP with no wifi); exits
+    spawn("sbin/wpasupp");    // WIFI M2: WPA2 4-way handshake KAT selftest -> WPASUPP SELFTEST: PASS; exits
+#ifdef WIFI_DEMO
+    // Headless connect proof (the Network Manager GUI is the real, user-driven
+    // trigger): connect wlan0 to the simulated HomeNet (WPA2) -> 4-way -> set_key
+    // -> CONNECTED -> dhcpc run wlan0. Needs a WIFI_SIM kernel.
+    spawn_args("sbin/wpasupp", "HomeNet 1 password");
+#endif
     spawn("sbin/browser2");   // BROWSER-CONSOLIDATE-0: the one real (DOM/CSS/JS/HTTPS) browser
 
 #ifndef DESKTOP_MINIMAL

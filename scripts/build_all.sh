@@ -56,6 +56,14 @@ if [ "${SMOKE_SELFTEST:-0}" = "1" ]; then
     INIT_EXTRA="$INIT_EXTRA -DSMOKE_SELFTEST"
     echo "*** SMOKE_SELFTEST build: init runs the bounded browser2 self-tests (img/smoke gates) ***"
 fi
+# WIFI_DEMO=1: init headlessly auto-connects wlan0 to the simulated HomeNet (WPA2)
+# via wpasupp, for a no-GUI end-to-end proof of connect->4way->DHCP. Needs a
+# WIFI_SIM kernel. The Network Manager GUI is the real (user-driven) trigger;
+# default OFF so a normal build never auto-connects.
+if [ "${WIFI_DEMO:-0}" = "1" ]; then
+    INIT_EXTRA="$INIT_EXTRA -DWIFI_DEMO"
+    echo "*** WIFI_DEMO build: init auto-connects wlan0 -> simulated HomeNet (headless proof) ***"
+fi
 # SELFHEAL=1 wires the userspace desktop self-heal: the compositor publishes a
 # per-frame heartbeat into a SysV SHM page, init creates+owns that page and spawns
 # sbin/cwatchdog (the recovery supervisor). Threads -DSELFHEAL into the compositor
@@ -361,6 +369,10 @@ $LD /tmp/cryptotest.o $CRYPTO_OBJS -o /tmp/cryptotest.elf
 # wlanctl: WiFi control-plane probe -- SYS_WLAN_SCAN proof (bare _start, no crt0).
 cc userspace/apps/wlanctl/wlanctl.c /tmp/wlanctl.o
 $LD /tmp/wlanctl.o -o /tmp/wlanctl.elf
+# wpasupp: WPA2 supplicant -- 4-way handshake + connect tool (crt0+main; links wpa + crypto).
+cc userspace/lib/wpa/wpa.c /tmp/wpa.o
+cc userspace/apps/wpasupp/wpasupp.c /tmp/wpasupp.o
+$LD /tmp/crt0.o /tmp/wpasupp.o /tmp/wpa.o $CRYPTO_OBJS -o /tmp/wpasupp.elf
 # tlsprobe: open a real TLS connection to host:443 + report (crt0+main).
 cc userspace/apps/tlsprobe/tlsprobe.c /tmp/tlsprobe.o; $LD /tmp/crt0.o /tmp/tlsprobe.o $HTTPS_OBJS -o /tmp/tlsprobe.elf
 # certtool: inspect a DER/PEM cert (crt0+main; needs x509 + base64).
@@ -642,7 +654,7 @@ $LD /tmp/crt0.o /tmp/cc.o \
     -o /tmp/cc.elf
 
 echo "[all] canary check (all must be 0):"
-for e in comp init filemanager calculator clock sysinfo settings sysmon uidemo dateapp applauncher taskman terminal editor snake paint synth tetris game2048 sheet notes calendar stopwatch mines piano dashboard welcome bench breakout pong invaders procmon soundtest solitaire aiconsole screenshot stress musicplayer ide bubbletd zombietd pacman clockapp forktest sigtest pollselftest threadtest reaploop forkfdtest forkregtest matmuljobs aibroker sed awk tar pkg make meminfo argvtest msgtest rpctest toolrun echoproof echoargs agenthost tool_read tool_ls tool_stat codeagent toolset_host chainhost modelbridge agentd tool_write tool_cc tool_exec tool_mkdir tool_mv tool_rm tool_spawn tool_kill tool_ps tool_shell tool_mouse tool_key tool_rollback ledgerver cockpit claudehost initrdp initrdalias floattest sleeptest prioritytest matbench tensortest cpuburn blk ps kill free uptime find diff cmp tee wcx xargs gzip cc nettest sockettest cpu1offload smpstress wget netman cryptotest wlanctl libtest ping nc netinfo netscan tcping dig httpget pktmon httpd traceroute arp grep head tail sort uniq cut tr nl du touch basename dirname uname hostname whoami date less hexdump lspci tlsprobe certtool dhcpc autodhcp apidemo gsignin js futextest epolltest sendfiletest perftest batchtest domtest htmltest csstest layouttest webtest browser2 webapitest cube3d ray chess asteroids sudoku photos startmenu controlcenter claudechat anthropic gametest exectest execchild; do
+for e in comp init filemanager calculator clock sysinfo settings sysmon uidemo dateapp applauncher taskman terminal editor snake paint synth tetris game2048 sheet notes calendar stopwatch mines piano dashboard welcome bench breakout pong invaders procmon soundtest solitaire aiconsole screenshot stress musicplayer ide bubbletd zombietd pacman clockapp forktest sigtest pollselftest threadtest reaploop forkfdtest forkregtest matmuljobs aibroker sed awk tar pkg make meminfo argvtest msgtest rpctest toolrun echoproof echoargs agenthost tool_read tool_ls tool_stat codeagent toolset_host chainhost modelbridge agentd tool_write tool_cc tool_exec tool_mkdir tool_mv tool_rm tool_spawn tool_kill tool_ps tool_shell tool_mouse tool_key tool_rollback ledgerver cockpit claudehost initrdp initrdalias floattest sleeptest prioritytest matbench tensortest cpuburn blk ps kill free uptime find diff cmp tee wcx xargs gzip cc nettest sockettest cpu1offload smpstress wget netman cryptotest wlanctl wpasupp libtest ping nc netinfo netscan tcping dig httpget pktmon httpd traceroute arp grep head tail sort uniq cut tr nl du touch basename dirname uname hostname whoami date less hexdump lspci tlsprobe certtool dhcpc autodhcp apidemo gsignin js futextest epolltest sendfiletest perftest batchtest domtest htmltest csstest layouttest webtest browser2 webapitest cube3d ray chess asteroids sudoku photos startmenu controlcenter claudechat anthropic gametest exectest execchild; do
     n=$(objdump -d /tmp/$e.elf 2>/dev/null | grep -c "fs:0x28" || true)
     echo "  $e=$n"
 done
@@ -795,6 +807,7 @@ done
 # KAT self-test harnesses -> /sbin (init spawns them at boot).
 cp /tmp/cryptotest.elf /tmp/ird/sbin/cryptotest
 cp /tmp/wlanctl.elf    /tmp/ird/sbin/wlanctl
+cp /tmp/wpasupp.elf    /tmp/ird/sbin/wpasupp
 cp /tmp/libtest.elf    /tmp/ird/sbin/libtest
 # Writable scratch dir so file-creating tools (cc -o, gzip, tee) have a target.
 mkdir -p /tmp/ird/tmp

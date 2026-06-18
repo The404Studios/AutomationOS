@@ -16,6 +16,8 @@
 #include "../../lib/crypto/chacha20poly1305.h"  /* chacha20poly1305_selftest() */
 #include "../../lib/crypto/hkdf.h"              /* hkdf_selftest()    */
 #include "../../lib/crypto/base64.h"            /* base64_selftest()  */
+#include "../../lib/crypto/pbkdf2.h"            /* pbkdf2_selftest() -- WPA2 PMK */
+#include "../../lib/crypto/keywrap.h"           /* keywrap_selftest() -- RFC 3394 GTK */
 #include "../../lib/tls/x509.h"                 /* x509_selftest()    */
 #include "../../lib/tls/x509_verify.h"          /* x509_verify_selftest() */
 #include "../../lib/tls/tls.h"                  /* tls_selftest()     */
@@ -44,6 +46,8 @@ void _start(void) {
     int chacha = chacha20poly1305_selftest();
     int hkdf   = hkdf_selftest();
     int b64    = base64_selftest();
+    int pbkdf2 = pbkdf2_selftest();    /* WPA-PROOF: PBKDF2-HMAC-SHA1 (PMK) */
+    int keywrap= keywrap_selftest();   /* WPA-PROOF: AES key-wrap RFC 3394  */
     int x509   = x509_selftest();
     int xverify= x509_verify_selftest();
     int tls    = tls_selftest();
@@ -56,11 +60,13 @@ void _start(void) {
     report("chacha20-poly1305", chacha);
     report("hkdf", hkdf);
     report("base64", b64);
+    report("pbkdf2-hmac-sha1 (wpa pmk)", pbkdf2);
+    report("aes key-wrap (rfc 3394)", keywrap);
     report("x509 parse", x509);
     report("x509 chain verify", xverify);
     report("tls PRF", tls);
 
-    int all = crypto | sha512 | rsa | x255 | p256 | chacha | hkdf | b64 | x509 | xverify | tls;
+    int all = crypto | sha512 | rsa | x255 | p256 | chacha | hkdf | b64 | pbkdf2 | keywrap | x509 | xverify | tls;
     if (all == 0)
         print("CRYPTOTEST: PASS (full crypto/TLS KAT battery)\n");
     else

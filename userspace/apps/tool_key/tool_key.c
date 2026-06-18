@@ -117,8 +117,8 @@ static volatile synthinput_shm_t *attach_synthinput(void)
  * newest event rather than overwriting an unread one. Returns 1 if enqueued. */
 static int enqueue_key(volatile synthinput_shm_t *shm, unsigned short code, int value)
 {
-    unsigned head = shm->head;
-    unsigned tail = shm->tail;
+    unsigned head = shm->head % SYNTHINPUT_QMAX;   /* mask defensively (match tool_mouse): */
+    unsigned tail = shm->tail % SYNTHINPUT_QMAX;   /* a corrupt head must never index q[] OOB */
     unsigned next = (head + 1u) % SYNTHINPUT_QMAX;
     if (next == tail) return 0;             /* ring full: drop newest */
     shm->q[head].type  = (unsigned short)SI_EV_KEY;

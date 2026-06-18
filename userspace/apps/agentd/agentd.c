@@ -127,7 +127,11 @@ static void cp_attach(void){
 }
 static void cp_setstr(char* dst,unsigned cap,const char* s){ unsigned i=0; for(;s&&s[i]&&i<cap-1;i++) dst[i]=s[i]; dst[i]=0; }
 static int is_confirm_tool(const char* t){
-    return streq(t,"remove")||streq(t,"spawn")||streq(t,"kill")||streq(t,"mouse")||streq(t,"key"); }
+    /* every MUTATING or control tool requires operator approval (matches the
+     * require_approval set in /etc/ai/policy.json). rollback + move WRITE files, so
+     * they belong here too (audit fix: they were missing). */
+    return streq(t,"remove")||streq(t,"spawn")||streq(t,"kill")||streq(t,"mouse")
+         ||streq(t,"key")||streq(t,"rollback")||streq(t,"move"); }
 /* pre-mutation snapshot -> /var/snapshots/<base>.<seq> (ramfs => in-session rollback only).
  * Only when a cockpit session is active; non-fatal (logs + continues on any error). */
 static void pre_snapshot(const char* path,unsigned seq){
@@ -149,13 +153,19 @@ static void pre_snapshot(const char* path,unsigned seq){
  * any wall-clock wait needs a cap). STOP or timeout => deny (fail-safe). */
 static int confirm_gate(const char* tool,const char* args,unsigned step){
     if(!g_cp || !is_confirm_tool(tool) || g_cp->grant_full) return 1;
-    g_cp->state=AC_STATE_CONFIRM; g_cp->step=step;
-    cp_setstr(g_cp->tool,sizeof(g_cp->tool),tool); cp_setstr(g_cp->args,sizeof(g_cp->args),args);
+    /* clear any stale decision + publish tool/args BEFORE announcing CONFIRM, so the
+     * cockpit (which only acts on state==CONFIRM) can never see CONFIRM with a decision
+     * that is about to be wiped -- closes the lost-Allow race. */
     g_cp->confirm=AC_CONFIRM_NONE;
+    g_cp->step=step;
+    cp_setstr(g_cp->tool,sizeof(g_cp->tool),tool); cp_setstr(g_cp->args,sizeof(g_cp->args),args);
+    g_cp->state=AC_STATE_CONFIRM;        /* announce LAST */
+    outfd(1,"AGENTD: CONFIRM-WAIT tool="); outfd(1,tool); outfd(1,"\n");
     for(long it=0; it<2000000; it++){
         if(g_cp->stop) return 0;
         unsigned c=g_cp->confirm;
-        if(c==AC_CONFIRM_ALLOW){ g_cp->confirm=AC_CONFIRM_NONE; g_cp->state=AC_STATE_RUNNING; return 1; }
+        if(c==AC_CONFIRM_ALLOW){ g_cp->confirm=AC_CONFIRM_NONE; g_cp->state=AC_STATE_RUNNING;
+            outfd(1,"AGENTD: CONFIRM-ALLOW tool="); outfd(1,tool); outfd(1,"\n"); return 1; }
         if(c==AC_CONFIRM_DENY){  g_cp->confirm=AC_CONFIRM_NONE; g_cp->state=AC_STATE_RUNNING; return 0; }
         yield();
     }
@@ -284,6 +294,10 @@ static int dispatch(int ctrl, unsigned long rid, const char* prog,
 
 static int host_mode(const char* goal){
     cp_attach();                 /* AGENTCOCKPIT-0: attach lookup-only; g_cp NULL if no cockpit */
+    /* Prefer the cockpit's SHM goal: sys_spawn space-splits argv, so a multi-word goal
+     * passed via argv[1] arrives TRUNCATED to its first word. The cockpit writes the full
+     * goal into g_cp->goal, so read it from there when present. */
+    const char* egoal = (g_cp && g_cp->goal[0]) ? (const char*)g_cp->goal : goal;
     if(!net_ready()){ outfd(1,"AGENTD: SKIP no_net\n"); return 0; }
     long fd=_ch_sc(SYS_SOCKET,SOCK_STREAM,0,0,0,0,0);
     if(fd<0){ outfd(1,"AGENTD: SKIP no_socket\n"); return 0; }
@@ -301,7 +315,7 @@ static int host_mode(const char* goal){
     if(pid<=0){ outfd(1,"AGENTD: FAIL spawn-runner\n"); ch_close(ctrl); _ch_sc(SYS_CLOSE_SK,fd,0,0,0,0,0); return 1; }
 
     /* GOAL */
-    send_all(fd,"GOAL ",5); send_all(fd,goal,(long)slen(goal)); send_all(fd,"\n",1);
+    send_all(fd,"GOAL ",5); send_all(fd,egoal,(long)slen(egoal)); send_all(fd,"\n",1);
     outfd(1,"AGENTD: GOAL sent; running gated agent loop\n");
     if(g_cp){ g_cp->run_seq=g_cp->goal_seq; g_cp->state=AC_STATE_RUNNING; g_cp->step=0; }
 

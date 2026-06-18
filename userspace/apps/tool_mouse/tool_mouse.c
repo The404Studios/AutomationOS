@@ -58,6 +58,7 @@
  * Syscall numbers (verified vs kernel/include/syscall.h).
  * --------------------------------------------------------------------- */
 #define SYS_WRITE   3
+#define SYS_YIELD  15
 #define SYS_SHMGET 18
 #define SYS_SHMAT  19
 
@@ -193,6 +194,30 @@ int main(int argc, char **argv)
         enqueue(SI_EV_REL, SI_REL_Y, dy);
         out("TOOL_MOUSE: OK move ");
         out_i(dx); out(" "); out_i(dy); out("\n");
+        return 0;
+    }
+
+    /* moven <dx> <dy> <count>: enqueue `count` (dx,dy) move-pairs from ONE gated step --
+     * the only way to push >QMAX events through the ring (MAX_STEPS=16 caps the agent at
+     * ~32 otherwise). Yield every 32 events so the single-consumer compositor drains
+     * between bursts: the 63-slot ring never permanently fills AND the consumer tail
+     * reliably wraps past slot 63 -- the exact path the masked-tail fix must survive. */
+    if (streq(verb, "moven")) {
+        if (argc < 5 || !argv[2] || !argv[3] || !argv[4]) { out("TOOL_MOUSE: ERR usage\n"); return 2; }
+        int dx = parse_int(argv[2]);
+        int dy = parse_int(argv[3]);
+        int count = parse_int(argv[4]);
+        if (count < 0) count = 0;
+        if (count > 4096) count = 4096;
+        int n = 0;
+        for (int i = 0; i < count; i++) {
+            enqueue(SI_EV_REL, SI_REL_X, dx);
+            enqueue(SI_EV_REL, SI_REL_Y, dy);
+            n++;
+            if ((i & 31) == 31) sc(SYS_YIELD, 0, 0, 0);   /* let the consumer drain */
+        }
+        out("TOOL_MOUSE: OK moven ");
+        out_i(n); out(" dx="); out_i(dx); out(" dy="); out_i(dy); out("\n");
         return 0;
     }
 

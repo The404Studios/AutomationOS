@@ -4949,6 +4949,15 @@ static void pump_synth_input(uint32_t W, uint32_t H) {
         { static int g_synth_first = 0;
           if (!g_synth_first) { g_synth_first = 1;
               print("[SHELL] SYNTHINPUT: input applied (agent is driving)\n"); } }
+        /* SYNTHINPUT-WRAP-0: prove the >64-event tail wrap. Cumulative drained count
+         * across frames; the FIRST time it exceeds QMAX (tail has wrapped past slot 63)
+         * print the count + settled cursor_x ONCE. A stale-replay regression would
+         * re-trip this every frame and keep moving the cursor. */
+        { static unsigned long g_synth_drained = 0; static int g_synth_wrap = 0;
+          g_synth_drained++;
+          if (!g_synth_wrap && g_synth_drained > SYNTHINPUT_QMAX) { g_synth_wrap = 1;
+              print("[SHELL] SYNTHINPUT: drained "); print_num((long)g_synth_drained);
+              print(" events cursor_x="); print_num((long)g_cursor_x); print("\n"); } }
         if (type == SI_EV_REL) {
             if (code == SI_REL_X)      { g_cursor_x += value; moved = 1; }
             else if (code == SI_REL_Y) { g_cursor_y += value; moved = 1; }

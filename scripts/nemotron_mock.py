@@ -95,12 +95,22 @@ CONFIRM_STEPS = [
     ("rollback",   "/tmp/cptest/a.txt"),                 # CONFIRM -> ALLOW -> restored from snapshot
     ("read_file",  "/tmp/cptest/a.txt"),                 # read back -> "v1" proves rollback worked
 ]
+# SYNTH-STRESS plan (NEMO_SYNTH=1): the >64-event ring-wrap proof. ONE gated step injects
+# SYNTH_MOVEN_COUNT right-moves via tool_mouse's `moven`, so the compositor consumer tail
+# wraps PAST slot 63 (QMAX=64) -- the regime the stale-replay bug lived in.
+SYNTH_MOVEN_COUNT = os.environ.get("SYNTH_MOVEN_COUNT", "200")
+SYNTH_STEPS = [
+    ("mouse",   "moven\t1\t0\t" + SYNTH_MOVEN_COUNT),  # COUNT right-moves of dx=+1 from ONE call
+    ("badtool", "/etc/passwd"),                         # unknown tool must still DENY
+]
 if os.environ.get("NEMO_HOSTILE"):
     STEPS = HOSTILE_STEPS
 elif os.environ.get("NEMO_CODETASK"):
     STEPS = CODETASK_STEPS
 elif os.environ.get("NEMO_GUI"):
     STEPS = GUI_STEPS
+elif os.environ.get("NEMO_SYNTH"):
+    STEPS = SYNTH_STEPS
 elif os.environ.get("NEMO_CONFIRM"):
     STEPS = CONFIRM_STEPS
 

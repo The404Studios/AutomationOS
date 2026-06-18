@@ -5,8 +5,9 @@
  * Implements dhcp_acquire() and the offline dhcp_selftest() declared in
  * dhcp.h.  See that header for the transport rationale (no SYS_BIND -> use a
  * broadcast SENDTO with the BOOTP broadcast flag set and let the kernel UDP
- * demux deliver the reply to our socket) and the integrator note about
- * applying the lease being out of scope.
+ * demux deliver the reply to our socket). This lib OBTAINS the lease; applying
+ * it to the kernel is done by the dhcpc app via SYS_NET_CONFIG (see dhcpc.c,
+ * "dhcpc run [ifname]") -- it is no longer out of scope.
  *
  * No libc: all byte handling uses the small static helpers below and every
  * scratch buffer is a fixed-size local array.  Every receive wait is a bounded

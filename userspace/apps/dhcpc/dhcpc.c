@@ -129,7 +129,7 @@ static void print_ip(unsigned int ip)
 
 int main(int argc, char **argv)
 {
-    (void)argv;   /* argv[0] is the program name; argv[1..] are extra args */
+    /* argv[0]=prog, argv[1]=mode ("run"), argv[2]=optional ifname (default eth0). */
 
     /* ------------------------------------------------------------------
      * Self-test mode: no arguments (argc <= 1).
@@ -175,13 +175,17 @@ int main(int argc, char **argv)
 
     /*
      * Apply the lease to the kernel's live network configuration via
-     * SYS_NET_CONFIG (89).  This updates eth0's IP/mask/gw/dns and syncs
-     * the legacy net.c globals so all subsequent networking (DNS, TCP, etc.)
-     * uses the DHCP-assigned address.
+     * SYS_NET_CONFIG (89).  This updates the target interface's IP/mask/gw/dns
+     * and syncs the legacy net.c globals so all subsequent networking (DNS,
+     * TCP, etc.) uses the DHCP-assigned address.
      *
      * The net_config_req_t layout: ifname[16], ip, netmask, gateway, dns, flags.
      */
     {
+        /* DHCP-APPLY: optional target interface "dhcpc run [ifname]" (default
+         * eth0). WAVE 1: wpasupp runs "dhcpc run wlan0" after WiFi association
+         * so the SAME apply path configures the wireless interface. */
+        const char *ifname = (argc >= 3 && argv[2] && argv[2][0]) ? argv[2] : "eth0";
         /*
          * net_config_req_t layout (must match kernel/include/netif.h):
          *   char     ifname[16];   // offset  0
@@ -202,8 +206,9 @@ int main(int argc, char **argv)
         } cfg;
         unsigned char *cp = (unsigned char *)&cfg;
         for (unsigned long i = 0; i < sizeof(cfg); i++) cp[i] = 0;
-        cfg.ifname[0] = 'e'; cfg.ifname[1] = 't';
-        cfg.ifname[2] = 'h'; cfg.ifname[3] = '0';
+        /* bounded copy of ifname into the 16-byte field (zeroed above -> NUL). */
+        for (unsigned long j = 0; ifname[j] && j < sizeof(cfg.ifname) - 1; j++)
+            cfg.ifname[j] = ifname[j];
         cfg.ip      = lease.ip;
         cfg.netmask = lease.netmask;
         cfg.gateway = lease.gateway;

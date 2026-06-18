@@ -48,9 +48,12 @@ static int find_hash(const char* s, int len){
     return -1;
 }
 
-int main(void){
+int main(int argc, char **argv){
+    /* argv[1] = ledger path to verify (crt0 supplies argv); default = aibroker's. */
+    const char *path = (argc > 1 && argv && argv[1] && argv[1][0]) ? argv[1]
+                       : "/var/log/ai/actions.log";
     static char buf[65536];
-    long fd = sc(SYS_OPEN, (long)"/var/log/ai/actions.log", O_RDONLY, 0);
+    long fd = sc(SYS_OPEN, (long)path, O_RDONLY, 0);
     if(fd < 0){ out("LEDGER: EMPTY\n"); return 0; }
     int total=0;
     for(;;){ long r=sc(SYS_READ, fd, (long)(buf+total), (long)(sizeof(buf)-1-total));

@@ -367,7 +367,7 @@ void _start(void) {
     // Bring it to life with `python3 scripts/nemotron_mock.py` (zero-cost) or
     // `node scripts/nemotron_broker.js` (live NVIDIA/Puter Nemotron) + boot -netdev.
     print("[INIT] Spawning agentd (Nemotron gated OS-automation agent)...\n");
-    spawn("sbin/agentd");
+    int agentd_pid = spawn("sbin/agentd");
 
 #ifdef COCKPIT_PROOF
     // AGENTCOCKPIT-0 headless seam proof: launch the cockpit in --proof mode so it
@@ -534,6 +534,10 @@ void _start(void) {
     // during its boot self-test). Prints "LEDGER: VERIFIED records=N" / "TAMPERED line=K"
     // / "EMPTY". A quick read-verify-exit; harmless on every boot.
     spawn("sbin/ledgerver");
+    // AGENT-LEDGER: also verify the LIVE agent's ledger. On a default (no-broker) boot
+    // agentd SKIPs, so /var/log/ai/agent.log is empty here -> "LEDGER: EMPTY" (fine). The
+    // authoritative verify is the LATE one keyed to agentd's reap in the reaper loop.
+    spawn_args("sbin/ledgerver", "/var/log/ai/agent.log");
 
 #ifdef FAIRTEST
     // SCHED-FAIRNESS-0 proof (build FAIRTEST=1 PREEMPT=1 DESKTOP_MINIMAL=1).
@@ -604,6 +608,15 @@ void _start(void) {
                 reaploop_spawned = 1;
                 print("[INIT] Spawning reaploop (PID-recycling proof)...\n");
                 spawn("sbin/reaploop");
+            }
+
+            // AGENT-LEDGER: once agentd's broker loop finishes and it is reaped, its live
+            // ledger /var/log/ai/agent.log is fully written -- verify it NOW. Keying to
+            // agentd's exit (not a fixed delay) closes the race where the boot-time
+            // ledgerver ran before any agent decision was logged.
+            if (pid == agentd_pid && agentd_pid > 0) {
+                print("[INIT] AGENT-LEDGER: re-verifying agent.log after agentd reap...\n");
+                spawn_args("sbin/ledgerver", "/var/log/ai/agent.log");
             }
 
             if (pid == compositor_pid) {

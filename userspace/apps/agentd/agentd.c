@@ -126,22 +126,78 @@ static void cp_attach(void){
     g_cp=cp;
 }
 static void cp_setstr(char* dst,unsigned cap,const char* s){ unsigned i=0; for(;s&&s[i]&&i<cap-1;i++) dst[i]=s[i]; dst[i]=0; }
+
+/* ---- POLICY-LOAD (tighten-only) ----------------------------------------------
+ * Reads /etc/ai/policy.json with the same dumb token-scanner aibroker uses, keeping
+ * ONLY the deny + require_approval(CONFIRM) bins. The allow bin is IGNORED (policy may
+ * NEVER add a runnable tool -- resolve_tool stays the sole whitelist). The sets are a
+ * UNION on top of the hardcoded floor: they can only make the gate STRICTER (more
+ * CONFIRM, more DENY), never looser. FAIL-SAFE: absent/unparseable/empty -> empty sets
+ * -> byte-identical to today. Loaded ONCE at startup (no per-step re-read). Per the
+ * adversarial review: ignore allow, union not replace, exact-name match, drop empty. */
+#define POL_MAX 64
+#define POL_TOKLEN 64
+static char g_pol_confirm[POL_MAX][POL_TOKLEN]; static int g_pol_n_confirm = 0;
+static char g_pol_deny[POL_MAX][POL_TOKLEN];    static int g_pol_n_deny    = 0;
+static void pol_add(char dst[][POL_TOKLEN], int* n, const char* tok){
+    if(*n>=POL_MAX || !tok[0]) return;          /* drop empty token (req 6) */
+    unsigned i=0; for(;tok[i]&&i<POL_TOKLEN-1;i++) dst[*n][i]=tok[i]; dst[*n][i]=0; (*n)++;
+}
+static int pol_has(char list[][POL_TOKLEN], int n, const char* tool){
+    for(int i=0;i<n;i++) if(streq(list[i],tool)) return 1; return 0;   /* exact-name only */
+}
+static void policy_load(void){
+    g_pol_n_confirm = 0; g_pol_n_deny = 0;       /* empty == hardcoded floor */
+    static char fb[8192];
+    long fd=_ch_sc(SYS_OPEN_N,(long)"/etc/ai/policy.json",0,0,0,0,0);   /* O_RDONLY */
+    if(fd<0) return;
+    long n=_ch_sc(SYS_READ_N,fd,(long)fb,sizeof(fb)-1,0,0,0);
+    _ch_sc(SYS_CLOSE_N,fd,0,0,0,0,0);
+    if(n<=0) return;
+    int bin=-1;                                  /* -1 none, 0 allow(ignored), 1 confirm, 2 deny */
+    for(long i=0;i<n;){
+        if(fb[i]=='"'){
+            long s=++i; while(i<n && fb[i]!='"') i++;
+            char tok[POL_TOKLEN]; int tl=0; for(long j=s;j<i && tl<POL_TOKLEN-1;j++) tok[tl++]=fb[j]; tok[tl]=0;
+            if(i<n) i++;
+            if(streq(tok,"allow")) bin=0;
+            else if(streq(tok,"require_approval")) bin=1;
+            else if(streq(tok,"deny")) bin=2;
+            else if(bin==1) pol_add(g_pol_confirm,&g_pol_n_confirm,tok);
+            else if(bin==2) pol_add(g_pol_deny,&g_pol_n_deny,tok);
+            /* bin==0 (allow) + bin==-1 (metadata) DROPPED: policy never loosens. */
+            continue;
+        }
+        i++;
+    }
+}
+static int policy_confirm_has(const char* t){ return pol_has(g_pol_confirm,g_pol_n_confirm,t); }
+static int is_deny_tool(const char* t){ return pol_has(g_pol_deny,g_pol_n_deny,t); }
+
 static int is_confirm_tool(const char* t){
     /* every MUTATING or control tool requires operator approval (matches the
      * require_approval set in /etc/ai/policy.json). rollback + move WRITE files, so
-     * they belong here too (audit fix: they were missing). */
+     * they belong here too. Policy can ADD confirm tools (union), never remove. */
     return streq(t,"remove")||streq(t,"spawn")||streq(t,"kill")||streq(t,"mouse")
-         ||streq(t,"key")||streq(t,"rollback")||streq(t,"move"); }
-/* pre-mutation snapshot -> /var/snapshots/<base>.<seq> (ramfs => in-session rollback only).
- * Only when a cockpit session is active; non-fatal (logs + continues on any error). */
+         ||streq(t,"key")||streq(t,"rollback")||streq(t,"move")
+         ||policy_confirm_has(t); }
+/* pre-mutation snapshot -> /var/snapshots/<enc(path)>.<seq> (ramfs => in-session rollback).
+ * Keyed on the FULL path (not basename) so /tmp/a/x and /home/x never collide. Encoding
+ * (MUST stay byte-identical to tool_rollback's path_encode): '/'->"_s", '_'->"_u", else
+ * passthrough -- '_' only ever leads an escape, so the map is injective. Cockpit only;
+ * non-fatal. */
 static void pre_snapshot(const char* path,unsigned seq){
     if(!g_cp || !path || !path[0]) return;
     static char sb[8192]; long n=0;
     long fd=_ch_sc(SYS_OPEN_N,(long)path,0,0,0,0,0);                 /* O_RDONLY */
     if(fd>=0){ n=_ch_sc(SYS_READ_N,fd,(long)sb,sizeof(sb)-1,0,0,0); if(n<0)n=0; _ch_sc(SYS_CLOSE_N,fd,0,0,0,0,0); }
-    const char* base=path; for(unsigned i=0;path[i];i++) if(path[i]=='/') base=path+i+1;
-    static char sp[256]; char* d=sp; const char* pre="/var/snapshots/";
-    while(*pre) *d++=*pre++; const char* b=base; while(*b && d<sp+sizeof(sp)-16) *d++=*b++;
+    static char sp[256]; char* d=sp; char* end=sp+sizeof(sp); const char* pre="/var/snapshots/";
+    while(*pre) *d++=*pre++;
+    for(const char* p=path; *p && d<end-16; p++){
+        if(*p=='/'){ *d++='_'; *d++='s'; }
+        else if(*p=='_'){ *d++='_'; *d++='u'; }
+        else *d++=*p;
+    }
     *d++='.'; { unsigned v=seq; char t[12]; int i=0; if(!v)t[i++]='0'; while(v){t[i++]=(char)('0'+v%10);v/=10;} while(i) *d++=t[--i]; } *d=0;
     long o=_ch_sc(SYS_OPEN_N,(long)sp,0x41,0600,0,0,0);             /* O_WRONLY|O_CREAT */
     if(o<0){ outfd(2,"AGENTD: snapshot open-fail\n"); return; }
@@ -170,6 +226,68 @@ static int confirm_gate(const char* tool,const char* args,unsigned step){
         yield();
     }
     g_cp->state=AC_STATE_RUNNING; return 0;
+}
+
+/* ===== AGENT AUDIT LEDGER (live-agent edition) ==============================
+ * agentd writes its OWN append-only tamper-evident ledger to /var/log/ai/agent.log
+ * -- SEPARATE from aibroker's actions.log (two writers on one chain would corrupt it).
+ * Byte-for-byte identical FNV-1a hash-chain to ledgerver, so `ledgerver /var/log/ai/
+ * agent.log` validates it. Unconditional (every agentd run is audited). args are
+ * SANITIZED (strip control chars + neutralise literal " seq="/" hash=") to block the
+ * ledger-injection the C4 audit found. Bounded; non-fatal on any error. */
+#define AGENT_LEDGER_PATH "/var/log/ai/agent.log"
+#define SYS_GET_TICKS_MS  40            /* monotonic ms since boot (same clock aibroker uses) */
+static unsigned long g_al_seq  = 0UL;
+static unsigned long g_al_prev = 0xcbf29ce484222325UL;   /* FNV-1a offset basis (chain seed) */
+static unsigned long al_fnv1a(const char* p, int n){
+    unsigned long h = 0xcbf29ce484222325UL;
+    for(int i=0;i<n;i++){ h ^= (unsigned char)p[i]; h *= 0x100000001b3UL; }
+    return h;
+}
+static void al_hex16(unsigned long v, char* buf){
+    static const char hx[]="0123456789abcdef";
+    for(int i=15;i>=0;i--){ buf[i]=hx[v & 0xf]; v >>= 4; } buf[16]=0;
+}
+static int al_dec(unsigned long v, char* buf){
+    char t[24]; int i=0; if(!v) t[i++]='0'; while(v){ t[i++]=(char)('0'+v%10); v/=10; }
+    int n=i; for(int j=0;j<n;j++) buf[j]=t[n-1-j]; buf[n]=0; return n;
+}
+static void al_cat(char* dst, int* pos, int cap, const char* s){
+    int p=*pos; for(int i=0; s[i] && p<cap-1; i++) dst[p++]=s[i]; dst[p]=0; *pos=p;
+}
+static void al_sanitize(char* dst, int cap, const char* s){
+    int p=0;
+    for(int i=0; s && s[i] && p<cap-1; i++){
+        unsigned char c=(unsigned char)s[i];
+        if(c=='\n'||c=='\r'||c<0x20||c==0x7f){ dst[p++]=' '; continue; }
+        if(c==' ' && (eqn(s+i," seq=",5) || eqn(s+i," hash=",6))){ dst[p++]='_'; continue; }
+        dst[p++]=(char)c;
+    }
+    if(p==0 && cap>1) dst[p++]='-';
+    dst[p]=0;
+}
+static void agent_ledger(const char* tool, const char* args, const char* decision){
+    static char line[2048]; static char st[256], sa[1024];
+    long tk=_ch_sc(SYS_GET_TICKS_MS,0,0,0,0,0,0); if(tk<0) tk=0;
+    al_sanitize(st,sizeof(st),tool?tool:"-");
+    al_sanitize(sa,sizeof(sa),args?args:"-");
+    int p=0; char num[24];
+    al_dec((unsigned long)tk,num);                      al_cat(line,&p,sizeof(line),num);
+    al_cat(line,&p,sizeof(line)," tool=");              al_cat(line,&p,sizeof(line),st);
+    al_cat(line,&p,sizeof(line)," args=");              al_cat(line,&p,sizeof(line),sa);
+    al_cat(line,&p,sizeof(line)," decision=");          al_cat(line,&p,sizeof(line),decision?decision:"-");
+    al_dec(g_al_seq,num); al_cat(line,&p,sizeof(line)," seq="); al_cat(line,&p,sizeof(line),num);
+    { static char chain[2304]; char prevh[17]; al_hex16(g_al_prev,prevh);
+      int c=0; for(int k=0;k<16;k++) chain[c++]=prevh[k]; chain[c++]=' ';
+      for(int k=0;k<p && c<(int)sizeof(chain)-1;k++) chain[c++]=line[k]; chain[c]=0;
+      char hh[17]; unsigned long h=al_fnv1a(chain,c); al_hex16(h,hh);
+      al_cat(line,&p,sizeof(line)," hash="); al_cat(line,&p,sizeof(line),hh);
+      g_al_prev=h; g_al_seq++; }
+    al_cat(line,&p,sizeof(line),"\n");
+    long fd=_ch_sc(SYS_OPEN_N,(long)AGENT_LEDGER_PATH,0x441,0644,0,0,0);  /* O_WRONLY|O_CREAT|O_APPEND */
+    if(fd<0) return;
+    long off=0; while(off<p){ long w=_ch_sc(SYS_WRITE,fd,(long)(line+off),p-off,0,0,0); if(w<=0) break; off+=w; }
+    _ch_sc(SYS_CLOSE_N,fd,0,0,0,0,0);
 }
 
 /* ---- whitelist + path gate ---- the FIRST line of defense: only a known tool name
@@ -294,6 +412,7 @@ static int dispatch(int ctrl, unsigned long rid, const char* prog,
 
 static int host_mode(const char* goal){
     cp_attach();                 /* AGENTCOCKPIT-0: attach lookup-only; g_cp NULL if no cockpit */
+    policy_load();               /* POLICY-LOAD: tighten-only confirm/deny overlay; empty == floor */
     /* Prefer the cockpit's SHM goal: sys_spawn space-splits argv, so a multi-word goal
      * passed via argv[1] arrives TRUNCATED to its first word. The cockpit writes the full
      * goal into g_cp->goal, so read it from there when present. */
@@ -325,7 +444,7 @@ static int host_mode(const char* goal){
     static char args[LINE_CAP];
     unsigned long rid=1; int steps=0, done=0;
     for(int step=0; step<MAX_STEPS; step++){
-        if(g_cp && g_cp->stop){ g_cp->state=AC_STATE_STOPPED; outfd(1,"AGENTD: STOP (operator)\n"); break; }
+        if(g_cp && g_cp->stop){ g_cp->state=AC_STATE_STOPPED; agent_ledger("-","-","STOP"); outfd(1,"AGENTD: STOP (operator)\n"); break; }
         int ll=recv_line(fd,line,sizeof(line));
         if(ll<0){ outfd(1,"AGENTD: broker closed\n"); break; }
         if(eqn(line,"DONE",4)){ outfd(1,"AGENTD: DONE "); outfd(1,line+ (line[4]==' '?5:4)); outfd(1,"\n"); done=1; break; }
@@ -348,10 +467,11 @@ static int host_mode(const char* goal){
                   seg=&args[i+1]; if(last) break;
               }
           } }
-        int gated_ok = (prog!=0 && !bad_path(ac>0?av[0]:0));
+        int gated_ok = (prog!=0 && !bad_path(ac>0?av[0]:0) && !is_deny_tool(tool));
         steps++;
         if(!gated_ok){
             outfd(1,"AGENTD: DENY tool="); outfd(1,tool); outfd(1,"\n");
+            agent_ledger(tool, ac>0?av[0]:"", "DENY");
             send_all(fd,"RESULT [denied by policy: unknown tool or bad path]\n",52);
             continue;
         }
@@ -363,9 +483,12 @@ static int host_mode(const char* goal){
         /* CONFIRM gate: dangerous tools wait for the operator's Allow/Deny (unless grant_full) */
         if(!confirm_gate(tool, ac>0?av[0]:"", (unsigned)steps)){
             outfd(1,"AGENTD: CONFIRM-DENY tool="); outfd(1,tool); outfd(1,"\n");
+            agent_ledger(tool, ac>0?av[0]:"", "CONFIRM-DENY");
             send_all(fd,"RESULT [denied by operator]\n",28);
             continue;
         }
+        /* AUDIT: this decision was approved -- log before the side effect. */
+        agent_ledger(tool, ac>0?av[0]:"", is_confirm_tool(tool) ? "CONFIRM-ALLOW" : "ALLOW");
         /* pre-mutation snapshot for rollback (cockpit session only) */
         if(streq(tool,"write_file")||streq(tool,"remove")) pre_snapshot(ac>0?av[0]:0,(unsigned)steps);
         static char buf[1024]; int bl=0, ec=-999;

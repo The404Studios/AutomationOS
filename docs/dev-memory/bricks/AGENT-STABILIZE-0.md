@@ -180,6 +180,28 @@ ops + auto-DENIES spawns. `COCKPIT-CONFIRM: PASS` --
   severity (only agent-written files, writable tree). Fix = full-path key.
 - Synthetic input >64 events + visible cursor/text effect still unproven (serial marker only).
 
+## "Get everything working" pass (10-agent designed, integrated + verified)
+Closed the audit's remaining STRUCTURAL gaps so the safety model is configurable + audited for the
+LIVE agent (not just the supervised cockpit case). All built clean (canary 0, smoke 43/43):
+- **agentd is now POLICY-DRIVEN (tighten-only):** `policy_load()` reads `/etc/ai/policy.json` and
+  overlays a deny-set + confirm-set on the hardcoded floor. It can only TIGHTEN (add DENY/CONFIRM),
+  never loosen -- the `allow` array is IGNORED, `resolve_tool` stays the sole whitelist, exact-name
+  match, empty tokens dropped, load-once, fail-safe (absent/bad file => floor). Adversarially vetted:
+  GO. policy.json fixed (`move` -> require_approval). PROOF: `run_policy_deny.sh` adds read_file to
+  deny -> `AGENTD: DENY tool=read_file` (live gate changed by editing the file).
+- **agentd SELF-AUDITS:** writes its own FNV-1a hash-chained ledger to `/var/log/ai/agent.log`
+  (separate from aibroker's actions.log), one record per gated decision (ALLOW/DENY/CONFIRM-*/STOP),
+  args SANITIZED against injection. `ledgerver <path>` verifies it; init re-verifies after agentd's
+  reap. PROOF: `run_agent_ledger.sh` -> **LEDGER: VERIFIED records=6** (the live agent's decisions,
+  tamper-evident). Closes the C4 "legacy only" overclaim.
+- **rollback FULL-PATH keyed:** pre_snapshot + tool_rollback encode the full path (`/`->`_s`,
+  `_`->`_u`) so `/tmp/a/x` and `/home/x` never collide. CONFIRM proof still restores (read=v1).
+- **>64 synthetic-input proof:** `tool_mouse moven <dx> <dy> <count>` injects many events from one
+  gated step (yields every 32 to let the consumer drain); compositor prints `drained N events` once
+  past QMAX. `run_synth_stress.sh` proves the masked-tail wrap with no stale-replay.
+- HONEST: SHM 0600=uid-0 theater + persistent (non-ramfs) ledger/snapshots across reboot remain
+  architectural; live model run needs the user's key (Puter isn't keyless from headless Node).
+
 ## Next (this branch, in order)
 - **Phase C** — harden the gate: `/etc/ai/policy.json`, O_NOFOLLOW symlink defense, rollback
   ownership, ledger integrity, CONFIRM + grant-full, multi-line-result hardening, adversarial verify.

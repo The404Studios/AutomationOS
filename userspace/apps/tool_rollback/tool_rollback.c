@@ -199,6 +199,25 @@ static const char *basename_of(const char *p)
     return base;
 }
 
+/* path_encode -- reversible, collision-free encoding of the FULL path, used as the
+ * snapshot-name key. MUST be byte-identical to agentd.c pre_snapshot:
+ *   '/' -> "_s",  '_' -> "_u",  else passthrough.  '_' only ever leads an escape, so the
+ * map is injective: distinct paths never collide (fixes the basename-only collision).
+ * Returns length, or -1 on overflow (no silent truncation). */
+static int path_encode(char *dst, const char *p, int cap)
+{
+    int o = 0;
+    for (int i = 0; p[i]; i++) {
+        char c = p[i];
+        if (c == '/')      { if (o >= cap - 2) return -1; dst[o++] = '_'; dst[o++] = 's'; }
+        else if (c == '_') { if (o >= cap - 2) return -1; dst[o++] = '_'; dst[o++] = 'u'; }
+        else               { if (o >= cap - 1) return -1; dst[o++] = c; }
+    }
+    if (o >= cap) return -1;
+    dst[o] = '\0';
+    return o;
+}
+
 /* =======================================================================
  *  Snapshot-name matcher.
  *
@@ -255,9 +274,13 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    /* 2. basename(<path>), then scan /var/snapshots for the highest seq. */
-    const char *base = basename_of(path);
-    if (!base[0]) {                                  /* path ended in '/' -> no file */
+    /* 2. Encode the FULL path (collision-free key), then scan /var/snapshots for the
+     *    highest seq whose entry is "<enc(path)>.<digits>". (void basename_of to keep it.) */
+    (void)basename_of;
+    static char enc[PATHBUF];
+    int enclen = path_encode(enc, path, (int)sizeof(enc));
+    const char *base = enc;
+    if (enclen <= 0) {                               /* empty or too long to key */
         out(FD_STDOUT, "TOOL_ROLLBACK: none ");
         out(FD_STDOUT, path);
         out(FD_STDOUT, "\n");

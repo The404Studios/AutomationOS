@@ -42,7 +42,6 @@
     "compile",
     "execute",
     "mkdir",
-    "move",
     "file.read",
     "process.list",
     "process.query",
@@ -59,6 +58,7 @@
     "shell",
     "mouse",
     "key",
+    "move",
     "file.write_project",
     "pkg.install_request",
     "rollback"

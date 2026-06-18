@@ -104,11 +104,19 @@ static const char* resolve_tool(const char* name){
     if(streq(name,"mkdir"))     return "sbin/tool_mkdir";
     if(streq(name,"move"))      return "sbin/tool_mv";
     if(streq(name,"remove"))    return "sbin/tool_rm";
-    /* Phase 2 apps/system + shell */
+    /* Phase 2 apps/system */
     if(streq(name,"spawn"))     return "sbin/tool_spawn";
     if(streq(name,"kill"))      return "sbin/tool_kill";
-    if(streq(name,"shell"))     return "sbin/tool_shell";
-    /* Phase 4 (synthetic input): mouse/key -- not yet */
+    /* SECURITY: "shell" is deliberately NOT on the rail. tool_shell forwards its
+     * argv[2..] UN-GATED to /bin coreutils (cc/touch/tee/head/...) which carry no
+     * path policy of their own, and agentd's bad_path() only inspects av[0] (the
+     * command NAME). So {"tool":"shell","args":"touch\t/etc/evil"} would defeat the
+     * entire write allowlist. Re-enabling shell REQUIRES gating every /bin argument
+     * that looks like a path -- until then it stays off. */
+    /* Phase 4 synthetic input -- GUI takeover (CONFIRM-class in /etc/ai/policy.json).
+     * Effects are inert unless the compositor has authorised injection (active=1). */
+    if(streq(name,"mouse"))     return "sbin/tool_mouse";
+    if(streq(name,"key"))       return "sbin/tool_key";
     return 0;                                  /* unknown/unsupported -> rejected */
 }
 static int bad_path(const char* p){ if(!p) return 0;       /* some tools take no path */

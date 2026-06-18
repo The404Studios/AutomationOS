@@ -1022,6 +1022,11 @@ static int     g_dock_selected[RDOCK_CAP];   /* 1 = selected (highlighted)      
 
 /* DOCK-DND-1: Start-menu -> dock drag handoff over a well-known SHM page. */
 #include "../include/dockdnd.h"
+/* SYNTHINPUT-0: agent -> compositor synthetic mouse/keyboard injection (mirrors the
+ * dockdnd SHM seam). The compositor creates+owns the page; agent tools attach
+ * lookup-only and enqueue events drained each frame by pump_synth_input(). */
+#include "../include/synthinput.h"
+static volatile synthinput_shm_t *g_synth = (volatile synthinput_shm_t *)0;
 #ifndef SYS_SHMGET
 #define SYS_SHMGET  18
 #endif
@@ -4922,6 +4927,60 @@ static void pump_input(int32_t fd, int keyboard, uint32_t W, uint32_t H) {
     }
 }
 
+/* SYNTHINPUT-0: drain the agent injection ring and apply each event exactly as the
+ * real PS/2 path would -- update the cursor/buttons + reuse send_pointer_to_focus /
+ * wm_handle_key / send_key_to_focus. Single-producer (agent tool) / single-consumer
+ * (here), so no locking; head/tail are accessed through the volatile SHM pointer.
+ * Drained BEFORE the real pump_input() each frame so human + agent input mix freely. */
+static void pump_synth_input(uint32_t W, uint32_t H) {
+    volatile synthinput_shm_t *si = g_synth;
+    if (!si || si->magic != SYNTHINPUT_MAGIC || !si->active) return;
+    int moved = 0;
+    int guard = 0;
+    while (si->tail != si->head && guard++ < SYNTHINPUT_QMAX) {
+        unsigned idx = si->tail & (SYNTHINPUT_QMAX - 1);
+        unsigned short type = si->q[idx].type, code = si->q[idx].code;
+        int value = si->q[idx].value;
+        si->tail = si->tail + 1;
+        { static int g_synth_first = 0;
+          if (!g_synth_first) { g_synth_first = 1;
+              print("[SHELL] SYNTHINPUT: input applied (agent is driving)\n"); } }
+        if (type == SI_EV_REL) {
+            if (code == SI_REL_X)      { g_cursor_x += value; moved = 1; }
+            else if (code == SI_REL_Y) { g_cursor_y += value; moved = 1; }
+            else if (code == SI_REL_WHEEL) { g_wheel_delta += value; }
+        } else if (type == SI_EV_KEY) {
+            int pressed = value != 0 ? 1 : 0;
+            int bit = (code == SI_BTN_LEFT)   ? 0 :
+                      (code == SI_BTN_RIGHT)  ? 1 :
+                      (code == SI_BTN_MIDDLE) ? 2 : -1;
+            if (bit >= 0) {
+                if (pressed) {
+                    if (bit == 0 && !(g_buttons & 1)) { g_click_latch = 1; g_click_cx = g_cursor_x; g_click_cy = g_cursor_y; }
+                    else if (bit == 1 && !(g_buttons & 2)) { g_rclick_latch = 1; g_rclick_cx = g_cursor_x; g_rclick_cy = g_cursor_y; }
+                    g_buttons |= (1 << bit);
+                } else {
+                    g_buttons &= ~(1 << bit);
+                }
+                moved = 1;
+            } else {
+                mark_dirty();
+                if (!wm_handle_key((int32_t)code, pressed))
+                    send_key_to_focus((int32_t)code, pressed);
+            }
+        }
+    }
+    if (moved) {
+        if (g_cursor_x < 0) g_cursor_x = 0;
+        if (g_cursor_y < 0) g_cursor_y = 0;
+        if (g_cursor_x >= (int32_t)W) g_cursor_x = (int32_t)W - 1;
+        if (g_cursor_y >= (int32_t)H) g_cursor_y = (int32_t)H - 1;
+        g_cursor_moved = 1;
+        mark_dirty();
+        send_pointer_to_focus();
+    }
+}
+
 /* ---------------------------------------------------------------------- *
  *  Desktop-shell mouse interaction (hit-testing + drag-move)             *
  * ---------------------------------------------------------------------- */
@@ -5701,6 +5760,27 @@ void _start(void) {
         }
     }
 
+    /* SYNTHINPUT-0: create + own the synthetic-input injection page. Agent tools
+     * (tool_mouse/tool_key) attach lookup-only and enqueue events; pump_synth_input()
+     * drains them each frame. 0600 owner-only (same defense-in-depth as dockdnd; the
+     * real authority is the agent gate that whitelists mouse/key). active=1 means
+     * injection is authorised; a future cockpit STOP sets active=0 to kill it. */
+    {
+        long id = sc6(SYS_SHMGET, (long)SYNTHINPUT_SHM_KEY, (long)SYNTHINPUT_SHM_SIZE,
+                      (long)(IPC_CREAT | 0600), 0, 0, 0);
+        if (id >= 0) {
+            long p = sc6(SYS_SHMAT, id, 0, 0, 0, 0, 0);
+            if (p > 0) {
+                g_synth = (volatile synthinput_shm_t *)p;
+                volatile char *z = (volatile char *)p;      /* sys_shmget won't zero */
+                for (int i = 0; i < (int)sizeof(synthinput_shm_t); i++) z[i] = 0;
+                g_synth->active = 1;
+                g_synth->magic  = SYNTHINPUT_MAGIC;          /* publish LAST */
+                print("[SHELL] SYNTHINPUT: injection page ready\n");
+            }
+        }
+    }
+
     /* 1. Acquire the framebuffer. */
     fb_acquire_t fb;
     long r = syscall(SYS_FB_ACQUIRE, (long)&fb, 0, 0);
@@ -5874,6 +5954,7 @@ void _start(void) {
         task_reflow(W);
 
         /* b) pump input devices (updates cursor + buttons, forwards kbd/ptr) */
+        pump_synth_input(W, H);            /* SYNTHINPUT-0: drain agent injection FIRST */
         pump_input(g_kbd_fd,   1, W, H);
         pump_input(g_mouse_fd, 0, W, H);
 

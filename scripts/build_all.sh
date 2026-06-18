@@ -204,6 +204,9 @@ cc userspace/apps/tool_spawn/tool_spawn.c /tmp/tool_spawn.o; $LD /tmp/crt0.o /tm
 cc userspace/apps/tool_kill/tool_kill.c   /tmp/tool_kill.o;  $LD /tmp/crt0.o /tmp/tool_kill.o  -o /tmp/tool_kill.elf
 cc userspace/apps/tool_ps/tool_ps.c       /tmp/tool_ps.o;    $LD /tmp/crt0.o /tmp/tool_ps.o    -o /tmp/tool_ps.elf
 cc userspace/apps/tool_shell/tool_shell.c /tmp/tool_shell.o; $LD /tmp/crt0.o /tmp/tool_shell.o -o /tmp/tool_shell.elf
+# SYNTHINPUT-0: synthetic input tools (mouse/keyboard) -- the agent drives the GUI via these.
+cc userspace/apps/tool_mouse/tool_mouse.c /tmp/tool_mouse.o; $LD /tmp/crt0.o /tmp/tool_mouse.o -o /tmp/tool_mouse.elf
+cc userspace/apps/tool_key/tool_key.c     /tmp/tool_key.o;   $LD /tmp/crt0.o /tmp/tool_key.o   -o /tmp/tool_key.elf
 # CLAUDE-API-0: claudehost -- raw TCP over the slirp seam to the host Claude
 # broker (scripts/claude_broker.py), which holds the API key + does the real
 # HTTPS to api.anthropic.com. Same socket-only link as modelbridge.
@@ -606,7 +609,7 @@ $LD /tmp/crt0.o /tmp/cc.o \
     -o /tmp/cc.elf
 
 echo "[all] canary check (all must be 0):"
-for e in comp init filemanager calculator clock sysinfo settings sysmon uidemo dateapp applauncher taskman terminal editor snake paint synth tetris game2048 sheet notes calendar stopwatch mines piano dashboard welcome bench breakout pong invaders procmon soundtest solitaire aiconsole screenshot stress musicplayer ide bubbletd zombietd pacman clockapp forktest sigtest pollselftest threadtest reaploop forkfdtest forkregtest matmuljobs aibroker sed awk tar pkg make meminfo argvtest msgtest rpctest toolrun echoproof echoargs agenthost tool_read tool_ls tool_stat codeagent toolset_host chainhost modelbridge agentd tool_write tool_cc tool_exec tool_mkdir tool_mv tool_rm tool_spawn tool_kill tool_ps tool_shell claudehost initrdp initrdalias floattest sleeptest prioritytest matbench tensortest cpuburn blk ps kill free uptime find diff cmp tee wcx xargs gzip cc nettest sockettest cpu1offload smpstress wget netman cryptotest libtest ping nc netinfo netscan tcping dig httpget pktmon httpd traceroute arp grep head tail sort uniq cut tr nl du touch basename dirname uname hostname whoami date less hexdump lspci tlsprobe certtool dhcpc autodhcp apidemo gsignin js futextest epolltest sendfiletest perftest batchtest domtest htmltest csstest layouttest webtest browser2 webapitest cube3d ray chess asteroids sudoku photos startmenu controlcenter claudechat anthropic gametest exectest execchild; do
+for e in comp init filemanager calculator clock sysinfo settings sysmon uidemo dateapp applauncher taskman terminal editor snake paint synth tetris game2048 sheet notes calendar stopwatch mines piano dashboard welcome bench breakout pong invaders procmon soundtest solitaire aiconsole screenshot stress musicplayer ide bubbletd zombietd pacman clockapp forktest sigtest pollselftest threadtest reaploop forkfdtest forkregtest matmuljobs aibroker sed awk tar pkg make meminfo argvtest msgtest rpctest toolrun echoproof echoargs agenthost tool_read tool_ls tool_stat codeagent toolset_host chainhost modelbridge agentd tool_write tool_cc tool_exec tool_mkdir tool_mv tool_rm tool_spawn tool_kill tool_ps tool_shell tool_mouse tool_key claudehost initrdp initrdalias floattest sleeptest prioritytest matbench tensortest cpuburn blk ps kill free uptime find diff cmp tee wcx xargs gzip cc nettest sockettest cpu1offload smpstress wget netman cryptotest libtest ping nc netinfo netscan tcping dig httpget pktmon httpd traceroute arp grep head tail sort uniq cut tr nl du touch basename dirname uname hostname whoami date less hexdump lspci tlsprobe certtool dhcpc autodhcp apidemo gsignin js futextest epolltest sendfiletest perftest batchtest domtest htmltest csstest layouttest webtest browser2 webapitest cube3d ray chess asteroids sudoku photos startmenu controlcenter claudechat anthropic gametest exectest execchild; do
     n=$(objdump -d /tmp/$e.elf 2>/dev/null | grep -c "fs:0x28" || true)
     echo "  $e=$n"
 done
@@ -683,6 +686,8 @@ cp /tmp/tool_spawn.elf /tmp/ird/sbin/tool_spawn
 cp /tmp/tool_kill.elf  /tmp/ird/sbin/tool_kill
 cp /tmp/tool_ps.elf    /tmp/ird/sbin/tool_ps
 cp /tmp/tool_shell.elf /tmp/ird/sbin/tool_shell
+cp /tmp/tool_mouse.elf /tmp/ird/sbin/tool_mouse
+cp /tmp/tool_key.elf   /tmp/ird/sbin/tool_key
 # CLAUDE-API-0 -> /sbin and /bin (init spawns it; also runnable from the terminal).
 cp /tmp/claudehost.elf /tmp/ird/sbin/claudehost
 cp /tmp/claudehost.elf /tmp/ird/bin/claudehost
@@ -691,6 +696,9 @@ cp /tmp/initrdp.elf /tmp/ird/sbin/initrdp
 cp /tmp/initrdalias.elf /tmp/ird/sbin/initrdalias
 # TOOLSET-0 test fixture: a small file with KNOWN content (15 bytes) for read_file/stat.
 mkdir -p /tmp/ird/etc && printf 'TOOLSET-0-FILE\n' > /tmp/ird/etc/toolset0.txt
+# AGENT-POLICY (C1): seed the canonical agent safety policy so aibroker loads it
+# instead of falling back to built-in defaults (the auditable source of truth).
+mkdir -p /tmp/ird/etc/ai && cp etc/ai/policy.json /tmp/ird/etc/ai/policy.json
 # BROWSER2-IMG-0 fixtures: deterministic PNG/GIF/BMP (+ a wider-than-viewport
 # big.png) for the about:imgtest acceptance page; missing.png stays missing.
 python3 scripts/gen_img_fixtures.py /tmp/ird/etc/imgtest

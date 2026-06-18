@@ -73,6 +73,36 @@ bricks, deletes dev scratch, and pins a green build+smoke baseline before any ne
   exploitability today — no symlink-creating tool is whitelisted), tool-level rollback, ledger
   integrity hash-chain.
 
+## Phase C/D push (10-agent) — synthetic input LIVE + a real gate bypass closed
+- **CRITICAL gate bypass FOUND + CLOSED:** `shell` was on agentd's `resolve_tool` whitelist;
+  `tool_shell` forwards its argv[2..] UN-GATED to `/bin` coreutils (cc/touch/tee/head/...) which
+  carry no path policy, and `bad_path` only checks av[0] (the command NAME). So
+  `{"tool":"shell","args":"touch\t/etc/evil"}` defeated the whole write allowlist. FIX: removed
+  `shell` from the rail (agentd.c `resolve_tool`); re-enabling requires gating every `/bin` path arg.
+- **SYNTHETIC INPUT (D1) BUILT + PROVEN** — the agent can now drive mouse+keyboard:
+  - `userspace/include/synthinput.h` (SHM ring, mirrors dockdnd), `tool_mouse` + `tool_key`
+    (freestanding, attach lookup-only, enqueue), wired into `resolve_tool` (mouse/key replace shell;
+    CONFIRM-class) + build_all.
+  - `compositor_m8.c`: `pump_synth_input()` drains the ring each frame BEFORE the real PS/2 pump,
+    reusing send_pointer_to_focus / wm_handle_key / send_key_to_focus; compositor creates+owns the
+    0600 page (active=1).
+  - PROOF (`run_agentd_gui.sh`, NEMO_GUI=1): `SYNTHINPUT: injection page ready` → `AGENTD: TOOL
+    mouse move` → `SYNTHINPUT: input applied (agent is driving)` → click/key/move → `DENY badtool`
+    → `AGENTD: PASS loop_completed steps=5`. The compositor CONSUMES the agent's injected events;
+    the gate still denies unknown tools in GUI mode.
+- **C1 policy.json LANDED:** `etc/ai/policy.json` (canonical, auditable gate policy) seeded into the
+  initrd (`/etc/ai/policy.json`) so aibroker loads it instead of built-in defaults. NOTE: aibroker's
+  parser is a dumb token scanner — the words allow/require_approval/deny may appear ONLY as the 3
+  array keys (the file is crafted around this). agentd's gate stays compiled-in (resolve_tool).
+- **Committed-foundation reviews:** kernel process-model brick (d837409) reviewed SOLID (no bugs;
+  BSS buffer copied under caller CR3, PREEMPT-WAITSAFE-0 recovers lost wakes correctly). Gate review
+  found ONLY the shell bypass (now closed); traversal/arg-injection/JSON-escape/spawn/kill all sound.
+- **DESIGNS READY (not yet applied):** O_NOFOLLOW symlink defense (C2: O_NOFOLLOW=0x100, final-
+  component-only check in vfs.c, tool opens) — precise patch in hand; tool-rollback + ledger
+  hash-chain (C3/C4: agentd pre_snapshot + FNV1a chain + verify util) — ramfs = in-session only;
+  cockpit GUI (D2: new `cockpit.c` extending the anthropic/ui.h pattern, spawns agentd + parses its
+  serial, Allow/Deny/grant-full/STOP). Apply these next.
+
 ## Next (this branch, in order)
 - **Phase C** — harden the gate: `/etc/ai/policy.json`, O_NOFOLLOW symlink defense, rollback
   ownership, ledger integrity, CONFIRM + grant-full, multi-line-result hardening, adversarial verify.

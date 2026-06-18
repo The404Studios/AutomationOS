@@ -70,10 +70,24 @@ CODETASK_STEPS = [
     ("ps",         ""),
     ("remove",     "/etc/passwd"),                 # destructive -> path-policy DENY
 ]
+# GUI plan (NEMO_GUI=1): the headline SYNTHETIC-INPUT workflow -- the agent moves the
+# mouse, clicks, and types into the focused window via the gated mouse/key tools. Those
+# tools enqueue events into the compositor's well-known injection page, which the
+# compositor drains each frame (pump_synth_input) and applies as real input. Proves
+# "the agent can drive the GUI (mouse + keyboard) at the user's request".
+GUI_STEPS = [
+    ("mouse", "move\t180\t120"),    # move the cursor by +180,+120
+    ("mouse", "click\tleft"),        # left button press + release (a click)
+    ("key",   "type\tHELLO"),        # type 5 chars into the focused window
+    ("mouse", "move\t-40\t30"),      # move again (proves repeated injection)
+    ("badtool", "/etc/passwd"),      # bonus: an unknown tool must still DENY
+]
 if os.environ.get("NEMO_HOSTILE"):
     STEPS = HOSTILE_STEPS
 elif os.environ.get("NEMO_CODETASK"):
     STEPS = CODETASK_STEPS
+elif os.environ.get("NEMO_GUI"):
+    STEPS = GUI_STEPS
 
 
 def log(m):

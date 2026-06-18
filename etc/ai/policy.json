@@ -1,0 +1,75 @@
+{
+  "_schema": "AutomationOS canonical agent safety policy. PARSER NOTE: the live agent gate (aibroker classify) uses a dumb scanner that reads every double-quoted token and bins it under the most-recently-seen section key among the three real arrays at the bottom: 'allow', 'require_approval', 'deny'. Therefore the EXACT tokens allow/require_approval/deny must appear NOWHERE except as those three array keys. All descriptive metadata above uses non-colliding key/value words (auto/auto_path/confirm/never) so it is binned to nobody (bin=-1) and ignored. classify precedence: DENY > REQUIRE_APPROVAL > ALLOW, deny-by-default; a token matches an exact tool name OR as a substring of the tool args.",
+  "_version": "1",
+  "_source_of_truth": "Canonical auditable encoding of the policy the userspace agent gate currently hardcodes (aibroker policy_load_defaults; tool_write/codeagent path_write_allowed; agentd resolve_tool). aibroker LOADS this file in place of its built-in defaults. agentd does NOT read this file yet (its gate is compiled in via resolve_tool + bad_path); this file is the declared source of truth those built-ins should converge to.",
+
+  "grant_full": false,
+  "_grant_full_doc": "Session toggle. false = enforce the require_approval gate (confirm tools block for human-in-the-loop approval). true = flip every confirm tool to auto for the session. Operator-only; default MUST be false.",
+
+  "tools": {
+    "_doc": "Vetted tool registry with default risk class. auto = run without prompting; auto_path = run only when the path passes path_rules; confirm = require human approval; never = always refused. Values intentionally avoid the words used as the array keys below.",
+    "read_file": "auto",
+    "list_dir": "auto",
+    "stat": "auto",
+    "ps": "auto",
+    "write_file": "auto_path",
+    "compile": "auto_path",
+    "execute": "auto_path",
+    "mkdir": "auto_path",
+    "move": "auto_path",
+    "remove": "confirm",
+    "spawn": "confirm",
+    "kill": "confirm",
+    "shell": "confirm",
+    "mouse": "confirm",
+    "key": "confirm"
+  },
+  "_mouse_key_doc": "mouse and key are synthetic-input GUI-takeover tools: always confirm because they seize the human pointer/keyboard.",
+
+  "path_rules": {
+    "_doc": "Write/mutation path gate enforced by path_write_allowed (defense-in-depth, on top of classify). A path is writable only if it starts with a write_prefix, does not start with a protected prefix, and contains none of the reject_substrings. Protected wins over writable. Reject any path containing '..' (no traversal).",
+    "write_prefixes": ["/tmp", "/home", "/usr/src"],
+    "protected_prefixes": ["/boot", "/sbin", "/bin", "/etc", "/kernel"],
+    "reject_substrings": ["kernel", ".."]
+  },
+
+  "allow": [
+    "read_file",
+    "list_dir",
+    "stat",
+    "ps",
+    "write_file",
+    "compile",
+    "execute",
+    "mkdir",
+    "move",
+    "file.read",
+    "process.list",
+    "process.query",
+    "sysinfo",
+    "service.status",
+    "git.status",
+    "git.diff"
+  ],
+
+  "require_approval": [
+    "remove",
+    "spawn",
+    "kill",
+    "shell",
+    "mouse",
+    "key",
+    "file.write_project",
+    "pkg.install_request",
+    "rollback"
+  ],
+
+  "deny": [
+    "/boot",
+    "/sbin",
+    "/bin",
+    "/etc",
+    "kernel",
+    ".."
+  ]
+}

@@ -4941,7 +4941,10 @@ static void pump_synth_input(uint32_t W, uint32_t H) {
         unsigned idx = si->tail & (SYNTHINPUT_QMAX - 1);
         unsigned short type = si->q[idx].type, code = si->q[idx].code;
         int value = si->q[idx].value;
-        si->tail = si->tail + 1;
+        /* Keep tail in the SAME [0,QMAX) space the producers keep head in (they store
+         * (head+1)%QMAX), else tail!=head stays true forever after the first wrap and
+         * we replay stale slots every frame. QMAX is a power of two so & works. */
+        si->tail = (si->tail + 1) & (SYNTHINPUT_QMAX - 1);
         { static int g_synth_first = 0;
           if (!g_synth_first) { g_synth_first = 1;
               print("[SHELL] SYNTHINPUT: input applied (agent is driving)\n"); } }

@@ -17,7 +17,8 @@ echo "[ia] quick_build rc=$?; tail:"; tail -2 /tmp/ia_kernel.log
 if grep -nE "error:|undefined reference" /tmp/ia_kernel.log; then echo "[ia] KERNEL BUILD ERRORS"; exit 1; fi
 
 echo "[ia] build_all (userspace + ISO, packages build/kernel.elf)..."
-bash scripts/build_all.sh > /tmp/ia_all.log 2>&1
+# BROWSER-DEDUP: about:imgtest self-test spawn is gated behind SMOKE_SELFTEST.
+SMOKE_SELFTEST=1 bash scripts/build_all.sh > /tmp/ia_all.log 2>&1
 echo "[ia] build_all rc=$?; tail:"; tail -2 /tmp/ia_all.log
 if grep -nE "error:|undefined reference" /tmp/ia_all.log; then echo "[ia] BUILD ERRORS"; exit 1; fi
 

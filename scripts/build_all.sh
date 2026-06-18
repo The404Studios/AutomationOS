@@ -48,6 +48,14 @@ if [ "${DESKTOP_MINIMAL:-0}" = "1" ]; then
     INIT_EXTRA="$INIT_EXTRA -DDESKTOP_MINIMAL"
     echo "*** DESKTOP_MINIMAL build: init spawns desktop apps only (no self-test storm) ***"
 fi
+# SMOKE_SELFTEST=1: spawn the two BOUNDED browser2 self-test runs (--smoke +
+# about:imgtest) that exist only to feed the smoke / img / alias verify gates.
+# Default OFF (BROWSER-DEDUP) so a normal desktop opens exactly ONE browser
+# window instead of three. The img/alias verify scripts set this.
+if [ "${SMOKE_SELFTEST:-0}" = "1" ]; then
+    INIT_EXTRA="$INIT_EXTRA -DSMOKE_SELFTEST"
+    echo "*** SMOKE_SELFTEST build: init runs the bounded browser2 self-tests (img/smoke gates) ***"
+fi
 # SELFHEAL=1 wires the userspace desktop self-heal: the compositor publishes a
 # per-frame heartbeat into a SysV SHM page, init creates+owns that page and spawns
 # sbin/cwatchdog (the recovery supervisor). Threads -DSELFHEAL into the compositor
@@ -401,7 +409,8 @@ cc userspace/apps/js/js.c /tmp/js.o; $LD /tmp/crt0.o /tmp/js.o $JS_OBJS /tmp/lst
 # ----------------------------------------------------------------------------
 # Browser wave (22 agents): DOM + HTML + CSS + Layout + JS web APIs +
 # per-layer selftests + new DOM-rendering browser (browser2). All files are
-# disjoint additions over the existing tree -- the legacy `browser` stays.
+# disjoint additions over the existing tree (the legacy text `browser` was
+# removed in BROWSER-CONSOLIDATE-0; browser2 is the one and only browser).
 # ----------------------------------------------------------------------------
 echo "[all] browser wave: DOM/HTML/CSS/Layout libs + selftests..."
 # BROWSER2-IMG-0: generate the embedded fixture header BEFORE browser2 compiles

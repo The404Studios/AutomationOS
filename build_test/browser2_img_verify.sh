@@ -7,7 +7,9 @@ cd /mnt/c/Users/wilde/Desktop/Kernel
 OUT="${1:-imgcheck}"
 
 echo "[img] build_all (userspace + ISO; kernel unchanged)..."
-bash scripts/build_all.sh > /tmp/img_all.log 2>&1
+# BROWSER-DEDUP: the about:imgtest self-test spawn is gated behind SMOKE_SELFTEST
+# (default OFF so a normal desktop opens one browser); this gate needs it ON.
+SMOKE_SELFTEST=1 bash scripts/build_all.sh > /tmp/img_all.log 2>&1
 echo "[img] build_all rc=$?; tail:"; tail -2 /tmp/img_all.log
 if grep -nE "error:|undefined reference" /tmp/img_all.log; then echo "[img] BUILD ERRORS"; exit 1; fi
 grep -n "imgfixtures" /tmp/img_all.log || { echo "[img] FIXTURES MISSING"; exit 1; }

@@ -452,16 +452,21 @@ void _start(void) {
     spawn("sbin/csstest");
     spawn("sbin/layouttest");
     spawn("sbin/webtest");
-    // BROWSER-PERSIST-0: the pipeline self-test runs browser2 in bounded
-    // "--smoke" mode (render about:home once, print the verdict, exit) so it
-    // gates the web stack without leaving a second browser window open. The
-    // user-facing desktop browser above (line 425, no arg) stays persistent.
+    // BROWSER-DEDUP: these two BOUNDED browser2 self-test runs (--smoke +
+    // about:imgtest) exist only to feed the smoke / img / alias verify gates.
+    // Each briefly opens a browser window, so on a normal desktop they looked
+    // like "double/triple browsers". Gated behind SMOKE_SELFTEST (default OFF)
+    // so a normal boot opens exactly ONE browser -- the persistent one above.
+    // The img/alias verify scripts build with SMOKE_SELFTEST=1.
+#ifdef SMOKE_SELFTEST
+    // BROWSER-PERSIST-0: bounded "--smoke" mode (render about:home once, print
+    // the verdict, exit) -- gates the web stack without a lingering window.
     spawn_args("sbin/browser2", "--smoke");
-    // BROWSER2-IMG-0: a second bounded browser2 run on the built-in
-    // about:imgtest page (local PNG/GIF/BMP fixtures + a missing source +
-    // a wider-than-viewport image). Prints "BROWSER2-IMG: PASS png=1 gif=1
-    // bmp=1 missing_safe=1 bounded=1" after its first paint and exits.
+    // BROWSER2-IMG-0: bounded run on about:imgtest (PNG/GIF/BMP fixtures + a
+    // missing source + a wider-than-viewport image). Prints "BROWSER2-IMG: PASS
+    // png=1 gif=1 bmp=1 missing_safe=1 bounded=1" after its first paint, exits.
     spawn_args("sbin/browser2", "about:imgtest");
+#endif
 
     // INITRD-ALIAS-0: the big-image (16 MiB pad, spans VA 16 MiB) + mmap-heavy
     // reader; reads an initrd-backed file on its own shadow-prone CR3,

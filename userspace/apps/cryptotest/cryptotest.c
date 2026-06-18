@@ -18,6 +18,9 @@
 #include "../../lib/crypto/base64.h"            /* base64_selftest()  */
 #include "../../lib/crypto/pbkdf2.h"            /* pbkdf2_selftest() -- WPA2 PMK */
 #include "../../lib/crypto/keywrap.h"           /* keywrap_selftest() -- RFC 3394 GTK */
+#include "../../lib/crypto/ccm.h"               /* ccm_selftest() -- NIST 800-38C */
+#include "../../lib/crypto/ccmp.h"              /* ccmp_selftest() -- 802.11 CCMP (WPA2) */
+#include "../../lib/crypto/gcmp.h"              /* gcmp_selftest() -- 802.11 GCMP (WPA3) */
 #include "../../lib/tls/x509.h"                 /* x509_selftest()    */
 #include "../../lib/tls/x509_verify.h"          /* x509_verify_selftest() */
 #include "../../lib/tls/tls.h"                  /* tls_selftest()     */
@@ -48,6 +51,9 @@ void _start(void) {
     int b64    = base64_selftest();
     int pbkdf2 = pbkdf2_selftest();    /* WPA-PROOF: PBKDF2-HMAC-SHA1 (PMK) */
     int keywrap= keywrap_selftest();   /* WPA-PROOF: AES key-wrap RFC 3394  */
+    int ccm    = ccm_selftest();       /* WPA-PROOF: AES-CCM (NIST 800-38C) */
+    int ccmp   = ccmp_selftest();      /* WPA-PROOF: 802.11 CCMP (WPA2)     */
+    int gcmp   = gcmp_selftest();      /* WPA-PROOF: 802.11 GCMP (WPA3)     */
     int x509   = x509_selftest();
     int xverify= x509_verify_selftest();
     int tls    = tls_selftest();
@@ -62,11 +68,15 @@ void _start(void) {
     report("base64", b64);
     report("pbkdf2-hmac-sha1 (wpa pmk)", pbkdf2);
     report("aes key-wrap (rfc 3394)", keywrap);
+    report("aes-ccm (nist 800-38c)", ccm);
+    report("ccmp (802.11 wpa2)", ccmp);
+    report("gcmp (802.11 wpa3)", gcmp);
     report("x509 parse", x509);
     report("x509 chain verify", xverify);
     report("tls PRF", tls);
 
-    int all = crypto | sha512 | rsa | x255 | p256 | chacha | hkdf | b64 | pbkdf2 | keywrap | x509 | xverify | tls;
+    int all = crypto | sha512 | rsa | x255 | p256 | chacha | hkdf | b64 | pbkdf2 | keywrap
+            | ccm | ccmp | gcmp | x509 | xverify | tls;
     if (all == 0)
         print("CRYPTOTEST: PASS (full crypto/TLS KAT battery)\n");
     else

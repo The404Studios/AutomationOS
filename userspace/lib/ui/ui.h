@@ -241,4 +241,116 @@ int ui_scroll_offset(ui_widget_t* w);
 /* Set the vertical scroll offset (clamped to [0, content_h - h]). */
 void ui_scroll_set_offset(ui_widget_t* w, int offset);
 
+/* =========================================================================
+ * ANIMATED WIDGETS + ANIMATION LAYER (additive, v3)
+ * =========================================================================
+ *
+ * Everything below is PURELY ADDITIVE: new widget KINDS, new constructors, and
+ * a tiny integer (Q8) animation helper. Existing widgets render byte-identically
+ * (no existing enum value, switch case, or behaviour is touched).
+ *
+ * Built for an animated Network Manager + Sound Manager: an iOS-style toggle, a
+ * rotating connecting spinner, a 4-bar WiFi strength meter, a selectable list
+ * row with an animated hover tint, plus a passphrase-mask flag on the existing
+ * textbox. No float/double anywhere -- all easing/sin is fixed-point Q8.
+ */
+
+/*
+ * Integer (Q8) one-shot animation. Drive a single int from `from` to `to` over
+ * `dur_ms`, eased with ease_out_cubic. Time comes from SYS_GET_TICKS_MS (the
+ * toolkit reads ticks itself), but ui_anim_value() also accepts an explicit
+ * now_ms so an app can pass a single sampled timestamp per frame.
+ *
+ *   ui_anim_t a;
+ *   ui_anim_start(&a, 0, 100, 250);            // 0 -> 100 over 250 ms
+ *   int v = ui_anim_value(&a, ui_now_ms());    // eased current value
+ *   if (ui_anim_done(&a, ui_now_ms())) { ... } // settled?
+ *
+ * The struct is plain data (no pointers) -- embed it anywhere, including inside
+ * an app's own state. All fields are ints; safe to zero-init (inactive).
+ */
+typedef struct {
+    int start_ms;   /* tick (ms) at which the animation began            */
+    int dur_ms;     /* total duration in ms (<=0 => instant)             */
+    int from;       /* starting value                                    */
+    int to;         /* target value                                      */
+    int active;     /* 1 while animating, 0 when settled / never started */
+} ui_anim_t;
+
+/* Current monotonic time in ms (SYS_GET_TICKS_MS). Handy for ui_anim_value. */
+int ui_now_ms(void);
+
+/* Begin an animation from `from` to `to` over dur_ms (clamped >= 0). */
+void ui_anim_start(ui_anim_t* a, int from, int to, int dur_ms);
+
+/* Eased current value at time now_ms (ease_out_cubic). Clamps to [from,to]
+ * range endpoints once complete; returns `to` for a settled/instant anim. */
+int ui_anim_value(ui_anim_t* a, int now_ms);
+
+/* 1 once now_ms is past the animation's end (or it was never active). */
+int ui_anim_done(ui_anim_t* a, int now_ms);
+
+/*
+ * iOS-style toggle switch.
+ *   x, y      -- top-left relative to parent, in pixels.
+ *   on        -- initial state (0 = off, 1 = on).
+ *   on_change -- called when toggled; receives new state (0/1) and ud. May NULL.
+ *   ud        -- opaque user data forwarded to on_change.
+ * Fixed size 44x24 (pre-scale). The knob slides via an internal ui_anim and the
+ * track fills with the accent color when on. Click anywhere on it to toggle.
+ */
+ui_widget_t* ui_toggle(ui_widget_t* parent, int x, int y, int on,
+                       void (*on_change)(int state, void* ud), void* ud);
+
+/* Read the current toggle state (0/1). */
+int ui_toggle_on(ui_widget_t* w);
+
+/* Set the toggle state programmatically (animates; does NOT fire on_change). */
+void ui_toggle_set(ui_widget_t* w, int on);
+
+/*
+ * Indeterminate spinner (rotating arc), continuous -- shown while connecting.
+ *   x, y -- top-left relative to parent, in pixels.
+ *   size -- diameter in pixels (pre-scale).
+ * Animates on its own every frame from the toolkit clock (no app code needed).
+ */
+ui_widget_t* ui_spinner(ui_widget_t* parent, int x, int y, int size);
+
+/*
+ * 4-bar WiFi signal-strength meter.
+ *   x, y       -- top-left relative to parent, in pixels.
+ *   strength   -- 0..4 active bars (clamped).
+ * Bars animate growing in (height eases up) when strength is (re)set.
+ * Fixed size 24x16 (pre-scale).
+ */
+ui_widget_t* ui_signal_bars(ui_widget_t* parent, int x, int y, int strength);
+
+/* Set the active bar count (0..4 clamped); re-triggers the grow-in animation. */
+void ui_signal_bars_set(ui_widget_t* w, int strength);
+
+/*
+ * Selectable list row with an animated hover tint + selected accent bar.
+ *   x, y, w, h -- position and size, in pixels.
+ *   text       -- left-aligned caption (copied, truncated).
+ *   on_click   -- called on a left-button press inside the row (may be NULL).
+ *   ud         -- opaque user data forwarded to on_click.
+ * Click marks the row selected (a thin accent bar on the left + a tint); use
+ * ui_list_row_selected()/ui_list_row_set_selected() to read/drive selection.
+ */
+ui_widget_t* ui_list_row(ui_widget_t* parent, int x, int y, int w, int h,
+                         const char* text, void (*on_click)(void* ud), void* ud);
+
+/* Read whether a list row is currently selected (0/1). */
+int ui_list_row_selected(ui_widget_t* w);
+
+/* Set a list row's selected flag programmatically (does NOT fire on_click). */
+void ui_list_row_set_selected(ui_widget_t* w, int sel);
+
+/*
+ * Toggle password-mask rendering on an existing UI_TEXTBOX. When mask != 0 the
+ * textbox draws a dot per character instead of the glyph (for a WiFi passphrase
+ * field). Purely additive to the textbox render -- no effect unless set.
+ */
+void ui_textbox_set_mask(ui_widget_t* w, int mask);
+
 #endif /* UI_H */

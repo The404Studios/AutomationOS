@@ -16,6 +16,25 @@
  * built once by the app, then rendered every frame by ui_app_run().
  */
 
+/*
+ * NO-FLOAT / NO-XMM GATE (v3): at -O2 the GCC tree/SLP vectorizer turns the
+ * toolkit per-pixel fills and struct/array zeroing into INTEGER SSE
+ * (pxor, movdqa, pshufd, movaps over xmm). That is NOT floating point -- there
+ * is no movss, movsd, cvt or x87 anywhere, and the freestanding ABI is
+ * unaffected. We disable ONLY the auto-vectorizer for this TU so objdump shows
+ * zero xmm; all integer arithmetic + every existing widget render is
+ * byte-identical (this changes instruction selection, never logic).
+ *
+ * IMPORTANT: we must NOT also let -O2 loop-distribute-patterns turn the
+ * toolkit hand-rolled ui_strlen/ui_memset loops into calls to libc strlen/
+ * memset (this freestanding lib links no libc). With the vectorizer ON, GCC
+ * keeps those loops inline; with it OFF it would synthesize the libc calls, so
+ * we ALSO pin -fno-tree-loop-distribute-patterns to keep them inline. Together
+ * these two pragmas give: 0 xmm, 0 undefined libc refs, identical behavior.
+ */
+#pragma GCC optimize("no-tree-vectorize")
+#pragma GCC optimize("no-tree-loop-distribute-patterns")
+
 #include "ui.h"
 #include "../wl/wl_client.h"
 #include "../font/bitfont.h"
@@ -98,6 +117,104 @@ static i32 ui_clamp(i32 v, i32 lo, i32 hi) {
     return v;
 }
 
+/* =========================================================================
+ * INTEGER (Q8) EASING + SINE  -- copied from compositor_m8.c.
+ * Input/output are Q8 in [0,256]. NO FLOAT (the #1 correctness gate): all
+ * cubics use a single 64-bit multiply chain, the same as the compositor.
+ * =========================================================================
+ */
+static inline i32 clamp256(i32 t) { return t < 0 ? 0 : (t > 256 ? 256 : t); }
+
+/* ease_out_cubic(t) = 1 - (1-t)^3   (Q8 in, Q8 out) */
+static i32 ease_out_cubic(i32 t) {
+    t = clamp256(t);
+    i32 u  = 256 - t;                                   /* (1-t) in Q8 */
+    i32 u3 = (i32)(((long long)u * u * u) >> 16);       /* u^3 -> Q8   */
+    return clamp256(256 - u3);
+}
+
+/* ease_in_cubic(t) = t^3   (Q8 in, Q8 out) -- kept for parity / future use.
+ * __attribute__((unused)): part of the spec-requested easing set copied from the
+ * compositor; not every curve is wired to a widget yet, so silence -Wall. */
+__attribute__((unused))
+static i32 ease_in_cubic(i32 t) {
+    t = clamp256(t);
+    return clamp256((i32)(((long long)t * t * t) >> 16));
+}
+
+/* ease_in_out_cubic: <0.5 -> 4t^3, else 1 - (-2t+2)^3 / 2  (Q8). */
+__attribute__((unused))
+static i32 ease_in_out_cubic(i32 t) {
+    t = clamp256(t);
+    if (t < 128) {
+        i32 t3 = (i32)(((long long)t * t * t) >> 16);
+        return clamp256(t3 << 2);
+    } else {
+        i32 u  = 2 * (256 - t);
+        i32 u3 = (i32)(((long long)u * u * u) >> 16);
+        return clamp256(256 - (u3 >> 1));
+    }
+}
+
+/* Fixed-point sine: sin_q(deg) -> Q8 signed (-256..256). Quarter-wave table
+ * (0..90 deg, 5-deg step) + quadrant symmetry + linear interp. NO LIBM. */
+static const i32 UI_SINQ_TBL[19] = {  /* sin(0..90 by 5 deg) * 256 */
+      0,  22,  44,  66,  88, 109, 128, 147, 165, 181,
+    196, 209, 221, 231, 240, 247, 252, 255, 256
+};
+static i32 sin_q(i32 deg) {
+    deg %= 360;
+    if (deg < 0) deg += 360;
+    int sign = 1;
+    if (deg >= 180) { deg -= 180; sign = -1; }
+    if (deg > 90) deg = 180 - deg;
+    i32 i    = deg / 5;
+    i32 frac = deg - i * 5;                  /* 0..4 */
+    i32 a    = UI_SINQ_TBL[i];
+    i32 b    = UI_SINQ_TBL[i + 1];
+    i32 v    = a + (b - a) * frac / 5;
+    return sign * v;
+}
+static i32 cos_q(i32 deg) { return sin_q(deg + 90); }
+
+/* =========================================================================
+ * PUBLIC ANIMATION LAYER (ui_anim_t)
+ * =========================================================================
+ */
+int ui_now_ms(void) {
+    return (int)sc(SYS_GET_TICKS_MS, 0, 0, 0);
+}
+
+void ui_anim_start(ui_anim_t* a, int from, int to, int dur_ms) {
+    if (!a) return;
+    a->start_ms = ui_now_ms();
+    a->dur_ms   = dur_ms < 0 ? 0 : dur_ms;
+    a->from     = from;
+    a->to       = to;
+    a->active   = 1;
+}
+
+int ui_anim_value(ui_anim_t* a, int now_ms) {
+    if (!a) return 0;
+    if (!a->active || a->dur_ms <= 0) return a->to;
+    int elapsed = now_ms - a->start_ms;
+    if (elapsed <= 0) return a->from;
+    if (elapsed >= a->dur_ms) { a->active = 0; return a->to; }
+    /* t in Q8 = elapsed/dur * 256, eased, then lerp from->to. */
+    i32 t      = (i32)(((long long)elapsed << 8) / a->dur_ms);
+    i32 e      = ease_out_cubic(t);                       /* 0..256 Q8 */
+    int span   = a->to - a->from;
+    int v      = a->from + (int)(((long long)span * e) >> 8);
+    return v;
+}
+
+int ui_anim_done(ui_anim_t* a, int now_ms) {
+    if (!a) return 1;
+    if (!a->active) return 1;
+    if (a->dur_ms <= 0) return 1;
+    return (now_ms - a->start_ms) >= a->dur_ms;
+}
+
 /* ---- serial diagnostics (fd 1) ---- */
 static void ui_log(const char* m) {
     sc(SYS_WRITE, 1, (long)m, (long)ui_strlen(m));
@@ -121,6 +238,15 @@ static void ui_log(const char* m) {
 #define COL_PROG_BG     0xFF38383Au   /* progress track         */
 #define COL_PROG_FILL   0xFF30D158u   /* progress fill (green)  */
 #define COL_SCROLL_BAR  0xFF48484Au   /* scrollbar thumb        */
+
+/* v3 animated-widget palette */
+#define COL_TOGGLE_OFF  0xFF3A3A3Cu   /* toggle track when off  */
+#define COL_TOGGLE_ON   0xFF30D158u   /* toggle track when on   */
+#define COL_TOGGLE_KNOB 0xFFFFFFFFu   /* toggle knob            */
+#define COL_SPINNER     0xFF0A84FFu   /* spinner arc accent     */
+#define COL_BARS_ON     0xFF0A84FFu   /* active signal bar      */
+#define COL_BARS_OFF    0xFF38383Au   /* inactive signal bar    */
+#define COL_ROW_SEL     0xFF0A84FFu   /* list-row selected accent */
 
 /* ---- widget model ---- */
 
@@ -169,7 +295,12 @@ typedef enum {
     UI_TEXTBOX,
     UI_PROGRESS,
     UI_IMAGE_RECT,
-    UI_SCROLL
+    UI_SCROLL,
+    /* v3 animated additions (appended -- existing values are unchanged) */
+    UI_TOGGLE,
+    UI_SPINNER,
+    UI_SIGNAL_BARS,
+    UI_LIST_ROW
 } ui_kind_t;
 
 struct ui_widget {
@@ -227,6 +358,25 @@ struct ui_widget {
     int          sc_dragging;               /* dragging scrollbar?        */
     i32          sc_drag_start_y;           /* cursor Y when drag started */
     i32          sc_drag_start_off;         /* offset when drag started   */
+
+    /* ---- v3 animated widgets (additive) ---- */
+
+    /* UI_TOGGLE */
+    int          tg_on;                      /* 0 / 1                     */
+    ui_anim_t    tg_anim;                    /* knob slide (0..256 Q8)    */
+    void       (*tg_on_change)(int state, void* ud);
+
+    /* UI_SIGNAL_BARS */
+    int          sg_strength;                /* 0..4 active bars          */
+    ui_anim_t    sg_anim;                    /* grow-in (0..256 Q8)       */
+
+    /* UI_LIST_ROW */
+    int          lr_selected;                /* 0 / 1                     */
+    ui_anim_t    lr_hover;                   /* hover tint (0..256 Q8)    */
+    int          lr_hover_prev;              /* last hover state for edge */
+
+    /* UI_TEXTBOX -- extra: password mask (additive to the textbox state) */
+    int          tb_mask;                    /* 1 => render dots          */
 };
 
 struct ui_app {
@@ -635,6 +785,135 @@ void ui_scroll_set_offset(ui_widget_t* w, int offset) {
 }
 
 /* =========================================================================
+ * NEW ANIMATED WIDGET CONSTRUCTORS (v3, additive)
+ * =========================================================================
+ */
+
+/* --- Textbox password mask (additive flag on UI_TEXTBOX) --- */
+
+void ui_textbox_set_mask(ui_widget_t* w, int mask) {
+    if (!w || w->kind != UI_TEXTBOX) return;
+    w->tb_mask = mask ? 1 : 0;
+}
+
+/* --- Toggle (iOS-style switch) --- */
+
+#define UI_TOGGLE_W  44
+#define UI_TOGGLE_H  24
+
+ui_widget_t* ui_toggle(ui_widget_t* parent, int x, int y, int on,
+                       void (*on_change)(int state, void* ud), void* ud) {
+    if (!parent) return 0;
+    ui_widget_t* tg = widget_alloc();
+    if (!tg) return 0;
+    tg->kind         = UI_TOGGLE;
+    tg->bg           = COL_TOGGLE_OFF;
+    tg->fg           = COL_TOGGLE_KNOB;
+    tg->tg_on        = on ? 1 : 0;
+    tg->tg_on_change = on_change;
+    tg->ud           = ud;
+    /* Knob position is a Q8 value 0 (off/left) .. 256 (on/right). */
+    ui_anim_start(&tg->tg_anim, tg->tg_on ? 256 : 0, tg->tg_on ? 256 : 0, 0);
+    if (attach_child(parent, tg, x, y, UI_TOGGLE_W, UI_TOGGLE_H) != 0) {
+        tg->used = 0;
+        return 0;
+    }
+    return tg;
+}
+
+int ui_toggle_on(ui_widget_t* w) {
+    if (!w || w->kind != UI_TOGGLE) return 0;
+    return w->tg_on;
+}
+
+void ui_toggle_set(ui_widget_t* w, int on) {
+    if (!w || w->kind != UI_TOGGLE) return;
+    int nv = on ? 1 : 0;
+    if (nv == w->tg_on) return;
+    /* animate the knob from its CURRENT eased position to the new end. */
+    int cur = ui_anim_value(&w->tg_anim, ui_now_ms());
+    w->tg_on = nv;
+    ui_anim_start(&w->tg_anim, cur, nv ? 256 : 0, 180);
+}
+
+/* --- Spinner (rotating arc, continuous) --- */
+
+ui_widget_t* ui_spinner(ui_widget_t* parent, int x, int y, int size) {
+    if (!parent) return 0;
+    if (size < 8) size = 8;
+    ui_widget_t* sp = widget_alloc();
+    if (!sp) return 0;
+    sp->kind = UI_SPINNER;
+    sp->bg   = 0;                 /* no fill -- draws on whatever is under */
+    sp->fg   = COL_SPINNER;
+    if (attach_child(parent, sp, x, y, size, size) != 0) {
+        sp->used = 0;
+        return 0;
+    }
+    return sp;
+}
+
+/* --- Signal bars (4-bar WiFi strength meter) --- */
+
+#define UI_BARS_W  24
+#define UI_BARS_H  16
+
+ui_widget_t* ui_signal_bars(ui_widget_t* parent, int x, int y, int strength) {
+    if (!parent) return 0;
+    ui_widget_t* sg = widget_alloc();
+    if (!sg) return 0;
+    sg->kind        = UI_SIGNAL_BARS;
+    sg->bg          = 0;
+    sg->fg          = COL_BARS_ON;
+    sg->sg_strength = ui_clamp(strength, 0, 4);
+    ui_anim_start(&sg->sg_anim, 0, 256, 320);   /* grow-in on create */
+    if (attach_child(parent, sg, x, y, UI_BARS_W, UI_BARS_H) != 0) {
+        sg->used = 0;
+        return 0;
+    }
+    return sg;
+}
+
+void ui_signal_bars_set(ui_widget_t* w, int strength) {
+    if (!w || w->kind != UI_SIGNAL_BARS) return;
+    w->sg_strength = ui_clamp(strength, 0, 4);
+    ui_anim_start(&w->sg_anim, 0, 256, 320);    /* re-trigger grow-in */
+}
+
+/* --- List row (selectable, animated hover tint) --- */
+
+ui_widget_t* ui_list_row(ui_widget_t* parent, int x, int y, int w, int h,
+                         const char* text, void (*on_click)(void* ud), void* ud) {
+    if (!parent) return 0;
+    ui_widget_t* lr = widget_alloc();
+    if (!lr) return 0;
+    lr->kind     = UI_LIST_ROW;
+    lr->bg       = COL_SURFACE;
+    lr->fg       = COL_TEXT;
+    lr->on_click = on_click;
+    lr->ud       = ud;
+    lr->lr_selected  = 0;
+    lr->lr_hover_prev = 0;
+    ui_strlcpy(lr->text, text, UI_TEXT_CAP);
+    ui_anim_start(&lr->lr_hover, 0, 0, 0);      /* settled at 0 (no tint) */
+    if (attach_child(parent, lr, x, y, w, h) != 0) {
+        lr->used = 0;
+        return 0;
+    }
+    return lr;
+}
+
+int ui_list_row_selected(ui_widget_t* w) {
+    if (!w || w->kind != UI_LIST_ROW) return 0;
+    return w->lr_selected;
+}
+
+void ui_list_row_set_selected(ui_widget_t* w, int sel) {
+    if (!w || w->kind != UI_LIST_ROW) return;
+    w->lr_selected = sel ? 1 : 0;
+}
+
+/* =========================================================================
  * RENDERING
  * =========================================================================
  */
@@ -700,6 +979,164 @@ static void stroke_rect(u32* buf, i32 bw, i32 bh, i32 stride_px,
     fill_rect(buf, bw, bh, stride_px, x,         y + h - 1, w, 1, color);
     fill_rect(buf, bw, bh, stride_px, x,         y,         1, h, color);
     fill_rect(buf, bw, bh, stride_px, x + w - 1, y,         1, h, color);
+}
+
+/* =========================================================================
+ * v3 ALPHA-AWARE DRAWING PRIMITIVES (additive; mirror compositor_m8.c).
+ * Integer-only Q8 alpha-over. These do NOT change the existing fill_rect /
+ * fill_round_rect / stroke_rect or any existing widget render.
+ * =========================================================================
+ */
+
+/* Alpha-over a single src pixel onto dst using src's 0..255 A channel.
+ * Mirrors compositor blend_pixel(); returns an opaque (0xFF) result. */
+static inline u32 ui_blend_pixel(u32 src, u32 dst) {
+    u32 a = (src >> 24) & 0xFFu;
+    if (a == 0xFFu) return 0xFF000000u | (src & 0x00FFFFFFu);
+    if (a == 0u)    return dst;
+    u32 sr = (src >> 16) & 0xFFu, sg = (src >> 8) & 0xFFu, sb = src & 0xFFu;
+    u32 dr = (dst >> 16) & 0xFFu, dg = (dst >> 8) & 0xFFu, db = dst & 0xFFu;
+    u32 ia = 255u - a;
+    u32 r = (sr * a + dr * ia) / 255u;
+    u32 g = (sg * a + dg * ia) / 255u;
+    u32 b = (sb * a + db * ia) / 255u;
+    return 0xFF000000u | (r << 16) | (g << 8) | b;
+}
+
+/* Alpha-over an opaque-RGB src onto dst with an explicit Q8 alpha (0..256).
+ * Mirrors compositor blend_pixel_a256() exactly. */
+static inline u32 ui_blend_a256(u32 src, u32 dst, u32 a256) {
+    if (a256 >= 256u) return 0xFF000000u | (src & 0x00FFFFFFu);
+    if (a256 == 0u)   return dst;
+    u32 sr = (src >> 16) & 0xFFu, sg = (src >> 8) & 0xFFu, sb = src & 0xFFu;
+    u32 dr = (dst >> 16) & 0xFFu, dg = (dst >> 8) & 0xFFu, db = dst & 0xFFu;
+    u32 ia = 256u - a256;
+    u32 r = (sr * a256 + dr * ia) >> 8;
+    u32 g = (sg * a256 + dg * ia) >> 8;
+    u32 b = (sb * a256 + db * ia) >> 8;
+    return 0xFF000000u | (r << 16) | (g << 8) | b;
+}
+
+/* Per-pixel alpha-over fill: blends `argb` (using its A channel) over the
+ * existing buffer contents. Clipped like fill_rect. (The file-scope
+ * no-tree-vectorize pragma keeps this hot per-pixel loop scalar / xmm-free.) */
+static void blend_rect(u32* buf, i32 bw, i32 bh, i32 stride_px,
+                       i32 x, i32 y, i32 w, i32 h, u32 argb) {
+    i32 x1 = x < 0 ? 0 : x;
+    i32 y1 = y < 0 ? 0 : y;
+    i32 x2 = x + w;
+    i32 y2 = y + h;
+    if (x2 > bw) x2 = bw;
+    if (y2 > bh) y2 = bh;
+    if (x1 >= x2 || y1 >= y2) return;
+    for (i32 yy = y1; yy < y2; yy++) {
+        u32* row = buf + (u32)yy * (u32)stride_px;
+        for (i32 xx = x1; xx < x2; xx++) row[xx] = ui_blend_pixel(argb, row[xx]);
+    }
+}
+
+/* Vertical gradient: per-row integer lerp of R/G/B from top_argb to bottom_argb.
+ * Opaque output (alpha forced to 0xFF). Clipped like fill_rect. */
+static void fill_grad_v(u32* buf, i32 bw, i32 bh, i32 stride_px,
+                        i32 x, i32 y, i32 w, i32 h,
+                        u32 top_argb, u32 bottom_argb) {
+    if (w <= 0 || h <= 0) return;
+    i32 tr = (i32)((top_argb >> 16) & 0xFFu);
+    i32 tg = (i32)((top_argb >> 8)  & 0xFFu);
+    i32 tb = (i32)(top_argb & 0xFFu);
+    i32 br = (i32)((bottom_argb >> 16) & 0xFFu);
+    i32 bg = (i32)((bottom_argb >> 8)  & 0xFFu);
+    i32 bb = (i32)(bottom_argb & 0xFFu);
+    i32 den = h > 1 ? h - 1 : 1;
+    for (i32 ry = 0; ry < h; ry++) {
+        /* signed deltas so a descending channel doesn't wrap */
+        i32 r = tr + (br - tr) * ry / den;
+        i32 g = tg + (bg - tg) * ry / den;
+        i32 b = tb + (bb - tb) * ry / den;
+        u32 row_col = 0xFF000000u | ((u32)r << 16) | ((u32)g << 8) | (u32)b;
+        fill_rect(buf, bw, bh, stride_px, x, y + ry, w, 1, row_col);
+    }
+}
+
+/* True rounded-rect fill: interior is opaque `argb`; the 1px corner boundary is
+ * blended ~50% so the edge reads smooth on ANY backdrop (no window-bg notch
+ * hack). For each corner box, dx*dx+dy*dy is compared against r*r:
+ *   inside  (d2 <= rr-band) -> opaque;  boundary -> 50% blend;  outside -> skip.
+ * Keeps the original fill_round_rect() untouched. */
+static void fill_round_rect_r(u32* buf, i32 bw, i32 bh, i32 stride_px,
+                              i32 x, i32 y, i32 w, i32 h, i32 radius, u32 argb) {
+    if (w <= 0 || h <= 0) return;
+    i32 r = radius;
+    if (r < 1) { fill_rect(buf, bw, bh, stride_px, x, y, w, h, argb); return; }
+    if (r > w / 2) r = w / 2;
+    if (r > h / 2) r = h / 2;
+    if (r < 1)     { fill_rect(buf, bw, bh, stride_px, x, y, w, h, argb); return; }
+
+    u32 edge = (argb & 0x00FFFFFFu) | 0x80000000u;   /* same RGB, ~50% alpha */
+    i32 rr   = r * r;
+
+    /* Middle band (full width, between the two corner rows): plain opaque. */
+    fill_rect(buf, bw, bh, stride_px, x, y + r, w, h - 2 * r, argb);
+
+    /* Top + bottom corner rows: opaque center span + rounded ends per row. */
+    for (i32 ry = 0; ry < r; ry++) {
+        /* distance of this row's pixel from the corner's circle center.
+         * Corner circle center is at (x+r, y+r) [top-left], dy = r-1-ry. */
+        i32 dy  = (r - 1) - ry;
+        i32 dy2 = dy * dy;
+
+        /* For each column within the corner box, decide opaque/edge/skip. */
+        /* TOP row band at buffer y = y+ry ; BOTTOM at y = y+h-1-ry. */
+        i32 top_y = y + ry;
+        i32 bot_y = y + h - 1 - ry;
+
+        /* Opaque center span (between the two corner boxes) for these rows. */
+        fill_rect(buf, bw, bh, stride_px, x + r, top_y, w - 2 * r, 1, argb);
+        fill_rect(buf, bw, bh, stride_px, x + r, bot_y, w - 2 * r, 1, argb);
+
+        for (i32 cx = 0; cx < r; cx++) {
+            i32 dx  = (r - 1) - cx;       /* distance into the left corner */
+            i32 d2  = dx * dx + dy2;
+            u32 col;
+            if (d2 <= rr - r)       col = argb;     /* well inside  -> opaque */
+            else if (d2 <= rr + r)  col = edge;     /* on boundary  -> 50%    */
+            else                    continue;       /* outside      -> skip   */
+            /* left + right mirrors, top + bottom mirrors (4 corners) */
+            i32 lx = x + cx;
+            i32 rx = x + w - 1 - cx;
+            if (col == argb) {
+                fill_rect (buf, bw, bh, stride_px, lx, top_y, 1, 1, col);
+                fill_rect (buf, bw, bh, stride_px, rx, top_y, 1, 1, col);
+                fill_rect (buf, bw, bh, stride_px, lx, bot_y, 1, 1, col);
+                fill_rect (buf, bw, bh, stride_px, rx, bot_y, 1, 1, col);
+            } else {
+                blend_rect(buf, bw, bh, stride_px, lx, top_y, 1, 1, col);
+                blend_rect(buf, bw, bh, stride_px, rx, top_y, 1, 1, col);
+                blend_rect(buf, bw, bh, stride_px, lx, bot_y, 1, 1, col);
+                blend_rect(buf, bw, bh, stride_px, rx, bot_y, 1, 1, col);
+            }
+        }
+    }
+}
+
+/* Soft drop shadow: a few decreasing-alpha black blend passes, each offset
+ * further down-right, to fake a 2-4px blurred shadow under a card. Draw this
+ * BEFORE the card so the card paints on top. radius widens the offsets. */
+static void draw_shadow(u32* buf, i32 bw, i32 bh, i32 stride_px,
+                        i32 x, i32 y, i32 w, i32 h, i32 radius) {
+    if (w <= 0 || h <= 0) return;
+    i32 spread = radius < 2 ? 2 : (radius > 4 ? 4 : radius);
+    /* Decreasing-alpha black, growing offset: outer passes are faintest. */
+    static const u32 ALPHA[4] = { 0x10u, 0x18u, 0x28u, 0x40u };
+    for (i32 p = spread; p >= 1; p--) {
+        u32 a   = ALPHA[p - 1];
+        u32 col = (a << 24);                 /* black with this alpha */
+        i32 off = p;                          /* down-right offset      */
+        i32 grow = p;                         /* slight outward grow    */
+        blend_rect(buf, bw, bh, stride_px,
+                   x - grow + off, y - grow + off,
+                   w + 2 * grow, h + 2 * grow, col);
+    }
 }
 
 static int point_in(const ui_widget_t* w, i32 px, i32 py) {
@@ -868,8 +1305,20 @@ static void render_widget(ui_app_t* app, ui_widget_t* w) {
         i32 cx = w->ax + UI_S(4);
         i32 cw = w->aw - UI_S(8);
         if (cw > 0) {
+            const char* shown = w->tb_buf;
+            /* tb_mask (additive): render a dot per char (passphrase field). The
+             * non-masked path is byte-identical to before -- only when the flag
+             * is set do we build a transient '*' string of the same length. */
+            char masked[UI_TEXTBOX_MAXBUF];
+            if (w->tb_mask) {
+                unsigned long n = ui_strlen(w->tb_buf);
+                if (n >= UI_TEXTBOX_MAXBUF) n = UI_TEXTBOX_MAXBUF - 1;
+                for (unsigned long mi = 0; mi < n; mi++) masked[mi] = '*';
+                masked[n] = '\0';
+                shown = masked;
+            }
             font2_draw_cell_clip(buf, sp, bw, bh, cx, cx + cw,
-                                 cx, ty, w->tb_buf, g_ui_cw, g_ui_ch, w->fg);
+                                 cx, ty, shown, g_ui_cw, g_ui_ch, w->fg);
         }
 
         /* Blinking caret when focused */
@@ -961,6 +1410,121 @@ static void render_widget(ui_app_t* app, ui_widget_t* w) {
         return;
     }
 
+    /* ---- v3 animated widget drawing ---- */
+
+    case UI_TOGGLE: {
+        int now = ui_now_ms();
+        i32 knob_q = ui_anim_value(&w->tg_anim, now);   /* 0..256 Q8 */
+        /* Track: lerp between off + on color by knob position (smooth fill). */
+        u32 track = ui_blend_a256(COL_TOGGLE_ON, COL_TOGGLE_OFF, (u32)knob_q);
+        i32 rad = w->ah / 2;
+        fill_round_rect_r(buf, bw, bh, sp, w->ax, w->ay, w->aw, w->ah, rad, track);
+        /* Subtle top-down sheen on the track (slightly lighter at top). */
+        {
+            u32 sheen_top = (track & 0x00FFFFFFu) | 0x22000000u;  /* +light  */
+            u32 sheen_bot = (track & 0x00FFFFFFu) | 0x00000000u;  /* nothing */
+            (void)sheen_bot;
+            blend_rect(buf, bw, bh, sp, w->ax + rad, w->ay,
+                       w->aw - 2 * rad, w->ah / 3, sheen_top);
+        }
+
+        /* Knob: a circle that slides left<->right with the Q8 position, with a
+         * soft drop shadow beneath it for depth. */
+        i32 pad      = UI_S(2);
+        i32 ksz      = w->ah - pad * 2;
+        i32 travel   = w->aw - pad * 2 - ksz;
+        i32 kx       = w->ax + pad + (travel * knob_q) / 256;
+        i32 ky       = w->ay + pad;
+        draw_shadow(buf, bw, bh, sp, kx, ky, ksz, ksz, 2);
+        fill_round_rect_r(buf, bw, bh, sp, kx, ky, ksz, ksz, ksz / 2, COL_TOGGLE_KNOB);
+        break;
+    }
+
+    case UI_SPINNER: {
+        /* Continuous rotating arc: a ring of dots whose alpha trails the head.
+         * Phase advances with the millisecond clock (no app tick needed). */
+        int now   = ui_now_ms();
+        i32 cx     = w->ax + w->aw / 2;
+        i32 cy     = w->ay + w->ah / 2;
+        i32 radius = (w->aw < w->ah ? w->aw : w->ah) / 2 - UI_S(2);
+        if (radius < 2) radius = 2;
+        i32 head  = (now / 4) % 360;          /* rotate ~90 deg / s */
+        i32 dot   = UI_S(2);
+        if (dot < 1) dot = 1;
+        /* 12 dots around the circle; brightness fades behind the head. */
+        for (int k = 0; k < 12; k++) {
+            i32 ang  = head - k * 30;
+            i32 px   = cx + (radius * cos_q(ang)) / 256;
+            i32 py   = cy + (radius * sin_q(ang)) / 256;
+            u32 a256 = (u32)(256 - k * 20);   /* trailing fade */
+            if ((i32)a256 < 32) a256 = 32;
+            u32 col  = (w->fg & 0x00FFFFFFu) | ((a256 > 255 ? 255u : a256) << 24);
+            blend_rect(buf, bw, bh, sp, px - dot / 2, py - dot / 2, dot, dot, col);
+        }
+        break;
+    }
+
+    case UI_SIGNAL_BARS: {
+        int now    = ui_now_ms();
+        i32 grow   = ui_anim_value(&w->sg_anim, now);   /* 0..256 Q8 */
+        i32 nbars  = 4;
+        i32 gap    = UI_S(2);
+        i32 total_gap = gap * (nbars - 1);
+        i32 bw_each = (w->aw - total_gap) / nbars;
+        if (bw_each < 1) bw_each = 1;
+        for (i32 k = 0; k < nbars; k++) {
+            /* Each bar's full height steps up; animated height eases in. */
+            i32 full_h = (w->ah * (k + 1)) / nbars;
+            i32 cur_h  = (full_h * grow) / 256;
+            if (cur_h < 1) cur_h = 1;
+            i32 bx = w->ax + k * (bw_each + gap);
+            i32 by = w->ay + w->ah - cur_h;
+            u32 col = (k < w->sg_strength) ? COL_BARS_ON : COL_BARS_OFF;
+            fill_round_rect_r(buf, bw, bh, sp, bx, by, bw_each, cur_h, UI_S(1), col);
+        }
+        break;
+    }
+
+    case UI_LIST_ROW: {
+        int now = ui_now_ms();
+        /* Animate the hover tint toward target on hover-state edges. */
+        if (hovered != w->lr_hover_prev) {
+            int cur = ui_anim_value(&w->lr_hover, now);
+            ui_anim_start(&w->lr_hover, cur, hovered ? 256 : 0, 140);
+            w->lr_hover_prev = hovered;
+        }
+        i32 tint = ui_anim_value(&w->lr_hover, now);    /* 0..256 Q8 */
+
+        /* Base fill: a subtle top->bottom gradient (slightly darker at the
+         * bottom) so stacked rows read as distinct cards. Then blend a hover
+         * tint, then the selected accent. */
+        {
+            u32 g_top = w->bg;
+            u32 r0 = (w->bg >> 16) & 0xFFu, g0 = (w->bg >> 8) & 0xFFu, b0 = w->bg & 0xFFu;
+            r0 = r0 > 8 ? r0 - 8 : 0; g0 = g0 > 8 ? g0 - 8 : 0; b0 = b0 > 8 ? b0 - 8 : 0;
+            u32 g_bot = 0xFF000000u | (r0 << 16) | (g0 << 8) | b0;
+            fill_grad_v(buf, bw, bh, sp, w->ax, w->ay, w->aw, w->ah, g_top, g_bot);
+        }
+        if (tint > 0) {
+            u32 tcol = (COL_HOVER & 0x00FFFFFFu) | ((u32)tint << 24);
+            blend_rect(buf, bw, bh, sp, w->ax, w->ay, w->aw, w->ah, tcol);
+        }
+        if (w->lr_selected) {
+            /* thin accent bar on the left edge + a faint accent wash */
+            fill_rect(buf, bw, bh, sp, w->ax, w->ay, UI_S(3), w->ah, COL_ROW_SEL);
+            u32 wash = (COL_ROW_SEL & 0x00FFFFFFu) | 0x30000000u;
+            blend_rect(buf, bw, bh, sp, w->ax, w->ay, w->aw, w->ah, wash);
+        }
+
+        /* Caption (vertically centered, small left inset). */
+        if (w->text[0]) {
+            i32 ty = w->ay + (w->ah - g_ui_ch) / 2;
+            i32 tx = w->ax + UI_S(8);
+            ui_text(buf, sp, bw, bh, tx, ty, w->text, w->fg);
+        }
+        break;
+    }
+
     } /* end switch */
 
     for (int i = 0; i < w->nchildren; i++)
@@ -1008,6 +1572,20 @@ static int dispatch_click(ui_app_t* app, ui_widget_t* w, i32 px, i32 py) {
     case UI_CHECKBOX:
         w->checked ^= 1;
         if (w->on_toggle) w->on_toggle(w->checked, w->ud);
+        return 1;
+
+    case UI_TOGGLE: {
+        /* Flip state, animate the knob, fire on_change. */
+        int cur = ui_anim_value(&w->tg_anim, ui_now_ms());
+        w->tg_on ^= 1;
+        ui_anim_start(&w->tg_anim, cur, w->tg_on ? 256 : 0, 180);
+        if (w->tg_on_change) w->tg_on_change(w->tg_on, w->ud);
+        return 1;
+    }
+
+    case UI_LIST_ROW:
+        w->lr_selected = 1;
+        if (w->on_click) w->on_click(w->ud);
         return 1;
 
     case UI_TEXTBOX:

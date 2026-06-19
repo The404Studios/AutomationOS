@@ -179,9 +179,20 @@ typedef struct tls_conn {
     unsigned char srv_ec_pub[65];
     unsigned long srv_ec_pub_len;       /* 65 when present, else 0            */
 
-    /* leaf certificate DER kept for the chain validator (if linked). */
+    /* leaf certificate DER kept for the chain validator (if linked). This
+     * aliases chain_der[0]/chain_len[0] below for any code that reads it. */
     const unsigned char *leaf_der;
     unsigned long        leaf_der_len;
+
+    /* FULL server-sent certificate chain (leaf first, then intermediates), as
+     * parsed out of the Certificate handshake message. Pointers alias the
+     * handshake accumulator (valid only during the handshake). Passed to
+     * x509_verify_chain() so leaf->intermediate->root validation can succeed
+     * for real sites; chain_count is the number of valid entries. */
+#define TLS_MAX_CHAIN 8
+    const unsigned char *chain_der[TLS_MAX_CHAIN];
+    unsigned long        chain_len[TLS_MAX_CHAIN];
+    int                  chain_count;
 } tls_conn_t;
 
 /*

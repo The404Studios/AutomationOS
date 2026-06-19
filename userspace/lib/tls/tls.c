@@ -58,26 +58,30 @@
 #include "asn1.h"
 
 /*
- * OPTIONAL certificate-chain validator. If a tls/x509_verify.h providing
- *   int x509_verify_chain(const unsigned char* const* certs,
- *                         const unsigned long* lens, int ncerts,
- *                         const char* hostname);
- * (returning 0 when the chain is trusted) is linked in, we call it. We declare
- * it as a WEAK symbol so this object links cleanly even when no validator is
- * provided -- in that case the weak symbol is NULL and we skip the check and
- * leave the connection flagged unauthenticated. The header may also declare it;
- * a matching prototype is harmless.
+ * OPTIONAL certificate-chain validator (tls/x509_verify.h). When that module is
+ * linked in, x509_verify_chain() (returning 0 when the chain is trusted) is
+ * called below. We pull in its real 5-argument prototype from the header --
+ * critically, the 5th argument is the current time string `now_yyyymmddhhmmss`,
+ * which MUST be supplied or the validity-window check sees garbage and rejects
+ * every chain (the historical NET-TLS-TRUST-0 bug). We also mark the symbol WEAK
+ * here so this object links cleanly even when no validator is provided -- in
+ * that case the weak symbol is NULL and we skip the check, leaving the
+ * connection flagged encrypted-but-unauthenticated.
  */
+#include "x509_verify.h"
+
 __attribute__((weak))
 int x509_verify_chain(const unsigned char *const *certs,
                       const unsigned long *lens, int ncerts,
-                      const char *hostname);
+                      const char *hostname,
+                      const char *now_yyyymmddhhmmss);
 
 /* ======================================================================== *
  *  Syscall layer
  * ======================================================================== */
 
 #define SYS_YIELD      15
+#define SYS_GETTIME    42      /* fill a user rtc_time_t* with wall-clock time */
 #define SYS_RANDOM     43
 #define SYS_SEND       53
 #define SYS_RECV       54
@@ -110,6 +114,72 @@ static int sys_random(void *buf, unsigned long len) {
      * insist all bytes were produced when a count is reported. */
     if (r > 0 && (unsigned long)r != len) return TLS_ERR_CRYPTO;
     return 0;
+}
+
+/*
+ * Broken-down wall-clock time as filled by SYS_GETTIME. The kernel's
+ * rtc_time_t (kernel/include/rtc.h) is: uint16_t year; uint8_t month, day,
+ * hour, min, sec. We mirror that byte layout EXACTLY so copy_to_user writes the
+ * fields where we read them (year little-endian at offset 0, then five bytes).
+ * All fields are natural binary (not BCD) on return.
+ */
+typedef struct {
+    unsigned short year;   /* full 4-digit year, e.g. 2026 */
+    unsigned char  month;  /* 1..12 */
+    unsigned char  day;    /* 1..31 */
+    unsigned char  hour;   /* 0..23 */
+    unsigned char  min;    /* 0..59 */
+    unsigned char  sec;    /* 0..59 */
+} tls_rtc_time_t;
+
+/* Lowest plausible "now" if the RTC reads back a nonsense year (e.g. an
+ * unset/zeroed CMOS). Using a fixed lower bound keeps the validity-window
+ * checks meaningful (notBefore must be <= now) instead of feeding garbage; it
+ * NEVER weakens trust -- a verify failure still leaves cert_trusted == 0. This
+ * is a compiled-in floor near the project's current era. */
+#define TLS_NOW_FALLBACK "20260101000000"
+
+/*
+ * tls_build_now -- write the current UTC time as a 14-char "YYYYMMDDHHMMSS"
+ * string plus NUL into out[15], exactly the format check_now_format() in
+ * x509_verify.c requires. Reads the RTC via SYS_GETTIME; if that fails or the
+ * year is implausible (< 2020), falls back to a sane compiled-in lower bound so
+ * validity-window checks still function rather than passing garbage.
+ */
+static void tls_put2(char *p, unsigned int v) {      /* zero-padded 2 digits */
+    p[0] = (char)('0' + (v / 10) % 10);
+    p[1] = (char)('0' + v % 10);
+}
+static void tls_build_now(char out[15]) {
+    tls_rtc_time_t t;
+    /* zero the struct (mem_set is declared later in this file) */
+    {
+        unsigned char *z = (unsigned char *)&t;
+        for (unsigned long i = 0; i < sizeof t; i++) z[i] = 0;
+    }
+    long r = sc(SYS_GETTIME, (long)&t, 0, 0, 0, 0);
+
+    /* SYS_GETTIME returns 0 (ESUCCESS) on success; anything else => fall back.
+     * Also reject an implausible year so we never feed a bogus window check. */
+    if (r != 0 || t.year < 2020 || t.year > 9999 ||
+        t.month < 1 || t.month > 12 || t.day < 1 || t.day > 31 ||
+        t.hour > 23 || t.min > 59 || t.sec > 59) {
+        const char *fb = TLS_NOW_FALLBACK;          /* "YYYYMMDDHHMMSS" + NUL */
+        for (int i = 0; i < 15; i++) out[i] = fb[i];
+        return;
+    }
+
+    /* YYYY */
+    out[0] = (char)('0' + (t.year / 1000) % 10);
+    out[1] = (char)('0' + (t.year / 100)  % 10);
+    out[2] = (char)('0' + (t.year / 10)   % 10);
+    out[3] = (char)('0' +  t.year         % 10);
+    tls_put2(out + 4,  t.month);
+    tls_put2(out + 6,  t.day);
+    tls_put2(out + 8,  t.hour);
+    tls_put2(out + 10, t.min);
+    tls_put2(out + 12, t.sec);
+    out[14] = '\0';
 }
 
 /* ======================================================================== *
@@ -1047,30 +1117,56 @@ static int ec_spki_extract_p256(const unsigned char *der, unsigned long len,
 }
 
 /*
- * parse_certificate -- take the FIRST (leaf) certificate from the cert_list and
- * extract the server public key. For an RSA leaf we pull modulus+exponent via
+ * parse_certificate -- parse the WHOLE server Certificate handshake message,
+ * collecting every certificate DER (leaf first, then intermediates, in the
+ * leaf->root order the server sent) into c->chain_der[]/chain_len[], and
+ * extract the leaf's public key. For an RSA leaf we pull modulus+exponent via
  * x509_extract_pubkey(); for an EC leaf we pull the uncompressed P-256 point.
- * The leaf DER is also recorded so an OPTIONAL chain validator can be run.
  *
- * Certificate body layout:
+ * Certificate body layout (RFC 5246 7.4.2):
  *   certificate_list_len(3)
  *   [ cert_len(3) cert_der(cert_len) ]...
  *
- * NOTE: this extracts the key only. Proving the cert belongs to the host
- * (chain to a trusted root + name match) is x509_verify_chain()'s job; see
- * tls_client_connect() where it is (optionally) invoked.
+ * Every length is bounds-checked against the message buffer: this is
+ * attacker-controlled network data, so a malformed/oversized field must yield
+ * TLS_ERR_PROTO, never an out-of-bounds read. The full chain is passed to
+ * x509_verify_chain() in tls_client_connect(); without the intermediates almost
+ * no real (leaf->intermediate->root) site would validate.
  */
 static int parse_certificate(tls_conn_t *c, const unsigned char *b, unsigned int n) {
     if (n < 3) return TLS_ERR_PROTO;
     unsigned int list_len = get_u24(b);
-    if (3u + list_len > n) return TLS_ERR_PROTO;
+    if (3u + (unsigned long)list_len > n) return TLS_ERR_PROTO;
     if (list_len < 3) return TLS_ERR_PROTO;
-    unsigned int cert_len = get_u24(b + 3);
-    if (3u + 3u + cert_len > n) return TLS_ERR_PROTO;
-    const unsigned char *der = b + 6;
 
-    /* Keep a pointer to the leaf DER (lives in c->rbuf-derived hs buffer which
-     * persists through the handshake) for the optional chain validator. */
+    /* Walk the certificate_list, collecting up to TLS_MAX_CHAIN entries. The
+     * cursor `off` is relative to the start of the list (b + 3); `end` bounds
+     * it. All arithmetic is done in unsigned long to avoid 32-bit overflow. */
+    c->chain_count = 0;
+    const unsigned char *list = b + 3;
+    unsigned long end = list_len;        /* bytes available in the list region */
+    unsigned long off = 0;
+    while (off + 3u <= end) {
+        unsigned int clen = get_u24(list + off);
+        off += 3u;
+        if ((unsigned long)clen > end - off) return TLS_ERR_PROTO;  /* OOB guard */
+        if (clen == 0) return TLS_ERR_PROTO;
+        if (c->chain_count < TLS_MAX_CHAIN) {
+            c->chain_der[c->chain_count] = list + off;
+            c->chain_len[c->chain_count] = clen;
+            c->chain_count++;
+        }
+        /* Beyond TLS_MAX_CHAIN we stop collecting but keep parsing to validate
+         * the structure; an absurdly long chain we simply cap. */
+        off += clen;
+        if (c->chain_count >= TLS_MAX_CHAIN) break;
+    }
+    if (c->chain_count == 0) return TLS_ERR_PROTO;
+
+    /* The leaf is the first entry. Keep leaf_der/leaf_der_len working for any
+     * code that reads them. */
+    const unsigned char *der = c->chain_der[0];
+    unsigned int cert_len    = (unsigned int)c->chain_len[0];
     c->leaf_der     = der;
     c->leaf_der_len = cert_len;
     c->srv_ec_pub_len = 0;
@@ -1438,20 +1534,27 @@ int tls_client_connect(tls_conn_t *c, int tcp_fd, const char *server_name) {
      * the ephemeral params to the leaf cert's key, but proving the leaf cert
      * actually belongs to `server_name` and chains to a trusted root requires a
      * CA store -- delegated to x509_verify_chain() if that module is linked. We
-     * pass the LEAF only (single-element chain); a fuller implementation would
-     * collect the whole Certificate list. If the validator is absent (weak
+     * pass the FULL server-sent chain (leaf + intermediates, as collected in
+     * parse_certificate) plus the current UTC time, so leaf->intermediate->root
+     * validation can succeed for real sites. If the validator is absent (weak
      * symbol NULL) or rejects the chain, we flag the connection
-     * encrypted-but-UNAUTHENTICATED and continue. */
+     * encrypted-but-UNAUTHENTICATED and continue -- a verify FAILURE always
+     * leaves cert_trusted == 0 (we never default-trust). */
     c->cert_trusted = 0;
-    if (x509_verify_chain && c->leaf_der && c->leaf_der_len) {
-        const unsigned char *certs[1] = { c->leaf_der };
-        unsigned long       lens[1]  = { c->leaf_der_len };
-        if (x509_verify_chain(certs, lens, 1, server_name) == 0)
+    if (x509_verify_chain && c->chain_count > 0) {
+        char now[15];
+        tls_build_now(now);     /* "YYYYMMDDHHMMSS" + NUL, from the RTC */
+        if (x509_verify_chain(c->chain_der, c->chain_len, c->chain_count,
+                              server_name, now) == 0)
             c->cert_trusted = 1;
     }
-    /* leaf_der points into the handshake reader's stack buffer (valid only here);
-     * clear it so nothing dereferences a dangling pointer after we return. */
+    /* The chain pointers alias the handshake reader's buffer (valid only here);
+     * clear them so nothing dereferences a dangling pointer after we return. */
     c->leaf_der = 0; c->leaf_der_len = 0;
+    for (int ci = 0; ci < TLS_MAX_CHAIN; ci++) {
+        c->chain_der[ci] = 0; c->chain_len[ci] = 0;
+    }
+    c->chain_count = 0;
 
     /* ---- 3. ClientKeyExchange + premaster ---- */
     unsigned char premaster[48];

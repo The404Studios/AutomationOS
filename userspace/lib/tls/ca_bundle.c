@@ -10,25 +10,29 @@
  *   -fno-pic -fno-pie -mno-red-zone -mstackrealign -O2
  *
  * ================================================================
- * SECURITY NOTICE -- EMPTY TRUST STORE
+ * TRUST STORE -- 7 EMBEDDED ROOT CAs
  * ================================================================
- * This module ships with ZERO embedded root CA certificates.
+ * This module ships with 7 real, bit-perfect root CA certificates,
+ * compiled in from ca_roots_data.h (ISRG Root X1, GTS Root R1,
+ * DigiCert Global Root CA, DigiCert Global Root G2, GlobalSign Root CA,
+ * USERTrust RSA Certification Authority, Amazon Root CA 1). Together
+ * they anchor the large majority of public HTTPS certificates.
  *
- * An empty trust store means the TLS layer can ENCRYPT traffic (the
- * cipher suite, key exchange, and record encryption all work normally)
- * but CANNOT AUTHENTICATE the remote peer: every call to
- * x509_verify_chain() returns X509V_ERR_NO_ROOT, which maps to
- * cert_trusted == 0 in tls_conn_t, and tls_cert_trusted() returns 0.
+ * With these roots present the TLS layer can both ENCRYPT traffic and
+ * AUTHENTICATE the remote peer: x509_verify_chain() can chain a server
+ * certificate to one of these roots, set cert_trusted == 1 in
+ * tls_conn_t, and make tls_cert_trusted() return 1. A server whose
+ * chain does NOT anchor here yields X509V_ERR_NO_ROOT -> cert_trusted
+ * == 0 (encrypted-but-unauthenticated).
  *
  * Callers that display a "secure connection" indicator MUST gate it
  * on tls_cert_trusted() returning 1, not merely on the TLS handshake
  * completing.
  *
- * This is the deliberately safe default: an empty store with known
- * semantics (unauthenticated) is far preferable to a store populated
- * with fabricated or misremembered DER bytes, which would produce a
- * root that silently fails to match real server chains while giving a
- * false sense of security.
+ * Every embedded root is bit-exact DER obtained from an authoritative
+ * source via the openssl pipeline below -- never hand-typed -- because a
+ * single flipped bit produces a root that silently fails to match real
+ * server chains.
  *
  * TO POPULATE THE TRUST STORE
  * ----------------------------
@@ -44,11 +48,12 @@
  *   file or a kernel config block.
  * ================================================================
  *
- * EMBEDDED ROOTS: 0 (zero).
+ * EMBEDDED ROOTS: 7 (see ca_roots_data.h for the exact set).
  *   Reproducing multi-hundred-byte DER blobs from memory is unreliable;
  *   a single flipped bit produces a root that silently fails to match
- *   real server chains.  Use the openssl pipeline to obtain bit-perfect
- *   bytes from an authoritative source.
+ *   real server chains.  Each embedded root was obtained via the openssl
+ *   pipeline above to guarantee bit-perfect bytes from an authoritative
+ *   source.
  */
 
 #include "ca_bundle.h"

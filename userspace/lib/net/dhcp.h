@@ -12,13 +12,14 @@
  * inline syscalls plus a handful of static helpers and fixed-size buffers, the
  * same way userspace/lib/net/dns.c is.
  *
- * --- Transport notes (why it works without SYS_BIND) ---------------------
+ * --- Transport notes (how the OFFER/ACK reach us) ------------------------
  * DHCP normally is client UDP port 68 -> server UDP port 67 (broadcast), and
- * the server replies to the client's port 68.  This kernel does NOT expose a
- * SYS_BIND syscall, so we cannot claim port 68 explicitly.  Instead we:
- *   - open an ordinary SOCK_DGRAM socket (it gets an ephemeral local port),
+ * the server replies to the client's port 68.  This kernel DOES expose a
+ * SYS_BIND syscall (76), so dhcp.c binds the socket to the DHCP client port
+ * (68) before sending; the implementation then:
+ *   - opens a SOCK_DGRAM socket and SYS_BIND()s it to client port 68,
  *   - SENDTO the limited-broadcast address 255.255.255.255:67, and
- *   - set the BOOTP `flags` BROADCAST bit (0x8000) so the server broadcasts
+ *   - sets the BOOTP `flags` BROADCAST bit (0x8000) so the server broadcasts
  *     its reply rather than unicasting to an (unassigned) client IP.
  * The kernel UDP layer demultiplexes the inbound datagram to the socket whose
  * local port matches, so RECVFROM on our socket sees the OFFER/ACK.

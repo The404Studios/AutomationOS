@@ -440,6 +440,7 @@ void _start(void) {
     // PERSISTENT desktop apps -- spawned in BOTH the full and minimal builds.
     print("[INIT] Spawning netman + browser2...\n");
     spawn("sbin/netman");
+    spawn("sbin/soundman");   // Sound Manager GUI (HDA volume/mute/test-tone via SYS_AUDIO_*)
     spawn("sbin/wlanctl");    // WIFI-SYS M1: one-shot SYS_WLAN_SCAN probe (prints the AP list, or ENOTSUP with no wifi); exits
     spawn("sbin/wpasupp");    // WIFI M2: WPA2 4-way handshake KAT selftest -> WPASUPP SELFTEST: PASS; exits
 #ifdef WIFI_DEMO

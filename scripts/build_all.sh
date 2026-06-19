@@ -62,7 +62,13 @@ fi
 # default OFF so a normal build never auto-connects.
 if [ "${WIFI_DEMO:-0}" = "1" ]; then
     INIT_EXTRA="$INIT_EXTRA -DWIFI_DEMO"
-    echo "*** WIFI_DEMO build: init auto-connects wlan0 -> simulated HomeNet (headless proof) ***"
+    echo "*** WIFI_DEMO build: init auto-connects wlan0 -> simulated HomeNet (WPA2 headless proof) ***"
+fi
+# WIFI_DEMO_WPA3=1: like WIFI_DEMO but auto-connects to the simulated SecureMesh
+# (WPA3/SAE) so the dragonfly path is exercised headlessly. Needs a WIFI_SIM kernel.
+if [ "${WIFI_DEMO_WPA3:-0}" = "1" ]; then
+    INIT_EXTRA="$INIT_EXTRA -DWIFI_DEMO_WPA3"
+    echo "*** WIFI_DEMO_WPA3 build: init auto-connects wlan0 -> simulated SecureMesh (WPA3/SAE) ***"
 fi
 # SELFHEAL=1 wires the userspace desktop self-heal: the compositor publishes a
 # per-frame heartbeat into a SysV SHM page, init creates+owns that page and spawns

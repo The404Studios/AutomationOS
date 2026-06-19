@@ -449,6 +449,11 @@ void _start(void) {
     // -> CONNECTED -> dhcpc run wlan0. Needs a WIFI_SIM kernel.
     spawn_args("sbin/wpasupp", "HomeNet 1 password");
 #endif
+#ifdef WIFI_DEMO_WPA3
+    // Headless WPA3 connect proof: wlan0 -> the simulated SecureMesh (WPA3/SAE
+    // dragonfly -> PMK -> 4-way -> CONNECTED -> dhcp).
+    spawn_args("sbin/wpasupp", "SecureMesh 2 password");
+#endif
     spawn("sbin/browser2");   // BROWSER-CONSOLIDATE-0: the one real (DOM/CSS/JS/HTTPS) browser
 
 #ifndef DESKTOP_MINIMAL

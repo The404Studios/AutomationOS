@@ -25,7 +25,8 @@
 
 #include "../../../kernel/include/uapi/wlan.h"
 #include "../../lib/wpa/wpa.h"
-#include "../../lib/crypto/pbkdf2.h"     /* wpa_pmk() */
+#include "../../lib/crypto/pbkdf2.h"     /* wpa_pmk()  -- WPA2 PMK   */
+#include "../../lib/crypto/sae.h"        /* sae_* dragonfly -- WPA3 PMK */
 
 /* ---- syscall numbers ------------------------------------------------- */
 #define SYS_WRITE           3
@@ -207,7 +208,31 @@ int main(int argc, char **argv) {
         for (int i = 0; i < 32; i++) anonce[i] = (unsigned char)(0x01 + i);
         for (int i = 0; i < 32; i++) snonce[i] = (unsigned char)(0x21 + i);
 
-        wpa_pmk(pass, (const uint8_t *)conn.ssid, ssid_len, pmk);
+        if (security == UAPI_WLAN_SEC_WPA3) {
+            /* WPA3: PMK from SAE (dragonfly). The sim has no live AP to swap
+             * auth frames with, so run BOTH SAE sides locally with deterministic
+             * demo randoms -- a genuine SAE-derived PMK, just not over the air. */
+            sae_state sta, ap;
+            unsigned char ra[32], ma[32], rb[32], mb[32], kck[32];
+            for (int i = 0; i < 32; i++) {
+                ra[i] = (unsigned char)(0x11 + i); ma[i] = (unsigned char)(0x22 + i);
+                rb[i] = (unsigned char)(0x33 + i); mb[i] = (unsigned char)(0x44 + i);
+            }
+            unsigned long pwlen = (unsigned long)slen(pass);
+            if (sae_derive_pwe(&sta, (const unsigned char *)pass, pwlen, DEMO_SPA, DEMO_AA) != 0 ||
+                sae_derive_pwe(&ap,  (const unsigned char *)pass, pwlen, DEMO_AA, DEMO_SPA) != 0 ||
+                sae_build_commit(&sta, ra, ma) != 0 ||
+                sae_build_commit(&ap,  rb, mb) != 0 ||
+                sae_process_commit(&sta, ap.commit_scalar, ap.commit_element, kck, pmk) != 0) {
+                out("WPASUPP: SAE PMK derivation failed\n");
+                return 1;
+            }
+            zero(kck, sizeof(kck));
+            out("WPASUPP: SAE PMK derived (WPA3 dragonfly)\n");
+        } else {
+            /* WPA2: PMK = PBKDF2(passphrase, SSID). */
+            wpa_pmk(pass, (const uint8_t *)conn.ssid, ssid_len, pmk);
+        }
         wpa_ptk(pmk, DEMO_AA, DEMO_SPA, anonce, snonce, ptk, 48);
 
         /* TK = PTK[32..48]; install it as the pairwise key. */

@@ -454,6 +454,11 @@ void _start(void) {
     // dragonfly -> PMK -> 4-way -> CONNECTED -> dhcp).
     spawn_args("sbin/wpasupp", "SecureMesh 2 password");
 #endif
+#ifdef WIFI_DEMO_FAIL
+    // Negative-path proof: a WRONG passphrase must reach WLAN_FAILED -- the sim
+    // rejects it and the supplicant must NOT install keys.
+    spawn_args("sbin/wpasupp", "HomeNet 1 wrongpass");
+#endif
     spawn("sbin/browser2");   // BROWSER-CONSOLIDATE-0: the one real (DOM/CSS/JS/HTTPS) browser
 
 #ifndef DESKTOP_MINIMAL

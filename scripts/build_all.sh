@@ -70,6 +70,12 @@ if [ "${WIFI_DEMO_WPA3:-0}" = "1" ]; then
     INIT_EXTRA="$INIT_EXTRA -DWIFI_DEMO_WPA3"
     echo "*** WIFI_DEMO_WPA3 build: init auto-connects wlan0 -> simulated SecureMesh (WPA3/SAE) ***"
 fi
+# WIFI_DEMO_FAIL=1: init attempts a WRONG-passphrase connect so the WLAN_FAILED
+# negative path is exercised (the sim rejects it; the supplicant must not install keys).
+if [ "${WIFI_DEMO_FAIL:-0}" = "1" ]; then
+    INIT_EXTRA="$INIT_EXTRA -DWIFI_DEMO_FAIL"
+    echo "*** WIFI_DEMO_FAIL build: init tries a wrong-passphrase connect (proves WLAN_FAILED) ***"
+fi
 # SELFHEAL=1 wires the userspace desktop self-heal: the compositor publishes a
 # per-frame heartbeat into a SysV SHM page, init creates+owns that page and spawns
 # sbin/cwatchdog (the recovery supervisor). Threads -DSELFHEAL into the compositor

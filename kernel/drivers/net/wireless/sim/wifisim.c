@@ -71,11 +71,22 @@ static int sim_scan_results(struct netif* nif, wlan_bss_t* out, int max) {
 
 static int sim_connect(struct netif* nif, const wlan_bss_t* bss,
                        const char* passphrase) {
-    (void)passphrase;
     if (!bss) return -1;
     int sl = bss->ssid_len; if (sl > 32) sl = 32;
     memcpy(g_sim_ssid, bss->ssid, (unsigned)sl); g_sim_ssid_len = (uint8_t)sl;
     g_sim_rssi = -55;
+    /* The sim's secured APs accept the passphrase "password" (matching the
+     * demos). A secured connect with the WRONG passphrase FAILS -- this gives
+     * the supplicant a real WLAN_FAILED branch to exercise (a real radio hits it
+     * too, e.g. a 4-way MIC mismatch on a bad PSK). */
+    if (bss->security != WLAN_SEC_OPEN &&
+        (!passphrase || strcmp(passphrase, "password") != 0)) {
+        g_sim_state = WLAN_FAILED;
+        nif->up = false;
+        kprintf("WIFISIM: connect ssid_len=%d sec=%d -> FAILED (wrong passphrase)\n",
+                sl, (int)bss->security);
+        return 0;   /* the connect syscall succeeds; SYS_WLAN_STATUS reports FAILED */
+    }
     /* OPEN associates straight to CONNECTED; WPA2/WPA3 reach ASSOCIATED and wait
      * for the supplicant's 4-way handshake (which lands via set_key in M2). */
     g_sim_state = (bss->security == WLAN_SEC_OPEN) ? WLAN_CONNECTED

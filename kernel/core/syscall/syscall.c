@@ -53,8 +53,9 @@ static int64_t sys_audio_volume(uint64_t vol, uint64_t arg2, uint64_t arg3,
     if (vol > 100) vol = 100;                  /* clamp, never trust ring 3     */
     hda_controller_t* ctrl = hda_find_controller();
     if (!ctrl || ctrl->num_codecs == 0) return ENODEV;
-    g_audio_volume = (uint8_t)vol;
-    return (int64_t)hda_set_volume(ctrl->codecs[0], ctrl, (uint8_t)vol);
+    int rv = hda_set_volume(ctrl->codecs[0], ctrl, (uint8_t)vol);
+    if (rv >= 0) g_audio_volume = (uint8_t)vol;  /* mirror only if the codec accepted it */
+    return (int64_t)rv;
 }
 
 /* SYS_AUDIO_MUTE=119: arg1 = 0|1. -> hda_set_mute on codec 0. */
@@ -64,8 +65,9 @@ static int64_t sys_audio_mute(uint64_t mute, uint64_t arg2, uint64_t arg3,
     hda_controller_t* ctrl = hda_find_controller();
     if (!ctrl || ctrl->num_codecs == 0) return ENODEV;
     bool m = (mute != 0);
-    g_audio_muted = m ? 1 : 0;
-    return (int64_t)hda_set_mute(ctrl->codecs[0], ctrl, m);
+    int rv = hda_set_mute(ctrl->codecs[0], ctrl, m);
+    if (rv >= 0) g_audio_muted = m ? 1 : 0;      /* mirror only if the codec accepted it */
+    return (int64_t)rv;
 }
 
 /* SYS_AUDIO_TEST=122: arg1 = freq Hz, arg2 = ms (capped at 2000). Plays a tone.

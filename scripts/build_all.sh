@@ -408,6 +408,9 @@ cc userspace/apps/autodhcp/autodhcp.c /tmp/autodhcp.o; $LD /tmp/crt0.o /tmp/auto
 # nicup: E1000-PCH-0B post-desktop trigger for the deferred T410 NIC bring-up.
 # Clean no-op on QEMU/non-PCH machines; tiny, shipped always.
 cc userspace/apps/nicup/nicup.c /tmp/nicup.o; $LD /tmp/crt0.o /tmp/nicup.o -o /tmp/nicup.elf
+# iwlup: IWL-TRIGGER post-desktop trigger for the deferred real iwlwifi bring-up.
+# Clean ENOTSUP no-op unless the build has the real radio (IWLWIFI=1); tiny, shipped always.
+cc userspace/apps/iwlup/iwlup.c /tmp/iwlup.o; $LD /tmp/crt0.o /tmp/iwlup.o -o /tmp/iwlup.elf
 # cpu1hello: SMP-F3-5 first-ring-3-on-CPU1 workload. Shipped always (tiny);
 # only the SMP_SCHED_DISPATCH kernel ever spawns it (pinned to CPU1).
 cc userspace/tests/cpu1hello.c /tmp/cpu1hello.o; $LD /tmp/crt0.o /tmp/cpu1hello.o -o /tmp/cpu1hello.elf
@@ -761,6 +764,24 @@ mkdir -p /tmp/ird/etc && printf 'TOOLSET-0-FILE\n' > /tmp/ird/etc/toolset0.txt
 # AGENT-POLICY (C1): seed the canonical agent safety policy so aibroker loads it
 # instead of falling back to built-in defaults (the auditable source of truth).
 mkdir -p /tmp/ird/etc/ai && cp etc/ai/policy.json /tmp/ird/etc/ai/policy.json
+# IWL-FW firmware: the real iwlwifi driver loads iwlwifi-<fam>-*.ucode from the
+# initrd at /lib/firmware/ (iwl_fw_load_from_initrd). The blob is a redistributable
+# Intel vendor file the USER drops into firmware/ (it is NOT in the repo -- see
+# docs/T410_IWLWIFI.md). Stage the dir always; copy any blobs the user provided.
+# No blob -> the driver prints a clean "no firmware" and aborts the bring-up.
+mkdir -p /tmp/ird/lib/firmware
+if ls firmware/iwlwifi*.ucode >/dev/null 2>&1; then
+  cp firmware/iwlwifi*.ucode /tmp/ird/lib/firmware/ 2>/dev/null
+  # The driver (iwl-ops.c) loads the stable alias /lib/firmware/iwlwifi.ucode.
+  # If the user only dropped versioned blob(s), alias the first to that name.
+  if [ ! -f /tmp/ird/lib/firmware/iwlwifi.ucode ]; then
+    FIRST_FW=$(ls firmware/iwlwifi*.ucode 2>/dev/null | head -1)
+    [ -n "$FIRST_FW" ] && cp "$FIRST_FW" /tmp/ird/lib/firmware/iwlwifi.ucode
+  fi
+  echo "IWL-FW: staged firmware into initrd /lib/firmware/ ($(ls -1 /tmp/ird/lib/firmware/ 2>/dev/null | tr '\n' ' '))"
+else
+  echo "IWL-FW: no firmware/iwlwifi*.ucode provided (real-radio bring-up reports missing firmware; QEMU/sim unaffected)"
+fi
 # BROWSER2-IMG-0 fixtures: deterministic PNG/GIF/BMP (+ a wider-than-viewport
 # big.png) for the about:imgtest acceptance page; missing.png stays missing.
 python3 scripts/gen_img_fixtures.py /tmp/ird/etc/imgtest
@@ -789,6 +810,8 @@ cp /tmp/sockettest.elf /tmp/ird/sbin/sockettest
 cp /tmp/autodhcp.elf /tmp/ird/sbin/autodhcp
 # nicup -> /bin (operator-run trigger for the deferred PCH NIC bring-up; QEMU no-op).
 cp /tmp/nicup.elf /tmp/ird/bin/nicup
+# iwlup -> /bin (operator-run trigger for the deferred real iwlwifi bring-up; QEMU/sim no-op).
+cp /tmp/iwlup.elf /tmp/ird/bin/iwlup
 # cpu1hello -> /sbin (SMP-F3-5; inert unless the SMP_SCHED_DISPATCH kernel spawns it).
 cp /tmp/cpu1hello.elf /tmp/ird/sbin/cpu1hello
 # bklstorm -> /sbin (SMP-H1; inert unless the SMP_BKL kernel spawns it).

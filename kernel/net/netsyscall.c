@@ -146,6 +146,24 @@ int64_t sys_net_config(uint64_t req_ptr, uint64_t a2, uint64_t a3,
          * freshly registered interface. */
     }
 
+    /* IWL-TRIGGER: the deferred real-radio bring-up, fired by `iwlup` from the
+     * running desktop -- never at boot (firmware-driven init that can hang
+     * un-validated hardware stays opt-in, mirroring the PCH NIC trigger above).
+     * iwl_wifi_bringup() runs the uCode-load -> ALIVE -> NVM -> scan-ready ->
+     * register-wlan0 ladder, logs its own markers, and aborts clean on any
+     * timeout (so a miss costs a re-run, never a wedged machine). Only present
+     * when the real radio is compiled in; a WIFI_SIM or stock build returns a
+     * clean ENOTSUP no-op. Must run while net is DOWN -- the radio isn't up yet. */
+    if (req.flags & NET_CONFIG_FLAG_WLAN_BRINGUP) {
+#ifdef IWLWIFI
+        extern void iwl_wifi_bringup(void);
+        iwl_wifi_bringup();
+        return 0;   /* bring-up logged its own ladder; wlan0 registered if alive */
+#else
+        return ENOTSUP;
+#endif
+    }
+
     if (!net_up()) return ENOTSUP;
 
     netif_t* nif = netif_get(req.ifname);

@@ -65,6 +65,12 @@ _Static_assert(sizeof(uapi_net_info_t) == NET_INFO_ABI_SIZE,
  * ME-shared-MDIO init out of boot; this completes it post-desktop). Works
  * while net is DOWN; clean ENOTSUP no-op when nothing was deferred. */
 #define NET_CONFIG_FLAG_NIC_BRINGUP (1u << 3)
+/* IWL-TRIGGER: trigger the DEFERRED real-radio bring-up (Intel iwlwifi: uCode
+ * load -> ALIVE -> NVM -> scan-ready -> register wlan0). Same discipline as the
+ * PCH NIC trigger: firmware-driven init that can hang un-validated silicon stays
+ * out of boot and is fired post-desktop by `iwlup`. ENOTSUP no-op on a build
+ * without the real radio (WIFI_SIM or no IWLWIFI). Works while net is DOWN. */
+#define NET_CONFIG_FLAG_WLAN_BRINGUP (1u << 4)
 
 typedef struct {
     char     ifname[16];        /* target interface name               */

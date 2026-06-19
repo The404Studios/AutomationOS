@@ -1075,6 +1075,14 @@ void kernel_main(void* raw_info) {
     wifisim_init();
 #endif
 
+#ifdef IWLWIFI
+    // IWL-IDENT: detect the real Intel WiFi card + a single safe MMIO probe
+    // (DEFAULT OFF; APM/firmware/RF bring-up is the deferred T410 hardware tail).
+    // In QEMU there is no iwlwifi card -> graceful "no card found".
+    extern void iwl_init(void);
+    iwl_init();
+#endif
+
 #ifdef NET_SELFTEST
     // NET-P1-A0: the deterministic in-kernel net test rig proof. Runs once,
     // pre-userspace, prints the NETRIG marker, and fully resets the socket

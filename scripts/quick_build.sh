@@ -53,6 +53,14 @@ if [ "${WIFI_SIM:-0}" = "1" ]; then
     CFLAGS="$CFLAGS -DWIFI_SIM"
     echo "*** WIFI_SIM build: simulated wlan0 backend compiled (scan/connect demo) ***"
 fi
+# IWLWIFI=1: compile the REAL Intel WiFi driver scaffolding (IWL-IDENT: card
+# detect + safe MMIO probe). DEFAULT OFF -- the firmware/RF bring-up tail can
+# hang un-validated hardware (same rule as the e1000 PCH NIC). QEMU has no
+# iwlwifi card, so iwl_init() reports "no card" gracefully. Real T410 = the card.
+if [ "${IWLWIFI:-0}" = "1" ]; then
+    CFLAGS="$CFLAGS -DIWLWIFI"
+    echo "*** IWLWIFI build: real Intel WiFi detect + safe probe (T410; bring-up deferred) ***"
+fi
 
 # ─────────────────────────────────────────────────────────────────────────────
 # OPT-IN: the NET-P1-A0 in-kernel network test rig.
@@ -546,6 +554,10 @@ compile kernel/net/wlansyscall.c             c_wlansyscall
 # WIFI-SIM: the simulated wlan0 backend (only under -DWIFI_SIM).
 if [ "${WIFI_SIM:-0}" = "1" ]; then
     compile kernel/drivers/net/wireless/sim/wifisim.c  c_wifisim
+fi
+# IWL-IDENT: the REAL Intel WiFi card detect + safe probe (only under -DIWLWIFI).
+if [ "${IWLWIFI:-0}" = "1" ]; then
+    compile kernel/drivers/net/wireless/intel/iwlwifi/iwl-pci.c  c_iwlpci
 fi
 # BSD-ish sockets (UDP + active-open TCP) on top of net.c. The ~338KB socket
 # table now lives in kmalloc (see socket.c), NOT .bss, so these are safe to link.

@@ -1081,6 +1081,11 @@ void kernel_main(void* raw_info) {
     // In QEMU there is no iwlwifi card -> graceful "no card found".
     extern void iwl_init(void);
     iwl_init();
+    // IWL-FW: prove the firmware-TLV parser on an embedded synthetic .ucode
+    // (the real iwlwifi-<fam>-*.ucode is parsed via iwl_fw_load_from_initrd on
+    // the T410). Hostile-input-safe; QEMU-checkable.
+    extern int iwl_fw_selftest(void);
+    iwl_fw_selftest();
 #endif
 
 #ifdef NET_SELFTEST

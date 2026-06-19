@@ -555,9 +555,11 @@ compile kernel/net/wlansyscall.c             c_wlansyscall
 if [ "${WIFI_SIM:-0}" = "1" ]; then
     compile kernel/drivers/net/wireless/sim/wifisim.c  c_wifisim
 fi
-# IWL-IDENT: the REAL Intel WiFi card detect + safe probe (only under -DIWLWIFI).
+# IWL-IDENT + IWL-FW: the REAL Intel WiFi card detect/safe-probe + the firmware
+# TLV parser (only under -DIWLWIFI).
 if [ "${IWLWIFI:-0}" = "1" ]; then
     compile kernel/drivers/net/wireless/intel/iwlwifi/iwl-pci.c  c_iwlpci
+    compile kernel/drivers/net/wireless/intel/iwlwifi/iwl-fw.c   c_iwlfw
 fi
 # BSD-ish sockets (UDP + active-open TCP) on top of net.c. The ~338KB socket
 # table now lives in kmalloc (see socket.c), NOT .bss, so these are safe to link.

@@ -35,7 +35,9 @@
  * Register values + the apm_init / grab_nic_access sequence are cited line-by-
  * line against the Linux iwlwifi sources in iwl-csr.h and in the comments below
  * (drivers/net/wireless/intel/iwlwifi/, kernel v5.10):
- *     pcie/trans.c   -- iwl_pcie_apm_init, iwl_pcie_apm_config,
+ *     pcie/trans.c   -- iwl_pcie_prepare_card_hw / iwl_pcie_set_hw_ready (the
+ *                       NIC_READY/PREPARE ownership handshake, before APM),
+ *                       iwl_pcie_apm_init, iwl_pcie_apm_config,
  *                       iwl_trans_pcie_grab_nic_access, iwl_pcie_set_pwr,
  *                       iwl_trans_pcie_{read,write}_prph
  *     iwl-io.c       -- iwl_finish_nic_init (the MAC_CLOCK_READY poll), iwl_poll_bit
@@ -45,44 +47,42 @@
  */
 #include "types.h"
 #include "kernel.h"          /* kprintf, PAGE_SIZE */
-#include "mem.h"             /* pmm_alloc_page (phys==virt in the identity map) */
+#include "mem.h"             /* pmm_alloc_page / pmm_alloc_pages (phys==virt) */
 #include "iwl-csr.h"
+#include "iwl-trans.h"       /* struct iwl_trans + the (now external) accessor protos --
+                             * shared with the DVM LOAD/NVM/SCAN/OPS bricks */
+#include "iwl-dvm-commands.h" /* IWL_CMD_QUEUE_ID -- the cmd queue the FW services */
 
-/* ====================================================================== *
- *  iwl_trans -- the minimal transport state for this brick.
- *  `mmio` is the identity-mapped BAR0 base (the CSR + PRPH window) mapped by
- *  IWL-IDENT (iwl-pci.c). The future trigger fills it in before calling
- *  iwl_trans_bringup(). The ring fields below are populated by the alloc steps.
- * ====================================================================== */
-struct iwl_trans {
-    volatile uint8_t* mmio;     /* BAR0 base (CSR/PRPH/FH register file) */
+/*
+ * sizeof(struct iwl_tfd) on the gen1 parts the T410 carries (1000/5000/6000).
+ * Linux iwl-fh.h: __reserved1[3] + num_tbs + tbs[IWL_NUM_OF_TBS=20] + __pad[4]
+ * = 128 bytes; upstream comment "For pre-22000 HW it is 256 x 128 = 32 KBytes".
+ * The cmd-ring DMA window is therefore TFD_QUEUE_SIZE_MAX * 128 = 32 KB = 8
+ * pages -- NOT one. (Review fix: the ring was allocated 8x too small.)
+ */
+#define IWL_TFD_SIZE  128
 
-    void*    cmd_ring;          /* TFD command-queue ring (one page) */
-    uint64_t cmd_ring_dma;      /* its physical/DMA address (== virt) */
-
-    void*    rx_bd;             /* RX buffer-descriptor (RBD) ring (one page) */
-    uint64_t rx_bd_dma;
-    void*    rx_bufs[RX_QUEUE_SIZE];   /* the RX DMA pages the RBDs point at */
-    void*    rb_status;         /* shared RB-status writeback block (one page) */
-    uint64_t rb_status_dma;
-};
+/* struct iwl_trans now lives in iwl-trans.h (lifted out so the DVM bring-up
+ * bricks can reach trans->mmio + the rings). The original five fields keep their
+ * order/types; the header adds hw_rev/cmd_wr_ptr/rx_read/mac[6]/is_otp for those
+ * bricks. iwl-trans.c is unaffected -- it only touches the original fields. */
 
 /* ====================================================================== *
  *  MMIO accessors over BAR0. Volatile 32-bit reads/writes at the identity-
  *  mapped base -- same model as e1000.c's mmio_{read,write}32.
  * ====================================================================== */
-static inline void iwl_write32(struct iwl_trans* trans, uint32_t off, uint32_t val) {
+void iwl_write32(struct iwl_trans* trans, uint32_t off, uint32_t val) {
     *(volatile uint32_t*)(trans->mmio + off) = val;
 }
-static inline uint32_t iwl_read32(struct iwl_trans* trans, uint32_t off) {
+uint32_t iwl_read32(struct iwl_trans* trans, uint32_t off) {
     return *(volatile uint32_t*)(trans->mmio + off);
 }
 
 /* Read-modify-write helpers (Linux iwl_set_bit / iwl_clear_bit). */
-static inline void iwl_set_bit(struct iwl_trans* trans, uint32_t off, uint32_t mask) {
+void iwl_set_bit(struct iwl_trans* trans, uint32_t off, uint32_t mask) {
     iwl_write32(trans, off, iwl_read32(trans, off) | mask);
 }
-static inline void iwl_clear_bit(struct iwl_trans* trans, uint32_t off, uint32_t mask) {
+void iwl_clear_bit(struct iwl_trans* trans, uint32_t off, uint32_t mask) {
     iwl_write32(trans, off, iwl_read32(trans, off) & ~mask);
 }
 
@@ -92,7 +92,7 @@ static inline void iwl_clear_bit(struct iwl_trans* trans, uint32_t off, uint32_t
  * e1000.c desc_wmb() -- sfence + compiler barrier (see that file for the WC/UC
  * ordering rationale).
  */
-static inline void iwl_desc_wmb(void) {
+void iwl_desc_wmb(void) {
     asm volatile("sfence" ::: "memory");
 }
 
@@ -101,7 +101,7 @@ static inline void iwl_desc_wmb(void) {
  * runs, so we spin on `pause` for a few microseconds of settle time rather than
  * waiting on ticks -- same reasoning as e1000_delay().
  */
-static void iwl_udelay_approx(volatile uint32_t loops) {
+void iwl_udelay_approx(volatile uint32_t loops) {
     while (loops--)
         asm volatile("pause");
 }
@@ -112,8 +112,8 @@ static void iwl_udelay_approx(volatile uint32_t loops) {
  *  stalled bus can never hang. Returns 0 on match, -1 on timeout.
  *  (Linux iwl-io.c iwl_poll_bit + IWL_POLL_INTERVAL = 10us.)
  * ====================================================================== */
-static int iwl_poll_bit(struct iwl_trans* trans, uint32_t off,
-                        uint32_t bits, uint32_t mask) {
+int iwl_poll_bit(struct iwl_trans* trans, uint32_t off,
+                 uint32_t bits, uint32_t mask) {
     for (int i = 0; i < IWL_TRANS_POLL_MAX; i++) {
         if ((iwl_read32(trans, off) & mask) == (bits & mask))
             return 0;
@@ -130,20 +130,20 @@ static int iwl_poll_bit(struct iwl_trans* trans, uint32_t off,
  *  These touch device-internal silicon, so they print a marker and must run
  *  only while NIC access is held (the caller grabs it).
  * ====================================================================== */
-static void iwl_write_prph(struct iwl_trans* trans, uint32_t addr, uint32_t val) {
+void iwl_write_prph(struct iwl_trans* trans, uint32_t addr, uint32_t val) {
     iwl_write32(trans, HBUS_TARG_PRPH_WADDR,
                 (addr & IWL_PRPH_ADDR_MASK) | IWL_PRPH_BURST_4B);
     iwl_write32(trans, HBUS_TARG_PRPH_WDAT, val);
 }
 
-static uint32_t iwl_read_prph(struct iwl_trans* trans, uint32_t addr) {
+uint32_t iwl_read_prph(struct iwl_trans* trans, uint32_t addr) {
     iwl_write32(trans, HBUS_TARG_PRPH_RADDR,
                 (addr & IWL_PRPH_ADDR_MASK) | IWL_PRPH_BURST_4B);
     return iwl_read32(trans, HBUS_TARG_PRPH_RDAT);
 }
 
 /* PRPH read-modify-write (Linux iwl_set_bits_prph). Caller holds NIC access. */
-static void iwl_set_bits_prph(struct iwl_trans* trans, uint32_t addr, uint32_t mask) {
+void iwl_set_bits_prph(struct iwl_trans* trans, uint32_t addr, uint32_t mask) {
     iwl_write_prph(trans, addr, iwl_read_prph(trans, addr) | mask);
 }
 
@@ -155,7 +155,7 @@ static void iwl_set_bits_prph(struct iwl_trans* trans, uint32_t addr, uint32_t m
  *     MAC_ACCESS_EN under the mask (MAC_CLOCK_READY | GOING_TO_SLEEP), 15000us.
  *  Returns 0 on grant, -1 on timeout (abort-clean).
  * ====================================================================== */
-static int iwl_grab_nic_access(struct iwl_trans* trans) {
+int iwl_grab_nic_access(struct iwl_trans* trans) {
     kprintf("IWLTRANS: grab nic access (set MAC_ACCESS_REQ)...\n");
     iwl_set_bit(trans, CSR_GP_CNTRL, CSR_GP_CNTRL_REG_FLAG_MAC_ACCESS_REQ);
 
@@ -174,8 +174,51 @@ static int iwl_grab_nic_access(struct iwl_trans* trans) {
 }
 
 /* Linux trans.c: clear CSR_GP_CNTRL.MAC_ACCESS_REQ to release. */
-static void iwl_release_nic_access(struct iwl_trans* trans) {
+void iwl_release_nic_access(struct iwl_trans* trans) {
     iwl_clear_bit(trans, CSR_GP_CNTRL, CSR_GP_CNTRL_REG_FLAG_MAC_ACCESS_REQ);
+}
+
+/* ====================================================================== *
+ *  iwl_prepare_card_hw -- take ownership of the device from the Management
+ *  Engine / BIOS, which MUST happen before APM power-up.
+ *  Linux pcie/trans.c iwl_pcie_prepare_card_hw -> iwl_pcie_set_hw_ready:
+ *     set CSR_HW_IF_CONFIG_REG_BIT_NIC_READY (PCI_OWN_SEM) and poll it; if it
+ *     does not come back, pulse CSR_HW_IF_CONFIG_REG_PREPARE (WAKE_ME) and retry,
+ *     up to ~10 times. On a real T410 the ME can still own the card at trigger
+ *     time -- without this handshake the later INIT_DONE/MAC_CLOCK_READY poll in
+ *     APM can never complete (or the APMG PRPH writes go nowhere).
+ *  (Review fix: this mandatory ownership step was missing; the NIC_READY/PREPARE
+ *  bits were defined in iwl-csr.h but never used -- the tell.)
+ *  Bounded throughout; marker before each MMIO; returns 0 on ready, -1 on fail.
+ * ====================================================================== */
+#define IWL_PREPARE_HW_TRIES 10
+static int iwl_set_hw_ready(struct iwl_trans* trans) {
+    iwl_set_bit(trans, CSR_HW_IF_CONFIG_REG, CSR_HW_IF_CONFIG_REG_BIT_NIC_READY);
+    /* Bounded poll for the device to echo NIC_READY back (it took the semaphore). */
+    return iwl_poll_bit(trans, CSR_HW_IF_CONFIG_REG,
+                        CSR_HW_IF_CONFIG_REG_BIT_NIC_READY,
+                        CSR_HW_IF_CONFIG_REG_BIT_NIC_READY);
+}
+static int iwl_prepare_card_hw(struct iwl_trans* trans) {
+    kprintf("IWLTRANS: prepare card HW (take ownership from ME/BIOS)...\n");
+    if (iwl_set_hw_ready(trans) == 0) {
+        kprintf("IWLTRANS: NIC_READY (semaphore already granted)\n");
+        return 0;
+    }
+    /* Not ready: pulse PREPARE/WAKE_ME and retry a BOUNDED number of times. */
+    for (int t = 0; t < IWL_PREPARE_HW_TRIES; t++) {
+        kprintf("IWLTRANS: pulse PREPARE/WAKE_ME (try %d/%d)...\n", t + 1, IWL_PREPARE_HW_TRIES);
+        iwl_set_bit(trans, CSR_HW_IF_CONFIG_REG, CSR_HW_IF_CONFIG_REG_PREPARE);
+        iwl_udelay_approx(20000);   /* ~1ms settle between tries (Linux: 200us poll) */
+        if (iwl_set_hw_ready(trans) == 0) {
+            kprintf("IWLTRANS: NIC_READY after %d prepare pulse(s)\n", t + 1);
+            return 0;
+        }
+    }
+    uint32_t v = iwl_read32(trans, CSR_HW_IF_CONFIG_REG);
+    kprintf("IWLTRANS: prepare card HW TIMEOUT (CSR_HW_IF_CONFIG_REG=0x%08x) -- "
+            "ME still owns the card; abort (safe to re-run)\n", v);
+    return -1;
 }
 
 /* ====================================================================== *
@@ -265,12 +308,19 @@ static int iwl_apm_init(struct iwl_trans* trans) {
 static int iwl_alloc_cmd_ring(struct iwl_trans* trans) {
     kprintf("IWLTRANS: alloc cmd ring (TFD)...\n");
 
-    void* ring = pmm_alloc_page();   /* TFD_QUEUE_SIZE_MAX TFDs fit in a page */
+    /* The ring is TFD_QUEUE_SIZE_MAX descriptors x IWL_TFD_SIZE(128) = 32 KB = 8
+     * contiguous pages. Allocating one page (the old bug) would point the DMA
+     * engine (FH_MEM_CBBC_QUEUE[0] = base >> 8) at a 32 KB window backed by only
+     * 4 KB; the device walking slots > 31 would read/write adjacent physical RAM
+     * the allocator handed elsewhere -- silent corruption on real hardware. */
+    uint32_t ring_bytes = (uint32_t)TFD_QUEUE_SIZE_MAX * IWL_TFD_SIZE;   /* 32768 */
+    uint32_t ring_pages = (ring_bytes + PAGE_SIZE - 1) / PAGE_SIZE;      /* 8 */
+    void* ring = pmm_alloc_pages(ring_pages);   /* contiguous; phys==virt */
     if (!ring) {
-        kprintf("IWLTRANS: cmd ring page alloc FAILED -- abort\n");
+        kprintf("IWLTRANS: cmd ring alloc FAILED (%u pages) -- abort\n", ring_pages);
         return -1;
     }
-    for (uint32_t i = 0; i < PAGE_SIZE; i++)
+    for (uint32_t i = 0; i < ring_bytes; i++)
         ((volatile uint8_t*)ring)[i] = 0;
 
     trans->cmd_ring     = ring;
@@ -282,18 +332,30 @@ static int iwl_alloc_cmd_ring(struct iwl_trans* trans) {
         kprintf("IWLTRANS: cmd ring could not grab NIC access -- abort\n");
         return -1;
     }
-    kprintf("IWLTRANS: program cmd ring base (FH_MEM_CBBC_QUEUE[0])...\n");
+    kprintf("IWLTRANS: program cmd ring base (FH_MEM_CBBC_QUEUE[%d])...\n",
+            IWL_CMD_QUEUE_ID);
     iwl_desc_wmb();   /* flush the zeroed ring before the device can see the base */
-    iwl_write32(trans, FH_MEM_CBBC_QUEUE(0),
+    iwl_write32(trans, FH_MEM_CBBC_QUEUE(IWL_CMD_QUEUE_ID),
                 (uint32_t)(trans->cmd_ring_dma >> 8));
 
-    /* Reset the queue write pointer doorbell to 0 (empty ring). */
-    kprintf("IWLTRANS: reset cmd ring write ptr (HBUS_TARG_WRPTR)...\n");
+    /* Reset the queue write pointer doorbell to the empty-ring value. Linux
+     * encodes HBUS_TARG_WRPTR as (ssn & 0xff) | (txq_id << 8); DVM firmware
+     * services host commands on queue IWL_CMD_QUEUE_ID (4), NOT queue 0 -- the
+     * CBBC base slot and this doorbell must target that queue or the device never
+     * sees the ring. (Review fix H-C1c.) */
+    kprintf("IWLTRANS: reset cmd ring write ptr (HBUS_TARG_WRPTR, q=%d)...\n",
+            IWL_CMD_QUEUE_ID);
     iwl_desc_wmb();
-    iwl_write32(trans, HBUS_TARG_WRPTR, 0);
+    iwl_write32(trans, HBUS_TARG_WRPTR, (0u & 0xff) | (IWL_CMD_QUEUE_ID << 8));
 
     iwl_release_nic_access(trans);
-    kprintf("IWLTRANS: cmd ring ready (%d TFD slots)\n", TFD_QUEUE_SIZE_MAX);
+    /* NOTE: the ring is allocated + based, but the Scheduler byte-count table
+     * (SCD_DRAM_BASE_ADDR) and the TX channel TCSR config are NOT programmed here
+     * -- those are deferred to IWL-OPS. uCode LOAD uses a direct SRAM copy (no
+     * SCD), so this is sufficient for IWL-LOAD; carrying a host command to a
+     * *running* uCode additionally needs the SCD setup OPS will add. */
+    kprintf("IWLTRANS: cmd ring ready (%d TFD slots, 8 pages; SCD bc-table deferred to OPS)\n",
+            TFD_QUEUE_SIZE_MAX);
     return 0;
 }
 
@@ -380,11 +442,13 @@ static int iwl_alloc_rx_ring(struct iwl_trans* trans) {
                 (RX_RB_TIMEOUT << FH_RCSR_RX_CONFIG_REG_IRQ_RBTH_POS) |
                 (RX_QUEUE_SIZE_LOG << FH_RCSR_RX_CONFIG_RBDCB_SIZE_POS));
 
-    /* Ring the RX write-pointer doorbell: hand all RX_QUEUE_SIZE RBDs to the
-     * device (write index = ring size, 8-aligned per HW; here the full ring). */
+    /* Ring the RX write-pointer doorbell: hand the RBDs to the device. The HW
+     * requires the write index be a multiple of 8 (Linux iwl_pcie_rxq_inc_wr_ptr
+     * writes round_down(write, 8)); 255 is not 8-aligned, so mask the low 3 bits
+     * -> 248. (Review fix: was RX_QUEUE_SIZE-1 = 255, mis-aligned.) */
     kprintf("IWLTRANS: ring RX write ptr doorbell (FH_RSCSR_CHNL0_WPTR)...\n");
     iwl_desc_wmb();
-    iwl_write32(trans, FH_RSCSR_CHNL0_WPTR, RX_QUEUE_SIZE - 1);
+    iwl_write32(trans, FH_RSCSR_CHNL0_WPTR, (RX_QUEUE_SIZE - 1) & ~7u);
 
     iwl_release_nic_access(trans);
     kprintf("IWLTRANS: rx ring ready (%d RBDs)\n", RX_QUEUE_SIZE);
@@ -404,6 +468,13 @@ int iwl_trans_bringup(struct iwl_trans* trans) {
 
     if (!trans || !trans->mmio) {
         kprintf("IWLTRANS: no BAR0 mapping -- abort (IWL-IDENT must map BAR0 first)\n");
+        return -1;
+    }
+
+    /* Take ownership from the ME/BIOS FIRST -- APM power-up assumes the host owns
+     * the device (Linux _iwl_trans_pcie_start_hw: prepare_card_hw before apm_init). */
+    if (iwl_prepare_card_hw(trans) != 0) {
+        kprintf("IWLTRANS: bring-up FAILED at prepare-card-hw (NIC ownership)\n");
         return -1;
     }
 

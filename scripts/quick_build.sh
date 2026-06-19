@@ -560,9 +560,18 @@ fi
 if [ "${IWLWIFI:-0}" = "1" ]; then
     compile kernel/drivers/net/wireless/intel/iwlwifi/iwl-pci.c    c_iwlpci
     compile kernel/drivers/net/wireless/intel/iwlwifi/iwl-fw.c     c_iwlfw
-    # IWL-TRANS: transport (APM + rings). WRITTEN + HELD -- iwl_trans_bringup is
-    # never called at boot; compiled here only for -DIWLWIFI compile coverage.
+    # IWL-TRANS: transport (APM + prepare-card-hw + rings). WRITTEN + HELD --
+    # iwl_trans_bringup is never called at boot; compiled here for coverage.
     compile kernel/drivers/net/wireless/intel/iwlwifi/iwl-trans.c  c_iwltrans
+    # IWL-LOAD + IWL-OPS (DVM): the real radio core -- host-command spine, uCode
+    # load -> ALIVE -> calibration, NVM (MAC/channels), scan, and the wifi_ops impl
+    # + iwl_wifi_bringup() that registers the REAL wlan0. HELD: iwl_wifi_bringup is
+    # called ONLY by the post-desktop iwlup trigger, never at boot.
+    compile kernel/drivers/net/wireless/intel/iwlwifi/iwl-hostcmd.c  c_iwlhostcmd
+    compile kernel/drivers/net/wireless/intel/iwlwifi/iwl-fw-load.c  c_iwlfwload
+    compile kernel/drivers/net/wireless/intel/iwlwifi/iwl-nvm.c      c_iwlnvm
+    compile kernel/drivers/net/wireless/intel/iwlwifi/iwl-scan.c     c_iwlscan
+    compile kernel/drivers/net/wireless/intel/iwlwifi/iwl-ops.c      c_iwlops
 fi
 # BSD-ish sockets (UDP + active-open TCP) on top of net.c. The ~338KB socket
 # table now lives in kmalloc (see socket.c), NOT .bss, so these are safe to link.

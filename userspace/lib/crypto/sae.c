@@ -500,6 +500,100 @@ int sae_process_commit(const sae_state *st,
 }
 
 /* =========================================================================
+ * Confirm exchange (sec. 12.4.5.5)
+ * -------------------------------------------------------------------------
+ *
+ *   confirm = CN(KCK, send-confirm, scalar1, element1, scalar2, element2)
+ * with
+ *   CN(K, sc, s1, E1, s2, E2) = HMAC-SHA256(K, sc_LE16 || s1 || E1 || s2 || E2)
+ *
+ * - send-confirm is the 16-bit Sync/sc counter, LITTLE-ENDIAN (2 bytes).
+ * - scalars are 32-byte big-endian; elements are 64-byte X||Y (each 32 BE).
+ * - The KCK is the 32-byte confirm key from sae_process_commit.
+ *
+ * Builder (own confirm):    CN(KCK, sc, OWN_s, OWN_E, PEER_s, PEER_E)
+ * Verifier (peer confirm):  CN(KCK, peer_sc, PEER_s, PEER_E, OWN_s, OWN_E)
+ *
+ * This matches hostap src/common/sae.c sae_cn_confirm() exactly: addr[0]=sc(2),
+ * addr[1]=scalar1(prime_len=32), addr[2]=element1(64), addr[3]=scalar2(32),
+ * addr[4]=element2(64), hmac_sha256_vector(kck, sizeof(kck)=32, ...); with
+ * sae_write_confirm passing (own,peer) and sae_check_confirm passing (peer,own).
+ * ====================================================================== */
+
+/*
+ * cn_confirm -- the SAE CN() confirm primitive.  Assembles the 5-segment
+ * message sc_LE16 || s1 || E1 || s2 || E2 into a fixed stack buffer and runs
+ * HMAC-SHA256(kck, msg).  scalar1/scalar2 are 32 bytes, element1/element2 are
+ * 64 bytes; the total message is 2 + 32 + 64 + 32 + 64 = 194 bytes.
+ */
+static void cn_confirm(const unsigned char kck[32],
+                       unsigned short send_confirm,
+                       const unsigned char scalar1[32],
+                       const unsigned char element1[64],
+                       const unsigned char scalar2[32],
+                       const unsigned char element2[64],
+                       unsigned char confirm_out[32])
+{
+    unsigned char msg[2 + 32 + 64 + 32 + 64];
+    unsigned long off = 0;
+
+    put_le16(msg + off, send_confirm);          off += 2;   /* sc, little-endian */
+    s_memcpy(msg + off, scalar1, 32);            off += 32;
+    s_memcpy(msg + off, element1, 64);           off += 64;
+    s_memcpy(msg + off, scalar2, 32);            off += 32;
+    s_memcpy(msg + off, element2, 64);           off += 64;
+
+    hmac_sha256(kck, 32, msg, off, confirm_out);
+    s_memset(msg, 0, sizeof(msg));
+}
+
+int sae_build_confirm(const sae_state *st,
+                      const unsigned char kck[32],
+                      unsigned short send_confirm,
+                      const unsigned char peer_scalar[32],
+                      const unsigned char peer_element[64],
+                      unsigned char confirm_out[32])
+{
+    if (!st || !st->valid || !kck || !peer_scalar || !peer_element ||
+        !confirm_out)
+        return -1;
+
+    /* own (scalar,element) first, then peer (scalar,element). */
+    cn_confirm(kck, send_confirm,
+               st->commit_scalar, st->commit_element,
+               peer_scalar, peer_element,
+               confirm_out);
+    return 0;
+}
+
+int sae_check_confirm(const sae_state *st,
+                      const unsigned char kck[32],
+                      unsigned short peer_send_confirm,
+                      const unsigned char peer_scalar[32],
+                      const unsigned char peer_element[64],
+                      const unsigned char peer_confirm[32])
+{
+    if (!st || !st->valid || !kck || !peer_scalar || !peer_element ||
+        !peer_confirm)
+        return -1;
+
+    unsigned char expect[32];
+
+    /* Verifier swaps the pairs: peer (scalar,element) first, then own. */
+    cn_confirm(kck, peer_send_confirm,
+               peer_scalar, peer_element,
+               st->commit_scalar, st->commit_element,
+               expect);
+
+    /* Constant-time-ish compare: accumulate all byte differences. */
+    unsigned char diff = 0;
+    for (int i = 0; i < 32; i++) diff |= (unsigned char)(expect[i] ^ peer_confirm[i]);
+
+    s_memset(expect, 0, sizeof(expect));
+    return diff ? -1 : 0;
+}
+
+/* =========================================================================
  * One-shot convenience driver
  * ========================================================================= */
 
@@ -658,6 +752,47 @@ int sae_selftest(void)
                            b.commit_scalar, b.commit_element, pmk_drv) != 0)
             return 12;
         if (s_memcmp(pmk_drv, pmk_a, 32) != 0) return 12;
+    }
+
+    /* ---- T2c: two-party CONFIRM exchange. ---------------------------- *
+     *
+     * Each side builds its confirm over its own KCK and CHECKS the peer's.
+     * Both checks must verify (return 0).  A builds with own=(A) peer=(B);
+     * A's check must succeed against B's confirm (which B built with own=(B)
+     * peer=(A)) precisely because the verifier swaps the pairs.  send-confirm
+     * is 0 for the first confirm on each side. */
+    {
+        unsigned char confirm_a[32], confirm_b[32];
+
+        if (sae_build_confirm(&a, kck_a, 0,
+                              b.commit_scalar, b.commit_element,
+                              confirm_a) != 0) return 17;
+        if (sae_build_confirm(&b, kck_b, 0,
+                              a.commit_scalar, a.commit_element,
+                              confirm_b) != 0) return 18;
+
+        /* A checks B's confirm; B checks A's confirm.  Both must verify. */
+        if (sae_check_confirm(&a, kck_a, 0,
+                              b.commit_scalar, b.commit_element,
+                              confirm_b) != 0) return 19;
+        if (sae_check_confirm(&b, kck_b, 0,
+                              a.commit_scalar, a.commit_element,
+                              confirm_a) != 0) return 20;
+
+        /* NEGATIVE: flip a byte of B's confirm -> A's check must FAIL (-1). */
+        {
+            unsigned char tampered[32];
+            s_memcpy(tampered, confirm_b, 32);
+            tampered[7] ^= 0x40;
+            if (sae_check_confirm(&a, kck_a, 0,
+                                  b.commit_scalar, b.commit_element,
+                                  tampered) != -1) return 21;
+        }
+
+        /* NEGATIVE: a wrong send-confirm counter must also fail. */
+        if (sae_check_confirm(&a, kck_a, 1,
+                              b.commit_scalar, b.commit_element,
+                              confirm_b) != -1) return 22;
     }
 
     /* ---- T3: negative tests. ----------------------------------------- */

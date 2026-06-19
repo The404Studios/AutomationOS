@@ -25,7 +25,7 @@ ALL=0;  grep -qaE 'CRYPTOTEST: PASS' "$SER" && ALL=1
 echo ""
 echo "sae=$SAE p256_intact=$P256 battery=$ALL"
 if [ "$SAE" = 1 ] && [ "$P256" = 1 ] && [ "$ALL" = 1 ]; then
-  echo "WPA3-SAE: PASS (sae KAT green; p256 unbroken; full battery CRYPTOTEST: PASS)"
+  echo "WPA3-SAE: PASS (sae self-consistency green [no published KAT]; p256 unbroken; full battery CRYPTOTEST: PASS)"
   exit 0
 else
   echo "WPA3-SAE: FAIL (sae=$SAE p256=$P256 battery=$ALL)"

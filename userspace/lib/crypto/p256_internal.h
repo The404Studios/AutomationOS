@@ -114,7 +114,11 @@ void p256_pt_dbl(p256_pt *R, const p256_pt *P);                    /* R = 2P    
 
 /*
  * p256_pt_scalar_mul: R = k * P, where k is a 32-byte big-endian scalar.
- * Left-to-right double-and-add (k is treated as public material).
+ * Left-to-right double-and-add. NOT constant-time: the per-bit branch leaks the
+ * scalar via timing. Fine for the public ECDH/ECDSA points, but SAE feeds SECRET
+ * scalars (rand/mask/peer_scalar) through this -- a Dragonblood-class side
+ * channel. Acceptable on this OS (no remote timing adversary) but NOT hardened;
+ * a constant-time ladder is the fix if that ever changes.
  */
 void p256_pt_scalar_mul(p256_pt *R, const p256_pt *P, const unsigned char k[32]);
 

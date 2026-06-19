@@ -42,6 +42,18 @@
  *     KCK || PMK = KDF-512( keyseed, "SAE KCK and PMK", context )
  *       KCK = first  32 bytes   (confirm key)
  *       PMK = second 32 bytes   (delivered to the 4-way handshake)
+ *
+ *   Confirm exchange (sec. 12.4.5.5):
+ *     confirm = CN( KCK, send-confirm,
+ *                   own_scalar,  own_element,
+ *                   peer_scalar, peer_element )
+ *     where
+ *       CN(K, sc, s1, E1, s2, E2) =
+ *           HMAC-SHA256( K, sc_LE16 || s1 || E1 || s2 || E2 )
+ *       send-confirm is a 16-bit anti-replay counter (little-endian), 0 for the
+ *       first confirm.  The VERIFIER swaps the (scalar,element) pairs: it checks
+ *       CN(KCK, peer_sc, peer_scalar, peer_element, own_scalar, own_element).
+ *       Scalars are 32-byte big-endian; elements are 64-byte X||Y.
  */
 
 #ifndef CRYPTO_SAE_H
@@ -132,6 +144,58 @@ int sae_process_commit(const sae_state *st,
                        const unsigned char peer_element[64],
                        unsigned char kck[32],
                        unsigned char pmk[32]);
+
+/*
+ * sae_build_confirm -- produce OUR confirm value (sec. 12.4.5.5).
+ *
+ *   confirm = HMAC-SHA256( KCK,
+ *                          send_confirm_LE16 ||
+ *                          own_commit_scalar  || own_commit_element  ||
+ *                          peer_commit_scalar || peer_commit_element )
+ *
+ *   st            : our state, after a successful sae_build_commit (supplies
+ *                   own commit_scalar / commit_element)
+ *   kck           : the confirm key from sae_process_commit (32 bytes)
+ *   send_confirm  : the 16-bit anti-replay counter (Sync/sc); 0 for the first
+ *                   confirm.  Encoded little-endian into the hash.
+ *   peer_scalar   : peer commit-scalar (32-byte big-endian)
+ *   peer_element  : peer commit-element X||Y (64 bytes)
+ *   confirm_out   : receives the 32-byte confirm value
+ *
+ * Returns 0 on success, -1 on bad arguments / state.
+ */
+int sae_build_confirm(const sae_state *st,
+                      const unsigned char kck[32],
+                      unsigned short send_confirm,
+                      const unsigned char peer_scalar[32],
+                      const unsigned char peer_element[64],
+                      unsigned char confirm_out[32]);
+
+/*
+ * sae_check_confirm -- verify the PEER's confirm value (sec. 12.4.5.5).
+ *
+ * The verifier swaps the (scalar,element) pairs relative to the builder:
+ *   expect = HMAC-SHA256( KCK,
+ *                         peer_send_confirm_LE16 ||
+ *                         peer_commit_scalar || peer_commit_element ||
+ *                         own_commit_scalar  || own_commit_element )
+ * and compares it (constant-time-ish) against the received peer_confirm.
+ *
+ *   st               : our state (supplies own commit_scalar / commit_element)
+ *   kck              : the confirm key (32 bytes)
+ *   peer_send_confirm: the peer's 16-bit send-confirm counter
+ *   peer_scalar      : peer commit-scalar (32-byte big-endian)
+ *   peer_element     : peer commit-element X||Y (64 bytes)
+ *   peer_confirm     : the 32-byte confirm value the peer sent
+ *
+ * Returns 0 if the peer confirm verifies, -1 otherwise.
+ */
+int sae_check_confirm(const sae_state *st,
+                      const unsigned char kck[32],
+                      unsigned short peer_send_confirm,
+                      const unsigned char peer_scalar[32],
+                      const unsigned char peer_element[64],
+                      const unsigned char peer_confirm[32]);
 
 /*
  * sae_derive_pmk -- one-shot convenience wrapper that drives a full SAE

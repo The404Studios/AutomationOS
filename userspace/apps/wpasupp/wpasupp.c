@@ -213,7 +213,8 @@ int main(int argc, char **argv) {
              * auth frames with, so run BOTH SAE sides locally with deterministic
              * demo randoms -- a genuine SAE-derived PMK, just not over the air. */
             sae_state sta, ap;
-            unsigned char ra[32], ma[32], rb[32], mb[32], kck[32];
+            unsigned char ra[32], ma[32], rb[32], mb[32];
+            unsigned char kck_sta[32], kck_ap[32], pmk_ap[32];
             for (int i = 0; i < 32; i++) {
                 ra[i] = (unsigned char)(0x11 + i); ma[i] = (unsigned char)(0x22 + i);
                 rb[i] = (unsigned char)(0x33 + i); mb[i] = (unsigned char)(0x44 + i);
@@ -223,12 +224,51 @@ int main(int argc, char **argv) {
                 sae_derive_pwe(&ap,  (const unsigned char *)pass, pwlen, DEMO_AA, DEMO_SPA) != 0 ||
                 sae_build_commit(&sta, ra, ma) != 0 ||
                 sae_build_commit(&ap,  rb, mb) != 0 ||
-                sae_process_commit(&sta, ap.commit_scalar, ap.commit_element, kck, pmk) != 0) {
+                sae_process_commit(&sta, ap.commit_scalar, ap.commit_element, kck_sta, pmk) != 0 ||
+                sae_process_commit(&ap,  sta.commit_scalar, sta.commit_element, kck_ap, pmk_ap) != 0) {
                 out("WPASUPP: SAE PMK derivation failed\n");
                 return 1;
             }
-            zero(kck, sizeof(kck));
             out("WPASUPP: SAE PMK derived (WPA3 dragonfly)\n");
+
+            /*
+             * SAE confirm exchange (sec. 12.4.5.5). Without a live AP we run
+             * both sides self-consistently, exactly like the PMK above: the
+             * station and the AP each build a confirm over their own KCK, then
+             * cross-check the peer's. If EITHER check fails the peer is not
+             * authenticated -- do NOT install keys. send-confirm = 0 (first).
+             */
+            {
+                unsigned char confirm_sta[32], confirm_ap[32];
+                int ok =
+                    sae_build_confirm(&sta, kck_sta, 0,
+                                      ap.commit_scalar, ap.commit_element,
+                                      confirm_sta) == 0 &&
+                    sae_build_confirm(&ap, kck_ap, 0,
+                                      sta.commit_scalar, sta.commit_element,
+                                      confirm_ap) == 0 &&
+                    /* station verifies AP's confirm; AP verifies station's. */
+                    sae_check_confirm(&sta, kck_sta, 0,
+                                      ap.commit_scalar, ap.commit_element,
+                                      confirm_ap) == 0 &&
+                    sae_check_confirm(&ap, kck_ap, 0,
+                                      sta.commit_scalar, sta.commit_element,
+                                      confirm_sta) == 0;
+
+                /* confirm done: the KCKs have served their purpose -- wipe. */
+                zero(kck_sta, sizeof(kck_sta));
+                zero(kck_ap, sizeof(kck_ap));
+                zero(confirm_sta, sizeof(confirm_sta));
+                zero(confirm_ap, sizeof(confirm_ap));
+                zero(pmk_ap, sizeof(pmk_ap));
+
+                if (!ok) {
+                    out("WPASUPP: SAE confirm FAILED\n");
+                    zero(pmk, sizeof(pmk));
+                    return 1;
+                }
+                out("WPASUPP: SAE confirm verified\n");
+            }
         } else {
             /* WPA2: PMK = PBKDF2(passphrase, SSID). */
             wpa_pmk(pass, (const uint8_t *)conn.ssid, ssid_len, pmk);
@@ -254,7 +294,7 @@ int main(int argc, char **argv) {
             out("WPASUPP: set_key failed\n");
             return 1;
         }
-        out("WPASUPP: 4way complete, keys installed\n");
+        out("WPASUPP: 4way complete (demo nonces; no live EAPOL yet), keys installed\n");
 
         /* ---- (d) poll for CONNECTED ------------------------------- */
         s = wait_state(UAPI_WLAN_ST_CONNECTED, 256);

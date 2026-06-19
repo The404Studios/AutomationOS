@@ -1067,6 +1067,10 @@ void kernel_main(void* raw_info) {
     extern void wifi_seam_selftest(void);
     wifi_seam_selftest();
 
+#if defined(WIFI_SIM) && defined(IWLWIFI)
+#error "wlan0 backend conflict: build WIFI_SIM (simulated) XOR IWLWIFI (real radio), not both -- both register wlan0"
+#endif
+
 #ifdef WIFI_SIM
     // WIFI-SIM: register the simulated wlan0 backend (fixed AP list + simulated
     // connect) so the whole scan->connect->DHCP flow runs in QEMU with no radio.

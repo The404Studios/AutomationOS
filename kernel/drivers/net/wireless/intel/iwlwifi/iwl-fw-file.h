@@ -65,8 +65,8 @@ struct iwl_ucode_tlv {
 #define IWL_UCODE_TLV_DATA                  2
 #define IWL_UCODE_TLV_INIT                  3
 #define IWL_UCODE_TLV_INIT_DATA             4
-#define IWL_UCODE_TLV_API_FLAGS             14
-#define IWL_UCODE_TLV_ENABLED_CAPABILITIES  18
+#define IWL_UCODE_TLV_FLAGS                 18  /* was misnamed API_FLAGS=14 (review fix) */
+#define IWL_UCODE_TLV_ENABLED_CAPABILITIES  30  /* was 18 (collided with FLAGS) */
 
 /*
  * struct iwl_fw -- the parsed result. The loader bricks read these sizes to

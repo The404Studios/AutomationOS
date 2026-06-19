@@ -311,6 +311,43 @@ int iwl_fw_selftest(void) {
         ok = 0;
     }
 
+    /* ---- negative test 4: oversized TLV length (declares far more payload than
+     * the blob holds); the `length > avail` bound must reject without OOB-read. */
+    static uint8_t oversized[IWL_FW_HDR_SIZE + IWL_TLV_HDR_SIZE];
+    for (uint32_t i = 0; i < IWL_FW_HDR_SIZE; i++) oversized[i] = iwl_synth_ucode[i];
+    oversized[IWL_FW_HDR_SIZE + 0] = 0x01;  /* type = INST            */
+    oversized[IWL_FW_HDR_SIZE + 1] = 0x00;
+    oversized[IWL_FW_HDR_SIZE + 2] = 0x00;
+    oversized[IWL_FW_HDR_SIZE + 3] = 0x00;
+    oversized[IWL_FW_HDR_SIZE + 4] = 0xF0;  /* length = 0xFFFFFFF0    */
+    oversized[IWL_FW_HDR_SIZE + 5] = 0xFF;
+    oversized[IWL_FW_HDR_SIZE + 6] = 0xFF;
+    oversized[IWL_FW_HDR_SIZE + 7] = 0xFF;
+    int rc_over = iwl_fw_parse(oversized, (uint32_t)sizeof(oversized), &fw_bad);
+    if (rc_over != -1) {
+        kprintf("IWL-FW: negative(oversized) FAILED -- expected -1 got %d\n", rc_over);
+        ok = 0;
+    }
+
+    /* ---- negative test 5: a TLV whose 4-byte-aligned advance overruns the blob
+     * (payload length 5 with no room for its alignment padding); the alignment
+     * guard must reject. ---- */
+    static uint8_t misaligned[IWL_FW_HDR_SIZE + IWL_TLV_HDR_SIZE + 5];
+    for (uint32_t i = 0; i < IWL_FW_HDR_SIZE; i++) misaligned[i] = iwl_synth_ucode[i];
+    misaligned[IWL_FW_HDR_SIZE + 0] = 0x01;  /* type = INST           */
+    misaligned[IWL_FW_HDR_SIZE + 1] = 0x00;
+    misaligned[IWL_FW_HDR_SIZE + 2] = 0x00;
+    misaligned[IWL_FW_HDR_SIZE + 3] = 0x00;
+    misaligned[IWL_FW_HDR_SIZE + 4] = 0x05;  /* length = 5 (unaligned) */
+    misaligned[IWL_FW_HDR_SIZE + 5] = 0x00;
+    misaligned[IWL_FW_HDR_SIZE + 6] = 0x00;
+    misaligned[IWL_FW_HDR_SIZE + 7] = 0x00;
+    int rc_mis = iwl_fw_parse(misaligned, (uint32_t)sizeof(misaligned), &fw_bad);
+    if (rc_mis != -1) {
+        kprintf("IWL-FW: negative(misaligned) FAILED -- expected -1 got %d\n", rc_mis);
+        ok = 0;
+    }
+
     if (ok) {
         kprintf("IWL-FW: PASS\n");
         return 0;

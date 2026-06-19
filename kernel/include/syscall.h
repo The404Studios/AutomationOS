@@ -127,6 +127,18 @@
 #define SYS_WLAN_STATUS     115 // association state (uapi_wlan_status_t)
 #define SYS_WLAN_DISCONNECT 116 // disconnect
 #define SYS_WLAN_SET_KEY    117 // supplicant installs PTK/GTK (uapi_wlan_setkey_t)
+// ---- Audio mixer surface (AUDIO-SYS) -- HDA volume / mute / test-tone / status.
+// Numbers 118-123 were FREE (113-117 went to WiFi, 200 to VMA test). Handlers in
+// syscall.c dispatch to hda_set_volume / hda_set_mute / audio_play_tone. The
+// default kernel always registers these (HDA is a default driver); on a machine
+// with no HDA controller the underlying audio_* calls return cleanly (negative),
+// so the syscalls are safe no-ops rather than hangs.
+#define SYS_AUDIO_VOLUME    118 // set output volume 0..100 (clamped) -> hda_set_volume
+#define SYS_AUDIO_MUTE      119 // set mute 0|1                       -> hda_set_mute
+#define SYS_AUDIO_OUTPUTS   120 // RESERVED (enumerate outputs)       -> ENOTSUP for now
+#define SYS_AUDIO_SELECT    121 // RESERVED (select active output)    -> ENOTSUP for now
+#define SYS_AUDIO_TEST      122 // play a test tone (arg1=freq Hz, arg2=ms, ms capped)
+#define SYS_AUDIO_STATUS    123 // fill user audio_status_t {present,volume,muted,_pad,codec_vendor}
 #define SYS_VMA_TEST    200 // VMA red-black tree testing and benchmarking
 
 // ---- SMP coprocessor offload (GATED: only registered under SMP_FOUNDATION) ----
@@ -152,6 +164,16 @@ typedef struct {
     uint32_t pitch;   // bytes per row
     uint32_t bpp;     // bits per pixel
 } fb_acquire_t;
+
+// Audio device status returned by SYS_AUDIO_STATUS (filled via copy_to_user).
+// 8 bytes, naturally aligned so userspace and kernel agree on the layout.
+typedef struct {
+    uint8_t  present;       // 1 = an HDA controller + codec is up, else 0
+    uint8_t  volume;        // last volume set via SYS_AUDIO_VOLUME (0..100)
+    uint8_t  muted;         // 1 = muted (last SYS_AUDIO_MUTE), else 0
+    uint8_t  _pad;          // alignment padding
+    uint32_t codec_vendor;  // codec vendor/device id (HDA GET_PARAMETER VENDOR_ID)
+} audio_status_t;
 
 // Buffer size limits
 #define MAX_READ_SIZE   (1024 * 1024)  // 1MB

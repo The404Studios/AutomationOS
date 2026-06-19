@@ -70,6 +70,31 @@ if [ "${NET_SELFTEST:-0}" = "1" ]; then
 fi
 
 # ─────────────────────────────────────────────────────────────────────────────
+# OPT-IN: audio playback self-test (AUDIO_SELFTEST).
+#   AUDIO_SELFTEST=1 bash scripts/quick_build.sh
+# DEFAULT OFF (no boot chime in normal builds). Plays one short 440 Hz / 200 ms
+# tone at the end of HDA init so a headless verify can assert real DMA playback:
+# the serial log shows "HDA: Initialization complete" then
+# "AUDIO: tone done bcis=<N> lpib_adv=<D>" with N>0 OR D>0. Requires QEMU booted
+# with an HDA output codec, e.g.:
+#   -audiodev dsound,id=snd0 -device intel-hda -device hda-output,audiodev=snd0
+# (audiodev MUST bind to hda-output, NOT to intel-hda). Safe no-op with no HDA HW.
+# ─────────────────────────────────────────────────────────────────────────────
+# HDA_ENABLE=1: compile in HD Audio init (hda_init at boot). DEFAULT OFF -- HDA
+# was gated behind the always-on T410_SAFE_BOOT, so it was compiled out
+# EVERYWHERE (no sound, even in QEMU). QEMU's emulated HDA works fine; the real
+# T410's HDA can hang on controller reset, so this stays opt-in. The audio demo
+# and the Sound Manager need HDA_ENABLE=1.
+if [ "${HDA_ENABLE:-0}" = "1" ]; then
+    CFLAGS="$CFLAGS -DHDA_ENABLE"
+    echo "*** HDA_ENABLE build: HD Audio init ENABLED (QEMU-safe; T410-unsafe) ***"
+fi
+if [ "${AUDIO_SELFTEST:-0}" = "1" ]; then
+    CFLAGS="$CFLAGS -DAUDIO_SELFTEST -DHDA_ENABLE"
+    echo "*** AUDIO_SELFTEST build: HDA enabled + boot test-tone (HDA DMA proof) ***"
+fi
+
+# ─────────────────────────────────────────────────────────────────────────────
 # OPT-IN: durable on-disk persistence (AHCI/SATA + diskfs at boot).
 #   DISK_PERSIST=1 bash scripts/quick_build.sh
 # DEFAULT OFF. ahci_init() pokes real SATA-controller MMIO at boot, a documented

@@ -205,6 +205,24 @@ void hda_init(void) {
         return;
     }
 
+    /*
+     * AUDIO-IRQ: register hda_irq_handler() on the controller's PCI interrupt
+     * line so the stream DMA engine's buffer-completion (BCIS) interrupts are
+     * actually serviced.  The handler reads INTSTS, walks the streams, clears
+     * SD_STS and bumps the global g_hda_bcis counter -- proof the DMA engine
+     * advanced.  Without this registration the handler in hda_stream.c was dead
+     * code: INTCTL=0x800000FF enables the controller to RAISE interrupts, but
+     * nothing dispatched them to the driver.
+     *
+     * irq_register_handler() (idt.c) installs the handler AND unmasks the line.
+     * It ignores irq >= 16, so a bogus/absent interrupt_line is harmless.
+     * Safe on the no-device path: hda_init() already returned before here if no
+     * controller was found, so we only register for a real, reset, enumerated
+     * controller.
+     */
+    extern void irq_register_handler(uint8_t irq, void (*handler)(void));
+    irq_register_handler(g_hda_ctrl->irq_line, hda_irq_handler);
+
     serial_write("HDA: Initialization complete\n", 30);
 }
 
@@ -434,44 +452,47 @@ static int hda_wait_for_response(hda_controller_t* ctrl, uint32_t* response) {
 }
 
 /**
- * Send a verb command to a codec and wait for response.
- * Use this for 12-bit verbs (verb in [0x100..0xFFF], param is 8-bit).
+ * hda_immediate_command -- send one codec verb via the Immediate Command
+ * Interface (IC/IR/ICS, HDA spec §3.4.3) and return the 32-bit response, or
+ * 0xFFFFFFFF on timeout. A CORB/RIRB-DMA-free path: QEMU's intel-hda (and real
+ * codecs) answer this reliably even when the CORB/RIRB response polling did not
+ * (every verb timed out -> vendor id 0xFFFFFFFF). Bounded waits; never hangs.
+ */
+static uint32_t hda_immediate_command(hda_controller_t* ctrl, uint32_t verb) {
+    int t;
+    /* 1. wait until the controller is idle (no in-flight immediate command). */
+    for (t = 1000; t > 0; t--) {
+        if (!(hda_read16(ctrl, HDA_REG_ICS) & HDA_ICS_ICB)) break;
+        hda_msleep(1);
+    }
+    /* 2. clear any stale Immediate-Result-Valid (RW1C). */
+    hda_write16(ctrl, HDA_REG_ICS, HDA_ICS_IRV);
+    /* 3. write the verb, then issue it by setting the busy bit. */
+    hda_write32(ctrl, HDA_REG_IC, verb);
+    asm volatile("sfence" ::: "memory");
+    hda_write16(ctrl, HDA_REG_ICS, HDA_ICS_ICB);
+    /* 4. poll for result-valid, then read the response. */
+    for (t = 1000; t > 0; t--) {
+        uint16_t ics = hda_read16(ctrl, HDA_REG_ICS);
+        if (ics & HDA_ICS_IRV) {
+            uint32_t r = hda_read32(ctrl, HDA_REG_IR);
+            hda_write16(ctrl, HDA_REG_ICS, HDA_ICS_IRV);  /* clear for next */
+            return r;
+        }
+        hda_msleep(1);
+    }
+    serial_write("HDA: immediate cmd timeout\n", 28);
+    return 0xFFFFFFFF;
+}
+
+/**
+ * Send a 12-bit verb (verb in [0x100..0xFFF], param 8-bit) and return the
+ * response. Uses the Immediate Command Interface (the CORB/RIRB DMA path timed
+ * out on every response under QEMU).
  */
 uint32_t hda_send_command(hda_controller_t* ctrl, uint8_t codec_addr,
                           uint8_t nid, uint32_t verb, uint32_t param) {
-    // Build verb command
-    uint32_t cmd = hda_build_verb(codec_addr, nid, verb, param);
-
-    // Write to CORB
-    ctrl->corb_wp = (ctrl->corb_wp + 1) % HDA_CORB_ENTRIES;
-    ctrl->corb_virt[ctrl->corb_wp].data = cmd;
-
-    /*
-     * Memory barrier before updating CORBWP.
-     *
-     * The CORB DMA engine (inside the HDA controller) begins fetching the
-     * new command as soon as CORBWP is written.  We must guarantee that the
-     * verb write to corb_virt[] (normal WB memory) is visible to the
-     * controller's DMA before it sees the new write-pointer value in MMIO.
-     * On x86 TSO the CPU won't reorder store→store within the same address
-     * type, but WB→UC stores can be reordered on some implementations without
-     * an explicit store fence (SFENCE / MFENCE).  The asm volatile("" :::
-     * "memory") compiler barrier is always sufficient to prevent the
-     * compiler from sinking the store past the MMIO write; SFENCE closes
-     * the hardware reorder window.
-     */
-    asm volatile("sfence" ::: "memory");
-
-    // Update CORB write pointer register
-    hda_write16(ctrl, HDA_REG_CORBWP, ctrl->corb_wp);
-
-    // Wait for response
-    uint32_t response = 0;
-    if (hda_wait_for_response(ctrl, &response) != 0) {
-        return 0xFFFFFFFF;  // Error response
-    }
-
-    return response;
+    return hda_immediate_command(ctrl, hda_build_verb(codec_addr, nid, verb, param));
 }
 
 /**
@@ -485,18 +506,7 @@ uint32_t hda_send_command(hda_controller_t* ctrl, uint8_t codec_addr,
  */
 uint32_t hda_send_verb4(hda_controller_t* ctrl, uint8_t codec_addr,
                         uint8_t nid, uint8_t verb4, uint16_t payload16) {
-    uint32_t cmd = hda_build_verb4(codec_addr, nid, verb4, payload16);
-
-    ctrl->corb_wp = (ctrl->corb_wp + 1) % HDA_CORB_ENTRIES;
-    ctrl->corb_virt[ctrl->corb_wp].data = cmd;
-    asm volatile("sfence" ::: "memory");  /* flush verb write before CORBWP MMIO update */
-    hda_write16(ctrl, HDA_REG_CORBWP, ctrl->corb_wp);
-
-    uint32_t response = 0;
-    if (hda_wait_for_response(ctrl, &response) != 0) {
-        return 0xFFFFFFFF;
-    }
-    return response;
+    return hda_immediate_command(ctrl, hda_build_verb4(codec_addr, nid, verb4, payload16));
 }
 
 /**

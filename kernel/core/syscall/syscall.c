@@ -9,6 +9,7 @@
 #include "../../include/socket.h" // sys_sock_* (BSD socket) prototypes
 #include "../../include/poll.h"   // POLL-SELECT-0: sys_poll / sys_select prototypes
 #include "../../include/audio.h" // audio_beep (SYS_BEEP target)
+#include "../../include/mem.h"   // copy_to_user / COPY_SUCCESS (SYS_AUDIO_STATUS)
 #include "../../include/acpi.h"  // power_off / power_reboot (SYS_POWEROFF/REBOOT)
 #include "../../include/pci.h"   // sys_pci_list (SYS_PCI_LIST=92)
 // NOTE: do NOT include compat/errno.h here. It defines EINVAL/ENOTSUP as
@@ -32,6 +33,74 @@ static int64_t sys_beep(uint64_t freq_hz, uint64_t duration_ms,
                         uint64_t arg5, uint64_t arg6) {
     (void)arg3; (void)arg4; (void)arg5; (void)arg6;
     return (int64_t)audio_beep((uint32_t)freq_hz, (uint32_t)duration_ms);
+}
+
+/* ─── AUDIO-SYS: the userspace mixer surface (SYS_AUDIO_*) ────────────────────
+ *
+ * A thin, guarded gateway from ring 3 to the HDA driver's volume/mute/tone
+ * controls.  The driver itself is fire-and-forget (it does not retain the last
+ * volume/mute), so we mirror them here for SYS_AUDIO_STATUS.  All handlers
+ * mirror sys_beep's signature and degrade safely when no HDA hardware is
+ * present (audio_* return negative; we surface that as a negative result).
+ */
+static volatile uint8_t g_audio_volume = 80;   /* last set volume (0..100)     */
+static volatile uint8_t g_audio_muted  = 0;    /* last set mute   (0|1)        */
+
+/* SYS_AUDIO_VOLUME=118: arg1 = 0..100 (clamped). -> hda_set_volume on codec 0. */
+static int64_t sys_audio_volume(uint64_t vol, uint64_t arg2, uint64_t arg3,
+                                uint64_t arg4, uint64_t arg5, uint64_t arg6) {
+    (void)arg2; (void)arg3; (void)arg4; (void)arg5; (void)arg6;
+    if (vol > 100) vol = 100;                  /* clamp, never trust ring 3     */
+    hda_controller_t* ctrl = hda_find_controller();
+    if (!ctrl || ctrl->num_codecs == 0) return ENODEV;
+    g_audio_volume = (uint8_t)vol;
+    return (int64_t)hda_set_volume(ctrl->codecs[0], ctrl, (uint8_t)vol);
+}
+
+/* SYS_AUDIO_MUTE=119: arg1 = 0|1. -> hda_set_mute on codec 0. */
+static int64_t sys_audio_mute(uint64_t mute, uint64_t arg2, uint64_t arg3,
+                              uint64_t arg4, uint64_t arg5, uint64_t arg6) {
+    (void)arg2; (void)arg3; (void)arg4; (void)arg5; (void)arg6;
+    hda_controller_t* ctrl = hda_find_controller();
+    if (!ctrl || ctrl->num_codecs == 0) return ENODEV;
+    bool m = (mute != 0);
+    g_audio_muted = m ? 1 : 0;
+    return (int64_t)hda_set_mute(ctrl->codecs[0], ctrl, m);
+}
+
+/* SYS_AUDIO_TEST=122: arg1 = freq Hz, arg2 = ms (capped at 2000). Plays a tone.
+ * Blocks for the duration (same model as SYS_BEEP). */
+static int64_t sys_audio_test(uint64_t freq_hz, uint64_t ms, uint64_t arg3,
+                              uint64_t arg4, uint64_t arg5, uint64_t arg6) {
+    (void)arg3; (void)arg4; (void)arg5; (void)arg6;
+    if (ms > 2000) ms = 2000;                  /* cap: never block ring 3 long  */
+    return (int64_t)audio_play_tone((uint32_t)freq_hz, (uint32_t)ms);
+}
+
+/* SYS_AUDIO_STATUS=123: arg1 = user ptr to audio_status_t. Fills it via
+ * copy_to_user (never dereference the raw user pointer directly). */
+static int64_t sys_audio_status(uint64_t user_ptr, uint64_t arg2, uint64_t arg3,
+                                uint64_t arg4, uint64_t arg5, uint64_t arg6) {
+    (void)arg2; (void)arg3; (void)arg4; (void)arg5; (void)arg6;
+    if (user_ptr == 0) return EINVAL;
+
+    audio_status_t st;
+    st.present      = 0;
+    st.volume       = g_audio_volume;
+    st.muted        = g_audio_muted;
+    st._pad         = 0;
+    st.codec_vendor = 0;
+
+    hda_controller_t* ctrl = hda_find_controller();
+    if (ctrl && ctrl->num_codecs > 0 && ctrl->codecs[0]) {
+        st.present      = 1;
+        st.codec_vendor = ctrl->codecs[0]->vendor_id;
+    }
+
+    if (copy_to_user((void*)user_ptr, &st, sizeof(st)) != COPY_SUCCESS) {
+        return EFAULT;
+    }
+    return 0;
 }
 
 /* sys_poweroff / sys_reboot live in handlers.c (canonical definitions).
@@ -111,6 +180,15 @@ void syscall_init(void) {
 
     // Audio beep (HDA tone playback)
     syscall_table[SYS_BEEP] = sys_beep;
+
+    // AUDIO-SYS: userspace mixer surface (volume/mute/test-tone/status). Always
+    // registered (HDA is a default driver); the handlers return ENODEV cleanly
+    // when no controller/codec is present, so they are safe no-ops on diskless/
+    // audioless boots. 120/121 (OUTPUTS/SELECT) are reserved -> ENOTSUP (NULL).
+    syscall_table[SYS_AUDIO_VOLUME] = sys_audio_volume;
+    syscall_table[SYS_AUDIO_MUTE]   = sys_audio_mute;
+    syscall_table[SYS_AUDIO_TEST]   = sys_audio_test;
+    syscall_table[SYS_AUDIO_STATUS] = sys_audio_status;
 
     // Power management: ACPI poweroff (S5) and reboot
     syscall_table[SYS_POWEROFF] = sys_poweroff;

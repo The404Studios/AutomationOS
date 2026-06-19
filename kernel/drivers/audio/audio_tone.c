@@ -40,6 +40,39 @@ extern void hda_msleep(uint32_t ms);
  * use and kept around (HDA streams are a scarce hardware resource). */
 static hda_stream_t* g_tone_stream = NULL;
 
+/*
+ * hda_active_lpib - read the active tone stream's Link Position In Buffer.
+ *
+ * SD_LPIB (HDA spec §3.3.39) is the byte offset the stream DMA engine has
+ * consumed within the cyclic buffer.  Reading it before and after playback and
+ * comparing the two values proves the DMA engine moved -- the most direct,
+ * interrupt-independent evidence that audio actually streamed out the link.
+ * Returns 0 if no tone stream is currently allocated.
+ */
+uint32_t hda_active_lpib(void) {
+    hda_controller_t* ctrl = hda_find_controller();
+    if (!ctrl || !g_tone_stream) return 0;
+    return hda_sd_read32(ctrl, g_tone_stream->stream_num, HDA_SD_LPIB);
+}
+
+/* Helper used by the AUDIO-VERIFY marker: print a small unsigned decimal to
+ * the serial console (no printf in this freestanding TU). */
+static void tone_serial_u32(uint32_t v) {
+    char tmp[12];
+    int i = 0;
+    if (v == 0) {
+        serial_putchar('0');
+        return;
+    }
+    while (v && i < 11) {
+        tmp[i++] = (char)('0' + (v % 10u));
+        v /= 10u;
+    }
+    while (i > 0) {
+        serial_putchar(tmp[--i]);
+    }
+}
+
 /* Fixed-point sine table: 256 entries, one full period, range [-32767,32767].
  * Generated with a 5th-order minimax-ish polynomial at build-relevant precision
  * is overkill here; instead we synthesise the table at init with a small CORDIC-
@@ -196,13 +229,34 @@ int audio_play_tone(uint32_t freq_hz, uint32_t ms) {
         return -1;
     }
 
+    /* AUDIO-VERIFY: snapshot the DMA link position right after the stream is
+     * running, before we sleep.  After the duration we read it again; the delta
+     * is how many bytes the DMA engine consumed.  Either a non-zero BCIS count
+     * (real interrupts serviced) OR a non-zero LPIB delta (real DMA movement)
+     * proves audio actually played -- not just that the registers were poked. */
+    uint32_t lpib_before = hda_sd_read32(ctrl, g_tone_stream->stream_num, HDA_SD_LPIB);
+    uint32_t bcis_before = g_hda_bcis;
+
     /* Block for the requested duration while DMA loops the buffer. */
     if (ms == 0) ms = 200;
     hda_msleep(ms);
 
+    /* Read LPIB while the stream is STILL running (stopping resets it). */
+    uint32_t lpib_after = hda_sd_read32(ctrl, g_tone_stream->stream_num, HDA_SD_LPIB);
+    uint32_t lpib_delta = lpib_after - lpib_before;  /* wraps cleanly mod 2^32 */
+    uint32_t bcis_total = g_hda_bcis;
+    (void)bcis_before;
+
     hda_stream_stop(ctrl, g_tone_stream);
 
-    serial_write("AUDIO: tone done\n", 17);
+    /* The proof marker the headless verify asserts on:
+     *   "AUDIO: tone done bcis=<N> lpib_adv=<D>"
+     * N>0 OR D>0 == real DMA playback happened. */
+    serial_write("AUDIO: tone done bcis=", 22);
+    tone_serial_u32(bcis_total);
+    serial_write(" lpib_adv=", 10);
+    tone_serial_u32(lpib_delta);
+    serial_putchar('\n');
     return 0;
 }
 

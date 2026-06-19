@@ -39,6 +39,13 @@
 #define HDA_REG_RIRBCTL           0x5C    // RIRB Control
 #define HDA_REG_RIRBSTS           0x5D    // RIRB Status
 #define HDA_REG_RIRBSIZE          0x5E    // RIRB Size
+// Immediate Command Interface (HDA spec §3.4.3) -- a CORB/RIRB-free path for
+// single codec verbs. More reliable than CORB/RIRB DMA under QEMU's intel-hda.
+#define HDA_REG_IC                0x60    // Immediate Command (write the 32-bit verb)
+#define HDA_REG_IR                0x64    // Immediate Response (read the 32-bit result)
+#define HDA_REG_ICS               0x68    // Immediate Command Status (16-bit)
+#define HDA_ICS_ICB               0x0001  // Immediate Command Busy (write 1 to issue)
+#define HDA_ICS_IRV               0x0002  // Immediate Result Valid (RW1C)
 #define HDA_REG_DPLBASE           0x70    // DMA Position Lower Base Address
 #define HDA_REG_DPUBASE           0x74    // DMA Position Upper Base Address
 
@@ -314,6 +321,22 @@ int hda_set_mute(hda_codec_t* codec, hda_controller_t* ctrl, bool mute);
 
 // Interrupt handler
 void hda_irq_handler(void);
+
+/*
+ * AUDIO-IRQ proof counter: incremented inside hda_irq_handler() every time a
+ * stream's buffer-completion (BCIS) status bit is observed.  A non-zero value
+ * proves the stream DMA engine advanced through at least one BDL entry and the
+ * controller raised (and we serviced) a real interrupt.  Read by the
+ * AUDIO-VERIFY marker in audio_tone.c.  volatile: written from IRQ context,
+ * read from task context.
+ */
+extern volatile uint32_t g_hda_bcis;
+
+/* Read the active stream's Link Position In Buffer (SD_LPIB).  Returns the
+ * byte position the DMA engine has consumed; a delta across playback proves
+ * real DMA movement even on builds where the BCIS interrupt does not fire.
+ * Returns 0 if no tone stream is active. */
+uint32_t hda_active_lpib(void);
 
 // Register access helpers
 static inline uint32_t hda_read32(hda_controller_t* ctrl, uint32_t offset) {

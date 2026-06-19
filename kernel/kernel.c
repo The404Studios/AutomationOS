@@ -928,21 +928,37 @@ void kernel_main(void* raw_info) {
 #endif
     boot_mark("timer ok");
 
-#ifndef T410_SAFE_BOOT
+#ifdef HDA_ENABLE
     /* HD Audio: PCI-scan for an Intel HDA controller, reset it, set up
      * CORB/RIRB, enumerate the codec, and configure a DAC->pin output path.
      * Must come after pci_init() AND pit_init() -- hda_msleep() uses
      * timer_get_ticks() which requires a running PIT tick counter.
-     * GATED by T410_SAFE_BOOT: the T410's real HDA hardware hangs during
-     * controller reset or codec enumeration (QEMU's emulated HDA works fine).
+     * OPT-IN via HDA_ENABLE (DEFAULT OFF): T410_SAFE_BOOT used to gate this, but
+     * since T410_SAFE_BOOT is always defined, HDA was compiled out EVERYWHERE --
+     * including QEMU, which is why sound never worked. The real T410's HDA hangs
+     * during controller reset / codec enumeration, so HDA stays off on the safe
+     * boot path; QEMU's emulated HDA works fine -- build HDA_ENABLE=1 for audio.
      * Safe when no HDA device is present (hda_init returns cleanly). */
     boot_mark("audio (HDA)");
     BOOT_LOG("[KERNEL] Initializing HD Audio (HDA)...\n");
     extern void hda_init(void);
     hda_init();
     boot_mark("audio ok");
+
+#ifdef AUDIO_SELFTEST
+    /* AUDIO-SELFTEST (build flag -DAUDIO_SELFTEST, DEFAULT OFF -- no boot chime
+     * in normal builds): play one short 440 Hz / 200 ms test tone so a headless
+     * verify can assert real DMA playback. audio_play_tone() prints the marker
+     *   "AUDIO: tone done bcis=<N> lpib_adv=<D>"
+     * and N>0 OR D>0 proves the DMA engine advanced. Safe no-op if no HDA HW
+     * (audio_play_tone returns negative without playing or hanging). */
+    {
+        extern int audio_play_tone(uint32_t, uint32_t);
+        audio_play_tone(440, 200);
+    }
+#endif
 #else
-    BOOT_LOG("[KERNEL] HDA audio skipped (T410_SAFE_BOOT)\n");
+    BOOT_LOG("[KERNEL] HDA audio skipped (build with HDA_ENABLE=1 to enable; T410-unsafe)\n");
 #endif
 
     // Storage: generic block layer + AHCI/SATA driver (#13). PMM, heap, PCI and

@@ -562,6 +562,13 @@ int hda_set_mute(hda_codec_t* codec, hda_controller_t* ctrl, bool mute) {
     return 0;
 }
 
+/*
+ * AUDIO-IRQ proof counter (declared extern in hda.h).  Incremented once per
+ * stream-BCIS observed in the IRQ handler.  Lives here (not hda.c) so it sits
+ * right next to the only writer.  volatile: IRQ-written, task-read.
+ */
+volatile uint32_t g_hda_bcis = 0;
+
 /**
  * Interrupt handler for HDA
  */
@@ -585,7 +592,12 @@ void hda_irq_handler(void) {
 
                 // Handle buffer completion interrupt
                 if (sts & HDA_SD_STS_BCIS) {
-                    // Buffer completed - could trigger a callback here
+                    // Buffer completed: the DMA engine finished one BDL entry.
+                    // Bump the global proof counter (AUDIO-IRQ) -- a non-zero
+                    // value proves the stream DMA engine advanced and a real
+                    // interrupt was raised + serviced.  Could also trigger a
+                    // refill callback here for streaming playback.
+                    g_hda_bcis++;
                 }
 
                 // Handle FIFO error

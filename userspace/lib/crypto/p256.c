@@ -62,19 +62,26 @@
  */
 
 #include "p256.h"
+#include "p256_internal.h"   /* shared limb/point types + the SAE-facing API */
 
 /* =========================================================================
  * Internal types
- * ========================================================================= */
+ * =========================================================================
+ *
+ * The limb/aggregate types live in p256_internal.h so that sae.c can share
+ * the exact same layout.  We keep the short local names (u32/u64/fe/pt) used
+ * throughout this file as aliases to the header types -- this is purely a
+ * spelling convenience and changes no behaviour.
+ */
 
-typedef unsigned int       u32;
-typedef unsigned long long u64;
+typedef p256_u32 u32;
+typedef p256_u64 u64;
 
 /* A 256-bit field element, little-endian 32-bit limbs. */
-typedef struct { u32 w[8]; } fe;
+typedef p256_fe fe;
 
 /* A projective (Jacobian) point on P-256. */
-typedef struct { fe X; fe Y; fe Z; } pt;
+typedef p256_pt pt;
 
 /* =========================================================================
  * Private memory helpers (no libc)
@@ -109,24 +116,39 @@ static int p_memcmp(const void *a, const void *b, unsigned long n)
  * Curve constants in little-endian limb form
  * ========================================================================= */
 
+/*
+ * These constants are defined with EXTERNAL linkage (the P256_* names) so the
+ * SAE module can reference them via p256_internal.h.  The original local
+ * names (FIELD_P/ORDER_N/CURVE_B/BASE_GX/BASE_GY) used throughout this file
+ * are kept as macro aliases below, so every existing reference is byte-for-
+ * byte unchanged.  The numeric values are identical to before.
+ */
+
 /* p = 2^256 - 2^224 + 2^192 + 2^96 - 1 */
-static const fe FIELD_P = {{ 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0x00000000,
-                              0x00000000, 0x00000000, 0x00000001, 0xFFFFFFFF }};
+const fe P256_FIELD_P = {{ 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0x00000000,
+                            0x00000000, 0x00000000, 0x00000001, 0xFFFFFFFF }};
 
 /* n = group order */
-static const fe ORDER_N = {{ 0xFC632551, 0xF3B9CAC2, 0xA7179E84, 0xBCE6FAAD,
-                              0xFFFFFFFF, 0xFFFFFFFF, 0x00000000, 0xFFFFFFFF }};
+const fe P256_ORDER_N = {{ 0xFC632551, 0xF3B9CAC2, 0xA7179E84, 0xBCE6FAAD,
+                            0xFFFFFFFF, 0xFFFFFFFF, 0x00000000, 0xFFFFFFFF }};
 
 /* b (curve coefficient) */
-static const fe CURVE_B = {{ 0x27D2604B, 0x3BCE3C3E, 0xCC53B0F6, 0x651D06B0,
-                              0x769886BC, 0xB3EBBD55, 0xAA3A93E7, 0x5AC635D8 }};
+const fe P256_CURVE_B = {{ 0x27D2604B, 0x3BCE3C3E, 0xCC53B0F6, 0x651D06B0,
+                            0x769886BC, 0xB3EBBD55, 0xAA3A93E7, 0x5AC635D8 }};
 
 /* Base point G in affine, stored as Jacobian with Z=1. */
-static const fe BASE_GX = {{ 0xD898C296, 0xF4A13945, 0x2DEB33A0, 0x77037D81,
-                              0x63A440F2, 0xF8BCE6E5, 0xE12C4247, 0x6B17D1F2 }};
+const fe P256_BASE_GX = {{ 0xD898C296, 0xF4A13945, 0x2DEB33A0, 0x77037D81,
+                            0x63A440F2, 0xF8BCE6E5, 0xE12C4247, 0x6B17D1F2 }};
 
-static const fe BASE_GY = {{ 0x37BF51F5, 0xCBB64068, 0x6B315ECE, 0x2BCE3357,
-                              0x7C0F9E16, 0x8EE7EB4A, 0xFE1A7F9B, 0x4FE342E2 }};
+const fe P256_BASE_GY = {{ 0x37BF51F5, 0xCBB64068, 0x6B315ECE, 0x2BCE3357,
+                            0x7C0F9E16, 0x8EE7EB4A, 0xFE1A7F9B, 0x4FE342E2 }};
+
+/* Local short aliases (unchanged spelling for the rest of this file). */
+#define FIELD_P  P256_FIELD_P
+#define ORDER_N  P256_ORDER_N
+#define CURVE_B  P256_CURVE_B
+#define BASE_GX  P256_BASE_GX
+#define BASE_GY  P256_BASE_GY
 
 /* =========================================================================
  * 256-bit field arithmetic mod p
@@ -977,6 +999,140 @@ int p256_ecdsa_verify(const unsigned char pub65[65],
     if (fe_cmp(&ax_mod_n, &fr) != 0) return -1;
     return 0;
 }
+
+/* =========================================================================
+ * Extra field primitives needed by WPA3 SAE (dragonfly).
+ * =========================================================================
+ *
+ * These are NEW functions; they do not alter any of the logic above.
+ * fe_pow generalises the fe_inv exponentiation ladder to an arbitrary
+ * exponent; fe_sqrt and fe_is_quadratic_residue build on it.
+ */
+
+/*
+ * fe_pow: out = base ^ exp mod p, exp = eight 32-bit LE limbs (exp[0]=LSW).
+ * Identical square-and-multiply structure to fe_inv (which is fe_pow with
+ * exp = p-2), MSB-first over all 256 bits.
+ */
+static void fe_pow(fe *out, const fe *base, const u32 exp[8])
+{
+    fe r, b;
+    fe_copy(&b, base);
+
+    /* r = 1 */
+    fe_zero(&r);
+    r.w[0] = 1;
+
+    for (int i = 255; i >= 0; i--) {
+        fe_sqr(&r, &r);
+        int word = i >> 5;
+        int bit  = i & 31;
+        if ((exp[word] >> bit) & 1u) {
+            fe_mul(&r, &r, &b);
+        }
+    }
+    fe_copy(out, &r);
+}
+
+/*
+ * (p+1)/4 as eight 32-bit LE words.
+ *   p   = FFFFFFFF 00000001 00000000 00000000 00000000 FFFFFFFF FFFFFFFF FFFFFFFF
+ *   p+1 = FFFFFFFF 00000001 00000000 00000000 00000001 00000000 00000000 00000000
+ *   (p+1)/4 (shift right 2):
+ *       = 3FFFFFFF C0000000 40000000 00000000 00000000 40000000 00000000 00000000
+ *   LE limbs (w0 = LSW):
+ */
+static const u32 P_PLUS_1_DIV_4[8] = {
+    0x00000000, 0x00000000, 0x40000000, 0x00000000,
+    0x00000000, 0x40000000, 0xC0000000, 0x3FFFFFFF
+};
+
+/*
+ * (p-1)/2 as eight 32-bit LE words (Euler's criterion exponent).
+ *   p-1 = FFFFFFFF 00000001 00000000 00000000 00000000 FFFFFFFF FFFFFFFF FFFFFFFE
+ *   (p-1)/2 (shift right 1):
+ *       = 7FFFFFFF 80000000 80000000 00000000 00000000 7FFFFFFF FFFFFFFF FFFFFFFF
+ *   LE limbs (w0 = LSW):
+ */
+static const u32 P_MINUS_1_DIV_2[8] = {
+    0xFFFFFFFF, 0xFFFFFFFF, 0x7FFFFFFF, 0x00000000,
+    0x00000000, 0x80000000, 0x80000000, 0x7FFFFFFF
+};
+
+/*
+ * fe_sqrt: out = sqrt(a) mod p.  Because p === 3 (mod 4), the principal
+ * square root is a^((p+1)/4) mod p.  We then verify out^2 == a; returns 1 if
+ * a is a QR (root valid), 0 otherwise.  a must be < p.
+ */
+static int fe_sqrt(fe *out, const fe *a)
+{
+    fe root, chk;
+    fe_pow(&root, a, P_PLUS_1_DIV_4);
+    fe_sqr(&chk, &root);
+    /* both root^2 and a are canonical (< p) here, so a direct compare works */
+    if (fe_cmp(&chk, a) != 0) {
+        return 0;
+    }
+    fe_copy(out, &root);
+    return 1;
+}
+
+/*
+ * fe_is_quadratic_residue: returns 1 iff a is a non-zero quadratic residue
+ * mod p, i.e. a^((p-1)/2) == 1 (Euler's criterion).  Returns 0 for a == 0
+ * and for non-residues (where the Legendre symbol is p-1).
+ */
+static int fe_is_quadratic_residue(const fe *a)
+{
+    fe r, one;
+    if (fe_is_zero(a)) return 0;
+    fe_pow(&r, a, P_MINUS_1_DIV_2);
+    fe_zero(&one); one.w[0] = 1;
+    return fe_cmp(&r, &one) == 0;
+}
+
+/* =========================================================================
+ * External-linkage wrappers for SAE (declared in p256_internal.h).
+ * =========================================================================
+ *
+ * Each forwards to the corresponding static implementation above WITHOUT any
+ * change of behaviour.  Promoting via thin wrappers (rather than dropping the
+ * `static` keyword in place) keeps every internal call site bound to the
+ * original symbol and leaves the proven ECDH/ECDSA code path untouched.
+ */
+void p256_fe_zero(p256_fe *out)                              { fe_zero(out); }
+void p256_fe_copy(p256_fe *out, const p256_fe *a)            { fe_copy(out, a); }
+int  p256_fe_is_zero(const p256_fe *a)                       { return fe_is_zero(a); }
+int  p256_fe_cmp(const p256_fe *a, const p256_fe *b)         { return fe_cmp(a, b); }
+void p256_fe_add(p256_fe *o, const p256_fe *a, const p256_fe *b) { fe_add(o, a, b); }
+void p256_fe_sub(p256_fe *o, const p256_fe *a, const p256_fe *b) { fe_sub(o, a, b); }
+void p256_fe_mul(p256_fe *o, const p256_fe *a, const p256_fe *b) { fe_mul(o, a, b); }
+void p256_fe_sqr(p256_fe *o, const p256_fe *a)               { fe_sqr(o, a); }
+void p256_fe_inv(p256_fe *o, const p256_fe *a)               { fe_inv(o, a); }
+void p256_fe_neg(p256_fe *o, const p256_fe *a)               { fe_neg(o, a); }
+void p256_fe_from_bytes(p256_fe *o, const unsigned char b[32]) { fe_from_bytes(o, b); }
+void p256_fe_to_bytes(unsigned char b[32], const p256_fe *in)  { fe_to_bytes(b, in); }
+void p256_fe_pow(p256_fe *o, const p256_fe *base, const p256_u32 exp[8])
+                                                             { fe_pow(o, base, exp); }
+int  p256_fe_sqrt(p256_fe *o, const p256_fe *a)              { return fe_sqrt(o, a); }
+int  p256_fe_is_quadratic_residue(const p256_fe *a)          { return fe_is_quadratic_residue(a); }
+
+int  p256_fe_cmp_n(const p256_fe *a)                         { return fe_cmp_n(a); }
+void p256_fe_cond_sub_n(p256_fe *a)                          { fe_cond_sub_n(a); }
+void p256_fe_mul_n(p256_fe *o, const p256_fe *a, const p256_fe *b) { fe_mul_n(o, a, b); }
+void p256_fe_inv_n(p256_fe *o, const p256_fe *a)             { fe_inv_n(o, a); }
+
+int  p256_point_on_curve(const p256_fe *x, const p256_fe *y) { return point_on_curve(x, y); }
+void p256_pt_infinity(p256_pt *P)                            { pt_infinity(P); }
+int  p256_pt_is_infinity(const p256_pt *P)                   { return pt_is_infinity(P); }
+void p256_pt_from_affine(p256_pt *P, const p256_fe *x, const p256_fe *y)
+                                                             { pt_from_affine(P, x, y); }
+void p256_pt_to_affine(p256_fe *ax, p256_fe *ay, const p256_pt *P)
+                                                             { pt_to_affine(ax, ay, P); }
+void p256_pt_add(p256_pt *R, const p256_pt *P, const p256_pt *Q) { pt_add(R, P, Q); }
+void p256_pt_dbl(p256_pt *R, const p256_pt *P)               { pt_dbl(R, P); }
+void p256_pt_scalar_mul(p256_pt *R, const p256_pt *P, const unsigned char k[32])
+                                                             { pt_scalar_mul(R, P, k); }
 
 /* =========================================================================
  * Self-test

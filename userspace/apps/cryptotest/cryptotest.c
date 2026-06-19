@@ -21,6 +21,7 @@
 #include "../../lib/crypto/ccm.h"               /* ccm_selftest() -- NIST 800-38C */
 #include "../../lib/crypto/ccmp.h"              /* ccmp_selftest() -- 802.11 CCMP (WPA2) */
 #include "../../lib/crypto/gcmp.h"              /* gcmp_selftest() -- 802.11 GCMP (WPA3) */
+#include "../../lib/crypto/sae.h"               /* sae_selftest() -- WPA3 SAE dragonfly  */
 #include "../../lib/tls/x509.h"                 /* x509_selftest()    */
 #include "../../lib/tls/x509_verify.h"          /* x509_verify_selftest() */
 #include "../../lib/tls/tls.h"                  /* tls_selftest()     */
@@ -54,6 +55,7 @@ void _start(void) {
     int ccm    = ccm_selftest();       /* WPA-PROOF: AES-CCM (NIST 800-38C) */
     int ccmp   = ccmp_selftest();      /* WPA-PROOF: 802.11 CCMP (WPA2)     */
     int gcmp   = gcmp_selftest();      /* WPA-PROOF: 802.11 GCMP (WPA3)     */
+    int sae    = sae_selftest();       /* WPA-PROOF: WPA3 SAE dragonfly     */
     int x509   = x509_selftest();
     int xverify= x509_verify_selftest();
     int tls    = tls_selftest();
@@ -71,12 +73,13 @@ void _start(void) {
     report("aes-ccm (nist 800-38c)", ccm);
     report("ccmp (802.11 wpa2)", ccmp);
     report("gcmp (802.11 wpa3)", gcmp);
+    report("sae (wpa3 dragonfly)", sae);
     report("x509 parse", x509);
     report("x509 chain verify", xverify);
     report("tls PRF", tls);
 
     int all = crypto | sha512 | rsa | x255 | p256 | chacha | hkdf | b64 | pbkdf2 | keywrap
-            | ccm | ccmp | gcmp | x509 | xverify | tls;
+            | ccm | ccmp | gcmp | sae | x509 | xverify | tls;
     if (all == 0)
         print("CRYPTOTEST: PASS (full crypto/TLS KAT battery)\n");
     else

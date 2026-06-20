@@ -24,6 +24,15 @@ static inline uint64_t ms_to_ticks(uint64_t ms) {
     return (ms * TIMER_FREQ) / 1000;
 }
 
+/* Convert ms to ticks with a 1-tick floor. AUDIT FIX (roadmap kcore-1): a sub-
+ * tick interval (e.g. 5ms at TIMER_FREQ=100 -> 0 ticks) must NOT become a 0-tick
+ * deadline, which turns a yielding re-check slice into a busy-spin. Use this for
+ * any "wake again in N ms" timed-block slice. */
+static inline uint64_t ms_to_ticks_atleast1(uint64_t ms) {
+    uint64_t t = ms_to_ticks(ms);
+    return t ? t : 1;
+}
+
 /* Convert ticks to milliseconds */
 static inline uint64_t ticks_to_ms(uint64_t ticks) {
     return (ticks * 1000) / TIMER_FREQ;

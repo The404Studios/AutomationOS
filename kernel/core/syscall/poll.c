@@ -21,6 +21,7 @@
 #include "../../include/kernel.h"
 #include "../../include/string.h"
 #include "../../include/drivers.h"   /* timer_get_ticks */
+#include "../../include/time.h"      /* ms_to_ticks_atleast1 */
 
 #define POLL_MAX_FDS    64    /* max pollfd entries per poll() call    */
 #define FD_SETSIZE_K    256   /* select() fd ceiling (4 x uint64 mask) */
@@ -127,7 +128,7 @@ int64_t sys_poll(uint64_t fds_ptr, uint64_t nfds_arg, uint64_t timeout_ms,
         if (ready > 0 || immediate) break;
         if (!infinite && timer_get_ticks() >= deadline) break;   /* timed out */
 
-        uint64_t until = timer_get_ticks() + POLL_SLICE_MS;
+        uint64_t until = timer_get_ticks() + ms_to_ticks_atleast1(POLL_SLICE_MS);
         if (!infinite && until > deadline) until = deadline;
         poll_sleep_slice(until);
     }
@@ -201,7 +202,7 @@ int64_t sys_select(uint64_t nfds_arg, uint64_t rfds_ptr, uint64_t wfds_ptr,
         if (total > 0 || immediate) break;
         if (!infinite && timer_get_ticks() >= deadline) break;
 
-        uint64_t until = timer_get_ticks() + POLL_SLICE_MS;
+        uint64_t until = timer_get_ticks() + ms_to_ticks_atleast1(POLL_SLICE_MS);
         if (!infinite && until > deadline) until = deadline;
         poll_sleep_slice(until);
     }

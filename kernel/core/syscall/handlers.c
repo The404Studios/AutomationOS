@@ -6,6 +6,7 @@
 #include "../../include/elf.h"     /* ELF_SUCCESS / ELF_ERR_* — EXECVE-INPLACE-0 */
 #include "../../include/kref.h"
 #include "../../include/drivers.h"
+#include "../../include/time.h"     /* ms_to_ticks_atleast1 */
 #include "../../include/vfs.h"
 #include "../../include/input.h"
 #include "../../include/tss.h"
@@ -669,7 +670,7 @@ int64_t sys_thread_join(uint64_t tid, uint64_t retval_out, uint64_t arg3,
         // real thread_exit signal still wakes us at once; a wake lost to the
         // scan/block gap is recovered when the deadline re-checks the while.
         (void)wait_object_block(&target->thread_join_wo,
-                                timer_get_ticks() + WAIT_RECHECK_MS);
+                                timer_get_ticks() + ms_to_ticks_atleast1(WAIT_RECHECK_MS));
 #else
         (void)wait_object_block(&target->thread_join_wo, 0);
 #endif
@@ -1416,7 +1417,7 @@ int64_t sys_waitpid(uint64_t pid, uint64_t status_ptr, uint64_t options,
         // wake is recovered when the deadline re-readies us and the for-loop
         // re-scans and finds the zombie. (Cooperative keeps the atomic block.)
         (void)wait_object_block(&((wait_queue_t*)current->child_wait)->wobj,
-                                timer_get_ticks() + WAIT_RECHECK_MS);
+                                timer_get_ticks() + ms_to_ticks_atleast1(WAIT_RECHECK_MS));
 #else
         wq_block_current((wait_queue_t*)current->child_wait);
 #endif

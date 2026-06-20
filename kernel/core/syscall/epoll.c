@@ -33,6 +33,7 @@
 #include "../../include/kernel.h"
 #include "../../include/string.h"
 #include "../../include/drivers.h"  // timer_get_ticks_ms
+#include "../../include/time.h"     // ms_to_ticks_atleast1
 #include "../../include/spinlock.h"
 #include "../../include/poll.h"     // POLL-SELECT-0: fd_poll_state / poll_pump / poll_sleep_slice
 
@@ -371,7 +372,7 @@ int64_t sys_epoll_wait(uint64_t epfd_arg, uint64_t events_ptr,
         if (n > 0 || immediate) return n;
         if (!infinite && timer_get_ticks() >= deadline) return 0;  // timed out
 
-        uint64_t until = timer_get_ticks() + 5;   // 5ms re-check slice (yields)
+        uint64_t until = timer_get_ticks() + ms_to_ticks_atleast1(5);   // 5ms re-check slice (yields)
         if (!infinite && until > deadline) until = deadline;
         poll_sleep_slice(until);
     }

@@ -414,7 +414,7 @@ static int nvme_setup_io_queues(nvme_controller_t* ctrl, uint16_t num_queues) {
 
         if (!sq_phys || !cq_phys) {
             kprintf("[NVMe] ERROR: Failed to allocate I/O queue %d memory\n", qid);
-            if (sq_phys) pmm_free_page(sq_phys);
+            if (sq_phys) pmm_free_pages(sq_phys, 4);   /* AUDIT FIX: matches pmm_alloc_pages(4) */
             if (cq_phys) pmm_free_page(cq_phys);
             break;
         }
@@ -438,7 +438,7 @@ static int nvme_setup_io_queues(nvme_controller_t* ctrl, uint16_t num_queues) {
         // Create completion queue
         if (nvme_create_io_cq(ctrl, qid, NVME_IO_QUEUE_SIZE, (uint64_t)cq_phys) != 0) {
             kprintf("[NVMe] ERROR: Failed to create I/O CQ %d\n", qid);
-            pmm_free_page(sq_phys);
+            pmm_free_pages(sq_phys, 4);   /* AUDIT FIX: matches pmm_alloc_pages(4) */
             pmm_free_page(cq_phys);
             break;
         }
@@ -447,7 +447,7 @@ static int nvme_setup_io_queues(nvme_controller_t* ctrl, uint16_t num_queues) {
         if (nvme_create_io_sq(ctrl, qid, NVME_IO_QUEUE_SIZE, (uint64_t)sq_phys, qid) != 0) {
             kprintf("[NVMe] ERROR: Failed to create I/O SQ %d\n", qid);
             nvme_delete_io_cq(ctrl, qid);
-            pmm_free_page(sq_phys);
+            pmm_free_pages(sq_phys, 4);   /* AUDIT FIX: matches pmm_alloc_pages(4) */
             pmm_free_page(cq_phys);
             break;
         }

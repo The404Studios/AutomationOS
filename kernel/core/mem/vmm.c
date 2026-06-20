@@ -518,8 +518,11 @@ void* vmm_alloc_at(void* vmm_ctx, void* addr, size_t size, int prot) {
             return NULL;
         }
 
-        // Zero the physical page (PE loader expects zero-initialized memory)
-        uint8_t* page_ptr = (uint8_t*)phys;
+        // Zero the physical page (PE loader expects zero-initialized memory).
+        // AUDIT FIX (gap-org): access via the stable direct-map alias, not the raw
+        // physical address -- (uint8_t*)phys only works while the page falls in the
+        // identity range; PHYS_TO_DIRECT resolves for any frame on any CR3.
+        uint8_t* page_ptr = (uint8_t*)PHYS_TO_DIRECT(phys);
         for (size_t j = 0; j < PAGE_SIZE; j++) {
             page_ptr[j] = 0;
         }

@@ -465,7 +465,7 @@ static int dfs_mount_from_sb(const diskfs_superblock_t* sb)
         sb->inode_size != DFS_INODE_SIZE ||
         sb->inode_count == 0 || sb->inode_count > DFS_INODE_COUNT ||
         sb->block_size != DFS_BLOCK_SIZE ||
-        sb->block_count > DFS_BITMAP_BITS ||
+        sb->block_count > DFS_BLOCK_COUNT ||   /* AUDIT FIX (gap-org): bound by real capacity (3584), not bitmap bits (4096) */
         sb->bitmap_lba == 0 || sb->inode_lba == 0 || sb->data_lba == 0) {
         kprintf("[DISKFS] superblock layout out of range -- refusing mount\n");
         return -1;

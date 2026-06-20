@@ -240,7 +240,7 @@ int64_t sys_kill(uint64_t pid, uint64_t sig, uint64_t arg3,
             // signal_default_action) is applied at the target's next
             // return-to-user, in deliver_pending_signals(). SIGKILL/SIGSTOP/
             // SIGCONT above stay immediate + uncatchable.
-            target->sig_pending |= (1ull << sig);
+            __atomic_fetch_or(&target->sig_pending, (1ull << sig), __ATOMIC_RELEASE);
             kprintf("[KILL] Signal %llu pending for process %u (%s)\n",
                     sig, target->pid, target->name);
             // Wake a plainly-blocked target so it reaches a delivery point.
@@ -356,7 +356,7 @@ void deliver_pending_signals(sig_gpframe_t* f, uint64_t retval) {
         if (deliverable & (1ull << sig)) break;
     if (sig >= 32) return;
 
-    p->sig_pending &= ~(1ull << sig);            /* consume */
+    __atomic_fetch_and(&p->sig_pending, ~(1ull << sig), __ATOMIC_RELEASE);            /* consume */
     h = p->sig_handlers[sig];
 
     if (h == 0) { signal_default_action(p, sig); return; }   /* SIG_DFL */
@@ -414,7 +414,7 @@ void deliver_pending_signals(sig_gpframe_t* f, uint64_t retval) {
         f->rdi      = (uint64_t)sig;              /* handler(signum) */
         f->rsi      = uc_addr;                    /* 2nd arg: context pointer */
         f->rflags   = sig_clean_rflags(f->rflags);  /* P0: force IF, strip IOPL/TF/NT/DF */
-        p->sig_mask |= (1ull << sig);             /* block during the handler */
+        __atomic_fetch_or(&p->sig_mask, (1ull << sig), __ATOMIC_RELEASE);             /* block during the handler */
     }
 }
 
@@ -449,9 +449,9 @@ int64_t sys_rt_sigprocmask(uint64_t how, uint64_t set, uint64_t oldset,
         uint64_t s;
         if (copy_from_user(&s, (void*)set, sizeof(s)) != 0) return EFAULT;
         s &= ~((1ull << SIGKILL) | (1ull << SIGSTOP));   /* never block these */
-        if (how == 0)      p->sig_mask |= s;     /* BLOCK */
-        else if (how == 1) p->sig_mask &= ~s;    /* UNBLOCK */
-        else               p->sig_mask = s;      /* SETMASK */
+        if (how == 0)      __atomic_fetch_or(&p->sig_mask, s, __ATOMIC_RELEASE);     /* BLOCK */
+        else if (how == 1) __atomic_fetch_and(&p->sig_mask, ~s, __ATOMIC_RELEASE);    /* UNBLOCK */
+        else               __atomic_store_n(&p->sig_mask, s, __ATOMIC_RELEASE);      /* SETMASK */
     }
     return ESUCCESS;
 }

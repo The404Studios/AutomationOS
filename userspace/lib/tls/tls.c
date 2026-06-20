@@ -1328,11 +1328,18 @@ static int verify_ske_signature(tls_conn_t *c,
         rsa_pubkey pk;
         rsa_pubkey_from_bytes(&pk, c->srv_mod, c->srv_mod_len,
                               c->srv_exp, c->srv_exp_len);
-        int alg = (hash_id == HASH_SHA1) ? RSA_HASH_SHA1 : RSA_HASH_SHA256;
-        /* The sibling rsa_pkcs1_verify only encodes SHA-1 / SHA-256 DigestInfo.
-         * For SHA-384/512 RSA we cannot construct the right DigestInfo, so we
-         * conservatively refuse rather than accept an unverifiable signature. */
-        if (hash_id != HASH_SHA1 && hash_id != HASH_SHA256) return TLS_ERR_SIG;
+        /* AUDIT FIX (gap-org): rsa_pkcs1_verify encodes DigestInfo for all four
+         * (rsa.h: RSA_HASH_SHA256/1/384/512), and the hash switch above already
+         * computes SHA-384/512 — so accept them instead of the old conservative
+         * refusal that broke RSA certs signed with SHA-384/512. */
+        int alg;
+        switch (hash_id) {
+        case HASH_SHA1:   alg = RSA_HASH_SHA1;   break;
+        case HASH_SHA256: alg = RSA_HASH_SHA256; break;
+        case HASH_SHA384: alg = RSA_HASH_SHA384; break;
+        case HASH_SHA512: alg = RSA_HASH_SHA512; break;
+        default: return TLS_ERR_SIG;
+        }
         if (rsa_pkcs1_verify(&pk, sig, sig_len, hash, hlen, alg) != 0)
             return TLS_ERR_SIG;
         return 0;

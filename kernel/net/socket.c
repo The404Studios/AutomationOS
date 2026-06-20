@@ -55,9 +55,29 @@ static sock_t* sock_from_fd(int fd) {
 }
 
 uint16_t sock_alloc_port(void) {
-    uint16_t p = g_next_port++;
-    if (g_next_port == 0 || g_next_port < 49152) g_next_port = 49152;
-    return p;
+    uint16_t p = 49152;
+
+    /* AUDIT FIX (gap-fix-round): guard before the table exists, and detect
+     * collisions so a wrapped ephemeral range can't hand out a live port. */
+    if (!g_socks) {
+        p = g_next_port++;
+        if (g_next_port == 0 || g_next_port < 49152) g_next_port = 49152;
+        return p;
+    }
+
+    const uint16_t MAX_SCAN = 1000;   /* bounded retry (ports 49152-65535) */
+    uint16_t scans = 0;
+    for (;;) {
+        p = g_next_port++;
+        if (g_next_port == 0 || g_next_port < 49152) g_next_port = 49152;
+
+        bool in_use = false;
+        for (int i = 0; i < SOCK_MAX; i++) {
+            if (g_socks[i].used && g_socks[i].local_port == p) { in_use = true; break; }
+        }
+        if (!in_use) return p;
+        if (++scans >= MAX_SCAN) return p;   /* exhausted: return anyway */
+    }
 }
 
 /* ------------------------------------------------------------------ */

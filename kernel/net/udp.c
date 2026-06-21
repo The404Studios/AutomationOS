@@ -63,6 +63,18 @@ void udp_input(uint32_t src_ip, uint32_t dst_ip,
     uint16_t ulen = net_ntohs(uh->length);
     if (ulen < sizeof(udp_hdr_t) || ulen > seg_len) ulen = seg_len;
 
+    /* RFC 768 RX checksum verification. A zero checksum field means the
+     * sender did not compute one (optional over IPv4) -> accept. Otherwise
+     * the one's-complement sum over the IPv4 pseudo-header + UDP header +
+     * payload (with the stored checksum left in place) must come out to 0;
+     * net_transport_checksum() returns the final ~sum, so a valid datagram
+     * yields exactly 0. Sum over the UDP length (ulen), not seg_len, so any
+     * Ethernet min-frame padding is excluded. Mismatch -> silently drop. */
+    if (uh->checksum != 0 &&
+        net_transport_checksum(src_ip, dst_ip, IPPROTO_UDP, seg, ulen) != 0) {
+        return;
+    }
+
     uint16_t src_port = net_ntohs(uh->src_port);
     uint16_t dst_port = net_ntohs(uh->dst_port);
     uint16_t payload_len = (uint16_t)(ulen - sizeof(udp_hdr_t));

@@ -229,7 +229,11 @@ int main(int argc, char **argv) {
     long t0 = sc(SYS_GET_TICKS_MS, 0, 0, 0, 0, 0);
     static char access_token[4096];
     access_token[0] = 0;
-    for (int poll = 0; poll < 600; poll++) {
+    /* AUDIT FIX: scale the poll bound to expires_in/interval so a long device-code
+     * lifetime isn't cut short by a hardcoded cap (the elapsed check below still
+     * enforces the real deadline). */
+    int max_polls = (interval > 0) ? (expires / interval) + 2 : 600;
+    for (int poll = 0; poll < max_polls; poll++) {
         long elapsed = sc(SYS_GET_TICKS_MS, 0, 0, 0, 0, 0) - t0;
         if (elapsed > (long)expires * 1000) {
             out("GSIGNIN: FAIL (code expired before approval)\n");

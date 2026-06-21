@@ -17,7 +17,7 @@ The roots picked cover the dominant set of HTTPS sites:
 """
 import subprocess, os, re, sys, datetime, pathlib
 
-BUNDLE = "/etc/ssl/certs/ca-certificates.crt"
+BUNDLE = os.environ.get("CA_BUNDLE_SRC", "/etc/ssl/certs/ca-certificates.crt")
 OUT    = "userspace/lib/tls/ca_roots_data.h"
 
 TARGETS = [
@@ -28,6 +28,14 @@ TARGETS = [
     ("GlobalSign Root CA",                           "globalsign_root_ca",    "GlobalSign Root CA"),
     ("USERTrust RSA Certification Authority",        "usertrust_rsa_ca",      "USERTrust RSA Certification Authority"),
     ("Amazon Root CA 1",                             "amazon_root_ca_1",      "Amazon Root CA 1"),
+    # ECDSA roots -- now useful since P-256 + P-384 ECDSA verification works.
+    # SSL.com TLS ECC Root CA 2022 is example.com's modern trust anchor (its
+    # chain: example.com <- Cloudflare TLS Issuing ECC CA 3 <- SSL.com TLS
+    # Transit ECC CA R2 <- SSL.com TLS ECC Root CA 2022).
+    ("SSL.com TLS ECC Root CA 2022",                 "sslcom_tls_ecc_root_2022", "SSL.com TLS ECC Root CA 2022"),
+    ("DigiCert Global Root G3",                      "digicert_root_g3",      "DigiCert Global Root G3"),
+    ("USERTrust ECC Certification Authority",        "usertrust_ecc_ca",      "USERTrust ECC Certification Authority"),
+    ("GTS Root R4",                                  "gts_root_r4",           "GTS Root R4"),
 ]
 
 

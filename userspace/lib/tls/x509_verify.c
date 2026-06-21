@@ -792,13 +792,24 @@ int x509_verify_chain(const unsigned char *const *certs,
         if (rc != X509V_OK) return rc;
     }
 
-    /* 3. Trust anchor: the top cert (last in the server-supplied chain) must be
-     *    issued by a root in the CA bundle whose subjectDN == top.issuerDN. The
-     *    same code path handles ncerts == 1 (leaf issued directly by a root). */
-    rc = verify_against_roots(certs[ncerts - 1], lens[ncerts - 1],
-                              f[ncerts - 1].issuer_dn,
-                              f[ncerts - 1].issuer_dn_len,
-                              now_yyyymmddhhmmss);
+    /* 3. Trust anchor: walk the sent chain from the leaf upward and anchor at
+     *    the FIRST cert whose issuer is a root in the CA bundle (subjectDN ==
+     *    that cert's issuerDN) AND whose signature verifies against that root.
+     *    Every leaf..i link was already verified in step 2, so anchoring at any
+     *    position i still yields a complete leaf -> trusted-root signature path.
+     *    Iterating (rather than only checking the last cert) handles servers
+     *    that append extra cross-signed CA certs ABOVE the real anchor -- e.g. a
+     *    modern ECC root cross-signed by a legacy root: we anchor at the modern
+     *    root we actually trust and ignore the legacy extras. ncerts == 1 (leaf
+     *    issued directly by a root) is the i == 0 case. */
+    rc = X509V_ERR_NO_ROOT;
+    for (i = 0; i < ncerts; i++) {
+        int arc = verify_against_roots(certs[i], lens[i],
+                                       f[i].issuer_dn, f[i].issuer_dn_len,
+                                       now_yyyymmddhhmmss);
+        if (arc == X509V_OK) { rc = X509V_OK; break; }
+        rc = arc;   /* keep the last error for diagnostics */
+    }
     if (rc != X509V_OK) return rc;
 
     /* 4. Hostname: the LEAF must authenticate `hostname` (SAN, CN fallback). */

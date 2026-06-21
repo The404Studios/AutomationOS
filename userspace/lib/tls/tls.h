@@ -193,6 +193,20 @@ typedef struct tls_conn {
     const unsigned char *chain_der[TLS_MAX_CHAIN];
     unsigned long        chain_len[TLS_MAX_CHAIN];
     int                  chain_count;
+
+    /* --- TLS 1.3 state (RFC 8446); set only when a 1.3 ServerHello is
+     * negotiated. The 1.3 handshake + record protection reuse the proven
+     * tls13_* modules; these fields carry the per-connection key material. */
+    int                is_tls13;             /* 1 once 1.3 negotiated          */
+    unsigned char      t13_cli_priv[32];     /* our x25519 key_share private   */
+    unsigned char      t13_peer_pub[32];     /* server key_share public        */
+    unsigned char      t13_chs[32];          /* client handshake traffic secret */
+    unsigned char      t13_shs[32];          /* server handshake traffic secret */
+    int                t13_aead;             /* TLS13_AEAD_* id (record AEAD)   */
+    unsigned int       t13_keylen;           /* bulk key length (16 or 32)      */
+    unsigned char      t13_rkey[32], t13_riv[12];  /* read (server) app key/iv  */
+    unsigned char      t13_wkey[32], t13_wiv[12];  /* write (client) app key/iv */
+    unsigned long long t13_rseq, t13_wseq;   /* app record sequence numbers     */
 } tls_conn_t;
 
 /*

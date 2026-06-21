@@ -23,6 +23,17 @@ int tls13_parse_server_hello(const unsigned char *sh, unsigned long shlen,
 
     if (end - p < 2 + 32 + 1) return -1;
     p += 2;                                               /* legacy_version */
+    /* HelloRetryRequest is a ServerHello whose random is the fixed SHA-256 of
+     * "HelloRetryRequest" (RFC 8446 4.1.3); we do not support it (would need to
+     * resend the ClientHello with the server-chosen group) -> reject with -2. */
+    {
+        static const unsigned char HRR[32] = {
+            0xcf,0x21,0xad,0x74,0xe5,0x9a,0x61,0x11,0xbe,0x1d,0x8c,0x02,0x1e,0x65,0xb8,0x91,
+            0xc2,0xa2,0x11,0x16,0x7a,0xbb,0x8c,0x5e,0x07,0x9e,0x09,0xe2,0xc8,0xa8,0x33,0x9c };
+        int hrr = 1;
+        for (int i = 0; i < 32; i++) if (p[i] != HRR[i]) { hrr = 0; break; }
+        if (hrr) return -2;
+    }
     p += 32;                                              /* random         */
     unsigned int sidlen = *p++;                           /* session_id echo */
     if (p + sidlen + 2 + 1 > end) return -1;

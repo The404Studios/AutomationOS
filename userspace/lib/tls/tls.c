@@ -59,6 +59,17 @@
 #include "tls13_keysched.h"
 #include "tls13_record.h"
 #include "tls13_certverify.h"
+#include "tls13_handshake.h"
+
+/* Offer + drive TLS 1.3 only when built with -DTLS13_CLIENT. Default builds
+ * stay pure TLS 1.2 (the ClientHello is byte-identical), so a buggy 1.3 path
+ * can never regress the proven 1.2 HTTPS path or the smoke gate. Flip the
+ * default on once the live 1.3 handshake is validated. */
+#ifdef TLS13_CLIENT
+#define TLS13_OFFER 1
+#else
+#define TLS13_OFFER 0
+#endif
 
 /*
  * OPTIONAL certificate-chain validator (tls/x509_verify.h). When that module is
@@ -857,7 +868,16 @@ static long build_client_hello(tls_conn_t *c, const char *server_name,
     /* session_id (empty) */
     out[p++] = 0;
 
-    /* cipher_suites: modern ECDHE+AEAD first, legacy CBC last. */
+    /* TLS 1.3 key_share ephemeral: generate the x25519 keypair NOW so its public
+     * key goes in the ClientHello key_share extension below (only when offered). */
+    unsigned char t13_pub[32];
+    if (TLS13_OFFER) {
+        if (sys_random(c->t13_cli_priv, 32) != 0) return TLS_ERR_CRYPTO;
+        if (x25519_base(t13_pub, c->t13_cli_priv) != 0) return TLS_ERR_CRYPTO;
+    }
+
+    /* cipher_suites: TLS 1.3 suites first (when offered), then 1.2 ECDHE+AEAD,
+     * legacy CBC last. */
     static const unsigned short suites[] = {
         SUITE_ECDHE_ECDSA_AES128_GCM_SHA256,   /* 0xC02B */
         SUITE_ECDHE_RSA_AES128_GCM_SHA256,     /* 0xC02F (broadest compat) */
@@ -867,8 +887,14 @@ static long build_client_hello(tls_conn_t *c, const char *server_name,
         SUITE_RSA_AES128_CBC_SHA,              /* 0x002F (last-resort fallback) */
     };
     unsigned int nsuites = (unsigned int)(sizeof(suites) / sizeof(suites[0]));
-    put_u16(out + p, (unsigned int)(nsuites * 2)); p += 2; /* suites length     */
+    unsigned long suites_len_pos = p; p += 2;             /* suites length ph   */
+    if (TLS13_OFFER) {
+        put_u16(out + p, 0x1301); p += 2;                /* AES_128_GCM_SHA256 */
+        put_u16(out + p, 0x1303); p += 2;                /* CHACHA20_SHA256    */
+        put_u16(out + p, 0x1302); p += 2;                /* AES_256_GCM_SHA384 */
+    }
     for (unsigned int i = 0; i < nsuites; i++) { put_u16(out + p, suites[i]); p += 2; }
+    put_u16(out + suites_len_pos, (unsigned int)(p - suites_len_pos - 2));
 
     /* compression methods: null only */
     out[p++] = 1;
@@ -909,25 +935,55 @@ static long build_client_hello(tls_conn_t *c, const char *server_name,
     out[p++] = 1;                                 /* formats list length       */
     out[p++] = 0;                                 /* uncompressed              */
 
-    /* --- signature_algorithms (RFC 5246 7.4.1.4.1, ext 0x000D) --- */
+    /* --- signature_algorithms (ext 0x000D). When offering 1.3, prepend the
+     *     RSA-PSS + ECDSA-P384 schemes a 1.3 server uses for CertificateVerify
+     *     (RFC 8446 9.1); only ones tls13_certverify can actually verify. --- */
     {
-        static const unsigned short sigalgs[] = {
-            SIGALG_RSA_PKCS1_SHA256,  /* 0x0401 */
-            SIGALG_ECDSA_SHA256,      /* 0x0403 */
-            SIGALG_RSA_PKCS1_SHA384,  /* 0x0501 */
-            SIGALG_RSA_PKCS1_SHA512,  /* 0x0601 */
-        };
-        unsigned int n = (unsigned int)(sizeof(sigalgs) / sizeof(sigalgs[0]));
         put_u16(out + p, 0x000D); p += 2;         /* extension_type            */
-        put_u16(out + p, (unsigned int)(2 + n * 2)); p += 2; /* ext_data len   */
-        put_u16(out + p, (unsigned int)(n * 2));  p += 2;    /* list length     */
-        for (unsigned int i = 0; i < n; i++) { put_u16(out + p, sigalgs[i]); p += 2; }
+        unsigned long sa_data_pos = p; p += 2;    /* ext_data length ph        */
+        unsigned long sa_list_pos = p; p += 2;    /* list length ph            */
+        if (TLS13_OFFER) {
+            put_u16(out + p, 0x0804); p += 2;     /* rsa_pss_rsae_sha256       */
+            put_u16(out + p, 0x0805); p += 2;     /* rsa_pss_rsae_sha384       */
+            put_u16(out + p, 0x0503); p += 2;     /* ecdsa_secp384r1_sha384    */
+        }
+        put_u16(out + p, SIGALG_RSA_PKCS1_SHA256); p += 2; /* 0x0401           */
+        put_u16(out + p, SIGALG_ECDSA_SHA256);     p += 2; /* 0x0403           */
+        put_u16(out + p, SIGALG_RSA_PKCS1_SHA384); p += 2; /* 0x0501           */
+        put_u16(out + p, SIGALG_RSA_PKCS1_SHA512); p += 2; /* 0x0601           */
+        unsigned int listlen = (unsigned int)(p - sa_list_pos - 2);
+        put_u16(out + sa_list_pos, listlen);
+        put_u16(out + sa_data_pos, (unsigned int)(2 + listlen));
     }
 
     /* --- renegotiation_info (RFC 5746, ext 0xFF01): empty (no renegotiation) */
     put_u16(out + p, 0xFF01); p += 2;             /* extension_type            */
     put_u16(out + p, 1);      p += 2;             /* ext_data length           */
     out[p++] = 0;                                 /* renegotiated_connection[0]*/
+
+    /* --- TLS 1.3 extensions (only when offered) --- */
+    if (TLS13_OFFER) {
+        /* supported_versions (0x002b), CLIENT list form: 1-byte list len. */
+        put_u16(out + p, 0x002b); p += 2;
+        put_u16(out + p, 5); p += 2;              /* ext_data = 1 + 2*2        */
+        out[p++] = 4;                             /* versions list length      */
+        put_u16(out + p, 0x0304); p += 2;         /* TLS 1.3                   */
+        put_u16(out + p, 0x0303); p += 2;         /* TLS 1.2 (fallback)        */
+
+        /* key_share (0x0033), CLIENT form: client_shares list of KeyShareEntry. */
+        put_u16(out + p, 0x0033); p += 2;
+        put_u16(out + p, 2 + 4 + 32); p += 2;     /* ext_data = 38             */
+        put_u16(out + p, 4 + 32); p += 2;         /* client_shares list length */
+        put_u16(out + p, 0x001d); p += 2;         /* group x25519              */
+        put_u16(out + p, 32); p += 2;             /* key_exchange length       */
+        mem_cpy(out + p, t13_pub, 32); p += 32;   /* our ephemeral public key  */
+
+        /* psk_key_exchange_modes (0x002d): psk_dhe_ke(1). */
+        put_u16(out + p, 0x002d); p += 2;
+        put_u16(out + p, 2); p += 2;              /* ext_data length           */
+        out[p++] = 1;                             /* ke_modes list length      */
+        out[p++] = 1;                             /* psk_dhe_ke                */
+    }
 
     unsigned long ext_total = p - ext_start;
     put_u16(out + ext_len_pos, (unsigned int)ext_total);
@@ -1475,6 +1531,189 @@ static int ecdhe_compute(tls_conn_t *c, transcript_t *tr,
  *  Handshake driver
  * ======================================================================== */
 
+#if TLS13_OFFER
+/* Parse a TLS 1.3 Certificate message body (RFC 8446 4.4.2):
+ *   context_len(1) context || cert_list_len(3) [ cert_len(3) DER ext_len(2) exts ]...
+ * Collects chain DERs into c->chain_der[]/chain_len[]. */
+static int tls13_parse_cert(tls_conn_t *c, const unsigned char *b, unsigned long n) {
+    if (n < 1) return TLS_ERR_PROTO;
+    unsigned long off = 0;
+    unsigned int ctxlen = b[off++];
+    if (off + ctxlen + 3u > n) return TLS_ERR_PROTO;
+    off += ctxlen;
+    unsigned long list_len = get_u24(b + off); off += 3;
+    if (off + list_len > n) return TLS_ERR_PROTO;
+    unsigned long end = off + list_len;
+    c->chain_count = 0;
+    while (off + 3u <= end) {
+        unsigned int clen = get_u24(b + off); off += 3;
+        if ((unsigned long)clen > end - off) return TLS_ERR_PROTO;
+        if (clen == 0) return TLS_ERR_PROTO;
+        if (c->chain_count < TLS_MAX_CHAIN) {
+            c->chain_der[c->chain_count] = b + off;
+            c->chain_len[c->chain_count] = clen;
+            c->chain_count++;
+        }
+        off += clen;
+        if (off + 2u > end) return TLS_ERR_PROTO;
+        unsigned int extlen = get_u16(b + off); off += 2;
+        if (off + extlen > end) return TLS_ERR_PROTO;
+        off += extlen;
+        if (c->chain_count >= TLS_MAX_CHAIN) break;
+    }
+    return (c->chain_count > 0) ? 0 : TLS_ERR_PROTO;
+}
+
+/* Drive the TLS 1.3 handshake after a 1.3 ServerHello has been parsed (key_share
+ * peer pub in c->t13_peer_pub, our priv in c->t13_cli_priv) and the transcript
+ * `tr` already contains ClientHello||ServerHello. Reuses the RFC-8448-KAT-proven
+ * tls13_* modules; only the socket I/O + message framing is new here. */
+static int tls13_do_handshake(tls_conn_t *c, transcript_t *tr, const char *server_name) {
+    int aead;
+    if      (c->cipher == 0x1301) aead = TLS13_AEAD_AES128_GCM;
+    else if (c->cipher == 0x1303) aead = TLS13_AEAD_CHACHA20;
+    else return TLS_ERR_SUITE;            /* 0x1302 (SHA-384) not wired yet */
+    unsigned int keylen = (aead == TLS13_AEAD_AES128_GCM) ? 16u : 32u;
+    const int hid = 0;                    /* SHA-256 suites */
+
+    /* 1. ECDHE shared secret. */
+    unsigned char shared[32];
+    if (x25519(shared, c->t13_cli_priv, c->t13_peer_pub) != 0) return TLS_ERR_CRYPTO;
+
+    /* 2. Handshake secrets from H(ClientHello..ServerHello). */
+    unsigned char th[48], eh[48], early[48], derived[48], hs[48];
+    unsigned char zero[48]; mem_set(zero, 0, sizeof zero);
+    tr_snapshot(tr, 0, th);
+    tls13_empty_hash(hid, eh);
+    tls13_extract(hid, 0, 0, zero, 32, early);
+    tls13_derive_secret(hid, early, "derived", eh, 32, derived);
+    tls13_extract(hid, derived, 32, shared, 32, hs);
+    tls13_derive_secret(hid, hs, "s hs traffic", th, 32, c->t13_shs);
+    tls13_derive_secret(hid, hs, "c hs traffic", th, 32, c->t13_chs);
+    unsigned char s_key[32], s_iv[12], c_key[32], c_iv[12];
+    tls13_traffic_keyiv(hid, c->t13_shs, s_key, keylen, s_iv, 12);
+    tls13_traffic_keyiv(hid, c->t13_chs, c_key, keylen, c_iv, 12);
+
+    /* 3. Read + decrypt the server flight; walk EE/Cert/CertVerify/Finished. */
+    static unsigned char flight[TLS_REC_BUF * 2];
+    static unsigned char inner[TLS_REC_BUF];
+    unsigned long flen = 0, walk_off = 0;
+    unsigned long long rseq = 0;
+    int got_cert = 0, got_cv = 0, got_fin = 0, guard = 0;
+    while (!got_fin) {
+        /* Walk any complete handshake messages buffered so far. */
+        for (;;) {
+            unsigned long off0 = walk_off;
+            const unsigned char *body; unsigned long blen;
+            int mt = tls13_next_handshake_msg(flight, flen, &walk_off, &body, &blen);
+            if (mt == 0) break;
+            if (mt < 0) return TLS_ERR_PROTO;
+            const unsigned char *full = flight + off0;
+            unsigned long full_len = walk_off - off0;
+            if (mt == 0x08) {                 /* EncryptedExtensions */
+                tr_add(tr, full, full_len);
+            } else if (mt == 0x0b) {          /* Certificate */
+                int rc = tls13_parse_cert(c, body, blen); if (rc) return rc;
+                tr_add(tr, full, full_len); got_cert = 1;
+            } else if (mt == 0x0f) {          /* CertificateVerify */
+                if (!got_cert) return TLS_ERR_PROTO;
+                unsigned char th_cert[48]; tr_snapshot(tr, 0, th_cert); /* H(CH..Cert) */
+                unsigned short sigalg = (unsigned short)get_u16(body);
+                unsigned int siglen = get_u16(body + 2);
+                if (4u + siglen > blen) return TLS_ERR_PROTO;
+                const unsigned char *sig = body + 4;
+                const unsigned char *leaf = c->chain_der[0];
+                unsigned long leaflen = c->chain_len[0];
+                int vr;
+                if (sigalg == 0x0804 || sigalg == 0x0805) {
+                    unsigned char mod[512], exp[16];
+                    unsigned long ml = sizeof mod, el = sizeof exp;
+                    if (x509_extract_pubkey(leaf, leaflen, mod, &ml, exp, &el) != 0)
+                        return TLS_ERR_CERT;
+                    rsa_pubkey pk; rsa_pubkey_from_bytes(&pk, mod, ml, exp, el);
+                    vr = tls13_certverify_rsapss(sigalg, 1, th_cert, 32, sig, siglen, &pk);
+                } else if (sigalg == 0x0403) {
+                    unsigned char pt[65];
+                    if (ec_spki_extract_p256(leaf, leaflen, pt) != 0) return TLS_ERR_CERT;
+                    vr = tls13_certverify_ecdsa(sigalg, 1, th_cert, 32, sig, siglen, pt, 65);
+                } else {
+                    return TLS_ERR_SIG;       /* unsupported CertVerify scheme */
+                }
+                if (vr != 0) return TLS_ERR_SIG;
+                tr_add(tr, full, full_len); got_cv = 1;
+            } else if (mt == 0x14) {          /* Finished */
+                if (!got_cv) return TLS_ERR_PROTO;
+                unsigned char th_cv[48], vd[48]; tr_snapshot(tr, 0, th_cv); /* H(CH..CV) */
+                tls13_finished_verify(hid, c->t13_shs, th_cv, 32, vd);
+                if (blen != 32 || mem_cmp(vd, body, 32) != 0) return TLS_ERR_VERIFY;
+                tr_add(tr, full, full_len); got_fin = 1; break;
+            } else {
+                tr_add(tr, full, full_len);   /* NewSessionTicket etc.: transcript */
+            }
+        }
+        if (got_fin) break;
+        if (++guard > 64) return TLS_ERR_PROTO;
+        /* Read the next record (the dummy ChangeCipherSpec is ignored). */
+        unsigned char ctype; unsigned char *rbody; unsigned int rblen;
+        int rc = recv_record(c, &ctype, &rbody, &rblen);
+        if (rc != 0) return rc;
+        if (ctype == CT_CHANGE_CIPHER_SPEC) { record_consume(c, rblen); continue; }
+        if (ctype != CT_APPLICATION_DATA)   { record_consume(c, rblen); return TLS_ERR_PROTO; }
+        unsigned long ilen; unsigned char itype;
+        int orc = tls13_record_open(aead, s_key, s_iv, rseq, rbody - 5, 5u + rblen,
+                                    inner, sizeof inner, &ilen, &itype);
+        record_consume(c, rblen);
+        if (orc != 0) return TLS_ERR_CRYPTO;
+        rseq++;
+        if (itype == 0x15) return TLS_ERR_ALERT;     /* fatal alert */
+        if (itype != 0x16) continue;                 /* ignore non-handshake */
+        if (flen + ilen > sizeof flight) return TLS_ERR_BUF;
+        mem_cpy(flight + flen, inner, ilen); flen += ilen;
+    }
+
+    /* 4. Chain trust (separate from the CertVerify signature, per the 1.2 policy). */
+    c->cert_trusted = 0;
+    if (x509_verify_chain && c->chain_count > 0) {
+        char now[15]; tls_build_now(now);
+        if (x509_verify_chain(c->chain_der, c->chain_len, c->chain_count, server_name, now) == 0)
+            c->cert_trusted = 1;
+    }
+    for (int ci = 0; ci < TLS_MAX_CHAIN; ci++) { c->chain_der[ci] = 0; c->chain_len[ci] = 0; }
+    c->chain_count = 0;
+
+    /* 5. Application traffic secrets from H(ClientHello..server Finished). */
+    unsigned char th_sf[48], derived2[48], master[48], c_ap[32], s_ap[32];
+    tr_snapshot(tr, 0, th_sf);
+    tls13_derive_secret(hid, hs, "derived", eh, 32, derived2);
+    tls13_extract(hid, derived2, 32, zero, 32, master);
+    tls13_derive_secret(hid, master, "c ap traffic", th_sf, 32, c_ap);
+    tls13_derive_secret(hid, master, "s ap traffic", th_sf, 32, s_ap);
+
+    /* 6. Send the dummy ChangeCipherSpec + the (encrypted) client Finished. */
+    {
+        unsigned char ccs[6] = { CT_CHANGE_CIPHER_SPEC, 0x03, 0x03, 0x00, 0x01, 0x01 };
+        if (raw_send_all(c->fd, ccs, 6) != 0) return TLS_ERR_IO;
+        unsigned char fin_vd[48], finmsg[4 + 48];
+        tls13_finished_verify(hid, c->t13_chs, th_sf, 32, fin_vd);
+        finmsg[0] = 0x14; finmsg[1] = 0; finmsg[2] = 0; finmsg[3] = 32;
+        mem_cpy(finmsg + 4, fin_vd, 32);
+        unsigned char crec[256]; unsigned long crlen;
+        if (tls13_record_seal(aead, c_key, c_iv, 0, finmsg, 36, 0x16,
+                              crec, sizeof crec, &crlen) != 0) return TLS_ERR_CRYPTO;
+        if (raw_send_all(c->fd, crec, crlen) != 0) return TLS_ERR_IO;
+    }
+
+    /* 7. Switch to application keys (per-direction sequence reset to 0). */
+    c->t13_aead = aead; c->t13_keylen = keylen;
+    tls13_traffic_keyiv(hid, s_ap, c->t13_rkey, keylen, c->t13_riv, 12);
+    tls13_traffic_keyiv(hid, c_ap, c->t13_wkey, keylen, c->t13_wiv, 12);
+    c->t13_rseq = 0; c->t13_wseq = 0;
+    c->is_tls13 = 1;
+    c->established = 1;
+    return TLS_OK;
+}
+#endif /* TLS13_OFFER */
+
 int tls_client_connect(tls_conn_t *c, int tcp_fd, const char *server_name) {
     /* Fresh state. */
     mem_set(c, 0, sizeof(*c));
@@ -1487,7 +1726,7 @@ int tls_client_connect(tls_conn_t *c, int tcp_fd, const char *server_name) {
 
     /* ---- 1. ClientHello ---- */
     {
-        static unsigned char ch[512];
+        static unsigned char ch[1024];   /* room for the TLS 1.3 extensions */
         long n = build_client_hello(c, server_name, ch, sizeof(ch));
         if (n < 0) return (int)n;
         tr_add(&tr, ch, (unsigned long)n);                /* transcript */
@@ -1507,6 +1746,24 @@ int tls_client_connect(tls_conn_t *c, int tcp_fd, const char *server_name) {
         if (rc != 0) return rc;
         switch (type) {
         case HS_SERVER_HELLO:
+#if TLS13_OFFER
+            {
+                /* Detect a TLS 1.3 ServerHello (supported_versions=0x0304) and,
+                 * if so, drive the whole 1.3 handshake from here. The transcript
+                 * already holds ClientHello||ServerHello (hs_next added the SH). */
+                int is13 = 0; unsigned short c13 = 0, g13 = 0;
+                unsigned char pp[64]; unsigned long ppl = 0;
+                int pr = tls13_parse_server_hello(msg - 4, mlen + 4, &c13, &is13,
+                                                  &g13, pp, sizeof pp, &ppl);
+                if (pr == -2) return TLS_ERR_PROTO;            /* HelloRetryRequest */
+                if (pr == 0 && is13) {
+                    if (g13 != TLS13_GROUP_X25519 || ppl != 32) return TLS_ERR_CURVE;
+                    c->cipher = c13;
+                    mem_cpy(c->t13_peer_pub, pp, 32);
+                    return tls13_do_handshake(c, &tr, server_name);
+                }
+            }
+#endif
             rc = parse_server_hello(c, msg, mlen);
             if (rc != 0) return rc;
             seen_sh = 1;
@@ -1710,6 +1967,25 @@ int tls_client_connect(tls_conn_t *c, int tcp_fd, const char *server_name) {
 
 long tls_write(tls_conn_t *c, const void *buf, unsigned long len) {
     if (!c->established || c->closed) return TLS_ERR_CLOSED;
+#if TLS13_OFFER
+    if (c->is_tls13) {
+        const unsigned char *q = (const unsigned char *)buf;
+        unsigned long o = 0;
+        while (o < len) {
+            unsigned long chunk = len - o;
+            if (chunk > TLS_MAX_PLAINTEXT) chunk = TLS_MAX_PLAINTEXT;
+            static unsigned char rec[TLS_REC_BUF];
+            unsigned long rlen;
+            if (tls13_record_seal(c->t13_aead, c->t13_wkey, c->t13_wiv, c->t13_wseq,
+                                  q + o, chunk, 0x17, rec, sizeof rec, &rlen) != 0)
+                return TLS_ERR_CRYPTO;
+            c->t13_wseq++;
+            if (raw_send_all(c->fd, rec, rlen) != 0) return TLS_ERR_IO;
+            o += chunk;
+        }
+        return (long)len;
+    }
+#endif
     const unsigned char *p = (const unsigned char *)buf;
     unsigned long off = 0;
     while (off < len) {
@@ -1735,6 +2011,38 @@ long tls_read(tls_conn_t *c, void *buf, unsigned long cap) {
         c->app_off += take;
         return (long)take;
     }
+
+#if TLS13_OFFER
+    if (c->is_tls13) {
+        for (;;) {
+            unsigned char ctype; unsigned char *rbody; unsigned int rblen;
+            int rc = recv_record(c, &ctype, &rbody, &rblen);
+            if (rc == TLS_ERR_CLOSED) { c->closed = 1; return 0; }
+            if (rc != 0) return -1;
+            if (ctype == CT_CHANGE_CIPHER_SPEC) { record_consume(c, rblen); continue; }
+            if (ctype != CT_APPLICATION_DATA)   { record_consume(c, rblen); continue; }
+            unsigned long ilen; unsigned char itype;
+            int orc = tls13_record_open(c->t13_aead, c->t13_rkey, c->t13_riv, c->t13_rseq,
+                                        rbody - 5, 5u + rblen, c->app_buf,
+                                        sizeof c->app_buf, &ilen, &itype);
+            record_consume(c, rblen);
+            if (orc != 0) { c->closed = 1; return -1; }
+            c->t13_rseq++;
+            if (itype == 0x15) {                 /* alert: close_notify => clean EOF */
+                c->closed = 1;
+                return (ilen >= 2 && c->app_buf[1] == AL_CLOSE_NOTIFY) ? 0 : -1;
+            }
+            if (itype == 0x16) continue;          /* NewSessionTicket / KeyUpdate: ignore */
+            if (itype != 0x17) continue;          /* anything else: skip */
+            if (ilen == 0) continue;
+            c->app_len = ilen; c->app_off = 0;
+            unsigned long take = (ilen < cap) ? ilen : cap;
+            mem_cpy(buf, c->app_buf, take);
+            c->app_off = take;
+            return (long)take;
+        }
+    }
+#endif
 
     /* Otherwise pull and decrypt the next application-data record. We loop past
      * non-application records (e.g. a server-initiated alert). */

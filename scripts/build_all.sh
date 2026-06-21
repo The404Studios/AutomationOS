@@ -13,6 +13,14 @@ CF="-std=gnu11 -ffreestanding -nostdlib -fno-builtin -fno-stack-protector -fno-p
 LD="ld -nostdlib -static -n -no-pie -e _start -T userspace/userspace.ld"
 cc() { gcc $CF -c "$1" -o "$2"; }
 
+# TLS13=1 builds the TLS 1.3-capable client: tls.c (the only consumer of the
+# macro) then offers + drives TLS 1.3. Default (unset) = pure TLS 1.2, so the
+# proven 1.2 HTTPS path and the smoke gate are byte-for-byte unchanged.
+if [ "${TLS13:-0}" = "1" ]; then
+    CF="$CF -DTLS13_CLIENT"
+    echo "*** TLS13 build: tls.c compiled with -DTLS13_CLIENT (offers + drives TLS 1.3) ***"
+fi
+
 # STRESS=1 adds -DPREEMPT_STRESS to the init compile ONLY, so init spawns the
 # never-yielding cpuburners (see the #ifdef PREEMPT_STRESS block in
 # userspace/init/main.c). With STRESS unset, INIT_EXTRA is empty and the default

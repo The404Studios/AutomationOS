@@ -79,6 +79,14 @@ static const unsigned char OID_RSA_SHA512[9] = {
 static const unsigned char OID_ECDSA_SHA256[8] = {
     0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x04, 0x03, 0x02
 };
+/* ecdsa-with-SHA384: 1.2.840.10045.4.3.3 */
+static const unsigned char OID_ECDSA_SHA384[8] = {
+    0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x04, 0x03, 0x03
+};
+/* ecdsa-with-SHA512: 1.2.840.10045.4.3.4 */
+static const unsigned char OID_ECDSA_SHA512[8] = {
+    0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x04, 0x03, 0x04
+};
 /* id-ecPublicKey: 1.2.840.10045.2.1 */
 static const unsigned char OID_EC_PUBLIC_KEY[7] = {
     0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x02, 0x01
@@ -101,6 +109,8 @@ static const unsigned char OID_COMMON_NAME[3] = { 0x55, 0x04, 0x03 };
 #define SIGALG_ECDSA_SHA256  2
 #define SIGALG_RSA_SHA384    3
 #define SIGALG_RSA_SHA512    4
+#define SIGALG_ECDSA_SHA384  5
+#define SIGALG_ECDSA_SHA512  6
 
 /* Public-key algorithm selector. */
 #define PKALG_RSA   0
@@ -359,6 +369,10 @@ static int sigalg_from_oid(const unsigned char *oid, unsigned long oidlen) {
         return SIGALG_RSA_SHA384;
     if (asn1_oid_equals(oid, oidlen, OID_RSA_SHA512, sizeof OID_RSA_SHA512))
         return SIGALG_RSA_SHA512;
+    if (asn1_oid_equals(oid, oidlen, OID_ECDSA_SHA384, sizeof OID_ECDSA_SHA384))
+        return SIGALG_ECDSA_SHA384;
+    if (asn1_oid_equals(oid, oidlen, OID_ECDSA_SHA512, sizeof OID_ECDSA_SHA512))
+        return SIGALG_ECDSA_SHA512;
     return 0;
 }
 
@@ -473,10 +487,10 @@ static int verify_cert_signed_by(const unsigned char *cert,
     if (alg == SIGALG_RSA_SHA256 || alg == SIGALG_ECDSA_SHA256) {
         sha256(tbs, tbs_len, hash);
         hash_len = 32;
-    } else if (alg == SIGALG_RSA_SHA384) {
+    } else if (alg == SIGALG_RSA_SHA384 || alg == SIGALG_ECDSA_SHA384) {
         sha384(tbs, tbs_len, hash);
         hash_len = 48;
-    } else { /* SIGALG_RSA_SHA512 */
+    } else { /* RSA_SHA512 or ECDSA_SHA512 */
         sha512(tbs, tbs_len, hash);
         hash_len = 64;
     }
@@ -506,7 +520,7 @@ static int verify_cert_signed_by(const unsigned char *cert,
                              rsa_hash_alg) != 0)
             return X509V_ERR_SIG_INVALID;
         return X509V_OK;
-    } else { /* SIGALG_ECDSA_SHA256 */
+    } else { /* ECDSA (P-256) with SHA-256/384/512 */
         unsigned char point[65];
         unsigned char r[32], s[32];
         if (pkalg != PKALG_EC256) return X509V_ERR_SIG_ALG;
@@ -514,7 +528,7 @@ static int verify_cert_signed_by(const unsigned char *cert,
             return X509V_ERR_PUBKEY;
         if (ec_sig_to_rs(sigbits, sigbits_len, r, s) != 0)
             return X509V_ERR_SIG_INVALID;
-        if (p256_ecdsa_verify(point, hash, 32, r, s) != 0)
+        if (p256_ecdsa_verify(point, hash, hash_len, r, s) != 0)
             return X509V_ERR_SIG_INVALID;
         return X509V_OK;
     }

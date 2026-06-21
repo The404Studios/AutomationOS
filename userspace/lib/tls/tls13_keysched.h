@@ -56,6 +56,13 @@ int tls13_traffic_keyiv(int hash_id, const unsigned char *secret,
 int tls13_finished_key(int hash_id, const unsigned char *secret,
                        unsigned char *out);
 
+/* Finished verify_data = HMAC(finished_key, transcript_hash), where
+ * finished_key is derived from the handshake traffic secret of the sender
+ * (RFC 8446 4.4.4). Writes HashLen bytes to out. */
+int tls13_finished_verify(int hash_id, const unsigned char *traffic_secret,
+                          const unsigned char *transcript_hash,
+                          unsigned long thlen, unsigned char *out);
+
 /*
  * tls13_keysched_selftest -- KAT against RFC 8448 Section 3 (Simple 1-RTT
  * Handshake): drives the full ladder from the published ECDHE shared secret +

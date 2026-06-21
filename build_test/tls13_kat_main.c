@@ -9,7 +9,7 @@ int main(void)
     int rc = tls13_keysched_selftest();
     if (rc == 0) {
         printf("  ok   RFC 8448 key schedule: early/derived/handshake/c+s hs traffic/"
-               "keys+iv/master/c+s ap traffic all match\n");
+               "keys+iv/master/c+s ap traffic + server&client Finished verify_data all match\n");
         printf("TLS13KAT: PASS\n");
         return 0;
     }

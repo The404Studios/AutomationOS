@@ -5,6 +5,7 @@
  */
 #include "tls13_keysched.h"
 #include "../crypto/hkdf.h"
+#include "../crypto/hmac.h"
 #include "../crypto/sha256.h"
 #include "../crypto/sha512.h"   /* sha384 */
 
@@ -54,6 +55,18 @@ int tls13_finished_key(int hash_id, const unsigned char *secret,
     unsigned long hlen = tls13_hashlen(hash_id);
     return tls13_hkdf_expand_label(hash_id, secret, hlen, "finished",
                                    (const unsigned char *)"", 0, out, hlen);
+}
+
+int tls13_finished_verify(int hash_id, const unsigned char *traffic_secret,
+                          const unsigned char *transcript_hash,
+                          unsigned long thlen, unsigned char *out)
+{
+    unsigned char fk[48];
+    unsigned long hlen = tls13_hashlen(hash_id);
+    if (tls13_finished_key(hash_id, traffic_secret, fk) != 0) return -1;
+    if (hash_id) hmac_sha384(fk, hlen, transcript_hash, thlen, out);
+    else         hmac_sha256(fk, hlen, transcript_hash, thlen, out);
+    return 0;
 }
 
 /* ===================================================================== *
@@ -144,6 +157,25 @@ int tls13_keysched_selftest(void)
     /* 10: server application traffic secret */
     tls13_derive_secret(0, master, "s ap traffic", th_chsf, 32, s_ap);
     unhex(SAP_H, want, 32); if (!eq(s_ap, want, 32)) return 10;
+
+    /* 11: server Finished verify_data = HMAC(finished_key(s_hs), H(CH..CertVerify)) */
+    {
+        const char *THSF_H = "edb7725fa7a3473b031ec8ef65a2485493900138a2b91291407d7951a06110ed";
+        const char *SFIN_H = "9b9b141d906337fbd2cbdce71df4deda4ab42c309572cb7fffee5454b78f0718";
+        unsigned char thsf[32], vd[32];
+        unhex(THSF_H, thsf, 32);
+        tls13_finished_verify(0, s_hs, thsf, 32, vd);
+        unhex(SFIN_H, want, 32); if (!eq(vd, want, 32)) return 11;
+    }
+
+    /* 12: client Finished verify_data = HMAC(finished_key(c_hs), H(CH..serverFin)),
+     *     where that transcript hash is the same CH..serverFinished hash (th_chsf). */
+    {
+        const char *CFIN_H = "a8ec436d677634ae525ac1fcebe11a039ec17694fac6e98527b642f2edd5ce61";
+        unsigned char vd[32];
+        tls13_finished_verify(0, c_hs, th_chsf, 32, vd);
+        unhex(CFIN_H, want, 32); if (!eq(vd, want, 32)) return 12;
+    }
 
     (void)got;
     return 0;

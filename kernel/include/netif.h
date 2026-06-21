@@ -69,6 +69,7 @@ int      netif_register(const netif_t* nif);
 netif_t* netif_get(const char* name);
 netif_t* netif_get_default(void);       /* first UP interface           */
 netif_t* netif_get_by_index(int idx);
+int      netif_get_by_ip(uint32_t ip, netif_t** out);  /* 0 on hit; K1 routing */
 int      netif_count(void);
 
 void     netif_set_ip(netif_t* nif, uint32_t ip);

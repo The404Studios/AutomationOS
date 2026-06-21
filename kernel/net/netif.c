@@ -55,6 +55,16 @@ netif_t* netif_get_by_index(int idx) {
     return &g_netifs[idx];
 }
 
+/* AUDIT FIX (K1 prerequisite): look up the interface that owns an IP so ip_tx can
+ * route to the right netif->tx instead of a hard-coded global NIC. Returns 0 on hit. */
+int netif_get_by_ip(uint32_t ip, netif_t** out) {
+    if (!out) return -1;
+    for (int i = 0; i < g_netif_count; i++) {
+        if (g_netifs[i].ip == ip) { *out = &g_netifs[i]; return 0; }
+    }
+    return -1;
+}
+
 int netif_count(void) {
     return g_netif_count;
 }

@@ -656,7 +656,9 @@ static long http_fetch_raw(const char *host, unsigned short port,
     buf_puts(req, &rp, (int)sizeof(req), " HTTP/1.1\r\nHost: ");
     buf_puts(req, &rp, (int)sizeof(req), host);
     buf_puts(req, &rp, (int)sizeof(req),
-             "\r\nAccept-Encoding: gzip, deflate\r\n"
+             "\r\nUser-Agent: AutomationOS/1.0\r\n"
+             "Accept: */*\r\n"
+             "Accept-Encoding: gzip, deflate\r\n"
              "Connection: keep-alive\r\n");
     if (req_extra && req_extra[0]) {
         buf_puts(req, &rp, (int)sizeof(req), req_extra);

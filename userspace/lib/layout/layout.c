@@ -420,7 +420,7 @@ static void emit_inline_subtree(ctx *C, const struct dom_node *n,
         blk->x = S->base_x + cs.margin_l;
         blk->y = S->content_y + S->total_h + cs.margin_t;
         int inner_w = S->max_w - cs.margin_l - cs.margin_r;
-        if (cs.width > 0) inner_w = cs.width;
+        if (cs.width > 0) inner_w = cs.width_pct ? (S->max_w * cs.width) / 100 : cs.width;  /* AUDIT FIX: resolve % width */
         if (inner_w < 0) inner_w = 0;
         blk->w = inner_w;
         box_attach(block, blk);
@@ -451,7 +451,7 @@ static void emit_inline_subtree(ctx *C, const struct dom_node *n,
         layout_box *ib = box_new(LB_INLINE, n);
         if (!ib) return;
         ib->style = cs;
-        int inner_w = cs.width > 0 ? cs.width : (S->max_w / 2);
+        int inner_w = cs.width > 0 ? (cs.width_pct ? (S->max_w * cs.width) / 100 : cs.width) : (S->max_w / 2);  /* AUDIT FIX: % width */
         if (inner_w < 0) inner_w = 0;
         ib->w = inner_w + cs.padding_l + cs.padding_r;
         /* Temporarily position at origin; inline_add will place it. */
@@ -569,7 +569,7 @@ static int layout_node(ctx *C, const struct dom_node *node, layout_box *block,
             blk->y = content_y + S.total_h + collapsed_gap;
 
             int inner_w = S.max_w - cs.margin_l - cs.margin_r;
-            if (cs.width > 0) inner_w = cs.width;
+            if (cs.width > 0) inner_w = cs.width_pct ? (S.max_w * cs.width) / 100 : cs.width;  /* AUDIT FIX: resolve % width */
             if (inner_w < 0) inner_w = 0;
             blk->w = inner_w;
 

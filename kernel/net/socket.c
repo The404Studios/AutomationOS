@@ -27,6 +27,7 @@
 #include "../include/drivers.h"   /* timer_get_ticks_ms */
 #include "../include/mem.h"       /* kmalloc + copy_from_user/copy_to_user */
 #include "../include/sched.h"    /* process_get_current (for owner_pid)   */
+#include "../include/netif.h"    /* K1: per-interface tx routing          */
 
 /* ------------------------------------------------------------------ */
 /* Socket table                                                        */
@@ -217,6 +218,15 @@ static int ip_send_fragment(uint8_t dmac[ETH_ALEN], uint32_t dst_ip,
     if (total < ETH_MIN_FRAME) {
         memset(f + total, 0, (uint32_t)(ETH_MIN_FRAME - total));
         total = ETH_MIN_FRAME;
+    }
+    /* K1: transmit via the owning interface's tx() (per-interface), not a hard-coded
+     * global NIC. Route by source IP; fall back to the default UP interface, then to
+     * net_send() so single-NIC (eth0/QEMU) behavior stays byte-identical. */
+    {
+        netif_t* nif = 0;
+        if (netif_get_by_ip(net_get_ip(), &nif) != 0) nif = 0;
+        if (!nif) nif = netif_get_default();
+        if (nif && nif->tx) return (nif->tx(f, total) > 0) ? 0 : -1;
     }
     return (net_send(f, total) > 0) ? 0 : -1;
 }

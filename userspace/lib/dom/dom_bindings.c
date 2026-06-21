@@ -22,6 +22,7 @@
 #include "dom_selector.h"        /* dom_query_selector[_all] + dom_selector_match */
 #include "dom_event.h"           /* dom_add_event_listener / dispatch */
 #include "dom_util.h"            /* dom_clone_node                    */
+#include "dom_serialize.h"       /* dom_serialize_inner (innerHTML get) */
 #include "../html/html_parse.h"  /* html_parse_fragment (innerHTML)   */
 
 /* Freestanding: pull NULL from a libc header. */
@@ -304,12 +305,16 @@ static js_value elem_get(js_vm *vm, void *self_ptr, const char *prop)
         return v;
     }
     if (str_eq(prop, "innerHTML")) {
-        /* No HTML serializer yet -- return concatenated text as a
-         * conservative approximation. Round-trips set/get for the
-         * "text only" case. */
-        const char *t = dom_get_text(n);
-        js_value v = js_native_make_string(vm, t ? t : "");
-        if (t) free((void *)t);
+        /* AUDIT FIX (browser correctness): serialize children to real HTML markup
+         * via dom_serialize_inner (dom_serialize.c, linked through DOM_OBJS) instead
+         * of the old text-only approximation -- so innerHTML get round-trips markup
+         * that was set via innerHTML, matching real DOM behavior. */
+        unsigned long cap = 16384;
+        char *buf = (char *)malloc(cap);
+        if (!buf) return js_native_make_string(vm, "");
+        long nlen = dom_serialize_inner(n, buf, cap);
+        js_value v = js_native_make_string(vm, (nlen >= 0) ? buf : "");
+        free(buf);
         return v;
     }
     if (str_eq(prop, "parentNode") || str_eq(prop, "parentElement")) {

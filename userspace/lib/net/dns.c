@@ -787,7 +787,14 @@ static int do_query_ex(const char *hostname, unsigned int hlen,
 
             long n = sc(SYS_RECVFROM, fd, (long)resp, (long)sizeof(resp),
                         (long)&from, 0);
-            if (n > 0) { rlen = (int)n; break; }
+            /* DNS source validation (anti cache-poisoning): only accept a
+             * reply that came from the resolver we queried (IP + port 53).
+             * from.ip/from.port are HOST order, matching g_dns_server. A
+             * spoofed reply from any other source is ignored; the bounded
+             * poll loop keeps waiting for the genuine answer. */
+            if (n > 0 && from.ip == g_dns_server && from.port == DNS_PORT) {
+                rlen = (int)n; break;
+            }
 
             sc(SYS_YIELD, 0, 0, 0, 0, 0);
             (void)n;

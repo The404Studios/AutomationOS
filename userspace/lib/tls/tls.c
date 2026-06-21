@@ -1144,8 +1144,11 @@ static int parse_server_hello(tls_conn_t *c, const unsigned char *b, unsigned in
  *
  * Returns 0 and writes out[0..64] on success; nonzero otherwise.
  */
-static int ec_spki_extract_p256(const unsigned char *der, unsigned long len,
-                                unsigned char out[65]) {
+/* Extract the uncompressed EC public point (0x04 || X || Y) from a cert SPKI,
+ * any curve size up to `cap`. Sets *outlen (65 for P-256, 97 for P-384). */
+static int ec_spki_extract_point(const unsigned char *der, unsigned long len,
+                                 unsigned char *out, unsigned long cap,
+                                 unsigned long *outlen) {
     asn1_cur top = { der, der + len };
     asn1_cur cert, tbs;
     if (asn1_enter(&top, ASN1_SEQUENCE, &cert)) return -1;     /* Certificate */
@@ -1170,9 +1173,18 @@ static int ec_spki_extract_p256(const unsigned char *der, unsigned long len,
     const unsigned char *bits; unsigned long bits_len; int unused = 0;
     if (asn1_get_bitstring(&spki, &bits, &bits_len, &unused)) return -1;
     if (unused != 0) return -1;
-    if (bits_len != 65 || bits[0] != 0x04) return -1;          /* uncompressed P-256 */
-    mem_cpy(out, bits, 65);
+    if (bits_len < 1 || bits_len > cap || bits[0] != 0x04) return -1; /* uncompressed */
+    mem_cpy(out, bits, bits_len);
+    *outlen = bits_len;
     return 0;
+}
+
+/* P-256 convenience wrapper (the TLS 1.2 ECDSA path expects exactly 65 bytes). */
+static int ec_spki_extract_p256(const unsigned char *der, unsigned long len,
+                                unsigned char out[65]) {
+    unsigned long n;
+    if (ec_spki_extract_point(der, len, out, 65, &n) != 0) return -1;
+    return (n == 65) ? 0 : -1;
 }
 
 /*
@@ -1632,10 +1644,11 @@ static int tls13_do_handshake(tls_conn_t *c, transcript_t *tr, const char *serve
                         return TLS_ERR_CERT;
                     rsa_pubkey pk; rsa_pubkey_from_bytes(&pk, mod, ml, exp, el);
                     vr = tls13_certverify_rsapss(sigalg, 1, th_cert, 32, sig, siglen, &pk);
-                } else if (sigalg == 0x0403) {
-                    unsigned char pt[65];
-                    if (ec_spki_extract_p256(leaf, leaflen, pt) != 0) return TLS_ERR_CERT;
-                    vr = tls13_certverify_ecdsa(sigalg, 1, th_cert, 32, sig, siglen, pt, 65);
+                } else if (sigalg == 0x0403 || sigalg == 0x0503) {
+                    unsigned char pt[97]; unsigned long ptl;
+                    if (ec_spki_extract_point(leaf, leaflen, pt, sizeof pt, &ptl) != 0)
+                        return TLS_ERR_CERT;
+                    vr = tls13_certverify_ecdsa(sigalg, 1, th_cert, 32, sig, siglen, pt, ptl);
                 } else {
                     return TLS_ERR_SIG;       /* unsupported CertVerify scheme */
                 }

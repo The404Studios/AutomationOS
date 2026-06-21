@@ -429,6 +429,9 @@ int sock_poll_bits(int fd) {
     if (so->state == TCP_CLOSE_WAIT) {
         /* peer sent FIN: a read returns EOF (won't block) and the stream is hanging up */
         bits |= SOCKPOLL_READ | SOCKPOLL_HUP;
+        /* AUDIT FIX: a peer FIN does not close our send half -- we can still drain/send
+         * buffered data before our own FIN, so report writable while the window is open. */
+        if (so->snd_wnd > 0) bits |= SOCKPOLL_WRITE;
     }
     return bits;
 }

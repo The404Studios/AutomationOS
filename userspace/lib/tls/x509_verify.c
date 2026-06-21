@@ -28,6 +28,7 @@
 #include "../crypto/sha512.h"
 #include "../crypto/rsa.h"
 #include "../crypto/p256.h"
+#include "../crypto/p384.h"
 
 #include "x509_verify.h"
 
@@ -95,6 +96,10 @@ static const unsigned char OID_EC_PUBLIC_KEY[7] = {
 static const unsigned char OID_P256[8] = {
     0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x03, 0x01, 0x07
 };
+/* secp384r1 (P-384): 1.3.132.0.34 */
+static const unsigned char OID_P384[5] = {
+    0x2B, 0x81, 0x04, 0x00, 0x22
+};
 /* rsaEncryption: 1.2.840.113549.1.1.1 */
 static const unsigned char OID_RSA_ENC[9] = {
     0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x01
@@ -115,6 +120,7 @@ static const unsigned char OID_COMMON_NAME[3] = { 0x55, 0x04, 0x03 };
 /* Public-key algorithm selector. */
 #define PKALG_RSA   0
 #define PKALG_EC256  1
+#define PKALG_EC384  2
 
 /* ====================================================================== */
 /* DER navigation helpers                                                 */
@@ -393,23 +399,25 @@ static int spki_alg(const unsigned char *spki, unsigned long spki_len) {
     if (asn1_oid_equals(oid, oidlen, OID_RSA_ENC, sizeof OID_RSA_ENC))
         return PKALG_RSA;
     if (asn1_oid_equals(oid, oidlen, OID_EC_PUBLIC_KEY, sizeof OID_EC_PUBLIC_KEY)) {
-        /* The curve must be P-256 (named curve param after the OID). */
+        /* Named curve param after the OID: P-256 or P-384 supported. */
         const unsigned char *curve;
         unsigned long curvelen;
         if (asn1_get_oid(&algid, &curve, &curvelen) != 0) return -1;
-        if (!asn1_oid_equals(curve, curvelen, OID_P256, sizeof OID_P256))
-            return -1;   /* curve other than P-256 unsupported */
-        return PKALG_EC256;
+        if (asn1_oid_equals(curve, curvelen, OID_P256, sizeof OID_P256))
+            return PKALG_EC256;
+        if (asn1_oid_equals(curve, curvelen, OID_P384, sizeof OID_P384))
+            return PKALG_EC384;
+        return -1;   /* curve other than P-256/P-384 unsupported */
     }
     return -1;
 }
 
 /*
- * Extract a 65-byte uncompressed EC point (0x04 || X32 || Y32) from an SPKI.
- * Returns 0 on success.
+ * Extract an uncompressed EC point (0x04 || X || Y) of exactly `expect_len`
+ * bytes from an SPKI (65 for P-256, 97 for P-384). Returns 0 on success.
  */
 static int spki_ec_point(const unsigned char *spki, unsigned long spki_len,
-                         unsigned char point[65]) {
+                         unsigned char *point, unsigned long expect_len) {
     asn1_cur top, seq;
     const unsigned char *bits;
     unsigned long bits_len;
@@ -420,18 +428,19 @@ static int spki_ec_point(const unsigned char *spki, unsigned long spki_len,
     if (asn1_skip(&seq) != 0) return -1;   /* AlgorithmIdentifier */
     if (asn1_get_bitstring(&seq, &bits, &bits_len, &unused) != 0) return -1;
     if (unused != 0) return -1;
-    if (bits_len != 65 || bits[0] != 0x04) return -1;   /* uncompressed only */
-    v_memcpy(point, bits, 65);
+    if (bits_len != expect_len || bits[0] != 0x04) return -1; /* uncompressed */
+    v_memcpy(point, bits, expect_len);
     return 0;
 }
 
 /*
  * Decode an ECDSA-Sig-Value DER ::= SEQUENCE { r INTEGER, s INTEGER } from the
- * signature BIT STRING payload into fixed 32-byte big-endian r and s (left
- * padded). Returns 0 on success.
+ * signature BIT STRING payload into fixed big-endian r and s of `clen` bytes
+ * each (left padded): 32 for P-256, 48 for P-384. Returns 0 on success.
  */
 static int ec_sig_to_rs(const unsigned char *sig, unsigned long sig_len,
-                        unsigned char r[32], unsigned char s[32]) {
+                        unsigned char *r, unsigned char *s,
+                        unsigned long clen) {
     asn1_cur top, seq;
     const unsigned char *rv, *sv;
     unsigned long rl, sl;
@@ -444,12 +453,12 @@ static int ec_sig_to_rs(const unsigned char *sig, unsigned long sig_len,
     /* strip leading 0x00 sign byte(s) */
     while (rl > 1 && rv[0] == 0x00) { rv++; rl--; }
     while (sl > 1 && sv[0] == 0x00) { sv++; sl--; }
-    if (rl == 0 || sl == 0 || rl > 32 || sl > 32) return -1;
+    if (rl == 0 || sl == 0 || rl > clen || sl > clen) return -1;
 
-    v_memset(r, 0, 32);
-    v_memset(s, 0, 32);
-    v_memcpy(r + (32 - rl), rv, rl);
-    v_memcpy(s + (32 - sl), sv, sl);
+    v_memset(r, 0, clen);
+    v_memset(s, 0, clen);
+    v_memcpy(r + (clen - rl), rv, rl);
+    v_memcpy(s + (clen - sl), sv, sl);
     return 0;
 }
 
@@ -520,13 +529,23 @@ static int verify_cert_signed_by(const unsigned char *cert,
                              rsa_hash_alg) != 0)
             return X509V_ERR_SIG_INVALID;
         return X509V_OK;
+    } else if (pkalg == PKALG_EC384) { /* ECDSA P-384 with SHA-256/384/512 */
+        unsigned char point[97];
+        unsigned char r[48], s[48];
+        if (spki_ec_point(issuer_spki, issuer_spki_len, point, 97) != 0)
+            return X509V_ERR_PUBKEY;
+        if (ec_sig_to_rs(sigbits, sigbits_len, r, s, 48) != 0)
+            return X509V_ERR_SIG_INVALID;
+        if (p384_ecdsa_verify(point, hash, hash_len, r, s) != 0)
+            return X509V_ERR_SIG_INVALID;
+        return X509V_OK;
     } else { /* ECDSA (P-256) with SHA-256/384/512 */
         unsigned char point[65];
         unsigned char r[32], s[32];
         if (pkalg != PKALG_EC256) return X509V_ERR_SIG_ALG;
-        if (spki_ec_point(issuer_spki, issuer_spki_len, point) != 0)
+        if (spki_ec_point(issuer_spki, issuer_spki_len, point, 65) != 0)
             return X509V_ERR_PUBKEY;
-        if (ec_sig_to_rs(sigbits, sigbits_len, r, s) != 0)
+        if (ec_sig_to_rs(sigbits, sigbits_len, r, s, 32) != 0)
             return X509V_ERR_SIG_INVALID;
         if (p256_ecdsa_verify(point, hash, hash_len, r, s) != 0)
             return X509V_ERR_SIG_INVALID;

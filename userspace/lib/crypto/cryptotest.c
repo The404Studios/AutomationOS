@@ -26,6 +26,7 @@
 #include "md5.h"
 #include "hmac.h"
 #include "aes.h"
+#include "p384.h"
 
 /* constant-time-ish fixed-length compare; 1 if equal */
 static int eq(const unsigned char *a, const unsigned char *b, unsigned long n) {
@@ -264,6 +265,11 @@ int crypto_selftest(void) {
         badtag[0] ^= 0x01;
         if (aes_gcm_decrypt(&c, iv, aad, 20, ct, 60, badtag, rt) == 0) return 12;
     }
+
+    /* 13: ECDSA P-384 verify (RFC 6979 A.2.6, "sample"/SHA-384): a valid
+     * signature must verify and a tampered one must be rejected. Proves the
+     * P-384 curve path works ON-DEVICE (freestanding), not just on host gcc. */
+    if (p384_selftest() != 0) return 13;
 
     return 0;
 }

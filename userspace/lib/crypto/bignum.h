@@ -83,4 +83,15 @@ int bn_bit_length(const bignum *x);
 void bn_mod_exp(bignum *out, const bignum *base, const bignum *exp,
                 const bignum *mod);
 
+/* ---- generic modular arithmetic (any modulus; used by the EC code) ---- *
+ *
+ * Correctness-first helpers built on shift/subtract reduction. bn_mod()
+ * reduces any input; bn_mod_add/sub/mul assume operands already in [0, m).
+ * Results are fully reduced into [0, m). Modular inverse for a PRIME modulus
+ * is obtained via Fermat: bn_mod_exp(out, a, m-2, m). */
+void bn_mod    (bignum *r, const bignum *a, const bignum *m);
+void bn_mod_add(bignum *r, const bignum *a, const bignum *b, const bignum *m);
+void bn_mod_sub(bignum *r, const bignum *a, const bignum *b, const bignum *m);
+void bn_mod_mul(bignum *r, const bignum *a, const bignum *b, const bignum *m);
+
 #endif /* CRYPTO_BIGNUM_H */

@@ -272,6 +272,107 @@ static void w_mod_bignum(u32 *acc, int len, const bignum *mod)
 }
 
 /* --------------------------------------------------------------------- *
+ *  Generic modular arithmetic (any modulus).                             *
+ *                                                                        *
+ *  Correctness-first (schoolbook multiply + shift/subtract reduction),   *
+ *  NOT the hot RSA path. Used by the elliptic-curve code (p384.c) for     *
+ *  field/scalar arithmetic over a prime. Results are fully reduced into   *
+ *  [0, m). bn_mod() accepts any input; bn_mod_add/sub/mul assume their    *
+ *  operands are already reduced (< m), which the EC code maintains.       *
+ * --------------------------------------------------------------------- */
+
+/* Significant word count of a raw word array (index of top nonzero + 1). */
+static int w_siglen(const u32 *a, int cap)
+{
+    int i = cap - 1;
+    while (i >= 0 && a[i] == 0) i--;
+    return i + 1;
+}
+
+/* Reduce acc (cap words) mod m using a tight working width, then store the
+ * low BN_WORDS words into r. The working width passed to w_mod_bignum is
+ * max(significant-words-of-acc, m->n) so reduction cost tracks the operand
+ * size (a P-384 product is ~24 words, not BN_TMP_WORDS). */
+static void w_reduce_into(bignum *r, u32 *acc, int cap, const bignum *m)
+{
+    int len = w_siglen(acc, cap);
+    if (len < m->n) len = m->n;
+    if (len < 1)    len = 1;
+    w_mod_bignum(acc, len, m);
+    bn_set_zero(r);
+    for (int i = 0; i < BN_WORDS && i < cap; i++) r->w[i] = acc[i];
+    bn_norm(r);
+}
+
+/* r = a mod m. */
+void bn_mod(bignum *r, const bignum *a, const bignum *m)
+{
+    u32 acc[BN_TMP_WORDS];
+    w_zero(acc, BN_TMP_WORDS);
+    for (int i = 0; i < a->n && i < BN_WORDS; i++) acc[i] = a->w[i];
+    w_reduce_into(r, acc, BN_TMP_WORDS, m);
+}
+
+/* r = (a + b) mod m  (a, b assumed < m). */
+void bn_mod_add(bignum *r, const bignum *a, const bignum *b, const bignum *m)
+{
+    u32 acc[BN_TMP_WORDS];
+    w_zero(acc, BN_TMP_WORDS);
+    u64 carry = 0;
+    for (int i = 0; i < BN_WORDS; i++) {
+        u64 t = (u64)a->w[i] + (u64)b->w[i] + carry;
+        acc[i] = (u32)t;
+        carry = t >> 32;
+    }
+    acc[BN_WORDS] = (u32)carry;
+    w_reduce_into(r, acc, BN_TMP_WORDS, m);
+}
+
+/* r = (a - b) mod m  (a, b assumed < m). Computes a + m - b (never underflows
+ * since b < m <= a + m), then reduces. */
+void bn_mod_sub(bignum *r, const bignum *a, const bignum *b, const bignum *m)
+{
+    u32 acc[BN_TMP_WORDS];
+    u32 bb[BN_TMP_WORDS];
+    w_zero(acc, BN_TMP_WORDS);
+    w_zero(bb, BN_TMP_WORDS);
+    u64 carry = 0;
+    for (int i = 0; i < BN_WORDS; i++) {
+        u64 t = (u64)a->w[i] + (u64)((i < m->n) ? m->w[i] : 0u) + carry;
+        acc[i] = (u32)t;
+        carry = t >> 32;
+    }
+    acc[BN_WORDS] = (u32)carry;
+    for (int i = 0; i < BN_WORDS; i++) bb[i] = b->w[i];
+    w_sub(acc, acc, bb, BN_TMP_WORDS);   /* acc >= a+m > b, no borrow */
+    w_reduce_into(r, acc, BN_TMP_WORDS, m);
+}
+
+/* r = (a * b) mod m. */
+void bn_mod_mul(bignum *r, const bignum *a, const bignum *b, const bignum *m)
+{
+    u32 prod[BN_TMP_WORDS];
+    w_zero(prod, BN_TMP_WORDS);
+    for (int i = 0; i < a->n; i++) {
+        u64 carry = 0;
+        u64 ai = a->w[i];
+        for (int j = 0; j < b->n; j++) {
+            u64 t = (u64)prod[i + j] + ai * (u64)b->w[j] + carry;
+            prod[i + j] = (u32)t;
+            carry = t >> 32;
+        }
+        int k = i + b->n;                 /* propagate the final carry upward */
+        while (carry && k < BN_TMP_WORDS) {
+            u64 t = (u64)prod[k] + carry;
+            prod[k] = (u32)t;
+            carry = t >> 32;
+            k++;
+        }
+    }
+    w_reduce_into(r, prod, BN_TMP_WORDS, m);
+}
+
+/* --------------------------------------------------------------------- *
  *  Montgomery arithmetic.                                                 *
  * --------------------------------------------------------------------- */
 

@@ -56,6 +56,7 @@
 #include "../crypto/rsa.h"
 #include "x509.h"
 #include "asn1.h"
+#include "tls13_keysched.h"
 
 /*
  * OPTIONAL certificate-chain validator (tls/x509_verify.h). When that module is
@@ -1881,6 +1882,11 @@ int tls_selftest(void) {
         if (rc != 0) return TLS_ERR_CRYPTO;
         if (mem_cmp(out, expect384, sizeof(expect384)) != 0) return TLS_ERR_VERIFY;
     }
+
+    /* TLS 1.3 key schedule (RFC 8448 Section 3): proves the 1.3 secret ladder
+     * (early/handshake/master secrets, traffic secrets, keys+iv) on-device
+     * alongside the 1.2 PRF above. */
+    if (tls13_keysched_selftest() != 0) return TLS_ERR_VERIFY;
 
     return TLS_OK;
 }

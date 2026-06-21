@@ -548,7 +548,9 @@ void nvme_init_queue(nvme_queue_t* queue, uint16_t queue_id, uint16_t queue_dept
  */
 void nvme_free_queue(nvme_queue_t* queue) {
     if (queue->sq) {
-        pmm_free_page((void*)queue->sq);
+        /* AUDIT FIX: I/O SQ (qid>=1) was pmm_alloc_pages(4); admin SQ (qid 0) is 1 page. */
+        if (queue->queue_id == 0) pmm_free_page((void*)queue->sq);
+        else                      pmm_free_pages((void*)queue->sq, 4);
         queue->sq = NULL;
     }
     if (queue->cq) {

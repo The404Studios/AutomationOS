@@ -115,9 +115,11 @@ static ssize_t fat32_vfs_read(vfs_file_t* file, void* buf, size_t count) {
     uint8_t* dest = (uint8_t*)buf;
     uint32_t cluster = start_cluster;
     uint64_t file_pos = 0;
+    uint32_t walk_guard = 0;
 
     // Skip to the cluster containing file->offset
     while (file_pos + fs_data->bytes_per_cluster <= file->offset) {
+        if (++walk_guard > fs_data->total_clusters) return 0;  /* AUDIT FIX: cluster-cycle guard */
         cluster = fat32_get_next_cluster(fs_data, cluster);
         if (cluster >= FAT32_EOC) {
             return 0;
@@ -126,7 +128,9 @@ static ssize_t fat32_vfs_read(vfs_file_t* file, void* buf, size_t count) {
     }
 
     // Read data
+    walk_guard = 0;
     while (bytes_read < count && cluster < FAT32_EOC) {
+        if (++walk_guard > fs_data->total_clusters) break;  /* AUDIT FIX: cluster-cycle guard */
         uint64_t lba = fat32_cluster_to_lba(fs_data, cluster);
         if (lba == 0) {
             break;

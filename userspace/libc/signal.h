@@ -11,6 +11,12 @@ typedef unsigned long size_t;   /* used by the sigaltstack ss_size field */
 typedef int sig_atomic_t;
 typedef unsigned long sigset_t;
 
+/* AUDIT FIX (gap-audit-40): file-scope forward decl so sigtimedwait()'s prototype
+ * (.h) and definition (.c) refer to the SAME struct timespec instead of two
+ * parameter-scope structs -> resolves the pre-existing conflicting-types error.
+ * The full definition lives in time.h. */
+struct timespec;
+
 // Signal numbers (POSIX)
 #define SIGHUP    1   // Hangup
 #define SIGINT    2   // Interrupt (Ctrl+C)

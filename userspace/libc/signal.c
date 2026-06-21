@@ -10,8 +10,10 @@
 // sigaction(SIGTERM,...) / signal(SIGPIPE, SIG_IGN) never took effect and a kill
 // hard-terminated it instead of running its graceful-shutdown handler. Wire them
 // to the kernel ABI (identical to userspace/apps/sigtest/sigtest.c).
-#define SYS_RT_SIGACTION 107
-#define SYS_RT_SIGRETURN 109
+#define SYS_RT_SIGACTION   107
+#define SYS_RT_SIGPROCMASK 108
+#define SYS_RT_SIGRETURN   109
+#define SYS_SIGPENDING     110
 
 // Raw 3-arg syscall. syscall6() is a static-inline in syscall.c and not visible
 // from this TU, so use a local stub. Clobbers rcx/r11 per the SYSCALL ABI.
@@ -209,16 +211,11 @@ int sigismember(const sigset_t* set, int signum) {
 
 // Change signal mask
 int sigprocmask(int how, const sigset_t* set, sigset_t* oldset) {
-    // Stub implementation - would need kernel support
-    // For now, just return success
-    (void)how;
-    (void)set;
-
-    if (oldset) {
-        *oldset = 0;
-    }
-
-    return 0;
+    // AUDIT FIX (gap-audit-40): was a no-op stub, so blocking a signal silently did
+    // nothing. The kernel implements SYS_RT_SIGPROCMASK=108 (how 0=BLOCK 1=UNBLOCK
+    // 2=SETMASK) and sigset_t uses the kernel's (1<<sig) convention (see sigaddset),
+    // so the args pass straight through.
+    return (int)__sig_sc(SYS_RT_SIGPROCMASK, how, (long)set, (long)oldset);
 }
 
 // Thread-specific signal mask (same as sigprocmask for single-threaded)
@@ -299,8 +296,9 @@ int sigpending(sigset_t* set) {
         return -1;
     }
 
-    // Stub implementation - no pending signals
-    *set = 0;
+    // AUDIT FIX (gap-audit-40): was a no-op stub. SYS_SIGPENDING=110 returns the
+    // kernel's pending-signal bitset as its return value (observability).
+    *set = (sigset_t)__sig_sc(SYS_SIGPENDING, 0, 0, 0);
     return 0;
 }
 

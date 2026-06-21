@@ -1228,12 +1228,19 @@ static int load_page(const char *url, js_vm *vm,
         /* -- HTTP fetch (DNS -> [TLS] -> HTTP, 8 s wall-clock budget, follows
          * redirects). Returns < 0 on any failure; it cannot hang. -- */
         int  http_status = 0;
-        if (base_https)
-            body_len = https_get(base_host, (unsigned short)base_port, base_path,
-                                 g_body, BODY_CAP, &http_status);
-        else
-            body_len = http_get(base_host, (unsigned short)base_port, base_path,
-                                g_body, BODY_CAP, &http_status);
+        /* AUDIT FIX: bounded retry (3 attempts, ~200ms backoff) on transient fetch
+         * errors before falling back -- handles brief DNS/TLS/connect glitches. */
+        for (int fa = 0; fa < 3; fa++) {
+            if (base_https)
+                body_len = https_get(base_host, (unsigned short)base_port, base_path,
+                                     g_body, BODY_CAP, &http_status);
+            else
+                body_len = http_get(base_host, (unsigned short)base_port, base_path,
+                                    g_body, BODY_CAP, &http_status);
+            if (body_len >= 0) break;
+            if (fa < 2) { b2_puts("BROWSER2: fetch retry...\n");
+                          for (int w = 0; w < 200; w++) sc(SYS_YIELD,0,0,0,0,0,0); }
+        }
 
         if (body_len < 0) {
             /* Fetch failed (network likely down -- the lead re-enables the NIC

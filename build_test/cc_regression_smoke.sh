@@ -71,6 +71,11 @@ check struct_mixed struct_mixed.c '^db 65$' ''
 # packed {char a;char b}={65,66} -> the 2nd char emits `db 66` at offset 1.
 check struct_packed struct_packed.c '^db 66$' ''
 
+echo "== cc regression: CC-SWITCH-0 switch/case/default codegen =="
+# switch(x=2){case 2: r=20; ...} -> dispatch emits `cmp rcx, 2` (case-2 compare)
+# and compiles clean (pre-fix: "unsupported statement" error on the switch).
+check switch_basic switch_basic.c 'cmp rcx, 2' ''
+
 rm -f "$DUMP" "$DIAG"
 echo "CCREGRESSION: PASS tests=$pass failures=$fail"
 [ "$fail" -eq 0 ] || { echo "CCREGRESSION: FAIL"; exit 1; }

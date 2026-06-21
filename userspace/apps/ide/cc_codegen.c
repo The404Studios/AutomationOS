@@ -403,6 +403,74 @@ static void gen_for(Cg* g, const AstNode* n, int epilogue, int depth)
     cc_emit_labeldef(g, Lend);
 }
 
+/* AUDIT FIX (gap-org): switch/case/default codegen. The parser already emits
+ * AST_SWITCH{sel,body}, AST_CASE{constexpr,stmt?}, AST_DEFAULT{stmt?}
+ * (ide_pstmt.c) -- this lowers them to a linear compare-and-jump table, then the
+ * body in source order so fall-through works; `break` exits via g->break_label.
+ * Up to 32 cases (freestanding cc). */
+static void gen_switch(Cg* g, const AstNode* n, int epilogue, int depth)
+{
+    const AstNode* sel = n->first_child;
+    const AstNode* body = sel ? sel->next : 0;
+    const AstNode* c;
+    int Lend = cc_new_label(g);
+    int Ldefault = -1;
+    int save_brk = g->break_label;
+    int case_count = 0;
+    int case_labels[32];
+    const AstNode* case_nodes[32];
+
+    if (sel) cg_expr(g, sel);                      /* selector value -> rax */
+
+    /* Pass 1: allocate a label per case (and the default) up front. */
+    if (body && body->kind == AST_COMPOUND) {
+        for (c = body->first_child; c; c = c->next) {
+            if (c->kind == AST_CASE && case_count < 32) {
+                case_labels[case_count] = cc_new_label(g);
+                case_nodes[case_count] = c;
+                case_count++;
+            } else if (c->kind == AST_DEFAULT) {
+                Ldefault = cc_new_label(g);
+            }
+        }
+    }
+
+    /* Pass 2: the dispatch -- cmp the selector against each constant case. */
+    for (int i = 0; i < case_count; i++) {
+        const AstNode* ce = case_nodes[i]->first_child;     /* the const-expr */
+        long cv = 0;
+        if (ce && cc_const_eval(ce, &cv)) {
+            cc_emit(g, "mov rcx, rax");
+            cc_emit_num(g, "cmp rcx, ", cv, "");
+            cc_emit_num(g, "je .L", (long)case_labels[i], "");
+        }
+    }
+    if (Ldefault < 0) Ldefault = Lend;
+    cc_emit_num(g, "jmp .L", (long)Ldefault, "");
+
+    /* Pass 3: emit the body in source order so fall-through is natural. */
+    g->break_label = Lend;
+    if (body && body->kind == AST_COMPOUND) {
+        int idx = 0;
+        for (c = body->first_child; c; c = c->next) {
+            if (c->kind == AST_CASE && idx < case_count) {
+                const AstNode* st = case_nodes[idx]->first_child;   /* const-expr */
+                if (st) st = st->next;                              /* labeled stmt */
+                cc_emit_labeldef(g, case_labels[idx]);
+                if (st) gen_stmt(g, st, epilogue, depth + 1);
+                idx++;
+            } else if (c->kind == AST_DEFAULT) {
+                cc_emit_labeldef(g, Ldefault);
+                if (c->first_child) gen_stmt(g, c->first_child, epilogue, depth + 1);
+            } else {
+                gen_stmt(g, c, epilogue, depth + 1);
+            }
+        }
+    }
+    g->break_label = save_brk;
+    cc_emit_labeldef(g, Lend);
+}
+
 static void gen_stmt(Cg* g, const AstNode* n, int epilogue, int depth)
 {
     if (!n) return;
@@ -450,6 +518,16 @@ static void gen_stmt(Cg* g, const AstNode* n, int epilogue, int depth)
 
     case AST_FOR:
         gen_for(g, n, epilogue, depth);
+        return;
+
+    case AST_SWITCH:
+        gen_switch(g, n, epilogue, depth);
+        return;
+
+    case AST_CASE:
+    case AST_DEFAULT:
+        /* Handled inside gen_switch; here means it appeared outside a switch. */
+        cc_error(g, n->span.start_line, "case/default outside switch");
         return;
 
     case AST_BREAK:

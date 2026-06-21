@@ -58,6 +58,7 @@
 #include "asn1.h"
 #include "tls13_keysched.h"
 #include "tls13_record.h"
+#include "tls13_certverify.h"
 
 /*
  * OPTIONAL certificate-chain validator (tls/x509_verify.h). When that module is
@@ -1892,6 +1893,11 @@ int tls_selftest(void) {
     /* TLS 1.3 record protection (RFC 8446 5.2): seal/open round-trip across the
      * AEADs + wrong-sequence rejection, on-device. */
     if (tls13_record_selftest() != 0) return TLS_ERR_VERIFY;
+
+    /* TLS 1.3 CertificateVerify (RFC 8446 4.4.3): the RFC 8448 server
+     * CertificateVerify (RSA-PSS over the CH..Cert transcript hash) verifies,
+     * proving RSA-PSS + the signed-content construction on-device. */
+    if (tls13_certverify_selftest() != 0) return TLS_ERR_VERIFY;
 
     return TLS_OK;
 }

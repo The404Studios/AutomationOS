@@ -332,7 +332,7 @@ int64_t sys_epoll_wait(uint64_t epfd_arg, uint64_t events_ptr,
     // timeout_ms: (uint64_t)-1 == infinite, 0 == return immediately, else ms.
     int infinite  = (timeout_ms == (uint64_t)-1);
     int immediate = (timeout_ms == 0);
-    uint64_t deadline = infinite ? 0 : timer_get_ticks() + timeout_ms;
+    uint64_t deadline = infinite ? 0 : timer_get_ticks() + ms_to_ticks(timeout_ms);
 
     // POLL-SELECT-0: scan each watch against the REAL readiness probe
     // (fd_poll_state) every wait — no more "always EPOLLIN" fake, no sock_poll

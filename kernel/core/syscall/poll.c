@@ -109,7 +109,7 @@ int64_t sys_poll(uint64_t fds_ptr, uint64_t nfds_arg, uint64_t timeout_ms,
     int64_t timeout = (int64_t)timeout_ms;
     int infinite  = (timeout < 0);
     int immediate = (timeout == 0);
-    uint64_t deadline = infinite ? 0 : timer_get_ticks() + (uint64_t)timeout;
+    uint64_t deadline = infinite ? 0 : timer_get_ticks() + ms_to_ticks((uint64_t)timeout);
 
     int ready = 0;
     for (;;) {
@@ -177,7 +177,7 @@ int64_t sys_select(uint64_t nfds_arg, uint64_t rfds_ptr, uint64_t wfds_ptr,
     }
     int infinite  = (timeout < 0);
     int immediate = (timeout == 0);
-    uint64_t deadline = infinite ? 0 : timer_get_ticks() + (uint64_t)timeout;
+    uint64_t deadline = infinite ? 0 : timer_get_ticks() + ms_to_ticks((uint64_t)timeout);
 
     fdset_k out_r = {{0}}, out_w = {{0}}, out_e = {{0}};
     int total = 0;

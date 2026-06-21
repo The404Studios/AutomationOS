@@ -366,6 +366,7 @@ cc userspace/lib/tls/x509_verify.c         /tmp/x509_verify.o
 cc userspace/lib/tls/tls13_keysched.c      /tmp/tls13ks.o
 cc userspace/lib/tls/tls13_record.c        /tmp/tls13rec.o
 cc userspace/lib/tls/tls13_certverify.c    /tmp/tls13cv.o
+cc userspace/lib/tls/tls13_handshake.c     /tmp/tls13hs.o
 cc userspace/lib/tls/ca_bundle.c           /tmp/ca_bundle.o
 cc userspace/lib/tls/tls.c                 /tmp/tls.o
 # net libs: DNS, HTTP(S), and the plain/TLS transport abstraction
@@ -375,7 +376,7 @@ cc userspace/lib/net/tlsconn.c             /tmp/tlsconn.o
 # libc string safety net (GCC may emit memcpy/memset under -O2 even w/ -fno-builtin)
 cc userspace/libc/string.c                 /tmp/lstring.o
 # The full crypto+TLS object bundle (linked into anything that does TLS).
-CRYPTO_OBJS="/tmp/sha256.o /tmp/sha1.o /tmp/md5.o /tmp/hmac.o /tmp/aes.o /tmp/pbkdf2.o /tmp/keywrap.o /tmp/wpa_aad.o /tmp/ccm.o /tmp/ccmp.o /tmp/gcmp.o /tmp/sae.o /tmp/cryptokat.o /tmp/bignum.o /tmp/rsa.o /tmp/sha512.o /tmp/hkdf.o /tmp/chacha.o /tmp/x25519.o /tmp/p256.o /tmp/p384.o /tmp/rsapss.o /tmp/base64.o /tmp/asn1.o /tmp/x509.o /tmp/x509_verify.o /tmp/tls13ks.o /tmp/tls13rec.o /tmp/tls13cv.o /tmp/ca_bundle.o /tmp/tls.o /tmp/lstring.o"
+CRYPTO_OBJS="/tmp/sha256.o /tmp/sha1.o /tmp/md5.o /tmp/hmac.o /tmp/aes.o /tmp/pbkdf2.o /tmp/keywrap.o /tmp/wpa_aad.o /tmp/ccm.o /tmp/ccmp.o /tmp/gcmp.o /tmp/sae.o /tmp/cryptokat.o /tmp/bignum.o /tmp/rsa.o /tmp/sha512.o /tmp/hkdf.o /tmp/chacha.o /tmp/x25519.o /tmp/p256.o /tmp/p384.o /tmp/rsapss.o /tmp/base64.o /tmp/asn1.o /tmp/x509.o /tmp/x509_verify.o /tmp/tls13ks.o /tmp/tls13rec.o /tmp/tls13cv.o /tmp/tls13hs.o /tmp/ca_bundle.o /tmp/tls.o /tmp/lstring.o"
 # Everything needed to do http:// + https:// from an app.
 HTTPS_OBJS="/tmp/http.o /tmp/dns.o /tmp/deflate.o /tmp/tlsconn.o $CRYPTO_OBJS"
 

@@ -855,6 +855,9 @@ static long build_client_hello(tls_conn_t *c, const char *server_name,
                                unsigned char *out, unsigned long cap) {
     unsigned long p = 4;          /* leave room for handshake header */
     if (cap < 256) return TLS_ERR_BUF;
+    /* Bound the SNI host (DNS names are <= 253 bytes) so the fixed ClientHello
+     * buffer cannot overflow even with the dual key_share + 1.3 extensions. */
+    if (str_len(server_name) > 253) return TLS_ERR_BUF;
 
     /* client_version */
     out[p++] = TLS_VERSION_MAJOR;
@@ -865,8 +868,18 @@ static long build_client_hello(tls_conn_t *c, const char *server_name,
     if (sys_random(c->client_random, TLS_RANDOM_LEN) != 0) return TLS_ERR_CRYPTO;
     mem_cpy(out + p, c->client_random, TLS_RANDOM_LEN); p += TLS_RANDOM_LEN;
 
-    /* session_id (empty) */
-    out[p++] = 0;
+    /* session_id: empty for 1.2. For 1.3 "middlebox compatibility mode" (we send
+     * the dummy ChangeCipherSpec) RFC 8446 4.1.2 requires a non-empty (32-byte
+     * random) legacy_session_id, which the server echoes. Gated so the default
+     * 1.2 ClientHello is byte-identical. */
+    if (TLS13_OFFER) {
+        unsigned char sid[32];
+        if (sys_random(sid, 32) != 0) return TLS_ERR_CRYPTO;
+        out[p++] = 32;
+        mem_cpy(out + p, sid, 32); p += 32;
+    } else {
+        out[p++] = 0;
+    }
 
     /* TLS 1.3 key_share ephemerals: generate BOTH an x25519 and a secp256r1
      * keypair NOW so both go in the ClientHello key_share -- a server preferring
@@ -893,9 +906,11 @@ static long build_client_hello(tls_conn_t *c, const char *server_name,
     unsigned int nsuites = (unsigned int)(sizeof(suites) / sizeof(suites[0]));
     unsigned long suites_len_pos = p; p += 2;             /* suites length ph   */
     if (TLS13_OFFER) {
+        /* Only the SHA-256 1.3 suites (tls13_do_handshake derives on SHA-256);
+         * do NOT offer 0x1302 (AES_256_GCM_SHA384) until the SHA-384 schedule is
+         * wired, else a server selecting it would fail. */
         put_u16(out + p, 0x1301); p += 2;                /* AES_128_GCM_SHA256 */
         put_u16(out + p, 0x1303); p += 2;                /* CHACHA20_SHA256    */
-        put_u16(out + p, 0x1302); p += 2;                /* AES_256_GCM_SHA384 */
     }
     for (unsigned int i = 0; i < nsuites; i++) { put_u16(out + p, suites[i]); p += 2; }
     put_u16(out + suites_len_pos, (unsigned int)(p - suites_len_pos - 2));

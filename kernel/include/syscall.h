@@ -127,7 +127,9 @@
 #define SYS_WLAN_STATUS     115 // association state (uapi_wlan_status_t)
 #define SYS_WLAN_DISCONNECT 116 // disconnect
 #define SYS_WLAN_SET_KEY    117 // supplicant installs PTK/GTK (uapi_wlan_setkey_t)
-#define SYS_WLAN_DIAG       118 // radio bring-up diagnostics (uapi_wlan_diag_t)
+// NOTE: SYS_WLAN_DIAG is 124 (below), NOT 118 -- 118-123 belong to the audio
+// mixer surface. (118 was briefly double-assigned to WLAN_DIAG + AUDIO_VOLUME;
+// fixed by moving WLAN_DIAG to the next free slot, 124.)
 // ---- Audio mixer surface (AUDIO-SYS) -- HDA volume / mute / test-tone / status.
 // Numbers 118-123 were FREE (113-117 went to WiFi, 200 to VMA test). Handlers in
 // syscall.c dispatch to hda_set_volume / hda_set_mute / audio_play_tone. The
@@ -140,6 +142,7 @@
 #define SYS_AUDIO_SELECT    121 // RESERVED (select active output)    -> ENOTSUP for now
 #define SYS_AUDIO_TEST      122 // play a test tone (arg1=freq Hz, arg2=ms, ms capped)
 #define SYS_AUDIO_STATUS    123 // fill user audio_status_t {present,volume,muted,_pad,codec_vendor}
+#define SYS_WLAN_DIAG       124 // radio bring-up diagnostics (uapi_wlan_diag_t) -- moved off 118
 #define SYS_VMA_TEST    200 // VMA red-black tree testing and benchmarking
 
 // ---- SMP coprocessor offload (GATED: only registered under SMP_FOUNDATION) ----

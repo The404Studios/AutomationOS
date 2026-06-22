@@ -58,7 +58,7 @@
 #define SYS_WLAN_SCAN   113  /* sc(113, &bss[], max) -> count                */
 #define SYS_WLAN_CONNECT 114 /* sc(114, &uapi_wlan_connect_t) -> 0/err       */
 #define SYS_WLAN_STATUS 115  /* sc(115, &uapi_wlan_status_t) -> 0/err        */
-#define SYS_WLAN_DIAG   118  /* sc(118, &uapi_wlan_diag_t) -> 0/err          */
+#define SYS_WLAN_DIAG   124  /* sc(124, &uapi_wlan_diag_t) -> 0/err (118 = audio) */
 
 /*
  * 6-arg raw inline syscall wrapper.

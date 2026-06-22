@@ -63,6 +63,12 @@ static int      g_zw_armed = 0, g_zw_probes = 0;
 static uint16_t g_zw_peer_port, g_zw_local_port;
 static uint32_t g_zw_peer_seq;
 
+/* TCP-ROBUST NETP1I: when armed, the next injected packet is corrupted so the
+ * RX checksum verification must DROP it. g_corrupt_ip flips a bit in the IPv4
+ * header checksum; g_corrupt_tcp mangles a TCP payload byte AFTER the checksum
+ * was computed (so the stored checksum stays non-zero but no longer matches). */
+static int g_corrupt_ip = 0, g_corrupt_tcp = 0;
+
 static void rig_inject_tcp(uint32_t src_ip, uint16_t src_port,
                            uint32_t dst_ip, uint16_t dst_port,
                            uint32_t seq, uint32_t ack, uint8_t flags,
@@ -132,6 +138,7 @@ static void rig_inject(uint32_t src_ip, uint32_t dst_ip, uint8_t proto,
     ip->src       = net_htonl(src_ip);
     ip->dst       = net_htonl(dst_ip);
     ip->checksum  = net_htons(net_inet_checksum(ip, sizeof(ipv4_hdr_t)));
+    if (g_corrupt_ip) ip->checksum ^= 0x0100;   /* NETP1I: invalidate IP header */
     memcpy(g_pkt + sizeof(ipv4_hdr_t), seg, seg_len);
     sock_testrig_inject_ipv4(g_pkt, (uint16_t)(sizeof(ipv4_hdr_t) + seg_len));
 }
@@ -172,6 +179,9 @@ static void rig_inject_tcp(uint32_t src_ip, uint16_t src_port,
     if (len) memcpy(g_seg + sizeof(tcp_hdr_t), payload, len);
     th->checksum = net_htons(net_transport_checksum(src_ip, dst_ip,
                                                     IPPROTO_TCP, g_seg, tlen));
+    /* NETP1I: corrupt a payload byte AFTER checksumming so the stored checksum
+     * no longer matches the data -> tcp_input must drop it. */
+    if (g_corrupt_tcp && len) g_seg[sizeof(tcp_hdr_t)] ^= 0xFF;
     rig_inject(src_ip, dst_ip, IPPROTO_TCP, g_seg, tlen);
 }
 
@@ -504,6 +514,65 @@ void net_testrig_selftest(void) {
         }
         sock_init();
         kprintf("NETP1H: LOOPBACK %s ok=%d\n", loop_ok ? "PASS" : "FAIL", loop_ok);
+    }
+
+    /* ---------------------------------------------------------------- */
+    /* TCP-ROBUST NETP1I: RX checksum verification. A good TCP segment   */
+    /* is delivered byte-exact; a segment whose checksum no longer       */
+    /* matches its data is DROPPED (never reaches the stream). A good    */
+    /* UDP datagram is delivered; one with a corrupt IPv4 header         */
+    /* checksum is dropped at ipv4_demux before udp_input.               */
+    /* ---------------------------------------------------------------- */
+    {
+        int tcp_good = 0, tcp_drop = 0, ip_drop = 0, ip_good = 0;
+
+        /* TCP: establish a connection, then good-then-corrupt data. */
+        int fd = -1;
+        int l = sock_socket(SOCK_STREAM);
+        if (l >= 0 && sock_bind(l, 47010) == 0 && sock_listen(l, 2) == 0) {
+            g_cap_n = 0;
+            rig_inject_tcp(peer_ip, 43000, my_ip, 47010,
+                           8000, 0, TCP_SYN, 4096, NULL, 0);
+            if (g_cap_n >= 1) {
+                const tcp_hdr_t* th = (const tcp_hdr_t*)g_cap[0].seg;
+                uint32_t isn = net_ntohl(th->seq);
+                rig_inject_tcp(peer_ip, 43000, my_ip, 47010,
+                               8001, isn + 1, TCP_ACK, 4096, NULL, 0);
+                fd = sock_accept(l);
+            }
+        }
+        if (fd >= 0) {
+            uint8_t buf[16];
+            rig_inject_tcp(peer_ip, 43000, my_ip, 47010,
+                           8001, 0, TCP_ACK | TCP_PSH, 4096, "GOOD", 4);
+            int n1 = sock_recv(fd, buf, sizeof(buf));
+            tcp_good = (n1 == 4 && memcmp(buf, "GOOD", 4) == 0) ? 1 : 0;
+            g_corrupt_tcp = 1;
+            rig_inject_tcp(peer_ip, 43000, my_ip, 47010,
+                           8005, 0, TCP_ACK | TCP_PSH, 4096, "BAD!", 4);
+            g_corrupt_tcp = 0;
+            int n2 = sock_recv(fd, buf, sizeof(buf));
+            tcp_drop = (n2 <= 0) ? 1 : 0;
+        }
+
+        /* IP: a corrupt IPv4 header checksum must be dropped at ipv4_demux. */
+        int u = sock_socket(SOCK_DGRAM);
+        if (u >= 0 && sock_bind(u, 47011) == 0) {
+            uint8_t buf[16];
+            g_corrupt_ip = 1;
+            rig_inject_udp(peer_ip, 7777, my_ip, 47011, "IPBAD", 5);
+            g_corrupt_ip = 0;
+            int nb = sock_recvfrom(u, buf, sizeof(buf), NULL, NULL);
+            ip_drop = (nb <= 0) ? 1 : 0;
+            rig_inject_udp(peer_ip, 7777, my_ip, 47011, "IPOK", 4);
+            int ng = sock_recvfrom(u, buf, sizeof(buf), NULL, NULL);
+            ip_good = (ng == 4 && memcmp(buf, "IPOK", 4) == 0) ? 1 : 0;
+        }
+
+        sock_init();
+        kprintf("NETP1I: RXCKSUM %s tcp_good=%d tcp_drop=%d ip_drop=%d ip_good=%d\n",
+                (tcp_good && tcp_drop && ip_drop && ip_good) ? "PASS" : "FAIL",
+                tcp_good, tcp_drop, ip_drop, ip_good);
     }
 
     g_rig_active = 0;

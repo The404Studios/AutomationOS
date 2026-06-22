@@ -396,6 +396,12 @@ static void ipv4_demux(const uint8_t* ip_start, uint16_t ip_avail) {
     if ((ip->ver_ihl >> 4) != 4) return;
     uint16_t ihl = (uint16_t)((ip->ver_ihl & 0x0F) * 4);
     if (ihl < sizeof(ipv4_hdr_t)) return;
+    if (ihl > ip_avail) return;
+
+    /* TCP-ROBUST (RX checksum verification): a valid IPv4 header sums to 0
+     * (the stored checksum is included in the sum). Corrupt header -> drop
+     * before it reaches UDP/TCP. net_inet_checksum returns the final ~sum. */
+    if (net_inet_checksum(ip, ihl) != 0) return;
 
     uint16_t tot = net_ntohs(ip->total_len);
     if (tot > ip_avail) tot = ip_avail;

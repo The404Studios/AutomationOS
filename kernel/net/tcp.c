@@ -805,10 +805,21 @@ int tcp_close(sock_t* s) {
  */
 void tcp_input(uint32_t src_ip, uint32_t dst_ip,
                const uint8_t* seg, uint16_t seg_len) {
-    (void)dst_ip;
     if (seg_len < sizeof(tcp_hdr_t)) return;
 
     const tcp_hdr_t* th = (const tcp_hdr_t*)seg;
+
+    /* TCP-ROBUST (RX checksum verification): the checksum covers the IPv4
+     * pseudo-header + TCP header + payload, so a VALID segment sums to 0
+     * (net_transport_checksum returns the final ~sum). A checksum field of 0
+     * is technically illegal for TCP, but tolerate it so in-kernel loopback /
+     * test injectors that leave it 0 are not penalized. Corrupt -> silent drop
+     * (the peer retransmits); never let corrupt bytes reach the stream. */
+    if (th->checksum != 0 &&
+        net_transport_checksum(src_ip, dst_ip, IPPROTO_TCP, seg, seg_len) != 0) {
+        return;
+    }
+
     uint16_t src_port = net_ntohs(th->src_port);
     uint16_t dst_port = net_ntohs(th->dst_port);
 

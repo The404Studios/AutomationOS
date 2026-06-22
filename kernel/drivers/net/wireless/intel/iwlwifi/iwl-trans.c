@@ -179,6 +179,22 @@ void iwl_release_nic_access(struct iwl_trans* trans) {
 }
 
 /* ====================================================================== *
+ *  iwl_is_rfkill -- read the live hardware RF-kill switch state.
+ *  Linux iwl_is_rfkill_set: CSR_GP_CNTRL bit 27 (HW_RF_KILL_SW) reads SET when
+ *  the radio is DISABLED -- the physical wireless slider on the T410 front edge,
+ *  or a BIOS "WLAN disabled" setting. An asserted RF-kill makes the firmware
+ *  drop everything silently: scan returns zero SSIDs with no other error. So we
+ *  read + report it at bring-up and before every scan. Caches into trans->rf_kill.
+ * ====================================================================== */
+int iwl_is_rfkill(struct iwl_trans* trans) {
+    if (!trans || !trans->mmio) return 0;
+    uint32_t gp = iwl_read32(trans, CSR_GP_CNTRL);
+    int killed = (gp & CSR_GP_CNTRL_REG_FLAG_HW_RF_KILL_SW) ? 1 : 0;
+    trans->rf_kill = killed;
+    return killed;
+}
+
+/* ====================================================================== *
  *  iwl_prepare_card_hw -- take ownership of the device from the Management
  *  Engine / BIOS, which MUST happen before APM power-up.
  *  Linux pcie/trans.c iwl_pcie_prepare_card_hw -> iwl_pcie_set_hw_ready:
@@ -257,6 +273,15 @@ static int iwl_apm_init(struct iwl_trans* trans) {
     /* (4) Always disable L0S (apm_config). */
     kprintf("IWLTRANS: APM disable L0S (CSR_GIO_REG)...\n");
     iwl_set_bit(trans, CSR_GIO_REG, CSR_GIO_REG_VAL_L0S_DISABLED);
+
+    /* (4b) Analog PLL config -- ONLY the 1000 + 5000 families need it (Linux
+     * iwl_pcie_apm_init: if base_params->pll_cfg). The 6000 series must NOT get
+     * this write. trans->pll_cfg is set per-family in iwl-ops.c. (Audit #7, the
+     * one genuine APM item -- gated so it never harms a 6000 card.) */
+    if (trans->pll_cfg) {
+        kprintf("IWLTRANS: APM set ANA_PLL_CFG (1000/5000 family)...\n");
+        iwl_set_bit(trans, CSR_ANA_PLL_CFG, CSR50_ANA_PLL_CFG_VAL);
+    }
 
     /* (5) Move adapter D0U* -> D0A* (INIT_DONE) then wait for clock to stabilize.
      * Linux iwl_finish_nic_init polls MAC_CLOCK_READY with a 25000us timeout;
@@ -481,6 +506,18 @@ int iwl_trans_bringup(struct iwl_trans* trans) {
     if (iwl_apm_init(trans) != 0) {
         kprintf("IWLTRANS: bring-up FAILED at APM init\n");
         return -1;
+    }
+
+    /* Report HW RF-kill now that the APM is up + CSR_GP_CNTRL is meaningful. We
+     * do NOT abort on RF-kill (the rest of bring-up is harmless and the user may
+     * flip the switch), but a prominent marker means a later empty scan is
+     * immediately explained. */
+    if (iwl_is_rfkill(trans)) {
+        kprintf("IWLTRANS: *** HW RF-KILL ASSERTED *** radio is DISABLED -- "
+                "flip the wireless switch (T410 front-left slider) or enable WLAN "
+                "in BIOS; scan will find NOTHING until then\n");
+    } else {
+        kprintf("IWLTRANS: RF-kill clear (radio enabled)\n");
     }
 
     if (iwl_alloc_cmd_ring(trans) != 0) {

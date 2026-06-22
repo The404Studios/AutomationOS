@@ -284,6 +284,24 @@ int iwl_scd_cmd_queue_init(struct iwl_trans* trans) {
     kprintf("IWLCMD: enable TX DMA/FIFO channels (SCD_TXFACT)...\n");
     iwl_write_prph(trans, SCD_TXFACT, SCD_TXFACT_ALL_QUEUES);
 
+    /* (6b) Enable the FH TX DMA channels themselves. SCD_TXFACT activates the
+     * SCHEDULER, but the per-channel FH TCSR DMA-enable + credit bits gate the
+     * actual data path -- Linux iwl_pcie_tx_start loops channels 0..7 writing
+     * FH_TCSR_CHNL_TX_CONFIG_REG with (DMA_CHNL_ENABLE | DMA_CREDIT_ENABLE) and
+     * then sets the SCD auto-retry chicken bit. Without this the scheduler signals
+     * a TFD is ready but no descriptor actually moves -> host commands (incl.
+     * REPLY_SCAN_CMD) never reach the running uCode -> no scan results. (Audit #2.) */
+    kprintf("IWLCMD: enable FH TX DMA channels 0..%d (FH_TCSR_CHNL_TX_CONFIG_REG)...\n",
+            FH_TCSR_CHNL_NUM - 1);
+    for (int ch = 0; ch < FH_TCSR_CHNL_NUM; ch++) {
+        iwl_write32(trans, FH_TCSR_CHNL_TX_CONFIG_REG(ch),
+                    FH_TCSR_TX_CONFIG_REG_VAL_DMA_CHNL_ENABLE |
+                    FH_TCSR_TX_CONFIG_REG_VAL_DMA_CREDIT_ENABLE);
+    }
+    kprintf("IWLCMD: set FH SCD auto-retry chicken bit...\n");
+    iwl_set_bit(trans, FH_TX_CHICKEN_BITS_REG,
+                FH_TX_CHICKEN_BITS_SCD_AUTO_RETRY_EN);
+
     iwl_release_nic_access(trans);
 
     /* (7) Seed the byte-count entry for the current (empty) cmd slot. The entry
@@ -356,6 +374,13 @@ static int iwl_cmd_enqueue(struct iwl_trans* trans, uint8_t cmd_id,
         if (wr < TFD_QUEUE_SIZE_BC_DUP)
             bc->tfd_offset[TFD_QUEUE_SIZE_MAX + wr] = bc_len;
     }
+
+    /* Flush the TFD + byte-count table stores to DRAM before the device can be
+     * told (via the doorbell) to read them. On x86 the sfence before the doorbell
+     * below already orders these WB stores ahead of the UC doorbell write, but
+     * make the descriptor-visible-before-doorbell ordering explicit here too,
+     * matching Linux iwl_pcie_txq_build_tfd + update_byte_cnt + wmb. (Audit #8.) */
+    iwl_desc_wmb();
 
     /* Hand the descriptor to the device: flush, then ring the write-pointer
      * doorbell with (write_ptr | (queue_id << 8)). NIC access held around it. */

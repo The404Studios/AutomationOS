@@ -1090,6 +1090,13 @@ void kernel_main(void* raw_info) {
     // the T410). Hostile-input-safe; QEMU-checkable.
     extern int iwl_fw_selftest(void);
     iwl_fw_selftest();
+    // IWL DVM pure-logic KATs: prove the RXON builder, the scan-command builder,
+    // and the beacon/IE parser against known-answer bytes -- the software-provable
+    // half of the radio bring-up (the RF tail itself has no emulator). QEMU-checkable.
+    extern int iwl_rxon_selftest(void);
+    iwl_rxon_selftest();
+    extern int iwl_scan_selftest(void);
+    iwl_scan_selftest();
 #endif
 
 #ifdef NET_SELFTEST

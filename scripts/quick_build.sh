@@ -570,6 +570,7 @@ if [ "${IWLWIFI:-0}" = "1" ]; then
     compile kernel/drivers/net/wireless/intel/iwlwifi/iwl-hostcmd.c  c_iwlhostcmd
     compile kernel/drivers/net/wireless/intel/iwlwifi/iwl-fw-load.c  c_iwlfwload
     compile kernel/drivers/net/wireless/intel/iwlwifi/iwl-nvm.c      c_iwlnvm
+    compile kernel/drivers/net/wireless/intel/iwlwifi/iwl-rxon.c     c_iwlrxon
     compile kernel/drivers/net/wireless/intel/iwlwifi/iwl-scan.c     c_iwlscan
     compile kernel/drivers/net/wireless/intel/iwlwifi/iwl-ops.c      c_iwlops
 fi

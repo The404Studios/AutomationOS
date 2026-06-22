@@ -40,6 +40,7 @@
 #include "iwl-fw-load.h"
 #include "iwl-nvm.h"
 #include "iwl-scan.h"
+#include "iwl-rxon.h"
 
 /* The firmware parser entry (iwl-fw.c) + the section-capture helper. */
 int iwl_fw_load_from_initrd(const char* path, struct iwl_fw* out);
@@ -69,7 +70,30 @@ static iwl_fw_images_t  g_fw_images;
 static int iwl_ops_scan_start(struct netif* nif) {
     (void)nif;
     if (!g_alive) { kprintf("IWLOPS: scan_start but radio not alive\n"); return -1; }
+
+    /* Live RF-kill re-check: the user can flip the physical wireless switch at any
+     * time. If asserted, a scan is guaranteed empty -- report clearly + bail so the
+     * GUI can tell the user WHY (rather than a mystery "no networks"). */
+    if (iwl_is_rfkill(&g_trans)) {
+        kprintf("IWLOPS: scan aborted -- HW RF-KILL is ON (flip the wireless switch)\n");
+        g_state = WLAN_DOWN;
+        return -1;
+    }
+
     g_state = WLAN_SCANNING;
+
+    /* THE #1 SCAN PREREQUISITE: configure the radio's MAC receiver via a baseline
+     * RXON BEFORE scanning. Without a committed RXON the DVM firmware delivers no
+     * received frames, so the scan would harvest zero beacons (no SSIDs). We use
+     * the first NVM channel (or channel 1) as the baseline listen channel; the
+     * scan command then hops channels itself. (Audit root cause #1.) */
+    uint8_t base_ch = (g_nvm.n_channels > 0) ? (uint8_t)g_nvm.channels[0].number : 1;
+    if (iwl_rxon_baseline(&g_trans, base_ch) != 0) {
+        kprintf("IWLOPS: baseline RXON FAILED -- scan would be deaf, abort\n");
+        g_state = WLAN_DOWN;
+        return -1;
+    }
+
     int n = iwl_scan(&g_trans, &g_nvm, g_scan,
                      (int)(sizeof(g_scan) / sizeof(g_scan[0])));
     if (n < 0) { g_state = WLAN_DOWN; g_scan_n = 0; return -1; }
@@ -239,6 +263,25 @@ void iwl_wifi_bringup(void) {
     }
     kprintf("IWLWIFI: card %s (fw family iwlwifi-%s)\n", name, fwfam);
 
+    /* Classify the family from the fw_family string (iwl-devices.h). This drives
+     * the 5000/1000-only ANA_PLL APM step and the NVM geometry. The strings are
+     * "1000", "5000", "6000", "6000g2a". pll_cfg is true for 1000 + 5000 (Linux
+     * iwl1000/iwl5000_base_params.pll_cfg), false for 6000. */
+    g_trans.family  = IWL_FAM_6000;
+    g_trans.pll_cfg = 0;
+    if (fwfam) {
+        if (fwfam[0] == '1') {                 /* "1000" */
+            g_trans.family = IWL_FAM_1000;  g_trans.pll_cfg = 1;
+        } else if (fwfam[0] == '5') {          /* "5000" */
+            g_trans.family = IWL_FAM_5000;  g_trans.pll_cfg = 1;
+        } else if (fwfam[4] == 'g') {          /* "6000g2a" */
+            g_trans.family = IWL_FAM_6000G2; g_trans.pll_cfg = 0;
+        } else {                                /* "6000" */
+            g_trans.family = IWL_FAM_6000;  g_trans.pll_cfg = 0;
+        }
+    }
+    kprintf("IWLWIFI: family=%d pll_cfg=%d\n", g_trans.family, g_trans.pll_cfg);
+
     pci_enable_memory_space(dev);
     pci_enable_bus_master(dev);
     uint64_t bar0 = pci_get_bar(dev, 0);
@@ -309,12 +352,18 @@ void iwl_wifi_bringup(void) {
     w.tx      = iwl_netif_tx;
     w.rx_poll = iwl_netif_rx_poll;
 
-    if (netif_register(&w) == 0)
+    if (netif_register(&w) == 0) {
         kprintf("IWLWIFI: registered REAL wlan0 "
                 "(%02x:%02x:%02x:%02x:%02x:%02x, %d channels) -- radio LIVE\n",
                 g_trans.mac[0], g_trans.mac[1], g_trans.mac[2],
                 g_trans.mac[3], g_trans.mac[4], g_trans.mac[5], g_nvm.n_channels);
-    else
+    } else {
+        /* Registration failed (name clash with wifisim, or registry full). Roll
+         * g_alive back so a re-run of iwlup re-does the FULL bring-up (NVM/scan)
+         * instead of operating on stale state behind a non-existent wlan0.
+         * (Audit #9: g_alive was left set on this path.) */
+        g_alive = 0;
         kprintf("IWLWIFI: wlan0 register FAILED "
-                "(name clash? ensure wifisim is NOT compiled in)\n");
+                "(name clash? ensure wifisim is NOT compiled in) -- radio NOT live\n");
+    }
 }

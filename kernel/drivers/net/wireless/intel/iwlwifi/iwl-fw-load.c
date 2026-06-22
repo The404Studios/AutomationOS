@@ -315,6 +315,15 @@ static int iwl_load_image_and_alive(struct iwl_trans* trans,
                 a->ver_subtype, INITIALIZE_SUBTYPE);
         return -1;
     }
+    /* Symmetric guard (audit #9): a RUNTIME ALIVE must NOT report the INIT
+     * subtype. If it does, the runtime image failed to take over (we are still
+     * running the INIT uCode or the ALIVE is stale) -- proceeding would calibrate
+     * + scan against a dead runtime and silently return zero SSIDs. Abort. */
+    if (!want_subtype_init && a->ver_subtype == INITIALIZE_SUBTYPE) {
+        kprintf("IWLLOAD: RUNTIME ALIVE still reports INIT subtype %u -- "
+                "runtime uCode did not start, abort\n", a->ver_subtype);
+        return -1;
+    }
 
     kprintf("IWLLOAD: %s ALIVE OK ucode=%u.%u subtype=%u\n",
             want_subtype_init ? "INIT" : "RUNTIME",

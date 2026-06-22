@@ -159,6 +159,94 @@ struct iwl_calib_hdr {
 } __attribute__((packed));
 
 /* ====================================================================== *
+ *  REPLY_RXON (0x10) + REPLY_RXON_TIMING (0x14) -- dvm/commands.h.
+ *  RXON configures the radio's MAC receiver: channel, band, RX filters, the
+ *  antenna chain (rx_chain), basic rates and the device type. THE DVM FIRMWARE
+ *  WILL NOT RECEIVE ANY 802.11 FRAME (including scan beacons/probe-responses)
+ *  until a valid RXON has been committed -- so a baseline RXON MUST be sent
+ *  after ALIVE and before the first REPLY_SCAN_CMD. Linux dvm/scan.c
+ *  iwlagn_request_scan runs only with an RXON context already established
+ *  (dvm/rxon.c iwl_commit_rxon, dvm/main.c iwl_connection_init_rx_config).
+ *  Layout verbatim from dvm/commands.h struct iwl_rxon_cmd (the AGN/DVM RXON).
+ * ====================================================================== */
+
+/* dev_type (dvm/commands.h RXON_DEV_TYPE_*). */
+#define RXON_DEV_TYPE_ESS        3      /* managed / station (dvm/commands.h) */
+
+/* rx_chain composition (dvm/commands.h RXON_RX_CHAIN_*). VALID selects which
+ * antennas exist; FORCE_SEL forces the radio to listen on them. Linux derives
+ * the valid mask from NVM; for a scan baseline we enable antennas A+B+C (0x7),
+ * which covers every T410 card (1000 is 1x, 5100/6200 are 2x, 5300/6300 are 3x
+ * -- enabling more chains than present is harmless for RX). HW-VALIDATE: pin
+ * the exact valid mask from NVM at association time. */
+#define RXON_RX_CHAIN_VALID_POS          1
+#define RXON_RX_CHAIN_FORCE_SEL_POS      4
+#define RXON_RX_CHAIN_SCAN_DEFAULT \
+    ((0x7u << RXON_RX_CHAIN_VALID_POS) | (0x7u << RXON_RX_CHAIN_FORCE_SEL_POS))
+
+/* flags (dvm/commands.h RXON_FLG_*). */
+#define RXON_FLG_CCK_MSK            0x00000002u  /* 1<<1  */
+#define RXON_FLG_AUTO_DETECT_MSK    0x00000004u  /* 1<<2  */
+#define RXON_FLG_TGG_PROTECT_MSK    0x00000008u  /* 1<<3  */
+#define RXON_FLG_SHORT_SLOT_MSK     0x00000010u  /* 1<<4  */
+#define RXON_FLG_SHORT_PREAMBLE_MSK 0x00000020u  /* 1<<5  */
+#define RXON_FLG_BAND_24G_MSK       0x00000100u  /* 1<<8 (clear == 5GHz)        */
+#define RXON_FLG_TSF2HOST_MSK       0x00008000u  /* 1<<15 (report TSF to host)  */
+
+/* filter_flags (dvm/commands.h RXON_FILTER_*). */
+#define RXON_FILTER_PROMISC_MSK     0x00000001u  /* 1<<0  */
+#define RXON_FILTER_CTL2HOST_MSK    0x00000002u  /* 1<<1  */
+#define RXON_FILTER_ACCEPT_GRP_MSK  0x00000004u  /* 1<<2  (multicast/bcast)     */
+#define RXON_FILTER_DIS_DECRYPT_MSK 0x00000008u  /* 1<<3  */
+#define RXON_FILTER_DIS_GRP_DECRYPT_MSK 0x00000010u /* 1<<4 */
+#define RXON_FILTER_ASSOC_MSK       0x00000020u  /* 1<<5  (set once associated)  */
+#define RXON_FILTER_BCON_AWARE_MSK  0x00000040u  /* 1<<6  */
+
+/* dvm/commands.h struct iwl_rxon_cmd (REPLY_RXON 0x10 payload). 0x28..0x2A in
+ * the channel field; sizeof == 50 bytes packed (gen1 DVM). */
+struct iwl_rxon_cmd {
+    uint8_t  node_addr[6];
+    uint16_t reserved1;
+    uint8_t  bssid_addr[6];
+    uint16_t reserved2;
+    uint8_t  wlap_bssid_addr[6];
+    uint16_t reserved3;
+    uint8_t  dev_type;
+    uint8_t  air_propagation;
+    uint16_t rx_chain;
+    uint8_t  ofdm_basic_rates;
+    uint8_t  cck_basic_rates;
+    uint16_t assoc_id;
+    uint32_t flags;
+    uint32_t filter_flags;
+    uint16_t channel;
+    uint8_t  ofdm_ht_single_stream_basic_rates;
+    uint8_t  ofdm_ht_dual_stream_basic_rates;
+    uint8_t  ofdm_ht_triple_stream_basic_rates;
+    uint8_t  reserved5;
+    uint16_t acquisition_data;
+    uint16_t reserved6;
+} __attribute__((packed));
+
+/* dvm/commands.h struct iwl_rxon_time_cmd (REPLY_RXON_TIMING 0x14 payload). */
+struct iwl_rxon_time_cmd {
+    uint32_t timestamp_lo;          /* __le64 split to avoid alignment issues */
+    uint32_t timestamp_hi;
+    uint16_t beacon_interval;
+    uint16_t atim_window;
+    uint32_t beacon_init_val;
+    uint16_t listen_interval;
+    uint8_t  dtim_period;
+    uint8_t  delta_cp_bss_tbtts;
+} __attribute__((packed));
+
+/* DVM basic-rate bitmaps (dvm/commands.h: the low nibble = CCK 1/2/5.5/11). For
+ * a 2.4GHz scan-baseline RXON the CCK basics are the universally-safe set; OFDM
+ * basics are not required to receive beacons. HW-VALIDATE per band/family. */
+#define IWL_CCK_BASIC_RATES_24    0x0Fu   /* 1+2+5.5+11 Mbps basic */
+#define IWL_OFDM_BASIC_RATES_24   0x00u   /* none needed for scan baseline */
+
+/* ====================================================================== *
  *  TFD (Transfer Frame Descriptor) -- pcie/tx.c struct iwl_tfd / iwl_tfd_tb.
  *  Each cmd-queue slot is one iwl_tfd. A host command is a single TB pointing
  *  at the command bytes (header + payload) in DRAM.
@@ -255,6 +343,35 @@ struct iwl_scan_channel {
 #define SCAN_CMD_OFF_SCAN_FLAGS     2    /* u8 scan_flags         */
 #define SCAN_CMD_OFF_CHANNEL_COUNT  3    /* u8 channel_count      */
 #define SCAN_CMD_OFF_QUIET_TIME     4    /* __le16 quiet_time     */
+#define SCAN_CMD_OFF_QUIET_PLCP_TH  6    /* __le16 quiet_plcp_th  */
+#define SCAN_CMD_OFF_GOOD_CRC_TH    8    /* __le16 good_CRC_th    */
+#define SCAN_CMD_OFF_RX_CHAIN      10    /* __le16 rx_chain (antenna mask) */
+#define SCAN_CMD_OFF_MAX_OUT_TIME  12    /* __le32 max_out_time   */
+#define SCAN_CMD_OFF_SUSPEND_TIME  16    /* __le32 suspend_time   */
+#define SCAN_CMD_OFF_FLAGS         20    /* __le32 flags (RXON_FLG_* band)  */
+#define SCAN_CMD_OFF_FILTER_FLAGS  24    /* __le32 filter_flags (RXON_FILTER_*) */
+
+/* tx_cmd is at offset 28 (after the 28 fixed header bytes). Its internal field
+ * offsets (dvm gen1 struct iwl_tx_cmd) -- only used for an ACTIVE probe TX,
+ * which is a Phase-2 refinement (needs a broadcast station added first). */
+#define SCAN_TXCMD_OFF_TX_FLAGS     (SCAN_CMD_OFF_TX_CMD + 4)   /* __le32 tx_flags */
+#define SCAN_TXCMD_OFF_RATE_N_FLAGS (SCAN_CMD_OFF_TX_CMD + 12)  /* __le32 rate_n_flags */
+#define SCAN_TXCMD_OFF_STA_ID       (SCAN_CMD_OFF_TX_CMD + 16)  /* u8 sta_id */
+
+/* Scan good-CRC / quiet-PLCP thresholds (dvm/scan.c). For a PASSIVE scan the
+ * firmware never early-exits a channel, so good_CRC_th is "never". */
+#define IWL_GOOD_CRC_TH_DISABLED    0x0000   /* dvm/scan.c (passive)  */
+#define IWL_GOOD_CRC_TH_DEFAULT     0x0001   /* dvm/scan.c (active)   */
+#define IWL_PLCP_QUIET_THRESH       0x0001   /* dvm/scan.c            */
+
+/* tx_flags / rate_n_flags for an ACTIVE probe (Phase 2). SEQ_CTL lets the FW
+ * fill the sequence number; the probe goes out at 1Mbps CCK on antenna A. */
+#define TX_CMD_FLG_SEQ_CTL_MSK      0x00002000u  /* 1<<13 dvm/commands.h */
+#define IWL_RATE_1M_PLCP            10           /* dvm IWL_RATE_1M_PLCP */
+#define RATE_MCS_CCK_MSK            0x00000200u  /* 1<<9  */
+#define RATE_MCS_ANT_A_MSK          0x00004000u  /* 1<<14 */
+#define IWL_SCAN_PROBE_RATE_24 \
+    (IWL_RATE_1M_PLCP | RATE_MCS_CCK_MSK | RATE_MCS_ANT_A_MSK)
 
 #define IWL_ACTIVE_DWELL_TIME_24    30   /* dvm/scan.c ~30 TU (2.4GHz active) */
 #define IWL_PASSIVE_DWELL_TIME_24   120  /* dvm/scan.c ~120 TU (passive)      */

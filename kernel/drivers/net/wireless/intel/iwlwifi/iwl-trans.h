@@ -35,6 +35,17 @@
 #include "types.h"
 #include "iwl-csr.h"   /* RX_QUEUE_SIZE, register map */
 
+/* DVM card family -- set by iwl_wifi_bringup() from the matched PCI device's
+ * fw_family string. Selects the family-specific NVM geometry (MAC offset, OTP
+ * block size) and the 5000-only ANA_PLL_CFG APM step. */
+enum iwl_family {
+    IWL_FAM_UNKNOWN = 0,
+    IWL_FAM_1000,
+    IWL_FAM_5000,
+    IWL_FAM_6000,
+    IWL_FAM_6000G2,
+};
+
 /* ====================================================================== *
  *  struct iwl_trans -- the transport state. This is the EXACT struct from
  *  iwl-trans.c, extended with the few fields the firmware-load / host-command /
@@ -68,6 +79,11 @@ struct iwl_trans {
     uint64_t scd_bc_tbl_dma;    /* its physical/DMA address (== virt) */
     uint32_t scd_base_addr;     /* device-internal SCD base (read from SCD_SRAM_BASE_ADDR) */
     int      scd_ready;         /* 1 once iwl_scd_cmd_queue_init has run */
+
+    /* ---- family + RF-kill (set during bring-up; used by NVM/APM/scan) ---- */
+    int      family;            /* enum iwl_family (NVM geometry + ANA_PLL pick) */
+    int      pll_cfg;           /* 1 if this family needs CSR_ANA_PLL_CFG (5000) */
+    int      rf_kill;           /* 1 if HW RF-kill was asserted at last check */
 };
 
 /* ====================================================================== *
@@ -90,5 +106,12 @@ void     iwl_udelay_approx(volatile uint32_t loops);
 
 /* The held transport entry (iwl-trans.c). Allocates rings + powers the APM. */
 int      iwl_trans_bringup(struct iwl_trans* trans);
+
+/* iwl_is_rfkill -- read the live HW RF-kill switch state (CSR_GP_CNTRL bit 27).
+ * Returns 1 if RF-kill is ASSERTED (radio disabled: physical wireless switch off
+ * or BIOS WLAN disabled), 0 otherwise. Also caches the result in trans->rf_kill.
+ * On a real T410 an asserted RF-kill silently yields zero scan results, so every
+ * bring-up/scan path checks + reports this. */
+int      iwl_is_rfkill(struct iwl_trans* trans);
 
 #endif /* IWL_TRANS_H */

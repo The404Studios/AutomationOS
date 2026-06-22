@@ -28,4 +28,8 @@
 int iwl_scan(struct iwl_trans* trans, const iwl_nvm_data_t* chans,
              wlan_bss_t* out, int max);
 
+/* Pure-logic KAT for the scan-command builder + beacon parser (QEMU, no radio).
+ * Returns 0 on PASS, -1 on FAIL. */
+int iwl_scan_selftest(void);
+
 #endif /* IWL_SCAN_H */

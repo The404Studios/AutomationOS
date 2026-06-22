@@ -72,6 +72,13 @@
 /* --- CSR_DBG_HPET_MEM_REG value (iwl-csr.h: CSR_DBG_HPET_MEM_REG_VAL) --- */
 #define CSR_DBG_HPET_MEM_REG_VAL   0xFFFF0000
 
+/* --- CSR_ANA_PLL_CFG value (iwl-csr.h: CSR50_ANA_PLL_CFG_VAL) --- *
+ * Linux iwl_pcie_apm_init sets this on families whose base_params->pll_cfg is
+ * true (the 1000 + 5000 series: iwl1000/iwl5000_base_params.pll_cfg_val). The
+ * 6000 series does NOT need it (pll_cfg_val == 0), so this is applied only when
+ * trans->pll_cfg is set (see iwl-ops.c family detection). */
+#define CSR50_ANA_PLL_CFG_VAL      0x00880300
+
 /* --- CSR_HW_IF_CONFIG_REG bits (iwl-csr.h) --- */
 #define CSR_HW_IF_CONFIG_REG_BIT_HAP_WAKE_L1A   0x00080000   /* iwl-csr.h */
 #define CSR_HW_IF_CONFIG_REG_BIT_NIC_READY      0x00400000   /* iwl-csr.h: PCI_OWN_SEM */
@@ -178,6 +185,12 @@
 #define FH_TCSR_TX_CONFIG_REG_VAL_DMA_CREDIT_ENABLE   0x00000008  /* iwl-fh.h */
 #define FH_TCSR_TX_CONFIG_REG_VAL_CIRQ_HOST_IFTFD     0x00200000  /* iwl-fh.h */
 #define FH_TCSR_TX_CONFIG_REG_VAL_DMA_CHNL_ENABLE     0x80000000  /* iwl-fh.h */
+
+/* FH TX chicken bits -- iwl_pcie_tx_start sets SCD_AUTO_RETRY_EN after enabling
+ * the TX DMA channels (iwl-fh.h FH_TX_CHICKEN_BITS_REG = FH_MEM_LOWER_BOUND +
+ * 0xE98 = 0x1E98). */
+#define FH_TX_CHICKEN_BITS_REG        (FH_MEM_LOWER_BOUND + 0xE98)  /* 0x1E98 */
+#define FH_TX_CHICKEN_BITS_SCD_AUTO_RETRY_EN  0x00000002            /* iwl-fh.h BIT(1) */
 
 /* TFD command-queue depth (iwl-fh.h: TFD_QUEUE_SIZE_MAX). One TFD per slot. */
 #define TFD_QUEUE_SIZE_MAX            256

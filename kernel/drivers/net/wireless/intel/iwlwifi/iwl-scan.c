@@ -59,6 +59,7 @@
  *  Returns the total frame length. The probe template is appended to the scan
  *  command after the head; tx_cmd.len records this length.
  * ====================================================================== */
+__attribute__((unused))
 static uint16_t iwl_fill_probe_req(uint8_t* frame, const uint8_t* own_mac) {
     uint16_t p = 0;
     /* frame_control (LE16). */
@@ -97,9 +98,28 @@ static uint16_t iwl_fill_probe_req(uint8_t* frame, const uint8_t* own_mac) {
  *  tx_cmd.len, and OR the probe mask into each active channel. Returns the total
  *  payload byte length.
  * ====================================================================== */
+/* Little-endian field stores into the command buffer. */
+static inline void sc_le16(uint8_t* p, uint16_t v) {
+    p[0] = (uint8_t)(v & 0xff); p[1] = (uint8_t)((v >> 8) & 0xff);
+}
+static inline void sc_le32(uint8_t* p, uint32_t v) {
+    p[0] = (uint8_t)(v & 0xff);         p[1] = (uint8_t)((v >> 8) & 0xff);
+    p[2] = (uint8_t)((v >> 16) & 0xff); p[3] = (uint8_t)((v >> 24) & 0xff);
+}
+
+/*
+ * Build a PASSIVE 2.4GHz scan. Milestone 1 (see SSIDs) does a passive listen:
+ * every AP beacons ~every 100ms, so a passive_dwell > 100 TU on each channel
+ * harvests them all -- WITHOUT needing a probe-request TX (which would require a
+ * broadcast station via REPLY_ADD_STA, a Phase-2 item). The fixed header is now
+ * fully initialized (previously only ~6 of 28 bytes were set, so the firmware
+ * received a malformed command). Returns the total payload byte length.
+ */
 static uint16_t iwl_build_scan_cmd(const iwl_nvm_data_t* chans,
                                    const uint8_t* own_mac,
                                    uint8_t* buf, uint16_t cap) {
+    (void)own_mac;   /* passive scan transmits no probe (active = Phase 2) */
+
     /* Head: zeroed block of IWL_SCAN_CMD_HEAD_SIZE (768 = 0x300). (S-S1: the old
      * 0xC8 head was far too small, so channels overwrote direct_scan[].) */
     uint16_t head = (uint16_t)IWL_SCAN_CMD_HEAD_SIZE;
@@ -107,47 +127,47 @@ static uint16_t iwl_build_scan_cmd(const iwl_nvm_data_t* chans,
     for (uint16_t i = 0; i < head; i++) buf[i] = 0;
 
     int nch = chans ? chans->n_channels : 0;
-    /* Reserve room for the probe template that follows the channels. */
     uint16_t per = (uint16_t)sizeof(struct iwl_scan_channel);
-    uint16_t probe_room = 64;   /* > a broadcast probe-req template */
-    while (nch > 0 &&
-           (uint32_t)head + (uint32_t)nch * per + probe_room > cap) nch--;
+    while (nch > 0 && (uint32_t)head + (uint32_t)nch * per > cap) nch--;
 
-    /* Leading named fields (dvm/scan.c). */
-    buf[SCAN_CMD_OFF_SCAN_FLAGS]    = 0;                 /* default scan flags */
+    /* ---- fixed header fields (dvm/scan.c iwlagn_request_scan) ---- */
+    buf[SCAN_CMD_OFF_SCAN_FLAGS]    = 0;
     buf[SCAN_CMD_OFF_CHANNEL_COUNT] = (uint8_t)nch;
-    /* quiet_time (LE16). */
-    buf[SCAN_CMD_OFF_QUIET_TIME + 0] = IWL_ACTIVE_QUIET_TIME & 0xff;
-    buf[SCAN_CMD_OFF_QUIET_TIME + 1] = (IWL_ACTIVE_QUIET_TIME >> 8) & 0xff;
+    sc_le16(buf + SCAN_CMD_OFF_QUIET_TIME,    IWL_ACTIVE_QUIET_TIME);
+    sc_le16(buf + SCAN_CMD_OFF_QUIET_PLCP_TH, IWL_PLCP_QUIET_THRESH);
+    /* passive scan never early-exits a channel on good CRCs */
+    sc_le16(buf + SCAN_CMD_OFF_GOOD_CRC_TH,   IWL_GOOD_CRC_TH_DISABLED);
+    sc_le16(buf + SCAN_CMD_OFF_RX_CHAIN,      (uint16_t)RXON_RX_CHAIN_SCAN_DEFAULT);
+    /* not associated -> stay on each channel for the full dwell (no host time-share) */
+    sc_le32(buf + SCAN_CMD_OFF_MAX_OUT_TIME,  0);
+    sc_le32(buf + SCAN_CMD_OFF_SUSPEND_TIME,  0);
+    /* band/RXON flags for the scan RF: 2.4GHz + auto-detect modulation */
+    sc_le32(buf + SCAN_CMD_OFF_FLAGS,
+            RXON_FLG_BAND_24G_MSK | RXON_FLG_AUTO_DETECT_MSK);
+    /* receive beacons/probe-responses from any BSS */
+    sc_le32(buf + SCAN_CMD_OFF_FILTER_FLAGS,
+            RXON_FILTER_PROMISC_MSK | RXON_FILTER_BCON_AWARE_MSK);
+    /* tx_cmd.len = 0: no probe template appended (passive). Phase-2 active scan
+     * fills tx_cmd (tx_flags/rate_n_flags/sta_id) + appends the probe template +
+     * sets the per-channel IWL_SCAN_PROBE_MASK_1. */
+    sc_le16(buf + SCAN_TXCMD_OFF_LEN, 0);
 
-    /* Append the per-channel descriptors right after the head. */
+    /* ---- per-channel descriptors (PASSIVE: listen for beacons) ---- */
     uint16_t off = head;
     for (int i = 0; i < nch; i++) {
         struct iwl_scan_channel* sc = (struct iwl_scan_channel*)(buf + off);
         for (uint16_t b = 0; b < per; b++) ((uint8_t*)sc)[b] = 0;
-        /* Active scan + the one-probe mask in the high bits so the firmware
-         * actually transmits the probe template on this channel (S-S2). */
-        sc->type          = SCAN_CHANNEL_TYPE_ACTIVE | IWL_SCAN_PROBE_MASK_1;
+        sc->type          = SCAN_CHANNEL_TYPE_PASSIVE;   /* no probe TX */
         sc->channel       = chans->channels[i].number;
-        sc->tx_gain       = IWL_SCAN_TX_GAIN_24;   /* 2.4GHz probe tx gain */
+        sc->tx_gain       = IWL_SCAN_TX_GAIN_24;
         sc->active_dwell  = IWL_ACTIVE_DWELL_TIME_24;
-        sc->passive_dwell = IWL_PASSIVE_DWELL_TIME_24;
+        sc->passive_dwell = IWL_PASSIVE_DWELL_TIME_24;   /* >100 TU -> catches a beacon */
         sc->dsp_atten     = 110;
         off += per;
     }
 
-    /* Build the broadcast probe-request template into data[] (after channels) and
-     * record its length in iwl_scan_cmd.tx_cmd.len (S-S2). */
-    if ((uint32_t)off + probe_room <= cap) {
-        uint16_t plen = iwl_fill_probe_req(buf + off, own_mac);
-        buf[SCAN_TXCMD_OFF_LEN + 0] = plen & 0xff;
-        buf[SCAN_TXCMD_OFF_LEN + 1] = (plen >> 8) & 0xff;
-        off = (uint16_t)(off + plen);
-    }
-
     /* Fill iwl_scan_cmd.len (LE16) with the total payload. */
-    buf[SCAN_CMD_OFF_LEN + 0] = off & 0xff;
-    buf[SCAN_CMD_OFF_LEN + 1] = (off >> 8) & 0xff;
+    sc_le16(buf + SCAN_CMD_OFF_LEN, off);
     return off;
 }
 
@@ -357,4 +377,83 @@ int iwl_scan(struct iwl_trans* trans, const iwl_nvm_data_t* chans,
      * clean, bounded outcome -- never hangs). */
     kprintf("IWLSCAN: harvest budget exhausted (no SCAN_COMPLETE) -- %d BSS\n", found);
     return found;
+}
+
+/* ====================================================================== *
+ *  iwl_scan_selftest -- pure-logic KAT for the scan-command builder + the beacon
+ *  parser. Runs in QEMU (no radio): proves the command head is fully formed and
+ *  that a synthetic beacon decodes to the right SSID/BSSID/channel/security --
+ *  catching struct-offset / IE-walk bugs WITHOUT hardware. Returns 0 / -1.
+ * ====================================================================== */
+static uint16_t st_rd16(const uint8_t* p) { return (uint16_t)(p[0] | (p[1] << 8)); }
+static uint32_t st_rd32(const uint8_t* p) {
+    return (uint32_t)(p[0] | (p[1] << 8) | (p[2] << 16) | ((uint32_t)p[3] << 24));
+}
+
+int iwl_scan_selftest(void) {
+    int ok = 1;
+
+    /* ---- (A) scan-command builder: 13x 2.4GHz passive channels ---- */
+    static iwl_nvm_data_t nvm;
+    for (uint32_t i = 0; i < sizeof(nvm); i++) ((uint8_t*)&nvm)[i] = 0;
+    nvm.n_channels = 13;
+    for (int c = 0; c < 13; c++) { nvm.channels[c].number = (uint16_t)(c + 1); nvm.channels[c].band = 0; }
+    const uint8_t mac[6] = { 0x00, 0x11, 0x22, 0x33, 0x44, 0x55 };
+    static uint8_t buf[1280];
+    uint16_t plen = iwl_build_scan_cmd(&nvm, mac, buf, (uint16_t)sizeof(buf));
+
+    if (plen == 0) { kprintf("IWL-SCAN: build returned 0\n"); ok = 0; }
+    if (buf[SCAN_CMD_OFF_CHANNEL_COUNT] != 13) ok = 0;
+    if (st_rd16(buf + SCAN_CMD_OFF_GOOD_CRC_TH) != IWL_GOOD_CRC_TH_DISABLED) ok = 0;
+    if (st_rd16(buf + SCAN_CMD_OFF_RX_CHAIN) != (uint16_t)RXON_RX_CHAIN_SCAN_DEFAULT) ok = 0;
+    if (!(st_rd32(buf + SCAN_CMD_OFF_FLAGS) & RXON_FLG_BAND_24G_MSK)) ok = 0;
+    if (!(st_rd32(buf + SCAN_CMD_OFF_FILTER_FLAGS) & RXON_FILTER_PROMISC_MSK)) ok = 0;
+    if (st_rd16(buf + SCAN_TXCMD_OFF_LEN) != 0) ok = 0;   /* passive: no probe */
+    /* first per-channel descriptor (right after the 768-byte head) */
+    {
+        const struct iwl_scan_channel* sc0 =
+            (const struct iwl_scan_channel*)(buf + IWL_SCAN_CMD_HEAD_SIZE);
+        if (sc0->channel != 1) ok = 0;
+        if (sc0->type & SCAN_CHANNEL_TYPE_ACTIVE) ok = 0;   /* must be PASSIVE */
+        if (sc0->passive_dwell != IWL_PASSIVE_DWELL_TIME_24) ok = 0;
+    }
+
+    /* ---- (B) beacon parser: synthetic REPLY_RX_MPDU -> wlan_bss_t ---- */
+    static uint8_t mpdu[128];
+    for (uint32_t i = 0; i < sizeof(mpdu); i++) mpdu[i] = 0;
+    uint8_t* f = mpdu + 4;   /* 802.11 header starts after iwl_rx_mpdu_res_start */
+    int p = 0;
+    f[p++] = 0x80; f[p++] = 0x00;                 /* frame_control = beacon */
+    f[p++] = 0;    f[p++] = 0;                     /* duration */
+    for (int i = 0; i < 6; i++) f[p++] = 0xff;     /* addr1 = broadcast */
+    for (int i = 0; i < 6; i++) f[p++] = (uint8_t)(0xa0 + i);  /* addr2 = SA */
+    const uint8_t bssid[6] = { 0xde, 0xad, 0xbe, 0xef, 0x00, 0x42 };
+    for (int i = 0; i < 6; i++) f[p++] = bssid[i]; /* addr3 = BSSID (offset 16) */
+    f[p++] = 0;    f[p++] = 0;                     /* seq_ctrl */
+    for (int i = 0; i < 8; i++) f[p++] = 0;        /* timestamp */
+    f[p++] = 0x64; f[p++] = 0x00;                  /* beacon_interval = 100 */
+    f[p++] = 0x11; f[p++] = 0x00;                  /* capability (ESS+privacy) @34 */
+    /* IEs @36: SSID "Hello", DS ch6, RSN (=> WPA2) */
+    f[p++] = 0;  f[p++] = 5;  f[p++]='H'; f[p++]='e'; f[p++]='l'; f[p++]='l'; f[p++]='o';
+    f[p++] = 3;  f[p++] = 1;  f[p++] = 6;
+    f[p++] = 48; f[p++] = 4;  f[p++]=1; f[p++]=0; f[p++]=0; f[p++]=0;
+    uint16_t framelen = (uint16_t)p;
+    mpdu[0] = (uint8_t)(framelen & 0xff);          /* iwl_rx_mpdu_res_start.byte_count */
+    mpdu[1] = (uint8_t)((framelen >> 8) & 0xff);
+
+    wlan_bss_t bss;
+    for (uint32_t i = 0; i < sizeof(bss); i++) ((uint8_t*)&bss)[i] = 0;
+    int r = iwl_parse_beacon(mpdu, (uint16_t)(4 + framelen), -50, &bss);
+    if (r != 1) { kprintf("IWL-SCAN: beacon parse returned %d\n", r); ok = 0; }
+    if (bss.ssid_len != 5) ok = 0;
+    { const char* exp = "Hello"; for (int i = 0; i < 5; i++) if (bss.ssid[i] != (uint8_t)exp[i]) ok = 0; }
+    for (int i = 0; i < 6; i++) if (bss.bssid[i] != bssid[i]) ok = 0;
+    if (bss.channel != 6) ok = 0;
+    if (bss.security != WLAN_SEC_WPA2) ok = 0;
+
+    kprintf("IWL-SCAN: selftest %s (scan_plen=%u ssid='%c%c%c%c%c' len=%u ch=%u sec=%u)\n",
+            ok ? "PASS" : "FAIL", plen,
+            bss.ssid[0], bss.ssid[1], bss.ssid[2], bss.ssid[3], bss.ssid[4],
+            bss.ssid_len, bss.channel, bss.security);
+    return ok ? 0 : -1;
 }

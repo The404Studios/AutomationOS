@@ -896,6 +896,8 @@ typedef struct {
 
 ## Driver API
 
+The built-in device drivers: serial, PS/2 keyboard, framebuffer, and the PIT timer.
+
 ### Serial Driver
 
 **Header:** `kernel/include/drivers.h`
@@ -1081,6 +1083,8 @@ Busy-wait loop. Not suitable for long delays.
 
 ## Architecture-Specific API
 
+The x86_64 primitives: descriptor tables, port I/O, CPU control, and the control registers.
+
 ### x86_64 Functions
 
 **Header:** `kernel/include/x86_64.h`
@@ -1150,6 +1154,8 @@ void write_cr4(uint64_t value);
 ---
 
 ## Kernel Library API
+
+The freestanding helpers available kernel-wide: string routines, formatted output, and panic/assert.
 
 ### String Functions
 
@@ -1239,6 +1245,8 @@ ASSERT(size > 0 && size < MAX_SIZE);
 
 ## Userspace libc API
 
+The in-tree freestanding libc that ring 3 programs link against.
+
 ### System Call Wrappers
 
 **Header:** `userspace/libc/syscall.h`
@@ -1292,6 +1300,8 @@ void* memcpy(void* dest, const void* src, size_t n);
 ---
 
 ## Usage Examples
+
+End-to-end snippets that combine the APIs above.
 
 ### Example 1: Allocating and Mapping Memory
 
@@ -1363,6 +1373,8 @@ void com2_write(char c) {
 ---
 
 ## API Conventions
+
+The naming, return-value, and error-handling conventions used throughout the codebase.
 
 ### Naming
 

@@ -868,12 +868,16 @@ static long build_client_hello(tls_conn_t *c, const char *server_name,
     /* session_id (empty) */
     out[p++] = 0;
 
-    /* TLS 1.3 key_share ephemeral: generate the x25519 keypair NOW so its public
-     * key goes in the ClientHello key_share extension below (only when offered). */
-    unsigned char t13_pub[32];
+    /* TLS 1.3 key_share ephemerals: generate BOTH an x25519 and a secp256r1
+     * keypair NOW so both go in the ClientHello key_share -- a server preferring
+     * P-256 then selects it directly instead of forcing a HelloRetryRequest. */
+    unsigned char t13_pub[32];          /* x25519 public                       */
+    unsigned char t13_p256_pub[65];     /* secp256r1 public (uncompressed)     */
     if (TLS13_OFFER) {
         if (sys_random(c->t13_cli_priv, 32) != 0) return TLS_ERR_CRYPTO;
         if (x25519_base(t13_pub, c->t13_cli_priv) != 0) return TLS_ERR_CRYPTO;
+        if (sys_random(c->t13_p256_priv, 32) != 0) return TLS_ERR_CRYPTO;
+        if (p256_keygen(c->t13_p256_priv, t13_p256_pub) != 0) return TLS_ERR_CRYPTO;
     }
 
     /* cipher_suites: TLS 1.3 suites first (when offered), then 1.2 ECDHE+AEAD,
@@ -970,13 +974,18 @@ static long build_client_hello(tls_conn_t *c, const char *server_name,
         put_u16(out + p, 0x0304); p += 2;         /* TLS 1.3                   */
         put_u16(out + p, 0x0303); p += 2;         /* TLS 1.2 (fallback)        */
 
-        /* key_share (0x0033), CLIENT form: client_shares list of KeyShareEntry. */
+        /* key_share (0x0033), CLIENT form: a list of KeyShareEntry. We offer
+         * BOTH x25519 (preferred) and secp256r1 so a P-256-preferring server
+         * selects directly without a HelloRetryRequest. */
         put_u16(out + p, 0x0033); p += 2;
-        put_u16(out + p, 2 + 4 + 32); p += 2;     /* ext_data = 38             */
-        put_u16(out + p, 4 + 32); p += 2;         /* client_shares list length */
+        put_u16(out + p, 2 + (4 + 32) + (4 + 65)); p += 2; /* ext_data = 107    */
+        put_u16(out + p, (4 + 32) + (4 + 65)); p += 2;     /* client_shares=105 */
         put_u16(out + p, 0x001d); p += 2;         /* group x25519              */
         put_u16(out + p, 32); p += 2;             /* key_exchange length       */
-        mem_cpy(out + p, t13_pub, 32); p += 32;   /* our ephemeral public key  */
+        mem_cpy(out + p, t13_pub, 32); p += 32;   /* x25519 ephemeral public   */
+        put_u16(out + p, 0x0017); p += 2;         /* group secp256r1           */
+        put_u16(out + p, 65); p += 2;             /* key_exchange length       */
+        mem_cpy(out + p, t13_p256_pub, 65); p += 65; /* P-256 ephemeral point  */
 
         /* psk_key_exchange_modes (0x002d): psk_dhe_ke(1). */
         put_u16(out + p, 0x002d); p += 2;
@@ -1588,9 +1597,14 @@ static int tls13_do_handshake(tls_conn_t *c, transcript_t *tr, const char *serve
     unsigned int keylen = (aead == TLS13_AEAD_AES128_GCM) ? 16u : 32u;
     const int hid = 0;                    /* SHA-256 suites */
 
-    /* 1. ECDHE shared secret. */
+    /* 1. ECDHE shared secret -- per the server-selected group (RFC 8446 7.4.2).
+     * For secp256r1 the IKM is the 32-byte X-coordinate (p256_ecdh out_x). */
     unsigned char shared[32];
-    if (x25519(shared, c->t13_cli_priv, c->t13_peer_pub) != 0) return TLS_ERR_CRYPTO;
+    if (c->t13_group == TLS13_GROUP_P256) {
+        if (p256_ecdh(shared, c->t13_p256_priv, c->t13_peer_pub) != 0) return TLS_ERR_CRYPTO;
+    } else {
+        if (x25519(shared, c->t13_cli_priv, c->t13_peer_pub) != 0) return TLS_ERR_CRYPTO;
+    }
 
     /* 2. Handshake secrets from H(ClientHello..ServerHello). */
     unsigned char th[48], eh[48], early[48], derived[48], hs[48];
@@ -1765,14 +1779,16 @@ int tls_client_connect(tls_conn_t *c, int tcp_fd, const char *server_name) {
                  * if so, drive the whole 1.3 handshake from here. The transcript
                  * already holds ClientHello||ServerHello (hs_next added the SH). */
                 int is13 = 0; unsigned short c13 = 0, g13 = 0;
-                unsigned char pp[64]; unsigned long ppl = 0;
+                unsigned char pp[97]; unsigned long ppl = 0;
                 int pr = tls13_parse_server_hello(msg - 4, mlen + 4, &c13, &is13,
                                                   &g13, pp, sizeof pp, &ppl);
                 if (pr == -2) return TLS_ERR_PROTO;            /* HelloRetryRequest */
                 if (pr == 0 && is13) {
-                    if (g13 != TLS13_GROUP_X25519 || ppl != 32) return TLS_ERR_CURVE;
-                    c->cipher = c13;
-                    mem_cpy(c->t13_peer_pub, pp, 32);
+                    int ok = (g13 == TLS13_GROUP_X25519 && ppl == 32) ||
+                             (g13 == TLS13_GROUP_P256   && ppl == 65);
+                    if (!ok) return TLS_ERR_CURVE;
+                    c->cipher = c13; c->t13_group = g13;
+                    mem_cpy(c->t13_peer_pub, pp, ppl);
                     return tls13_do_handshake(c, &tr, server_name);
                 }
             }

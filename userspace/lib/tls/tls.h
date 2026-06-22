@@ -199,7 +199,9 @@ typedef struct tls_conn {
      * tls13_* modules; these fields carry the per-connection key material. */
     int                is_tls13;             /* 1 once 1.3 negotiated          */
     unsigned char      t13_cli_priv[32];     /* our x25519 key_share private   */
-    unsigned char      t13_peer_pub[32];     /* server key_share public        */
+    unsigned char      t13_p256_priv[32];    /* our secp256r1 key_share private */
+    unsigned short     t13_group;            /* negotiated group (0x1d/0x17)   */
+    unsigned char      t13_peer_pub[65];     /* server key_share public (32/65) */
     unsigned char      t13_chs[32];          /* client handshake traffic secret */
     unsigned char      t13_shs[32];          /* server handshake traffic secret */
     int                t13_aead;             /* TLS13_AEAD_* id (record AEAD)   */

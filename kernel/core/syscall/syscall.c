@@ -251,6 +251,10 @@ void syscall_init(void) {
     syscall_table[SYS_BIND]      = (syscall_handler_t)sys_sock_bind;
     syscall_table[SYS_LISTEN]    = (syscall_handler_t)sys_sock_listen;
     syscall_table[SYS_ACCEPT]    = (syscall_handler_t)sys_sock_accept;
+    // A4 (SOCKET-PARITY-0): setsockopt/getsockopt + shutdown half-close
+    syscall_table[SYS_SETSOCKOPT] = (syscall_handler_t)sys_sock_setsockopt;
+    syscall_table[SYS_GETSOCKOPT] = (syscall_handler_t)sys_sock_getsockopt;
+    syscall_table[SYS_SHUTDOWN]   = (syscall_handler_t)sys_sock_shutdown;
 
     // Network configuration (DHCP lease apply, routing, ARP table query)
     syscall_table[SYS_NET_CONFIG]  = (syscall_handler_t)sys_net_config;

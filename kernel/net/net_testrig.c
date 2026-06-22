@@ -431,6 +431,81 @@ void net_testrig_selftest(void) {
                 n, heapok, (extra < 0) ? 1 : 0);
     }
 
+    /* ---------------------------------------------------------------- */
+    /* A4 (SOCKET-PARITY-0): setsockopt/getsockopt round-trip + the      */
+    /* SO_REUSEADDR relaxation of the bind() duplicate-port check.        */
+    /* ---------------------------------------------------------------- */
+    {
+        int type_ok = 0, rcvto_ok = 0, reuse_reject = 0, reuse_ok = 0;
+        int u = sock_socket(SOCK_DGRAM);
+        if (u >= 0) {
+            int v = -1;
+            if (sock_getsockopt(u, SOL_SOCKET, SO_TYPE, &v) == SOCK_OK &&
+                v == SOCK_DGRAM)
+                type_ok = 1;
+            if (sock_setsockopt(u, SOL_SOCKET, SO_RCVTIMEO, 500) == SOCK_OK) {
+                v = -1;
+                if (sock_getsockopt(u, SOL_SOCKET, SO_RCVTIMEO, &v) == SOCK_OK &&
+                    v == 500)
+                    rcvto_ok = 1;
+            }
+            sock_bind(u, 47007);
+            int w = sock_socket(SOCK_DGRAM);
+            if (w >= 0) {
+                /* No SO_REUSEADDR -> duplicate bind must be REJECTED. */
+                if (sock_bind(w, 47007) < 0) reuse_reject = 1;
+                /* With SO_REUSEADDR -> the same bind must SUCCEED. */
+                sock_setsockopt(w, SOL_SOCKET, SO_REUSEADDR, 1);
+                if (sock_bind(w, 47007) == SOCK_OK) reuse_ok = 1;
+            }
+        }
+        sock_init();
+        kprintf("NETP1F: SOCKOPT %s type=%d rcvtimeo=%d reuse_reject=%d reuse_ok=%d\n",
+                (type_ok && rcvto_ok && reuse_reject && reuse_ok) ? "PASS" : "FAIL",
+                type_ok, rcvto_ok, reuse_reject, reuse_ok);
+    }
+
+    /* ---------------------------------------------------------------- */
+    /* A4: shutdown(2) half-close. SHUT_RD makes recv return EOF (0)      */
+    /* even with a datagram queued; SHUT_WR makes sendto fail.            */
+    /* ---------------------------------------------------------------- */
+    {
+        int rd_eof = 0, wr_blocked = 0;
+        int u = sock_socket(SOCK_DGRAM);
+        if (u >= 0 && sock_bind(u, 47008) == 0) {
+            rig_inject_udp(peer_ip, 7777, my_ip, 47008, "Z", 1);
+            sock_shutdown(u, SHUT_RD);
+            uint8_t buf[8];
+            int r = sock_recvfrom(u, buf, sizeof(buf), NULL, NULL);
+            rd_eof = (r == 0) ? 1 : 0;
+            sock_shutdown(u, SHUT_WR);
+            int sr = sock_sendto(u, "Q", 1, peer_ip, 7777);
+            wr_blocked = (sr < 0) ? 1 : 0;
+        }
+        sock_init();
+        kprintf("NETP1G: SHUTDOWN %s rd_eof=%d wr_blocked=%d\n",
+                (rd_eof && wr_blocked) ? "PASS" : "FAIL", rd_eof, wr_blocked);
+    }
+
+    /* ---------------------------------------------------------------- */
+    /* A4: loopback. A UDP datagram to 127.0.0.1 must arrive byte-exact  */
+    /* in a socket bound to that port -- exercising the REAL send path    */
+    /* (ip_tx 127/8 short-circuit -> ipv4_demux -> udp_input -> queue).   */
+    /* ---------------------------------------------------------------- */
+    {
+        int loop_ok = 0;
+        int u = sock_socket(SOCK_DGRAM);
+        if (u >= 0 && sock_bind(u, 47009) == 0) {
+            int sr = sock_sendto(u, "LOOPBK", 6, 0x7F000001u, 47009);
+            uint8_t buf[16]; uint32_t sip = 0; uint16_t sp = 0;
+            int n = sock_recvfrom(u, buf, sizeof(buf), &sip, &sp);
+            loop_ok = (sr == 6 && n == 6 && memcmp(buf, "LOOPBK", 6) == 0 &&
+                       sp == 47009) ? 1 : 0;
+        }
+        sock_init();
+        kprintf("NETP1H: LOOPBACK %s ok=%d\n", loop_ok ? "PASS" : "FAIL", loop_ok);
+    }
+
     g_rig_active = 0;
 }
 

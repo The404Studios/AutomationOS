@@ -47,6 +47,13 @@ static uint16_t g_next_port = 49152;   /* ephemeral range start */
 static uint8_t g_rx[ETH_MAX_FRAME];
 /* TX scratch for ip_tx(). */
 static uint8_t g_tx[ETH_MAX_FRAME];
+/* A4: loopback (127/8) delivery scratch -- a self-addressed IPv4 packet fed
+ * straight back into the demux, never near ARP/Ethernet/the NIC. */
+static uint8_t g_lo[ETH_MAX_FRAME];
+
+/* ipv4_demux() is defined later in this file; the A4 loopback short-circuit at
+ * the head of ip_tx() needs it. */
+static void ipv4_demux(const uint8_t* ip_start, uint16_t ip_avail);
 
 static sock_t* sock_from_fd(int fd) {
     if (!g_socks) return NULL;
@@ -242,6 +249,33 @@ static int ip_send_fragment(uint8_t dmac[ETH_ALEN], uint32_t dst_ip,
 int ip_tx(uint32_t dst_ip, uint8_t proto, const void* seg, uint16_t seg_len) {
     static uint16_t ip_id = 1;
 
+    /* A4 (SOCKET-PARITY-0): loopback. Anything to 127.0.0.0/8 is delivered
+     * locally by wrapping the segment in an IPv4 header and feeding it straight
+     * to the demux -- no ARP, no Ethernet, no NIC, works even with net DOWN.
+     * Placed BEFORE the test-rig tap so loopback always loops (the tap is for
+     * on-the-wire segments). The source is net_get_ip() so the transport
+     * checksum (computed by udp.c/tcp.c with net_get_ip() as the pseudo-header
+     * source) verifies on the receive side. */
+    if ((dst_ip >> 24) == 127u) {
+        uint16_t iplen = (uint16_t)(sizeof(ipv4_hdr_t) + seg_len);
+        if (iplen > sizeof(g_lo)) return -1;
+        ipv4_hdr_t* ip = (ipv4_hdr_t*)g_lo;
+        ip->ver_ihl   = 0x45;
+        ip->tos       = 0;
+        ip->total_len = net_htons(iplen);
+        ip->id        = net_htons(ip_id++);
+        ip->frag_off  = 0;
+        ip->ttl       = 64;
+        ip->proto     = proto;
+        ip->checksum  = 0;
+        ip->src       = net_htonl(net_get_ip());
+        ip->dst       = net_htonl(dst_ip);
+        ip->checksum  = net_htons(net_inet_checksum(ip, sizeof(ipv4_hdr_t)));
+        memcpy(g_lo + sizeof(ipv4_hdr_t), seg, seg_len);
+        ipv4_demux(g_lo, iplen);
+        return 0;
+    }
+
 #ifdef NET_SELFTEST
     /* NET-P1-A0: while the in-kernel test rig is live it swallows every
      * outbound segment here -- BEFORE net_up()/ARP/the NIC are touched --
@@ -370,8 +404,10 @@ static void ipv4_demux(const uint8_t* ip_start, uint16_t ip_avail) {
     uint32_t src = net_ntohl(ip->src);
     uint32_t dst = net_ntohl(ip->dst);
 
-    /* Only packets destined for us (or broadcast) are interesting. */
-    if (dst != net_get_ip() && dst != 0xFFFFFFFFu) return;
+    /* Only packets destined for us (or broadcast, or loopback) are
+     * interesting. A4: accept 127.0.0.0/8 so loopback delivery (ip_tx's
+     * 127/8 short-circuit) reaches udp_input/tcp_input. */
+    if (dst != net_get_ip() && dst != 0xFFFFFFFFu && (dst >> 24) != 127u) return;
 
     const uint8_t* seg = ip_start + ihl;
     uint16_t seg_len = (uint16_t)(tot - ihl);
@@ -502,11 +538,14 @@ int sock_socket(int type) {
 int sock_bind(int s, uint16_t local_port) {
     sock_t* so = sock_from_fd(s);
     if (!so) return SOCK_EBADF;
-    /* Reject if another socket of the same type already owns the port. */
-    for (int i = 0; i < SOCK_MAX; i++) {
-        if (i != s && g_socks[i].used && g_socks[i].type == so->type &&
-            g_socks[i].local_port == local_port) {
-            return SOCK_EINVAL;
+    /* Reject if another socket of the same type already owns the port -- UNLESS
+     * this socket set SO_REUSEADDR (A4), which relaxes the duplicate check. */
+    if (!so->so_reuseaddr) {
+        for (int i = 0; i < SOCK_MAX; i++) {
+            if (i != s && g_socks[i].used && g_socks[i].type == so->type &&
+                g_socks[i].local_port == local_port) {
+                return SOCK_EINVAL;
+            }
         }
     }
     so->local_port = local_port;
@@ -573,6 +612,7 @@ int sock_send(int s, const void* buf, uint32_t len) {
     sock_t* so = sock_from_fd(s);
     if (!so) return SOCK_EBADF;
     if (buf == NULL || len == 0) return SOCK_EINVAL;
+    if (so->shut_wr) return SOCK_ECONN;   /* A4: send half shut down */
 
     if (so->type == SOCK_DGRAM) {
         if (so->remote_port == 0) return SOCK_ECONN;   /* not "connected" */
@@ -590,6 +630,7 @@ int sock_recv(int s, void* buf, uint32_t len) {
     sock_t* so = sock_from_fd(s);
     if (!so) return SOCK_EBADF;
     if (buf == NULL || len == 0) return SOCK_EINVAL;
+    if (so->shut_rd) return 0;            /* A4: recv half shut down -> EOF */
 
     if (so->type == SOCK_DGRAM) {
         return sock_recvfrom(s, buf, len, NULL, NULL);
@@ -609,6 +650,7 @@ int sock_sendto(int s, const void* buf, uint32_t len,
     if (!so) return SOCK_EBADF;
     if (so->type != SOCK_DGRAM) return SOCK_EINVAL;
     if (buf == NULL || len == 0) return SOCK_EINVAL;
+    if (so->shut_wr) return SOCK_ECONN;   /* A4: send half shut down */
     if (len > UDP_DGRAM_MAX) len = UDP_DGRAM_MAX;
     return udp_send_to(so, ip, port, buf, (uint16_t)len);
 }
@@ -619,6 +661,7 @@ int sock_recvfrom(int s, void* buf, uint32_t len,
     if (!so) return SOCK_EBADF;
     if (so->type != SOCK_DGRAM) return SOCK_EINVAL;
     if (buf == NULL || len == 0) return SOCK_EINVAL;
+    if (so->shut_rd) return 0;            /* A4: recv half shut down -> EOF */
 
     if (so->dq_count == 0) return SOCK_EAGAIN;
 
@@ -717,6 +760,59 @@ int sock_close(int s) {
 
     memset(so, 0, sizeof(*so));
     return SOCK_OK;
+}
+
+/* ------------------------------------------------------------------ */
+/* A4 (SOCKET-PARITY-0): shutdown + setsockopt/getsockopt              */
+/* ------------------------------------------------------------------ */
+int sock_shutdown(int s, int how) {
+    sock_t* so = sock_from_fd(s);
+    if (!so) return SOCK_EBADF;
+    if (how != SHUT_RD && how != SHUT_WR && how != SHUT_RDWR) return SOCK_EINVAL;
+
+    if (how == SHUT_RD || how == SHUT_RDWR) so->shut_rd = 1;
+    if (how == SHUT_WR || how == SHUT_RDWR) {
+        so->shut_wr = 1;
+        /* TCP write-half shutdown: emit a FIN now (half-close) but keep the
+         * socket so the read half can still drain. Reuses the proven FIN path;
+         * sock_close() later does the final teardown. */
+        if (so->type == SOCK_STREAM &&
+            (so->state == TCP_ESTABLISHED || so->state == TCP_CLOSE_WAIT)) {
+            tcp_close(so);
+        }
+    }
+    return SOCK_OK;
+}
+
+int sock_setsockopt(int s, int level, int optname, int value) {
+    sock_t* so = sock_from_fd(s);
+    if (!so) return SOCK_EBADF;
+    if (level != SOL_SOCKET) return SOCK_EINVAL;
+    switch (optname) {
+        case SO_REUSEADDR: so->so_reuseaddr   = value ? 1 : 0;            return SOCK_OK;
+        case SO_BROADCAST: so->so_broadcast   = value ? 1 : 0;            return SOCK_OK;
+        case SO_KEEPALIVE: so->so_keepalive   = value ? 1 : 0;            return SOCK_OK;
+        case SO_RCVTIMEO:  so->so_rcvtimeo_ms = (value < 0) ? 0u : (uint32_t)value; return SOCK_OK;
+        case SO_SNDTIMEO:  so->so_sndtimeo_ms = (value < 0) ? 0u : (uint32_t)value; return SOCK_OK;
+        default:           return SOCK_EINVAL;   /* SO_TYPE/SO_ERROR are read-only */
+    }
+}
+
+int sock_getsockopt(int s, int level, int optname, int* out_value) {
+    sock_t* so = sock_from_fd(s);
+    if (!so) return SOCK_EBADF;
+    if (!out_value) return SOCK_EINVAL;
+    if (level != SOL_SOCKET) return SOCK_EINVAL;
+    switch (optname) {
+        case SO_REUSEADDR: *out_value = so->so_reuseaddr;        return SOCK_OK;
+        case SO_BROADCAST: *out_value = so->so_broadcast;        return SOCK_OK;
+        case SO_KEEPALIVE: *out_value = so->so_keepalive;        return SOCK_OK;
+        case SO_RCVTIMEO:  *out_value = (int)so->so_rcvtimeo_ms; return SOCK_OK;
+        case SO_SNDTIMEO:  *out_value = (int)so->so_sndtimeo_ms; return SOCK_OK;
+        case SO_TYPE:      *out_value = so->type;                return SOCK_OK;
+        case SO_ERROR:     *out_value = so->reset ? SOCK_ECONN : 0; return SOCK_OK;
+        default:           return SOCK_EINVAL;
+    }
 }
 
 /* ------------------------------------------------------------------ */
@@ -901,4 +997,35 @@ int64_t sys_sock_accept(uint64_t s, uint64_t a2, uint64_t a3,
                         uint64_t a4, uint64_t a5, uint64_t a6) {
     (void)a2;(void)a3;(void)a4;(void)a5;(void)a6;
     return sock_accept((int)s);
+}
+
+/* A4 (SOCKET-PARITY-0): optval is a user pointer to an int; optlen is the
+ * byte count available (a plain value, not a pointer -- the kernel reads/writes
+ * exactly one int). */
+int64_t sys_sock_setsockopt(uint64_t s, uint64_t level, uint64_t optname,
+                            uint64_t optval, uint64_t optlen, uint64_t a6) {
+    (void)a6;
+    if (optval == 0 || optlen < sizeof(int)) return SOCK_EINVAL;
+    int value = 0;
+    if (copy_from_user(&value, (const void*)optval, sizeof(int)) != COPY_SUCCESS)
+        return SOCK_EINVAL;
+    return sock_setsockopt((int)s, (int)level, (int)optname, value);
+}
+
+int64_t sys_sock_getsockopt(uint64_t s, uint64_t level, uint64_t optname,
+                            uint64_t optval, uint64_t optlen, uint64_t a6) {
+    (void)a6;
+    if (optval == 0 || optlen == 0) return SOCK_EINVAL;
+    int value = 0;
+    int r = sock_getsockopt((int)s, (int)level, (int)optname, &value);
+    if (r != SOCK_OK) return r;
+    size_t n = (optlen < sizeof(int)) ? (size_t)optlen : sizeof(int);
+    if (copy_to_user((void*)optval, &value, n) != COPY_SUCCESS) return SOCK_EINVAL;
+    return SOCK_OK;
+}
+
+int64_t sys_sock_shutdown(uint64_t s, uint64_t how, uint64_t a3,
+                          uint64_t a4, uint64_t a5, uint64_t a6) {
+    (void)a3;(void)a4;(void)a5;(void)a6;
+    return sock_shutdown((int)s, (int)how);
 }

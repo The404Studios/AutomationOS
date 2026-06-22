@@ -58,6 +58,26 @@
 #define SOCK_ETIMEDOUT -110
 
 /* ------------------------------------------------------------------ */
+/* A4 (SOCKET-PARITY-0): setsockopt/getsockopt + shutdown surface.     */
+/* ------------------------------------------------------------------ */
+/* Option level (only SOL_SOCKET is supported). */
+#define SOL_SOCKET      1
+
+/* Option names (SOL_SOCKET). All are int-valued; timeouts are in ms. */
+#define SO_REUSEADDR    2   /* relax the bind() duplicate-port check     */
+#define SO_TYPE         3   /* read-only: SOCK_STREAM | SOCK_DGRAM       */
+#define SO_ERROR        4   /* read-only: 0 or a negative SOCK_E*        */
+#define SO_BROADCAST    6   /* permit sendto() to a broadcast address    */
+#define SO_RCVTIMEO     20  /* receive timeout in milliseconds (int)     */
+#define SO_SNDTIMEO     21  /* send timeout in milliseconds (int)        */
+#define SO_KEEPALIVE    9   /* enable TCP keepalive (stored; advisory)   */
+
+/* shutdown(2) "how". */
+#define SHUT_RD         0   /* disable further receives                  */
+#define SHUT_WR         1   /* disable further sends (TCP: emit FIN)     */
+#define SHUT_RDWR       2   /* both                                      */
+
+/* ------------------------------------------------------------------ */
 /* Wire-format transport headers (big-endian fields).                  */
 /* ------------------------------------------------------------------ */
 #ifndef PACKED
@@ -170,6 +190,15 @@ struct sock {
     uint8_t     rt_data[TCP_MSS];
 
     bool        reset;         /* peer sent RST / fatal error           */
+
+    /* --- A4 (SOCKET-PARITY-0): socket options + half-close state --- */
+    uint8_t     so_reuseaddr;  /* SO_REUSEADDR: relax bind dup check     */
+    uint8_t     so_broadcast;  /* SO_BROADCAST: allow broadcast sendto   */
+    uint8_t     so_keepalive;  /* SO_KEEPALIVE: stored (advisory)        */
+    uint8_t     shut_rd;       /* shutdown(SHUT_RD): recv returns EOF    */
+    uint8_t     shut_wr;       /* shutdown(SHUT_WR): send is rejected    */
+    uint32_t    so_rcvtimeo_ms;/* SO_RCVTIMEO (ms; 0 = none)             */
+    uint32_t    so_sndtimeo_ms;/* SO_SNDTIMEO (ms; 0 = none)             */
 };
 
 /* ------------------------------------------------------------------ */
@@ -280,6 +309,16 @@ int sock_recvfrom(int s, void* buf, uint32_t len,
 /* Close (TCP: send FIN if connected). 0 / negative. */
 int sock_close(int s);
 
+/* A4: half-close. how = SHUT_RD | SHUT_WR | SHUT_RDWR. After SHUT_RD a recv
+ * returns 0 (EOF); after SHUT_WR a send is rejected (TCP also emits a FIN).
+ * The socket stays open until sock_close. 0 / negative. */
+int sock_shutdown(int s, int how);
+
+/* A4: set/get a socket option. level must be SOL_SOCKET. Values are int
+ * (timeouts in ms). Returns 0 / negative SOCK_E*. */
+int sock_setsockopt(int s, int level, int optname, int value);
+int sock_getsockopt(int s, int level, int optname, int* out_value);
+
 /* Close all sockets owned by a dying process. Called from process_unref(). */
 void sock_cleanup_process(uint32_t pid);
 
@@ -339,5 +378,12 @@ int64_t sys_sock_listen(uint64_t s, uint64_t backlog, uint64_t a3,
                         uint64_t a4, uint64_t a5, uint64_t a6);
 int64_t sys_sock_accept(uint64_t s, uint64_t a2, uint64_t a3,
                         uint64_t a4, uint64_t a5, uint64_t a6);
+/* A4 (SOCKET-PARITY-0): SYS_SETSOCKOPT=125, SYS_GETSOCKOPT=126, SYS_SHUTDOWN=127. */
+int64_t sys_sock_setsockopt(uint64_t s, uint64_t level, uint64_t optname,
+                            uint64_t optval, uint64_t optlen, uint64_t a6);
+int64_t sys_sock_getsockopt(uint64_t s, uint64_t level, uint64_t optname,
+                            uint64_t optval, uint64_t optlen, uint64_t a6);
+int64_t sys_sock_shutdown(uint64_t s, uint64_t how, uint64_t a3,
+                          uint64_t a4, uint64_t a5, uint64_t a6);
 
 #endif /* SOCKET_H */

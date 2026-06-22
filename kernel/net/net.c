@@ -694,6 +694,8 @@ int net_init(void) {
         eth0.rx_poll = (g_nic == NIC_RTL8139) ? rtl8139_rx_poll : e1000_rx_poll;
         eth0.get_mac = (g_nic == NIC_RTL8139) ? rtl8139_get_mac : e1000_get_mac;
         netif_register(&eth0);
+        /* A4 (SOCKET-PARITY-0): register "lo" AFTER eth0 (eth0 stays default). */
+        netif_register_loopback();
     }
 
     /* Gateway ARP pre-resolve (settle loop).

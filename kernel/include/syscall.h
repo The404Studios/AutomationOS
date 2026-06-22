@@ -143,6 +143,12 @@
 #define SYS_AUDIO_TEST      122 // play a test tone (arg1=freq Hz, arg2=ms, ms capped)
 #define SYS_AUDIO_STATUS    123 // fill user audio_status_t {present,volume,muted,_pad,codec_vendor}
 #define SYS_WLAN_DIAG       124 // radio bring-up diagnostics (uapi_wlan_diag_t) -- moved off 118
+
+// A4 (SOCKET-PARITY-0): BSD socket options + half-close (kernel/net/socket.c)
+#define SYS_SETSOCKOPT      125 // sys_sock_setsockopt(s, level, optname, optval, optlen)
+#define SYS_GETSOCKOPT      126 // sys_sock_getsockopt(s, level, optname, optval, optlen)
+#define SYS_SHUTDOWN        127 // sys_sock_shutdown(s, how)  how=SHUT_RD|SHUT_WR|SHUT_RDWR
+
 #define SYS_VMA_TEST    200 // VMA red-black tree testing and benchmarking
 
 // ---- SMP coprocessor offload (GATED: only registered under SMP_FOUNDATION) ----

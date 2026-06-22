@@ -1,18 +1,16 @@
 # AutomationOS API Reference
 
-**Version:** 0.1.0  
-**Phase:** 1 - Core Foundation (+ networking / WiFi / audio control planes)  
-**Last Updated:** 2026-06-21
+The reference for AutomationOS kernel, syscall, driver, and userspace APIs.
 
-> The canonical, authoritative source of truth for syscall numbers and ABI
-> structs is the kernel header `kernel/include/syscall.h` (numbers) plus the
-> UAPI headers `kernel/include/uapi/*.h` (structs). This document is a
-> hand-maintained companion -- when in doubt, the headers win. Every number
-> below was cross-checked against `kernel/include/syscall.h`.
+| Field | Value |
+|-------|-------|
+| Version | 0.1.0 |
+| Phase | 1 — Core Foundation (plus networking / WiFi / audio control planes) |
+| Last updated | 2026-06-21 |
 
----
+> **Note:** The canonical, authoritative source of truth for syscall numbers and ABI structs is the kernel header `kernel/include/syscall.h` (numbers) plus the UAPI headers `kernel/include/uapi/*.h` (structs). This document is a hand-maintained companion — when in doubt, the headers win. Every number below was cross-checked against `kernel/include/syscall.h`.
 
-## Table of Contents
+## Table of contents
 
 1. [Memory Management API](#memory-management-api)
 2. [Process Management API](#process-management-api)
@@ -27,6 +25,8 @@
 ---
 
 ## Memory Management API
+
+The physical, virtual, and heap allocators that back all kernel memory.
 
 ### Physical Memory Manager (PMM)
 
@@ -155,7 +155,7 @@ void vmm_init(void);
 ```
 
 **Description:**
-Sets up 4-level paging structures (PML4 → PDPT → PD → PT). Maps kernel in higher half and sets up identity mapping for low memory.
+Sets up 4-level paging structures (PML4 -> PDPT -> PD -> PT). Maps the kernel in the higher half and sets up identity mapping for low memory.
 
 **Example:**
 ```c
@@ -286,6 +286,8 @@ Returns memory to the heap. Passing NULL is safe (no-op).
 ---
 
 ## Process Management API
+
+The process table, scheduler, and context-switch primitives.
 
 ### Process Table
 
@@ -484,25 +486,27 @@ Low-level assembly function that saves/restores CPU registers and switches page 
 
 ## System Call API
 
+The ring 3 syscall surface: the dispatcher, a sampling of handlers, and the error-code convention.
+
 ### System Call Interface
 
-**Header:** `kernel/include/syscall.h` (numbers 0-200; `MAX_SYSCALLS == 256`)  
-**Dispatch table + registration:** `kernel/core/syscall/syscall.c`
+| Item | Location |
+|------|----------|
+| Header (numbers) | `kernel/include/syscall.h` (numbers 0-200; `MAX_SYSCALLS == 256`) |
+| Dispatch table + registration | `kernel/core/syscall/syscall.c` |
 
-The syscall surface is much larger than the handful detailed below; the header
-is the authoritative list. Beyond the POSIX-ish core (exit/fork/read/write/
-open/close/waitpid/execve/getpid/sleep, 0-9) it spans: IPC (SHM/MSG, 18-25),
-signals (`rt_sigaction`/`rt_sigprocmask`/`rt_sigreturn`/`sigpending`, 107-110),
-threads (79-81), futex (70), epoll (73-75) and `poll`/`select` (111-112),
-sockets (51-58, 76-78) and raw frames / net config / route+ARP table dumps
-(59, 68-69, 89-91), block + persistent diskfs I/O (49-50, 94-95), the typed
-agent-rail channels (`CHANNEL-0`, 96-106), framebuffer/RTC/entropy/clipboard/
-notifications, PCI/battery introspection, the
-[WiFi control plane](#wifi-control-plane-sys_wlan_) (113-117, plus `SYS_WLAN_DIAG` at 124) and the
-[audio mixer](#audio-mixer-sys_audio_) (118-123). A few numbers are *gated*: e.g.
-`SYS_CPU1_OFFLOAD` (83) is only registered under `SMP_FOUNDATION`; on the default
-build the slot is empty and the call returns `ENOTSUP`. Unregistered numbers
-likewise return `ENOTSUP`.
+The syscall surface is much larger than the handful detailed below; the header is the authoritative list. Beyond the POSIX-ish core (exit/fork/read/write/open/close/waitpid/execve/getpid/sleep, 0-9) it spans:
+
+- IPC (SHM/MSG, 18-25).
+- Signals (`rt_sigaction`/`rt_sigprocmask`/`rt_sigreturn`/`sigpending`, 107-110).
+- Threads (79-81), futex (70), epoll (73-75), and `poll`/`select` (111-112).
+- Sockets (51-58, 76-78) and raw frames / net config / route + ARP table dumps (59, 68-69, 89-91).
+- Block and persistent diskfs I/O (49-50, 94-95).
+- The typed agent-rail channels (`CHANNEL-0`, 96-106).
+- Framebuffer, RTC, entropy, clipboard, notifications, and PCI/battery introspection.
+- The [WiFi control plane](#wifi-control-plane-sys_wlan_) (113-117, plus `SYS_WLAN_DIAG` at 124) and the [audio mixer](#audio-mixer-sys_audio_) (118-123).
+
+A few numbers are *gated*: for example, `SYS_CPU1_OFFLOAD` (83) is only registered under `SMP_FOUNDATION`; on the default build the slot is empty and the call returns `ENOTSUP`. Unregistered numbers likewise return `ENOTSUP`.
 
 #### `syscall_init()`
 
@@ -657,20 +661,15 @@ The canonical negative-errno set lives in `kernel/include/errno.h` (included by
 
 ## WiFi Control Plane (SYS_WLAN_*)
 
-**Numbers:** `kernel/include/syscall.h` (113-117, plus `SYS_WLAN_DIAG` at 124)  
-**ABI structs:** `kernel/include/uapi/wlan.h` (every struct carries an
-`*_ABI_SIZE` constant and a `_Static_assert`, so ABI drift is a compile error)  
-**Handlers:** `kernel/net/wlansyscall.c`
+The thin syscall layer that drives WiFi association from ring 3.
 
-These are *thin* handlers: each locates the default WiFi interface
-(`netif_get_wifi_default()`), validates the user struct, then calls through
-`netif_t.wifi` -- the `wifi_ops` swap seam declared in `kernel/include/wifi.h`.
-The handlers never touch a driver directly. The active backend behind the seam
-is either the simulated one (`kernel/drivers/net/wireless/sim/wifisim.c`, built
-with `WIFI_SIM=1`) or the from-scratch Intel iwlwifi DVM driver under
-`kernel/drivers/net/wireless/intel/iwlwifi/` (built with `IWLWIFI`, brought up
-post-desktop by `sbin/iwlup`, never at boot). When no WiFi interface is
-registered (a wired-only or no-NIC build), every handler returns `ENOTSUP`.
+| Item | Location |
+|------|----------|
+| Numbers | `kernel/include/syscall.h` (113-117, plus `SYS_WLAN_DIAG` at 124) |
+| ABI structs | `kernel/include/uapi/wlan.h` (every struct carries an `*_ABI_SIZE` constant and a `_Static_assert`, so ABI drift is a compile error) |
+| Handlers | `kernel/net/wlansyscall.c` |
+
+These are *thin* handlers: each locates the default WiFi interface (`netif_get_wifi_default()`), validates the user struct, then calls through `netif_t.wifi` — the `wifi_ops` swap seam declared in `kernel/include/wifi.h`. The handlers never touch a driver directly. The active backend behind the seam is either the simulated one (`kernel/drivers/net/wireless/sim/wifisim.c`, built with `WIFI_SIM=1`) or the from-scratch Intel iwlwifi DVM driver under `kernel/drivers/net/wireless/intel/iwlwifi/` (built with `IWLWIFI`, brought up post-desktop by `sbin/iwlup`, never at boot). When no WiFi interface is registered (a wired-only or no-NIC build), every handler returns `ENOTSUP`.
 
 | # | Name | Handler | Payload |
 |---|------|---------|---------|
@@ -791,7 +790,7 @@ int64_t sys_wlan_diag(uint64_t out_ptr, ...);
 Copies the radio bring-up diagnostics snapshot (maintained by the active backend
 and surfaced from `kernel/net/wifidiag.c`) to userspace, so the Network Manager
 (`userspace/apps/netman`) can show *where* iwlwifi bring-up stopped on real
-hardware -- no serial cable needed. Rendered as the live "Radio:" line in netman.
+hardware — no serial cable needed. Rendered as the live "Radio:" line in netman.
 
 ```c
 // uapi/wlan.h  (WLAN_DIAG_ABI_SIZE == 120)
@@ -819,19 +818,15 @@ seam), `7 SCANNED`, `8 FAILED` (see `msg`).
 
 ## Audio Mixer (SYS_AUDIO_*)
 
-**Numbers:** `kernel/include/syscall.h` (118-123)  
-**Handlers:** `kernel/core/syscall/syscall.c`  
-**Driver:** Intel HDA (`kernel/drivers/hda_stream.c`, `kernel/drivers/audio/`),
-codec comm via the Immediate Command Interface; gated on at build time with
-`HDA_ENABLE=1`.
+The thin syscall gateway from ring 3 to the Intel HDA volume / mute / tone controls.
 
-A thin, guarded gateway from ring 3 to the HDA driver's volume / mute / tone
-controls. The driver is fire-and-forget (it does not retain the last
-volume/mute), so the syscall layer mirrors those in two `static` globals for
-`SYS_AUDIO_STATUS`. Handlers degrade safely: with no HDA controller/codec they
-return `ENODEV` cleanly rather than hanging, so they are safe no-ops on
-audioless boots. The consumer is the Sound Manager app
-(`userspace/apps/soundman`).
+| Item | Location |
+|------|----------|
+| Numbers | `kernel/include/syscall.h` (118-123) |
+| Handlers | `kernel/core/syscall/syscall.c` |
+| Driver | Intel HDA (`kernel/drivers/hda_stream.c`, `kernel/drivers/audio/`), codec comm via the Immediate Command Interface; gated on at build time with `HDA_ENABLE=1` |
+
+This is a thin, guarded gateway from ring 3 to the HDA driver's volume / mute / tone controls. The driver is fire-and-forget (it does not retain the last volume/mute), so the syscall layer mirrors those in two `static` globals for `SYS_AUDIO_STATUS`. Handlers degrade safely: with no HDA controller/codec they return `ENODEV` cleanly rather than hanging, so they are safe no-ops on audioless boots. The consumer is the Sound Manager app (`userspace/apps/soundman`).
 
 | # | Name | Handler | Notes |
 |---|------|---------|-------|
@@ -1323,7 +1318,7 @@ pmm_free_page(phys_page);
 ```c
 void init_main(void) {
     printf("Init process started\n");
-    
+
     // Fork and exec shell
     pid_t pid = fork();
     if (pid == 0) {
@@ -1399,31 +1394,30 @@ ASSERT(ptr != NULL);
 
 ## Thread Safety & Concurrency Model
 
-The **default** build is cooperative + single-core, so most kernel APIs run
-without contention. Two concurrency tiers exist as **gated** builds, validated
-separately:
+How the APIs behave by build tier, from the default single-core build to the gated concurrency tiers.
 
-- **`PREEMPT=1`** -- preemptive scheduling (timer-driven preemption).
-- **`SMP=1`** -- multi-core, with per-CPU data, spinlocks/run-queue locks, and
-  IPI-based TLB shootdown on the validated paths.
+The default build is cooperative and single-core, so most kernel APIs run without contention. Two concurrency tiers exist as gated builds, validated separately:
+
+- `PREEMPT=1` — preemptive scheduling (timer-driven preemption).
+- `SMP=1` — multi-core, with per-CPU data, spinlocks/run-queue locks, and IPI-based TLB shootdown on the validated paths.
 
 Under the default build:
-- **Safe:** PMM allocation (protected by implicit spinlocks)
-- **Single-threaded by construction:** process table, scheduler queue, driver
-  globals (no concurrent kernel-mode execution without `PREEMPT`/`SMP`)
 
-When building `SMP=1`/`PREEMPT=1`, treat the process table, scheduler queue, and
-driver globals as shared state guarded by their respective locks; see the SMP
-hardening notes in `docs/SMP_HARDENING.md`.
+- **Safe:** PMM allocation (protected by implicit spinlocks).
+- **Single-threaded by construction:** process table, scheduler queue, and driver globals (no concurrent kernel-mode execution without `PREEMPT`/`SMP`).
+
+When building `SMP=1`/`PREEMPT=1`, treat the process table, scheduler queue, and driver globals as shared state guarded by their respective locks; see the SMP hardening notes in `docs/SMP_HARDENING.md`.
 
 ---
 
 ## Performance Notes
 
-- **Fast paths:** `pmm_alloc_page()`, `vmm_map_page()`, system calls
-- **Slow paths:** `process_create()` (allocates stacks), `context_switch()` (TLB flush)
-- **Avoid:** Frequent allocation/deallocation, excessive system calls in tight loops
+Rough cost guidance for the common kernel operations.
+
+- **Fast paths:** `pmm_alloc_page()`, `vmm_map_page()`, system calls.
+- **Slow paths:** `process_create()` (allocates stacks), `context_switch()` (TLB flush).
+- **Avoid:** frequent allocation/deallocation, and excessive system calls in tight loops.
 
 ---
 
-**End of API Reference**
+*End of API Reference.*

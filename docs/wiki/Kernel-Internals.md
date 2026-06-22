@@ -409,9 +409,9 @@ latency. The handler signature is uniform:
 AutomationOS uses its **own** syscall numbering, *not* the Linux ABI. This is the single
 most common mistake when hand-writing user-space against this kernel:
 
-> ⚠️ **`SYS_WRITE` is 3, and syscall number 1 is `SYS_FORK` — not `write`.** On Linux,
-> syscall 1 is `write`; here, calling syscall 1 *forks the process*. Always pull the
-> constants from `kernel/include/syscall.h`; never assume Linux numbers.
+> **Warning:** `SYS_WRITE` is 3, and syscall number 1 is `SYS_FORK` — not `write`. On
+> Linux, syscall 1 is `write`; here, calling syscall 1 *forks the process*. Always pull
+> the constants from `kernel/include/syscall.h`; never assume Linux numbers.
 
 A representative excerpt of the table (full list in `syscall.h`):
 
@@ -496,9 +496,9 @@ Sound Manager app (`userspace/apps/soundman`) drives it.
 The audio handlers return cleanly (negative) when no HDA controller/codec is present, so
 they are safe no-ops on audioless boots.
 
-> **Number map.** The audio mixer owns the contiguous block **118–123** with no overlap,
-> so `SYS_AUDIO_VOLUME` at 118 is fully reachable. (`SYS_WLAN_DIAG` was briefly assigned 118
-> as well; it has since been moved to its own free slot, **124**, so there is no longer any
+> **Note:** The audio mixer owns the contiguous block 118–123 with no overlap, so
+> `SYS_AUDIO_VOLUME` at 118 is fully reachable. (`SYS_WLAN_DIAG` was briefly assigned 118
+> as well; it has since moved to its own free slot, 124, so there is no longer any
 > collision.) Always pull constants from `kernel/include/syscall.h`.
 
 ---

@@ -24,7 +24,7 @@ helpers (`browser2_ui.c`, `browser2_anim.c`). It links the whole web pipeline as
 libraries and runs a bounded ~60 fps render loop: poll input, run JS timers,
 animate inertial scroll, repaint the chrome + content. The pipeline per page is:
 
-```
+```text
 HTTP(S) fetch  --(http_get / https_get)-->  bytes
 bytes          --(html_parse)----------->  DOM tree (dom_document / dom_node)
 DOM + CSS      --(css_parse + cascade)-->  computed styles

@@ -33,7 +33,7 @@ freestanding translation units, and it is exposed two ways:
 The shared contract is [`tc.h`](../../userspace/apps/ide/tc.h), which both
 front-ends include. The pipeline is:
 
-```
+```text
 C source text  --(lex_tokenize + parse_translation_unit)-->  AST (AstNode* tu)
 AST            --(cc_compile)----------------------------->  Intel-subset x86-64 asm text
 asm text       --(as_assemble @ TC_ENTRY_VADDR)----------->  x86-64 machine code (bytes)
@@ -200,7 +200,7 @@ uses (`kernel/fs/exec.c` + `userspace.ld`). It writes every field explicitly in
 little-endian at its exact offset, so the result is correct regardless of host
 endianness or struct packing. The layout is just:
 
-```
+```text
 [ Elf64_Ehdr = 64 ][ one Elf64_Phdr = 56 ][ code... ]     (120 + code_len bytes)
 ```
 

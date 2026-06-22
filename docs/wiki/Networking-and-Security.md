@@ -1,51 +1,22 @@
 # Networking & Security
 
-AutomationOS speaks to the network through an entirely from-scratch stack: a
-poll-mode NIC driver in the kernel, a minimal Ethernet/ARP/IPv4/ICMP/UDP/TCP
-implementation, a BSD-style socket layer exposed to ring 3 via syscalls, a
-freestanding userspace networking library (DNS, HTTP/1.1, DHCP), and a
-hand-rolled cryptography suite — hashes, AEAD ciphers, public-key, and
-ASN.1/X.509 — that powers a real **TLS 1.2** client and `https://` fetching.
-Nothing here links a third-party library; every byte of crypto and protocol is
-original code compiled `-ffreestanding -nostdlib`. Everything is single-threaded
-and poll-mode, matching the rest of the OS.
+AutomationOS speaks to the network through an entirely from-scratch stack: a poll-mode NIC driver in the kernel, a minimal Ethernet/ARP/IPv4/ICMP/UDP/TCP implementation, a BSD-style socket layer exposed to ring 3 via syscalls, a freestanding userspace networking library (DNS, HTTP/1.1, DHCP), and a hand-rolled cryptography suite — hashes, AEAD ciphers, public-key, and ASN.1/X.509 — that powers a real **TLS 1.2** client and `https://` fetching. Nothing here links a third-party library; every byte of crypto and protocol is original code compiled `-ffreestanding -nostdlib`. Everything is single-threaded and poll-mode, matching the rest of the OS.
 
-This page is the network counterpart to [Drivers & I/O](Drivers-and-IO.md),
-which covers the storage/VFS side; the NIC driver and kernel stack summarized
-there are documented in full below.
+This page is the network counterpart to [Drivers & I/O](Drivers-and-IO.md), which covers the storage/VFS side; the NIC driver and kernel stack summarized there are documented in full below.
 
 ---
 
 ## The NIC driver (`kernel/drivers/net/e1000.c`)
 
-The supported NIC is Intel's e1000 family. The **verified** path targets QEMU's
-emulated 82540EM (`-device e1000`, PCI `0x8086:0x100E`) and the closely related
-82545; QEMU's `-device e1000e` (82574L, `0x10D3`) is treated as part of the same
-classic bring-up. Detection also recognizes a range of e1000e/PCH parts
-including the **ThinkPad T410's Intel 82577LM** (`0x8086:0x10EA`).
+The supported NIC is Intel's e1000 family.
 
-**Classic bring-up** (the working path) is deliberately simple: scan PCI for the
-device, enable bus-master + memory space, map BAR0 (the MMIO register file),
-read the MAC from the Receive Address registers (RAL0/RAH0, seeded by QEMU from
-the EEPROM image as `52:54:00:12:34:56`), allocate RX (32 descriptors, 2 KiB
-buffers) and TX (8 descriptors) rings from the PMM, then program
-RDBAL/RDBAH/RDLEN/RDH/RDT and the TX equivalents and set RCTL/TCTL to enable the
-receiver and transmitter. Because the kernel identity-maps physical RAM 1:1, a
-`pmm_alloc_page()` pointer **is** its DMA address. RX/TX is poll-mode (device
-IRQs are left masked); the caller drains the NIC by calling into the stack.
+The **verified** path targets QEMU's emulated 82540EM (`-device e1000`, PCI `0x8086:0x100E`) and the closely related 82545; QEMU's `-device e1000e` (82574L, `0x10D3`) is treated as part of the same classic bring-up. Detection also recognizes a range of e1000e/PCH parts including the **ThinkPad T410's Intel 82577LM** (`0x8086:0x10EA`).
+
+**Classic bring-up** (the working path) is deliberately simple: scan PCI for the device, enable bus-master + memory space, map BAR0 (the MMIO register file), read the MAC from the Receive Address registers (RAL0/RAH0, seeded by QEMU from the EEPROM image as `52:54:00:12:34:56`), allocate RX (32 descriptors, 2 KiB buffers) and TX (8 descriptors) rings from the PMM, then program RDBAL/RDBAH/RDLEN/RDH/RDT and the TX equivalents and set RCTL/TCTL to enable the receiver and transmitter. Because the kernel identity-maps physical RAM 1:1, a `pmm_alloc_page()` pointer **is** its DMA address. RX/TX is poll-mode (device IRQs are left masked); the caller drains the NIC by calling into the stack.
 
 ### The T410 / PCH runtime gate (honest scope)
 
-The PCH-integrated parts (82577LM and friends: 82578/82579/i217/i218) are not
-the classic e1000 — the MAC lives in the chipset and the PHY hangs off an
-internal MDIO link **shared with the Management-Engine firmware**. Driving it
-requires taking the SW/FW MDIO-ownership flag (`EXTCNF_CTRL.SWFLAG`), then
-powering the PHY up and restarting auto-negotiation over MDIC. That full
-bring-up (`e1000_pch_phy_bringup()`) is written and intact in the source — but it
-is **gated off at runtime**. On the real T410, re-enabling it made the boot hang
-inside the 82577LM bring-up: a *bus stall*, not a software spin, so the
-iteration-cap discipline used elsewhere in the driver cannot unwedge it. The
-gate fires the instant a PCH part is recognized, *before any MMIO access*:
+The PCH-integrated parts (82577LM and friends: 82578/82579/i217/i218) are not the classic e1000 — the MAC lives in the chipset and the PHY hangs off an internal MDIO link **shared with the Management-Engine firmware**. Driving it requires taking the SW/FW MDIO-ownership flag (`EXTCNF_CTRL.SWFLAG`), then powering the PHY up and restarting auto-negotiation over MDIC. That full bring-up (`e1000_pch_phy_bringup()`) is written and intact in the source — but it is **gated off at runtime**. On the real T410, re-enabling it made the boot hang inside the 82577LM bring-up: a *bus stall*, not a software spin, so the iteration-cap discipline used elsewhere in the driver cannot unwedge it. The gate fires the instant a PCH part is recognized, *before any MMIO access*:
 
 ```c
 if (e1000.is_pch) {
@@ -55,21 +26,15 @@ if (e1000.is_pch) {
 }
 ```
 
-PCI config-space enumeration (safe) still identifies the device, so the T410
-boots to the desktop with the NIC **detected but link-down**. The gate can be
-removed once the PCH path is validated on real hardware. (An RTL8139 fallback
-path also exists in `kernel/net/net.c` for the case where no e1000 is present.)
+PCI config-space enumeration (safe) still identifies the device, so the T410 boots to the desktop with the NIC **detected but link-down**. The gate can be removed once the PCH path is validated on real hardware. (An RTL8139 fallback path also exists in `kernel/net/net.c` for the case where no e1000 is present.)
 
 ---
 
 ## The kernel protocol stack (`kernel/net/`)
 
-A "just enough" TCP/IP stack sitting directly on the NIC. It is poll-mode and
-single-threaded: the caller drives `net_recv()` in a loop, and inbound frames
-are run through ARP-learning, ARP-reply, and ICMP-echo-reply on the way in. All
-on-wire multi-byte fields are big-endian; internal IPs are kept host-order. In
-QEMU user-net (slirp) the guest is `10.0.2.15`, the gateway `10.0.2.2`, and DNS
-`10.0.2.3`.
+A "just enough" TCP/IP stack sitting directly on the NIC.
+
+It is poll-mode and single-threaded: the caller drives `net_recv()` in a loop, and inbound frames are run through ARP-learning, ARP-reply, and ICMP-echo-reply on the way in. All on-wire multi-byte fields are big-endian; internal IPs are kept host-order. In QEMU user-net (slirp) the guest is `10.0.2.15`, the gateway `10.0.2.2`, and DNS `10.0.2.3`.
 
 | File | Responsibility |
 |---|---|
@@ -80,26 +45,19 @@ QEMU user-net (slirp) the guest is `10.0.2.15`, the gateway `10.0.2.2`, and DNS
 | `tcp.c` | RFC 793 active-open TCP: 3-way handshake, segmentation (`TCP_MSS`), multi-retransmit with exponential back-off, out-of-order side-table, dynamic receive window, FIN/RST handling |
 | `netsyscall.c` | Syscall wiring (see below) |
 
-### The socket layer & syscalls (`kernel/net/netsyscall.c`)
+### The socket layer and syscalls (`kernel/net/netsyscall.c`)
 
-The socket table is exposed to ring 3 as a BSD-ish API. The wired syscalls are
-`SYS_SOCKET`, `SYS_CONNECT`, `SYS_SEND`, `SYS_RECV`, `SYS_SENDTO`,
-`SYS_RECVFROM`, `SYS_CLOSE_SK`, `SYS_SOCK_POLL`, and `SYS_BIND`; there is also a
-raw-frame path (`SYS_NET_SEND` / `SYS_NET_RECV`, numbers 68/69) and
-`SYS_NET_INFO` (59) which returns the NIC MAC + assigned IPv4 + gateway. Note
-that the active-open model is the supported one — `SYS_BIND` exists but DHCP, for
-example, works *without* claiming a fixed port (see below).
+The socket table is exposed to ring 3 as a BSD-ish API.
+
+The wired syscalls are `SYS_SOCKET`, `SYS_CONNECT`, `SYS_SEND`, `SYS_RECV`, `SYS_SENDTO`, `SYS_RECVFROM`, `SYS_CLOSE_SK`, `SYS_SOCK_POLL`, and `SYS_BIND`; there is also a raw-frame path (`SYS_NET_SEND` / `SYS_NET_RECV`, numbers 68/69) and `SYS_NET_INFO` (59), which returns the NIC MAC + assigned IPv4 + gateway. The active-open model is the supported one — `SYS_BIND` exists, but DHCP, for example, works *without* claiming a fixed port (see below).
 
 ---
 
 ## The userspace networking library (`userspace/lib/net/`)
 
-A freestanding ring-3 library (no libc, no stdio, no malloc) built directly on
-the socket syscalls. Every module is fully **bounded** — no call can hang the OS
-— and **gracefully degrades**: `net_available()` probes `SYS_NET_INFO` once and
-caches the result, and when the driver is unwired every call returns
-`NET_ERR_UNAVAIL` (`-ENOSYS`) so callers print "networking not enabled" instead
-of crashing.
+A freestanding ring-3 library (no libc, no stdio, no malloc) built directly on the socket syscalls.
+
+Every module is fully **bounded** — no call can hang the OS — and **gracefully degrades**: `net_available()` probes `SYS_NET_INFO` once and caches the result, and when the driver is unwired every call returns `NET_ERR_UNAVAIL` (`-ENOSYS`) so callers print "networking not enabled" instead of crashing.
 
 | Module | File | What it does |
 |---|---|---|
@@ -111,9 +69,7 @@ of crashing.
 
 ### Userspace network tools
 
-Each tool runs at boot in a self-test mode (no arguments) printing
-`PASS`/`SKIP`/`FAIL`, and accepts live arguments interactively. They are
-freestanding ELF binaries linked with `crt0`.
+Each tool runs at boot in a self-test mode (no arguments) printing `PASS`/`SKIP`/`FAIL`, and accepts live arguments interactively. They are freestanding ELF binaries linked with `crt0`.
 
 | Tool | Path | What it is |
 |---|---|---|
@@ -128,11 +84,9 @@ freestanding ELF binaries linked with `crt0`.
 
 ## The cryptography suite (`userspace/lib/crypto/`)
 
-A complete, self-contained crypto library — pure computation, no libc, no
-syscalls, no malloc, all caller-supplied fixed buffers and its own
-`memset`/`memcpy`. It is built for ring 3 with the `-ffreestanding -nostdlib`
-discipline used everywhere in the userspace (and the headers insist `objdump`
-show **no** `fs:0x28` stack canary).
+A complete, self-contained crypto library — pure computation, no libc, no syscalls, no malloc, all caller-supplied fixed buffers and its own `memset`/`memcpy`.
+
+It is built for ring 3 with the `-ffreestanding -nostdlib` discipline used everywhere in the userspace (and the headers insist `objdump` show **no** `fs:0x28` stack canary).
 
 | Category | Files | Primitives |
 |---|---|---|
@@ -145,43 +99,29 @@ show **no** `fs:0x28` stack canary).
 | Public-key | `rsa.c`, `bignum.c` | RSA PKCS#1 v1.5 encrypt + signature **verify** (public-key half only, Montgomery `mod_exp`); arbitrary-precision integers |
 | Encoding | `base64.c` | Base64 encode/decode |
 
-A few honest notes the source makes itself: RSA here is the *public-key* half
-only (no private key / CRT / blinding), because a TLS *client* only ever needs
-to encrypt to and verify the server. p256 implements ECDSA *verify*, not sign.
-X25519 and the AEAD decrypts are written constant-time; the legacy CBC path is
-not (a documented Lucky-13-class caveat).
+A few honest notes the source makes itself: RSA here is the *public-key* half only (no private key / CRT / blinding), because a TLS *client* only ever needs to encrypt to and verify the server. p256 implements ECDSA *verify*, not sign. X25519 and the AEAD decrypts are written constant-time; the legacy CBC path is not (a documented Lucky-13-class caveat).
 
 ### Known-answer self-tests (`cryptotest.c`)
 
-Every primitive is checked against published test vectors at boot, and each test
-returns its own failure id so a broken primitive is identifiable:
+Every primitive is checked against published test vectors at boot, and each test returns its own failure id so a broken primitive is identifiable:
 
-- SHA-256 / SHA-1 / MD5 of `"abc"`
-- HMAC-SHA256 (RFC 4231 case 1) and HMAC-SHA1 (RFC 2202 case 1)
-- AES-128 and AES-256 single-block encrypt (FIPS-197), with an AES-128 decrypt
-  round-trip
-- AES-128-CBC against NIST SP 800-38A F.2.1
-- AES-128-GCM against the NIST GCM Case 4 vector — encrypt (ct + tag), decrypt
-  with tag verify, **and** a negative test where a corrupted tag *must* fail
+- SHA-256 / SHA-1 / MD5 of `"abc"`.
+- HMAC-SHA256 (RFC 4231 case 1) and HMAC-SHA1 (RFC 2202 case 1).
+- AES-128 and AES-256 single-block encrypt (FIPS-197), with an AES-128 decrypt round-trip.
+- AES-128-CBC against NIST SP 800-38A F.2.1.
+- AES-128-GCM against the NIST GCM Case 4 vector — encrypt (ct + tag), decrypt with tag verify, **and** a negative test where a corrupted tag *must* fail.
 
-ChaCha20-Poly1305 (RFC 8439 vectors), X25519 (RFC 7748), p256 (NIST CAVP), RSA,
-and HKDF (RFC 5869) each ship their own `*_selftest()` too. The boot smoke test
-gates on the combined marker
-`crypto/HTTPS KATs verified (SHA/AES/HMAC/RSA/X.509/TLS-PRF)`.
+ChaCha20-Poly1305 (RFC 8439 vectors), X25519 (RFC 7748), p256 (NIST CAVP), RSA, and HKDF (RFC 5869) each ship their own `*_selftest()` too. The boot smoke test gates on the combined marker `crypto/HTTPS KATs verified (SHA/AES/HMAC/RSA/X.509/TLS-PRF)`.
 
 ---
 
 ## TLS & HTTPS (`userspace/lib/tls/`)
 
-The TLS layer is a deliberately-minimal **TLS 1.2 client** (RFC 5246) that runs
-over an already-connected TCP fd: the caller does the socket connect and hands
-`tls_client_connect()` the fd; the layer drives the handshake and then
-encrypts/decrypts application data on `tls_write()` / `tls_read()`. The whole
-connection state lives in one (~40 KB) `tls_conn_t` struct — no allocator
-required.
+The TLS layer is a deliberately-minimal **TLS 1.2 client** (RFC 5246) that runs over an already-connected TCP fd.
 
-**Cipher suites** advertised (and any negotiated end-to-end), in preference
-order:
+The caller does the socket connect and hands `tls_client_connect()` the fd; the layer drives the handshake and then encrypts/decrypts application data on `tls_write()` / `tls_read()`. The whole connection state lives in one (~40 KB) `tls_conn_t` struct — no allocator required.
+
+**Cipher suites** advertised (and any negotiated end-to-end), in preference order:
 
 | Suite | Notes |
 |---|---|
@@ -192,103 +132,61 @@ order:
 | `0xCCA9` ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256 | |
 | `0x002F` TLS_RSA_WITH_AES_128_CBC_SHA | legacy last-resort fallback only |
 
-ECDHE key exchange supports the **x25519** (`0x001D`) and **secp256r1**
-(`0x0017`) named groups. The ServerKeyExchange signature is verified
-(RSA-PKCS1 or ECDSA-P256) against the leaf certificate's public key over
-`client_random || server_random || ECDHE params`. The PRF / Finished hash is
-selected per suite (P_SHA256 vs P_SHA384). AEAD record protection follows
-RFC 5288 (AES-GCM, explicit 8-byte nonce) and RFC 7905 (ChaCha20-Poly1305).
-`tls_selftest()` checks the TLS 1.2 PRF against the published vector offline.
+ECDHE key exchange supports the **x25519** (`0x001D`) and **secp256r1** (`0x0017`) named groups. The ServerKeyExchange signature is verified (RSA-PKCS1 or ECDSA-P256) against the leaf certificate's public key over `client_random || server_random || ECDHE params`. The PRF / Finished hash is selected per suite (P_SHA256 vs P_SHA384). AEAD record protection follows RFC 5288 (AES-GCM, explicit 8-byte nonce) and RFC 7905 (ChaCha20-Poly1305). `tls_selftest()` checks the TLS 1.2 PRF against the published vector offline.
 
-> Scope note: the handshake state machine in `tls.c` is **TLS 1.2 only** — there
-> is no 1.3 handshake. The crypto library *does* contain the TLS 1.3 key-schedule
-> building block (`HKDF-Expand-Label`), but the client does not negotiate 1.3.
-> There is no session resumption, renegotiation, or client-certificate support.
+> **Note:** The handshake state machine in `tls.c` is **TLS 1.2 only** — there is no 1.3 handshake. The crypto library *does* contain the TLS 1.3 key-schedule building block (`HKDF-Expand-Label`), but the client does not negotiate 1.3. There is no session resumption, renegotiation, or client-certificate support.
 
 ### Certificate chain validation (`x509.c`, `x509_verify.c`, `asn1.c`)
 
-Extracting the server's public key (`x509.c` + the bounds-checked `asn1.c` DER
-reader) gives *encryption* but not *authentication*. `x509_verify_chain()`
-closes that gap with the classic four checks against the embedded CA bundle
-(`ca_bundle.c` / `ca_roots_data.h`):
+Extracting the server's public key (`x509.c` + the bounds-checked `asn1.c` DER reader) gives *encryption* but not *authentication*. `x509_verify_chain()` closes that gap with the classic four checks against the embedded CA bundle (`ca_bundle.c` / `ca_roots_data.h`):
 
-1. **Chain linkage + signatures** — each cert is verified against the next
-   cert's key, and issuer-DN must equal the next subject-DN.
-2. **Trust anchor** — the top of the chain must be issued by a root in the CA
-   store.
+1. **Chain linkage + signatures** — each cert is verified against the next cert's key, and issuer-DN must equal the next subject-DN.
+2. **Trust anchor** — the top of the chain must be issued by a root in the CA store.
 3. **Validity window** — `notBefore <= now <= notAfter` for every cert.
-4. **Hostname** — the leaf's subjectAltName dNSNames (or CN fallback) must match
-   the requested host, with single-label `*.` wildcard support.
+4. **Hostname** — the leaf's subjectAltName dNSNames (or CN fallback) must match the requested host, with single-label `*.` wildcard support.
 
-The source is candid about the limits: **no revocation** (no CRL, no OCSP); only
-RSA-SHA256/384/512 and ECDSA-P256-SHA256 signature algorithms are accepted (SHA-1
-and RSA-PSS are *rejected*, not silently trusted); and `basicConstraints`
-CA:TRUE / pathLen / key-usage are not enforced. If the verifier is **not**
-linked, the TLS handshake still completes but the connection is flagged
-**encrypted-but-unauthenticated** — `tls_cert_trusted()` returns 0, and the
-HTTP layer surfaces `nc->trusted == 0` so a UI "lock" indicator must be gated on
-it (this is exactly what `wget -k` acknowledges). The same caveat is why
-`browser2` can show pages over HTTPS while being honest about trust.
+The source is candid about the limits: **no revocation** (no CRL, no OCSP); only RSA-SHA256/384/512 and ECDSA-P256-SHA256 signature algorithms are accepted (SHA-1 and RSA-PSS are *rejected*, not silently trusted); and `basicConstraints` CA:TRUE / pathLen / key-usage are not enforced. If the verifier is **not** linked, the TLS handshake still completes but the connection is flagged **encrypted-but-unauthenticated** — `tls_cert_trusted()` returns 0, and the HTTP layer surfaces `nc->trusted == 0` so a UI "lock" indicator must be gated on it (this is exactly what `wget -k` acknowledges). The same caveat is why `browser2` can show pages over HTTPS while being honest about trust.
 
-How it all stacks up for an `https://` GET: `https_get()` → `netconn` (DNS
-resolve + TCP connect + `tls_client_connect`) → TLS records → the same HTTP/1.1
-response parsing used for plain HTTP.
+How it all stacks up for an `https://` GET: `https_get()` → `netconn` (DNS resolve + TCP connect + `tls_client_connect`) → TLS records → the same HTTP/1.1 response parsing used for plain HTTP.
 
 ---
 
-## TLS 1.3 + authenticated certificates
+## TLS 1.3 and authenticated certificates
 
-The client now negotiates **TLS 1.3** (RFC 8446) in addition to 1.2 (offer it with the
-`TLS13=1` build). The whole 1.3 path is hand-written and **known-answer-proven against the
-RFC 8448 trace**: the HKDF `Derive-Secret` key-schedule ladder, the record layer (AEAD nonce =
-`iv ^ seq`, AAD = record header, inner `content || type || pad`), `CertificateVerify`
-(`RSA-PSS` and `ECDSA` over `64×0x20 || context || 0x00 || transcript-hash`), the `Finished`
-HMAC, and a dual `key_share` ClientHello offering **X25519 + secp256r1** (with P-384 ECDHE also
-implemented). Certificate **trust is now real** (NET-TLS-TRUST-0): `x509_verify_chain` validates
-the chain against the CA bundle with correct time handling, so `tls_cert_trusted()` reflects a
-genuinely authenticated peer — proven live against `cloudflare.com`. (The older "encrypted-but-
-unauthenticated" caveat above predates this fix.)
+The client now negotiates **TLS 1.3** (RFC 8446) in addition to 1.2.
+
+Offer it with the `TLS13=1` build. The whole 1.3 path is hand-written and **known-answer-proven against the RFC 8448 trace**: the HKDF `Derive-Secret` key-schedule ladder, the record layer (AEAD nonce = `iv ^ seq`, AAD = record header, inner `content || type || pad`), `CertificateVerify` (`RSA-PSS` and `ECDSA` over `64×0x20 || context || 0x00 || transcript-hash`), the `Finished` HMAC, and a dual `key_share` ClientHello offering **X25519 + secp256r1** (with P-384 ECDHE also implemented).
+
+Certificate **trust is now real** (NET-TLS-TRUST-0): `x509_verify_chain` validates the chain against the CA bundle with correct time handling, so `tls_cert_trusted()` reflects a genuinely authenticated peer — proven live against `cloudflare.com`. (The older "encrypted-but-unauthenticated" caveat above predates this fix.)
+
+---
 
 ## WPA2 + WPA3 supplicant
 
-`sbin/wpasupp` is a from-scratch Wi-Fi supplicant. **WPA2**: PBKDF2-HMAC-SHA1 PMK, the 4-way
-handshake, AES key-wrap (RFC 3394), and CCMP/GCMP — all KAT-proven in the boot `cryptotest`
-battery. **WPA3-SAE**: the full dragonfly handshake — hunting-and-pecking PWE → `commit` →
-`confirm` → PMK — is implemented and proven. The supplicant drives the radio entirely through the
-`SYS_WLAN_*` control plane (below), so it works identically over the simulated backend and the
-real radio.
+`sbin/wpasupp` is a from-scratch Wi-Fi supplicant.
+
+- **WPA2** — PBKDF2-HMAC-SHA1 PMK, the 4-way handshake, AES key-wrap (RFC 3394), and CCMP/GCMP, all KAT-proven in the boot `cryptotest` battery.
+- **WPA3-SAE** — the full dragonfly handshake (hunting-and-pecking PWE → `commit` → `confirm` → PMK) is implemented and proven.
+
+The supplicant drives the radio entirely through the `SYS_WLAN_*` control plane (below), so it works identically over the simulated backend and the real radio.
+
+---
 
 ## The from-scratch WiFi driver (`kernel/drivers/net/wireless/intel/iwlwifi/`)
 
-The T410's Intel radio is driven by a **hand-written iwlwifi DVM driver** — the DVM-era firmware
-API for the 1000 / 5000 / 6000-series cards — built correct-by-review against Linux v5.10. The
-bring-up ladder (triggered post-desktop by `sbin/iwlup`, never at boot, so an untested radio can
-never wedge the bus): **prepare-card-hw → APM power-up → cmd + RX DMA rings → firmware DMA load →
-INIT/runtime ALIVE → calibration → EEPROM/OTP NVM read → RXON → passive scan → register `wlan0`**
-behind the same `wifi_ops` seam the simulator uses.
+The T410's Intel radio is driven by a **hand-written iwlwifi DVM driver** — the DVM-era firmware API for the 1000 / 5000 / 6000-series cards — built correct-by-review against Linux v5.10.
+
+The bring-up ladder (triggered post-desktop by `sbin/iwlup`, never at boot, so an untested radio can never wedge the bus): **prepare-card-hw → APM power-up → cmd + RX DMA rings → firmware DMA load → INIT/runtime ALIVE → calibration → EEPROM/OTP NVM read → RXON → passive scan → register `wlan0`**, behind the same `wifi_ops` seam the simulator uses.
 
 Highlights of the design:
 
-- **`REPLY_RXON` before scan.** The MAC receiver must be configured (channel/band/filters/antenna)
-  or the firmware delivers no frames — the driver commits a baseline RXON, then a passive scan
-  harvests beacons into the network list (`iwl-rxon.c`, `iwl-scan.c`).
-- **Firmware auto-select.** The PCI device id maps deterministically to the card family, so the
-  driver tries that family's known `iwlwifi-<fam>-<api>.ucode` revisions (newest first) and uses
-  the first that parses (`iwl_fw_candidates`). Bundle the whole redistributable DVM blob set into
-  `firmware/` once and WiFi auto-picks the right one for whatever card is present.
-- **RF-kill aware.** It reads + reports the hardware wireless switch (`CSR_GP_CNTRL` bit 27) so an
-  off switch is diagnosed rather than a mystery empty scan.
-- **GUI bring-up diagnostics (`SYS_WLAN_DIAG` / `kernel/net/wifidiag.c`).** The driver publishes a
-  snapshot (card, family, RF-kill, stage, MAC, channels, scan count, message) that the Network
-  Manager renders as a live **"Radio:"** line — so the radio can be debugged on-screen without a
-  serial cable.
-- **Software-provable, hardware-iterated.** Boot-time KATs (`IWL-RXON`, `IWL-SCAN`, `IWL-FWSEL`,
-  `IWL-FW`) prove the register/struct/parse logic in QEMU; the RF tail itself has no emulator and
-  is iterated on the physical T410. Full procedure: [`docs/T410_IWLWIFI.md`](../T410_IWLWIFI.md).
+- **`REPLY_RXON` before scan.** The MAC receiver must be configured (channel/band/filters/antenna) or the firmware delivers no frames — the driver commits a baseline RXON, then a passive scan harvests beacons into the network list (`iwl-rxon.c`, `iwl-scan.c`).
+- **Firmware auto-select.** The PCI device id maps deterministically to the card family, so the driver tries that family's known `iwlwifi-<fam>-<api>.ucode` revisions (newest first) and uses the first that parses (`iwl_fw_candidates`). Bundle the whole redistributable DVM blob set into `firmware/` once and WiFi auto-picks the right one for whatever card is present.
+- **RF-kill aware.** It reads + reports the hardware wireless switch (`CSR_GP_CNTRL` bit 27) so an off switch is diagnosed rather than a mystery empty scan.
+- **GUI bring-up diagnostics (`SYS_WLAN_DIAG` / `kernel/net/wifidiag.c`).** The driver publishes a snapshot (card, family, RF-kill, stage, MAC, channels, scan count, message) that the Network Manager renders as a live **"Radio:"** line — so the radio can be debugged on-screen without a serial cable.
+- **Software-provable, hardware-iterated.** Boot-time KATs (`IWL-RXON`, `IWL-SCAN`, `IWL-FWSEL`, `IWL-FW`) prove the register/struct/parse logic in QEMU; the RF tail itself has no emulator and is iterated on the physical T410. Full procedure: [`docs/T410_IWLWIFI.md`](../T410_IWLWIFI.md).
 
-The control plane the GUI/supplicant use: `SYS_WLAN_SCAN/CONNECT/STATUS/DISCONNECT/SET_KEY` plus
-`SYS_WLAN_DIAG`, dispatched through `netif_t.wifi` (`wifi_ops`) so the simulated backend
-(`wifisim`) and the real `iwlwifi` driver are interchangeable below the seam.
+The control plane the GUI/supplicant use: `SYS_WLAN_SCAN/CONNECT/STATUS/DISCONNECT/SET_KEY` plus `SYS_WLAN_DIAG`, dispatched through `netif_t.wifi` (`wifi_ops`) so the simulated backend (`wifisim`) and the real `iwlwifi` driver are interchangeable below the seam.
 
 ---
 

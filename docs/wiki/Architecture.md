@@ -4,7 +4,7 @@ AutomationOS is a from-scratch x86_64 operating system that boots through GRUB i
 
 ![The AutomationOS desktop](../../screenshots/desktop.png)
 
-> Scope note: this document describes what the code *does today*, in the **default** build. The scheduler is **cooperative** (processes yield via `SYS_YIELD`; there is no timer preemption), the system is **single-core**, and boot is **GRUB Multiboot1 on legacy BIOS** (not UEFI). Preemptive (`PREEMPT=1`) and multi-core SMP (`SMP=1`) builds exist behind env-gated flags and are separately validated, but are **not** the shipped default. A growing list of subsystems — the real Intel iwlwifi WiFi driver, Intel HD Audio, the AI agent rail, TLS 1.3 — are likewise gated behind build flags or post-desktop triggers and are **off in a plain boot** (the reasons are explained below). See [Roadmap](../ROADMAP.md) for what is planned.
+> **Note:** This document describes what the code *does today*, in the **default** build. The scheduler is **cooperative** (processes yield via `SYS_YIELD`; there is no timer preemption), the system is **single-core**, and boot is **GRUB Multiboot1 on legacy BIOS** (not UEFI). Preemptive (`PREEMPT=1`) and multi-core SMP (`SMP=1`) builds exist behind env-gated flags and are separately validated, but are **not** the shipped default. A growing list of subsystems — the real Intel iwlwifi WiFi driver, Intel HD Audio, the AI agent rail, TLS 1.3 — are likewise gated behind build flags or post-desktop triggers and are **off in a plain boot** (the reasons are explained below). See [Roadmap](../ROADMAP.md) for what is planned.
 >
 > The boot smoke test (`scripts/smoke_boot.sh`) runs **43 invariant checks** against a real QEMU boot of the default ISO; a separate `GAMETEST=1` harness proves **25 games + apps** spawn and survive.
 
@@ -14,7 +14,7 @@ AutomationOS is a from-scratch x86_64 operating system that boots through GRUB i
 
 From firmware up to the apps, each layer hands off to the next:
 
-```
+```text
 Legacy BIOS / firmware
         │  (El Torito ISO, GRUB stage built by grub-mkrescue)
         ▼
@@ -169,7 +169,7 @@ The boot contract that ties them: `grub.cfg` does `multiboot /boot/kernel.elf` +
 ### Build-flag quick reference
 
 | Flag | Effect | Default |
-|------|--------|---------|
+| :--- | :--- | :--- |
 | `IWLWIFI=1` | Compile the real Intel iwlwifi DVM driver (bring-up still deferred to `iwlup`) | off |
 | `WIFI_SIM=1` | Compile the simulated `wlan0` backend (scan/connect demo) | off |
 | `HDA_ENABLE=1` | Enable Intel HD Audio init at boot | off |
@@ -188,7 +188,7 @@ The boot contract that ties them: `grub.cfg` does `multiboot /boot/kernel.elf` +
 ## Directory map
 
 | Path | What lives here |
-|------|-----------------|
+| :--- | :--- |
 | `kernel/` | The kernel. `kernel.c` (`kernel_main`), `linker.ld`, `stubs.c`. |
 | `kernel/arch/x86_64/` | Long-mode entry (`boot.asm`), GDT/IDT, paging, syscall/context-switch/usermode asm+C, the single-CPU `tlb_uni.c` (and the un-compiled SMP files). |
 | `kernel/core/` | `mem/` (pmm, vmm, heap, slab, cow, vma), `sched/` (scheduler, process, context), `syscall/` (dispatch + futex/epoll/sendfile/batch), `signal/`, `procapi/`. |

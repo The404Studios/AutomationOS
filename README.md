@@ -63,7 +63,7 @@ A from-scratch compositor with window management (maximize + edge-snap, Alt+Tab 
 
 `cc` (`userspace/apps/cc`) is a real C front end + x86-64 back end + assembler + ELF writer that runs on the OS. The IDE (`userspace/apps/ide`) is the "Semantic LEGO Map" — file tree, syntax-highlighting editor, integrated terminal, a navigable code/blueprint map, teaching dictionaries, a snippet library, and **Ctrl+B** build / **Ctrl+R** run wired to `cc`. The editor and compiler share one verified front end (lexer / parser / codegen / assembler / ELF writer).
 
-### Browser & the modern web
+### Browser (work in progress)
 
 ![browser](screenshots/browser.png)
 

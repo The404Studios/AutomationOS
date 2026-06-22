@@ -13,6 +13,8 @@ For the editor, the "Semantic LEGO Map," and the desktop the IDE lives in, see
 [Desktop & Apps](Desktop-and-Apps.md); for the process model the produced ELF is
 spawned into, see [Kernel Internals](Kernel-Internals.md).
 
+![The IDE — the Semantic LEGO Map view of a program](../../screenshots/ide.png)
+
 ---
 
 ## One toolchain, two front-ends
@@ -227,10 +229,20 @@ real but deliberately small C subset:
   `union`/`enum` and `typedef`) are parsed and structs get sequential field
   layout for member access.
 - **Storage**: global and local scalar (int/char/pointer) variables; arrays
-  (`int a[4]`); string literals (emitted to `.data`).
+  (`int a[4]`); string literals (emitted to `.data`). **Constant initializers**
+  are honoured — a file-scope `int x = 5;` emits `dq 5`, an array `int a[]={1,2}`
+  emits its elements (unset slots zero-fill), and a known `struct` initializer is
+  laid out field-by-field (`db` for 1-byte fields, `dq` otherwise) via the struct
+  registry. File-scope initializers must fold to an integer constant
+  (`cc_const_eval`); a non-constant initializer falls back to `dq 0`.
 - **Functions**: definitions and prototypes, **≤ 6 parameters**, `return`, and
   recursion.
-- **Control flow**: `if` / `else`, `while`, `for`, `break`, `continue`, blocks.
+- **Control flow**: `if` / `else`, `while`, `for`, **`switch` / `case` /
+  `default`**, `break`, `continue`, blocks. `switch` is lowered to a linear
+  compare-and-jump dispatch (`gen_switch` in `cc_codegen.c`): each `case`
+  constant is folded with `cc_const_eval`, the body is emitted in source order so
+  **fall-through works naturally**, and `break` exits via the shared end label.
+  Limit: **≤ 32 cases** per `switch`.
 - **Operators**: `+ - * / % & | ^ << >> ! ~`, unary `-`, `&& ||`,
   `== != < <= > >=`, `=` and the compound-assignment forms; `*p` deref, `&x`
   address-of, `a[i]` index, `s.field` / `p->field` member access.
@@ -272,6 +284,8 @@ too. **`.cpp`/`.cc`/`.cxx`** is attempted *best-effort as C* (no C++ semantics).
 ---
 
 ## How the IDE drives it
+
+![The IDE editor — write C, Ctrl+B to build, Ctrl+R to run](../../screenshots/ide_editor.png)
 
 Inside the IDE, the toolchain is the **Build** panel
 ([`ide_build.c`](../../userspace/apps/ide/ide_build.c)). The relevant chords

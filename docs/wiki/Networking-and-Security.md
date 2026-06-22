@@ -236,6 +236,62 @@ response parsing used for plain HTTP.
 
 ---
 
+## TLS 1.3 + authenticated certificates
+
+The client now negotiates **TLS 1.3** (RFC 8446) in addition to 1.2 (offer it with the
+`TLS13=1` build). The whole 1.3 path is hand-written and **known-answer-proven against the
+RFC 8448 trace**: the HKDF `Derive-Secret` key-schedule ladder, the record layer (AEAD nonce =
+`iv ^ seq`, AAD = record header, inner `content || type || pad`), `CertificateVerify`
+(`RSA-PSS` and `ECDSA` over `64×0x20 || context || 0x00 || transcript-hash`), the `Finished`
+HMAC, and a dual `key_share` ClientHello offering **X25519 + secp256r1** (with P-384 ECDHE also
+implemented). Certificate **trust is now real** (NET-TLS-TRUST-0): `x509_verify_chain` validates
+the chain against the CA bundle with correct time handling, so `tls_cert_trusted()` reflects a
+genuinely authenticated peer — proven live against `cloudflare.com`. (The older "encrypted-but-
+unauthenticated" caveat above predates this fix.)
+
+## WPA2 + WPA3 supplicant
+
+`sbin/wpasupp` is a from-scratch Wi-Fi supplicant. **WPA2**: PBKDF2-HMAC-SHA1 PMK, the 4-way
+handshake, AES key-wrap (RFC 3394), and CCMP/GCMP — all KAT-proven in the boot `cryptotest`
+battery. **WPA3-SAE**: the full dragonfly handshake — hunting-and-pecking PWE → `commit` →
+`confirm` → PMK — is implemented and proven. The supplicant drives the radio entirely through the
+`SYS_WLAN_*` control plane (below), so it works identically over the simulated backend and the
+real radio.
+
+## The from-scratch WiFi driver (`kernel/drivers/net/wireless/intel/iwlwifi/`)
+
+The T410's Intel radio is driven by a **hand-written iwlwifi DVM driver** — the DVM-era firmware
+API for the 1000 / 5000 / 6000-series cards — built correct-by-review against Linux v5.10. The
+bring-up ladder (triggered post-desktop by `sbin/iwlup`, never at boot, so an untested radio can
+never wedge the bus): **prepare-card-hw → APM power-up → cmd + RX DMA rings → firmware DMA load →
+INIT/runtime ALIVE → calibration → EEPROM/OTP NVM read → RXON → passive scan → register `wlan0`**
+behind the same `wifi_ops` seam the simulator uses.
+
+Highlights of the design:
+
+- **`REPLY_RXON` before scan.** The MAC receiver must be configured (channel/band/filters/antenna)
+  or the firmware delivers no frames — the driver commits a baseline RXON, then a passive scan
+  harvests beacons into the network list (`iwl-rxon.c`, `iwl-scan.c`).
+- **Firmware auto-select.** The PCI device id maps deterministically to the card family, so the
+  driver tries that family's known `iwlwifi-<fam>-<api>.ucode` revisions (newest first) and uses
+  the first that parses (`iwl_fw_candidates`). Bundle the whole redistributable DVM blob set into
+  `firmware/` once and WiFi auto-picks the right one for whatever card is present.
+- **RF-kill aware.** It reads + reports the hardware wireless switch (`CSR_GP_CNTRL` bit 27) so an
+  off switch is diagnosed rather than a mystery empty scan.
+- **GUI bring-up diagnostics (`SYS_WLAN_DIAG` / `kernel/net/wifidiag.c`).** The driver publishes a
+  snapshot (card, family, RF-kill, stage, MAC, channels, scan count, message) that the Network
+  Manager renders as a live **"Radio:"** line — so the radio can be debugged on-screen without a
+  serial cable.
+- **Software-provable, hardware-iterated.** Boot-time KATs (`IWL-RXON`, `IWL-SCAN`, `IWL-FWSEL`,
+  `IWL-FW`) prove the register/struct/parse logic in QEMU; the RF tail itself has no emulator and
+  is iterated on the physical T410. Full procedure: [`docs/T410_IWLWIFI.md`](../T410_IWLWIFI.md).
+
+The control plane the GUI/supplicant use: `SYS_WLAN_SCAN/CONNECT/STATUS/DISCONNECT/SET_KEY` plus
+`SYS_WLAN_DIAG`, dispatched through `netif_t.wifi` (`wifi_ops`) so the simulated backend
+(`wifisim`) and the real `iwlwifi` driver are interchangeable below the seam.
+
+---
+
 ## See also
 
 - [Home](Home.md)

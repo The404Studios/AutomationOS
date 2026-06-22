@@ -12,11 +12,12 @@ A few facts to anchor everything below, all verifiable in the tree:
   `SYS_YIELD` (or blocks/exits). The timer interrupt does **not** preempt — see the
   `NOTE` in `kernel/core/sched/scheduler.c` and `timer_handler()` in
   `kernel/drivers/pit.c`, which only bumps a tick counter.
-- **The system is single-core.** `kernel/arch/x86_64/smp.c`, `lapic.c`, `ipi.c`,
-  `scheduler_smp.c`, and `ap_trampoline.asm` exist in-tree but are **not compiled** —
-  confirm against the file list in `scripts/quick_build.sh` (it builds `scheduler.c`,
-  which is wrapped in `#ifndef CONFIG_SMP`, and `tlb_uni.c`, the single-CPU TLB, in
-  place of the SMP `tlb.c`).
+- **The default build is single-core.** With no build flags set, `scripts/quick_build.sh`
+  compiles `scheduler.c` and the single-CPU `tlb_uni.c`; the SMP-only sources are left
+  out. Multi-core is a **gated, opt-in** variant: `SMP=1` (with a deeper `SMP_SCHED=1`
+  sub-gate) adds `-DSMP_FOUNDATION` and the AP bring-up sources and writes a *separate*
+  `build/kernel-smp.elf` — the default `build/kernel.elf` is byte-for-byte unchanged. See
+  [Multi-core (SMP, gated)](#multi-core-smp-gated-experimental) below.
 - **Boot is GRUB Multiboot1 on legacy BIOS.** The Multiboot1 header magic
   `0x1BADB002` lives at the top of `kernel/arch/x86_64/boot.asm`. There is no UEFI path.
 
@@ -334,11 +335,40 @@ box, which is the entire point.
 Measured result: **all six burners progress equally** (interleaved heartbeats == fair
 time-slicing of ring 3), **zero** page-faults / GP faults / panics / double-faults,
 `FLOATTEST: PASS` under preemption, and the desktop stays alive. The default cooperative
-build is unaffected and **smoke is 33/33**.
+build is unaffected and **boot smoke is 43/43** (`scripts/smoke_boot.sh`; a `GAMETEST=1`
+harness additionally proves 25/25 games+apps spawn and survive).
 
 This is real, validated, and committed — but it is still **gated and experimental**, and
 **not the default**. SMP (true multi-core) is a separate, larger concurrency-safety
-project that comes only after single-core preemption is bulletproof.
+project, also gated — see the next section.
+
+---
+
+## Multi-core (SMP, gated, experimental)
+
+> **The default build is single-core and unchanged.** Everything here is compiled **only**
+> under `-DSMP_FOUNDATION`, off by default. With the flag unset the AP sources are not
+> compiled, `build/kernel.elf` is byte-for-byte what it was, and the single-core story
+> above is the whole story.
+
+Like preemption, multi-core is an opt-in, separately-built variant rather than a flip of
+the default. `scripts/quick_build.sh` exposes two nested gates:
+
+```sh
+SMP=1 bash scripts/quick_build.sh              # -> build/kernel-smp.elf : BSP LAPIC + AP bring-up
+SMP=1 SMP_SCHED=1 bash scripts/quick_build.sh  # -> adds real per-CPU scheduling (CPU1 runs processes)
+```
+
+`SMP=1` defines `-DSMP_FOUNDATION` and pulls in the AP-bring-up sources (`lapic.c`,
+`ap_boot.c`, `ap_trampoline.asm`) that the default build leaves out, writing the separate
+`build/kernel-smp.elf`. The deeper `SMP_SCHED=1` sub-gate (which requires `SMP=1`) adds
+`-DSMP_SCHED` and the real per-CPU scheduler so CPU1 runs actual processes; every scheduler
+change for it is wrapped `#ifdef SMP_SCHED`. There is also a test-only
+`SMP_FORCE_AP_FAIL=1` knob that forces AP start to fail, to prove the BSP degrades cleanly
+to single-core rather than hanging — never set it for a shipping image. The deliberate
+choice of `-DSMP_FOUNDATION` (rather than the older `-DCONFIG_SMP`) is so the default
+`#ifndef CONFIG_SMP` cooperative scheduler and the single-CPU `tlb_uni.c` stay selected
+unless you explicitly opt in.
 
 ---
 
@@ -403,11 +433,73 @@ A representative excerpt of the table (full list in `syscall.h`):
 | 37 | `SYS_MMAP` | `sys_mmap` | Eager anonymous mapping (see `vma.c`) |
 | 39 | `SYS_FB_ACQUIRE` | `sys_fb_acquire` | Map framebuffer into caller |
 | 40 | `SYS_GET_TICKS_MS` | (inlined) | Monotonic ms since boot (PIT-driven) |
+| 88 | `SYS_RECOVERY_OVERLAY` | `sys_recovery_overlay` | Self-heal recovery animation |
+| 106 | `SYS_SPAWN_EX_ARGV` | `sys_spawn_ex_argv` | Spawn with an explicit argv vector (agent rail) |
 
-Numbers 41+ are an integrator-assigned, collision-free extended map (RTC, RNG, sockets,
-clipboard, notifications, epoll, futex, sendfile, batch). `syscall_init()` registers the
-whole table; roughly ~70 numbers are defined and the dispatcher reports the count at
-boot.
+Numbers 41+ are an integrator-assigned extended map (RTC, RNG, sockets, clipboard,
+notifications, poll/select, futex, sendfile, batch, channels, signals). `syscall_init()`
+registers the whole table; roughly ~80 numbers are defined and the dispatcher reports the
+count at boot. Two later blocks — the **WiFi control plane** and the **audio mixer** — are
+documented below; they sit at numbers 113–124.
+
+### WiFi control plane — `SYS_WLAN_*` (113–117, plus `SYS_WLAN_DIAG` at 124)
+
+The WiFi syscalls live in `kernel/net/wlansyscall.c`, with the kernel/userspace ABI fixed
+in `kernel/include/uapi/wlan.h` (every struct carries an `ABI_SIZE` constant and a
+`_Static_assert` so any drift is a compile error). They are deliberately **thin**: each
+handler finds the WiFi interface (`netif_get_wifi_default()`), validates the user struct,
+and dispatches **through `netif_t.wifi`** — a `wifi_ops` vtable (`kernel/include/wifi.h`).
+This `wifi_ops` pointer is the **swap seam**: the simulated backend
+(`kernel/drivers/net/wireless/sim/wifisim.c`, `WIFI_SIM=1`) and the from-scratch Intel
+**iwlwifi** DVM driver (`kernel/drivers/net/wireless/intel/iwlwifi/`) implement the exact
+same contract, so the syscall layer never touches a driver directly.
+
+| # | Name | Handler | Payload (UAPI struct) |
+|---|------|---------|-----------------------|
+| 113 | `SYS_WLAN_SCAN` | `sys_wlan_scan` | fills `uapi_wlan_bss_t[]`, returns count (≤16/call) |
+| 114 | `SYS_WLAN_CONNECT` | `sys_wlan_connect` | `uapi_wlan_connect_t` (SSID + passphrase) |
+| 115 | `SYS_WLAN_STATUS` | `sys_wlan_status` | `uapi_wlan_status_t` (state + RSSI) |
+| 116 | `SYS_WLAN_DISCONNECT` | `sys_wlan_disconnect` | none |
+| 117 | `SYS_WLAN_SET_KEY` | `sys_wlan_set_key` | `uapi_wlan_setkey_t` (supplicant installs PTK/GTK) |
+| 124 | `SYS_WLAN_DIAG` | `sys_wlan_diag` | `uapi_wlan_diag_t` (radio bring-up diagnostics) |
+
+All return `ENOTSUP` (negative) when no WiFi interface is registered — e.g. a wired-only or
+no-NIC build — so they are safe no-ops rather than failures there.
+
+**`SYS_WLAN_DIAG` (124)** is the bring-up observability path. The Intel radio has no
+emulator, so on the physical T410 it has to be iterated by reading *where* bring-up
+stopped. Rather than require a serial cable, the active WiFi backend updates a single
+snapshot store — `kernel/net/wifidiag.c` — as detect → APM → ALIVE → NVM → register → scan
+proceeds (and records the step + a message on any failure). `sys_wlan_diag` just
+`copy_to_user`s that `uapi_wlan_diag_t` (card name, family, RF-kill, stage, MAC, channel
+count, last scan count, status message). The Network Manager (`userspace/apps/netman`)
+renders it as a live "Radio:" line — see `../../screenshots/netman_diag.png`. Writers in
+`wifidiag.c`: `wifi_diag_card/_rfkill/_stage/_mac/_alive/_scan/_msg`, a single-writer
+(bring-up path) / single-reader (the syscall) discipline that needs no lock on this
+uniprocessor build.
+
+### Audio mixer — `SYS_AUDIO_*` (118–123)
+
+The audio mixer surface (handlers in `kernel/core/syscall/syscall.c`, defined in
+`syscall.h`) is a thin shim over the Intel HDA driver (built only with `HDA_ENABLE=1`); the
+Sound Manager app (`userspace/apps/soundman`) drives it.
+
+| # | Name | Handler | Effect |
+|---|------|---------|--------|
+| 118 | `SYS_AUDIO_VOLUME` | `sys_audio_volume` | set output volume 0..100 → `hda_set_volume` |
+| 119 | `SYS_AUDIO_MUTE` | `sys_audio_mute` | set mute 0\|1 → `hda_set_mute` |
+| 120 | `SYS_AUDIO_OUTPUTS` | — | RESERVED → `ENOTSUP` |
+| 121 | `SYS_AUDIO_SELECT` | — | RESERVED → `ENOTSUP` |
+| 122 | `SYS_AUDIO_TEST` | `sys_audio_test` | play a test tone (arg1 = freq Hz, arg2 = ms, capped) |
+| 123 | `SYS_AUDIO_STATUS` | `sys_audio_status` | fills `audio_status_t` {present, volume, muted, codec_vendor} |
+
+The audio handlers return cleanly (negative) when no HDA controller/codec is present, so
+they are safe no-ops on audioless boots.
+
+> **Number map.** The audio mixer owns the contiguous block **118–123** with no overlap,
+> so `SYS_AUDIO_VOLUME` at 118 is fully reachable. (`SYS_WLAN_DIAG` was briefly assigned 118
+> as well; it has since been moved to its own free slot, **124**, so there is no longer any
+> collision.) Always pull constants from `kernel/include/syscall.h`.
 
 ---
 
@@ -477,9 +569,12 @@ To keep this page honest:
   (`PREEMPT=1 bash scripts/quick_build.sh` → `build/kernel-preempt.elf`) — validated but
   experimental and **not** the default. See
   [Preemptive scheduling](#preemptive-scheduling-gated-experimental) above.
-- **No SMP.** `smp.c`, `lapic.c`, `ipi.c`, `scheduler_smp.c`, `ap_trampoline.asm`, and the
-  IPI-based `tlb.c` are present in-tree but excluded from `scripts/quick_build.sh`; the
-  build compiles the `#ifndef CONFIG_SMP` scheduler and the single-CPU `tlb_uni.c`.
+- **No SMP *in the default build*.** The default `kernel.elf` is single-core: it compiles
+  the `#ifndef CONFIG_SMP` scheduler and the single-CPU `tlb_uni.c`, and leaves the
+  AP-bring-up sources out. A gated, opt-in multi-core variant
+  (`SMP=1` / `SMP=1 SMP_SCHED=1` → `build/kernel-smp.elf`) is validated but experimental
+  and **not** the default. See [Multi-core (SMP, gated)](#multi-core-smp-gated-experimental)
+  above.
 - **No UEFI.** Boot is GRUB Multiboot1 (`0x1BADB002`) on legacy BIOS.
 
 These are tracked under "Planned" in the [Roadmap](../ROADMAP.md).

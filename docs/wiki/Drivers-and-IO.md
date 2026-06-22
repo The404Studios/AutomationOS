@@ -194,12 +194,107 @@ A freestanding (no libc, no stdio, no malloc) networking library compiled for ri
 |---|---|---|
 | DNS resolver | `userspace/lib/net/dns.c` | A-record query over UDP to `10.0.2.3:53` (QEMU slirp DNS); dotted-quad shortcut bypasses network |
 | HTTP/1.1 client | `userspace/lib/net/http.c` | GET with redirect following (up to cap), chunked transfer decoding, Content-Length, gzip/deflate inflate, 1-slot keep-alive cache, both `http://` and `https://` |
-| TLS 1.2 client | `userspace/lib/tls/tls.c` | Handshake over an already-connected TCP fd. Advertises ECDHE+AEAD suites: `ECDHE_ECDSA_WITH_AES_128_GCM_SHA256`, `ECDHE_RSA_WITH_AES_128_GCM_SHA256`, `ECDHE_RSA_WITH_AES_256_GCM_SHA384`, `ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256`, `ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256`, plus legacy `TLS_RSA_WITH_AES_128_CBC_SHA`. x25519 and secp256r1 key exchange. ServerKeyExchange signature is verified. Certificate chain validation via `x509_verify_chain()` when linked; without it the connection is flagged encrypted-but-unauthenticated. No session resumption. |
+| TLS 1.2 client | `userspace/lib/tls/tls.c` | Handshake over an already-connected TCP fd. Advertises ECDHE+AEAD suites: `ECDHE_ECDSA_WITH_AES_128_GCM_SHA256`, `ECDHE_RSA_WITH_AES_128_GCM_SHA256`, `ECDHE_RSA_WITH_AES_256_GCM_SHA384`, `ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256`, `ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256`, plus legacy `TLS_RSA_WITH_AES_128_CBC_SHA`. x25519 and secp256r1 key exchange. ServerKeyExchange signature is verified. **Real certificate-chain trust** via `x509_verify_chain()`. No session resumption. |
+| TLS 1.3 client | `userspace/lib/tls/tls13_*.c` | RFC 8446 handshake, offered when built with `TLS13=1`. X25519 + P-256 (+ P-384) ECDHE, RSA-PSS and ECDSA `CertificateVerify`. Known-answer-proven against the RFC 8448 test vectors. See [Networking & Security](Networking-and-Security.md). |
 | X.509 / ASN.1 | `userspace/lib/tls/x509.c`, `asn1.c` | DER parsing, SubjectPublicKeyInfo decode, basic constraints |
 | TLS connection helper | `userspace/lib/tls/tlsconn.c` | Wraps DNS resolve + TCP connect + TLS handshake into a single `netconn` object used by the HTTP client |
 | HKDF | `userspace/lib/crypto/hkdf.c` | Used internally by the TLS 1.2 PRF machinery |
 
 Userspace apps using this stack: `userspace/apps/tlsprobe`, `userspace/apps/netman`, `userspace/apps/livenet`, `userspace/apps/nettool`.
+
+The TLS implementation now offers **TLS 1.2 and TLS 1.3** (the latter built with `TLS13=1`, sources in `userspace/lib/tls/tls13_*.c`, known-answer-proven against RFC 8448) and performs **real certificate-chain trust** via `x509_verify_chain()`. The full crypto, supplicant, and security story lives in [Networking & Security](Networking-and-Security.md) — this page covers only the device drivers.
+
+---
+
+## Wireless (WiFi)
+
+WiFi is a from-scratch driver effort, not a port. It is structured around a single **swap seam** (`kernel/include/wifi.h`): a `wifi_ops` control struct hangs off `netif_t.wifi`, and everything above the seam — the `SYS_WLAN_*` syscalls, the WPA supplicant, the Network Manager GUI — talks only to that contract. Two backends implement the *identical* contract: a simulated one for QEMU and the real Intel iwlwifi DVM driver for hardware. Swapping one for the other touches nothing above the seam.
+
+### Control-plane syscalls (`kernel/net/wlansyscall.c`)
+
+| Syscall | Number | Purpose |
+|---|---|---|
+| `SYS_WLAN_SCAN` | 113 | trigger a scan, marshal results into a `uapi_wlan_bss_t[]` (cap 16/call) |
+| `SYS_WLAN_CONNECT` | 114 | join an SSID (`uapi_wlan_connect_t`: ssid, security, optional BSSID pin, passphrase) |
+| `SYS_WLAN_STATUS` | 115 | current association state + RSSI (`uapi_wlan_status_t`) |
+| `SYS_WLAN_DISCONNECT` | 116 | drop the link |
+| `SYS_WLAN_SET_KEY` | 117 | supplicant installs a PTK (pairwise) or GTK (group) key (`uapi_wlan_setkey_t`) |
+| `SYS_WLAN_DIAG` | 124 | copy the radio bring-up diagnostics snapshot to userspace (`uapi_wlan_diag_t`) |
+
+The handlers are deliberately thin: each resolves the wifi interface via `netif_get_wifi_default()`, validates and marshals the user struct, and calls through `netif_t.wifi` (`wifi_ops`). They never touch a driver directly — that is the swap point. The kernel/userspace ABI lives in `kernel/include/uapi/wlan.h`, with `_Static_assert` size guards on every struct so drift is a compile error. (`ENOTSUP` is returned cleanly on a wired-only or no-NIC build.)
+
+### Simulated backend (`kernel/drivers/net/wireless/sim/wifisim.c`)
+
+Built with `WIFI_SIM=1`. Registers a fake `wlan0` whose `wifi_ops` return a canned mix of OPEN/WPA2/WPA3 APs (`AutomationOS-Open`, `HomeNet`, `Guest5G`, `SecureMesh`) and simulate scan → auth → assoc → connect. This drives the *entire* stack above the seam — `SYS_WLAN_*`, the Network Manager GUI, the WPA/WPA3 supplicant, DHCP — end-to-end in QEMU at zero cost, because no emulator implements an iwlwifi radio. The data path falls through to the wired NIC under slirp. `WIFI_DEMO=1` makes `init` headlessly auto-connect the sim `wlan0` to `HomeNet` (WPA2) as a non-GUI proof; `WIFI_DEMO_WPA3=1` targets `SecureMesh` (WPA3/SAE).
+
+### Real Intel iwlwifi DVM driver (`kernel/drivers/net/wireless/intel/iwlwifi/`)
+
+A from-scratch implementation of the Intel **DVM** firmware family (1000 / 5000 / 6000 / 6000g2a — the iwlwifi generation in the ThinkPad T410), written correct-by-review against Linux iwlwifi v5.10 with each register and host command cited line-by-line. Built with `IWLWIFI=1` (which is mutually exclusive with `WIFI_SIM`). The files form a bring-up ladder:
+
+| File | Responsibility |
+|---|---|
+| `iwl-trans.c` / `iwl-trans.h` | Transport: APM power-up, NIC-access grab, the TFD command-queue ring, the RX buffer-descriptor ring + RB-status writeback, and the MMIO/PRPH/poll primitives. `iwl_is_rfkill()` reads the live HW RF-kill switch (`CSR_GP_CNTRL` bit 27). |
+| `iwl-fw.c`, `iwl-fw-file.h` | Parse the `.ucode` TLV firmware file and capture its section pointers. |
+| `iwl-fw-load.c` | DMA the parsed firmware sections to SRAM and drive INIT-ALIVE → calibration → RUNTIME-ALIVE. |
+| `iwl-hostcmd.c` | Host-command submission + RX-notification drain; TX-scheduler (SCD) setup for the command queue. |
+| `iwl-nvm.c` | Read the NVM (EEPROM or OTP, family-dependent) for the MAC address and channel list. |
+| `iwl-rxon.c` | Configure the radio's MAC receiver via a baseline RXON (the prerequisite for a scan to hear any beacons). |
+| `iwl-scan.c` | The passive scan command (`REPLY_SCAN_CMD`), harvesting beacons into `wlan_bss_t` rows. |
+| `iwl-ops.c` | The `wifi_ops` seam implementation **and** `iwl_wifi_bringup()`, the single held top-level entry. Includes firmware auto-select. |
+| `iwl-csr.h`, `iwl-devices.h`, `iwl-dvm-commands.h`, `iwl-pci.h` | The CSR/PRPH register map, the PCI device table, and the DVM command structures. |
+
+**Held for hardware.** `iwl_wifi_bringup()` is the *only* entry, and it is **never** called from any boot path. The bring-up ladder runs only when triggered post-desktop on the physical T410, via the ring-3 tool `userspace/apps/iwlup/iwlup.c` (`iwlup`), which fires the held bring-up through `SYS_NET_CONFIG`'s WLAN-bringup flag. The chain is:
+
+```
+detect card + map BAR0
+  -> iwl_trans_bringup    (APM power-up + grab NIC access + cmd/RX rings)
+  -> parse .ucode + capture sections (from the initrd)
+  -> iwl_load_ucode       (DMA sections -> INIT ALIVE -> calibration -> RUNTIME ALIVE)
+  -> iwl_read_nvm         (MAC address + channel list)
+  -> register a REAL wlan0 behind the wifi_ops seam
+```
+
+Every sub-step is bounded (iteration-capped), prints a serial marker before any risky operation, and aborts clean on failure (`iwl_wifi_bringup()` registers nothing and never panics or blocks unbounded), so a stall costs a re-run of `iwlup`, never the boot.
+
+**Firmware auto-select.** The matched PCI device ID deterministically gives the card family, so `iwl_fw_candidates()` picks that family's known DVM blob names (newest API revision first) plus a generic `/lib/firmware/iwlwifi.ucode` alias as the final fallback, and uses the first one that *parses* from the initrd. The operator drops every redistributable Intel DVM blob into `firmware/` once and `build_all` stages them all into the initrd `/lib/firmware/`; WiFi then auto-selects the right one for whatever card is actually present — no manual card identification. (`iwl_fwselect_selftest()` is a QEMU KAT that verifies the name table.)
+
+**RF-kill detection.** The hardware wireless switch (or a BIOS WLAN-disable) asserts `CSR_GP_CNTRL` bit 27. Bring-up and every scan re-check it (`iwl_is_rfkill()`); an asserted RF-kill yields zero scan results on real hardware, so each path reports it explicitly rather than surfacing a mystery "no networks".
+
+**GUI bring-up diagnostics.** Because the radio tail has no emulator and is iterated over a serial cable on the T410, the active backend maintains a diagnostics snapshot (`kernel/net/wifidiag.c`, surfaced via `SYS_WLAN_DIAG`). It captures the stage reached (`NOCARD` → `DETECTED` → `TRANS_OK` → `ALIVE` → `NVM_OK` → `REGISTERED` → `SCANNED`, or `FAILED`), the card name and family, RF-kill state, MAC, channel count, last scan count, and a human-readable status line. The Network Manager (`userspace/apps/netman`) shows this as a live **"Radio:"** line, so the user can see exactly *where* bring-up stopped without a serial console. (See `screenshots/netman_diag.png`.)
+
+**Proven vs. held.** In QEMU the boot self-tests `IWL-RXON`, `IWL-SCAN`, `IWL-FWSEL`, and `IWL-FW` report PASS (control-plane logic and the firmware parse/select). The radio-frequency tail — APM power-up, firmware ALIVE, NVM read, association, and the data plane — has no emulator and is iterated on the physical T410. The `connect`/`set_key`/data paths in `iwl-ops.c` are deliberately scaffolded with hardware TODOs (the RXON/ADD_STA/TX structs are large and family-sensitive and are not fabricated blind). **WiFi association and the data plane are the next milestone**; see `docs/T410_IWLWIFI.md`.
+
+> The supplicant (`sbin/wpasupp`: WPA2 4-way + WPA3-SAE) and the WiFi crypto KATs are documented in [Networking & Security](Networking-and-Security.md).
+
+---
+
+## Audio
+
+### Intel HD Audio (`kernel/drivers/hda.c`, `hda_stream.c`, `hda_wav.c`)
+
+A from-scratch Intel HDA controller driver. **Gated off by default** — build with `HDA_ENABLE=1` to compile in `hda_init()` at boot. The gate exists because HDA controller bring-up was observed to stall the boot path on the real T410; QEMU's emulated HDA works fine, so audio is opt-in. (Earlier this was incorrectly tied to `T410_SAFE_BOOT`; `HDA_ENABLE` is now the dedicated, default-off gate.)
+
+The driver:
+- Enumerates the HDA controller over PCI and brings up the codec.
+- Talks to the codec via the **Immediate Command Interface** (`hda_immediate_command()`): it waits for the controller to go idle, issues the verb, and reads the response. This replaced an unreliable CORB/RIRB DMA codec-comm path. Verbs are built by `hda_build_verb()` (12-bit verbs) / `hda_build_verb4()` (4-bit verbs such as `SET_AMP_GAIN_MUTE` / `SET_CONVERTER_FORMAT`), per Intel HDA §7.3.3.
+- Plays audio via a DMA stream (`hda_stream.c`), with WAV playback support in `hda_wav.c`.
+
+`hda_msleep()` follows the frozen-tick discipline: during the pre-`sti()` boot phase (no process yet) it uses the tick-independent `timer_sleep()` io-delay; in syscall context (e.g. `SYS_BEEP`) it uses a cooperative yield with a hard iteration cap so audio can never hang the caller.
+
+### Audio core + mixer syscalls (`kernel/drivers/audio/audio_core.c`, `audio_tone.c`)
+
+`audio_core.c` is a thin device-abstraction layer over HDA: it registers a default playback device (`dsp0`), exposes a `/dev/dsp` character device, and is safe to call as the sole audio entry from `kernel.c` (a clean `-1` no-op when no HDA hardware is present). The mixer/control surface is exposed to userspace via `SYS_AUDIO_*` syscalls:
+
+| Syscall | Number | Purpose |
+|---|---|---|
+| `SYS_AUDIO_VOLUME` | 118 | set output volume 0..100 (clamped) → `hda_set_volume` |
+| `SYS_AUDIO_MUTE` | 119 | set mute 0/1 → `hda_set_mute` |
+| `SYS_AUDIO_OUTPUTS` | 120 | reserved (enumerate outputs) |
+| `SYS_AUDIO_SELECT` | 121 | reserved (select active output) |
+| `SYS_AUDIO_TEST` | 122 | play a test tone (freq Hz, duration ms, capped) |
+| `SYS_AUDIO_STATUS` | 123 | fill `audio_status_t` {present, volume, muted, codec_vendor} |
+
+The graphical front-end is the **Sound Manager** app (`userspace/apps/soundman`), which drives these syscalls for volume, mute, and the test tone.
 
 ---
 
@@ -208,6 +303,7 @@ Userspace apps using this stack: `userspace/apps/tlsprobe`, `userspace/apps/netm
 - [Home](Home.md)
 - [Architecture](Architecture.md)
 - [Kernel Internals](Kernel-Internals.md)
+- [Networking & Security](Networking-and-Security.md) — TCP/IP, TLS 1.2/1.3, WPA2/WPA3 supplicant, crypto KATs
 - [Desktop & Apps](Desktop-and-Apps.md)
 - [Building & Running](Building-and-Running.md)
 - [Roadmap](../ROADMAP.md)

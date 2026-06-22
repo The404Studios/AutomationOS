@@ -41,6 +41,13 @@ if [ "${GAMETEST:-0}" = "1" ]; then
     INIT_EXTRA="$INIT_EXTRA -DGAMETEST_RUN"
     echo "*** GAMETEST build: init compiled with -DGAMETEST_RUN (spawns sbin/gametest) ***"
 fi
+# SHOWCASE=1: init auto-opens a curated set of headline GUI apps (sound manager,
+# AI cockpit, a game, the IDE) on top of the desktop, for documentation
+# screenshots. OFF by default -- a normal boot never auto-runs them.
+if [ "${SHOWCASE:-0}" = "1" ]; then
+    INIT_EXTRA="$INIT_EXTRA -DSHOWCASE"
+    echo "*** SHOWCASE build: init auto-opens headline apps for screenshots ***"
+fi
 # COCKPIT_PROOF=1: init auto-launches sbin/cockpit --proof so build_test/run_cockpit.sh can
 # verify the cockpit<->agentd seam headlessly. OFF by default -- a normal boot never auto-runs
 # the proof; the cockpit stays launchable from the dock for interactive use.

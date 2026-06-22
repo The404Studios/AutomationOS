@@ -595,6 +595,19 @@ void _start(void) {
     spawn("sbin/ide");
 #endif
 
+#ifdef SHOWCASE
+    /* SHOWCASE=1 build: open a curated set of headline GUI apps cascaded on top
+     * of the desktop, so one boot can be screendumped (+ Alt+Tab cycled) to
+     * photograph each. Normal boot leaves them launchable from the dock instead. */
+    print("[INIT] SHOWCASE: opening headline apps (soundman, cockpit, zombietd, ide)...\n");
+    spawn("sbin/soundman");
+    spawn("sbin/ide");
+    spawn("sbin/zombietd");
+    spawn("sbin/cube3d");
+    spawn("sbin/cockpit");
+    spawn("sbin/browser2"); /* SHOWCASE_TOP picks which spawns LAST (on top) */
+#endif
+
     // PID-recycling proof (#9) is launched from the reaper loop below, exactly once,
     // when prioritytest is reaped -- by then the boot self-test storm has drained
     // and the timing-sensitive probes have finished, so reaploop runs on a settled

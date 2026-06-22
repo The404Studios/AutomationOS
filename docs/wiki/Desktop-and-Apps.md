@@ -12,8 +12,11 @@ initrd by [`scripts/build_all.sh`](../../scripts/build_all.sh).
 
 The compositor is launched by `init` as `sbin/compositor`; apps are spawned from
 the dock, the Start menu, or desktop icons via `SYS_SPAWN`. The whole desktop is
-cooperative: every component yields with `SYS_YIELD` (see
+cooperative by default: every component yields with `SYS_YIELD` (gated
+preemptive `PREEMPT=1` and SMP `SMP=1` builds also exist — see
 [Kernel Internals](Kernel-Internals.md) for the scheduler model).
+
+![The AutomationOS desktop](../../screenshots/showcase.png)
 
 ---
 
@@ -113,29 +116,35 @@ drawn with a nearest-neighbor scale-about-center + alpha blit
 
 ### Top panel / taskbar
 
-`render_panel()` (compositor_m8.c:1656) draws the 28-px top bar: the focused
-window's title (or "AutomationOS") on the left, and on the right an `HH:MM:SS`
-clock derived from `SYS_GET_TICKS_MS`. Just left of the clock is a 4-bar
-**network indicator** — note this is currently **static decoration** in a neutral
-color; the source comments that the compositor has no network-status syscall
-wired in yet. The bottom **dock** (`render_dock`) hosts a launcher button (which
+`render_panel()` draws the 28-px top bar: the focused window's title (or
+"AutomationOS") on the left, and on the right an `HH:MM:SS` clock derived from
+`SYS_GET_TICKS_MS`. Just left of the clock is a **live network indicator** —
+`refresh_net_status()` (compositor_m8.c:2454) queries `SYS_NET_INFO` once per
+second (piggybacked on the clock refresh) and renders the interface IP (green
+signal bars) or "No Net" (gray); clicking the indicator spawns `sbin/netman`.
+A **battery indicator** sits alongside it: `SYS_BATTERY` is polled once/sec and
+shown as "BAT/CHG: N%" (colored by charge), present only on real laptops (absent
+on QEMU). The bottom **dock** (`render_dock`) hosts a launcher button (which
 spawns `sbin/terminal`) plus one taskbar button per window; minimized windows
 keep a button with a small accent dot.
 
 ### Right-side dock (hover-magnify + folders)
 
-The signature macOS-style strip is a 64-px vertical dock on the right edge,
-`render_right_dock()` (compositor_m8.c:2140). It lists 21 app tiles plus 2
-folders (`rdock_apps[]` / `rdock_folders[]`, compositor_m8.c:592). Each tile's
-size follows a fixed-point **magnification field**: a tile near the cursor grows
-(scale up to ~1.9× via a Q8 factor that falls off over ~110 px), smoothing toward
-its target a few units per frame. Tiles draw procedural icons from the icon
-library; hovering lightens the tile, shows a tooltip to the left, and a launch
-click triggers a leftward **bounce** animation. The two folders (**Games**,
-**Tools**) open a rainbow **fan-out** — member icons sweep out along an arc into
-the workspace, bobbing with sparkles, using a fixed-point sine table (`sin_q`).
-Any tile whose magnified rect would overflow the strip is simply not drawn (it
-stays reachable from the Start menu).
+The signature macOS-style strip is a 44-px vertical dock on the right edge
+(`RDOCK_W`), `render_right_dock()`. It lists **19** app tiles (`RDOCK_NICONS`)
+plus 2 folders (`rdock_apps[]` / `rdock_folders[]`, compositor_m8.c:901). The tile
+roster includes Terminal, Files, IDE, Browser, NetManager, Settings, Calculator,
+Clock, Editor, Snake, Tetris, 2048, Pac-Man, Clock+, **Derby 3D**, **Claude**,
+**Anthropic**, the **Agent Cockpit** (`Ck` → `sbin/cockpit`), and the **Sound
+Manager** (`Au` → `sbin/soundman`). Each tile's size follows a fixed-point
+**magnification field**: a tile near the cursor grows (scale up via a Q8 factor
+that falls off with distance), smoothing toward its target a few units per frame.
+Tiles draw procedural icons from the icon library; hovering lightens the tile,
+shows a tooltip to the left, and a launch click triggers a leftward **bounce**
+animation. The two folders (**Games**, **Tools**) open a rainbow **fan-out** —
+member icons sweep out along an arc into the workspace, bobbing with sparkles,
+using a fixed-point sine table (`sin_q`). Any tile whose magnified rect would
+overflow the strip is simply not drawn (it stays reachable from the Start menu).
 
 ### Desktop icons, Start menu, context menu
 
@@ -205,18 +214,101 @@ dock-launchable) or `/bin` (CLI tools the shell can spawn).
 | **Photos** | `apps/photos` | image viewer; links the PNG/BMP/GIF codecs |
 | **Settings** | `apps/settings` | settings panels (ui toolkit) |
 | **Task Manager** | `apps/taskman` | process list / system info |
-| **Editor / Notes / Calculator / Clock / Paint / Calendar** | `apps/*` | desktop accessories |
-| **NetManager** | `apps/netman` | network manager UI (links the DNS lib) |
+| **Editor / Notes / Calculator / Clock / Paint / Calendar / Sheet** | `apps/*` | desktop accessories (sheet = a small spreadsheet) |
+| **NetManager** | `apps/netman` | Wi-Fi / network manager UI with a live **Radio** diagnostics line (links the DNS lib) — see below |
+| **Sound Manager** | `apps/soundman` | system audio panel over the Intel HDA driver (volume / mute / test tone) — see below |
+| **Agent Cockpit** | `apps/cockpit` | the human-in-the-loop console for the on-device AI agent (`sbin/agentd`) — see below |
+
+### The AI agent rail — cockpit, agentd, gated tools
+
+![Agent cockpit](../../screenshots/cockpit.png)
+
+AutomationOS can drive *itself* under human supervision. The model lives **off
+device** (a host LLM reached over the QEMU slirp seam through a broker in
+[`scripts/`](../../scripts)); the OS side is the gated hands. Every byte the model
+emits is treated as **hostile text** and never reaches a syscall without passing
+the gates.
+
+- **`sbin/agentd`** ([`apps/agentd/agentd.c`](../../userspace/apps/agentd/agentd.c))
+  is the OS-side multi-step ReAct loop. It opens one persistent connection to the
+  broker, sends a `GOAL`, and the broker replies with `TOOL {...}` lines (call a
+  tool) or `DONE` (finished). agentd executes the tool, captures its stdout, and
+  feeds it back as a `RESULT` — bounded to `MAX_STEPS` iterations.
+- **Capability-gated typed tools.** agentd never spawns a free shell. A strict
+  whitelist (`resolve_tool`) maps tool *names* to a fixed set of tiny `sbin/tool_*`
+  programs: read-only (`tool_read` / `tool_ls` / `tool_stat` / `tool_ps`),
+  run-open-code (`tool_write` / `tool_cc` / `tool_exec`), files
+  (`tool_mkdir` / `tool_mv` / `tool_rm`), apps/system (`tool_spawn` / `tool_kill`),
+  rollback (`tool_rollback`), and synthetic input (`tool_mouse` / `tool_key`). Each
+  call also passes a path policy (`bad_path` rejects `..` traversal). A `shell`
+  tool is **deliberately omitted** — forwarding un-gated argv to `/bin` coreutils
+  would defeat the write allowlist.
+- **A tighten-only policy file.** `/etc/ai/policy.json` (`policy_load`) can add
+  tools to the deny set or the require-approval (CONFIRM) set, but the **allow bin
+  is ignored** — policy can never add a runnable tool, so `resolve_tool` stays the
+  sole whitelist.
+- **The cockpit GUI** ([`apps/cockpit/cockpit.c`](../../userspace/apps/cockpit/cockpit.c))
+  is the human in the loop. You type a **GOAL**, click **RUN** (which spawns
+  agentd), and watch the agent's steps stream into a scrolling log. The cockpit
+  owns a single shared-memory contract page (`agentcockpit.h`): it writes goal /
+  stop / grant-full / confirm; agentd writes state / step / tool / args / result.
+  Dangerous (CONFIRM-class) tools park agentd until you click **Allow** or
+  **Deny**; **STOP** halts the run; a *grant full (auto-allow)* checkbox lets a
+  trusted run proceed unattended.
+- **Tamper-evident audit + rollback.** agentd appends every decision to an
+  append-only **hash-chained ledger** (`/var/log/ai/agent.log`, FNV-1a chain,
+  verifiable with `sbin/ledgerver`), and snapshots a file before mutating it so a
+  later `rollback` can restore it.
 
 ### Games
 
-Spawned from the dock's **Games** folder and the Start menu. Snake, Tetris, 2048,
-Mines, Breakout, Pong, Invaders (space invaders), Solitaire, Chess, Asteroids,
-Sudoku, and **BubbleTD** (a tower-defense game that doubles as an IDE sample
-project). The arcade titles (breakout/pong/invaders/solitaire/chess) link the
-game-framework bundle; the rest are wl-direct.
+![A game running on the desktop](../../screenshots/game.png)
+
+Spawned from the dock's **Games** folder and the Start menu — all 15 are proven
+to spawn-and-survive by the `GAMETEST=1` harness ([`apps/gametest`](../../userspace/apps/gametest),
+25/25 covering 15 games + 10 apps):
+
+- **Arcade / action** — Snake, Tetris, 2048, Breakout, Pong, Invaders (space
+  invaders), Asteroids, Pac-Man.
+- **Puzzle / board** — Mines (minesweeper), Solitaire, Chess, Sudoku.
+- **Tower defense** — **BubbleTD** and **ZombieTD** (each also doubles as an IDE
+  sample project).
+- **Software 3D (the from-scratch `g3d` renderer, [`lib/g3d`](../../userspace/lib/g3d))** —
+  **cube3d** (spinning textured cube), **ray** (raycaster), and **Derby** (a 3D
+  demolition-derby game with an arena + AI). These link `wl + bitfont + g3d`;
+  there is no GPU — `g3d` rasterizes into the window's ARGB32 buffer.
+
+The classic arcade titles (breakout / pong / invaders / solitaire / chess) link
+the game-framework bundle; the rest are wl-direct.
+
+### NetManager — Wi-Fi with on-screen radio diagnostics
+
+![Network Manager radio diagnostics](../../screenshots/netman_diag.png)
+
+[`apps/netman`](../../userspace/apps/netman) is the network UI: a scrollable list
+of scanned Wi-Fi networks (`SYS_WLAN_SCAN` every ~3 s), a connect flow
+(`SYS_WLAN_CONNECT` + spawn `sbin/wpasupp`, with a spinner while
+`SYS_WLAN_STATUS` reports ASSOCIATING / 4-WAY), and — distinctively — a live
+**"Radio:"** diagnostics line driven by `SYS_WLAN_DIAG` (`poll_diag`). That line
+surfaces the kernel's `iwlwifi` bring-up state *on screen* (e.g. "firmware
+missing", "RF-kill ON", "wlan0 LIVE", scan results), so the real Intel radio on a
+physical ThinkPad T410 can be diagnosed without a serial cable. When no Wi-Fi
+backend is present it reads `Radio: no Wi-Fi backend (run iwlup on the T410)`. See
+[Drivers & I/O](Drivers-and-IO.md) for the driver and `sbin/iwlup`.
+
+### Sound Manager — the Intel HDA audio panel
+
+[`apps/soundman`](../../userspace/apps/soundman) is a small system-audio panel
+over the Intel HDA driver (built with `HDA_ENABLE=1`). It drives the `SYS_AUDIO_*`
+mixer syscalls: a Volume slider, an animated Mute toggle, a Test-Tone button
+(440 Hz), and a status line refreshed each tick from `SYS_AUDIO_STATUS`
+("Codec: present | Vol: N% | Mute: on/off | vendor 0x…", or "No audio device" on
+an audioless boot). It opens already in sync with the kernel's reported volume
+and mute state.
 
 ### Browser2 — a from-scratch web stack
+
+![Browser2 rendering a page](../../screenshots/browser.png)
 
 `browser2` is the flagship app. It links the whole web pipeline as separate
 freestanding libraries:
@@ -232,8 +324,13 @@ freestanding libraries:
   `<script>` tags.
 - **TLS / HTTPS** — a real crypto + TLS stack ([`lib/crypto`](../../userspace/lib/crypto),
   [`lib/tls`](../../userspace/lib/tls), [`lib/net`](../../userspace/lib/net)):
-  SHA/HMAC/AES/RSA/ChaCha20-Poly1305/X25519/P-256, ASN.1/X.509 verification with
-  a CA bundle, DNS, and HTTP(S). So `browser2` can fetch `https://` URLs.
+  SHA/HMAC/AES/RSA/ChaCha20-Poly1305/X25519/P-256/P-384, ASN.1/X.509, DNS, and
+  HTTP(S). The stack speaks both **TLS 1.2 and TLS 1.3** (RFC 8446; TLS 1.3 is
+  offered with `TLS13=1`, known-answer-proven against RFC 8448 in
+  [`lib/tls/tls13_*.c`](../../userspace/lib/tls)) with ECDHE key exchange and
+  RSA-PSS / ECDSA CertificateVerify. **Certificate trust is real** — the chain is
+  validated against a CA bundle (`x509_verify_chain`), so `browser2` can fetch
+  `https://` URLs with authenticated certificates.
 
 Each web layer also ships a boot-time self-test (`domtest`, `htmltest`,
 `csstest`, `layouttest`, `webtest`, `webapitest`) that prints PASS/FAIL.
@@ -264,12 +361,19 @@ int/pointer types (char/_Bool are 1 byte), globals + locals, functions of ≤6
 params, `if`/`while`/`for`, the usual operators incl. recursion, string literals,
 arrays, pointers, struct member layout, and `sys_write` / `sys_exit` builtins
 that emit `syscall`. Output ELFs carry their own `_start` trampoline, so compiled
-programs are self-contained (they don't need `crt0`).
+programs are self-contained (they don't need `crt0`). This is a deliberate,
+**careful subset — not full C11**: there are no floating-point types, no
+`switch`, and compilation is single-file. Programs that need floats (or any of the
+omitted constructs) are built with the WSL host toolchain instead.
 
 ### The IDE — an on-device forge
 
+![The IDE Semantic LEGO Map](../../screenshots/ide.png)
+
 [`userspace/apps/ide/ide.c`](../../userspace/apps/ide) is an editor plus the
-"Semantic LEGO Map" code visualizer, backed by ~30 toolchain objects
+"Semantic LEGO Map" code visualizer (the code rendered as a navigable blueprint
+map — built for thinking about a program spatially), backed by ~30 toolchain
+objects
 (`ide_lex` → `ide_parser` → `cc_codegen` → `as_x64` → `elf_write`; see the
 `IDE_SRCS` list in build_all.sh:322). Key bindings (ide.c:47):
 
@@ -282,8 +386,13 @@ programs are self-contained (they don't need `crt0`).
 - **Ctrl+S** save, **Ctrl+E** toggle editor / LEGO-map workspace,
   **Ctrl+`** focus the embedded terminal.
 
-Because the compositor periodically rescans `/Desktop`, a program compiled in the
-IDE can appear as a desktop icon and be launched without a restart.
+![The IDE editor view](../../screenshots/ide_editor.png)
+
+The build/run chain is wired to the on-device C compiler ([`apps/cc`](../../userspace/apps/cc),
+the same toolchain objects the IDE links), so the machine compiles its own
+programs. Because the compositor periodically rescans `/Desktop`, a program
+compiled in the IDE can appear as a desktop icon and be launched without a
+restart.
 
 ---
 

@@ -8,6 +8,8 @@ like everything else), wired together into a real rendering pipeline that fetche
 pages over the OS's own HTTP/HTTPS stack and paints them into a compositor
 window.
 
+![browser2 rendering a page](../../screenshots/browser.png)
+
 This page documents the engine internals. For the network and TLS plumbing the
 browser sits on, see [Networking & Security](Networking-and-Security.md); for
 the compositor window it draws into and the rest of the app suite, see
@@ -215,9 +217,42 @@ after every `js_new()`.
 The `fetch`/XHR module is what ties JavaScript to the network stack: it resolves
 the host via `dns_resolve()` and calls the same `http_get` / `https_get`
 (`https://` → TLS) used elsewhere, so a page's scripts can hit `https://` URLs
-through the OS's own TLS 1.2 client. (See
-[Networking & Security](Networking-and-Security.md) for the crypto/TLS details
-and the encrypted-but-unauthenticated trust caveat.)
+through the OS's own TLS client — which now offers **TLS 1.2 *and* TLS 1.3**
+(RFC 8446) and **authenticates the server certificate** (see below). (See
+[Networking & Security](Networking-and-Security.md) for the crypto/TLS details.)
+
+---
+
+## Networking & security (TLS 1.2 / 1.3, real certificate trust)
+
+The browser fetches every `https://` page and subresource through the OS's own
+hand-rolled stack — there is no system curl or libcurl underneath. `browser2.c`
+calls `https_get` (and `https_get_range`) from `userspace/lib/net/http.c`, which
+sits on the from-scratch TLS client in `userspace/lib/tls/tls.c`. Two facts that
+were *not* true in earlier docs are now true:
+
+- **TLS 1.2 *and* TLS 1.3.** The client offers TLS 1.2 (ECDHE + AEAD) by
+  default and additionally offers **TLS 1.3** (RFC 8446) when built with
+  `TLS13=1` (`-DTLS13_CLIENT`). The 1.3 handshake — key schedule, record layer,
+  and CertificateVerify — lives in `userspace/lib/tls/tls13_keysched.c`,
+  `tls13_record.c`, `tls13_handshake.c`, and `tls13_certverify.c`, and is
+  known-answer-proven against the RFC 8448 test vectors. Key exchange is ECDHE
+  over X25519 and P-256 (P-384 also implemented); server signatures verify both
+  RSA-PSS and ECDSA.
+- **The certificate chain is actually authenticated.** TLS links in the
+  `x509_verify_chain()` validator (`userspace/lib/tls/x509_verify.c`), which
+  walks the presented chain up to the bundled trust roots
+  (`userspace/lib/tls/ca_bundle.c`) and validates names, validity dates (against
+  the RTC via `SYS_GETTIME`), and signatures. A connection whose chain does not
+  verify is **rejected**, not silently accepted. This closes the old
+  "encrypted-but-unauthenticated" caveat: pages now load over a connection that
+  is both confidential **and** authenticated, so the browser is talking to the
+  real host, not just *a* host with a key.
+
+The same path backs the JS `fetch`/`XMLHttpRequest` module, so scripts inherit
+the same TLS 1.2/1.3 + cert-trust guarantees as the top-level page load. See
+[Networking & Security](Networking-and-Security.md) for the full crypto, X.509,
+and CA-bundle details.
 
 ---
 

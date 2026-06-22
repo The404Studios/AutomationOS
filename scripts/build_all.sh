@@ -778,23 +778,26 @@ mkdir -p /tmp/ird/etc && printf 'TOOLSET-0-FILE\n' > /tmp/ird/etc/toolset0.txt
 # AGENT-POLICY (C1): seed the canonical agent safety policy so aibroker loads it
 # instead of falling back to built-in defaults (the auditable source of truth).
 mkdir -p /tmp/ird/etc/ai && cp etc/ai/policy.json /tmp/ird/etc/ai/policy.json
-# IWL-FW firmware: the real iwlwifi driver loads iwlwifi-<fam>-*.ucode from the
-# initrd at /lib/firmware/ (iwl_fw_load_from_initrd). The blob is a redistributable
-# Intel vendor file the USER drops into firmware/ (it is NOT in the repo -- see
-# docs/T410_IWLWIFI.md). Stage the dir always; copy any blobs the user provided.
-# No blob -> the driver prints a clean "no firmware" and aborts the bring-up.
+# IWL-FW firmware: the real iwlwifi driver AUTO-SELECTS iwlwifi-<fam>-<api>.ucode
+# from the initrd /lib/firmware/ by the detected card family (iwl-ops.c
+# iwl_fw_candidates). The blobs are redistributable Intel vendor files the USER
+# drops into firmware/ (NOT in the repo -- see docs/T410_IWLWIFI.md). BUNDLE-ALL:
+# drop the whole set of DVM blobs (iwlwifi-1000-5 / -5000-5 / -6000-4 /
+# -6000g2a-6 .ucode) and WiFi auto-picks the right one for whatever T410 card is
+# present -- no manual card identification. We stage ALL of them with their real
+# names; the alias is just a final fallback for a single-blob drop.
 mkdir -p /tmp/ird/lib/firmware
 if ls firmware/iwlwifi*.ucode >/dev/null 2>&1; then
   cp firmware/iwlwifi*.ucode /tmp/ird/lib/firmware/ 2>/dev/null
-  # The driver (iwl-ops.c) loads the stable alias /lib/firmware/iwlwifi.ucode.
-  # If the user only dropped versioned blob(s), alias the first to that name.
+  # Back-compat: if the user dropped exactly one versioned blob and no alias,
+  # alias the first to the generic name (the driver tries it last anyway).
   if [ ! -f /tmp/ird/lib/firmware/iwlwifi.ucode ]; then
     FIRST_FW=$(ls firmware/iwlwifi*.ucode 2>/dev/null | head -1)
     [ -n "$FIRST_FW" ] && cp "$FIRST_FW" /tmp/ird/lib/firmware/iwlwifi.ucode
   fi
-  echo "IWL-FW: staged firmware into initrd /lib/firmware/ ($(ls -1 /tmp/ird/lib/firmware/ 2>/dev/null | tr '\n' ' '))"
+  echo "IWL-FW: staged firmware into initrd /lib/firmware/ -- driver auto-selects by family ($(ls -1 /tmp/ird/lib/firmware/ 2>/dev/null | tr '\n' ' '))"
 else
-  echo "IWL-FW: no firmware/iwlwifi*.ucode provided (real-radio bring-up reports missing firmware; QEMU/sim unaffected)"
+  echo "IWL-FW: no firmware/iwlwifi*.ucode provided (bundle the DVM blobs in firmware/ for real-radio auto-select; QEMU/sim unaffected)"
 fi
 # BROWSER2-IMG-0 fixtures: deterministic PNG/GIF/BMP (+ a wider-than-viewport
 # big.png) for the about:imgtest acceptance page; missing.png stays missing.

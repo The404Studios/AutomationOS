@@ -244,6 +244,48 @@ static int iwl_netif_rx_poll(void* buf, uint16_t cap) {
 }
 
 /* ====================================================================== *
+ *  Firmware AUTO-SELECT. The PCI device id deterministically gives the card's
+ *  family (iwl-devices.h), so we do NOT blindly try to ALIVE every blob -- we
+ *  pick the family and try its known API revisions HIGH->LOW, using the first
+ *  that PARSES (a safe, no-hardware check). The operator drops all the
+ *  redistributable Intel DVM blobs (linux-firmware) into firmware/ once;
+ *  build_all stages them all into the initrd /lib/firmware/ with their real
+ *  names, so WiFi auto-selects the right one for WHATEVER T410 card is present
+ *  -- no manual card identification. The generic alias is the final fallback.
+ *  Returns the number of candidate paths written to out[] (highest API first).
+ * ====================================================================== */
+static int iwl_fw_candidates(int family, const char* out[], int max) {
+    /* Known DVM filenames per family (linux-firmware), newest API first. */
+    static const char* c1000[]   = { "/lib/firmware/iwlwifi-1000-5.ucode",
+                                     "/lib/firmware/iwlwifi-1000-3.ucode" };
+    static const char* c5000[]   = { "/lib/firmware/iwlwifi-5000-5.ucode",
+                                     "/lib/firmware/iwlwifi-5000-2.ucode",
+                                     "/lib/firmware/iwlwifi-5000-1.ucode" };
+    static const char* c6000[]   = { "/lib/firmware/iwlwifi-6000-4.ucode" };
+    static const char* c6000g2[] = { "/lib/firmware/iwlwifi-6000g2a-6.ucode",
+                                     "/lib/firmware/iwlwifi-6000g2a-5.ucode" };
+    const char** src; int n;
+    switch (family) {
+        case IWL_FAM_1000:   src = c1000;   n = 2; break;
+        case IWL_FAM_5000:   src = c5000;   n = 3; break;
+        case IWL_FAM_6000G2: src = c6000g2; n = 2; break;
+        case IWL_FAM_6000:   default: src = c6000; n = 1; break;
+    }
+    int k = 0;
+    for (; k < n && k < max; k++) out[k] = src[k];
+    /* generic stable alias as the final fallback (back-compat single-blob drop) */
+    if (k < max) out[k++] = "/lib/firmware/iwlwifi.ucode";
+    return k;
+}
+
+/* short basename of a /lib/firmware/<name> path, for diagnostics. */
+static const char* iwl_fw_basename(const char* p) {
+    const char* b = p;
+    for (const char* s = p; *s; s++) if (*s == '/') b = s + 1;
+    return b;
+}
+
+/* ====================================================================== *
  *  iwl_wifi_bringup -- THE HELD TOP-LEVEL ENTRY.
  *  Called ONLY by the future post-desktop trigger on the real T410 (a separate
  *  parent brick), NEVER from boot. Chain:
@@ -332,17 +374,32 @@ void iwl_wifi_bringup(void) {
      * The firmware file name follows the family (iwlwifi-<fam>-N.ucode). We try
      * a family-named path; absent firmware fails cleanly (no radio, no crash). */
     struct iwl_fw fw_meta;
-    /* Build the conventional path. We keep it simple: the operator drops the
-     * matching ucode at /lib/firmware/iwlwifi.ucode (a stable alias). The real
-     * driver tries versioned names; the alias keeps this brick firmware-agnostic.
-     * HARDWARE-VALIDATION: the versioned name probe is a refinement. */
-    const char* fw_path = "/lib/firmware/iwlwifi.ucode";
-    if (iwl_fw_load_from_initrd(fw_path, &fw_meta) != 0) {
-        kprintf("IWLWIFI: firmware %s not available -- abort "
-                "(provide iwlwifi-%s-*.ucode)\n", fw_path, fwfam);
+    /* AUTO-SELECT the firmware for the detected family: try the family's known
+     * API revisions (newest first), then the generic alias, and use the first
+     * one that PARSES from the initrd. This lets the operator bundle every DVM
+     * blob once and have WiFi pick the right one for the card actually present. */
+    const char* cands[6];
+    int ncand = iwl_fw_candidates(g_trans.family, cands, 6);
+    const char* fw_path = (const char*)0;
+    for (int i = 0; i < ncand; i++) {
+        kprintf("IWLWIFI: try firmware %s ...\n", cands[i]);
+        if (iwl_fw_load_from_initrd(cands[i], &fw_meta) == 0) { fw_path = cands[i]; break; }
+    }
+    if (!fw_path) {
+        kprintf("IWLWIFI: no usable firmware in initrd for family iwlwifi-%s "
+                "(tried %d candidates) -- abort\n", fwfam, ncand);
         wifi_diag_stage(UAPI_WLAN_STAGE_FAILED);
-        wifi_diag_msg("firmware MISSING -- drop iwlwifi-<family>.ucode in firmware/");
+        wifi_diag_msg("firmware MISSING -- drop iwlwifi-<family>-*.ucode in firmware/");
         return;
+    }
+    kprintf("IWLWIFI: using firmware %s\n", fw_path);
+    {
+        char m[64]; int l = 0;
+        const char* pre = "using firmware "; const char* bn = iwl_fw_basename(fw_path);
+        for (const char* s = pre; *s && l < 63; s++) m[l++] = *s;
+        for (const char* s = bn;  *s && l < 63; s++) m[l++] = *s;
+        m[l] = '\0';
+        wifi_diag_msg(m);
     }
 
     /* Re-walk the SAME file bytes to capture section pointers for the DMA load. */
@@ -412,4 +469,36 @@ void iwl_wifi_bringup(void) {
         kprintf("IWLWIFI: wlan0 register FAILED "
                 "(name clash? ensure wifisim is NOT compiled in) -- radio NOT live\n");
     }
+}
+
+/* ====================================================================== *
+ *  iwl_fwselect_selftest -- KAT for the firmware AUTO-SELECT name table (QEMU,
+ *  no radio). Verifies each family maps to the right newest-API blob first and
+ *  that the generic alias is the final fallback. Returns 0 PASS / -1 FAIL.
+ * ====================================================================== */
+static int fw_streq(const char* a, const char* b) {
+    int i = 0; for (; a[i] && b[i]; i++) if (a[i] != b[i]) return 0;
+    return a[i] == b[i];
+}
+int iwl_fwselect_selftest(void) {
+    int ok = 1;
+    const char* c[6];
+    int n;
+
+    n = iwl_fw_candidates(IWL_FAM_6000, c, 6);
+    if (n < 2 || !fw_streq(c[0], "/lib/firmware/iwlwifi-6000-4.ucode")) ok = 0;
+    if (!fw_streq(c[n - 1], "/lib/firmware/iwlwifi.ucode")) ok = 0;   /* alias last */
+
+    n = iwl_fw_candidates(IWL_FAM_5000, c, 6);
+    if (n < 1 || !fw_streq(c[0], "/lib/firmware/iwlwifi-5000-5.ucode")) ok = 0;
+
+    n = iwl_fw_candidates(IWL_FAM_1000, c, 6);
+    if (n < 1 || !fw_streq(c[0], "/lib/firmware/iwlwifi-1000-5.ucode")) ok = 0;
+
+    n = iwl_fw_candidates(IWL_FAM_6000G2, c, 6);
+    if (n < 1 || !fw_streq(c[0], "/lib/firmware/iwlwifi-6000g2a-6.ucode")) ok = 0;
+
+    kprintf("IWL-FWSEL: selftest %s (6000->%s, alias-fallback ok)\n",
+            ok ? "PASS" : "FAIL", "iwlwifi-6000-4.ucode");
+    return ok ? 0 : -1;
 }

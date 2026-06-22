@@ -1097,6 +1097,11 @@ void kernel_main(void* raw_info) {
     iwl_rxon_selftest();
     extern int iwl_scan_selftest(void);
     iwl_scan_selftest();
+    // IWL firmware AUTO-SELECT KAT: the card's PCI id -> family -> the matching
+    // iwlwifi-<fam>-<api>.ucode is picked (newest API first, alias fallback), so
+    // the operator can bundle ALL DVM blobs and WiFi auto-selects per card.
+    extern int iwl_fwselect_selftest(void);
+    iwl_fwselect_selftest();
 #endif
 
 #ifdef NET_SELFTEST

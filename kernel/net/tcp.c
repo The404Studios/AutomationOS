@@ -142,6 +142,9 @@ static void tcp_ooo_clear(int idx) {
  */
 static uint8_t  tcp_rt_count[TCP_OOO_SLOTS];   /* retransmit attempt count */
 static uint32_t tcp_rt_rto_ms[TCP_OOO_SLOTS];  /* current RTO for backoff  */
+/* TCP-ROBUST (RFC 5681 fast retransmit): consecutive duplicate-ACK count per
+ * socket. Reset on every fresh arm/disarm and whenever snd_una advances. */
+static uint8_t  tcp_dupack[TCP_OOO_SLOTS];
 
 /*
  * Resolve a sock_t* to its stable slot index by scanning the socket
@@ -234,6 +237,7 @@ static void tcp_arm_retransmit(sock_t* s, uint8_t flags, uint32_t seq,
     if (s->rt_len && data) memcpy(s->rt_data, data, s->rt_len);
     tcp_rt_count[idx] = 0;
     tcp_rt_rto_ms[idx] = TCP_RTO_INIT_MS;
+    tcp_dupack[idx] = 0;
 }
 
 /* Clear the retransmit machinery for this socket. */
@@ -243,11 +247,26 @@ static void tcp_disarm_retransmit(sock_t* s) {
     s->rt_done          = false;
     tcp_rt_count[idx]   = 0;
     tcp_rt_rto_ms[idx]  = TCP_RTO_INIT_MS;
+    tcp_dupack[idx]     = 0;
 }
 
 /* Send a pure ACK for the current rcv_nxt (no retransmit tracking). */
 static void tcp_send_ack(sock_t* s) {
     tcp_xmit(s, TCP_ACK, s->snd_nxt, s->rcv_nxt, NULL, 0);
+}
+
+/*
+ * TCP-ROBUST (RFC 5681 fast retransmit): resend the oldest unacked segment
+ * IMMEDIATELY on the 3rd duplicate ACK, instead of waiting a full RTO. Resets
+ * the RTO clock so the timer does not also fire right after. Does not touch the
+ * back-off count (that stays owned by tcp_tick).
+ */
+static void tcp_fast_retransmit(sock_t* s) {
+    if (!s->rt_pending) return;
+    uint32_t ack_val = (s->state == TCP_SYN_SENT) ? 0 : s->rcv_nxt;
+    tcp_xmit(s, s->rt_flags, s->rt_seq, ack_val,
+             s->rt_len ? s->rt_data : NULL, s->rt_len);
+    s->rt_time_ms = now_ms();
 }
 
 /* ------------------------------------------------------------------ */
@@ -908,17 +927,30 @@ void tcp_input(uint32_t src_ip, uint32_t dst_ip,
          * CHANGED: SEQ32_GEQ for wraparound; also update snd_una.
          * ---------------------------------------------------------- */
         if (flags & TCP_ACK) {
+            int idx = sock_index(s);
             if (s->rt_pending) {
                 uint32_t end = s->rt_seq + s->rt_len +
                                ((s->rt_flags & (TCP_SYN | TCP_FIN)) ? 1u : 0u);
                 if (SEQ32_GEQ(ack, end)) {
-                    tcp_disarm_retransmit(s);
+                    tcp_disarm_retransmit(s);   /* also resets tcp_dupack[idx] */
                     s->snd_una = ack;
+                } else if (ack == s->snd_una && payload_len == 0 &&
+                           (flags & (TCP_SYN | TCP_FIN)) == 0 &&
+                           s->state == TCP_ESTABLISHED) {
+                    /* TCP-ROBUST (RFC 5681 fast retransmit): a duplicate ACK
+                     * does not advance snd_una and carries no data. The 3rd one
+                     * means a segment was almost certainly lost -> resend the
+                     * oldest unacked segment NOW (~RTT recovery vs a full RTO).
+                     * Fires exactly once at 3 (== not >=), so later dups don't
+                     * re-storm the wire. */
+                    if (++tcp_dupack[idx] == 3) {
+                        tcp_fast_retransmit(s);
+                    }
                 }
             } else {
                 /* Update snd_una even if no retransmit is pending (covers
                  * cumulative ACKs for previously delivered segments). */
-                if (SEQ32_GT(ack, s->snd_una)) s->snd_una = ack;
+                if (SEQ32_GT(ack, s->snd_una)) { s->snd_una = ack; tcp_dupack[idx] = 0; }
             }
             if (s->state == TCP_FIN_WAIT && SEQ32_GEQ(ack, s->snd_nxt)) {
                 s->state = TCP_TIME_WAIT;   /* our FIN acked */

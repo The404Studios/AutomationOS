@@ -575,6 +575,73 @@ void net_testrig_selftest(void) {
                 tcp_good, tcp_drop, ip_drop, ip_good);
     }
 
+    /* ---------------------------------------------------------------- */
+    /* TCP-ROBUST NETP1K: fast retransmit (RFC 5681). With one segment    */
+    /* outstanding, 3 duplicate ACKs must IMMEDIATELY resend it -- not     */
+    /* wait for the RTO. The rig never calls sock_poll(), so tcp_tick()    */
+    /* (the RTO timer) can NEVER fire here: any captured retransmit is     */
+    /* provably the fast path. The "one unacked segment" precondition is   */
+    /* set on the child directly (tcp_send's blocking final-drain loop     */
+    /* makes it unusable inside the boot rig).                             */
+    /* ---------------------------------------------------------------- */
+    {
+        int armed = 0, no_early = 0, fast_rtx = 0, seq_ok = 0, data_ok = 0;
+        int fd = -1;
+        int l = sock_socket(SOCK_STREAM);
+        if (l >= 0 && sock_bind(l, 47012) == 0 && sock_listen(l, 2) == 0) {
+            g_cap_n = 0;
+            rig_inject_tcp(peer_ip, 43001, my_ip, 47012,
+                           11000, 0, TCP_SYN, 4096, NULL, 0);
+            if (g_cap_n >= 1) {
+                const tcp_hdr_t* th = (const tcp_hdr_t*)g_cap[0].seg;
+                uint32_t isn = net_ntohl(th->seq);
+                rig_inject_tcp(peer_ip, 43001, my_ip, 47012,
+                               11001, isn + 1, TCP_ACK, 4096, NULL, 0);
+                fd = sock_accept(l);
+            }
+        }
+        if (fd >= 0) {
+            sock_t* base = sock_table_base();
+            sock_t* c = base ? &base[fd] : (sock_t*)0;
+            if (c && c->state == TCP_ESTABLISHED) {
+                uint32_t S   = c->snd_nxt;     /* seq of the outstanding seg  */
+                uint32_t una = c->snd_una;     /* dup-ACKs must equal this    */
+                c->rt_pending = true;
+                c->rt_done    = false;
+                c->rt_seq     = S;
+                c->rt_flags   = TCP_ACK | TCP_PSH;
+                c->rt_len     = 8;
+                memcpy(c->rt_data, "FASTRTX!", 8);
+                c->snd_nxt    = S + 8;
+                armed = 1;
+
+                g_cap_n = 0;
+                rig_inject_tcp(peer_ip, 43001, my_ip, 47012,
+                               11001, una, TCP_ACK, 4096, NULL, 0);   /* dup 1 */
+                rig_inject_tcp(peer_ip, 43001, my_ip, 47012,
+                               11001, una, TCP_ACK, 4096, NULL, 0);   /* dup 2 */
+                no_early = (g_cap_n == 0) ? 1 : 0;
+                rig_inject_tcp(peer_ip, 43001, my_ip, 47012,
+                               11001, una, TCP_ACK, 4096, NULL, 0);   /* dup 3 -> fast rtx */
+                fast_rtx = (g_cap_n == 1) ? 1 : 0;
+                if (g_cap_n >= 1) {
+                    const rig_cap_t* cap = &g_cap[0];
+                    const tcp_hdr_t* th = (const tcp_hdr_t*)cap->seg;
+                    uint8_t ihl = (uint8_t)((th->data_off >> 4) * 4);
+                    seq_ok  = (cap->proto == IPPROTO_TCP &&
+                               cap->dst_ip == peer_ip &&
+                               net_ntohl(th->seq) == S) ? 1 : 0;
+                    data_ok = (cap->seg_len >= (uint16_t)(ihl + 8) &&
+                               memcmp(cap->seg + ihl, "FASTRTX!", 8) == 0) ? 1 : 0;
+                }
+            }
+        }
+        sock_init();
+        kprintf("NETP1K: FASTRTX %s armed=%d no_early=%d fast_rtx=%d seq_ok=%d data_ok=%d\n",
+                (armed && no_early && fast_rtx && seq_ok && data_ok) ? "PASS" : "FAIL",
+                armed, no_early, fast_rtx, seq_ok, data_ok);
+    }
+
     g_rig_active = 0;
 }
 

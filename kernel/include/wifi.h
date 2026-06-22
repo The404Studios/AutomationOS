@@ -84,5 +84,21 @@ int64_t sys_wlan_connect(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint6
 int64_t sys_wlan_status(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t);
 int64_t sys_wlan_disconnect(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t);
 int64_t sys_wlan_set_key(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t);
+int64_t sys_wlan_diag(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t);
+
+/* WIFI DIAGNOSTICS store (kernel/net/wifidiag.c). The active wifi backend
+ * (wifisim OR the real iwlwifi driver) updates this as bring-up/scan proceeds;
+ * SYS_WLAN_DIAG copies a snapshot to the Network Manager so the user can see
+ * WHERE radio bring-up stopped on real hardware -- without a serial cable.
+ * `family` uses the UAPI_WLAN_FAM_* values (== enum iwl_family). */
+void wifi_diag_reset(void);
+void wifi_diag_card(const char* name, int family, int present);
+void wifi_diag_rfkill(int killed);
+void wifi_diag_stage(int stage);                 /* UAPI_WLAN_STAGE_* */
+void wifi_diag_mac(const uint8_t* mac6, int n_channels);
+void wifi_diag_alive(int alive);
+void wifi_diag_scan(int bss_count);
+void wifi_diag_msg(const char* s);
+void wifi_diag_get(void* out_uapi_wlan_diag);    /* fills a uapi_wlan_diag_t */
 
 #endif /* WIFI_H */

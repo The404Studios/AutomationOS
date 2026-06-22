@@ -127,6 +127,7 @@
 #define SYS_WLAN_STATUS     115 // association state (uapi_wlan_status_t)
 #define SYS_WLAN_DISCONNECT 116 // disconnect
 #define SYS_WLAN_SET_KEY    117 // supplicant installs PTK/GTK (uapi_wlan_setkey_t)
+#define SYS_WLAN_DIAG       118 // radio bring-up diagnostics (uapi_wlan_diag_t)
 // ---- Audio mixer surface (AUDIO-SYS) -- HDA volume / mute / test-tone / status.
 // Numbers 118-123 were FREE (113-117 went to WiFi, 200 to VMA test). Handlers in
 // syscall.c dispatch to hda_set_volume / hda_set_mute / audio_play_tone. The

@@ -551,6 +551,7 @@ compile kernel/net/netsyscall.c              c_netsyscall
 # WIFI-SYS: the SYS_WLAN_* control-plane syscalls (always compiled; they return
 # ENOTSUP when no wifi interface is registered).
 compile kernel/net/wlansyscall.c             c_wlansyscall
+compile kernel/net/wifidiag.c                c_wifidiag
 # WIFI-SIM: the simulated wlan0 backend (only under -DWIFI_SIM).
 if [ "${WIFI_SIM:-0}" = "1" ]; then
     compile kernel/drivers/net/wireless/sim/wifisim.c  c_wifisim

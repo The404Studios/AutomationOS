@@ -58,6 +58,7 @@
 #define SYS_WLAN_SCAN   113  /* sc(113, &bss[], max) -> count                */
 #define SYS_WLAN_CONNECT 114 /* sc(114, &uapi_wlan_connect_t) -> 0/err       */
 #define SYS_WLAN_STATUS 115  /* sc(115, &uapi_wlan_status_t) -> 0/err        */
+#define SYS_WLAN_DIAG   118  /* sc(118, &uapi_wlan_diag_t) -> 0/err          */
 
 /*
  * 6-arg raw inline syscall wrapper.
@@ -205,6 +206,7 @@ static ui_widget_t *g_mac_label  = 0;
 static ui_widget_t *g_ip_label   = 0;
 static ui_widget_t *g_gw_label   = 0;
 static ui_widget_t *g_wifi_toggle = 0;
+static ui_widget_t *g_diag_label = 0;   /* radio bring-up diagnostics (no serial) */
 
 /* Network list (scroll view) + per-row widgets. */
 static ui_widget_t *g_list       = 0;   /* ui_scroll viewport            */
@@ -613,6 +615,43 @@ static void build_rows(int count)
 }
 
 /* -----------------------------------------------------------------------
+ * Radio bring-up diagnostics (SYS_WLAN_DIAG=118). Surfaces the kernel IWL*
+ * bring-up state ON-SCREEN so the user can see WHERE the radio stopped on the
+ * real T410 -- no serial cable needed. Updated every tick.
+ * --------------------------------------------------------------------- */
+static void poll_diag(void)
+{
+    if (!g_diag_label) return;
+
+    uapi_wlan_diag_t d;
+    for (unsigned i = 0; i < sizeof(d); i++) ((unsigned char *)&d)[i] = 0;
+    long r = sc(SYS_WLAN_DIAG, (long)&d, 0, 0, 0, 0);
+    if (r != 0 || !d.present) {
+        ui_label_set_text(g_diag_label, "Radio: no Wi-Fi backend (run iwlup on the T410)");
+        return;
+    }
+
+    /* "Radio: <card> -- <msg> (nets=N)". d.msg is the actionable line the kernel
+     * set (firmware missing / RF-kill ON / wlan0 LIVE / scan complete ...). */
+    char line[180];
+    int  l = 0;
+    line[0] = '\0';
+    l = str_append(line, l, "Radio: ");
+    l = str_append(line, l, d.card[0] ? d.card : "Wi-Fi");
+    if (d.msg[0]) {
+        l = str_append(line, l, " -- ");
+        l = str_append(line, l, d.msg);
+    }
+    if (d.last_scan_bss >= 0) {
+        l = str_append(line, l, "  (nets=");
+        l = append_int(line, l, (int)d.last_scan_bss);
+        l = str_append(line, l, ")");
+    }
+    line[l] = '\0';
+    ui_label_set_text(g_diag_label, line);
+}
+
+/* -----------------------------------------------------------------------
  * Run a WiFi scan and refresh the list. Called every ~3s from the tick.
  * --------------------------------------------------------------------- */
 static void do_scan(void)
@@ -695,6 +734,7 @@ static void tick_cb(void *ud)
         if (g_frames == 0 || (g_frames % 180) == 0) do_scan();
         poll_wlan_status();
     }
+    poll_diag();   /* keep the radio bring-up diagnostics line live (always) */
     g_frames++;
 }
 
@@ -778,6 +818,11 @@ void _start(void)
 
     /* Scrollable network list. content_h allows up to MAX_NETS rows. */
     g_list = ui_scroll(root, 16, 148, 388, 200, COL_FIELD, MAX_NETS * 36 + 8);
+
+    /* Radio bring-up diagnostics line: shows the kernel IWL* bring-up state
+     * (detected / firmware alive / RF-kill / scanned / FAILED + reason) so the
+     * user can diagnose the real T410 radio on-screen, no serial cable. */
+    g_diag_label = ui_label(root, 16, 356, "Radio: ...", COL_DIM);
 
     /* DNS lookup row at the bottom. */
     g_dns_input  = ui_textbox(root, 16, 410, 200, 63);

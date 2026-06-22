@@ -16,6 +16,7 @@
  */
 #include "netif.h"
 #include "wifi.h"
+#include "uapi/wlan.h"   /* UAPI_WLAN_STAGE_* for the GUI diagnostics */
 #include "kernel.h"   /* kprintf */
 #include "string.h"   /* memset / memcpy */
 
@@ -45,7 +46,14 @@ static int sim_strlen(const char* s) { int n = 0; while (s[n]) n++; return n; }
 /* ---- wifi_ops implementation -------------------------------------------- */
 
 static int sim_scan_start(struct netif* nif) {
-    (void)nif; g_sim_state = WLAN_SCANNING; return 0;
+    (void)nif; g_sim_state = WLAN_SCANNING;
+    /* Populate the GUI diagnostics so the Network Manager's radio panel works in
+     * QEMU exactly as it will on the T410 (where the real iwlwifi driver fills
+     * the same snapshot). The sim is a registered, "alive" radio with no RF-kill. */
+    wifi_diag_card("Simulated WiFi (QEMU)", UAPI_WLAN_FAM_UNKNOWN, 1);
+    wifi_diag_rfkill(0);
+    wifi_diag_stage(UAPI_WLAN_STAGE_REGISTERED);
+    return 0;
 }
 
 static int sim_scan_results(struct netif* nif, wlan_bss_t* out, int max) {
@@ -65,6 +73,9 @@ static int sim_scan_results(struct netif* nif, wlan_bss_t* out, int max) {
         out[i].capability = 0;
     }
     if (g_sim_state == WLAN_SCANNING) g_sim_state = WLAN_DOWN;   /* scan done */
+    wifi_diag_scan(n);
+    wifi_diag_stage(UAPI_WLAN_STAGE_SCANNED);
+    wifi_diag_msg("scan complete (simulated)");
     kprintf("WIFISIM: scan -> %d APs\n", n);
     return n;
 }

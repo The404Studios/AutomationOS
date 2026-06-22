@@ -110,4 +110,47 @@ _Static_assert(sizeof(uapi_wlan_setkey_t) == WLAN_SETKEY_ABI_SIZE,
 
 /* SYS_WLAN_DISCONNECT (116) takes no payload. */
 
+/* -------------------------------------------------------------------
+ * SYS_WLAN_DIAG (118): radio bring-up diagnostics for the GUI. Lets the
+ * Network Manager show WHERE bring-up stopped on real hardware WITHOUT a
+ * serial cable -- the kernel IWL* markers distilled into a snapshot. The
+ * active wifi backend (wifisim OR the real iwlwifi driver) maintains it.
+ * ------------------------------------------------------------------- */
+/* bring-up stage reached (monotonic until a failure resets to FAILED) */
+#define UAPI_WLAN_STAGE_NONE        0   /* nothing attempted              */
+#define UAPI_WLAN_STAGE_NOCARD      1   /* no Intel WiFi card present      */
+#define UAPI_WLAN_STAGE_DETECTED    2   /* card detected + BAR0 mapped     */
+#define UAPI_WLAN_STAGE_TRANS_OK    3   /* APM + DMA rings up              */
+#define UAPI_WLAN_STAGE_ALIVE       4   /* firmware reached runtime ALIVE  */
+#define UAPI_WLAN_STAGE_NVM_OK      5   /* MAC + channels read from NVM    */
+#define UAPI_WLAN_STAGE_REGISTERED  6   /* wlan0 live behind the seam      */
+#define UAPI_WLAN_STAGE_SCANNED     7   /* a scan has completed            */
+#define UAPI_WLAN_STAGE_FAILED      8   /* bring-up aborted (see msg)      */
+
+/* family (mirror of enum iwl_family in iwl-trans.h -- same values) */
+#define UAPI_WLAN_FAM_UNKNOWN  0
+#define UAPI_WLAN_FAM_1000     1
+#define UAPI_WLAN_FAM_5000     2
+#define UAPI_WLAN_FAM_6000     3
+#define UAPI_WLAN_FAM_6000G2   4
+
+#define WLAN_DIAG_ABI_SIZE  120
+
+typedef struct {
+    uint8_t  present;          /* 1 if a wifi backend is active            */
+    uint8_t  family;           /* UAPI_WLAN_FAM_*                          */
+    uint8_t  rf_kill;          /* 1 if HW RF-kill asserted (switch off)    */
+    uint8_t  alive;            /* 1 if firmware reached runtime ALIVE      */
+    uint8_t  nvm_ok;           /* 1 if MAC/channels read OK                */
+    uint8_t  stage;            /* UAPI_WLAN_STAGE_*                        */
+    uint8_t  mac[6];           /* radio MAC (once NVM read)                */
+    uint16_t n_channels;       /* channels enumerated                      */
+    int16_t  last_scan_bss;    /* last scan result count (-1 = none/error) */
+    char     card[40];         /* card friendly name                       */
+    char     msg[64];          /* last status / failure-step line          */
+} uapi_wlan_diag_t;
+
+_Static_assert(sizeof(uapi_wlan_diag_t) == WLAN_DIAG_ABI_SIZE,
+               "uapi_wlan_diag_t ABI size drift");
+
 #endif /* UAPI_WLAN_H */

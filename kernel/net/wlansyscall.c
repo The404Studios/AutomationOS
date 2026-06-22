@@ -126,6 +126,21 @@ int64_t sys_wlan_disconnect(uint64_t a1, uint64_t a2, uint64_t a3,
     return (r == 0) ? 0 : EIO;
 }
 
+/* SYS_WLAN_DIAG: copy the radio bring-up diagnostics snapshot to userspace so the
+ * Network Manager can show WHERE bring-up stopped on real hardware (card, family,
+ * RF-kill, stage, MAC, channels, last scan count, message) -- no serial needed. */
+int64_t sys_wlan_diag(uint64_t out_ptr, uint64_t a2, uint64_t a3,
+                      uint64_t a4, uint64_t a5, uint64_t a6) {
+    (void)a2; (void)a3; (void)a4; (void)a5; (void)a6;
+    if (out_ptr == 0) return EINVAL;
+    uapi_wlan_diag_t d;
+    memset(&d, 0, sizeof(d));
+    wifi_diag_get(&d);
+    if (copy_to_user((void*)out_ptr, &d, sizeof(d)) != COPY_SUCCESS)
+        return EFAULT;
+    return 0;
+}
+
 /* SYS_WLAN_SET_KEY: the supplicant installs a PTK (pairwise) or GTK (group). */
 int64_t sys_wlan_set_key(uint64_t req_ptr, uint64_t a2, uint64_t a3,
                          uint64_t a4, uint64_t a5, uint64_t a6) {

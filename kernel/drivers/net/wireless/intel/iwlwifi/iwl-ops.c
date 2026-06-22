@@ -41,6 +41,7 @@
 #include "iwl-nvm.h"
 #include "iwl-scan.h"
 #include "iwl-rxon.h"
+#include "uapi/wlan.h"        /* UAPI_WLAN_STAGE_* for the GUI diagnostics */
 
 /* The firmware parser entry (iwl-fw.c) + the section-capture helper. */
 int iwl_fw_load_from_initrd(const char* path, struct iwl_fw* out);
@@ -76,9 +77,12 @@ static int iwl_ops_scan_start(struct netif* nif) {
      * GUI can tell the user WHY (rather than a mystery "no networks"). */
     if (iwl_is_rfkill(&g_trans)) {
         kprintf("IWLOPS: scan aborted -- HW RF-KILL is ON (flip the wireless switch)\n");
+        wifi_diag_rfkill(1);
+        wifi_diag_msg("scan aborted: RF-KILL is ON -- flip the wireless switch");
         g_state = WLAN_DOWN;
         return -1;
     }
+    wifi_diag_rfkill(0);
 
     g_state = WLAN_SCANNING;
 
@@ -96,9 +100,18 @@ static int iwl_ops_scan_start(struct netif* nif) {
 
     int n = iwl_scan(&g_trans, &g_nvm, g_scan,
                      (int)(sizeof(g_scan) / sizeof(g_scan[0])));
-    if (n < 0) { g_state = WLAN_DOWN; g_scan_n = 0; return -1; }
+    if (n < 0) {
+        g_state = WLAN_DOWN; g_scan_n = 0;
+        wifi_diag_scan(-1);
+        wifi_diag_msg("scan command failed (see IWLSCAN serial markers)");
+        return -1;
+    }
     g_scan_n = n;
     g_state  = WLAN_DOWN;     /* scan finished */
+    wifi_diag_scan(n);
+    wifi_diag_stage(UAPI_WLAN_STAGE_SCANNED);
+    wifi_diag_msg(n > 0 ? "scan complete -- networks found"
+                        : "scan complete -- 0 networks (check antenna/RF-kill/range)");
     kprintf("IWLOPS: scan_start -> %d BSS\n", n);
     return 0;
 }
@@ -248,6 +261,7 @@ void iwl_wifi_bringup(void) {
     memset(&g_trans, 0, sizeof(g_trans));
     memset(&g_nvm,   0, sizeof(g_nvm));
     g_scan_n = 0; g_state = WLAN_DOWN; g_alive = 0;
+    wifi_diag_reset();   /* fresh GUI diagnostics snapshot for this bring-up */
 
     /* ---- detect the card + map BAR0 (IWL-IDENT logic, inline) ---- */
     pci_device_t* dev = (pci_device_t*)0;
@@ -259,6 +273,8 @@ void iwl_wifi_bringup(void) {
     }
     if (!dev) {
         kprintf("IWLWIFI: no Intel WiFi card present -- nothing to bring up\n");
+        wifi_diag_stage(UAPI_WLAN_STAGE_NOCARD);
+        wifi_diag_msg("no Intel WiFi card found (check the card seating / BIOS)");
         return;
     }
     kprintf("IWLWIFI: card %s (fw family iwlwifi-%s)\n", name, fwfam);
@@ -281,23 +297,36 @@ void iwl_wifi_bringup(void) {
         }
     }
     kprintf("IWLWIFI: family=%d pll_cfg=%d\n", g_trans.family, g_trans.pll_cfg);
+    wifi_diag_card(name, g_trans.family, 1);
+    wifi_diag_msg("card detected; powering radio...");
 
     pci_enable_memory_space(dev);
     pci_enable_bus_master(dev);
     uint64_t bar0 = pci_get_bar(dev, 0);
     if (!bar0) {
         kprintf("IWLWIFI: BAR0 not mapped -- abort\n");
+        wifi_diag_stage(UAPI_WLAN_STAGE_FAILED);
+        wifi_diag_msg("PCI BAR0 not mapped (enumeration issue)");
         return;
     }
     g_trans.mmio = (volatile uint8_t*)(bar0 & ~0xFULL);
     g_trans.hw_rev = iwl_read32(&g_trans, CSR_HW_REV);
     kprintf("IWLWIFI: BAR0 mapped, CSR_HW_REV=0x%08x\n", g_trans.hw_rev);
+    wifi_diag_stage(UAPI_WLAN_STAGE_DETECTED);
 
     /* ---- transport: APM power-up + cmd/RX rings ---- */
     if (iwl_trans_bringup(&g_trans) != 0) {
         kprintf("IWLWIFI: transport bring-up FAILED -- abort\n");
+        wifi_diag_stage(UAPI_WLAN_STAGE_FAILED);
+        wifi_diag_msg("APM/transport bring-up failed (radio did not power up)");
         return;
     }
+    /* surface the RF-kill state read during transport bring-up */
+    wifi_diag_rfkill(g_trans.rf_kill);
+    wifi_diag_stage(UAPI_WLAN_STAGE_TRANS_OK);
+    wifi_diag_msg(g_trans.rf_kill
+                  ? "RADIO POWERED but RF-KILL is ON -- flip the wireless switch"
+                  : "radio powered; loading firmware...");
 
     /* ---- firmware: parse the .ucode from the initrd + capture sections ---- *
      * The firmware file name follows the family (iwlwifi-<fam>-N.ucode). We try
@@ -311,6 +340,8 @@ void iwl_wifi_bringup(void) {
     if (iwl_fw_load_from_initrd(fw_path, &fw_meta) != 0) {
         kprintf("IWLWIFI: firmware %s not available -- abort "
                 "(provide iwlwifi-%s-*.ucode)\n", fw_path, fwfam);
+        wifi_diag_stage(UAPI_WLAN_STAGE_FAILED);
+        wifi_diag_msg("firmware MISSING -- drop iwlwifi-<family>.ucode in firmware/");
         return;
     }
 
@@ -323,6 +354,8 @@ void iwl_wifi_bringup(void) {
             iwl_fw_capture_sections((const uint8_t*)blob, (uint32_t)fsz,
                                     &g_fw_images) != 0) {
             kprintf("IWLWIFI: firmware section capture FAILED -- abort\n");
+            wifi_diag_stage(UAPI_WLAN_STAGE_FAILED);
+            wifi_diag_msg("firmware blob malformed (not a valid .ucode)");
             return;
         }
     }
@@ -330,14 +363,23 @@ void iwl_wifi_bringup(void) {
     /* ---- load firmware to ALIVE (INIT->calib->RUNTIME) ---- */
     if (iwl_load_ucode(&g_trans, &g_fw_images) != 0) {
         kprintf("IWLWIFI: ucode load/ALIVE FAILED -- abort\n");
+        wifi_diag_stage(UAPI_WLAN_STAGE_FAILED);
+        wifi_diag_msg("firmware load/ALIVE failed (see IWLLOAD serial markers)");
         return;
     }
+    wifi_diag_alive(1);
+    wifi_diag_stage(UAPI_WLAN_STAGE_ALIVE);
+    wifi_diag_msg("firmware ALIVE; reading NVM...");
 
     /* ---- read NVM (MAC + channels) ---- */
     if (iwl_read_nvm(&g_trans, &g_nvm) != 0) {
         kprintf("IWLWIFI: NVM read FAILED -- abort\n");
+        wifi_diag_stage(UAPI_WLAN_STAGE_FAILED);
+        wifi_diag_msg("NVM read failed (EEPROM/OTP -- see IWLNVM markers)");
         return;
     }
+    wifi_diag_mac(g_trans.mac, g_nvm.n_channels);
+    wifi_diag_stage(UAPI_WLAN_STAGE_NVM_OK);
 
     g_alive = 1;   /* radio is alive + identified; control plane may run */
 
@@ -357,6 +399,10 @@ void iwl_wifi_bringup(void) {
                 "(%02x:%02x:%02x:%02x:%02x:%02x, %d channels) -- radio LIVE\n",
                 g_trans.mac[0], g_trans.mac[1], g_trans.mac[2],
                 g_trans.mac[3], g_trans.mac[4], g_trans.mac[5], g_nvm.n_channels);
+        wifi_diag_stage(UAPI_WLAN_STAGE_REGISTERED);
+        wifi_diag_msg(g_trans.rf_kill
+                      ? "wlan0 LIVE but RF-kill ON -- flip the wireless switch, then scan"
+                      : "wlan0 LIVE -- ready to scan");
     } else {
         /* Registration failed (name clash with wifisim, or registry full). Roll
          * g_alive back so a re-run of iwlup re-does the FULL bring-up (NVM/scan)

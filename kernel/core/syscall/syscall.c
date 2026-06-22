@@ -263,6 +263,7 @@ void syscall_init(void) {
     syscall_table[SYS_WLAN_STATUS]     = (syscall_handler_t)sys_wlan_status;
     syscall_table[SYS_WLAN_DISCONNECT] = (syscall_handler_t)sys_wlan_disconnect;
     syscall_table[SYS_WLAN_SET_KEY]    = (syscall_handler_t)sys_wlan_set_key;
+    syscall_table[SYS_WLAN_DIAG]       = (syscall_handler_t)sys_wlan_diag;
 
     // PCI device list (lspci userspace tool)
     syscall_table[SYS_PCI_LIST]    = (syscall_handler_t)sys_pci_list;

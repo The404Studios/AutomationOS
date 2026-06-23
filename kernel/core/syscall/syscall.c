@@ -256,6 +256,14 @@ void syscall_init(void) {
     syscall_table[SYS_GETSOCKOPT] = (syscall_handler_t)sys_sock_getsockopt;
     syscall_table[SYS_SHUTDOWN]   = (syscall_handler_t)sys_sock_shutdown;
 
+    // CONFIG-STORE: durable namespaced K/V config (Wave0 ledger 133/134)
+    {
+        extern int64_t sys_cfg_get(uint64_t,uint64_t,uint64_t,uint64_t,uint64_t,uint64_t);
+        extern int64_t sys_cfg_set(uint64_t,uint64_t,uint64_t,uint64_t,uint64_t,uint64_t);
+        syscall_table[SYS_CFG_GET] = (syscall_handler_t)sys_cfg_get;
+        syscall_table[SYS_CFG_SET] = (syscall_handler_t)sys_cfg_set;
+    }
+
     // Network configuration (DHCP lease apply, routing, ARP table query)
     syscall_table[SYS_NET_CONFIG]  = (syscall_handler_t)sys_net_config;
     syscall_table[SYS_ROUTE_TABLE] = (syscall_handler_t)sys_route_table;

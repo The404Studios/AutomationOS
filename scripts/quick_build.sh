@@ -628,6 +628,9 @@ compile kernel/fs/fat32.c                    c_fat32
 # diskfs: durable superblock over AHCI (persistence #57). Self-contained, only
 # touches a fixed LBA via ahci_read/write; no-op when no disk is attached.
 compile kernel/fs/diskfs.c                   c_diskfs
+# CONFIG-STORE: durable namespaced K/V over diskfs (SYS_CFG_GET/SET). Self-
+# contained, lazy-init, RAM-fallback when diskless -> safe in every build.
+compile kernel/fs/config_store.c             c_config_store
 compile kernel/init/initrd.c                 c_initrd
 compile kernel/fs/elf_loader.c               c_elf_loader
 compile kernel/fs/exec.c                     c_exec

@@ -859,6 +859,15 @@ void net_testrig_selftest(void) {
     }
 
     g_rig_active = 0;
+
+    /* CONFIG-STORE proof (independent of the net rig; reuses the NET_SELFTEST
+     * boot hook so it is grepped alongside the NETP1 markers). */
+    {
+        extern void cfg_selftest(void);
+        extern void cfg_persist_selftest(void);
+        cfg_selftest();
+        cfg_persist_selftest();
+    }
 }
 
 #else  /* !NET_SELFTEST */

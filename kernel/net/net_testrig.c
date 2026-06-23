@@ -185,6 +185,35 @@ static void rig_inject_tcp(uint32_t src_ip, uint16_t src_port,
     rig_inject(src_ip, dst_ip, IPPROTO_TCP, g_seg, tlen);
 }
 
+/* NETP1J: craft + inject a SYN-ACK carrying a 12-byte options block
+ * (MSS / window-scale / SACK-permitted + NOP pad) so the options parser can be
+ * exercised. data_off is widened to 8 words. */
+static void rig_inject_synack_opts(uint32_t src_ip, uint16_t src_port,
+                                   uint32_t dst_ip, uint16_t dst_port,
+                                   uint32_t seq, uint32_t ack,
+                                   uint16_t mss, uint8_t wscale) {
+    tcp_hdr_t* th = (tcp_hdr_t*)g_seg;
+    uint8_t* opt  = g_seg + sizeof(tcp_hdr_t);
+    int o = 0;
+    opt[o++] = 2; opt[o++] = 4; opt[o++] = (uint8_t)(mss >> 8); opt[o++] = (uint8_t)(mss & 0xFF);
+    opt[o++] = 3; opt[o++] = 3; opt[o++] = wscale;
+    opt[o++] = 4; opt[o++] = 2;
+    opt[o++] = 1; opt[o++] = 1; opt[o++] = 1;   /* NOP pad -> 12 bytes (8 words) */
+    uint16_t tlen = (uint16_t)(sizeof(tcp_hdr_t) + o);
+    th->src_port = net_htons(src_port);
+    th->dst_port = net_htons(dst_port);
+    th->seq      = net_htonl(seq);
+    th->ack      = net_htonl(ack);
+    th->data_off = (uint8_t)((tlen / 4) << 4);
+    th->flags    = TCP_SYN | TCP_ACK;
+    th->window   = net_htons(4096);
+    th->checksum = 0;
+    th->urgent   = 0;
+    th->checksum = net_htons(net_transport_checksum(src_ip, dst_ip,
+                                                    IPPROTO_TCP, g_seg, tlen));
+    rig_inject(src_ip, dst_ip, IPPROTO_TCP, g_seg, tlen);
+}
+
 /* ------------------------------------------------------------------ */
 /* The A0 selftest: prove INJECT (loopback) and CAPTURE (tap).         */
 /* ------------------------------------------------------------------ */
@@ -760,6 +789,41 @@ void net_testrig_selftest(void) {
         kprintf("NETP1M: RTOEST %s staged=%d sampled=%d rto_ok=%d\n",
                 (staged && sampled && rto_ok) ? "PASS" : "FAIL",
                 staged, sampled, rto_ok);
+    }
+
+    /* ---------------------------------------------------------------- */
+    /* TCP-ROBUST NETP1J: TCP options parsing. Stage a socket in         */
+    /* SYN_SENT (the active-open client path -- what we use to reach      */
+    /* real servers), inject a SYN-ACK carrying MSS/wscale/SACK options, */
+    /* and assert the negotiated values were parsed onto the socket.     */
+    /* ---------------------------------------------------------------- */
+    {
+        int parsed_mss = 0, parsed_ws = 0, parsed_sack = 0;
+        int s = sock_socket(SOCK_STREAM);
+        if (s >= 0) {
+            sock_t* base = sock_table_base();
+            sock_t* c = base ? &base[s] : (sock_t*)0;
+            if (c) {
+                c->state       = TCP_SYN_SENT;
+                c->remote_ip   = peer_ip;
+                c->remote_port = 44000;
+                c->local_port  = 47015;
+                c->snd_nxt     = 50000;
+                c->snd_una     = 50000;
+                c->peer_mss = 0; c->snd_wscale = 0; c->peer_sack_ok = 0; c->peer_ts_ok = 0;
+                /* SYN-ACK acks our ISN (>= snd_nxt) and carries options. */
+                rig_inject_synack_opts(peer_ip, 44000, my_ip, 47015,
+                                       /*seq*/ 60000, /*ack*/ 50000,
+                                       /*mss*/ 1400, /*wscale*/ 7);
+                parsed_mss  = (c->peer_mss == 1400) ? 1 : 0;
+                parsed_ws   = (c->snd_wscale == 7) ? 1 : 0;
+                parsed_sack = (c->peer_sack_ok == 1) ? 1 : 0;
+            }
+        }
+        sock_init();
+        kprintf("NETP1J: TCPOPT %s mss=%d wscale=%d sack=%d\n",
+                (parsed_mss && parsed_ws && parsed_sack) ? "PASS" : "FAIL",
+                parsed_mss, parsed_ws, parsed_sack);
     }
 
     g_rig_active = 0;

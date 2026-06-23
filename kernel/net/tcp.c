@@ -296,6 +296,32 @@ static void tcp_rtt_update(sock_t* s, uint32_t r_ms) {
 }
 
 /*
+ * TCP-ROBUST: parse the TCP options that sit between the 20-byte fixed header
+ * and the data offset (ihl). Extracts MSS, window-scale, SACK-permitted, and
+ * timestamps. Walks kind/length defensively (bounded by ihl, malformed -> stop)
+ * since the segment is untrusted input. Stores onto the socket.
+ */
+static void tcp_parse_options(sock_t* s, const uint8_t* seg, uint16_t ihl) {
+    uint16_t i = sizeof(tcp_hdr_t);
+    while (i < ihl) {
+        uint8_t kind = seg[i];
+        if (kind == 0) break;               /* End-of-options */
+        if (kind == 1) { i++; continue; }   /* NOP */
+        if (i + 1 >= ihl) break;
+        uint8_t len = seg[i + 1];
+        if (len < 2 || i + len > ihl) break; /* malformed -> stop */
+        switch (kind) {
+            case 2:  if (len == 4)  s->peer_mss = (uint16_t)((seg[i+2] << 8) | seg[i+3]); break;
+            case 3:  if (len == 3)  { uint8_t w = seg[i+2]; s->snd_wscale = (w > 14) ? 14 : w; } break;
+            case 4:  if (len == 2)  s->peer_sack_ok = 1; break;
+            case 8:  if (len == 10) s->peer_ts_ok = 1; break;
+            default: break;
+        }
+        i += len;
+    }
+}
+
+/*
  * TCP-ROBUST (RFC 5681 fast retransmit): resend the oldest unacked segment
  * IMMEDIATELY on the 3rd duplicate ACK, instead of waiting a full RTO. Resets
  * the RTO clock so the timer does not also fire right after. Does not touch the
@@ -703,9 +729,12 @@ int tcp_send(sock_t* s, const void* data, uint16_t len) {
             }
         }
 
-        /* Determine this segment's size: min(remaining, MSS, peer window). */
+        /* Determine this segment's size: min(remaining, effective-MSS, peer wnd).
+         * TCP-ROBUST: cap to the peer's advertised MSS when smaller than ours so
+         * we never oversize a segment a real server told us it won't accept. */
+        uint16_t eff_mss = (s->peer_mss && s->peer_mss < TCP_MSS) ? s->peer_mss : TCP_MSS;
         uint16_t chunk = (uint16_t)(len - sent);
-        if (chunk > TCP_MSS) chunk = TCP_MSS;
+        if (chunk > eff_mss) chunk = eff_mss;
         /* Respect peer's advertised send window (never send 0-window data).
          * NET-P1-C: the old guard (`snd_wnd > 0 && ...`) skipped the clamp
          * exactly when the window was ZERO, so the persist branch below was
@@ -947,6 +976,9 @@ void tcp_input(uint32_t src_ip, uint32_t dst_ip,
         if ((flags & TCP_SYN) && (flags & TCP_ACK)) {
             /* CHANGED: SEQ32_GEQ for wraparound-safe ack check. */
             if (!SEQ32_GEQ(ack, s->snd_nxt)) { /* unexpected ack */ return; }
+            /* TCP-ROBUST: learn the server's options (MSS/wscale/SACK/TS) from
+             * its SYN-ACK so our send path can size segments to the peer's MSS. */
+            tcp_parse_options(s, seg, ihl);
             s->rcv_nxt = seq + 1;          /* their SYN consumes one seq */
             s->snd_una = ack;
             tcp_disarm_retransmit(s);       /* our SYN is acked */

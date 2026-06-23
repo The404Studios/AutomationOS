@@ -207,6 +207,12 @@ struct sock {
     uint32_t    srtt_ms;       /* smoothed RTT (0 = no sample yet)        */
     uint32_t    rttvar_ms;     /* RTT variance                            */
     uint32_t    base_rto_ms;   /* current un-backed-off RTO (0 = none)    */
+
+    /* --- TCP-ROBUST options negotiated from the peer's SYN/SYN-ACK --- */
+    uint16_t    peer_mss;      /* peer's advertised MSS (0 = unknown)     */
+    uint8_t     snd_wscale;    /* peer's window-scale shift (0..14)       */
+    uint8_t     peer_sack_ok;  /* peer sent SACK-permitted                */
+    uint8_t     peer_ts_ok;    /* peer sent the timestamp option          */
 };
 
 /* ------------------------------------------------------------------ */

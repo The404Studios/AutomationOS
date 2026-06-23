@@ -32,6 +32,7 @@
 #include "../../include/x86_64.h"
 #include "../../include/drivers.h"   // serial_*, timer_*, timer_sleep
 #include "../../include/types.h"
+#include "../../include/amix.h"      // amix_mix_period (mixer -> HDA DMA proof)
 
 /* hda_msleep lives in hda.c; reuse it for consistent timing. */
 extern void hda_msleep(uint32_t ms);
@@ -253,6 +254,76 @@ int audio_play_tone(uint32_t freq_hz, uint32_t ms) {
      *   "AUDIO: tone done bcis=<N> lpib_adv=<D>"
      * N>0 OR D>0 == real DMA playback happened. */
     serial_write("AUDIO: tone done bcis=", 22);
+    tone_serial_u32(bcis_total);
+    serial_write(" lpib_adv=", 10);
+    tone_serial_u32(lpib_delta);
+    serial_putchar('\n');
+    return 0;
+}
+
+/* ====================================================================== *
+ *  AUDIO-MIXER end-to-end proof: play TWO tones SUMMED by the real software
+ *  mixer (amix_mix_period) through the HDA DMA engine -- proving concurrent
+ *  streams reach real audio hardware, not just a RAM-buffer KAT.
+ * ====================================================================== */
+#define MIX_CHUNK 256
+static int16_t g_mix_a[MIX_CHUNK * 2];   /* source A, interleaved stereo s16 */
+static int16_t g_mix_b[MIX_CHUNK * 2];   /* source B                          */
+
+static void tone_fill_buffer_mixed(hda_stream_t* stream, uint32_t f1, uint32_t f2) {
+    if (!stream || !stream->buffer_virt) return;
+    int16_t* dst = (int16_t*)stream->buffer_virt;
+    uint32_t frames = (stream->buffer_size / 2) / 2;     /* L+R pairs */
+    const uint32_t rate = 48000;
+    if (f1 == 0) f1 = 440;
+    if (f2 == 0) f2 = 660;
+    uint32_t inc1 = (uint32_t)(((uint64_t)f1 * 65536ULL) / rate);
+    uint32_t inc2 = (uint32_t)(((uint64_t)f2 * 65536ULL) / rate);
+    uint32_t ph1 = 0, ph2 = 0;
+    for (uint32_t off = 0; off < frames; off += MIX_CHUNK) {
+        uint32_t n = frames - off; if (n > MIX_CHUNK) n = MIX_CHUNK;
+        for (uint32_t i = 0; i < n; i++) {
+            int32_t a = isin(ph1) / 3; ph1 += inc1;   /* ~1/3 each: headroom for the sum */
+            int32_t b = isin(ph2) / 3; ph2 += inc2;
+            g_mix_a[i*2+0] = (int16_t)a; g_mix_a[i*2+1] = (int16_t)a;
+            g_mix_b[i*2+0] = (int16_t)b; g_mix_b[i*2+1] = (int16_t)b;
+        }
+        amix_stream_t st[2] = {
+            { g_mix_a, n, 256, 1 },
+            { g_mix_b, n, 256, 1 },
+        };
+        amix_mix_period(st, 2, 256, dst + (uint64_t)off * 2, n);
+    }
+}
+
+/**
+ * audio_play_mixed - play two tones summed by the AUDIO-MIXER through HDA DMA.
+ * Proves the mixer output reaches real hardware via the bcis/lpib DMA marker.
+ */
+int audio_play_mixed(uint32_t f1, uint32_t f2, uint32_t ms) {
+    hda_controller_t* ctrl = NULL;
+    hda_codec_t* codec = NULL;
+    if (tone_prepare_stream(&ctrl, &codec) != 0) return -1;
+
+    g_tone_stream->position = 0;
+    tone_fill_buffer_mixed(g_tone_stream, f1, f2);
+    hda_set_volume(codec, ctrl, 80);
+    hda_set_mute(codec, ctrl, false);
+
+    serial_write("AUDIO: playing mixed\n", 21);
+    if (hda_stream_start(ctrl, g_tone_stream) != 0) {
+        serial_write("AUDIO: mixed: stream start failed\n", 34);
+        return -1;
+    }
+    uint32_t lpib_before = hda_sd_read32(ctrl, g_tone_stream->stream_num, HDA_SD_LPIB);
+    if (ms == 0) ms = 200;
+    hda_msleep(ms);
+    uint32_t lpib_after = hda_sd_read32(ctrl, g_tone_stream->stream_num, HDA_SD_LPIB);
+    uint32_t lpib_delta = lpib_after - lpib_before;
+    uint32_t bcis_total = g_hda_bcis;
+    hda_stream_stop(ctrl, g_tone_stream);
+
+    serial_write("AUDIO: mixed done bcis=", 23);
     tone_serial_u32(bcis_total);
     serial_write(" lpib_adv=", 10);
     tone_serial_u32(lpib_delta);

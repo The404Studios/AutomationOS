@@ -21,15 +21,7 @@
  */
 #include "../../include/types.h"
 #include "../../include/kernel.h"   /* kprintf (selftest only) */
-
-#define AMIX_MAX_STREAMS 8
-
-typedef struct {
-    const int16_t* buf;   /* interleaved stereo s16 (frame f -> buf[f*2 + ch]) */
-    uint32_t       frames;/* frames available in buf                           */
-    uint16_t       gain_q8;/* per-stream gain, 256 = unity                     */
-    uint8_t        active; /* 0 = skip                                         */
-} amix_stream_t;
+#include "../../include/amix.h"     /* amix_stream_t + amix_mix_period (shared) */
 
 /*
  * Mix `nstreams` stereo-s16 streams into `out` (frames * 2 samples), applying

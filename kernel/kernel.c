@@ -955,6 +955,11 @@ void kernel_main(void* raw_info) {
     {
         extern int audio_play_tone(uint32_t, uint32_t);
         audio_play_tone(440, 200);
+        /* AUDIO-MIXER end-to-end proof: two tones SUMMED by amix_mix_period,
+         * played through HDA DMA. Marker "AUDIO: mixed done bcis=<N> lpib_adv=<D>"
+         * (N>0 OR D>0) proves the software mixer drives real audio hardware. */
+        extern int audio_play_mixed(uint32_t, uint32_t, uint32_t);
+        audio_play_mixed(440, 660, 200);
     }
 #endif
 #else

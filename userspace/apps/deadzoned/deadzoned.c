@@ -76,6 +76,10 @@ typedef unsigned int   u32;
 typedef int            i32;
 typedef unsigned char  u8;
 
+/* The wire protocol is shared verbatim with the game client (sbin/deadzone)
+ * via dzproto.h -- ONE definition for both ends so they can never drift. */
+#include "dzproto.h"
+
 /* ===================================================================== */
 /* Raw 6-arg inline syscall (verbatim from httpd.c / nc.c)               */
 /* ===================================================================== */
@@ -150,19 +154,9 @@ static i32 rng_range(i32 lo, i32 hi)   /* inclusive lo, exclusive hi */
     return lo + (i32)(rng_next() % (u32)(hi - lo));
 }
 
-/* ===================================================================== */
-/* Little-endian wire (un)packers -- zero struct-padding ambiguity        */
-/* ===================================================================== */
-static void put_u32(u8 *p, u32 v)
-{
-    p[0] = (u8)(v); p[1] = (u8)(v >> 8); p[2] = (u8)(v >> 16); p[3] = (u8)(v >> 24);
-}
-static u32 get_u32(const u8 *p)
-{
-    return (u32)p[0] | ((u32)p[1] << 8) | ((u32)p[2] << 16) | ((u32)p[3] << 24);
-}
-static void put_i32(u8 *p, i32 v)  { put_u32(p, (u32)v); }
-static i32  get_i32(const u8 *p)   { return (i32)get_u32(p); }
+/* Wire (un)packers + packet (de)serializers live in dzproto.h (dz_put_u32 /
+ * dz_snap_encode / dz_input_decode / ...). The server maps its internal World
+ * onto the shared dz_snapshot_t below. */
 
 /* ===================================================================== */
 /* Authoritative world model                                             */
@@ -371,91 +365,39 @@ static void world_tick(World *w)
 }
 
 /* ===================================================================== */
-/* Wire serialization                                                    */
+/* Wire serialization -- maps the server's internal World onto the SHARED  */
+/* dz_snapshot_t and delegates the actual byte-packing to dzproto.h, so    */
+/* the bytes the server emits are exactly what the client's dz_snap_decode  */
+/* (same header) reads back.                                                */
 /* ===================================================================== */
-#define DZ_SNAP_MAGIC  0x31535A44u    /* "DZS1" */
-#define DZ_INPUT_MAGIC 0x31495A44u    /* "DZI1" */
-
-/* Snapshot layout (all u32/i32 LE):
- *   magic, tick, wave, n_players, n_zombies,
- *   players[n_players]: { id, x, y, hp, yaw, score },
- *   zombies[n_zombies]: { x, y, state }
- * Returns the byte length written (<= cap), or 0 if it would not fit. */
-#define SNAP_HDR_U32     5
-#define SNAP_PLAYER_U32  6
-#define SNAP_ZOMBIE_U32  3
-#define SNAP_MAX_BYTES   (4 * (SNAP_HDR_U32 + MAX_CLIENTS * SNAP_PLAYER_U32 \
-                                          + MAX_ZOMBIES * SNAP_ZOMBIE_U32))
+static dz_snapshot_t g_snapview;     /* scratch view for snap_serialize    */
 
 static u32 snap_serialize(const World *w, u8 *buf, u32 cap)
 {
-    u32 need = 4 * (SNAP_HDR_U32 + w->n_players * SNAP_PLAYER_U32
-                                 + w->n_zombies * SNAP_ZOMBIE_U32);
-    if (need > cap) return 0;
-    u8 *p = buf;
-    put_u32(p, DZ_SNAP_MAGIC);   p += 4;
-    put_u32(p, w->tick);         p += 4;
-    put_u32(p, w->wave);         p += 4;
-    put_u32(p, w->n_players);    p += 4;
-    put_u32(p, w->n_zombies);    p += 4;
+    dz_snapshot_t *v = &g_snapview;
+    v->tick = w->tick; v->wave = w->wave;
+    v->n_players = w->n_players; v->n_zombies = w->n_zombies;
     for (u32 i = 0; i < w->n_players; i++) {
-        put_u32(p, i);                  p += 4;
-        put_i32(p, w->p[i].x);          p += 4;
-        put_i32(p, w->p[i].y);          p += 4;
-        put_i32(p, w->p[i].hp);         p += 4;
-        put_u32(p, (u32)w->p[i].yaw);   p += 4;
-        put_u32(p, w->p[i].score);      p += 4;
+        v->p[i].id    = i;
+        v->p[i].x     = w->p[i].x;
+        v->p[i].y     = w->p[i].y;
+        v->p[i].hp    = w->p[i].hp;
+        v->p[i].yaw   = (dz_u32)w->p[i].yaw;
+        v->p[i].score = w->p[i].score;
     }
     for (u32 i = 0; i < w->n_zombies; i++) {
-        put_i32(p, w->z[i].x);          p += 4;
-        put_i32(p, w->z[i].y);          p += 4;
-        put_u32(p, w->z[i].state);      p += 4;
+        v->z[i].x = w->z[i].x; v->z[i].y = w->z[i].y; v->z[i].state = w->z[i].state;
     }
-    return need;
+    return dz_snap_encode(v, (dz_u8 *)buf, cap);
 }
 
-/* Parse a snapshot back into a World (client-side / self-test). Returns 1
- * on a structurally valid snapshot, 0 otherwise. */
-static int snap_parse(const u8 *buf, u32 len, World *out)
-{
-    if (len < 4 * SNAP_HDR_U32) return 0;
-    const u8 *p = buf;
-    if (get_u32(p) != DZ_SNAP_MAGIC) return 0;
-    p += 4;
-    out->tick      = get_u32(p); p += 4;
-    out->wave      = get_u32(p); p += 4;
-    out->n_players = get_u32(p); p += 4;
-    out->n_zombies = get_u32(p); p += 4;
-    if (out->n_players > MAX_CLIENTS || out->n_zombies > MAX_ZOMBIES) return 0;
-    u32 need = 4 * (SNAP_HDR_U32 + out->n_players * SNAP_PLAYER_U32
-                                 + out->n_zombies * SNAP_ZOMBIE_U32);
-    if (len < need) return 0;
-    for (u32 i = 0; i < out->n_players; i++) {
-        p += 4;                                  /* id (positional) */
-        out->p[i].x     = get_i32(p); p += 4;
-        out->p[i].y     = get_i32(p); p += 4;
-        out->p[i].hp    = get_i32(p); p += 4;
-        out->p[i].yaw   = (i32)get_u32(p); p += 4;
-        out->p[i].score = get_u32(p); p += 4;
-    }
-    for (u32 i = 0; i < out->n_zombies; i++) {
-        out->z[i].x     = get_i32(p); p += 4;
-        out->z[i].y     = get_i32(p); p += 4;
-        out->z[i].state = get_u32(p); p += 4;
-    }
-    return 1;
-}
-
-/* Parse a DZ_INPUT packet (fixed 24 bytes). Returns 1 if valid. */
-#define INPUT_BYTES  24
+/* Parse a DZ_INPUT packet into the server's Input. Returns 1 if valid. */
 static int input_parse(const u8 *buf, Input *in)
 {
-    if (get_u32(buf) != DZ_INPUT_MAGIC) return 0;
-    in->seq     = get_u32(buf + 4);
-    in->move_x  = get_i32(buf + 8);
-    in->move_y  = get_i32(buf + 12);
-    in->yaw     = get_u32(buf + 16);
-    in->buttons = get_u32(buf + 20);
+    dz_input_t d;
+    if (!dz_input_decode((const dz_u8 *)buf, &d)) return 0;
+    in->seq = d.seq; in->move_x = d.move_x; in->move_y = d.move_y;
+    in->yaw = d.yaw; in->buttons = d.buttons;
     return 1;
 }
 
@@ -489,7 +431,7 @@ typedef struct {
 } Client;
 
 static Client g_cli[MAX_CLIENTS];
-static u8     g_snapbuf[SNAP_MAX_BYTES];
+static u8     g_snapbuf[DZ_SNAP_MAX_BYTES];
 
 static void client_clear(int i)
 {
@@ -499,7 +441,7 @@ static void client_clear(int i)
 }
 
 /* Drain whatever input bytes are pending on a client; apply each complete
- * INPUT_BYTES packet authoritatively. Non-blocking. Returns 0 if the peer
+ * DZ_INPUT_BYTES packet authoritatively. Non-blocking. Returns 0 if the peer
  * closed (caller drops it), 1 otherwise. */
 static int client_pump_input(Client *c, World *w)
 {
@@ -511,13 +453,13 @@ static int client_pump_input(Client *c, World *w)
         if (n == SOCK_EAGAIN) break;                /* nothing more now */
         if (n < 0) break;                           /* transient error  */
         c->rxn += (u32)n;
-        while (c->rxn >= INPUT_BYTES) {
+        while (c->rxn >= DZ_INPUT_BYTES) {
             Input in;
             if (input_parse(c->rx, &in))
                 apply_input(w, c->slot, &in);
             /* shift the consumed packet out of the buffer */
-            u32 rem = c->rxn - INPUT_BYTES;
-            for (u32 k = 0; k < rem; k++) c->rx[k] = c->rx[INPUT_BYTES + k];
+            u32 rem = c->rxn - DZ_INPUT_BYTES;
+            for (u32 k = 0; k < rem; k++) c->rx[k] = c->rx[DZ_INPUT_BYTES + k];
             c->rxn = rem;
         }
     }
@@ -647,11 +589,11 @@ static int self_test(void)
     if (kills == 0)  { out_puts("DEADZONED SELFTEST: FAIL no_kills\n"); return 1; }
 
     /* (2) snapshot round-trip ----------------------------------------- */
-    u8 buf[SNAP_MAX_BYTES];
+    u8 buf[DZ_SNAP_MAX_BYTES];
     u32 n = snap_serialize(w, buf, sizeof(buf));
     if (n == 0) { out_puts("DEADZONED SELFTEST: FAIL serialize\n"); return 1; }
-    static World parsed;       /* big -- keep it off the stack */
-    if (!snap_parse(buf, n, &parsed)) { out_puts("DEADZONED SELFTEST: FAIL parse\n"); return 1; }
+    static dz_snapshot_t parsed;       /* big -- keep it off the stack */
+    if (!dz_snap_decode(buf, n, &parsed)) { out_puts("DEADZONED SELFTEST: FAIL parse\n"); return 1; }
     if (parsed.tick != w->tick || parsed.wave != w->wave ||
         parsed.n_players != w->n_players || parsed.n_zombies != w->n_zombies) {
         out_puts("DEADZONED SELFTEST: FAIL roundtrip_hdr\n"); return 1;

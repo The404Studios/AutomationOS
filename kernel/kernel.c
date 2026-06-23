@@ -941,8 +941,15 @@ void kernel_main(void* raw_info) {
      * Safe when no HDA device is present (hda_init returns cleanly). */
     boot_mark("audio (HDA)");
     BOOT_LOG("[KERNEL] Initializing HD Audio (HDA)...\n");
-    extern void hda_init(void);
-    hda_init();
+    /* audio_init() is the documented sole audio entry point: it brings up the
+     * HDA controller (hda_init, a clean no-op when no controller is present),
+     * then registers the default playback device + initialises /dev/dsp so
+     * userspace (aplay / the mixer) has an audio device to open. This is the B0
+     * keystone -- previously only hda_init() ran, so the controller came up but
+     * no device was ever exposed to userspace. Returns <0 cleanly (no hang) when
+     * there is no codec; the AUDIO_SELFTEST tones below still find the controller. */
+    extern int audio_init(void);
+    audio_init();
     boot_mark("audio ok");
 
 #ifdef AUDIO_SELFTEST

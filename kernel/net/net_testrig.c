@@ -858,6 +858,34 @@ void net_testrig_selftest(void) {
                 fresh_hit, aged_out, relearn);
     }
 
+    /* ---------------------------------------------------------------- */
+    /* NET-RESILIENCE-OBS NETP1O: SYS_SOCK_LIST snapshot (netstat/ss).   */
+    /* A bound UDP socket and a TCP LISTEN socket must both appear in the */
+    /* live socket-table snapshot with the right type/port/state.        */
+    /* ---------------------------------------------------------------- */
+    {
+        int found_udp = 0, found_tcp = 0, count = 0;
+        int u = sock_socket(SOCK_DGRAM);
+        int l = sock_socket(SOCK_STREAM);
+        if (u >= 0 && l >= 0 &&
+            sock_bind(u, 48000) == 0 &&
+            sock_bind(l, 48001) == 0 && sock_listen(l, 2) == 0) {
+            sock_info_t info[8];
+            int n = sock_get_list(info, 8);
+            count = n;
+            for (int i = 0; i < n; i++) {
+                if (info[i].type == SOCK_DGRAM && info[i].local_port == 48000)
+                    found_udp = 1;
+                if (info[i].type == SOCK_STREAM && info[i].local_port == 48001 &&
+                    info[i].state == TCP_LISTEN)
+                    found_tcp = 1;
+            }
+        }
+        sock_init();
+        kprintf("NETP1O: SOCKLIST %s n=%d udp=%d tcp=%d\n",
+                (found_udp && found_tcp) ? "PASS" : "FAIL", count, found_udp, found_tcp);
+    }
+
     g_rig_active = 0;
 
     /* CONFIG-STORE proof (independent of the net rig; reuses the NET_SELFTEST

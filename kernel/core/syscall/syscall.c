@@ -255,6 +255,8 @@ void syscall_init(void) {
     syscall_table[SYS_SETSOCKOPT] = (syscall_handler_t)sys_sock_setsockopt;
     syscall_table[SYS_GETSOCKOPT] = (syscall_handler_t)sys_sock_getsockopt;
     syscall_table[SYS_SHUTDOWN]   = (syscall_handler_t)sys_sock_shutdown;
+    // NET-RESILIENCE-OBS: socket table snapshot for netstat/ss (Wave0 ledger 131)
+    syscall_table[SYS_SOCK_LIST]  = (syscall_handler_t)sys_sock_list;
 
     // CONFIG-STORE: durable namespaced K/V config (Wave0 ledger 133/134)
     {

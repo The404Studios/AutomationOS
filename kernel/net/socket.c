@@ -1035,3 +1035,36 @@ int64_t sys_sock_shutdown(uint64_t s, uint64_t how, uint64_t a3,
     (void)a3;(void)a4;(void)a5;(void)a6;
     return sock_shutdown((int)s, (int)how);
 }
+
+/* NET-RESILIENCE-OBS: snapshot the live socket table (for netstat/ss). */
+int sock_get_list(sock_info_t* out, int max) {
+    if (!g_socks || !out || max <= 0) return 0;
+    int n = 0;
+    for (int i = 0; i < SOCK_MAX && n < max; i++) {
+        if (!g_socks[i].used) continue;
+        sock_info_t* e = &out[n++];
+        e->type        = (uint8_t)g_socks[i].type;
+        e->state       = (uint8_t)g_socks[i].state;
+        e->local_port  = g_socks[i].local_port;
+        e->remote_port = g_socks[i].remote_port;
+        e->reserved    = 0;
+        e->local_ip    = g_socks[i].local_ip;
+        e->remote_ip   = g_socks[i].remote_ip;
+        e->owner_pid   = g_socks[i].owner_pid;
+    }
+    return n;
+}
+
+int64_t sys_sock_list(uint64_t out_ptr, uint64_t max_entries, uint64_t a3,
+                      uint64_t a4, uint64_t a5, uint64_t a6) {
+    (void)a3;(void)a4;(void)a5;(void)a6;
+    if (out_ptr == 0 || max_entries == 0) return SOCK_EINVAL;
+    int cap = (int)max_entries;
+    if (cap > SOCK_MAX) cap = SOCK_MAX;
+    sock_info_t kbuf[SOCK_MAX];
+    int n = sock_get_list(kbuf, cap);
+    if (n <= 0) return 0;
+    if (copy_to_user((void*)out_ptr, kbuf, (size_t)n * sizeof(sock_info_t)) != COPY_SUCCESS)
+        return SOCK_EINVAL;
+    return n;
+}

@@ -370,6 +370,24 @@ typedef struct {
     uint16_t _pad;
 } sock_addr_t;
 
+/* NET-RESILIENCE-OBS: one row of the live socket table for netstat/ss
+ * (SYS_SOCK_LIST=131). All host byte order. type=SOCK_STREAM|SOCK_DGRAM;
+ * state=tcp_state_t (0 for UDP); owner_pid is the creating process. */
+typedef struct {
+    uint8_t  type;
+    uint8_t  state;
+    uint16_t local_port;
+    uint16_t remote_port;
+    uint16_t reserved;
+    uint32_t local_ip;
+    uint32_t remote_ip;
+    uint32_t owner_pid;
+} sock_info_t;
+_Static_assert(sizeof(sock_info_t) == 20, "sock_info_t ABI must be 20 bytes");
+
+/* Fill `out` (up to `max` rows) with the live socket table; returns row count. */
+int sock_get_list(sock_info_t* out, int max);
+
 int64_t sys_sock_socket(uint64_t type, uint64_t a2, uint64_t a3,
                         uint64_t a4, uint64_t a5, uint64_t a6);
 int64_t sys_sock_connect(uint64_t s, uint64_t ip, uint64_t port,
@@ -399,5 +417,8 @@ int64_t sys_sock_getsockopt(uint64_t s, uint64_t level, uint64_t optname,
                             uint64_t optval, uint64_t optlen, uint64_t a6);
 int64_t sys_sock_shutdown(uint64_t s, uint64_t how, uint64_t a3,
                           uint64_t a4, uint64_t a5, uint64_t a6);
+/* NET-RESILIENCE-OBS: SYS_SOCK_LIST=131 -- copy the socket table to userspace. */
+int64_t sys_sock_list(uint64_t out_ptr, uint64_t max_entries, uint64_t a3,
+                      uint64_t a4, uint64_t a5, uint64_t a6);
 
 #endif /* SOCKET_H */

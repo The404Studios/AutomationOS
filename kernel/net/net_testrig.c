@@ -826,6 +826,38 @@ void net_testrig_selftest(void) {
                 parsed_mss, parsed_ws, parsed_sack);
     }
 
+    /* ---------------------------------------------------------------- */
+    /* ARP-AGING NETP1N: an inserted ARP entry hits while fresh, then is */
+    /* aged out once the (rig-advanced) clock passes ARP_TTL_MS so a     */
+    /* moved/changed host is re-resolved instead of using a stale MAC.   */
+    /* ---------------------------------------------------------------- */
+    {
+        extern void net_rig_advance_ms(uint64_t);
+        extern void net_rig_clock_reset(void);
+        extern void net_arp_rig_insert(uint32_t, const uint8_t*);
+        int fresh_hit = 0, aged_out = 0, relearn = 0;
+        net_rig_clock_reset();
+        uint8_t  mac[ETH_ALEN] = { 0x52, 0x54, 0x00, 0xAB, 0xCD, 0xEF };
+        uint32_t ip = 0x0A0002C8u;   /* 10.0.2.200 -- a fake test peer */
+        uint8_t  out[ETH_ALEN];
+
+        net_arp_rig_insert(ip, mac);
+        fresh_hit = (net_arp_lookup(ip, out) == 0 &&
+                     memcmp(out, mac, ETH_ALEN) == 0) ? 1 : 0;
+
+        net_rig_advance_ms(200000);   /* > ARP_TTL_MS (120000) */
+        aged_out = (net_arp_lookup(ip, out) != 0) ? 1 : 0;
+
+        /* After re-learning under the (still-advanced) clock it hits again. */
+        net_arp_rig_insert(ip, mac);
+        relearn = (net_arp_lookup(ip, out) == 0) ? 1 : 0;
+
+        net_rig_clock_reset();
+        kprintf("NETP1N: ARPAGE %s fresh=%d aged=%d relearn=%d\n",
+                (fresh_hit && aged_out && relearn) ? "PASS" : "FAIL",
+                fresh_hit, aged_out, relearn);
+    }
+
     g_rig_active = 0;
 }
 

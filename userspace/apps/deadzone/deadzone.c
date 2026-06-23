@@ -393,8 +393,29 @@ static void zombies_step(void)
 /* ====================================================================== *
  *  Render
  * ====================================================================== */
-static g3d_i32 g_zbuf[WIN_W * WIN_H];
+/* PSX look: render the 3D scene into a small low-res target, then nearest-
+ * upscale-blit it to the window. Gives chunky PSX pixels + ~4x faster software
+ * raster. The HUD is drawn at full window res on top. */
+#define LOWW 320
+#define LOWH 240
+static u32      g_lowfb[LOWW * LOWH];
+static g3d_i32  g_lowz[LOWW * LOWH];
 #define BG_COLOR 0xFF0A0F14u
+
+static void upscale_blit(wl_window *win)
+{
+    u32 stride = win->stride / 4u;
+    int ww = (int)win->w, wh = (int)win->h;
+    for (int y = 0; y < wh; y++) {
+        int ly = (y * LOWH) / wh; if (ly >= LOWH) ly = LOWH - 1;
+        const u32 *src = g_lowfb + (u64)ly * LOWW;
+        u32 *dst = win->pixels + (u64)y * stride;
+        for (int x = 0; x < ww; x++) {
+            int lx = (x * LOWW) / ww; if (lx >= LOWW) lx = LOWW - 1;
+            dst[x] = src[lx];
+        }
+    }
+}
 
 static u32 tint_white(u32 c, int amt)
 {
@@ -510,9 +531,9 @@ void _start(void)
     build_world();
     box_mesh(g_zmesh, Z_HX, Z_HY, Z_HZ);
 
+    /* PSX low-res render target (static; upscaled to the window each frame). */
     g3d_target tgt;
-    tgt.pixels=win->pixels; tgt.zbuf=g_zbuf; tgt.stride=(g3d_i32)(win->stride/4u);
-    tgt.w=(i32)win->w<WIN_W?(i32)win->w:WIN_W; tgt.h=(i32)win->h<WIN_H?(i32)win->h:WIN_H;
+    tgt.pixels=g_lowfb; tgt.zbuf=g_lowz; tgt.stride=LOWW; tgt.w=LOWW; tgt.h=LOWH;
 
     fx aspect = fx_ratio(WIN_W, WIN_H);
     mat4 proj = mat4_perspective(g3d_deg(70), aspect, fx_ratio(1,10), fx_from_int(120));
@@ -527,11 +548,7 @@ void _start(void)
     for (;;) {
         int kind,a,b,cev;
         while (wl_poll_event(win,&kind,&a,&b,&cev)) {
-            if (kind==WL_EVENT_RESIZE) {
-                tgt.pixels=win->pixels; tgt.stride=(g3d_i32)(win->stride/4u);
-                tgt.w=(i32)win->w<WIN_W?(i32)win->w:WIN_W; tgt.h=(i32)win->h<WIN_H?(i32)win->h:WIN_H;
-                continue;
-            }
+            if (kind==WL_EVENT_RESIZE) { continue; }  /* low-res tgt static; blit adapts to win */
             if (kind==WL_EVENT_POINTER) {
                 if (g_have_mouse) {
                     int dx = a - g_last_mx;
@@ -577,8 +594,9 @@ void _start(void)
             }
         }
 
-        render_scene(&tgt, proj, light);
-        draw_hud(win, (int)win->w, (int)win->h);
+        render_scene(&tgt, proj, light);   /* into the low-res PSX target */
+        upscale_blit(win);                  /* nearest-upscale to the window */
+        draw_hud(win, (int)win->w, (int)win->h);  /* HUD at full res on top */
         wl_commit(win);
         sc(SYS_YIELD,0,0,0,0,0,0);
     }

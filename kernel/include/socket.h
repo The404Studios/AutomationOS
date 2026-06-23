@@ -199,6 +199,9 @@ struct sock {
     uint8_t     shut_wr;       /* shutdown(SHUT_WR): send is rejected    */
     uint32_t    so_rcvtimeo_ms;/* SO_RCVTIMEO (ms; 0 = none)             */
     uint32_t    so_sndtimeo_ms;/* SO_SNDTIMEO (ms; 0 = none)             */
+
+    /* --- TCP-ROBUST 2MSL: when this socket entered TIME_WAIT (ms). --- */
+    uint64_t    time_wait_ms;
 };
 
 /* ------------------------------------------------------------------ */

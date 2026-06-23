@@ -642,6 +642,71 @@ void net_testrig_selftest(void) {
                 armed, no_early, fast_rtx, seq_ok, data_ok);
     }
 
+    /* ---------------------------------------------------------------- */
+    /* TCP-ROBUST NETP1L: 2MSL TIME_WAIT via the RIG-TIME-HOOK. A socket  */
+    /* in TIME_WAIT must NOT close before 2MSL, must ABSORB a             */
+    /* retransmitted FIN (re-ACK + restart the linger), and must reap to  */
+    /* CLOSED once the fast-forwarded clock passes 2MSL. The rig never     */
+    /* calls sock_poll(), so tcp_tick() is invoked directly and the clock  */
+    /* is advanced via tcp_rig_advance_ms() (no wall-clock wait).          */
+    /* ---------------------------------------------------------------- */
+    {
+        extern void     tcp_rig_advance_ms(uint64_t);
+        extern void     tcp_rig_clock_reset(void);
+        extern uint64_t tcp_rig_now(void);
+        int staged = 0, not_early = 0, absorb_ack = 0, expired = 0;
+        int fd = -1;
+        int l = sock_socket(SOCK_STREAM);
+        if (l >= 0 && sock_bind(l, 47013) == 0 && sock_listen(l, 2) == 0) {
+            g_cap_n = 0;
+            rig_inject_tcp(peer_ip, 43002, my_ip, 47013,
+                           12000, 0, TCP_SYN, 4096, NULL, 0);
+            if (g_cap_n >= 1) {
+                const tcp_hdr_t* th = (const tcp_hdr_t*)g_cap[0].seg;
+                uint32_t isn = net_ntohl(th->seq);
+                rig_inject_tcp(peer_ip, 43002, my_ip, 47013,
+                               12001, isn + 1, TCP_ACK, 4096, NULL, 0);
+                fd = sock_accept(l);
+            }
+        }
+        if (fd >= 0) {
+            sock_t* base = sock_table_base();
+            sock_t* c = base ? &base[fd] : (sock_t*)0;
+            if (c && c->state == TCP_ESTABLISHED) {
+                tcp_rig_clock_reset();
+                c->state        = TCP_TIME_WAIT;     /* stage TIME_WAIT directly */
+                c->time_wait_ms = tcp_rig_now();
+                staged = 1;
+
+                /* (1) Not expired before 2MSL. */
+                tcp_tick(c);
+                not_early = (c->state == TCP_TIME_WAIT) ? 1 : 0;
+
+                /* (2) A retransmitted FIN is absorbed: re-ACK captured. */
+                g_cap_n = 0;
+                rig_inject_tcp(peer_ip, 43002, my_ip, 47013,
+                               12000, 0, TCP_FIN | TCP_ACK, 4096, NULL, 0);
+                if (g_cap_n == 1) {
+                    const tcp_hdr_t* th = (const tcp_hdr_t*)g_cap[0].seg;
+                    absorb_ack = (g_cap[0].proto == IPPROTO_TCP &&
+                                  (th->flags & TCP_ACK) &&
+                                  c->state == TCP_TIME_WAIT) ? 1 : 0;
+                }
+
+                /* (3) Reap to CLOSED once the clock passes 2MSL. */
+                tcp_rig_advance_ms(120000);   /* > TCP_TIMEWAIT_MS (60000) */
+                tcp_tick(c);
+                expired = (c->state == TCP_CLOSED) ? 1 : 0;
+
+                tcp_rig_clock_reset();
+            }
+        }
+        sock_init();
+        kprintf("NETP1L: TIMEWAIT %s staged=%d not_early=%d absorb_ack=%d expired=%d\n",
+                (staged && not_early && absorb_ack && expired) ? "PASS" : "FAIL",
+                staged, not_early, absorb_ack, expired);
+    }
+
     g_rig_active = 0;
 }
 

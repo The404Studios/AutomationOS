@@ -72,6 +72,7 @@
 #define TCP_RTO_MAX_RETRIES   8       /* give up after this many retransmits*/
 #define TCP_CONNECT_MS        8000    /* total connect budget (ms)          */
 #define TCP_CLOSE_MS          4000    /* wait for FIN/ACK on close          */
+#define TCP_TIMEWAIT_MS       60000   /* 2MSL linger before TIME_WAIT->CLOSED*/
 
 /* sock_poll lives in socket.c. */
 int sock_poll(void);
@@ -169,7 +170,21 @@ static int sock_index(const sock_t* s) {
 /* ------------------------------------------------------------------ */
 /* Helpers                                                             */
 /* ------------------------------------------------------------------ */
+#ifdef NET_SELFTEST
+/* RIG-TIME-HOOK: the boot test rig never calls sock_poll(), so timer-driven
+ * features (2MSL TIME_WAIT, RTO, ARP aging) cannot fire by inject->assert. This
+ * offset lets the rig fast-forward the clock deterministically (no wall-clock
+ * wait) so a directly-invoked tcp_tick() sees a deadline as expired. It is 0 in
+ * normal NET_SELFTEST runs (existing NETP1 tests do not advance it). Compiled
+ * out entirely without NET_SELFTEST -> the default kernel is byte-identical. */
+static uint64_t g_rig_clock_offset_ms = 0;
+void     tcp_rig_advance_ms(uint64_t ms) { g_rig_clock_offset_ms += ms; }
+void     tcp_rig_clock_reset(void)       { g_rig_clock_offset_ms = 0; }
+static uint64_t now_ms(void) { return timer_get_ticks_ms() + g_rig_clock_offset_ms; }
+uint64_t tcp_rig_now(void)   { return now_ms(); }
+#else
 static uint64_t now_ms(void) { return timer_get_ticks_ms(); }
+#endif
 
 /* A simple-ish ISN. Not security-relevant here; derive from the clock. */
 static uint32_t gen_isn(void) {
@@ -795,6 +810,7 @@ int tcp_close(sock_t* s) {
         s->snd_nxt += 1;   /* FIN consumes one seq */
         tcp_arm_retransmit(s, TCP_FIN | TCP_ACK, seq, NULL, 0);
         s->state = (s->state == TCP_CLOSE_WAIT) ? TCP_TIME_WAIT : TCP_FIN_WAIT;
+        s->time_wait_ms = now_ms();   /* 2MSL: start the linger clock */
 
         uint64_t start = now_ms();
         while (now_ms() - start < TCP_CLOSE_MS) {
@@ -954,6 +970,7 @@ void tcp_input(uint32_t src_ip, uint32_t dst_ip,
             }
             if (s->state == TCP_FIN_WAIT && SEQ32_GEQ(ack, s->snd_nxt)) {
                 s->state = TCP_TIME_WAIT;   /* our FIN acked */
+                s->time_wait_ms = now_ms(); /* 2MSL: start the linger clock */
             }
         }
 
@@ -1038,18 +1055,26 @@ void tcp_input(uint32_t src_ip, uint32_t dst_ip,
          * consumed above (seq + payload_len == rcv_nxt after push).
          * ---------------------------------------------------------- */
         if (flags & TCP_FIN) {
+            /* TCP-ROBUST 2MSL: a FIN retransmitted by the peer during TIME_WAIT
+             * (its ACK of our FIN was lost) is ABSORBED -- re-ACK it and restart
+             * the 2MSL linger (RFC 793) so the peer's close completes cleanly. */
+            if (s->state == TCP_TIME_WAIT) {
+                tcp_send_ack(s);
+                s->time_wait_ms = now_ms();
+                return;
+            }
             /* In-order FIN: advance rcv_nxt. */
             if (seq + payload_len == s->rcv_nxt) {
                 s->rcv_nxt += 1;   /* FIN consumes one seq */
                 tcp_send_ack(s);
                 if (s->state == TCP_ESTABLISHED)   s->state = TCP_CLOSE_WAIT;
-                else if (s->state == TCP_FIN_WAIT) s->state = TCP_TIME_WAIT;
+                else if (s->state == TCP_FIN_WAIT) { s->state = TCP_TIME_WAIT; s->time_wait_ms = now_ms(); }
             } else if (seq == s->rcv_nxt) {
                 /* FIN with no data (common simultaneous FIN). */
                 s->rcv_nxt += 1;
                 tcp_send_ack(s);
                 if (s->state == TCP_ESTABLISHED)   s->state = TCP_CLOSE_WAIT;
-                else if (s->state == TCP_FIN_WAIT) s->state = TCP_TIME_WAIT;
+                else if (s->state == TCP_FIN_WAIT) { s->state = TCP_TIME_WAIT; s->time_wait_ms = now_ms(); }
             }
             /* If FIN arrived OOO just ACK current position; we'll re-process
              * it when the gap fills (limitation: no FIN in OOO slot). */
@@ -1072,6 +1097,15 @@ void tcp_input(uint32_t src_ip, uint32_t dst_ip,
  * counters tcp_rt_count[] / tcp_rt_rto_ms[].
  */
 void tcp_tick(sock_t* s) {
+    /* TCP-ROBUST 2MSL: reap a TIME_WAIT socket once the 2MSL linger elapses, so
+     * it no longer sits in TIME_WAIT forever (the prior behavior). A TIME_WAIT
+     * socket has no outstanding segment, so this must precede the rt_pending
+     * early-return. (Proven deterministically via the RIG-TIME-HOOK clock.) */
+    if (s->state == TCP_TIME_WAIT) {
+        if (now_ms() - s->time_wait_ms >= TCP_TIMEWAIT_MS) s->state = TCP_CLOSED;
+        return;
+    }
+
     if (!s->rt_pending) return;
 
     int idx        = sock_index(s);

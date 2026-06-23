@@ -866,9 +866,11 @@ void net_testrig_selftest(void) {
         extern void cfg_selftest(void);
         extern void cfg_persist_selftest(void);
         extern void afmt_selftest(void);
+        extern void amix_selftest(void);
         cfg_selftest();
         cfg_persist_selftest();
         afmt_selftest();
+        amix_selftest();
     }
 }
 

@@ -233,7 +233,10 @@ static int ip_send_fragment(uint8_t dmac[ETH_ALEN], uint32_t dst_ip,
         netif_t* nif = 0;
         if (netif_get_by_ip(net_get_ip(), &nif) != 0) nif = 0;
         if (!nif) nif = netif_get_default();
-        if (nif && nif->tx) return (nif->tx(f, total) > 0) ? 0 : -1;
+        if (nif && nif->tx) {
+            nif->tx_packets++; nif->tx_bytes += total;   /* NET-RESILIENCE-OBS */
+            return (nif->tx(f, total) > 0) ? 0 : -1;
+        }
     }
     return (net_send(f, total) > 0) ? 0 : -1;
 }
@@ -272,6 +275,15 @@ int ip_tx(uint32_t dst_ip, uint8_t proto, const void* seg, uint16_t seg_len) {
         ip->dst       = net_htonl(dst_ip);
         ip->checksum  = net_htons(net_inet_checksum(ip, sizeof(ipv4_hdr_t)));
         memcpy(g_lo + sizeof(ipv4_hdr_t), seg, seg_len);
+        /* NET-RESILIENCE-OBS: account loopback traffic on the lo interface (it
+         * both "transmits" and "receives" the same packet). */
+        {
+            netif_t* lo = netif_get("lo");
+            if (lo) {
+                lo->tx_packets++; lo->tx_bytes += iplen;
+                lo->rx_packets++; lo->rx_bytes += iplen;
+            }
+        }
         ipv4_demux(g_lo, iplen);
         return 0;
     }
@@ -443,6 +455,11 @@ int sock_poll(void) {
         int n = net_recv(g_rx, sizeof(g_rx));
         if (n <= 0) break;
         frames++;
+        /* NET-RESILIENCE-OBS: account inbound frames on the receiving (default) interface. */
+        {
+            netif_t* dn = netif_get_default();
+            if (dn) { dn->rx_packets++; dn->rx_bytes += (uint64_t)n; }
+        }
         if ((uint16_t)n < ETH_HLEN) continue;
 
         const eth_hdr_t* eh = (const eth_hdr_t*)g_rx;

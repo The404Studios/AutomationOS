@@ -29,6 +29,7 @@
 
 #include "../include/socket.h"
 #include "../include/net.h"
+#include "../include/netif.h"   /* NETP1P: per-interface counters */
 #include "../include/kernel.h"
 #include "../include/string.h"
 
@@ -884,6 +885,30 @@ void net_testrig_selftest(void) {
         sock_init();
         kprintf("NETP1O: SOCKLIST %s n=%d udp=%d tcp=%d\n",
                 (found_udp && found_tcp) ? "PASS" : "FAIL", count, found_udp, found_tcp);
+    }
+
+    /* ---------------------------------------------------------------- */
+    /* NET-RESILIENCE-OBS NETP1P: per-interface counters (were hollow).  */
+    /* A loopback datagram must increment the lo interface's tx + rx     */
+    /* packet/byte counters (netstat -i data).                          */
+    /* ---------------------------------------------------------------- */
+    {
+        netif_t* lo = netif_get("lo");
+        int has_lo = (lo != 0) ? 1 : 0, tx_inc = 0, rx_inc = 0, bytes_inc = 0;
+        if (lo) {
+            uint64_t tx0 = lo->tx_packets, rx0 = lo->rx_packets, b0 = lo->tx_bytes;
+            int u = sock_socket(SOCK_DGRAM);
+            if (u >= 0 && sock_bind(u, 48100) == 0) {
+                sock_sendto(u, "COUNTERS", 8, 0x7F000001u, 48100);
+                tx_inc    = (lo->tx_packets == tx0 + 1) ? 1 : 0;
+                rx_inc    = (lo->rx_packets == rx0 + 1) ? 1 : 0;
+                bytes_inc = (lo->tx_bytes > b0) ? 1 : 0;
+            }
+        }
+        sock_init();
+        kprintf("NETP1P: COUNTERS %s lo=%d tx=%d rx=%d bytes=%d\n",
+                (has_lo && tx_inc && rx_inc && bytes_inc) ? "PASS" : "FAIL",
+                has_lo, tx_inc, rx_inc, bytes_inc);
     }
 
     g_rig_active = 0;

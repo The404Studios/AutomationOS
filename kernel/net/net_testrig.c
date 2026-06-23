@@ -707,6 +707,61 @@ void net_testrig_selftest(void) {
                 staged, not_early, absorb_ack, expired);
     }
 
+    /* ---------------------------------------------------------------- */
+    /* TCP-ROBUST NETP1M: adaptive RTO (RFC 6298) via the RIG-TIME-HOOK. */
+    /* Stage one outstanding segment sent at T, fast-forward the clock    */
+    /* 2000ms, then ACK it: the estimator must take RTT~2000 (Karn-safe,  */
+    /* count==0) and set base_rto = srtt + 4*rttvar, clamped >= 200ms.    */
+    /* ---------------------------------------------------------------- */
+    {
+        extern void     tcp_rig_advance_ms(uint64_t);
+        extern void     tcp_rig_clock_reset(void);
+        extern uint64_t tcp_rig_now(void);
+        int staged = 0, sampled = 0, rto_ok = 0;
+        int fd = -1;
+        int l = sock_socket(SOCK_STREAM);
+        if (l >= 0 && sock_bind(l, 47014) == 0 && sock_listen(l, 2) == 0) {
+            g_cap_n = 0;
+            rig_inject_tcp(peer_ip, 43003, my_ip, 47014,
+                           13000, 0, TCP_SYN, 4096, NULL, 0);
+            if (g_cap_n >= 1) {
+                const tcp_hdr_t* th = (const tcp_hdr_t*)g_cap[0].seg;
+                uint32_t isn = net_ntohl(th->seq);
+                rig_inject_tcp(peer_ip, 43003, my_ip, 47014,
+                               13001, isn + 1, TCP_ACK, 4096, NULL, 0);
+                fd = sock_accept(l);
+            }
+        }
+        if (fd >= 0) {
+            sock_t* base = sock_table_base();
+            sock_t* c = base ? &base[fd] : (sock_t*)0;
+            if (c && c->state == TCP_ESTABLISHED) {
+                tcp_rig_clock_reset();
+                uint32_t S = c->snd_nxt;
+                c->rt_pending = true; c->rt_done = false;
+                c->rt_seq = S; c->rt_flags = TCP_ACK | TCP_PSH; c->rt_len = 8;
+                memcpy(c->rt_data, "RTTPROBE", 8);
+                c->rt_time_ms = tcp_rig_now();   /* segment "sent" at T */
+                c->snd_nxt = S + 8;
+                c->srtt_ms = 0; c->rttvar_ms = 0; c->base_rto_ms = 0;
+                staged = 1;
+
+                tcp_rig_advance_ms(2000);        /* RTT = ~2000ms */
+                rig_inject_tcp(peer_ip, 43003, my_ip, 47014,
+                               13001, S + 8, TCP_ACK, 4096, NULL, 0);
+                /* First sample: srtt = R (~2000), rttvar = R/2, base = 3R. */
+                sampled = (c->srtt_ms >= 2000 && c->srtt_ms <= 2100) ? 1 : 0;
+                rto_ok  = (c->base_rto_ms == c->srtt_ms + 4 * c->rttvar_ms &&
+                           c->base_rto_ms >= 200) ? 1 : 0;
+                tcp_rig_clock_reset();
+            }
+        }
+        sock_init();
+        kprintf("NETP1M: RTOEST %s staged=%d sampled=%d rto_ok=%d\n",
+                (staged && sampled && rto_ok) ? "PASS" : "FAIL",
+                staged, sampled, rto_ok);
+    }
+
     g_rig_active = 0;
 }
 

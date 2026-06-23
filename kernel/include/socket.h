@@ -202,6 +202,11 @@ struct sock {
 
     /* --- TCP-ROBUST 2MSL: when this socket entered TIME_WAIT (ms). --- */
     uint64_t    time_wait_ms;
+
+    /* --- TCP-ROBUST adaptive RTO (RFC 6298, integer ms) --- */
+    uint32_t    srtt_ms;       /* smoothed RTT (0 = no sample yet)        */
+    uint32_t    rttvar_ms;     /* RTT variance                            */
+    uint32_t    base_rto_ms;   /* current un-backed-off RTO (0 = none)    */
 };
 
 /* ------------------------------------------------------------------ */

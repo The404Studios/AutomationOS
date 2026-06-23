@@ -73,6 +73,7 @@
 #define TCP_CONNECT_MS        8000    /* total connect budget (ms)          */
 #define TCP_CLOSE_MS          4000    /* wait for FIN/ACK on close          */
 #define TCP_TIMEWAIT_MS       60000   /* 2MSL linger before TIME_WAIT->CLOSED*/
+#define TCP_RTO_MIN_MS        200     /* RFC 6298 RTO floor (ms)            */
 
 /* sock_poll lives in socket.c. */
 int sock_poll(void);
@@ -251,7 +252,9 @@ static void tcp_arm_retransmit(sock_t* s, uint8_t flags, uint32_t seq,
     s->rt_len        = (len > TCP_MSS) ? TCP_MSS : len;
     if (s->rt_len && data) memcpy(s->rt_data, data, s->rt_len);
     tcp_rt_count[idx] = 0;
-    tcp_rt_rto_ms[idx] = TCP_RTO_INIT_MS;
+    /* TCP-ROBUST adaptive RTO: seed from the smoothed estimate once we have one,
+     * else the conservative initial RTO. tcp_tick still doubles this on loss. */
+    tcp_rt_rto_ms[idx] = s->base_rto_ms ? s->base_rto_ms : TCP_RTO_INIT_MS;
     tcp_dupack[idx] = 0;
 }
 
@@ -268,6 +271,28 @@ static void tcp_disarm_retransmit(sock_t* s) {
 /* Send a pure ACK for the current rcv_nxt (no retransmit tracking). */
 static void tcp_send_ack(sock_t* s) {
     tcp_xmit(s, TCP_ACK, s->snd_nxt, s->rcv_nxt, NULL, 0);
+}
+
+/*
+ * TCP-ROBUST adaptive RTO (RFC 6298): fold one RTT sample into the smoothed
+ * estimator and recompute the base (un-backed-off) RTO. Integer fixed point;
+ * alpha=1/8, beta=1/4; clamped to [TCP_RTO_MIN_MS, TCP_RTO_MAX_MS]. Karn's
+ * rule (skip retransmitted segments) is enforced by the caller.
+ */
+static void tcp_rtt_update(sock_t* s, uint32_t r_ms) {
+    if (s->srtt_ms == 0) {
+        s->srtt_ms   = r_ms;          /* first sample */
+        s->rttvar_ms = r_ms / 2;
+    } else {
+        uint32_t srtt  = s->srtt_ms;
+        uint32_t delta = (srtt > r_ms) ? (srtt - r_ms) : (r_ms - srtt);
+        s->rttvar_ms = (3 * s->rttvar_ms + delta) / 4;   /* (1-1/4)var + 1/4|d| */
+        s->srtt_ms   = (7 * srtt + r_ms) / 8;            /* (1-1/8)srtt + 1/8 R  */
+    }
+    uint32_t rto = s->srtt_ms + 4 * s->rttvar_ms;
+    if (rto < TCP_RTO_MIN_MS) rto = TCP_RTO_MIN_MS;
+    if (rto > TCP_RTO_MAX_MS) rto = TCP_RTO_MAX_MS;
+    s->base_rto_ms = rto;
 }
 
 /*
@@ -948,6 +973,11 @@ void tcp_input(uint32_t src_ip, uint32_t dst_ip,
                 uint32_t end = s->rt_seq + s->rt_len +
                                ((s->rt_flags & (TCP_SYN | TCP_FIN)) ? 1u : 0u);
                 if (SEQ32_GEQ(ack, end)) {
+                    /* TCP-ROBUST adaptive RTO (RFC6298 + Karn): sample RTT only
+                     * for a segment that was NOT retransmitted (count==0), so an
+                     * ambiguous ACK never corrupts the estimator. */
+                    if (tcp_rt_count[idx] == 0)
+                        tcp_rtt_update(s, (uint32_t)(now_ms() - s->rt_time_ms));
                     tcp_disarm_retransmit(s);   /* also resets tcp_dupack[idx] */
                     s->snd_una = ack;
                 } else if (ack == s->snd_una && payload_len == 0 &&

@@ -50,10 +50,17 @@
 #define KEY_S      31
 #define KEY_D      32
 #define KEY_SPACE  57
+#define KEY_TAB    15
+#define KEY_C      46
+#define KEY_ENTER  28
+#define KEY_1       2
+#define KEY_2       3
 
-typedef unsigned int  u32;
-typedef int           i32;
-typedef unsigned long u64;
+typedef unsigned int   u32;
+typedef int            i32;
+typedef unsigned long  u64;
+typedef unsigned char  u8;
+typedef unsigned short u16;
 
 static inline long sc(long n, long a1, long a2, long a3, long a4, long a5, long a6)
 {
@@ -138,6 +145,49 @@ static u32 rng_next(void) { g_rng = g_rng * 1664525u + 1013904223u; return (g_rn
 static i32 g_hold_fwd, g_hold_back, g_hold_left, g_hold_right, g_hold_tl, g_hold_tr;
 static i32 g_shoot_held;
 static i32 g_have_mouse, g_last_mx;
+
+/* ---- Tarkov-lite systems: inventory grid + character attributes ---- */
+#define INV_COLS 6
+#define INV_ROWS 5
+#define INV_SLOTS (INV_COLS * INV_ROWS)
+#define ITEM_NONE   0
+#define ITEM_AMMO   1
+#define ITEM_MEDKIT 2
+typedef struct { u8 type; u16 count; } Slot;
+static Slot g_inv[INV_SLOTS];
+static i32  g_ui_mode;      /* 0 play, 1 inventory, 2 character */
+static i32  g_inv_sel;      /* selected inventory slot          */
+
+/* attributes: 0=STR 1=AGI 2=END 3=PER */
+static i32 g_attr[4];
+static i32 g_attr_pts;      /* unspent level-up points */
+static i32 g_char_sel;      /* selected attribute row  */
+static const char *ATTR_NAME[4] = { "STR", "AGI", "END", "PER" };
+
+/* derived stats (recomputed from attributes; read at the gameplay use-sites) */
+static i32 g_hp_max;
+static fx  g_move_spd;
+static i32 g_mag_size;
+static fx  g_hit_r;
+static i32 g_reload_steps;
+
+static void recompute_derived(void)
+{
+    g_hp_max       = 100 + g_attr[2] * 20;                       /* END  -> health     */
+    g_move_spd     = MOVE_SPD + fx_mul(fx_from_int(g_attr[1]), fx_ratio(1,100)); /* AGI -> speed */
+    g_mag_size     = MAG_SIZE + g_attr[0] * 3;                   /* STR  -> magazine   */
+    g_hit_r        = Z_HIT_R + fx_mul(fx_from_int(g_attr[3]), fx_ratio(10,100));  /* PER -> aim   */
+    g_reload_steps = RELOAD_STEPS - g_attr[1] * 5;              /* AGI  -> faster reload */
+    if (g_reload_steps < 20) g_reload_steps = 20;
+}
+
+static void inv_add(u8 type, u16 count)
+{
+    for (int i = 0; i < INV_SLOTS; i++)        /* stack onto an existing slot */
+        if (g_inv[i].type == type) { g_inv[i].count += count; return; }
+    for (int i = 0; i < INV_SLOTS; i++)        /* else first empty slot       */
+        if (g_inv[i].type == ITEM_NONE) { g_inv[i].type = type; g_inv[i].count = count; return; }
+}
 
 static fx fx_clamp(fx v, fx lo, fx hi) { return v < lo ? lo : (v > hi ? hi : v); }
 static fx dirx(i32 h) { return fx_sin(h & G3D_ANG_MASK); }
@@ -233,6 +283,7 @@ static void start_wave(int w)
     if (g_wave_size > MAX_Z) g_wave_size = MAX_Z;
     g_spawned = 0;
     g_spawn_timer = 0;
+    if (w > 1) g_attr_pts++;          /* a level-up point per cleared wave */
 }
 
 static void deadzone_reset(u64 seed)
@@ -240,11 +291,18 @@ static void deadzone_reset(u64 seed)
     g_rng = (u32)(seed ^ 0x9E3779B9u) | 1u;
     for (int i=0;i<MAX_Z;i++) { g_z[i].alive=0; g_z[i].health=0; g_z[i].hitflash=0; g_z[i].bite_cd=0; }
     g_px = 0; g_pz = 0; g_yaw = 0;
-    g_hp = 100; g_alive = 1; g_over = 0;
-    g_mag = MAG_SIZE; g_ammo = MAG_SIZE * 6;
+    for (int i = 0; i < 4; i++) g_attr[i] = 0;
+    g_attr_pts = 0; g_char_sel = 0;
+    recompute_derived();
+    g_hp = g_hp_max; g_alive = 1; g_over = 0;
+    g_mag = g_mag_size; g_ammo = g_mag_size * 6;
     g_reload = 0; g_fire_cd = 0; g_recoil = 0; g_muzzle = 0;
     g_kills = 0;
     g_have_mouse = 0;
+    g_ui_mode = 0; g_inv_sel = 0;
+    for (int i = 0; i < INV_SLOTS; i++) { g_inv[i].type = ITEM_NONE; g_inv[i].count = 0; }
+    inv_add(ITEM_AMMO, g_mag_size * 6);   /* starting kit */
+    inv_add(ITEM_MEDKIT, 2);
     start_wave(1);
 }
 
@@ -286,7 +344,11 @@ static void hurt_zombie(int i, int dmg)
     if (!z->alive) return;
     z->health -= dmg;
     z->hitflash = 5;
-    if (z->health <= 0) { z->alive = 0; g_kills++; }
+    if (z->health <= 0) {
+        z->alive = 0; g_kills++;
+        g_ammo += 3;                                   /* scavenge rounds */
+        if ((g_kills % 7) == 0) inv_add(ITEM_MEDKIT, 1);  /* occasional drop */
+    }
 }
 
 /* ====================================================================== *
@@ -302,10 +364,10 @@ static void player_step(void)
     fx fdx = dirx(g_yaw), fdz = dirz(g_yaw);          /* forward */
     fx rdx = dirz(g_yaw), rdz = -dirx(g_yaw);         /* right = forward rotated -90 */
     fx mf = 0, ms = 0;
-    if (g_hold_fwd)  mf = fx_add(mf,  MOVE_SPD);
-    if (g_hold_back) mf = fx_sub(mf,  MOVE_SPD);
-    if (g_hold_right)ms = fx_add(ms,  MOVE_SPD);
-    if (g_hold_left) ms = fx_sub(ms,  MOVE_SPD);
+    if (g_hold_fwd)  mf = fx_add(mf,  g_move_spd);   /* AGI-scaled */
+    if (g_hold_back) mf = fx_sub(mf,  g_move_spd);
+    if (g_hold_right)ms = fx_add(ms,  g_move_spd);
+    if (g_hold_left) ms = fx_sub(ms,  g_move_spd);
 
     fx nx = fx_add(g_px, fx_add(fx_mul(fdx, mf), fx_mul(rdx, ms)));
     fx nz = fx_add(g_pz, fx_add(fx_mul(fdz, mf), fx_mul(rdz, ms)));
@@ -318,14 +380,14 @@ static void player_step(void)
     if (g_muzzle > 0) g_muzzle--;
     if (g_fire_cd > 0) g_fire_cd--;
     if (g_reload > 0) { g_reload--; if (g_reload == 0) {
-        int need = MAG_SIZE - g_mag; if (need > g_ammo) need = g_ammo;
+        int need = g_mag_size - g_mag; if (need > g_ammo) need = g_ammo;
         g_mag += need; g_ammo -= need; } }
 }
 
 static void try_shoot(void)
 {
     if (!g_alive || g_fire_cd > 0 || g_reload > 0) return;
-    if (g_mag <= 0) { if (g_ammo > 0) g_reload = RELOAD_STEPS; return; }
+    if (g_mag <= 0) { if (g_ammo > 0) g_reload = g_reload_steps; return; }
     g_mag--; g_fire_cd = FIRE_COOLDN; g_recoil = fx_ratio(6,100); g_muzzle = 3;
 
     fx fdx = dirx(g_yaw), fdz = dirz(g_yaw);
@@ -337,7 +399,7 @@ static void try_shoot(void)
         if (t <= 0) continue;
         fx perp = fx_sub(fx_mul(dx, fdz), fx_mul(dz, fdx));   /* lookdir unit -> |perp| = miss dist */
         if (perp < 0) perp = -perp;
-        if (perp <= Z_HIT_R && t < bestt) { best = i; bestt = t; }
+        if (perp <= g_hit_r && t < bestt) { best = i; bestt = t; }   /* PER-scaled aim */
     }
     if (best >= 0) hurt_zombie(best, WEAPON_DMG);
 }
@@ -480,7 +542,7 @@ static void draw_hud(wl_window *win, int tw, int th)
     int bx=12, by=12, bw=200, bh=16;
     fill_rect(px,stride,tw,th, bx-2,by-2,bw+4,bh+4, 0xFF000000u);
     fill_rect(px,stride,tw,th, bx,by,bw,bh, 0xFF333A44u);
-    int hpw=(bw*(g_hp<0?0:g_hp))/100;
+    int hpw=(bw*(g_hp<0?0:g_hp))/(g_hp_max>0?g_hp_max:1);
     u32 hpc = g_hp>50?0xFF3CCB5Au:(g_hp>20?0xFFE9C46Au:0xFFE63946u);
     fill_rect(px,stride,tw,th, bx,by,hpw,bh, hpc);
     font_draw_string(px,stride,tw,th, bx+4,by, g_alive?"HP":"DEAD", 0xFFFFFFFFu);
@@ -520,6 +582,113 @@ static void draw_hud(wl_window *win, int tw, int th)
 }
 
 /* ====================================================================== *
+ *  Tarkov-lite UI: inventory + character/attribute menus
+ * ====================================================================== */
+static void use_item(int slot)
+{
+    if (slot < 0 || slot >= INV_SLOTS) return;
+    Slot *s = &g_inv[slot];
+    if (s->type == ITEM_AMMO && s->count > 0) {
+        g_ammo += s->count; s->type = ITEM_NONE; s->count = 0;
+    } else if (s->type == ITEM_MEDKIT && s->count > 0) {
+        g_hp += 30; if (g_hp > g_hp_max) g_hp = g_hp_max;
+        s->count--; if (s->count == 0) s->type = ITEM_NONE;
+    }
+}
+static void spend_point(int idx)
+{
+    if (g_attr_pts <= 0 || idx < 0 || idx > 3) return;
+    g_attr[idx]++; g_attr_pts--;
+    recompute_derived();
+    if (idx == 2) { g_hp += 20; if (g_hp > g_hp_max) g_hp = g_hp_max; }  /* END heal */
+}
+static void handle_ui_key(int a)
+{
+    if (a == KEY_ESC) { g_ui_mode = 0; return; }
+    if (g_ui_mode == 1) {            /* inventory grid */
+        if      (a == KEY_LEFT  && (g_inv_sel % INV_COLS))               g_inv_sel--;
+        else if (a == KEY_RIGHT && (g_inv_sel % INV_COLS) != INV_COLS-1) g_inv_sel++;
+        else if (a == KEY_UP    && g_inv_sel >= INV_COLS)                g_inv_sel -= INV_COLS;
+        else if (a == KEY_DOWN  && g_inv_sel + INV_COLS < INV_SLOTS)     g_inv_sel += INV_COLS;
+        else if (a == KEY_ENTER)                                         use_item(g_inv_sel);
+    } else if (g_ui_mode == 2) {     /* character */
+        if      (a == KEY_UP   && g_char_sel > 0) g_char_sel--;
+        else if (a == KEY_DOWN && g_char_sel < 3) g_char_sel++;
+        else if (a == KEY_ENTER)                  spend_point(g_char_sel);
+    }
+}
+static const char *item_label(u8 t)
+{
+    if (t == ITEM_AMMO)   return "AM";
+    if (t == ITEM_MEDKIT) return "MD";
+    return "..";
+}
+static void draw_ui_panel(wl_window *win)
+{
+    if (g_ui_mode == 0) return;
+    u32 *px = win->pixels; int stride = (int)(win->stride/4u);
+    int tw = (int)win->w, th = (int)win->h;
+    fill_rect(px,stride,tw,th, 0,0,tw,th, 0x99000000u);     /* dim the scene */
+    int pw = 372, ph = 250, pxx = (tw-pw)/2, pyy = (th-ph)/2;
+    fill_rect(px,stride,tw,th, pxx-2,pyy-2,pw+4,ph+4, 0xFF000000u);
+    fill_rect(px,stride,tw,th, pxx,pyy,pw,ph, 0xFF1A2230u);
+
+    if (g_ui_mode == 1) {
+        font_draw_string(px,stride,tw,th, pxx+12,pyy+8,
+                         "INVENTORY  arrows=move ENTER=use TAB=close", 0xFFFFFFFFu);
+        int gx0 = pxx+16, gy0 = pyy+34, cell = 56;
+        for (int r=0;r<INV_ROWS;r++) for (int c=0;c<INV_COLS;c++) {
+            int idx = r*INV_COLS+c, cxp = gx0+c*cell, cyp = gy0+r*cell;
+            u32 bg = (idx==g_inv_sel) ? 0xFF3A5A8Au : 0xFF2A3340u;
+            fill_rect(px,stride,tw,th, cxp,cyp,cell-6,cell-6, bg);
+            if (g_inv[idx].type != ITEM_NONE) {
+                char nb[12]; num_to_str(nb, g_inv[idx].count);
+                font_draw_string(px,stride,tw,th, cxp+4,cyp+4,  item_label(g_inv[idx].type), 0xFFFFE0A0u);
+                font_draw_string(px,stride,tw,th, cxp+4,cyp+22, nb, 0xFFCFE8FFu);
+            }
+        }
+    } else {
+        char nb[12];
+        font_draw_string(px,stride,tw,th, pxx+12,pyy+8,
+                         "CHARACTER  up/down ENTER=spend C=close", 0xFFFFFFFFu);
+        font_draw_string(px,stride,tw,th, pxx+12,pyy+30, "Points:", 0xFFAAB2BFu);
+        num_to_str(nb, g_attr_pts);
+        font_draw_string(px,stride,tw,th, pxx+84,pyy+30, nb, 0xFF3CCB5Au);
+        for (int i=0;i<4;i++) {
+            int ry = pyy+58 + i*22;
+            u32 col = (i==g_char_sel) ? 0xFFFFE060u : 0xFFCFE8FFu;
+            font_draw_string(px,stride,tw,th, pxx+16,ry, ATTR_NAME[i], col);
+            num_to_str(nb, g_attr[i]);
+            font_draw_string(px,stride,tw,th, pxx+74,ry, nb, col);
+        }
+        int dy = pyy+58+4*22+12;
+        font_draw_string(px,stride,tw,th, pxx+16,dy,    "HPmax", 0xFFAAB2BFu);
+        num_to_str(nb, g_hp_max);   font_draw_string(px,stride,tw,th, pxx+84,dy,    nb, 0xFFFFFFFFu);
+        font_draw_string(px,stride,tw,th, pxx+16,dy+18, "Mag",   0xFFAAB2BFu);
+        num_to_str(nb, g_mag_size); font_draw_string(px,stride,tw,th, pxx+84,dy+18, nb, 0xFFFFFFFFu);
+    }
+}
+
+/* Headless proof: attributes deterministically drive the derived gameplay stats. */
+static void systems_selftest(void)
+{
+    char nb[12];
+    for (int i=0;i<4;i++) g_attr[i]=0; recompute_derived();
+    int hp0=g_hp_max, mag0=g_mag_size;
+    g_attr[2]=1; g_attr[0]=1; recompute_derived();      /* +1 END, +1 STR */
+    int hp1=g_hp_max, mag1=g_mag_size;
+    int ok = (hp0==100 && mag0==MAG_SIZE && hp1==120 && mag1==MAG_SIZE+3);
+    for (int i=0;i<4;i++) g_attr[i]=0; recompute_derived();   /* reset to clean */
+    print("DEADZONE: systems "); print(ok ? "PASS" : "FAIL");
+    print(" inv=");  num_to_str(nb, INV_SLOTS); print(nb);
+    print(" hp0="); num_to_str(nb, hp0); print(nb);
+    print(" hp1="); num_to_str(nb, hp1); print(nb);
+    print(" mag0="); num_to_str(nb, mag0); print(nb);
+    print(" mag1="); num_to_str(nb, mag1); print(nb);
+    print("\n");
+}
+
+/* ====================================================================== *
  *  Entry
  * ====================================================================== */
 void _start(void)
@@ -543,6 +712,7 @@ void _start(void)
     deadzone_reset(now);
     u64 last=now, acc=0;
 
+    systems_selftest();          /* headless proof: attributes -> derived stats */
     print("DEADZONE: ready\n");
 
     for (;;) {
@@ -550,17 +720,25 @@ void _start(void)
         while (wl_poll_event(win,&kind,&a,&b,&cev)) {
             if (kind==WL_EVENT_RESIZE) { continue; }  /* low-res tgt static; blit adapts to win */
             if (kind==WL_EVENT_POINTER) {
-                if (g_have_mouse) {
-                    int dx = a - g_last_mx;
-                    g_yaw = (g_yaw + dx * MOUSE_SENS) & G3D_ANG_MASK;
+                if (g_ui_mode == 0) {
+                    if (g_have_mouse) {
+                        int dx = a - g_last_mx;
+                        g_yaw = (g_yaw + dx * MOUSE_SENS) & G3D_ANG_MASK;
+                    }
+                    g_shoot_held = (cev & 1);
+                    if (g_shoot_held) try_shoot();
+                } else {
+                    g_shoot_held = 0;
                 }
                 g_last_mx = a; g_have_mouse = 1;
-                g_shoot_held = (cev & 1);
-                if (g_shoot_held) try_shoot();
                 continue;
             }
             if (kind!=WL_EVENT_KEY) continue;
             i32 down=(b==1);
+            /* panel toggles work in any mode */
+            if (down && a==KEY_TAB) { g_ui_mode=(g_ui_mode==1)?0:1; continue; }
+            if (down && a==KEY_C)   { g_ui_mode=(g_ui_mode==2)?0:2; continue; }
+            if (g_ui_mode != 0) { if (down) handle_ui_key(a); continue; }
             switch (a) {
             case KEY_W: case KEY_UP:    g_hold_fwd=down; break;
             case KEY_S: case KEY_DOWN:  g_hold_back=down; break;
@@ -569,7 +747,7 @@ void _start(void)
             case KEY_LEFT:              g_hold_tl=down; break;     /* turn */
             case KEY_RIGHT:             g_hold_tr=down; break;
             case KEY_SPACE: if (down) try_shoot(); break;
-            case KEY_R: if (down && g_mag<MAG_SIZE && g_ammo>0 && g_reload==0) g_reload=RELOAD_STEPS; break;
+            case KEY_R: if (down && g_mag<g_mag_size && g_ammo>0 && g_reload==0) g_reload=g_reload_steps; break;
             case KEY_ESC: if (down) sc(SYS_EXIT,0,0,0,0,0,0); break;
             }
             if (a==KEY_R && down && g_over) deadzone_reset((u64)sc(SYS_GET_TICKS_MS,0,0,0,0,0,0));
@@ -581,7 +759,7 @@ void _start(void)
         int steps=0;
         while (acc>=STEP_MS && steps<5) {
             acc-=STEP_MS; steps++;
-            if (!g_over) {
+            if (!g_over && g_ui_mode==0) {   /* sim freezes while a panel is open */
                 player_step();
                 if (g_shoot_held) try_shoot();
                 zombies_step();
@@ -597,6 +775,7 @@ void _start(void)
         render_scene(&tgt, proj, light);   /* into the low-res PSX target */
         upscale_blit(win);                  /* nearest-upscale to the window */
         draw_hud(win, (int)win->w, (int)win->h);  /* HUD at full res on top */
+        draw_ui_panel(win);                 /* inventory / character overlay */
         wl_commit(win);
         sc(SYS_YIELD,0,0,0,0,0,0);
     }

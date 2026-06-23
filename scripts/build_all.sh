@@ -619,6 +619,10 @@ $LD /tmp/derby.o  /tmp/wlc.o /tmp/bf.o /tmp/g3d.o -o /tmp/derby.elf
 # deadzone: first-person zombie-survival shooter (g3d FPS + waves). Same link set.
 cc userspace/apps/deadzone/deadzone.c /tmp/deadzone.o
 $LD /tmp/deadzone.o /tmp/wlc.o /tmp/bf.o /tmp/g3d.o -o /tmp/deadzone.elf
+# deadzoned: the DeadZone authoritative multiplayer game SERVER. A pure-syscall
+# TCP daemon (no wl/g3d) -- links only crt0, exactly like httpd/nc.
+cc userspace/apps/deadzoned/deadzoned.c /tmp/deadzoned.o
+$LD /tmp/crt0.o /tmp/deadzoned.o -o /tmp/deadzoned.elf
 build_wl_app userspace/apps/sudoku/sudoku.c           sudoku
 build_wl_app userspace/apps/pacman/pacman.c           pacman
 build_wl_app userspace/apps/clockapp/clockapp.c       clockapp
@@ -695,7 +699,7 @@ $LD /tmp/crt0.o /tmp/cc.o \
     -o /tmp/cc.elf
 
 echo "[all] canary check (all must be 0):"
-for e in comp init filemanager calculator clock sysinfo settings sysmon uidemo dateapp applauncher taskman terminal editor snake paint synth tetris game2048 sheet notes calendar stopwatch mines piano dashboard welcome bench breakout pong invaders procmon soundtest solitaire aiconsole screenshot stress musicplayer ide bubbletd zombietd pacman clockapp forktest sigtest pollselftest threadtest reaploop forkfdtest forkregtest matmuljobs aibroker sed awk tar pkg make meminfo argvtest msgtest rpctest toolrun echoproof echoargs agenthost tool_read tool_ls tool_stat codeagent toolset_host chainhost modelbridge agentd tool_write tool_cc tool_exec tool_mkdir tool_mv tool_rm tool_spawn tool_kill tool_ps tool_shell tool_mouse tool_key tool_rollback ledgerver cockpit claudehost initrdp initrdalias floattest sleeptest prioritytest matbench tensortest cpuburn blk ps kill free uptime find diff cmp tee wcx xargs gzip cc nettest sockettest cpu1offload smpstress wget netman soundman cryptotest wlanctl wpasupp libtest ping nc netinfo netscan tcping dig httpget pktmon httpd traceroute arp grep head tail sort uniq cut tr nl du touch basename dirname uname hostname whoami date less hexdump lspci tlsprobe certtool dhcpc autodhcp apidemo gsignin js futextest epolltest sendfiletest perftest batchtest domtest htmltest csstest layouttest webtest browser2 webapitest cube3d ray derby deadzone chess asteroids sudoku photos startmenu controlcenter claudechat anthropic gametest exectest execchild; do
+for e in comp init filemanager calculator clock sysinfo settings sysmon uidemo dateapp applauncher taskman terminal editor snake paint synth tetris game2048 sheet notes calendar stopwatch mines piano dashboard welcome bench breakout pong invaders procmon soundtest solitaire aiconsole screenshot stress musicplayer ide bubbletd zombietd pacman clockapp forktest sigtest pollselftest threadtest reaploop forkfdtest forkregtest matmuljobs aibroker sed awk tar pkg make meminfo argvtest msgtest rpctest toolrun echoproof echoargs agenthost tool_read tool_ls tool_stat codeagent toolset_host chainhost modelbridge agentd tool_write tool_cc tool_exec tool_mkdir tool_mv tool_rm tool_spawn tool_kill tool_ps tool_shell tool_mouse tool_key tool_rollback ledgerver cockpit claudehost initrdp initrdalias floattest sleeptest prioritytest matbench tensortest cpuburn blk ps kill free uptime find diff cmp tee wcx xargs gzip cc nettest sockettest cpu1offload smpstress wget netman soundman cryptotest wlanctl wpasupp libtest ping nc netinfo netscan tcping dig httpget pktmon httpd traceroute arp grep head tail sort uniq cut tr nl du touch basename dirname uname hostname whoami date less hexdump lspci tlsprobe certtool dhcpc autodhcp apidemo gsignin js futextest epolltest sendfiletest perftest batchtest domtest htmltest csstest layouttest webtest browser2 webapitest cube3d ray derby deadzone deadzoned chess asteroids sudoku photos startmenu controlcenter claudechat anthropic gametest exectest execchild; do
     n=$(objdump -d /tmp/$e.elf 2>/dev/null | grep -c "fs:0x28" || true)
     echo "  $e=$n"
 done
@@ -717,7 +721,7 @@ if [ "${SELFHEAL:-0}" != "1" ]; then rm -f /tmp/ird/sbin/cwatchdog; fi
 rm -f /tmp/ird/sbin/browser /tmp/ird/bin/browser
 cp /tmp/comp.elf /tmp/ird/sbin/compositor
 cp /tmp/init.elf /tmp/ird/sbin/init
-for e in filemanager calculator clock sysinfo settings sysmon uidemo dateapp applauncher taskman terminal editor snake paint synth tetris game2048 sheet notes calendar stopwatch mines piano dashboard welcome bench breakout pong invaders procmon soundtest solitaire aiconsole screenshot stress musicplayer ide bubbletd startmenu controlcenter claudechat anthropic chess asteroids sudoku photos pacman clockapp zombietd forktest sigtest pollselftest threadtest reaploop forkfdtest forkregtest matmuljobs cube3d ray derby deadzone exectest; do
+for e in filemanager calculator clock sysinfo settings sysmon uidemo dateapp applauncher taskman terminal editor snake paint synth tetris game2048 sheet notes calendar stopwatch mines piano dashboard welcome bench breakout pong invaders procmon soundtest solitaire aiconsole screenshot stress musicplayer ide bubbletd startmenu controlcenter claudechat anthropic chess asteroids sudoku photos pacman clockapp zombietd forktest sigtest pollselftest threadtest reaploop forkfdtest forkregtest matmuljobs cube3d ray derby deadzone deadzoned exectest; do
     cp /tmp/$e.elf /tmp/ird/sbin/$e
 done
 [ "$IV_OK" = "1" ] && cp /tmp/imageviewer.elf /tmp/ird/sbin/imageviewer
@@ -891,6 +895,10 @@ cp userspace/apps/derby/derby.c /tmp/ird/usr/src/derby/ 2>/dev/null || true
 # project so the Semantic LEGO Map visualizes its FPS/zombie/wave/render structure.
 mkdir -p /tmp/ird/usr/src/deadzone
 cp userspace/apps/deadzone/deadzone.c /tmp/ird/usr/src/deadzone/ 2>/dev/null || true
+# DeadZone multiplayer SERVER source as its own IDE project (authoritative sim +
+# wire protocol + bind/listen/accept loop -- the "host a server" half).
+mkdir -p /tmp/ird/usr/src/deadzoned
+cp userspace/apps/deadzoned/deadzoned.c /tmp/ird/usr/src/deadzoned/ 2>/dev/null || true
 # IDE "complex" library: editable disk snippets (*.snip) loaded at IDE startup
 # (built-in core lives in ide_library.c; this dir extends it without recompiling).
 mkdir -p /tmp/ird/usr/lib/snippets

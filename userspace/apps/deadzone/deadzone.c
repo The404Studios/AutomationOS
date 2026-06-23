@@ -29,6 +29,9 @@
 #include "../../lib/wl/wl_client.h"
 #include "../../lib/font/bitfont.h"
 #include "../../lib/g3d/g3d.h"
+/* Multiplayer: the SAME wire protocol the authoritative server (deadzoned)
+ * speaks -- shared verbatim so client + server can never drift. */
+#include "../deadzoned/dzproto.h"
 
 #pragma GCC optimize ("O2", "no-stack-protector", "no-tree-loop-distribute-patterns")
 
@@ -691,6 +694,106 @@ static void systems_selftest(void)
 /* ====================================================================== *
  *  Entry
  * ====================================================================== */
+/* ===================================================================== */
+/* Multiplayer client -- connect to an authoritative deadzoned server and  */
+/* exchange the shared dzproto.h packets over TCP. The single-player game   */
+/* runs unchanged; these are the seam a co-op session uses. Live two-       */
+/* instance play is opt-in (no NIC/peer needed for single-player).          */
+/* ===================================================================== */
+#define SYS_SOCKET     51
+#define SYS_CONNECT    52
+#define SYS_SEND       53
+#define SYS_RECV       54
+#define SYS_CLOSE_SK   55
+#define SYS_SOCK_POLL  58
+#define MP_SOCK_STREAM  1
+#define MP_EAGAIN     (-11)
+#define DZ_GAME_PORT   27015
+
+typedef struct { long fd; dz_u32 seq; dz_u8 rx[2048]; dz_u32 rxn; } dz_client;
+
+/* Connect to a server. ip_be = packed big-endian a.b.c.d, port = bare number.
+ * Returns 0 on success (or connect-in-progress), negative on a hard error. */
+static int mp_connect(dz_client *c, dz_u32 ip_be, long port)
+{
+    c->fd = sc(SYS_SOCKET, MP_SOCK_STREAM, 0, 0, 0, 0, 0);
+    if (c->fd < 0) return -1;
+    long r = sc(SYS_CONNECT, c->fd, (long)ip_be, port, 0, 0, 0);
+    if (r < 0 && r != MP_EAGAIN) { sc(SYS_CLOSE_SK, c->fd, 0, 0, 0, 0, 0); return -2; }
+    c->seq = 0; c->rxn = 0;
+    return 0;
+}
+
+/* Send this frame's input to the server (bounded). Returns 0 / negative. */
+static int mp_send_input(dz_client *c, dz_i32 mx, dz_i32 my, dz_u32 yaw, dz_u32 buttons)
+{
+    dz_input_t in; in.seq = ++c->seq; in.move_x = mx; in.move_y = my;
+    in.yaw = yaw; in.buttons = buttons;
+    dz_u8 b[DZ_INPUT_BYTES]; dz_input_encode(b, &in);
+    long off = 0; int guard = 0;
+    while (off < DZ_INPUT_BYTES) {
+        long n = sc(SYS_SEND, c->fd, (long)(b + off), DZ_INPUT_BYTES - off, 0, 0, 0);
+        if (n > 0) { off += n; continue; }
+        if (n == MP_EAGAIN) { sc(SYS_YIELD,0,0,0,0,0,0); if(++guard>100000) return -1; continue; }
+        return -1;
+    }
+    return 0;
+}
+
+/* Drain pending bytes, decode complete snapshots, keep the latest in `out`.
+ * Returns 1 if at least one fresh snapshot was decoded this call. */
+static int mp_poll_snapshot(dz_client *c, dz_snapshot_t *out)
+{
+    int got = 0;
+    sc(SYS_SOCK_POLL, 0, 0, 0, 0, 0, 0);
+    for (;;) {
+        if (c->rxn >= sizeof(c->rx)) c->rxn = 0;            /* defensive resync */
+        long n = sc(SYS_RECV, c->fd, (long)(c->rx + c->rxn),
+                    (long)(sizeof(c->rx) - c->rxn), 0, 0, 0);
+        if (n <= 0) break;                                  /* EAGAIN / closed  */
+        c->rxn += (dz_u32)n;
+        for (;;) {
+            if (c->rxn < 4u * DZ_SNAP_HDR_U32) break;
+            dz_u32 need = dz_snap_bytes(dz_get_u32(c->rx + 12), dz_get_u32(c->rx + 16));
+            if (need == 0 || need > sizeof(c->rx)) { c->rxn = 0; break; }
+            if (c->rxn < need) break;
+            if (dz_snap_decode(c->rx, need, out)) got = 1;
+            dz_u32 rem = c->rxn - need;
+            for (dz_u32 k = 0; k < rem; k++) c->rx[k] = c->rx[need + k];
+            c->rxn = rem;
+        }
+    }
+    return got;
+}
+
+/* Headless proof that THIS binary speaks the shared protocol the server uses:
+ * encode/decode both packet families through dzproto.h and assert round-trip.
+ * Runs at launch like systems_selftest(); no network/peer required. */
+static void mp_selftest(void)
+{
+    (void)mp_connect; (void)mp_send_input; (void)mp_poll_snapshot;   /* link-keep */
+
+    dz_input_t in, in2;
+    in.seq = 42; in.move_x = -9; in.move_y = 12; in.yaw = 300; in.buttons = DZ_BTN_FIRE;
+    dz_u8 ib[DZ_INPUT_BYTES]; dz_input_encode(ib, &in);
+    if (!dz_input_decode(ib, &in2) || in2.seq != in.seq || in2.move_x != in.move_x
+        || in2.buttons != in.buttons) { print("DEADZONE: mp FAIL input\n"); return; }
+
+    static dz_snapshot_t s, s2;
+    s.tick = 5; s.wave = 2; s.n_players = 2; s.n_zombies = 5;
+    for (dz_u32 i = 0; i < s.n_players; i++) {
+        s.p[i].id = i; s.p[i].x = 10 + (dz_i32)i; s.p[i].y = 20; s.p[i].hp = 88;
+        s.p[i].yaw = 1; s.p[i].score = i;
+    }
+    for (dz_u32 i = 0; i < s.n_zombies; i++) { s.z[i].x = (dz_i32)i*3; s.z[i].y = (dz_i32)i; s.z[i].state = 1; }
+    static dz_u8 sb[DZ_SNAP_MAX_BYTES];
+    dz_u32 n = dz_snap_encode(&s, sb, sizeof(sb));
+    if (!n || !dz_snap_decode(sb, n, &s2) || s2.n_zombies != s.n_zombies
+        || s2.p[1].x != s.p[1].x) { print("DEADZONE: mp FAIL snap\n"); return; }
+
+    print("DEADZONE: mp PASS (dzproto client wire ok)\n");
+}
+
 void _start(void)
 {
     if (wl_connect() != 0) { print("DEADZONE: wl_connect FAILED\n"); for(;;) sc(SYS_YIELD,0,0,0,0,0,0); }
@@ -713,6 +816,7 @@ void _start(void)
     u64 last=now, acc=0;
 
     systems_selftest();          /* headless proof: attributes -> derived stats */
+    mp_selftest();               /* headless proof: client speaks dzproto wire  */
     print("DEADZONE: ready\n");
 
     for (;;) {

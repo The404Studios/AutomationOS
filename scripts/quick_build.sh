@@ -544,6 +544,8 @@ compile kernel/net/net.c                      c_net
 compile kernel/drivers/hda.c                  c_hda
 compile kernel/drivers/hda_stream.c           c_hda_stream
 compile kernel/drivers/audio/audio_core.c     c_audio_core
+# AUDIO-FMT: PCM format/channel/sample-rate converter (FPU-free). Pure utility.
+compile kernel/drivers/audio/audio_fmt.c      c_audio_fmt
 compile kernel/drivers/audio/audio_tone.c     c_audio_tone
 compile kernel/net/route.c                    c_route
 compile kernel/net/netif.c                   c_netif

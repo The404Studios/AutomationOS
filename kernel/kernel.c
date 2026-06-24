@@ -967,6 +967,12 @@ void kernel_main(void* raw_info) {
          * (N>0 OR D>0) proves the software mixer drives real audio hardware. */
         extern int audio_play_mixed(uint32_t, uint32_t, uint32_t);
         audio_play_mixed(440, 660, 200);
+        /* AUDIO B1: gapless on_bcis refill. Streams a continuous sine across
+         * multiple buffer cycles via the per-chunk refill. Marker
+         *   "AUDIO: stream done bcis=<N> refills=<R> lpib_adv=<D>"
+         * R>8 proves the refill fired repeatedly across a buffer wrap. */
+        extern int audio_stream_selftest(void);
+        audio_stream_selftest();
     }
 #endif
 #else

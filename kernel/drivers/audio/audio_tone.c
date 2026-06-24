@@ -331,6 +331,97 @@ int audio_play_mixed(uint32_t f1, uint32_t f2, uint32_t ms) {
     return 0;
 }
 
+#ifdef HDA_ENABLE
+/* ====================================================================== *
+ *  AUDIO B1: on_bcis gapless refill -- the streaming keystone.
+ *
+ *  The DMA plays the 8x8KB BDL cyclically, raising one BCIS per chunk. The IRQ
+ *  handler (hda_stream.c) calls refill_cb for the just-completed chunk; we fill
+ *  it with the NEXT slice of a 48kHz/16-bit/stereo sine whose phase PERSISTS
+ *  across chunks. So the played waveform is continuous far beyond the 64 KB
+ *  buffer -- genuine gapless streaming, not a looped buffer. This is the B0->B1
+ *  mechanism a userspace SYS_AUDIO_STREAM_WRITE will later feed from a ring.
+ * ====================================================================== */
+static volatile uint32_t g_stream_phase = 0;   /* brad phase (IRQ-written)      */
+static uint32_t g_stream_inc = 0;              /* per-frame phase increment     */
+
+/* Runs in the HDA IRQ on each BCIS. Bounded fill + sfence only -- no alloc,
+ * no codec verbs, no locks. */
+static void stream_refill_sine(void* sptr, uint32_t chunk_idx) {
+    hda_stream_t* stream = (hda_stream_t*)sptr;
+    if (!stream || !stream->buffer_virt || stream->chunk_size == 0) return;
+    int16_t* dst = (int16_t*)((uint8_t*)stream->buffer_virt + chunk_idx * stream->chunk_size);
+    uint32_t frames = stream->chunk_size / 4;        /* 16-bit stereo = 4 B/frame */
+    uint32_t ph = g_stream_phase;
+    for (uint32_t f = 0; f < frames; f++) {
+        int32_t s = isin(ph) / 2;                    /* ~50% amplitude            */
+        ph += g_stream_inc;
+        dst[f*2+0] = (int16_t)s;
+        dst[f*2+1] = (int16_t)s;
+    }
+    g_stream_phase = ph;
+    asm volatile("sfence" ::: "memory");             /* visible before DMA laps it */
+}
+
+/**
+ * audio_stream_selftest - prove on_bcis gapless refill.
+ *
+ * Streams a continuous sine via the per-chunk on_bcis refill for long enough to
+ * cross multiple buffer cycles (>8 refills == >1 full 64 KB cycle, so the refill
+ * fired repeatedly across a wrap). Marker:
+ *   "AUDIO: stream done bcis=<delta> refills=<R> lpib_adv=<D>"
+ * PASS = R>8 (gapless refill ran across a wrap) AND D>0 (DMA actually moved).
+ */
+int audio_stream_selftest(void) {
+    hda_controller_t* ctrl = NULL;
+    hda_codec_t* codec = NULL;
+    if (tone_prepare_stream(&ctrl, &codec) != 0) return -1;
+
+    /* 440 Hz continuous sine */
+    g_stream_inc   = (uint32_t)(((uint64_t)440 * 65536ULL) / 48000ULL);
+    g_stream_phase = 0;
+
+    /* Prefill every chunk once so the first cycle plays real audio before any
+     * chunk's first on_bcis refill. */
+    g_tone_stream->position     = 0;
+    for (uint32_t i = 0; i < g_tone_stream->bdl_entries; i++)
+        stream_refill_sine(g_tone_stream, i);
+    g_tone_stream->refill_next  = 0;
+    g_tone_stream->refill_count = 0;
+
+    hda_set_volume(codec, ctrl, 80);
+    hda_set_mute(codec, ctrl, false);
+
+    uint32_t bcis_before = g_hda_bcis;
+    g_tone_stream->refill_cb = stream_refill_sine;   /* arm BEFORE start */
+    serial_write("AUDIO: streaming (gapless on_bcis refill)\n", 42);
+    if (hda_stream_start(ctrl, g_tone_stream) != 0) {
+        g_tone_stream->refill_cb = 0;
+        serial_write("AUDIO: stream: start failed\n", 28);
+        return -1;
+    }
+
+    uint32_t lpib_before = hda_sd_read32(ctrl, g_tone_stream->stream_num, HDA_SD_LPIB);
+    hda_msleep(600);                                  /* ~14 chunk completions */
+    uint32_t lpib_after  = hda_sd_read32(ctrl, g_tone_stream->stream_num, HDA_SD_LPIB);
+    uint32_t lpib_delta  = lpib_after - lpib_before;
+    uint32_t bcis_delta  = g_hda_bcis - bcis_before;
+    uint32_t refills     = g_tone_stream->refill_count;
+
+    g_tone_stream->refill_cb = 0;                     /* disarm before stop */
+    hda_stream_stop(ctrl, g_tone_stream);
+
+    serial_write("AUDIO: stream done bcis=", 24);
+    tone_serial_u32(bcis_delta);
+    serial_write(" refills=", 9);
+    tone_serial_u32(refills);
+    serial_write(" lpib_adv=", 10);
+    tone_serial_u32(lpib_delta);
+    serial_putchar('\n');
+    return 0;
+}
+#endif /* HDA_ENABLE */
+
 /**
  * audio_play_pcm - play raw interleaved 16-bit stereo PCM.
  *

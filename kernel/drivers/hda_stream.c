@@ -194,6 +194,15 @@ int hda_stream_setup(hda_controller_t* ctrl, hda_stream_t* stream,
     // Use 8 entries of 8KB each = 64KB total
     stream->bdl_entries = 8;
     uint32_t chunk_size = stream->buffer_size / stream->bdl_entries;
+#ifdef HDA_ENABLE
+    /* AUDIO B1: reset the gapless-streaming bookkeeping for this (re)setup. The
+     * caller arms refill_cb AFTER setup to enable streaming; default it off so
+     * the plain tone/PCM paths are unaffected. */
+    stream->chunk_size   = chunk_size;
+    stream->refill_next  = 0;
+    stream->refill_count = 0;
+    stream->refill_cb    = 0;
+#endif
 
     for (uint32_t i = 0; i < stream->bdl_entries; i++) {
         stream->bdl_virt[i].address = (uint64_t)buffer_phys + (i * chunk_size);
@@ -595,9 +604,24 @@ void hda_irq_handler(void) {
                     // Buffer completed: the DMA engine finished one BDL entry.
                     // Bump the global proof counter (AUDIO-IRQ) -- a non-zero
                     // value proves the stream DMA engine advanced and a real
-                    // interrupt was raised + serviced.  Could also trigger a
-                    // refill callback here for streaming playback.
+                    // interrupt was raised + serviced.
                     g_hda_bcis++;
+#ifdef HDA_ENABLE
+                    /* AUDIO B1 gapless refill: the chunk that just completed is
+                     * now free -- the DMA has moved to the next of the 8 BDL
+                     * entries and will not replay this one until it laps the whole
+                     * 64 KB buffer (~300 ms later), so refilling it now is race-
+                     * free against the actively-playing chunk. refill_cb fills it
+                     * with the next slice of audio -> continuous playback past the
+                     * initial buffer. IRQ-context: the callback must be bounded +
+                     * allocation/verb/lock-free (pure fill + sfence). */
+                    if (stream->refill_cb) {
+                        uint32_t idx = stream->refill_next;
+                        stream->refill_cb(stream, idx);
+                        stream->refill_next = (idx + 1) % stream->bdl_entries;
+                        stream->refill_count++;
+                    }
+#endif
                 }
 
                 // Handle FIFO error

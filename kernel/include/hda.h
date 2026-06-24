@@ -250,6 +250,17 @@ typedef struct {
 
     // Stream position
     uint32_t position;                    // Current position in buffer (bytes)
+#ifdef HDA_ENABLE
+    /* AUDIO B1 gapless streaming: the DMA plays the 8-entry BDL cyclically and
+     * raises one BCIS per chunk; on each BCIS the IRQ handler refills the
+     * just-completed chunk via refill_cb, so playback continues past the initial
+     * 64 KB (true gapless streaming, not a looped buffer). All HDA_ENABLE-gated
+     * so the default (HDA-off) kernel is byte-identical. */
+    uint32_t chunk_size;                  // bytes per BDL chunk (buffer_size/bdl_entries)
+    uint32_t refill_next;                 // next chunk index on_bcis will refill
+    volatile uint32_t refill_count;       // chunks refilled (proof counter)
+    void (*refill_cb)(void* stream, uint32_t chunk_idx);  // NULL = not streaming
+#endif
 } hda_stream_t;
 
 // HDA Controller

@@ -592,20 +592,157 @@ static mat4 camera_view(void)
     return mat4_lookat(eye, tgt, up);
 }
 
+/* ====================================================================== *
+ *  VISUAL OVERHAUL: generated pixel-art assets + billboard sprite rendering.
+ *  No GPU, no texture-mapping in g3d -- so enemies/loot are drawn as billboarded
+ *  image sprites blitted into the low-res framebuffer (DOOM-style), painter-
+ *  sorted far->near with distance fog. Assets are generated procedurally at
+ *  launch (gen_assets) into static ARGB buffers; alpha 0 == transparent.
+ * ====================================================================== */
+#define ZSPR_W 16
+#define ZSPR_H 28
+static u32 g_spr_zombie[ZSPR_W * ZSPR_H];
+#define LSPR_W 10
+#define LSPR_H 10
+static u32 g_spr_loot[LSPR_W * LSPR_H];   /* white base, multiplied by a per-type tint */
+
+static void spr_rect(u32 *s, int w, int h, int x, int y, int rw, int rh, u32 c) {
+    for (int yy = y; yy < y + rh; yy++) { if (yy < 0 || yy >= h) continue;
+        for (int xx = x; xx < x + rw; xx++) { if (xx < 0 || xx >= w) continue; s[yy*w + xx] = c; } }
+}
+
+static void gen_assets(void) {
+    for (int i = 0; i < ZSPR_W*ZSPR_H; i++) g_spr_zombie[i] = 0;       /* transparent */
+    u32 skin = 0xFF6E8E4Eu, skinD = 0xFF566E3Cu, shirt = 0xFF34402Fu,
+        pants = 0xFF24242Au, blood = 0xFF7A1E1Eu;
+    /* head */
+    spr_rect(g_spr_zombie, ZSPR_W, ZSPR_H, 5, 2, 6, 6, skin);
+    spr_rect(g_spr_zombie, ZSPR_W, ZSPR_H, 5, 2, 2, 6, skinD);        /* left shade */
+    g_spr_zombie[3*ZSPR_W + 6] = 0xFFB01010u;                         /* eyes (glow) */
+    g_spr_zombie[3*ZSPR_W + 9] = 0xFFB01010u;
+    g_spr_zombie[6*ZSPR_W + 7] = blood;                              /* mouth */
+    /* torso: torn shirt + exposed wound */
+    spr_rect(g_spr_zombie, ZSPR_W, ZSPR_H, 4, 8, 8, 11, shirt);
+    spr_rect(g_spr_zombie, ZSPR_W, ZSPR_H, 4, 8, 2, 11, skinD);
+    spr_rect(g_spr_zombie, ZSPR_W, ZSPR_H, 7, 12, 3, 4, skin);
+    g_spr_zombie[13*ZSPR_W + 8] = blood;
+    /* arms reaching (down the sides) */
+    spr_rect(g_spr_zombie, ZSPR_W, ZSPR_H, 1, 9, 3, 8, skin);
+    spr_rect(g_spr_zombie, ZSPR_W, ZSPR_H, 12, 9, 3, 8, skinD);
+    /* legs */
+    spr_rect(g_spr_zombie, ZSPR_W, ZSPR_H, 5, 19, 3, 9, pants);
+    spr_rect(g_spr_zombie, ZSPR_W, ZSPR_H, 8, 19, 3, 9, pants);
+    /* loot crate: white base (tinted per type at blit) + dark border */
+    for (int i = 0; i < LSPR_W*LSPR_H; i++) g_spr_loot[i] = 0xFFFFFFFFu;
+    spr_rect(g_spr_loot, LSPR_W, LSPR_H, 0, 0, LSPR_W, 1, 0xFF606060u);
+    spr_rect(g_spr_loot, LSPR_W, LSPR_H, 0, LSPR_H-1, LSPR_W, 1, 0xFF303030u);
+    spr_rect(g_spr_loot, LSPR_W, LSPR_H, 0, 0, 1, LSPR_H, 0xFF505050u);
+    spr_rect(g_spr_loot, LSPR_W, LSPR_H, LSPR_W-1, 0, 1, LSPR_H, 0xFF303030u);
+    spr_rect(g_spr_loot, LSPR_W, LSPR_H, 4, 0, 2, LSPR_H, 0xFF707070u); /* strap */
+}
+
+/* Nearest-scaled sprite blit into the low-res framebuffer, multiplied by `mul`
+ * (0xFFRRGGBB; use 0xFFFFFFFF for unchanged). Strictly bounds-clipped -> never
+ * writes outside g_lowfb (a wrong projection looks wrong but cannot crash). */
+static void blit_spr(const u32 *spr, int sw, int sh, int dx, int dy, int dw, int dh, u32 mul) {
+    if (dw <= 0 || dh <= 0) return;
+    int mr = (mul>>16)&0xFF, mg = (mul>>8)&0xFF, mb = mul&0xFF;
+    for (int py = dy; py < dy + dh; py++) {
+        if (py < 0 || py >= LOWH) continue;
+        int sy = (py - dy) * sh / dh; if (sy < 0) sy = 0; if (sy >= sh) sy = sh - 1;
+        u32 *row = g_lowfb + (u64)py * LOWW;
+        for (int px = dx; px < dx + dw; px++) {
+            if (px < 0 || px >= LOWW) continue;
+            int sx = (px - dx) * sw / dw; if (sx < 0) sx = 0; if (sx >= sw) sx = sw - 1;
+            u32 c = spr[sy*sw + sx];
+            if (!(c >> 24)) continue;                                /* transparent */
+            int cr = (c>>16)&0xFF, cg = (c>>8)&0xFF, cb = c&0xFF;
+            row[px] = 0xFF000000u | (((cr*mr)/255)<<16) | (((cg*mg)/255)<<8) | ((cb*mb)/255);
+        }
+    }
+}
+
+/* Apocalyptic gradient sky filled into the low-res framebuffer (replaces the
+ * flat clear). The ground mesh paints over the lower half. */
+static void sky_fill(g3d_target *t) {
+    int half = LOWH/2; if (half < 1) half = 1;
+    for (int y = 0; y < LOWH; y++) {
+        int yy = y > half ? half : y;
+        int r = 10 + (62-10)*yy/half, g = 12 + (58-12)*yy/half, b = 20 + (40-20)*yy/half;
+        u32 c = 0xFF000000u | ((u32)r<<16) | ((u32)g<<8) | (u32)b;
+        u32 *row = t->pixels + (g3d_i32)y * t->stride;
+        for (int x = 0; x < t->w; x++) row[x] = c;
+    }
+}
+
+static u32 loot_color(u8 type) {
+    switch (type) {
+        case ITEM_AMMO:         return 0xFFE9C46Au;   /* amber  */
+        case ITEM_MEDKIT:       return 0xFFE63946u;   /* red    */
+        case ITEM_ARMOR:        return 0xFF5A8AE6u;   /* blue   */
+        case ITEM_WEAPON_PARTS: return 0xFF4FD0C0u;   /* cyan   */
+        default:                return 0xFFB0B0B0u;   /* scrap/grey */
+    }
+}
+
+/* Project a world point through the view matrix into screen space (pinhole;
+ * camera looks down -Z). Returns 1 + fills sx/syb/depth if in front. */
+static int project_pt(mat4 view, fx wx, fx wy, fx wz, fx focal, int *sx, int *syb, fx *depth) {
+    vec3 e = mat4_mul_point(view, v3(wx, wy, wz));
+    fx d = -e.z;
+    if (d <= fx_ratio(2,10)) return 0;                /* behind / too near */
+    *sx  = LOWW/2 + fx_to_int(fx_mul(fx_div(e.x, d), focal));
+    *syb = LOWH/2 - fx_to_int(fx_mul(fx_div(e.y, d), focal));
+    *depth = d;
+    return 1;
+}
+
 static void render_scene(g3d_target *tgt, mat4 proj, vec3 light)
 {
     mat4 view = camera_view();
     mat4 vp = mat4_mul(proj, view);
-    g3d_clear(tgt, BG_COLOR);
+    sky_fill(tgt);                                    /* gradient sky */
     g3d_clear_depth(tgt);
     g3d_draw_mesh(tgt, g_world, g_nworld, mat4_identity(), vp, light);
-    for (int i=0;i<MAX_Z;i++) {
+
+    /* focal length for billboard projection (matches the 70-deg fov in _start) */
+    fx tan35 = fx_div(fx_sin(g3d_deg(35)), fx_cos(g3d_deg(35)));
+    fx focal = fx_div(fx_from_int(LOWW/2), tan35);
+
+    /* collect alive zombies + painter-sort far->near (MAX_Z small) */
+    int order[MAX_Z]; fx depth[MAX_Z]; int nz = 0;
+    for (int i = 0; i < MAX_Z; i++) {
         if (!g_z[i].alive) continue;
-        u32 col = g_z[i].hitflash ? tint_white(0xFF4FAE5Au, 150) : 0xFF4FAE5Au;
-        for (int t=0;t<12;t++) g_zmesh[t].color = col;
-        mat4 model = mat4_mul(mat4_translate(g_z[i].x, Z_HY, g_z[i].z), mat4_rotate_y(g_z[i].head));
-        mat4 mvp = mat4_mul(vp, model);
-        g3d_draw_mesh(tgt, g_zmesh, 12, model, mvp, light);
+        int sx, syb; fx d;
+        if (!project_pt(view, g_z[i].x, 0, g_z[i].z, focal, &sx, &syb, &d)) continue;
+        order[nz] = i; depth[nz] = d; nz++;
+    }
+    for (int a = 1; a < nz; a++) {
+        int oi = order[a]; fx od = depth[a]; int b = a - 1;
+        while (b >= 0 && depth[b] < od) { order[b+1]=order[b]; depth[b+1]=depth[b]; b--; }
+        order[b+1] = oi; depth[b+1] = od;
+    }
+    for (int q = 0; q < nz; q++) {
+        int i = order[q]; int sx, syb; fx d;
+        if (!project_pt(view, g_z[i].x, 0, g_z[i].z, focal, &sx, &syb, &d)) continue;
+        int h = fx_to_int(fx_div(fx_mul(fx_ratio(16,10), focal), d));
+        if (h < 6) h = 6; if (h > 420) h = 420;
+        int w = h * ZSPR_W / ZSPR_H;
+        int fog = 255 - fx_to_int(d) * 13; if (fog < 70) fog = 70; if (fog > 255) fog = 255;
+        u32 mul = g_z[i].hitflash ? 0xFFFFFFFFu
+                                  : (0xFF000000u | ((u32)fog<<16) | ((u32)fog<<8) | (u32)fog);
+        blit_spr(g_spr_zombie, ZSPR_W, ZSPR_H, sx - w/2, syb - h, w, h, mul);
+    }
+
+    /* loot pickups as billboarded crates on the ground (bob up/down) */
+    for (int i = 0; i < MAX_PICKUPS; i++) {
+        if (!g_pickup[i].alive) continue;
+        int sx, syb; fx d;
+        if (!project_pt(view, g_pickup[i].x, fx_ratio(12,100), g_pickup[i].z, focal, &sx, &syb, &d)) continue;
+        int h = fx_to_int(fx_div(fx_mul(fx_ratio(5,10), focal), d));
+        if (h < 4) h = 4; if (h > 140) h = 140;
+        int bob = (g_pickup[i].bob / 6) % 5; if (bob > 2) bob = 4 - bob;
+        blit_spr(g_spr_loot, LSPR_W, LSPR_H, sx - h/2, syb - h - bob, h, h, loot_color(g_pickup[i].type));
     }
 }
 
@@ -644,6 +781,21 @@ static void draw_hud(wl_window *win, int tw, int th)
     fill_rect(px,stride,tw,th, bx,by,hpw,bh, hpc);
     font_draw_string(px,stride,tw,th, bx+4,by, g_alive?"HP":"DEAD", 0xFFFFFFFFu);
 
+    /* weapon durability bar (below HP) */
+    int dby=by+bh+6, dbw=140, dbh=8;
+    fill_rect(px,stride,tw,th, bx-2,dby-2,dbw+4,dbh+4, 0xFF000000u);
+    fill_rect(px,stride,tw,th, bx,dby,dbw,dbh, 0xFF333A44u);
+    int durw=(dbw*(g_weap_dur<0?0:g_weap_dur))/WEAP_DUR_MAX;
+    u32 durc=g_weap_dur>WEAP_WORN_THRESH?0xFF8AB4F8u:0xFFE9C46Au;
+    fill_rect(px,stride,tw,th, bx,dby,durw,dbh, durc);
+    font_draw_string(px,stride,tw,th, bx+dbw+8,dby-3, "DUR", 0xFFAAB2BFu);
+    /* armor + scrap readout */
+    { int p=0; const char *ar="ARMOR "; while(ar[p]){lbl[p]=ar[p];p++;}
+      char b2[24]; num_to_str(b2,g_armor); int kk=0; while(b2[kk]){lbl[p++]=b2[kk++];}
+      const char *sl="  SCRAP "; int mm=0; while(sl[mm]){lbl[p++]=sl[mm++];}
+      num_to_str(b2,g_scrap); kk=0; while(b2[kk]){lbl[p++]=b2[kk++];} lbl[p]=0;
+      font_draw_string(px,stride,tw,th, bx, dby+dbh+6, lbl, 0xFFBFC7D2u); }
+
     /* ammo bottom-right */
     n=0; const char *al="AMMO "; while(al[n]){lbl[n]=al[n];n++;}
     num_to_str(buf, g_mag); int k=0; while(buf[k]){lbl[n++]=buf[k++];}
@@ -659,10 +811,19 @@ static void draw_hud(wl_window *win, int tw, int th)
     num_to_str(buf, g_kills); k=0; while(buf[k]){lbl[n++]=buf[k++];} lbl[n]=0;
     font_draw_string(px,stride,tw,th, tw-12-(int)k_strlen(lbl)*FONT_W, 14, lbl, 0xFFFFFFFFu);
 
-    /* simple gun viewmodel (2D) bottom-center */
-    int gx=tw/2-10, gy=th-70;
-    fill_rect(px,stride,tw,th, gx,gy,20,60, 0xFF202830u);
-    fill_rect(px,stride,tw,th, gx-6,gy+40,32,20, 0xFF2A343Eu);
+    /* weapon viewmodel (bottom-center) with a recoil kick + muzzle flash */
+    int kick = g_muzzle>0 ? 7 : (g_recoil>0 ? 3 : 0);
+    int gx=tw/2-14, gy=th-82+kick;
+    fill_rect(px,stride,tw,th, gx-10,gy+46,46,26, 0xFF222A33u);   /* stock/grip   */
+    fill_rect(px,stride,tw,th, gx,gy,28,60, 0xFF1A1F26u);        /* receiver     */
+    fill_rect(px,stride,tw,th, gx+3,gy+2,4,56, 0xFF2A323Cu);     /* highlight     */
+    fill_rect(px,stride,tw,th, gx+9,gy-26,9,30, 0xFF12161Cu);    /* barrel        */
+    fill_rect(px,stride,tw,th, gx+20,gy+12,11,18, 0xFF2A333Du);  /* magazine      */
+    if (g_muzzle>0) {                                            /* muzzle flash  */
+        int mfx=gx+9, mfy=gy-30;
+        fill_rect(px,stride,tw,th, mfx-5,mfy-5,19,14, 0xFFFFE060u);
+        fill_rect(px,stride,tw,th, mfx,mfy-11,9,24, 0xFFFFF4B0u);
+    }
 
     font_draw_string(px,stride,tw,th, 12, th-FONT_H-8,
                      "WASD move  MOUSE/A-D look(arrows)  LMB/SPACE fire  R reload  ESC quit",
@@ -937,6 +1098,7 @@ void _start(void)
 
     build_world();
     box_mesh(g_zmesh, Z_HX, Z_HY, Z_HZ);
+    gen_assets();                       /* generate pixel-art sprite assets */
 
     /* PSX low-res render target (static; upscaled to the window each frame). */
     g3d_target tgt;

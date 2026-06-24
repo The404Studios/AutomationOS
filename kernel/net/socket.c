@@ -47,9 +47,23 @@ static uint16_t g_next_port = 49152;   /* ephemeral range start */
 static uint8_t g_rx[ETH_MAX_FRAME];
 /* TX scratch for ip_tx(). */
 static uint8_t g_tx[ETH_MAX_FRAME];
-/* A4: loopback (127/8) delivery scratch -- a self-addressed IPv4 packet fed
- * straight back into the demux, never near ARP/Ethernet/the NIC. */
-static uint8_t g_lo[ETH_MAX_FRAME];
+/* A4: loopback (127/8) delivery. A self-addressed IPv4 packet is fed back into
+ * the demux, never near ARP/Ethernet/the NIC. Delivery is ITERATIVE via a small
+ * ring, NOT a synchronous recursive call into ipv4_demux(): a TCP data exchange
+ * loops as send -> demux -> peer ACKs -> ip_tx -> demux -> ..., and doing that
+ * recursively overflows the 8 KB kernel stack (each tcp_xmit carries a ~1.5 KB
+ * on-stack segment buffer). So ip_tx() ENQUEUES the loopback packet and, unless a
+ * drain is already running, drains the ring in a loop; nested ip_tx() calls made
+ * from inside the drain just enqueue and return -- the outer loop delivers them.
+ * This bounds the kernel-stack depth to a single demux chain while preserving
+ * SYNCHRONOUS completion (the peer's reply is delivered before the top-level
+ * ip_tx() returns -- connect()/send() rely on that). */
+#define LO_Q_SLOTS  8
+static uint8_t  lo_q[LO_Q_SLOTS][ETH_MAX_FRAME];
+static uint16_t lo_q_len[LO_Q_SLOTS];
+static int      lo_q_head;      /* next slot to deliver                        */
+static int      lo_q_tail;      /* next slot to fill                           */
+static int      lo_draining;    /* re-entrancy guard: 1 while the drain runs    */
 
 /* ipv4_demux() is defined later in this file; the A4 loopback short-circuit at
  * the head of ip_tx() needs it. */
@@ -249,6 +263,24 @@ static int ip_send_fragment(uint8_t dmac[ETH_ALEN], uint32_t dst_ip,
  * Fragments if seg_len > MTU payload (1480 bytes).
  * Returns 0 on success.
  */
+/* Deliver all queued loopback packets, one demux chain at a time. The guard
+ * makes a nested ip_tx() issued from inside ipv4_demux() during the drain only
+ * ENQUEUE (this loop then picks it up), so the kernel-stack depth stays bounded
+ * to a single demux chain no matter how many packets ping-pong. Called inline by
+ * ip_tx() for UDP (one-way) and from sock_poll() for TCP (whose reply cascade
+ * would otherwise stack multiple ~1.5 KB tcp_xmit frames and overflow). */
+static void lo_drain(void) {
+    if (lo_draining) return;
+    lo_draining = 1;
+    while (lo_q_head != lo_q_tail) {
+        uint8_t*  p    = lo_q[lo_q_head];
+        uint16_t  plen = lo_q_len[lo_q_head];
+        ipv4_demux(p, plen);
+        lo_q_head = (lo_q_head + 1) % LO_Q_SLOTS;
+    }
+    lo_draining = 0;
+}
+
 int ip_tx(uint32_t dst_ip, uint8_t proto, const void* seg, uint16_t seg_len) {
     static uint16_t ip_id = 1;
 
@@ -256,13 +288,19 @@ int ip_tx(uint32_t dst_ip, uint8_t proto, const void* seg, uint16_t seg_len) {
      * locally by wrapping the segment in an IPv4 header and feeding it straight
      * to the demux -- no ARP, no Ethernet, no NIC, works even with net DOWN.
      * Placed BEFORE the test-rig tap so loopback always loops (the tap is for
-     * on-the-wire segments). The source is net_get_ip() so the transport
-     * checksum (computed by udp.c/tcp.c with net_get_ip() as the pseudo-header
-     * source) verifies on the receive side. */
+     * on-the-wire segments). UDP uses net_get_ip() as the source so its
+     * checksum (computed by udp.c with net_get_ip()) verifies on receive. TCP
+     * stamps the loopback DESTINATION as the source instead (see below). */
     if ((dst_ip >> 24) == 127u) {
         uint16_t iplen = (uint16_t)(sizeof(ipv4_hdr_t) + seg_len);
-        if (iplen > sizeof(g_lo)) return -1;
-        ipv4_hdr_t* ip = (ipv4_hdr_t*)g_lo;
+        if (iplen > ETH_MAX_FRAME) return -1;
+        /* Enqueue the wrapped packet. Drop if the ring is momentarily full (the
+         * transport peer retransmits; in practice <=3 packets are ever in flight
+         * on loopback, so this never trips). */
+        int next = (lo_q_tail + 1) % LO_Q_SLOTS;
+        if (next == lo_q_head) return -1;
+        uint8_t* slot = lo_q[lo_q_tail];
+        ipv4_hdr_t* ip = (ipv4_hdr_t*)slot;
         ip->ver_ihl   = 0x45;
         ip->tos       = 0;
         ip->total_len = net_htons(iplen);
@@ -271,10 +309,19 @@ int ip_tx(uint32_t dst_ip, uint8_t proto, const void* seg, uint16_t seg_len) {
         ip->ttl       = 64;
         ip->proto     = proto;
         ip->checksum  = 0;
-        ip->src       = net_htonl(net_get_ip());
+        /* TCP replies must loop back too: a passive open records the SYN's IP
+         * source as the peer, and the SYN-ACK/data are then addressed there.
+         * Stamping net_get_ip() would send them to the real NIC and the in-OS
+         * handshake would never complete. So for TCP we stamp the (loopback)
+         * destination as the source -- src==dst in 127/8, so the entire
+         * handshake + data path loops. UDP stays one-way with net_get_ip() (the
+         * NETP1H proof). The TCP checksum uses this same source (tcp_src_ip()). */
+        ip->src       = net_htonl((proto == IPPROTO_TCP) ? dst_ip : net_get_ip());
         ip->dst       = net_htonl(dst_ip);
         ip->checksum  = net_htons(net_inet_checksum(ip, sizeof(ipv4_hdr_t)));
-        memcpy(g_lo + sizeof(ipv4_hdr_t), seg, seg_len);
+        memcpy(slot + sizeof(ipv4_hdr_t), seg, seg_len);
+        lo_q_len[lo_q_tail] = iplen;
+        lo_q_tail = next;
         /* NET-RESILIENCE-OBS: account loopback traffic on the lo interface (it
          * both "transmits" and "receives" the same packet). */
         {
@@ -284,7 +331,17 @@ int ip_tx(uint32_t dst_ip, uint8_t proto, const void* seg, uint16_t seg_len) {
                 lo->rx_packets++; lo->rx_bytes += iplen;
             }
         }
-        ipv4_demux(g_lo, iplen);
+        /* TCP's loopback reply cascade recurses (send -> demux -> peer ACK ->
+         * ip_tx -> demux -> ...). Delivering it HERE, inside the caller's
+         * tcp_xmit() frame (a ~1.5 KB on-stack segment), would stack two such
+         * frames and overflow the 8 KB kernel stack. So defer TCP loopback
+         * delivery to lo_drain() in sock_poll(), which runs ABOVE tcp_xmit() --
+         * tcp_send/connect/recv all pump sock_poll(), so the reply is still
+         * processed before they return, but only ONE tcp_xmit frame is ever live.
+         * UDP is one-way (no cascade) -> deliver inline to keep its synchronous
+         * semantics (the NETP1H loopback proof). */
+        if (proto != IPPROTO_TCP)
+            lo_drain();
         return 0;
     }
 
@@ -447,6 +504,12 @@ void sock_testrig_inject_ipv4(const uint8_t* ip_start, uint16_t ip_avail) {
 #endif
 
 int sock_poll(void) {
+    /* Deliver any deferred loopback packets FIRST -- before the net_up() gate,
+     * since 127/8 loopback works even with the NIC down. This is where in-OS TCP
+     * loopback data is actually delivered (ip_tx() only enqueues TCP packets to
+     * keep the kernel-stack depth bounded). tcp_send/connect/recv all pump
+     * sock_poll(), so the peer's reply is processed before they return. */
+    lo_drain();
     if (!net_up() || !g_socks) return 0;
     int frames = 0;
 
@@ -476,6 +539,12 @@ int sock_poll(void) {
     }
     /* NET-P1-A: half-open side-table timers (SYN-ACK retransmit + expiry). */
     tcp_synq_tick();
+    /* tcp_tick()/tcp_synq_tick() above may have ENQUEUED a loopback retransmit or
+     * SYN-ACK (TCP loopback only enqueues -- delivery is deferred to lo_drain).
+     * The leading lo_drain() already ran, so drain again here to deliver those in
+     * THIS poll instead of leaving them stranded until the next sock_poll(). The
+     * lo_draining guard makes this safe + cheap (no-op when the ring is empty). */
+    lo_drain();
     return frames;
 }
 

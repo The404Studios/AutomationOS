@@ -72,6 +72,12 @@
 #define TCP_RTO_MAX_RETRIES   8       /* give up after this many retransmits*/
 #define TCP_CONNECT_MS        8000    /* total connect budget (ms)          */
 #define TCP_CLOSE_MS          4000    /* wait for FIN/ACK on close          */
+/* Frozen-tick backstop: any wall-clock-bounded spin INSIDE a syscall must also
+ * cap consecutive iterations where now_ms() did not advance, because the PIT IRQ
+ * (the only thing that bumps the ms clock) cannot fire while the syscall runs
+ * with IF=0 -- so a pure wall-clock guard can never trip. Same value + pattern as
+ * resolve_mac's iter_cap (socket.c) and the zero-window persist loop below. */
+#define TCP_FROZEN_SPIN_CAP   200000
 #define TCP_TIMEWAIT_MS       60000   /* 2MSL linger before TIME_WAIT->CLOSED*/
 #define TCP_RTO_MIN_MS        200     /* RFC 6298 RTO floor (ms)            */
 
@@ -209,6 +215,17 @@ static uint16_t rcv_wnd(const sock_t* s) {
  * CHANGED: advertises rcv_wnd(s) (our free rx ring space) instead of
  * s->snd_wnd (peer's window), so the server knows when it can keep sending.
  */
+/* The IP source address for a TCP segment to `dst`. A loopback destination
+ * (127/8) must use a loopback source so the peer's replies are themselves
+ * loopback-routed by ip_tx -- otherwise a SYN-ACK addressed to net_get_ip()
+ * escapes to the NIC and the in-OS (client+server in one kernel) handshake never
+ * completes. Non-loopback returns net_get_ip() exactly as before (no behavior
+ * change for real-NIC TCP). The pseudo-header checksum is computed with this same
+ * source so it verifies against the source ip_tx actually stamps. */
+static inline uint32_t tcp_src_ip(uint32_t dst) {
+    return ((dst >> 24) == 127u) ? dst : net_get_ip();
+}
+
 static int tcp_xmit(sock_t* s, uint8_t flags, uint32_t seq, uint32_t ack,
                     const void* data, uint16_t len) {
     if (len > TCP_MSS) len = TCP_MSS;
@@ -230,7 +247,7 @@ static int tcp_xmit(sock_t* s, uint8_t flags, uint32_t seq, uint32_t ack,
     if (len && data) memcpy(seg + sizeof(tcp_hdr_t), data, len);
     uint16_t seg_len = (uint16_t)(sizeof(tcp_hdr_t) + len);
 
-    uint16_t ck = net_transport_checksum(net_get_ip(), s->remote_ip,
+    uint16_t ck = net_transport_checksum(tcp_src_ip(s->remote_ip), s->remote_ip,
                                          IPPROTO_TCP, seg, seg_len);
     th->checksum = net_htons(ck);
 
@@ -386,7 +403,7 @@ static int tcp_xmit_raw(uint32_t remote_ip, uint16_t local_port,
     th->data_off = (uint8_t)((sizeof(tcp_hdr_t) / 4) << 4);
     th->flags    = flags;
     th->window   = net_htons(window);
-    th->checksum = net_htons(net_transport_checksum(net_get_ip(), remote_ip,
+    th->checksum = net_htons(net_transport_checksum(tcp_src_ip(remote_ip), remote_ip,
                                                     IPPROTO_TCP, seg,
                                                     sizeof(tcp_hdr_t)));
     return ip_tx(remote_ip, IPPROTO_TCP, seg, sizeof(tcp_hdr_t));
@@ -646,19 +663,39 @@ int tcp_connect(sock_t* s, uint32_t dst_ip, uint16_t dst_port) {
     s->state     = TCP_SYN_SENT;
     s->reset     = false;
 
+    /* Arm BEFORE transmitting (see tcp_send): on the in-kernel loopback path the
+     * SYN-ACK is delivered + processed by lo_drain() inside the sock_poll() pump
+     * BELOW -- ip_tx() only ENQUEUES TCP loopback packets; their delivery is
+     * deferred to lo_drain() in sock_poll() -- and that processing disarms the
+     * retransmit. Arming AFTER the xmit would leave rt_pending re-armed for the
+     * (by then already-ACKed) SYN once the deferred ACK is processed, and nothing
+     * could clear it (the ms clock is frozen inside this IF=0 syscall, so no
+     * RTO-retransmit ever fires). Only the ORDER matters (arm before the disarm),
+     * not WHERE the disarm happens. */
+    tcp_arm_retransmit(s, TCP_SYN, isn, NULL, 0);
     if (tcp_xmit(s, TCP_SYN, isn, 0, NULL, 0) != 0) {
+        tcp_disarm_retransmit(s);
         s->state = TCP_CLOSED;
         return SOCK_ECONN;
     }
-    tcp_arm_retransmit(s, TCP_SYN, isn, NULL, 0);
 
-    /* Pump until ESTABLISHED, RST, or timeout. */
+    /* Pump until ESTABLISHED, RST, or timeout. The wall-clock guard ALONE cannot
+     * terminate this loop: now_ms() is frozen inside this IF=0 syscall, so a SYN
+     * to a non-listening loopback port (which tcp_input drops with NO RST) would
+     * spin forever and hang the whole cooperative OS. The frozen-tick backstop
+     * guarantees we bail to SOCK_ETIMEDOUT -- exactly the negative rc callers
+     * (e.g. dzclient's connect-retry) expect when the peer is not yet listening. */
     uint64_t start = now_ms();
+    uint64_t last  = start;
+    uint32_t frozen = 0;
     while (now_ms() - start < TCP_CONNECT_MS) {
         sock_poll();
         if (s->reset)                     { s->state = TCP_CLOSED; return SOCK_ECONN; }
         if (s->state == TCP_ESTABLISHED)  return SOCK_OK;
         if (s->state == TCP_CLOSED)       return SOCK_ECONN;
+        uint64_t n = now_ms();
+        if (n != last) { last = n; frozen = 0; }
+        else if (++frozen >= TCP_FROZEN_SPIN_CAP) break;
     }
     s->state = TCP_CLOSED;
     return SOCK_ETIMEDOUT;
@@ -698,6 +735,8 @@ int tcp_send(sock_t* s, const void* data, uint16_t len) {
         if (in_flight >= TCP_CWND_INIT || s->rt_pending) {
             uint32_t old_una = s->snd_una;
             uint64_t start = now_ms();
+            uint64_t last  = start;
+            uint32_t frozen = 0;
             while (now_ms() - start < TCP_CONNECT_MS) {
                 sock_poll();
                 if (s->reset) return sent ? (int)sent : SOCK_ECONN;
@@ -715,6 +754,10 @@ int tcp_send(sock_t* s, const void* data, uint16_t len) {
                     in_flight = 0;
                     break;
                 }
+                /* Frozen-tick backstop (IF=0 syscall: now_ms() can't advance). */
+                uint64_t n = now_ms();
+                if (n != last) { last = n; frozen = 0; }
+                else if (++frozen >= TCP_FROZEN_SPIN_CAP) break;
             }
             /* If snd_una still hasn't moved, check if rt timed out. */
             if (in_flight >= TCP_CWND_INIT) {
@@ -785,15 +828,28 @@ int tcp_send(sock_t* s, const void* data, uint16_t len) {
         }
 
         uint32_t seq = s->snd_nxt;
-        if (tcp_xmit(s, TCP_ACK | TCP_PSH, seq, s->rcv_nxt,
-                     ptr + sent, chunk) != 0)
-            return sent ? (int)sent : SOCK_ECONN;
-
-        s->snd_nxt += chunk;
-        /* Arm retransmit for this latest segment (overwrites previous -- only
-         * the tail of the pipeline is retransmittable, which is acceptable for
-         * the common no-loss case and matches the single-slot rt_data design). */
+        /* Arm the retransmit BEFORE transmitting. On the in-kernel loopback path
+         * (127/8) ip_tx() only ENQUEUES the segment; it is delivered to the peer
+         * socket later by lo_drain() inside the sock_poll() pump below (the L855
+         * post-send poll and the final drain), the peer ACKs, and that ACK is
+         * processed (disarming rt_pending) -- all still WITHIN this tcp_send()
+         * call, just not literally inside tcp_xmit(). Arming first guarantees the
+         * arm precedes that deferred disarm; arming AFTER could leave rt_pending
+         * set with nothing able to clear it -- the only other trigger is an
+         * RTO-driven retransmit, but the ms clock is frozen inside this IF=0
+         * syscall (the drains rely on the frozen-tick backstop), so the "final
+         * drain" below would otherwise spin (this is what hung in-OS loopback
+         * data transfer). Only the ORDER matters, not where the disarm happens;
+         * on the NIC path the ACK arrives even later via sock_poll(). Overwrites
+         * any previous arm -- only the pipeline tail is retransmittable, matching
+         * the single-slot rt_data design. */
         tcp_arm_retransmit(s, TCP_ACK | TCP_PSH, seq, ptr + sent, chunk);
+        if (tcp_xmit(s, TCP_ACK | TCP_PSH, seq, s->rcv_nxt,
+                     ptr + sent, chunk) != 0) {
+            tcp_disarm_retransmit(s);
+            return sent ? (int)sent : SOCK_ECONN;
+        }
+        s->snd_nxt += chunk;
         sent = (uint16_t)(sent + chunk);
         in_flight++;
 
@@ -805,12 +861,19 @@ int tcp_send(sock_t* s, const void* data, uint16_t len) {
     }
 
     /* Final drain: wait briefly for the last segment's ACK so the caller
-     * doesn't close the connection before the peer has confirmed receipt. */
+     * doesn't close the connection before the peer has confirmed receipt. The
+     * frozen-tick backstop is essential: now_ms() can't advance inside this IF=0
+     * syscall, so without it a never-ACKed loopback segment would spin forever. */
     if (s->rt_pending) {
         uint64_t start = now_ms();
+        uint64_t last  = start;
+        uint32_t frozen = 0;
         while (s->rt_pending && now_ms() - start < TCP_CONNECT_MS) {
             sock_poll();
             if (s->reset) break;
+            uint64_t n = now_ms();
+            if (n != last) { last = n; frozen = 0; }
+            else if (++frozen >= TCP_FROZEN_SPIN_CAP) break;
         }
     }
 
@@ -867,9 +930,15 @@ int tcp_close(sock_t* s) {
         s->time_wait_ms = now_ms();   /* 2MSL: start the linger clock */
 
         uint64_t start = now_ms();
+        uint64_t last  = start;
+        uint32_t frozen = 0;
         while (now_ms() - start < TCP_CLOSE_MS) {
             sock_poll();
             if (s->state == TCP_CLOSED || s->state == TCP_TIME_WAIT) break;
+            /* Frozen-tick backstop (IF=0 syscall: now_ms() can't advance). */
+            uint64_t n = now_ms();
+            if (n != last) { last = n; frozen = 0; }
+            else if (++frozen >= TCP_FROZEN_SPIN_CAP) break;
         }
     }
     s->state = TCP_CLOSED;
@@ -1131,8 +1200,15 @@ void tcp_input(uint32_t src_ip, uint32_t dst_ip,
                 tcp_send_ack(s);
                 if (s->state == TCP_ESTABLISHED)   s->state = TCP_CLOSE_WAIT;
                 else if (s->state == TCP_FIN_WAIT) { s->state = TCP_TIME_WAIT; s->time_wait_ms = now_ms(); }
-            } else if (seq == s->rcv_nxt) {
-                /* FIN with no data (common simultaneous FIN). */
+            } else if (seq == s->rcv_nxt && payload_len == 0) {
+                /* FIN with no data (common simultaneous FIN). The payload_len==0
+                 * guard is load-bearing: a FIN piggybacked on in-order data whose
+                 * payload was DROPPED (rx ring full -> rx_ring_push returned 0, so
+                 * rcv_nxt did not advance) leaves seq==rcv_nxt with payload_len>0.
+                 * Without the guard this branch would consume the FIN at the wrong
+                 * sequence (rcv_nxt += 1 mid-stream) and falsely ACK dropped bytes.
+                 * Excluding it lets the segment fall through + re-ACK current
+                 * rcv_nxt, so the peer retransmits data+FIN together. */
                 s->rcv_nxt += 1;
                 tcp_send_ack(s);
                 if (s->state == TCP_ESTABLISHED)   s->state = TCP_CLOSE_WAIT;

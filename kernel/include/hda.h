@@ -260,6 +260,16 @@ typedef struct {
     uint32_t refill_next;                 // next chunk index on_bcis will refill
     volatile uint32_t refill_count;       // chunks refilled (proof counter)
     void (*refill_cb)(void* stream, uint32_t chunk_idx);  // NULL = not streaming
+    /* AUDIO B1 part-2: SPSC software ring for userspace streaming. Producer =
+     * SYS_AUDIO_STREAM_WRITE (task ctx, IF=0, owns ring_tail); consumer =
+     * stream_refill_ring in on_bcis IRQ ctx (owns ring_head). pmm-allocated (not
+     * inline/static -- avoids a 64KB kmalloc + .bss bloat). volatile + aligned
+     * 32-bit cursors, single-writer-each => race-safe on the single-core default
+     * (SMP would need release/acquire -- HDA streaming is single-core only). */
+    uint8_t* ring;                        // pmm_alloc_pages(16) == 64KB, or NULL
+    volatile uint32_t ring_head;          // CONSUMER pop cursor (IRQ owns)
+    volatile uint32_t ring_tail;          // PRODUCER push cursor (syscall owns)
+    volatile uint32_t underruns;          // chunks zero-filled (ring empty at BCIS)
 #endif
 } hda_stream_t;
 

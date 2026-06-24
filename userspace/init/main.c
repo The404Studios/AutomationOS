@@ -200,6 +200,19 @@ void _start(void) {
     spawn("sbin/deadzone");
 #endif
 
+#ifdef AUDIO_STREAMTEST
+    // AUDIO_STREAMTEST: prove a ring-3 app streams PCM via SYS_AUDIO_STREAM_WRITE
+    // (the on_bcis ring consumer drains it into the HDA DMA). Gated => default boot
+    // never spawns it. Pair with a kernel built AUDIO_SELFTEST=1 (implies HDA_ENABLE)
+    // so the syscall handler + ring exist. Wait on it (it streams ~1-2s) so it gets
+    // CPU before the self-test storm.
+    print("[INIT] AUDIO_STREAMTEST: spawning streamtest (userspace PCM stream proof)...\n");
+    {
+        int stt_pid = spawn("sbin/streamtest");
+        if (stt_pid > 0) { int stt_st = 0; syscall(SYS_WAITPID, stt_pid, (long)&stt_st, 0); }
+    }
+#endif
+
     // NOTE: the right-side dock IS the launcher now, so we no longer auto-open
     // the Applications grid window (it duplicated the dock + covered the desktop).
     // DECLUTTER: dateapp ("Date & Time") is no longer auto-opened either -- it

@@ -420,6 +420,91 @@ int audio_stream_selftest(void) {
     serial_putchar('\n');
     return 0;
 }
+
+/* ====================================================================== *
+ *  AUDIO B1 part-2: SYS_AUDIO_STREAM_WRITE -- userspace PCM streaming.
+ *
+ *  A single-producer/single-consumer software ring feeds the SAME on_bcis hook
+ *  as part-1, but from ring-3 PCM instead of a kernel sine generator:
+ *    producer = audio_stream_write (task ctx, IF=0, owns ring_tail)
+ *    consumer = stream_refill_ring (on_bcis IRQ ctx, owns ring_head)
+ *  Both use the shared g_tone_stream (sequential with tone/mixed/sine-selftest,
+ *  never concurrent). Race-safe on the single-core default (volatile aligned
+ *  cursors, single-writer-each, sfence-before-publish; see the part-2 audit).
+ * ====================================================================== */
+#define HDA_RING_SIZE (16 * 4096)        /* 64KB == 8 chunks; pmm_alloc_pages(16) */
+
+/* CONSUMER (IRQ ctx): pop chunk_size bytes ring->DMA chunk; zero-fill + count an
+ * underrun if the ring has < a chunk. Pure: bounded copy + sfence, no alloc/verb/
+ * lock/serial/yield (the on_bcis contract). */
+static void stream_refill_ring(void* sptr, uint32_t chunk_idx) {
+    hda_stream_t* s = (hda_stream_t*)sptr;
+    if (!s || !s->buffer_virt || !s->ring || s->chunk_size == 0) return;
+    uint8_t* dst = (uint8_t*)s->buffer_virt + chunk_idx * s->chunk_size;
+    uint32_t head = s->ring_head;                 /* consumer owns        */
+    uint32_t tail = s->ring_tail;                 /* snapshot producer    */
+    uint32_t avail = (tail - head + HDA_RING_SIZE) % HDA_RING_SIZE;
+    uint32_t cs = s->chunk_size;
+    uint32_t pop = (avail < cs) ? avail : cs;
+    for (uint32_t i = 0; i < pop; i++) {
+        dst[i] = s->ring[head];
+        head++; if (head >= HDA_RING_SIZE) head = 0;
+    }
+    for (uint32_t i = pop; i < cs; i++) dst[i] = 0;   /* underrun -> silence */
+    if (pop < cs) s->underruns++;
+    asm volatile("sfence" ::: "memory");          /* visible before DMA laps it */
+    s->ring_head = head;                          /* publish (single store) */
+}
+
+/* PRODUCER (task ctx, IF=0): push PCM into the ring with back-pressure. Arms the
+ * stream on first call (refill_cb set LAST, before start). NON-BLOCKING: returns
+ * bytes accepted (may be < len when the ring is full); never waits. */
+int audio_stream_write(const void* data, uint32_t len) {
+    if (!data || len == 0) return 0;
+
+    /* (Re)arm streaming if not already running the ring consumer. */
+    if (!g_tone_stream || !g_tone_stream->running ||
+        g_tone_stream->refill_cb != stream_refill_ring) {
+        hda_controller_t* ctrl = NULL; hda_codec_t* codec = NULL;
+        if (tone_prepare_stream(&ctrl, &codec) != 0) return -1;   /* alloc+setup */
+        hda_stream_t* s = g_tone_stream;
+        if (!s->ring) {
+            s->ring = (uint8_t*)pmm_alloc_pages(16);              /* 64KB ring */
+            if (!s->ring) return -1;
+        }
+        s->ring_head = s->ring_tail = 0; s->underruns = 0;
+        s->refill_next = 0; s->refill_count = 0;
+        /* zero the DMA buffer so the initial laps (before ring data propagates)
+         * play silence, not stale bytes. */
+        for (uint32_t i = 0; i < s->buffer_size; i++)
+            ((uint8_t*)s->buffer_virt)[i] = 0;
+        hda_set_volume(codec, ctrl, 80);
+        hda_set_mute(codec, ctrl, false);
+        s->refill_cb = stream_refill_ring;                        /* arm LAST */
+        if (hda_stream_start(ctrl, s) != 0) { s->refill_cb = 0; return -1; }
+    }
+
+    hda_stream_t* s = g_tone_stream;
+    const uint8_t* src = (const uint8_t*)data;
+    uint32_t head = s->ring_head;                 /* snapshot consumer    */
+    uint32_t tail = s->ring_tail;                 /* producer owns        */
+    uint32_t count = (tail - head + HDA_RING_SIZE) % HDA_RING_SIZE;
+    uint32_t freeb = (HDA_RING_SIZE - 1) - count; /* reserve 1 (full vs empty) */
+    uint32_t n = (len < freeb) ? len : freeb;     /* BACK-PRESSURE: partial   */
+    for (uint32_t i = 0; i < n; i++) {
+        s->ring[tail] = src[i];
+        tail++; if (tail >= HDA_RING_SIZE) tail = 0;
+    }
+    asm volatile("sfence" ::: "memory");          /* payload visible before... */
+    s->ring_tail = tail;                          /* ...publishing the cursor  */
+    return (int)n;
+}
+
+/* Read the streaming underrun count (0 if not streaming) -- for diagnostics. */
+uint32_t audio_stream_underruns(void) {
+    return (g_tone_stream && g_tone_stream->refill_cb == stream_refill_ring)
+           ? g_tone_stream->underruns : 0;
+}
 #endif /* HDA_ENABLE */
 
 /**

@@ -952,6 +952,16 @@ cp userspace/apps/ide/sample/gamestarter/*    /tmp/ird/usr/src/templates/gamesta
 cp userspace/apps/ide/sample/appstarter/*     /tmp/ird/usr/src/templates/appstarter/     2>/dev/null || true
 cp userspace/apps/ide/sample/servicestarter/* /tmp/ird/usr/src/templates/servicestarter/ 2>/dev/null || true
 mkdir -p /tmp/ird/Desktop
+# DeadZone as a FIRST-CLASS IDE PROJECT: a real /Desktop/Projects/DeadZone tree
+# (project.json manifest + src + prebuilt run target) so the in-OS Semantic-LEGO
+# IDE lists it under /Desktop/Projects, opens+parses the source, and Run launches
+# the fully-linked game (deadzone.c needs wl/bf/g3d, so the run target is the
+# prebuilt ELF -- on-device cc can't relink it, but open/browse/run all work).
+mkdir -p /tmp/ird/Desktop/Projects/DeadZone/src /tmp/ird/Desktop/Projects/DeadZone/build /tmp/ird/Desktop/Projects/DeadZone/res
+cp userspace/apps/deadzone/deadzone.c /tmp/ird/Desktop/Projects/DeadZone/src/ 2>/dev/null || true
+cp /tmp/deadzone.elf /tmp/ird/Desktop/Projects/DeadZone/build/deadzone.elf 2>/dev/null || true
+printf 'name=DeadZone\nlang=c\nentry=src/deadzone.c\nrun_target=build/deadzone.elf\n' > /tmp/ird/Desktop/Projects/DeadZone/project.json
+: > /tmp/ird/Desktop/Projects/DeadZone/res/.keep
 # Zombie Bastion: a Desktop FOLDER holding the game ELF. The compositor shows
 # /Desktop entries as icons; a folder opens the filemanager, where the .elf can
 # be launched. (The dock "Zt" icon launches it directly too.)

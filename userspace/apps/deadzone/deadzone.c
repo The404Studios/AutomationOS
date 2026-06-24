@@ -156,6 +156,10 @@ static i32 g_have_mouse, g_last_mx;
 #define ITEM_NONE   0
 #define ITEM_AMMO   1
 #define ITEM_MEDKIT 2
+#define ITEM_ARMOR        3   /* loot: flat bite-damage soak            */
+#define ITEM_SCRAP        4   /* loot: currency / repair material       */
+#define ITEM_WEAPON_PARTS 5   /* loot: repairs equipped weapon durability */
+#define N_ITEM_TYPES      6
 typedef struct { u8 type; u16 count; } Slot;
 static Slot g_inv[INV_SLOTS];
 static i32  g_ui_mode;      /* 0 play, 1 inventory, 2 character */
@@ -190,6 +194,83 @@ static void inv_add(u8 type, u16 count)
         if (g_inv[i].type == type) { g_inv[i].count += count; return; }
     for (int i = 0; i < INV_SLOTS; i++)        /* else first empty slot       */
         if (g_inv[i].type == ITEM_NONE) { g_inv[i].type = type; g_inv[i].count = count; return; }
+}
+
+/* ---- LOOT / EQUIPMENT / DURABILITY ------------------------------------- */
+typedef struct { u8 type; u16 cmin, cmax; u16 weight; } LootEntry;
+static const LootEntry LOOT_TABLE[] = {
+    { ITEM_AMMO,          4, 9, 50 },   /* common                          */
+    { ITEM_SCRAP,         1, 3, 25 },
+    { ITEM_MEDKIT,        1, 1, 12 },
+    { ITEM_WEAPON_PARTS,  1, 2,  8 },
+    { ITEM_ARMOR,         1, 1,  5 },   /* rare                            */
+};
+#define LOOT_TABLE_N (int)(sizeof(LOOT_TABLE)/sizeof(LOOT_TABLE[0]))
+static u32 g_loot_wsum;                  /* sum of weights (set in reset)   */
+
+#define MAX_PICKUPS 16
+typedef struct { fx x, z; u8 type; u16 count; i32 alive; i32 bob; } Pickup;
+static Pickup g_pickup[MAX_PICKUPS];
+#define PICKUP_R fx_ratio(80,100)        /* auto-pickup radius (walk over)  */
+
+#define WEAP_DUR_MAX      100
+#define WEAP_DUR_PERSHOT  1              /* durability lost per fired round */
+#define WEAP_WORN_THRESH  30             /* below this: degraded damage     */
+static i32 g_weap_dur;                   /* weapon durability 0..MAX        */
+static i32 g_armor;                      /* flat armor points (soaks bites) */
+static i32 g_scrap;                      /* repair currency                 */
+
+static void loot_wsum_init(void)
+{
+    g_loot_wsum = 0;
+    for (int i = 0; i < LOOT_TABLE_N; i++) g_loot_wsum += LOOT_TABLE[i].weight;
+}
+
+/* Roll the weighted loot table and spawn a world pickup at (x,z). */
+static void roll_loot(fx x, fx z)
+{
+    if (g_loot_wsum == 0) loot_wsum_init();
+    u32 r = rng_next() % g_loot_wsum;
+    const LootEntry *e = &LOOT_TABLE[0];
+    for (int i = 0; i < LOOT_TABLE_N; i++) {
+        if (r < LOOT_TABLE[i].weight) { e = &LOOT_TABLE[i]; break; }
+        r -= LOOT_TABLE[i].weight;
+    }
+    u16 cnt = e->cmin;
+    if (e->cmax > e->cmin) cnt = (u16)(e->cmin + (rng_next() % (u32)(e->cmax - e->cmin + 1)));
+    int slot = -1;
+    for (int i = 0; i < MAX_PICKUPS; i++) if (!g_pickup[i].alive) { slot = i; break; }
+    if (slot < 0) return;                /* crate cap reached -- drop lost   */
+    g_pickup[slot].x = x; g_pickup[slot].z = z;
+    g_pickup[slot].type = e->type; g_pickup[slot].count = cnt;
+    g_pickup[slot].alive = 1; g_pickup[slot].bob = 0;
+}
+
+/* Apply a collected item to the player's loadout. */
+static void loot_apply(u8 type, u16 count)
+{
+    switch (type) {
+        case ITEM_AMMO:         g_ammo  += count;       break;
+        case ITEM_ARMOR:        g_armor += 5 * count;   break;
+        case ITEM_SCRAP:        g_scrap += count;       break;
+        case ITEM_WEAPON_PARTS: g_weap_dur += 40 * count;
+                                if (g_weap_dur > WEAP_DUR_MAX) g_weap_dur = WEAP_DUR_MAX;
+                                break;
+        default:                inv_add(type, count);   break;   /* MEDKIT etc. */
+    }
+}
+
+/* Walk-over collection: grab any alive pickup within PICKUP_R of the player. */
+static void pickups_step(void)
+{
+    fx r2 = fx_mul(PICKUP_R, PICKUP_R);
+    for (int i = 0; i < MAX_PICKUPS; i++) {
+        if (!g_pickup[i].alive) continue;
+        g_pickup[i].bob++;
+        fx dx = g_pickup[i].x - g_px, dz = g_pickup[i].z - g_pz;
+        fx d2 = fx_add(fx_mul(dx,dx), fx_mul(dz,dz));
+        if (d2 <= r2) { loot_apply(g_pickup[i].type, g_pickup[i].count); g_pickup[i].alive = 0; }
+    }
 }
 
 static fx fx_clamp(fx v, fx lo, fx hi) { return v < lo ? lo : (v > hi ? hi : v); }
@@ -306,6 +387,10 @@ static void deadzone_reset(u64 seed)
     for (int i = 0; i < INV_SLOTS; i++) { g_inv[i].type = ITEM_NONE; g_inv[i].count = 0; }
     inv_add(ITEM_AMMO, g_mag_size * 6);   /* starting kit */
     inv_add(ITEM_MEDKIT, 2);
+    /* loot/equipment/durability */
+    for (int i = 0; i < MAX_PICKUPS; i++) g_pickup[i].alive = 0;
+    g_weap_dur = WEAP_DUR_MAX; g_armor = 0; g_scrap = 0;
+    loot_wsum_init();
     start_wave(1);
 }
 
@@ -350,7 +435,7 @@ static void hurt_zombie(int i, int dmg)
     if (z->health <= 0) {
         z->alive = 0; g_kills++;
         g_ammo += 3;                                   /* scavenge rounds */
-        if ((g_kills % 7) == 0) inv_add(ITEM_MEDKIT, 1);  /* occasional drop */
+        roll_loot(z->x, z->z);                         /* weighted loot drop */
     }
 }
 
@@ -392,6 +477,7 @@ static void try_shoot(void)
     if (!g_alive || g_fire_cd > 0 || g_reload > 0) return;
     if (g_mag <= 0) { if (g_ammo > 0) g_reload = g_reload_steps; return; }
     g_mag--; g_fire_cd = FIRE_COOLDN; g_recoil = fx_ratio(6,100); g_muzzle = 3;
+    if (g_weap_dur > 0) g_weap_dur -= WEAP_DUR_PERSHOT;   /* weapon wears with use */
 
     fx fdx = dirx(g_yaw), fdz = dirz(g_yaw);
     int best=-1; fx bestt=fx_from_int(9999);
@@ -404,7 +490,13 @@ static void try_shoot(void)
         if (perp < 0) perp = -perp;
         if (perp <= g_hit_r && t < bestt) { best = i; bestt = t; }   /* PER-scaled aim */
     }
-    if (best >= 0) hurt_zombie(best, WEAPON_DMG);
+    if (best >= 0) {
+        /* a worn weapon (durability < threshold) does proportionally less damage */
+        int dmg = (g_weap_dur < WEAP_WORN_THRESH)
+                  ? (WEAPON_DMG * g_weap_dur) / WEAP_DUR_MAX + 1
+                  : WEAPON_DMG;
+        hurt_zombie(best, dmg);
+    }
 }
 
 /* ====================================================================== *
@@ -434,7 +526,9 @@ static void zombies_step(void)
         } else {
             /* in range: bite on cooldown */
             if (g_alive && z->bite_cd == 0) {
-                g_hp -= Z_BITE_DMG; z->bite_cd = Z_BITE_CD;
+                int bd = Z_BITE_DMG - g_armor / 4;     /* armor soaks bite dmg */
+                if (bd < 1) bd = 1;                     /* always at least 1    */
+                g_hp -= bd; z->bite_cd = Z_BITE_CD;
                 if (g_hp <= 0) { g_hp = 0; g_alive = 0; }
             }
         }
@@ -691,6 +785,42 @@ static void systems_selftest(void)
     print("\n");
 }
 
+/* Headless proof of loot/equipment/durability: deterministic (fixed RNG seed),
+ * no window/peer needed. Saves+restores g_rng so gameplay randomness is intact. */
+static void loot_selftest(void)
+{
+    char nb[12];
+    u32 saved = g_rng;
+    loot_wsum_init();
+    g_rng = 0x1234567u | 1u;                          /* fixed seed             */
+    for (int i=0;i<MAX_PICKUPS;i++) g_pickup[i].alive = 0;
+
+    int drops = 0;
+    for (int k=0;k<8;k++) roll_loot(0,0);             /* 8 kills' worth of loot */
+    for (int i=0;i<MAX_PICKUPS;i++) if (g_pickup[i].alive) drops++;
+
+    g_weap_dur = WEAP_DUR_MAX;                         /* 50 shots wear exactly 50 */
+    for (int s=0;s<50;s++) if (g_weap_dur>0) g_weap_dur -= WEAP_DUR_PERSHOT;
+
+    g_armor = 10; int soak = Z_BITE_DMG - g_armor/4;  /* 8 - 10/4 = 6           */
+    if (soak < 1) soak = 1;
+
+    int ok = (drops == 8)
+          && (g_weap_dur == WEAP_DUR_MAX - 50)
+          && (soak == 6)
+          && (g_loot_wsum == 100);
+    print("DEADZONE: loot "); print(ok ? "PASS" : "FAIL");
+    print(" drops="); num_to_str(nb, drops);             print(nb);
+    print(" dur=");   num_to_str(nb, g_weap_dur);        print(nb);
+    print(" soak=");  num_to_str(nb, soak);              print(nb);
+    print(" wsum=");  num_to_str(nb, (int)g_loot_wsum);  print(nb);
+    print("\n");
+
+    /* restore clean gameplay state */
+    for (int i=0;i<MAX_PICKUPS;i++) g_pickup[i].alive = 0;
+    g_armor = 0; g_weap_dur = WEAP_DUR_MAX; g_rng = saved;
+}
+
 /* ====================================================================== *
  *  Entry
  * ====================================================================== */
@@ -822,6 +952,7 @@ void _start(void)
 
     systems_selftest();          /* headless proof: attributes -> derived stats */
     mp_selftest();               /* headless proof: client speaks dzproto wire  */
+    loot_selftest();             /* headless proof: loot/equip/durability       */
     print("DEADZONE: ready\n");
 
     for (;;) {
@@ -872,6 +1003,7 @@ void _start(void)
                 player_step();
                 if (g_shoot_held) try_shoot();
                 zombies_step();
+                pickups_step();          /* walk-over loot collection */
                 wave_update();
                 if (!g_alive && !g_over) {
                     g_over = 1;

@@ -191,6 +191,15 @@ void _start(void) {
         print("[INIT] ERROR: Failed to spawn filemanager!\n");
     }
 
+#ifdef DZ_GAMETEST
+    // DZ_GAMETEST (DZ_GAMETEST=1): spawn the DeadZone GUI game so its launch-time
+    // headless selftests (systems / mp / loot) print to serial for the loot proof.
+    // The compositor is up by here, so wl_connect succeeds; deadzone runs its game
+    // loop afterward (harmless headless). Gated => default boot never spawns it.
+    print("[INIT] DZ_GAMETEST: spawning deadzone (selftest proof)...\n");
+    spawn("sbin/deadzone");
+#endif
+
     // NOTE: the right-side dock IS the launcher now, so we no longer auto-open
     // the Applications grid window (it duplicated the dock + covered the desktop).
     // DECLUTTER: dateapp ("Date & Time") is no longer auto-opened either -- it

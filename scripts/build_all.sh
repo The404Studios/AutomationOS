@@ -49,6 +49,12 @@ if [ "${DZ_MPLIVE:-0}" = "1" ]; then
     INIT_EXTRA="$INIT_EXTRA -DDZ_MPLIVE"
     echo "*** DZ_MPLIVE build: init spawns deadzoned + dzclient (live loopback co-op proof) ***"
 fi
+# DZ_GAMETEST=1 adds -DDZ_GAMETEST so init spawns sbin/deadzone, whose launch-time
+# headless selftests (systems/mp/loot) print to serial. Unset => normal boot.
+if [ "${DZ_GAMETEST:-0}" = "1" ]; then
+    INIT_EXTRA="$INIT_EXTRA -DDZ_GAMETEST"
+    echo "*** DZ_GAMETEST build: init spawns sbin/deadzone (selftest proof) ***"
+fi
 # SHOWCASE=1: init auto-opens a curated set of headline GUI apps (sound manager,
 # AI cockpit, a game, the IDE) on top of the desktop, for documentation
 # screenshots. OFF by default -- a normal boot never auto-runs them.

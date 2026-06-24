@@ -455,8 +455,12 @@ static int client_pump_input(Client *c, World *w)
         c->rxn += (u32)n;
         while (c->rxn >= DZ_INPUT_BYTES) {
             Input in;
-            if (input_parse(c->rx, &in))
-                apply_input(w, c->slot, &in);
+            /* A bad magic means the input stream is misframed -- resync to the
+             * buffer head rather than blindly consuming 24 bytes (which would
+             * never re-align). Loopback TCP can't reorder, but a buggy/hostile
+             * client could send garbage; this keeps the authoritative server robust. */
+            if (!input_parse(c->rx, &in)) { c->rxn = 0; break; }
+            apply_input(w, c->slot, &in);
             /* shift the consumed packet out of the buffer */
             u32 rem = c->rxn - DZ_INPUT_BYTES;
             for (u32 k = 0; k < rem; k++) c->rx[k] = c->rx[DZ_INPUT_BYTES + k];

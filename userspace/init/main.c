@@ -125,6 +125,31 @@ void _start(void) {
         print("[INIT] ERROR: Failed to spawn compositor!\n");
     }
 
+#ifdef DZ_MPLIVE
+    // DEADZONE-MP-LIVE-0: prove LIVE networked co-op over the kernel's loopback
+    // datapath. Spawn the authoritative server, give it a moment to bind/listen
+    // and start ticking, then spawn the headless client -- it connects to
+    // 127.0.0.1:27015, plays a scripted session, and prints
+    //   "DEADZONE: mp LIVE PASS ..."   (verified server applied our inputs).
+    // Loopback needs no NIC; this is the first userspace two-process TCP exchange
+    // in the OS. Gated -DDZ_MPLIVE => the default boot never spawns either, so it
+    // is byte-behaviorally invisible (the smoke gate stays unchanged).
+    print("[INIT] DZ_MPLIVE: spawning deadzoned (authoritative server)...\n");
+    spawn("sbin/deadzoned");
+    sleep(800);
+    print("[INIT] DZ_MPLIVE: spawning dzclient (live loopback co-op client)...\n");
+    int dz_client_pid = spawn("sbin/dzclient");
+    if (dz_client_pid > 0) {
+        // Block init on the client's scripted session so it gets CPU promptly --
+        // otherwise the ~70-process self-test storm spawned below would starve the
+        // cooperative client and it would never finish before the smoke timeout.
+        // The server keeps running (init waits ONLY on the client).
+        int dz_status = 0;
+        syscall(SYS_WAITPID, dz_client_pid, (long)&dz_status, 0);
+        print("[INIT] DZ_MPLIVE: dzclient session complete\n");
+    }
+#endif
+
     // Auto-DHCP: spawns in the background, sleeps 2s (NIC PHY negotiate),
     // checks link, runs DHCP if up, applies lease, exits. Non-blocking --
     // init does not wait for it. If no NIC or DHCP fails, exits silently.
@@ -176,6 +201,12 @@ void _start(void) {
     // prioritytest's pid (referenced by the reaper loop). Declared here so it is
     // visible in BOTH the full and DESKTOP_MINIMAL builds; -1 means "never spawned".
     int prioritytest_pid = -1;
+    // agentd's pid is likewise referenced by the reaper loop (the AGENT-LEDGER
+    // re-verify on agentd's reap) in BOTH builds, but agentd is only spawned in the
+    // full build. Declare it unconditionally (-1 = "never spawned") so the
+    // DESKTOP_MINIMAL build compiles -- it was previously declared inside the
+    // #ifndef DESKTOP_MINIMAL storm, which broke the minimal build.
+    int agentd_pid = -1;
 
     // ── DESKTOP_MINIMAL boot trim ───────────────────────────────────────────
     // When built with -DDESKTOP_MINIMAL (the T410 desktop profile), init spawns
@@ -367,7 +398,7 @@ void _start(void) {
     // Bring it to life with `python3 scripts/nemotron_mock.py` (zero-cost) or
     // `node scripts/nemotron_broker.js` (live NVIDIA/Puter Nemotron) + boot -netdev.
     print("[INIT] Spawning agentd (Nemotron gated OS-automation agent)...\n");
-    int agentd_pid = spawn("sbin/agentd");
+    agentd_pid = spawn("sbin/agentd");
 
 #ifdef COCKPIT_PROOF
     // AGENTCOCKPIT-0 headless seam proof: launch the cockpit in --proof mode so it

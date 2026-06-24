@@ -41,6 +41,14 @@ if [ "${GAMETEST:-0}" = "1" ]; then
     INIT_EXTRA="$INIT_EXTRA -DGAMETEST_RUN"
     echo "*** GAMETEST build: init compiled with -DGAMETEST_RUN (spawns sbin/gametest) ***"
 fi
+# DZ_MPLIVE=1 adds -DDZ_MPLIVE to the init compile ONLY, so init spawns the
+# authoritative deadzoned server + the headless dzclient (DEADZONE-MP-LIVE-0):
+# a LIVE loopback co-op exchange that prints "DEADZONE: mp LIVE PASS". Unset =>
+# the normal boot is byte-for-byte unchanged (neither is ever spawned).
+if [ "${DZ_MPLIVE:-0}" = "1" ]; then
+    INIT_EXTRA="$INIT_EXTRA -DDZ_MPLIVE"
+    echo "*** DZ_MPLIVE build: init spawns deadzoned + dzclient (live loopback co-op proof) ***"
+fi
 # SHOWCASE=1: init auto-opens a curated set of headline GUI apps (sound manager,
 # AI cockpit, a game, the IDE) on top of the desktop, for documentation
 # screenshots. OFF by default -- a normal boot never auto-runs them.
@@ -627,6 +635,12 @@ $LD /tmp/crt0.o /tmp/deadzoned.o -o /tmp/deadzoned.elf
 # (encode/decode round-trip for both packet families). Console binary.
 cc userspace/apps/deadzoned/dzproto_test.c /tmp/dzproto_test.o
 $LD /tmp/crt0.o /tmp/dzproto_test.o -o /tmp/dzproto_test.elf
+# dzclient: the DEADZONE-MP-LIVE-0 headless co-op client -- connects to deadzoned
+# over loopback (127.0.0.1), plays a scripted session, prints "DEADZONE: mp LIVE
+# PASS". Pure-syscall (no wl/g3d), links only crt0 like deadzoned. Always built;
+# only spawned when init is compiled with -DDZ_MPLIVE (DZ_MPLIVE=1).
+cc userspace/apps/dzclient/dzclient.c /tmp/dzclient.o
+$LD /tmp/crt0.o /tmp/dzclient.o -o /tmp/dzclient.elf
 build_wl_app userspace/apps/sudoku/sudoku.c           sudoku
 build_wl_app userspace/apps/pacman/pacman.c           pacman
 build_wl_app userspace/apps/clockapp/clockapp.c       clockapp
@@ -703,7 +717,7 @@ $LD /tmp/crt0.o /tmp/cc.o \
     -o /tmp/cc.elf
 
 echo "[all] canary check (all must be 0):"
-for e in comp init filemanager calculator clock sysinfo settings sysmon uidemo dateapp applauncher taskman terminal editor snake paint synth tetris game2048 sheet notes calendar stopwatch mines piano dashboard welcome bench breakout pong invaders procmon soundtest solitaire aiconsole screenshot stress musicplayer ide bubbletd zombietd pacman clockapp forktest sigtest pollselftest threadtest reaploop forkfdtest forkregtest matmuljobs aibroker sed awk tar pkg make meminfo argvtest msgtest rpctest toolrun echoproof echoargs agenthost tool_read tool_ls tool_stat codeagent toolset_host chainhost modelbridge agentd tool_write tool_cc tool_exec tool_mkdir tool_mv tool_rm tool_spawn tool_kill tool_ps tool_shell tool_mouse tool_key tool_rollback ledgerver cockpit claudehost initrdp initrdalias floattest sleeptest prioritytest matbench tensortest cpuburn blk ps kill free uptime find diff cmp tee wcx xargs gzip cc nettest sockettest cpu1offload smpstress wget netman soundman cryptotest wlanctl wpasupp libtest ping nc netinfo netscan tcping dig httpget pktmon httpd traceroute arp grep head tail sort uniq cut tr nl du touch basename dirname uname hostname whoami date less hexdump lspci tlsprobe certtool dhcpc autodhcp apidemo gsignin js futextest epolltest sendfiletest perftest batchtest domtest htmltest csstest layouttest webtest browser2 webapitest cube3d ray derby deadzone deadzoned dzproto_test chess asteroids sudoku photos startmenu controlcenter claudechat anthropic gametest exectest execchild; do
+for e in comp init filemanager calculator clock sysinfo settings sysmon uidemo dateapp applauncher taskman terminal editor snake paint synth tetris game2048 sheet notes calendar stopwatch mines piano dashboard welcome bench breakout pong invaders procmon soundtest solitaire aiconsole screenshot stress musicplayer ide bubbletd zombietd pacman clockapp forktest sigtest pollselftest threadtest reaploop forkfdtest forkregtest matmuljobs aibroker sed awk tar pkg make meminfo argvtest msgtest rpctest toolrun echoproof echoargs agenthost tool_read tool_ls tool_stat codeagent toolset_host chainhost modelbridge agentd tool_write tool_cc tool_exec tool_mkdir tool_mv tool_rm tool_spawn tool_kill tool_ps tool_shell tool_mouse tool_key tool_rollback ledgerver cockpit claudehost initrdp initrdalias floattest sleeptest prioritytest matbench tensortest cpuburn blk ps kill free uptime find diff cmp tee wcx xargs gzip cc nettest sockettest cpu1offload smpstress wget netman soundman cryptotest wlanctl wpasupp libtest ping nc netinfo netscan tcping dig httpget pktmon httpd traceroute arp grep head tail sort uniq cut tr nl du touch basename dirname uname hostname whoami date less hexdump lspci tlsprobe certtool dhcpc autodhcp apidemo gsignin js futextest epolltest sendfiletest perftest batchtest domtest htmltest csstest layouttest webtest browser2 webapitest cube3d ray derby deadzone deadzoned dzproto_test dzclient chess asteroids sudoku photos startmenu controlcenter claudechat anthropic gametest exectest execchild; do
     n=$(objdump -d /tmp/$e.elf 2>/dev/null | grep -c "fs:0x28" || true)
     echo "  $e=$n"
 done
@@ -725,7 +739,7 @@ if [ "${SELFHEAL:-0}" != "1" ]; then rm -f /tmp/ird/sbin/cwatchdog; fi
 rm -f /tmp/ird/sbin/browser /tmp/ird/bin/browser
 cp /tmp/comp.elf /tmp/ird/sbin/compositor
 cp /tmp/init.elf /tmp/ird/sbin/init
-for e in filemanager calculator clock sysinfo settings sysmon uidemo dateapp applauncher taskman terminal editor snake paint synth tetris game2048 sheet notes calendar stopwatch mines piano dashboard welcome bench breakout pong invaders procmon soundtest solitaire aiconsole screenshot stress musicplayer ide bubbletd startmenu controlcenter claudechat anthropic chess asteroids sudoku photos pacman clockapp zombietd forktest sigtest pollselftest threadtest reaploop forkfdtest forkregtest matmuljobs cube3d ray derby deadzone deadzoned dzproto_test exectest; do
+for e in filemanager calculator clock sysinfo settings sysmon uidemo dateapp applauncher taskman terminal editor snake paint synth tetris game2048 sheet notes calendar stopwatch mines piano dashboard welcome bench breakout pong invaders procmon soundtest solitaire aiconsole screenshot stress musicplayer ide bubbletd startmenu controlcenter claudechat anthropic chess asteroids sudoku photos pacman clockapp zombietd forktest sigtest pollselftest threadtest reaploop forkfdtest forkregtest matmuljobs cube3d ray derby deadzone deadzoned dzproto_test dzclient exectest; do
     cp /tmp/$e.elf /tmp/ird/sbin/$e
 done
 [ "$IV_OK" = "1" ] && cp /tmp/imageviewer.elf /tmp/ird/sbin/imageviewer

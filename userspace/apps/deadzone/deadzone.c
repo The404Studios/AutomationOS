@@ -754,10 +754,15 @@ static int mp_poll_snapshot(dz_client *c, dz_snapshot_t *out)
         c->rxn += (dz_u32)n;
         for (;;) {
             if (c->rxn < 4u * DZ_SNAP_HDR_U32) break;
+            /* Validate magic before trusting the header counts (rx+12/rx+16); on a
+             * bad/garbage frame resync (rxn=0) rather than consuming a possibly-
+             * wrapped length, which would desync the stream forever. */
+            if (dz_get_u32(c->rx) != DZ_SNAP_MAGIC) { c->rxn = 0; break; }
             dz_u32 need = dz_snap_bytes(dz_get_u32(c->rx + 12), dz_get_u32(c->rx + 16));
             if (need == 0 || need > sizeof(c->rx)) { c->rxn = 0; break; }
             if (c->rxn < need) break;
-            if (dz_snap_decode(c->rx, need, out)) got = 1;
+            if (!dz_snap_decode(c->rx, need, out)) { c->rxn = 0; break; }
+            got = 1;
             dz_u32 rem = c->rxn - need;
             for (dz_u32 k = 0; k < rem; k++) c->rx[k] = c->rx[need + k];
             c->rxn = rem;

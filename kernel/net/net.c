@@ -581,11 +581,25 @@ static void ipv4_input(const eth_hdr_t* eh, const uint8_t* ip_start,
     if ((net_ntohl(ip->src) >> 24) == 127u || (net_ntohl(ip->dst) >> 24) == 127u)
         return;
 
+    /* NET-HARDENING-2: verify the IPv4 header checksum (a valid header sums to 0).
+     * The socket.c ipv4_demux path already did this for the UDP/TCP frames; this
+     * NIC ICMP/ARP path did NOT, so a corrupt-header ICMP reached icmp_echo_reply
+     * and could poison the echo bookkeeping below. Mirrors ipv4_demux. */
+    if (inet_checksum(ip, ihl) != 0)
+        return;
+
     /* Check if packet is fragmented. */
     uint16_t frag_off_flags = net_ntohs(ip->frag_off);
     uint16_t frag_offset = (frag_off_flags & 0x1FFF) * 8;
     bool more_frags = (frag_off_flags & 0x2000) != 0;
     bool is_fragment = (frag_offset != 0 || more_frags);
+
+    /* NET-HARDENING-2: only the ICMP path here consumes a reassembled packet, so a
+     * fragmented NON-ICMP datagram must NOT drive the reassembly engine (a wasted
+     * 64KB buffer + hole scan an off-LAN host could use as an amplifier). UDP/TCP
+     * fragments are handled -- and dropped -- by the socket.c demux instead. */
+    if (is_fragment && ip->proto != IPPROTO_ICMP)
+        return;
 
     /* If fragmented, reassemble. */
     if (is_fragment) {

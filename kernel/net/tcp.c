@@ -1221,8 +1221,14 @@ void tcp_input(uint32_t src_ip, uint32_t dst_ip,
                  * slot FARTHEST from rcv_nxt if this segment is nearer
                  * (earlier data fills the gap sooner). No buffer (alloc
                  * failed at boot) degrades to drop + re-ACK: correct, the
-                 * peer retransmits in order. */
-                if (tcp_ooo) {
+                 * peer retransmits in order.
+                 * NET-HARDENING-2 (RFC 793 receive-window acceptability): only
+                 * buffer a future segment that falls WITHIN the advertised window
+                 * [rcv_nxt, rcv_nxt + rcv_wnd). An out-of-window (arbitrarily far)
+                 * segment is dropped (not buffered) so a peer/attacker cannot
+                 * pollute the OOO slots with data that can never drain; we still
+                 * re-ACK rcv_nxt so a legitimate sender retransmits in window. */
+                if (tcp_ooo && !SEQ32_GEQ(seq, s->rcv_nxt + rcv_wnd(s))) {
                     int idx = sock_index(s);
                     tcp_ooo_slot_t* dst = NULL;
                     tcp_ooo_slot_t* far = NULL;

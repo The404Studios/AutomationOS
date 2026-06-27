@@ -73,6 +73,12 @@ fi
 if grep -qF "NETP1V:" "$LOG"; then
     grep -qF "NETP1V: ACKACC PASS established=1 snd_una_held=1" "$LOG" || P=0
 fi
+if grep -qF "NETP1W:" "$LOG"; then
+    grep -qF "NETP1W: MARTIAN PASS spoof_src=1 spoof_dst=1 legit=1" "$LOG" || P=0
+fi
+if grep -qF "NETP1X:" "$LOG"; then
+    grep -qF "NETP1X: IPFRAG PASS frag_dropped=1 legit=1" "$LOG" || P=0
+fi
 # Real unrecoverable kernel faults always fail.
 if grep -qiE "KERNEL PANIC|TRIPLE FAULT" "$LOG"; then
     echo "KERNEL FAULT during boot"; P=0

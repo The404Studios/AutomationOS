@@ -63,6 +63,7 @@
 #include "../include/string.h"
 #include "../include/drivers.h"   /* timer_get_ticks_ms */
 #include "../include/mem.h"       /* kmalloc (heap-backed OOO side-table)  */
+#include "../include/rng.h"       /* rng_u64 (unpredictable ISN)           */
 
 /* ------------------------------------------------------------------ */
 /* Timeouts and retransmit parameters                                  */
@@ -193,10 +194,13 @@ uint64_t tcp_rig_now(void)   { return now_ms(); }
 static uint64_t now_ms(void) { return timer_get_ticks_ms(); }
 #endif
 
-/* A simple-ish ISN. Not security-relevant here; derive from the clock. */
+/* NET-HARDENING-1 (RFC 6528-style ISN): draw the initial sequence number from
+ * the kernel CSPRNG (RDRAND, or seeded xorshift128+ fallback) so a remote peer
+ * cannot PREDICT it. The old version hashed now_ms(), which is invertible from
+ * uptime -- and synq_on_ack's only anti-spoof gate is ack==isn+1, so a
+ * predictable ISN let an off-path attacker forge the completing handshake ACK. */
 static uint32_t gen_isn(void) {
-    uint32_t t = (uint32_t)now_ms();
-    return (t * 2654435761u) ^ 0xDEADBEEFu;
+    return (uint32_t)rng_u64();
 }
 
 /* Free space left in the receive ring (= what we advertise as rcv_wnd). */

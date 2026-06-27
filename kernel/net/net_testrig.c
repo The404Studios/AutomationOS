@@ -124,6 +124,10 @@ int net_testrig_tx_tap(uint32_t dst_ip, uint8_t proto,
 static uint8_t g_pkt[ETH_MAX_FRAME];   /* injection scratch (boot-time only) */
 static uint8_t g_seg[ETH_MAX_FRAME];   /* transport segment scratch          */
 
+/* NETP1X: when set, rig_inject marks the IPv4 packet as a fragment (More-
+ * Fragments bit) so the ipv4_demux fragment-drop guard can be exercised. */
+static int g_frag_mf = 0;
+
 /* Wrap a transport segment in an IPv4 header and feed it to the demux. */
 static void rig_inject(uint32_t src_ip, uint32_t dst_ip, uint8_t proto,
                        const void* seg, uint16_t seg_len) {
@@ -132,7 +136,7 @@ static void rig_inject(uint32_t src_ip, uint32_t dst_ip, uint8_t proto,
     ip->tos       = 0;
     ip->total_len = net_htons((uint16_t)(sizeof(ipv4_hdr_t) + seg_len));
     ip->id        = net_htons(0x4242);
-    ip->frag_off  = 0;
+    ip->frag_off  = g_frag_mf ? net_htons(0x2000) : 0;
     ip->ttl       = 64;
     ip->proto     = proto;
     ip->checksum  = 0;
@@ -1204,6 +1208,61 @@ void net_testrig_selftest(void) {
         kprintf("NETP1V: ACKACC %s established=%d snd_una_held=%d\n",
                 (established && snd_una_held) ? "PASS" : "FAIL",
                 established, snd_una_held);
+    }
+
+    /* ---------------------------------------------------------------- */
+    /* NET-HARDENING-1 NETP1W (martian filter): a frame arriving from the */
+    /* NIC/injector with a loopback (127/8) SRC or DST is spoofed and must */
+    /* be DROPPED; a genuine peer datagram still arrives.                 */
+    /* ---------------------------------------------------------------- */
+    {
+        int spoof_src_dropped = 0, spoof_dst_dropped = 0, legit_ok = 0;
+        int u = sock_socket(SOCK_DGRAM);
+        if (u >= 0 && sock_bind(u, 47022) == 0) {
+            uint8_t buf[16];
+            /* (a) spoofed 127/8 SOURCE off the wire -> dropped. */
+            rig_inject_udp(0x7F000001u, 7777, my_ip, 47022, "MARTIANS", 8);
+            spoof_src_dropped =
+                (sock_recvfrom(u, buf, sizeof(buf), NULL, NULL) <= 0) ? 1 : 0;
+            /* (b) 127/8 DEST off the wire -> dropped (delivered to no socket). */
+            rig_inject_udp(peer_ip, 7777, 0x7F000002u, 47022, "MARTIAND", 8);
+            spoof_dst_dropped =
+                (sock_recvfrom(u, buf, sizeof(buf), NULL, NULL) <= 0) ? 1 : 0;
+            /* (c) a legit peer datagram still arrives. */
+            rig_inject_udp(peer_ip, 7777, my_ip, 47022, "OKOK", 4);
+            int n = sock_recvfrom(u, buf, sizeof(buf), NULL, NULL);
+            legit_ok = (n == 4 && memcmp(buf, "OKOK", 4) == 0) ? 1 : 0;
+        }
+        sock_init();
+        kprintf("NETP1W: MARTIAN %s spoof_src=%d spoof_dst=%d legit=%d\n",
+                (spoof_src_dropped && spoof_dst_dropped && legit_ok) ? "PASS" : "FAIL",
+                spoof_src_dropped, spoof_dst_dropped, legit_ok);
+    }
+
+    /* ---------------------------------------------------------------- */
+    /* NET-HARDENING-1 NETP1X (IP fragment drop): a fragmented IPv4 UDP   */
+    /* datagram (More-Fragments set) must be DROPPED -- ipv4_demux does    */
+    /* not reassemble, so delivering the first fragment would truncate;    */
+    /* an unfragmented datagram to the same socket still arrives.          */
+    /* ---------------------------------------------------------------- */
+    {
+        int frag_dropped = 0, legit_ok = 0;
+        int u = sock_socket(SOCK_DGRAM);
+        if (u >= 0 && sock_bind(u, 47023) == 0) {
+            uint8_t buf[16];
+            g_frag_mf = 1;
+            rig_inject_udp(peer_ip, 7777, my_ip, 47023, "FRAGDATA", 8);
+            g_frag_mf = 0;
+            frag_dropped =
+                (sock_recvfrom(u, buf, sizeof(buf), NULL, NULL) <= 0) ? 1 : 0;
+            rig_inject_udp(peer_ip, 7777, my_ip, 47023, "OKOK", 4);
+            int n = sock_recvfrom(u, buf, sizeof(buf), NULL, NULL);
+            legit_ok = (n == 4 && memcmp(buf, "OKOK", 4) == 0) ? 1 : 0;
+        }
+        sock_init();
+        kprintf("NETP1X: IPFRAG %s frag_dropped=%d legit=%d\n",
+                (frag_dropped && legit_ok) ? "PASS" : "FAIL",
+                frag_dropped, legit_ok);
     }
 
     g_rig_active = 0;

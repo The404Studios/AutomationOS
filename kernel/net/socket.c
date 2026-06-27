@@ -69,7 +69,7 @@ static int      lo_draining;    /* re-entrancy guard: 1 while the drain runs    
 
 /* ipv4_demux() is defined later in this file; the A4 loopback short-circuit at
  * the head of ip_tx() needs it. */
-static void ipv4_demux(const uint8_t* ip_start, uint16_t ip_avail);
+static void ipv4_demux(const uint8_t* ip_start, uint16_t ip_avail, int from_loopback);
 
 static sock_t* sock_from_fd(int fd) {
     if (!g_socks) return NULL;
@@ -277,7 +277,7 @@ static void lo_drain(void) {
     while (lo_q_head != lo_q_tail) {
         uint8_t*  p    = lo_q[lo_q_head];
         uint16_t  plen = lo_q_len[lo_q_head];
-        ipv4_demux(p, plen);
+        ipv4_demux(p, plen, 1);   /* trusted loopback path */
         lo_q_head = (lo_q_head + 1) % LO_Q_SLOTS;
     }
     lo_draining = 0;
@@ -465,7 +465,7 @@ sock_t* sock_find_tcp(uint32_t remote_ip, uint16_t remote_port,
 /* ------------------------------------------------------------------ */
 /* Demux one IPv4 packet (UDP/TCP) into the owning socket. ARP/ICMP were
  * already handled inside net_recv() before we get here. */
-static void ipv4_demux(const uint8_t* ip_start, uint16_t ip_avail) {
+static void ipv4_demux(const uint8_t* ip_start, uint16_t ip_avail, int from_loopback) {
     if (ip_avail < sizeof(ipv4_hdr_t)) return;
     const ipv4_hdr_t* ip = (const ipv4_hdr_t*)ip_start;
 
@@ -485,6 +485,22 @@ static void ipv4_demux(const uint8_t* ip_start, uint16_t ip_avail) {
 
     uint32_t src = net_ntohl(ip->src);
     uint32_t dst = net_ntohl(ip->dst);
+
+    /* NET-HARDENING-1 (martian filter): loopback (127/8) addresses must NEVER
+     * appear on a real interface. A frame from the NIC or the test injector
+     * (from_loopback==0) whose src OR dst is in 127/8 is spoofed -- drop it so an
+     * off-LAN host cannot inject into / RST the in-OS loopback co-op session.
+     * Genuine loopback is delivered only via lo_drain() (from_loopback==1). */
+    if (!from_loopback && ((src >> 24) == 127u || (dst >> 24) == 127u))
+        return;
+
+    /* NET-HARDENING-1 (fragment drop): ipv4_demux does NOT reassemble (only the
+     * ICMP path in net.c does), so an IP fragment would reach udp_input/tcp_input
+     * as a TRUNCATED datagram. Drop any packet with a non-zero fragment offset or
+     * the More-Fragments bit set (mask 0x3FFF = offset|MF; the 0x4000 Don't-
+     * Fragment bit is intentionally left untouched). */
+    if ((net_ntohs(ip->frag_off) & 0x3FFF) != 0)
+        return;
 
     /* Only packets destined for us (or broadcast, or loopback) are
      * interesting. A4: accept 127.0.0.0/8 so loopback delivery (ip_tx's
@@ -506,7 +522,7 @@ static void ipv4_demux(const uint8_t* ip_start, uint16_t ip_avail) {
  * (kernel/net/net_testrig.c) -- hands a crafted packet to the SAME demux
  * the NIC path uses, so rig-tested behavior is real-path behavior. */
 void sock_testrig_inject_ipv4(const uint8_t* ip_start, uint16_t ip_avail) {
-    ipv4_demux(ip_start, ip_avail);
+    ipv4_demux(ip_start, ip_avail, 0);   /* simulates an untrusted NIC arrival */
 }
 #endif
 
@@ -534,7 +550,7 @@ int sock_poll(void) {
 
         const eth_hdr_t* eh = (const eth_hdr_t*)g_rx;
         if (net_ntohs(eh->ethertype) == ETH_P_IP) {
-            ipv4_demux(g_rx + ETH_HLEN, (uint16_t)(n - ETH_HLEN));
+            ipv4_demux(g_rx + ETH_HLEN, (uint16_t)(n - ETH_HLEN), 0);  /* untrusted NIC */
         }
     }
 

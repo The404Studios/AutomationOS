@@ -1531,6 +1531,72 @@ void net_testrig_selftest(void) {
                 found_a, found_b, isns_differ);
     }
 
+    /* ---------------------------------------------------------------- */
+    /* NET-HARDENING-2 NETP1AE (passive-close FIN retransmit + reap): a  */
+    /* deferred passive close sits in LAST_ACK with the FIN armed and    */
+    /* orphaned. If the peer does not ACK, tcp_tick (rig clock) must      */
+    /* RETRANSMIT the FIN; when the ACK arrives the socket -> CLOSED and   */
+    /* the orphan reaper frees the slot. (Drives the close-machine rework */
+    /* without the frozen-clock blocking close path.)                     */
+    /* ---------------------------------------------------------------- */
+    {
+        extern void     tcp_rig_advance_ms(uint64_t);
+        extern void     tcp_rig_clock_reset(void);
+        extern uint64_t tcp_rig_now(void);
+        int staged = 0, fin_rtx = 0, closed_on_ack = 0, reaped = 0;
+        int fd = -1;
+        uint32_t isn = 0;
+        int l = sock_socket(SOCK_STREAM);
+        if (l >= 0 && sock_bind(l, 47031) == 0 && sock_listen(l, 2) == 0) {
+            g_cap_n = 0;
+            rig_inject_tcp(peer_ip, 45008, my_ip, 47031,
+                           25000, 0, TCP_SYN, 4096, NULL, 0);
+            if (g_cap_n >= 1) {
+                const tcp_hdr_t* th = (const tcp_hdr_t*)g_cap[0].seg;
+                isn = net_ntohl(th->seq);
+                rig_inject_tcp(peer_ip, 45008, my_ip, 47031,
+                               25001, isn + 1, TCP_ACK, 4096, NULL, 0);
+                fd = sock_accept(l);
+            }
+        }
+        if (fd >= 0) {
+            sock_t* base = sock_table_base();
+            sock_t* c = base ? &base[fd] : (sock_t*)0;
+            if (c && c->state == TCP_ESTABLISHED) {
+                tcp_rig_clock_reset();
+                uint32_t F = c->snd_nxt;          /* seq of our FIN */
+                /* Stage a DEFERRED passive close: LAST_ACK, FIN armed, orphaned. */
+                c->state      = TCP_LAST_ACK;
+                c->snd_nxt    = F + 1;            /* FIN consumes one seq */
+                c->rt_pending = true; c->rt_done = false;
+                c->rt_seq     = F; c->rt_flags = TCP_FIN | TCP_ACK; c->rt_len = 0;
+                c->rt_time_ms = tcp_rig_now();
+                c->orphaned   = true;
+                staged = 1;
+                /* No peer ACK -> after the RTO, tcp_tick retransmits the FIN. */
+                g_cap_n = 0;
+                tcp_rig_advance_ms(5000);
+                tcp_tick(c);
+                if (g_cap_n >= 1) {
+                    const tcp_hdr_t* th = (const tcp_hdr_t*)g_cap[g_cap_n - 1].seg;
+                    fin_rtx = ((th->flags & TCP_FIN) && net_ntohl(th->seq) == F) ? 1 : 0;
+                }
+                /* Peer ACKs our FIN -> LAST_ACK -> CLOSED. */
+                rig_inject_tcp(peer_ip, 45008, my_ip, 47031,
+                               25001, F + 1, TCP_ACK, 4096, NULL, 0);
+                closed_on_ack = (c->state == TCP_CLOSED) ? 1 : 0;
+                /* Orphan reaper frees the slot on the next tick. */
+                tcp_tick(c);
+                reaped = (!c->used) ? 1 : 0;
+                tcp_rig_clock_reset();
+            }
+        }
+        sock_init();
+        kprintf("NETP1AE: FINRTX %s staged=%d fin_rtx=%d closed_on_ack=%d reaped=%d\n",
+                (staged && fin_rtx && closed_on_ack && reaped) ? "PASS" : "FAIL",
+                staged, fin_rtx, closed_on_ack, reaped);
+    }
+
     g_rig_active = 0;
 
     /* CONFIG-STORE proof (independent of the net rig; reuses the NET_SELFTEST

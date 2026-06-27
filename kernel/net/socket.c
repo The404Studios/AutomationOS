@@ -797,9 +797,17 @@ int sock_close(int s) {
     sock_t* so = sock_from_fd(s);
     if (!so) return SOCK_EBADF;
 
+    int deferred = 0;
     if (so->type == SOCK_STREAM &&
         (so->state == TCP_ESTABLISHED || so->state == TCP_CLOSE_WAIT)) {
         tcp_close(so);   /* send FIN, drive a few polls */
+        /* NET-HARDENING-2 (deferred teardown): tcp_close leaves the socket in a
+         * closing state (FIN_WAIT / LAST_ACK) with rt_pending set when our FIN was
+         * NOT acked within its short drain (a lossy NIC close). Keep the slot so
+         * background tcp_tick() can retransmit the FIN and reap it once acked --
+         * freeing it now would lose the FIN forever. On loopback / a completed
+         * close tcp_close reached CLOSED, so deferred stays 0 and we free below. */
+        if (so->state != TCP_CLOSED && so->rt_pending) deferred = 1;
     }
 
     /* Unlink from listener bookkeeping BEFORE zeroing, so no accept_queue /
@@ -873,6 +881,14 @@ int sock_close(int s) {
         }
     }
 
+    if (deferred) {
+        /* Orphan: detach from owner/parent but keep the slot used so its 4-tuple
+         * still matches the peer's ACK and tcp_tick() services + reaps it. */
+        so->orphaned  = true;
+        so->owner_pid = 0;
+        so->parent    = NULL;
+        return SOCK_OK;
+    }
     memset(so, 0, sizeof(*so));
     return SOCK_OK;
 }

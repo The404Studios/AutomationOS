@@ -73,6 +73,9 @@
 #define TCP_RTO_MAX_RETRIES   8       /* give up after this many retransmits*/
 #define TCP_CONNECT_MS        8000    /* total connect budget (ms)          */
 #define TCP_CLOSE_MS          4000    /* wait for FIN/ACK on close          */
+#define TCP_CLOSE_DRAIN_ITERS 4096    /* NET-HARDENING-2: short close-drain spin --
+                                       * loopback completes in a few iterations; a
+                                       * lossy close defers to background tcp_tick */
 /* Frozen-tick backstop: any wall-clock-bounded spin INSIDE a syscall must also
  * cap consecutive iterations where now_ms() did not advance, because the PIT IRQ
  * (the only thing that bumps the ms clock) cannot fire while the syscall runs
@@ -1015,20 +1018,31 @@ int tcp_close(sock_t* s) {
         tcp_xmit(s, TCP_FIN | TCP_ACK, seq, s->rcv_nxt, NULL, 0);
         s->snd_nxt += 1;   /* FIN consumes one seq */
         tcp_arm_retransmit(s, TCP_FIN | TCP_ACK, seq, NULL, 0);
-        s->state = (s->state == TCP_CLOSE_WAIT) ? TCP_TIME_WAIT : TCP_FIN_WAIT;
-        s->time_wait_ms = now_ms();   /* 2MSL: start the linger clock */
+        /* NET-HARDENING-2: passive close (CLOSE_WAIT) -> LAST_ACK so tcp_tick
+         * RETRANSMITS our FIN until the peer ACKs it (the old CLOSE_WAIT->TIME_WAIT
+         * never retransmitted a lost passive-close FIN); active close -> FIN_WAIT. */
+        s->state = (s->state == TCP_CLOSE_WAIT) ? TCP_LAST_ACK : TCP_FIN_WAIT;
+        s->time_wait_ms = now_ms();
 
-        uint64_t start = now_ms();
-        uint64_t last  = start;
-        uint32_t frozen = 0;
-        while (now_ms() - start < TCP_CLOSE_MS) {
+        /* Brief drain: on loopback the peer ACKs our FIN within a few polls and
+         * the close completes synchronously (-> CLOSED/TIME_WAIT, freed below). A
+         * short iteration cap keeps the syscall fast; if our FIN is still un-acked
+         * when it expires (a lossy NIC close), DEFER teardown to background. */
+        uint32_t spins = 0;
+        while (spins++ < TCP_CLOSE_DRAIN_ITERS) {
             sock_poll();
             if (s->state == TCP_CLOSED || s->state == TCP_TIME_WAIT) break;
-            /* Frozen-tick backstop (IF=0 syscall: now_ms() can't advance). */
-            uint64_t n = now_ms();
-            if (n != last) { last = n; frozen = 0; }
-            else if (++frozen >= TCP_FROZEN_SPIN_CAP) break;
+            if (!s->rt_pending) break;   /* our FIN was acked */
         }
+
+        /* DEFERRED TEARDOWN: if our FIN is still outstanding, leave the socket in
+         * its closing state (FIN_WAIT / LAST_ACK) with rt_pending armed. sock_close()
+         * orphans it and tcp_tick() retransmits the FIN under the advancing clock,
+         * reaping it once the FIN is acked or the retry budget is exhausted. On a
+         * completed (loopback) close rt_pending is clear, so we fall through to
+         * CLOSED and the slot is freed immediately as before. */
+        if (s->rt_pending && s->state != TCP_CLOSED && s->state != TCP_TIME_WAIT)
+            return SOCK_OK;
     }
     s->state = TCP_CLOSED;
     return SOCK_OK;
@@ -1184,6 +1198,7 @@ void tcp_input(uint32_t src_ip, uint32_t dst_ip,
     case TCP_ESTABLISHED:
     case TCP_CLOSE_WAIT:
     case TCP_FIN_WAIT:
+    case TCP_LAST_ACK:        /* NET-HARDENING-2: process the peer's ACK of our FIN */
     case TCP_TIME_WAIT: {
         /* ----------------------------------------------------------
          * ACK processing: free outstanding segment if fully covered.
@@ -1233,6 +1248,13 @@ void tcp_input(uint32_t src_ip, uint32_t dst_ip,
             if (s->state == TCP_FIN_WAIT && SEQ32_GEQ(ack, s->snd_nxt)) {
                 s->state = TCP_TIME_WAIT;   /* our FIN acked */
                 s->time_wait_ms = now_ms(); /* 2MSL: start the linger clock */
+            }
+            /* NET-HARDENING-2: in passive close (LAST_ACK) the peer ACKing our
+             * FIN completes the close -> CLOSED (an orphaned socket is then
+             * reaped by tcp_tick). */
+            if (s->state == TCP_LAST_ACK && SEQ32_GEQ(ack, s->snd_nxt)) {
+                tcp_disarm_retransmit(s);
+                s->state = TCP_CLOSED;
             }
         }
 
@@ -1391,6 +1413,16 @@ void tcp_input(uint32_t src_ip, uint32_t dst_ip,
  * counters tcp_rt_count[] / tcp_rt_rto_ms[].
  */
 void tcp_tick(sock_t* s) {
+    /* NET-HARDENING-2 (orphan reaper): a socket the app already closed but whose
+     * FIN was DEFERRED (orphaned by sock_close) is freed the moment its close
+     * completes -- as soon as it reaches CLOSED or TIME_WAIT. An orphan gets NO
+     * 2MSL linger, so even a lossy-NIC close cannot pin a slot (the audit's
+     * table-exhaustion hazard); it only lived long enough to retransmit the FIN. */
+    if (s->orphaned && (s->state == TCP_CLOSED || s->state == TCP_TIME_WAIT)) {
+        memset(s, 0, sizeof(*s));
+        return;
+    }
+
     /* TCP-ROBUST 2MSL: reap a TIME_WAIT socket once the 2MSL linger elapses, so
      * it no longer sits in TIME_WAIT forever (the prior behavior). A TIME_WAIT
      * socket has no outstanding segment, so this must precede the rt_pending
@@ -1411,9 +1443,9 @@ void tcp_tick(sock_t* s) {
         /* Exhausted retries: give up. */
         tcp_disarm_retransmit(s);
         if (s->state == TCP_SYN_SENT || s->state == TCP_ESTABLISHED ||
-            s->state == TCP_FIN_WAIT) {
+            s->state == TCP_FIN_WAIT || s->state == TCP_LAST_ACK) {
             s->reset = true;
-            s->state = TCP_CLOSED;
+            s->state = TCP_CLOSED;   /* orphan reaped on the next tick */
         }
         return;
     }

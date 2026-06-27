@@ -119,7 +119,8 @@ typedef enum {
     TCP_ESTABLISHED,
     TCP_FIN_WAIT,      /* we sent FIN, awaiting ACK / peer FIN           */
     TCP_CLOSE_WAIT,    /* peer sent FIN; we may still send, must FIN     */
-    TCP_TIME_WAIT
+    TCP_TIME_WAIT,
+    TCP_LAST_ACK       /* NET-HARDENING-2: passive close, awaiting ACK of our FIN */
 } tcp_state_t;
 
 /* ------------------------------------------------------------------ */
@@ -190,6 +191,9 @@ struct sock {
     uint8_t     rt_data[TCP_MSS];
 
     bool        reset;         /* peer sent RST / fatal error           */
+    bool        orphaned;      /* NET-HARDENING-2: app closed but our FIN is    */
+                               /* un-acked; background tcp_tick retransmits +   */
+                               /* reaps it (no owning fd)                       */
 
     /* --- A4 (SOCKET-PARITY-0): socket options + half-close state --- */
     uint8_t     so_reuseaddr;  /* SO_REUSEADDR: relax bind dup check     */

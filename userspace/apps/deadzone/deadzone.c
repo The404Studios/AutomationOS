@@ -45,6 +45,7 @@
 
 /* In-game audio mixer -- defined below, forward-declared for try_shoot/bite. */
 static void audio_trigger(int kind);
+static void num_to_str(char *buf, int v);   /* defined later; used by extraction_step */
 
 /* ---- key scancodes ---- */
 #define KEY_ESC     1
@@ -253,8 +254,29 @@ static void roll_loot(fx x, fx z)
 }
 
 /* Apply a collected item to the player's loadout. */
+/* ====================================================================== *
+ *  EXTRACTION / RAID LOOP (RAID-LOOP-0): a run is a timed RAID. Loot
+ *  collected this raid is UNSECURED (g_raid_bag); standing in the EXTRACTION
+ *  ZONE long enough commits the bag into the PERSISTENT cross-raid stash
+ *  (g_stash) and WINS. Dying or the raid timer expiring forfeits the bag.
+ *  All userspace, integer/fx only; the kernel + dzproto.h wire are untouched.
+ * ====================================================================== */
+#define RAID_DURATION_STEPS   11250            /* ~3:00 at STEP_MS=16            */
+#define EXTRACT_X             9                 /* extraction-zone center (units)*/
+#define EXTRACT_Z             (-9)
+#define EXTRACT_R             fx_ratio(200,100) /* zone radius (2.0)             */
+#define EXTRACT_CHANNEL_STEPS 120               /* steps held in-zone to extract */
+enum { RAID_ACTIVE = 0, RAID_EXTRACTING, RAID_EXTRACTED, RAID_DIED, RAID_TIMEOUT };
+
+static i32 g_raid_timer;                 /* steps remaining (re-init each raid)  */
+static i32 g_raid_state;                 /* RAID_* (re-init each raid)           */
+static i32 g_extract_hold;               /* consecutive steps held in the zone   */
+static u32 g_raid_bag[N_ITEM_TYPES];     /* unsecured loot this raid (forfeitable)*/
+static u32 g_stash[N_ITEM_TYPES];        /* PERSISTENT secured loot -- NEVER reset */
+
 static void loot_apply(u8 type, u16 count)
 {
+    if (type < N_ITEM_TYPES) g_raid_bag[type] += count;   /* RAID: track unsecured gain */
     switch (type) {
         case ITEM_AMMO:         g_ammo  += count;       break;
         case ITEM_ARMOR:        g_armor += 5 * count;   break;
@@ -279,6 +301,31 @@ static void pickups_step(void)
     }
 }
 
+/* RAID: extraction-zone channel. Hold the zone EXTRACT_CHANNEL_STEPS continuous
+ * sim-steps to commit the unsecured bag into the persistent stash and WIN the
+ * raid; leaving the zone (or dying) resets the channel. */
+static void extraction_step(void)
+{
+    if (!g_alive || g_over) return;          /* a corpse / a concluded raid can't extract */
+    fx dx = g_px - fx_from_int(EXTRACT_X);
+    fx dz = g_pz - fx_from_int(EXTRACT_Z);
+    fx d2 = fx_add(fx_mul(dx,dx), fx_mul(dz,dz));
+    if (d2 <= fx_mul(EXTRACT_R, EXTRACT_R)) {
+        g_raid_state = RAID_EXTRACTING;
+        if (++g_extract_hold >= EXTRACT_CHANNEL_STEPS) {
+            for (int i = 0; i < N_ITEM_TYPES; i++) g_stash[i] += g_raid_bag[i];   /* secure the haul */
+            g_raid_state = RAID_EXTRACTED;
+            g_over = 1;                       /* raid concluded as a WIN (g_alive stays 1) */
+            char b[24]; int tot = 0;
+            for (int i = 0; i < N_ITEM_TYPES; i++) tot += (int)g_stash[i];
+            print("[DEADZONE] extracted stash="); num_to_str(b, tot); print(b); print("\n");
+        }
+    } else {
+        g_extract_hold = 0;
+        if (g_raid_state == RAID_EXTRACTING) g_raid_state = RAID_ACTIVE;
+    }
+}
+
 static fx fx_clamp(fx v, fx lo, fx hi) { return v < lo ? lo : (v > hi ? hi : v); }
 static fx dirx(i32 h) { return fx_sin(h & G3D_ANG_MASK); }
 static fx dirz(i32 h) { return fx_cos(h & G3D_ANG_MASK); }
@@ -287,7 +334,9 @@ static fx dirz(i32 h) { return fx_cos(h & G3D_ANG_MASK); }
  *  Meshes (hand-built boxes; no assets)
  * ====================================================================== */
 static g3d_tri g_zmesh[12];
-#define MAX_WORLD 220
+#define MAX_WORLD 320   /* was 220; build_world already pushes ~280 tris (floor+walls+
+                         * trees) so the old cap silently clipped geometry -- raised to
+                         * fit the new extraction-zone pad AND un-clip the trees. */
 static g3d_tri g_world[MAX_WORLD];
 static int     g_nworld;
 
@@ -347,6 +396,11 @@ static void build_world(void)
         u32 col = ((gx+gz)&1) ? 0xFF1E2A1Cu : 0xFF15201Au;   /* dim grass tones */
         quad_push(v3(x0,0,z1),v3(x1,0,z1),v3(x1,0,z0),v3(x0,0,z0), col, 0);
     }
+    /* RAID: bright extraction-zone pad on the floor so the player can find it. */
+    {
+        fx ex=fx_from_int(EXTRACT_X), ez=fx_from_int(EXTRACT_Z), pr=EXTRACT_R, y=fx_ratio(3,100);
+        quad_push(v3(ex-pr,y,ez+pr), v3(ex+pr,y,ez+pr), v3(ex+pr,y,ez-pr), v3(ex-pr,y,ez-pr), 0xFF28E048u, 0);
+    }
     fx H = fx_from_int(2);
     u32 wcol = 0xFF2B2F36u;
     quad_push(v3(-half,0,half), v3(half,0,half), v3(half,H,half), v3(-half,H,half), wcol,1);
@@ -396,6 +450,11 @@ static void deadzone_reset(u64 seed)
     /* loot/equipment/durability */
     for (int i = 0; i < MAX_PICKUPS; i++) g_pickup[i].alive = 0;
     g_weap_dur = WEAP_DUR_MAX; g_armor = 0; g_scrap = 0;
+    /* RAID: fresh raid clock + state. g_stash is PERSISTENT -- never reset here. */
+    g_raid_timer = RAID_DURATION_STEPS;
+    g_raid_state = RAID_ACTIVE;
+    g_extract_hold = 0;
+    for (int i = 0; i < N_ITEM_TYPES; i++) g_raid_bag[i] = 0;
     loot_wsum_init();
     start_wave(1);
 }
@@ -819,6 +878,26 @@ static void draw_hud(wl_window *win, int tw, int th)
     num_to_str(buf, g_kills); k=0; while(buf[k]){lbl[n++]=buf[k++];} lbl[n]=0;
     font_draw_string(px,stride,tw,th, tw-12-(int)k_strlen(lbl)*FONT_W, 14, lbl, 0xFFFFFFFFu);
 
+    /* RAID timer (mm:ss) + SECURED(stash) / RISK(unsecured bag), top-center */
+    {
+        int secs = (g_raid_timer * STEP_MS) / 1000, mins = secs / 60; secs %= 60;
+        n=0; const char *rl="RAID "; while(rl[n]){lbl[n]=rl[n];n++;}
+        num_to_str(buf, mins); k=0; while(buf[k]){lbl[n++]=buf[k++];}
+        lbl[n++]=':'; if (secs<10) lbl[n++]='0';
+        num_to_str(buf, secs); k=0; while(buf[k]){lbl[n++]=buf[k++];} lbl[n]=0;
+        u32 tc = (g_raid_timer < (20*1000)/STEP_MS) ? 0xFFE63946u : 0xFFFFFFFFu;   /* red under ~20s */
+        font_draw_string(px,stride,tw,th, tw/2-(int)k_strlen(lbl)*FONT_W/2, 14, lbl, tc);
+        int sec=0, risk=0;
+        for (int i=0;i<N_ITEM_TYPES;i++){ sec += (int)g_stash[i]; risk += (int)g_raid_bag[i]; }
+        n=0; const char *cl="SECURED "; while(cl[n]){lbl[n]=cl[n];n++;}
+        num_to_str(buf, sec); k=0; while(buf[k]){lbl[n++]=buf[k++];}
+        const char *rk="  RISK "; int mq=0; while(rk[mq]){lbl[n++]=rk[mq++];}
+        num_to_str(buf, risk); k=0; while(buf[k]){lbl[n++]=buf[k++];} lbl[n]=0;
+        font_draw_string(px,stride,tw,th, tw/2-(int)k_strlen(lbl)*FONT_W/2, 26, lbl, 0xFFBFC7D2u);
+        if (g_raid_state == RAID_EXTRACTING)
+            font_draw_string(px,stride,tw,th, tw/2-44, th/2+40, "EXTRACTING...", 0xFF3CCB5Au);
+    }
+
     /* weapon viewmodel (bottom-center) with a recoil kick + muzzle flash */
     int kick = g_muzzle>0 ? 7 : (g_recoil>0 ? 3 : 0);
     int gx=tw/2-14, gy=th-82+kick;
@@ -838,12 +917,15 @@ static void draw_hud(wl_window *win, int tw, int th)
                      0xFFAAB2BFu);
 
     if (g_over) {
-        const char *msg="YOU DIED -  Press R";
+        const char *msg; u32 mc;
+        if      (g_raid_state == RAID_EXTRACTED) { msg="EXTRACTED -  Press R"; mc=0xFF3CCB5Au; } /* green */
+        else if (g_raid_state == RAID_TIMEOUT)   { msg="TIME UP -  Press R";   mc=0xFFE9C46Au; } /* amber */
+        else                                     { msg="YOU DIED -  Press R";  mc=0xFFE63946u; } /* red   */
         int mw=(int)k_strlen(msg)*FONT_W*2, mx=(tw-mw)/2, my=th/2-16;
         fill_rect(px,stride,tw,th, mx-16,my-12,mw+32,FONT_H+24, 0xCC000000u);
         for (int s=0;msg[s];s++){ int xx=mx+s*FONT_W*2;
-            font_draw_char(px,stride,tw,th, xx,my,msg[s],0xFFE63946u);
-            font_draw_char(px,stride,tw,th, xx+1,my,msg[s],0xFFE63946u); }
+            font_draw_char(px,stride,tw,th, xx,my,msg[s],mc);
+            font_draw_char(px,stride,tw,th, xx+1,my,msg[s],mc); }
     }
 }
 
@@ -1056,6 +1138,54 @@ static void audio_selftest(void){
     for (int i=0;i<AUD_VOICES;i++) g_av[i].active = 0;   /* clean for gameplay */
 }
 
+/* Headless raid-lifecycle proof: drive a REAL pickups_step collect -> extract
+ * (stash grows) and a collect -> die (stash unchanged) through the actual game
+ * code. Saves/restores the PERSISTENT stash + rng and ends with a clean reset,
+ * so it must run LAST and leaves live play untouched. */
+static void raid_selftest(void)
+{
+    char nb[12];
+    u32 save_stash[N_ITEM_TYPES]; for (int i=0;i<N_ITEM_TYPES;i++) save_stash[i]=g_stash[i];
+    u32 save_rng = g_rng;
+    u64 now = (u64)sc(SYS_GET_TICKS_MS,0,0,0,0,0,0);
+
+    /* Scenario A: collect 7 SCRAP via pickups_step, then EXTRACT -> stash kept. */
+    deadzone_reset(now);
+    for (int i=0;i<N_ITEM_TYPES;i++) g_stash[i]=0;          /* clean stash baseline */
+    g_pickup[0].x=g_px; g_pickup[0].z=g_pz; g_pickup[0].type=ITEM_SCRAP;
+    g_pickup[0].count=7; g_pickup[0].alive=1; g_pickup[0].bob=0;
+    pickups_step();                                          /* -> loot_apply -> bag[SCRAP]=7 */
+    int bagged = (g_raid_bag[ITEM_SCRAP]==7) ? 1 : 0;
+    g_px=fx_from_int(EXTRACT_X); g_pz=fx_from_int(EXTRACT_Z);
+    for (int s=0; s<EXTRACT_CHANNEL_STEPS+2 && g_raid_state!=RAID_EXTRACTED; s++) extraction_step();
+    int extracted = (g_raid_state==RAID_EXTRACTED && g_over==1) ? 1 : 0;
+    int kept = (g_stash[ITEM_SCRAP]==7) ? 1 : 0;
+
+    /* Scenario B: collect 5 SCRAP, then DIE before extracting -> stash unchanged. */
+    deadzone_reset(now ^ 0x55u);                            /* fresh raid; stash persists */
+    u32 stash_before = g_stash[ITEM_SCRAP];                 /* == 7 from scenario A */
+    g_pickup[0].x=g_px; g_pickup[0].z=g_pz; g_pickup[0].type=ITEM_SCRAP;
+    g_pickup[0].count=5; g_pickup[0].alive=1; g_pickup[0].bob=0;
+    pickups_step();
+    g_hp=0; g_alive=0;
+    if (g_raid_state==RAID_ACTIVE) g_raid_state=RAID_DIED;  /* mirror the loss-latch tag */
+    int died = (g_raid_state==RAID_DIED) ? 1 : 0;
+    int lost = (g_stash[ITEM_SCRAP]==stash_before) ? 1 : 0; /* bag (5) NOT secured */
+
+    int ok = bagged && extracted && kept && died && lost;
+    print("DEADZONE: raid "); print(ok?"PASS":"FAIL");
+    print(" bagged=");    num_to_str(nb,bagged);    print(nb);
+    print(" extracted="); num_to_str(nb,extracted); print(nb);
+    print(" kept=");      num_to_str(nb,kept);      print(nb);
+    print(" died=");      num_to_str(nb,died);      print(nb);
+    print(" lost=");      num_to_str(nb,lost);      print(nb);
+    print("\n");
+
+    for (int i=0;i<N_ITEM_TYPES;i++) g_stash[i]=save_stash[i];   /* restore persistent stash */
+    g_rng = save_rng;
+    deadzone_reset((u64)sc(SYS_GET_TICKS_MS,0,0,0,0,0,0));        /* clean raid for live play */
+}
+
 static void systems_selftest(void)
 {
     char nb[12];
@@ -1244,6 +1374,7 @@ void _start(void)
     mp_selftest();               /* headless proof: client speaks dzproto wire  */
     loot_selftest();             /* headless proof: loot/equip/durability       */
     audio_selftest();            /* headless proof: in-game SFX stream (or SKIP) */
+    raid_selftest();             /* headless proof: extraction/raid lifecycle    */
     print("DEADZONE: ready\n");
 
     for (;;) {
@@ -1295,8 +1426,15 @@ void _start(void)
                 if (g_shoot_held) try_shoot();
                 zombies_step();
                 pickups_step();          /* walk-over loot collection */
+                extraction_step();       /* RAID: extraction-zone channel -> secure + win */
                 wave_update();
+                /* RAID timer: expiry = MIA (loss). Set the result BEFORE g_alive=0 so the
+                 * latch below tags it TIMEOUT, not DIED. */
+                if (g_alive && !g_over && g_raid_timer > 0 && --g_raid_timer == 0) {
+                    g_raid_state = RAID_TIMEOUT; g_alive = 0;
+                }
                 if (!g_alive && !g_over) {
+                    if (g_raid_state == RAID_ACTIVE) g_raid_state = RAID_DIED;  /* death (timeout set above) */
                     g_over = 1;
                     char b1[24], b2[24]; num_to_str(b1,g_wave); num_to_str(b2,g_kills);
                     print("[DEADZONE] over wave "); print(b1); print(" kills "); print(b2); print("\n");

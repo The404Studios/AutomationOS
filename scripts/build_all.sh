@@ -49,6 +49,15 @@ if [ "${DZ_MPLIVE:-0}" = "1" ]; then
     INIT_EXTRA="$INIT_EXTRA -DDZ_MPLIVE"
     echo "*** DZ_MPLIVE build: init spawns deadzoned + dzclient (live loopback co-op proof) ***"
 fi
+# DZ_MP2=1 compiles dzclient.c with -DDZ_MP2 so the (single) spawned dzclient opens
+# TWO connections internally -- the MP-HELLO-0 headless 2-client proof (distinct
+# slots via DZ_HELLO). Use together with DZ_MPLIVE=1 (init spawns deadzoned + the
+# one dzclient). Unset => the normal single-connection dzclient.
+DZ_MP2_FLAG=""
+if [ "${DZ_MP2:-0}" = "1" ]; then
+    DZ_MP2_FLAG="-DDZ_MP2"
+    echo "*** DZ_MP2 build: dzclient compiled -DDZ_MP2 (2-connection co-op harness) ***"
+fi
 # DZ_GAMETEST=1 adds -DDZ_GAMETEST so init spawns sbin/deadzone, whose launch-time
 # headless selftests (systems/mp/loot) print to serial. Unset => normal boot.
 if [ "${DZ_GAMETEST:-0}" = "1" ]; then
@@ -652,7 +661,7 @@ $LD /tmp/crt0.o /tmp/dzproto_test.o -o /tmp/dzproto_test.elf
 # over loopback (127.0.0.1), plays a scripted session, prints "DEADZONE: mp LIVE
 # PASS". Pure-syscall (no wl/g3d), links only crt0 like deadzoned. Always built;
 # only spawned when init is compiled with -DDZ_MPLIVE (DZ_MPLIVE=1).
-cc userspace/apps/dzclient/dzclient.c /tmp/dzclient.o
+gcc $CF $DZ_MP2_FLAG -c userspace/apps/dzclient/dzclient.c -o /tmp/dzclient.o
 $LD /tmp/crt0.o /tmp/dzclient.o -o /tmp/dzclient.elf
 # streamtest: AUDIO B1 part-2 userspace PCM-streaming proof. Pure-syscall (no
 # wl/g3d), links only crt0. Always built; spawned only under -DAUDIO_STREAMTEST.

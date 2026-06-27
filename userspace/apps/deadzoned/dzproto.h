@@ -92,6 +92,35 @@ static inline int dz_input_decode(const dz_u8 *buf, dz_input_t *in)
     return 1;
 }
 
+/* ---- join-ack (server -> client, ONCE on accept, BEFORE the snapshot stream) -
+ * MP-HELLO-0: the server assigns each connecting client a slot (world_join) and
+ * sends it back so the client learns its identity instead of assuming slot 0.
+ * This is a NEW typed message; DZ_INPUT (24B) / DZ_SNAPSHOT stay byte-identical,
+ * and DZ_HELLO is read once in mp_connect BEFORE the snapshot pump so it never
+ * reaches the snapshot reassembler. */
+#define DZ_HELLO_MAGIC    0x31485A44u   /* "DZH1" LE -- distinct from DZI1/DZS1 */
+#define DZ_HELLO_BYTES    16
+#define DZ_PROTO_VER      1
+#define DZ_SLOT_EMPTY     0xFFFFFFFFu    /* dz_player_t.id for an unoccupied slot */
+
+typedef struct { dz_u32 slot, max_players, proto_ver; } dz_hello_t;
+
+static inline void dz_hello_encode(dz_u8 *buf, const dz_hello_t *h)
+{
+    dz_put_u32(buf,      DZ_HELLO_MAGIC);
+    dz_put_u32(buf + 4,  h->slot);
+    dz_put_u32(buf + 8,  h->max_players);
+    dz_put_u32(buf + 12, h->proto_ver);
+}
+static inline int dz_hello_decode(const dz_u8 *buf, dz_hello_t *h)
+{
+    if (dz_get_u32(buf) != DZ_HELLO_MAGIC) return 0;
+    h->slot        = dz_get_u32(buf + 4);
+    h->max_players = dz_get_u32(buf + 8);
+    h->proto_ver   = dz_get_u32(buf + 12);
+    return 1;
+}
+
 /* ---- snapshot (client-side view) --------------------------------------- */
 typedef struct { dz_u32 id; dz_i32 x, y, hp; dz_u32 yaw, score; } dz_player_t;
 typedef struct { dz_i32 x, y; dz_u32 state; } dz_zombie_t;

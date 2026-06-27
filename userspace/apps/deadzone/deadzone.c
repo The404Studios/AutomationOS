@@ -1259,17 +1259,33 @@ static void loot_selftest(void)
 #define MP_EAGAIN     (-11)
 #define DZ_GAME_PORT   27015
 
-typedef struct { long fd; dz_u32 seq; dz_u8 rx[2048]; dz_u32 rxn; } dz_client;
+typedef struct { long fd; dz_u32 seq; dz_u8 rx[2048]; dz_u32 rxn; dz_u32 slot; } dz_client;
 
 /* Connect to a server. ip_be = packed big-endian a.b.c.d, port = bare number.
- * Returns 0 on success (or connect-in-progress), negative on a hard error. */
+ * Returns 0 on success, negative on a hard error. (NOTE: deadzone.c sc() is the
+ * 7-arg form -- do NOT paste the 6-arg client/server call shape here.) */
 static int mp_connect(dz_client *c, dz_u32 ip_be, long port)
 {
     c->fd = sc(SYS_SOCKET, MP_SOCK_STREAM, 0, 0, 0, 0, 0);
     if (c->fd < 0) return -1;
     long r = sc(SYS_CONNECT, c->fd, (long)ip_be, port, 0, 0, 0);
-    if (r < 0 && r != MP_EAGAIN) { sc(SYS_CLOSE_SK, c->fd, 0, 0, 0, 0, 0); return -2; }
-    c->seq = 0; c->rxn = 0;
+    if (r < 0) { sc(SYS_CLOSE_SK, c->fd, 0, 0, 0, 0, 0); return -2; }  /* synchronous connect: any neg = hard fail */
+    c->seq = 0; c->rxn = 0; c->slot = 0;
+    /* MP-HELLO-0: read the server's 16B DZ_HELLO join-ack FIRST (bounded recv ->
+     * trailing snapshot bytes stay in the kernel for mp_poll_snapshot). */
+    {
+        dz_u8 hb[DZ_HELLO_BYTES]; long off = 0; int guard = 0;
+        while (off < DZ_HELLO_BYTES) {
+            sc(SYS_SOCK_POLL, 0, 0, 0, 0, 0, 0);
+            long n = sc(SYS_RECV, c->fd, (long)(hb + off), DZ_HELLO_BYTES - off, 0, 0, 0);
+            if (n > 0) { off += n; continue; }
+            if (n == MP_EAGAIN) { sc(SYS_YIELD,0,0,0,0,0,0); if (++guard > 200000) { sc(SYS_CLOSE_SK,c->fd,0,0,0,0,0); return -3; } continue; }
+            sc(SYS_CLOSE_SK, c->fd, 0, 0, 0, 0, 0); return -4;   /* closed before hello */
+        }
+        dz_hello_t hel;
+        if (!dz_hello_decode(hb, &hel) || hel.proto_ver != DZ_PROTO_VER) { sc(SYS_CLOSE_SK,c->fd,0,0,0,0,0); return -5; }
+        c->slot = hel.slot;
+    }
     return 0;
 }
 
@@ -1344,6 +1360,13 @@ static void mp_selftest(void)
     dz_u32 n = dz_snap_encode(&s, sb, sizeof(sb));
     if (!n || !dz_snap_decode(sb, n, &s2) || s2.n_zombies != s.n_zombies
         || s2.p[1].x != s.p[1].x) { print("DEADZONE: mp FAIL snap\n"); return; }
+
+    /* MP-HELLO-0: the DZ_HELLO join-ack round-trips on the game side too. */
+    dz_hello_t h, h2; h.slot = 1; h.max_players = 8; h.proto_ver = DZ_PROTO_VER;
+    dz_u8 hbb[DZ_HELLO_BYTES]; dz_hello_encode(hbb, &h);
+    if (!dz_hello_decode(hbb, &h2) || h2.slot != h.slot || h2.proto_ver != h.proto_ver) {
+        print("DEADZONE: mp FAIL hello\n"); return;
+    }
 
     print("DEADZONE: mp PASS (dzproto client wire ok)\n");
 }

@@ -506,6 +506,20 @@ static int do_serve(long port)
             g_cli[placed].fd = cfd;
             g_cli[placed].slot = slot;
             g_cli[placed].rxn = 0;
+            /* MP-HELLO-0: tell the client its assigned slot FIRST (a 16B join-ack).
+             * TCP in-order delivery guarantees it precedes this tick's snapshot
+             * broadcast, so the client reads it before its snapshot pump. */
+            {
+                dz_hello_t hel = { (dz_u32)slot, (dz_u32)MAX_CLIENTS, (dz_u32)DZ_PROTO_VER };
+                u8 hb[DZ_HELLO_BYTES];
+                dz_hello_encode(hb, &hel);
+                if (send_all(cfd, hb, DZ_HELLO_BYTES) != DZ_HELLO_BYTES) {
+                    world_leave(&g_world, slot);
+                    sc(SYS_CLOSE_SK, cfd, 0,0,0,0);
+                    client_clear(placed);
+                    continue;
+                }
+            }
             out_puts("DEADZONED: client joined slot=");
             out_num(slot); out_puts("\n");
         }

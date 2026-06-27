@@ -119,7 +119,7 @@ static i32 clamp_move(i32 v)
 /* Client seam -- the same three calls the dormant deadzone.c seam uses,   */
 /* re-expressed with deadzoned's syscall wrapper + bounded waits.          */
 /* ===================================================================== */
-typedef struct { long fd; dz_u32 seq; dz_u8 rx[2048]; dz_u32 rxn; } dz_client;
+typedef struct { long fd; dz_u32 seq; dz_u8 rx[2048]; dz_u32 rxn; dz_u32 slot; } dz_client;
 
 /* Connect to ip:port (ip = host byte order). The kernel TCP connect is fully
  * synchronous -- it never returns SOCK_EAGAIN (there is no non-blocking socket),
@@ -133,7 +133,29 @@ static long mp_connect(dz_client *c, dz_u32 ip, long port)
     if (c->fd < 0) return -1000;
     long r = sc(SYS_CONNECT, c->fd, (long)ip, port, 0, 0);
     if (r < 0) { sc(SYS_CLOSE_SK, c->fd, 0, 0, 0, 0); return r; }
-    c->seq = 0; c->rxn = 0;
+    c->seq = 0; c->rxn = 0; c->slot = 0;
+    /* MP-HELLO-0: the server sends a 16B DZ_HELLO join-ack FIRST. Read EXACTLY
+     * DZ_HELLO_BYTES (bounded recv -> any trailing snapshot bytes stay in the
+     * kernel socket buffer for mp_poll_snapshot), then learn our slot. */
+    {
+        dz_u8 hb[DZ_HELLO_BYTES]; long off = 0; int guard = 0;
+        while (off < DZ_HELLO_BYTES) {
+            sc(SYS_SOCK_POLL, 0, 0, 0, 0, 0);
+            long n = sc(SYS_RECV, c->fd, (long)(hb + off), DZ_HELLO_BYTES - off, 0, 0);
+            if (n > 0) { off += n; continue; }
+            if (n == SOCK_EAGAIN) {
+                sc(SYS_YIELD, 0, 0, 0, 0, 0);
+                if (++guard > 200000) { sc(SYS_CLOSE_SK, c->fd, 0, 0, 0, 0); return -1; }
+                continue;
+            }
+            sc(SYS_CLOSE_SK, c->fd, 0, 0, 0, 0); return -1;   /* closed before hello */
+        }
+        dz_hello_t hel;
+        if (!dz_hello_decode(hb, &hel) || hel.proto_ver != DZ_PROTO_VER) {
+            sc(SYS_CLOSE_SK, c->fd, 0, 0, 0, 0); return -1;   /* bad / incompatible hello */
+        }
+        c->slot = hel.slot;
+    }
     return r;
 }
 
@@ -191,10 +213,74 @@ static int mp_poll_snapshot(dz_client *c, dz_snapshot_t *out)
 static dz_client     g_c;
 static dz_snapshot_t g_snap;      /* big -- keep it off the stack          */
 
-/* We are the sole client -> world_join() hands us slot 0 deterministically,
- * so g_snap.p[MY_SLOT] is OUR authoritative player. */
-#define MY_SLOT 0
+/* MP-HELLO-0: our slot is now LEARNED from the server's DZ_HELLO (g_c.slot),
+ * not assumed. For the 1-client path the server assigns slot 0 first, so
+ * g_c.slot==0 and the 'mp LIVE PASS' line stays byte-identical. */
+#define MY_SLOT ((int)g_c.slot)
 
+#ifdef DZ_MP2
+/* ===================================================================== */
+/* DZ_MP2: single-process TWO-connection co-op harness. Proves DZ_HELLO   */
+/* hands two clients DISTINCT slots (0 and 1) and both drive the server   */
+/* (one spawn + one WAITPID -- no two-process scheduler fragility).        */
+/* ===================================================================== */
+static dz_client     g_c2;
+static dz_snapshot_t g_snap2;
+int main(void)
+{
+    int okA = 0, okB = 0;
+    for (int a = 0; a < CONNECT_TRIES && !okA; a++) {
+        if (mp_connect(&g_c,  LOOPBACK_IP, DZ_GAME_PORT) >= 0) okA = 1; else sc(SYS_SLEEP, CONNECT_WAIT_MS,0,0,0,0); }
+    for (int a = 0; a < CONNECT_TRIES && !okB; a++) {
+        if (mp_connect(&g_c2, LOOPBACK_IP, DZ_GAME_PORT) >= 0) okB = 1; else sc(SYS_SLEEP, CONNECT_WAIT_MS,0,0,0,0); }
+    if (!okA || !okB) { out_puts("DEADZONE: mp2 FAIL connect\n"); sc(SYS_EXIT,1,0,0,0,0); }
+
+    i32 ax0=0, ay0=0, bx0=0, by0=0;
+    int hasA=0, hasB=0, movedA=0, movedB=0, otherA=0, otherB=0;
+    for (int f = 0; f < PLAY_FRAMES; f++) {
+        /* A chases the nearest zombie (diverges naturally). */
+        i32 amx=0, amy=0;
+        if (hasA) {
+            i32 px=g_snap.p[g_c.slot].x, py=g_snap.p[g_c.slot].y; i32 bestd=0x7fffffff; int zb=-1;
+            for (dz_u32 zi=0; zi<g_snap.n_zombies; zi++) {
+                if (g_snap.z[zi].state != Z_ALIVE_WIRE) continue;
+                i32 d=iabs(g_snap.z[zi].x-px)+iabs(g_snap.z[zi].y-py); if (d<bestd){bestd=d;zb=(int)zi;}
+            }
+            if (zb>=0) { amx=clamp_move(g_snap.z[zb].x-px); amy=clamp_move(g_snap.z[zb].y-py); }
+        }
+        mp_send_input(&g_c,  amx, amy, 0, DZ_BTN_FIRE);
+        /* B drives a fixed opposite vector so its position provably diverges. */
+        mp_send_input(&g_c2, clamp_move(99999), clamp_move(-99999), 0, 0);
+
+        if (mp_poll_snapshot(&g_c, &g_snap)) {
+            if (!hasA) { ax0=g_snap.p[g_c.slot].x; ay0=g_snap.p[g_c.slot].y; hasA=1; }
+            if (iabs(g_snap.p[g_c.slot].x-ax0)+iabs(g_snap.p[g_c.slot].y-ay0) > MOVED_EPS) movedA=1;
+            if (g_snap.n_players >= 2) otherA=1;
+        }
+        if (mp_poll_snapshot(&g_c2, &g_snap2)) {
+            if (!hasB) { bx0=g_snap2.p[g_c2.slot].x; by0=g_snap2.p[g_c2.slot].y; hasB=1; }
+            if (iabs(g_snap2.p[g_c2.slot].x-bx0)+iabs(g_snap2.p[g_c2.slot].y-by0) > MOVED_EPS) movedB=1;
+            if (g_snap2.n_players >= 2) otherB=1;
+        }
+        sc(SYS_SLEEP, TICK_MS, 0,0,0,0);
+    }
+    sc(SYS_CLOSE_SK, g_c.fd,  0,0,0,0);
+    sc(SYS_CLOSE_SK, g_c2.fd, 0,0,0,0);
+
+    int ok = (g_c.slot != g_c2.slot) && (g_c.slot<=1) && (g_c2.slot<=1)
+             && movedA && movedB && otherA && otherB;
+    out_puts("DEADZONE: mp2 "); out_puts(ok?"PASS":"FAIL");
+    out_puts(" slotA=");  out_unum(g_c.slot);
+    out_puts(" slotB=");  out_unum(g_c2.slot);
+    out_puts(" movedA="); out_unum((u32)movedA);
+    out_puts(" movedB="); out_unum((u32)movedB);
+    out_puts(" otherA="); out_unum((u32)otherA);
+    out_puts(" otherB="); out_unum((u32)otherB);
+    out_puts("\n");
+    sc(SYS_EXIT, ok?0:1, 0,0,0,0);
+    return 0;
+}
+#else
 int main(void)
 {
     /* ---- connect (retry while the server is still binding/listening) -- */
@@ -267,3 +353,4 @@ int main(void)
     sc(SYS_EXIT, 0, 0, 0, 0, 0);
     return 0;
 }
+#endif /* DZ_MP2 */

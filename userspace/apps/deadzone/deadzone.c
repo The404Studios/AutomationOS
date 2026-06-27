@@ -40,6 +40,11 @@
 #define SYS_WRITE         3
 #define SYS_YIELD         15
 #define SYS_GET_TICKS_MS  40
+#define SYS_AUDIO_STREAM_WRITE 128   /* AUDIO B1: stream 48k/16-bit/stereo PCM */
+#define AUD_EAGAIN  (-11)            /* kernel software ring full (EAGAIN)     */
+
+/* In-game audio mixer -- defined below, forward-declared for try_shoot/bite. */
+static void audio_trigger(int kind);
 
 /* ---- key scancodes ---- */
 #define KEY_ESC     1
@@ -64,6 +69,7 @@ typedef int            i32;
 typedef unsigned long  u64;
 typedef unsigned char  u8;
 typedef unsigned short u16;
+typedef short          i16;   /* signed 16-bit PCM sample (in-game audio mixer) */
 
 static inline long sc(long n, long a1, long a2, long a3, long a4, long a5, long a6)
 {
@@ -477,6 +483,7 @@ static void try_shoot(void)
     if (!g_alive || g_fire_cd > 0 || g_reload > 0) return;
     if (g_mag <= 0) { if (g_ammo > 0) g_reload = g_reload_steps; return; }
     g_mag--; g_fire_cd = FIRE_COOLDN; g_recoil = fx_ratio(6,100); g_muzzle = 3;
+    audio_trigger(0);                                    /* gunshot SFX */
     if (g_weap_dur > 0) g_weap_dur -= WEAP_DUR_PERSHOT;   /* weapon wears with use */
 
     fx fdx = dirx(g_yaw), fdz = dirz(g_yaw);
@@ -529,6 +536,7 @@ static void zombies_step(void)
                 int bd = Z_BITE_DMG - g_armor / 4;     /* armor soaks bite dmg */
                 if (bd < 1) bd = 1;                     /* always at least 1    */
                 g_hp -= bd; z->bite_cd = Z_BITE_CD;
+                audio_trigger(1);                       /* zombie bite SFX */
                 if (g_hp <= 0) { g_hp = 0; g_alive = 0; }
             }
         }
@@ -928,6 +936,126 @@ static void draw_ui_panel(wl_window *win)
 }
 
 /* Headless proof: attributes deterministically drive the derived gameplay stats. */
+/* ====================================================================== *
+ *  In-game audio: a tiny NON-BLOCKING SFX mixer over AUDIO B1's
+ *  SYS_AUDIO_STREAM_WRITE (48 kHz / 16-bit / stereo). Procedural gunshot +
+ *  bite voices; each frame we fill the kernel ring as far as it will take
+ *  (EAGAIN-throttled) so playback stays gapless and the game loop never
+ *  blocks. Gracefully no-ops on a kernel with no HDA device (the syscall
+ *  returns a negative rc -> we disable). No art/audio assets: all synthesized.
+ * ====================================================================== */
+#define AUD_RATE      48000u
+#define AUD_CHUNK     480u           /* frames per write (10 ms; 1920 B stereo) */
+#define AUD_VOICES    6
+#define AUD_PER_FRAME 24             /* cap writes/frame so a frame can't stall  */
+
+typedef struct {
+    int  active;
+    int  kind;      /* 0 = gunshot, 1 = bite */
+    u32  pos;       /* frame within the sound */
+    u32  dur;       /* total frames */
+    u32  phase;     /* tone phase (16-bit brad) */
+    u32  inc;       /* tone increment per frame */
+    u32  seed;      /* noise LCG state */
+} aud_voice;
+
+static aud_voice g_av[AUD_VOICES];
+static i16 g_aud_buf[AUD_CHUNK * 2];   /* interleaved L,R scratch */
+static int g_audio_off = 0;            /* set once the syscall reports no device */
+static u32 g_aud_seed  = 0x1234567u;
+static int g_aud_streamed = 0;         /* selftest counter: writes accepted */
+
+/* integer sine, brad 0..65535 (Bhaskara I; no libm) */
+static i32 aud_sin(u32 brad){
+    brad &= 0xFFFF; int neg=0;
+    if (brad >= 32768){ brad -= 32768; neg=1; }
+    u32 deg = (brad * 180u) / 32768u;
+    u32 t = deg * (180u - deg);
+    i32 num = (i32)(4u*t) * 32767;
+    i32 den = (i32)(40500u - t);
+    i32 v = den ? (num/den) : 0;
+    if (v > 32767) v = 32767;
+    return neg ? -v : v;
+}
+static u32 aud_noise(u32* s){ *s = (*s)*1103515245u + 12345u; return *s; }
+
+/* start a voice in a free slot (steal slot 0 if all busy). */
+static void audio_trigger(int kind){
+    if (g_audio_off) return;
+    int slot = -1;
+    for (int i=0;i<AUD_VOICES;i++) if (!g_av[i].active){ slot=i; break; }
+    if (slot < 0) slot = 0;
+    aud_voice* v = &g_av[slot];
+    v->active = 1; v->kind = kind; v->pos = 0; v->phase = 0;
+    v->seed = (g_aud_seed += 0x9E3779B9u);
+    if (kind == 0){ v->dur = (AUD_RATE*90u)/1000u; v->inc = (70u *65536u)/AUD_RATE; }  /* gunshot ~90ms / 70Hz boom */
+    else          { v->dur = (AUD_RATE*55u)/1000u; v->inc = (140u*65536u)/AUD_RATE; }  /* bite ~55ms / 140Hz thud   */
+}
+
+/* one mixed mono sample (advances the voice). */
+static i32 aud_voice_sample(aud_voice* v){
+    if (!v->active) return 0;
+    u32 rem = v->dur - v->pos;
+    i32 env = (i32)((rem * 4096u) / v->dur);   /* 4096 = unity */
+    env = (env * env) >> 12;                    /* square -> percussive decay */
+    i32 tone  = aud_sin(v->phase);
+    i32 noise = (i32)((aud_noise(&v->seed) >> 16) & 0x7FFFu) - 16384;
+    i32 s = (v->kind == 0) ? (tone/3 + noise)        /* gunshot: noise + low boom */
+                           : (tone*3/4 + noise/3);   /* bite: tonal thud + crunch */
+    s = (s * env) >> 12;
+    v->phase += v->inc;
+    if (++v->pos >= v->dur) v->active = 0;
+    return s;
+}
+
+/* mix AUD_CHUNK frames of all active voices into g_aud_buf (stereo, clamped). */
+static void audio_mix(void){
+    for (u32 f=0; f<AUD_CHUNK; f++){
+        i32 m = 0;
+        for (int i=0;i<AUD_VOICES;i++) if (g_av[i].active) m += aud_voice_sample(&g_av[i]);
+        if (m >  32767) m =  32767;
+        if (m < -32768) m = -32768;
+        g_aud_buf[f*2+0] = (i16)m;
+        g_aud_buf[f*2+1] = (i16)m;
+    }
+}
+
+/* per game frame: fill the kernel ring as far as it will take, non-blocking.
+ * On EAGAIN we REWIND the voices so the chunk is regenerated next frame (no
+ * waveform gap); a negative rc means no audio device -> disable for good. */
+static void audio_step(void){
+    if (g_audio_off) return;
+    for (int w=0; w<AUD_PER_FRAME; w++){
+        aud_voice saved[AUD_VOICES];
+        for (int i=0;i<AUD_VOICES;i++) saved[i] = g_av[i];
+        audio_mix();
+        long n = sc(SYS_AUDIO_STREAM_WRITE, (long)g_aud_buf, (long)sizeof(g_aud_buf), 0,0,0,0);
+        if (n == AUD_EAGAIN){
+            for (int i=0;i<AUD_VOICES;i++) g_av[i] = saved[i];   /* undo advance */
+            break;
+        }
+        if (n < 0){ g_audio_off = 1; break; }
+        g_aud_streamed++;
+    }
+}
+
+/* Headless audio proof: trigger a gunshot, pump the mixer a few frames. With
+ * HDA the stream accepts bytes (PASS); without a device the first write returns
+ * a negative rc and we disable (honest SKIP). Either way the game keeps running. */
+static void audio_selftest(void){
+    char nb[12];
+    for (int i=0;i<AUD_VOICES;i++) g_av[i].active = 0;
+    g_audio_off = 0; g_aud_streamed = 0;
+    audio_trigger(0);                       /* a gunshot */
+    for (int f=0; f<8 && !g_audio_off; f++) audio_step();
+    if (g_audio_off) {
+        print("DEADZONE: audio SKIP (no HDA device)\n");
+    } else {
+        print("DEADZONE: audio PASS streamed="); num_to_str(nb, g_aud_streamed); print(nb); print("\n");
+    }
+    for (int i=0;i<AUD_VOICES;i++) g_av[i].active = 0;   /* clean for gameplay */
+}
+
 static void systems_selftest(void)
 {
     char nb[12];
@@ -1115,6 +1243,7 @@ void _start(void)
     systems_selftest();          /* headless proof: attributes -> derived stats */
     mp_selftest();               /* headless proof: client speaks dzproto wire  */
     loot_selftest();             /* headless proof: loot/equip/durability       */
+    audio_selftest();            /* headless proof: in-game SFX stream (or SKIP) */
     print("DEADZONE: ready\n");
 
     for (;;) {
@@ -1180,6 +1309,7 @@ void _start(void)
         draw_hud(win, (int)win->w, (int)win->h);  /* HUD at full res on top */
         draw_ui_panel(win);                 /* inventory / character overlay */
         wl_commit(win);
+        audio_step();                       /* feed gunshot/bite SFX to the HDA stream */
         sc(SYS_YIELD,0,0,0,0,0,0);
     }
 }

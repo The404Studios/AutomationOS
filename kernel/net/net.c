@@ -572,6 +572,15 @@ static void ipv4_input(const eth_hdr_t* eh, const uint8_t* ip_start,
     if (tot > ip_avail) tot = ip_avail;
     if (tot < ihl) return;
 
+    /* NET-HARDENING-1 (martian filter on the NIC ICMP/ARP RX path): loopback
+     * (127/8) addresses must NEVER appear on a real interface. A NIC-delivered
+     * frame whose src OR dst is in 127/8 is spoofed -- drop it. Mirrors the
+     * socket.c ipv4_demux guard, which had been the only hardened RX path; this
+     * also prevents the OS echoing a martian ICMP reply onto the wire and a
+     * spoofed 127/8 source poisoning the ping echo bookkeeping below. */
+    if ((net_ntohl(ip->src) >> 24) == 127u || (net_ntohl(ip->dst) >> 24) == 127u)
+        return;
+
     /* Check if packet is fragmented. */
     uint16_t frag_off_flags = net_ntohs(ip->frag_off);
     uint16_t frag_offset = (frag_off_flags & 0x1FFF) * 8;

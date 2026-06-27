@@ -34,7 +34,7 @@ timeout 60 qemu-system-x86_64 -cdrom build/automationos.iso -m 512 \
 sleep 2
 
 echo "=== result ==="
-grep -E "NETRIG:|NETP1[A-Z]:" "$LOG" || { echo "rig markers MISSING (see $LOG)"; exit 1; }
+grep -E "NETRIG:|NETP1[A-Z]+:" "$LOG" || { echo "rig markers MISSING (see $LOG)"; exit 1; }
 P=1
 grep -qF "NETRIG: PASS loopback=1 cap=1" "$LOG" || P=0
 # Per-brick markers: only assert the ones that exist in this build's serial
@@ -84,6 +84,12 @@ if grep -qF "NETP1Y:" "$LOG"; then
 fi
 if grep -qF "NETP1Z:" "$LOG"; then
     grep -qF "NETP1Z: SWSWND PASS established=1 filled=1 reopen_ack=1" "$LOG" || P=0
+fi
+if grep -qF "NETP1AA:" "$LOG"; then
+    grep -qF "NETP1AA: FINWAIT2 PASS established=1 in_timewait=1 fin_acked=1" "$LOG" || P=0
+fi
+if grep -qF "NETP1AB:" "$LOG"; then
+    grep -qF "NETP1AB: SYNQACK PASS synack=1 wrong_rejected=1 right_promoted=1" "$LOG" || P=0
 fi
 # Real unrecoverable kernel faults always fail.
 if grep -qiE "KERNEL PANIC|TRIPLE FAULT" "$LOG"; then

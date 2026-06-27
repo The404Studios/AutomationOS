@@ -1368,6 +1368,93 @@ void net_testrig_selftest(void) {
                 established, filled, reopen_ack);
     }
 
+    /* ---------------------------------------------------------------- */
+    /* NET-HARDENING-1 NETP1AA (FIN_WAIT-2 absorb fix): the active-close */
+    /* path collapses FIN_WAIT->TIME_WAIT on the ACK of our FIN before    */
+    /* consuming the peer's FIN. A first-time in-order peer FIN arriving   */
+    /* in TIME_WAIT must be CONSUMED (rcv_nxt+1) and ACKed correctly, not  */
+    /* re-ACKed at a stale rcv_nxt by the dup-FIN absorb branch.           */
+    /* ---------------------------------------------------------------- */
+    {
+        int established = 0, in_timewait = 0, fin_acked = 0;
+        int fd = -1;
+        uint32_t isn = 0;
+        int l = sock_socket(SOCK_STREAM);
+        if (l >= 0 && sock_bind(l, 47027) == 0 && sock_listen(l, 2) == 0) {
+            g_cap_n = 0;
+            rig_inject_tcp(peer_ip, 45006, my_ip, 47027,
+                           22000, 0, TCP_SYN, 4096, NULL, 0);
+            if (g_cap_n >= 1) {
+                const tcp_hdr_t* th = (const tcp_hdr_t*)g_cap[0].seg;
+                isn = net_ntohl(th->seq);
+                rig_inject_tcp(peer_ip, 45006, my_ip, 47027,
+                               22001, isn + 1, TCP_ACK, 4096, NULL, 0);
+                fd = sock_accept(l);
+            }
+        }
+        if (fd >= 0) {
+            sock_t* base = sock_table_base();
+            sock_t* c = base ? &base[fd] : (sock_t*)0;
+            if (c && c->state == TCP_ESTABLISHED) {
+                established = 1;
+                uint32_t R = c->rcv_nxt;             /* peer's next seq (= 22001) */
+                /* Simulate our active close: FIN sent -> FIN_WAIT, snd_nxt past it. */
+                c->state   = TCP_FIN_WAIT;
+                c->snd_nxt = c->snd_una + 1;         /* our FIN consumes one seq */
+                /* Peer ACKs our FIN -> premature FIN_WAIT->TIME_WAIT (rcv_nxt held). */
+                rig_inject_tcp(peer_ip, 45006, my_ip, 47027,
+                               R, c->snd_nxt, TCP_ACK, 4096, NULL, 0);
+                in_timewait = (c->state == TCP_TIME_WAIT && c->rcv_nxt == R) ? 1 : 0;
+                /* Peer's first-time in-order FIN -> must advance rcv_nxt + ACK R+1. */
+                g_cap_n = 0;
+                rig_inject_tcp(peer_ip, 45006, my_ip, 47027,
+                               R, c->snd_nxt, TCP_FIN | TCP_ACK, 4096, NULL, 0);
+                if (g_cap_n >= 1 && c->rcv_nxt == R + 1) {
+                    const tcp_hdr_t* ath = (const tcp_hdr_t*)g_cap[g_cap_n - 1].seg;
+                    fin_acked = (net_ntohl(ath->ack) == R + 1) ? 1 : 0;
+                }
+            }
+        }
+        sock_init();
+        kprintf("NETP1AA: FINWAIT2 %s established=%d in_timewait=%d fin_acked=%d\n",
+                (established && in_timewait && fin_acked) ? "PASS" : "FAIL",
+                established, in_timewait, fin_acked);
+    }
+
+    /* ---------------------------------------------------------------- */
+    /* NET-HARDENING-1 NETP1AB (synq anti-spoof gate, negative proof):   */
+    /* the passive-open promotion must REJECT a final handshake ACK whose */
+    /* ack != isn+1 (a forged/blind completing ACK) and PROMOTE only the  */
+    /* correct one. Exercises synq_on_ack's sole anti-spoof check.        */
+    /* ---------------------------------------------------------------- */
+    {
+        int synack = 0, wrong_rejected = 0, right_promoted = 0;
+        uint32_t isn = 0;
+        int l = sock_socket(SOCK_STREAM);
+        if (l >= 0 && sock_bind(l, 47028) == 0 && sock_listen(l, 4) == 0) {
+            g_cap_n = 0;
+            rig_inject_tcp(peer_ip, 45007, my_ip, 47028,
+                           23000, 0, TCP_SYN, 4096, NULL, 0);
+            if (g_cap_n >= 1) {
+                const tcp_hdr_t* th = (const tcp_hdr_t*)g_cap[0].seg;
+                isn = net_ntohl(th->seq);
+                synack = 1;
+                /* WRONG final ACK (ack != isn+1) -> entry stays half-open, no child. */
+                rig_inject_tcp(peer_ip, 45007, my_ip, 47028,
+                               23001, isn + 12345u, TCP_ACK, 4096, NULL, 0);
+                wrong_rejected = (sock_accept(l) < 0) ? 1 : 0;
+                /* RIGHT final ACK (ack == isn+1) -> promotes to a child. */
+                rig_inject_tcp(peer_ip, 45007, my_ip, 47028,
+                               23001, isn + 1, TCP_ACK, 4096, NULL, 0);
+                right_promoted = (sock_accept(l) >= 0) ? 1 : 0;
+            }
+        }
+        sock_init();
+        kprintf("NETP1AB: SYNQACK %s synack=%d wrong_rejected=%d right_promoted=%d\n",
+                (synack && wrong_rejected && right_promoted) ? "PASS" : "FAIL",
+                synack, wrong_rejected, right_promoted);
+    }
+
     g_rig_active = 0;
 
     /* CONFIG-STORE proof (independent of the net rig; reuses the NET_SELFTEST

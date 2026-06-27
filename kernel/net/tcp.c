@@ -194,13 +194,21 @@ uint64_t tcp_rig_now(void)   { return now_ms(); }
 static uint64_t now_ms(void) { return timer_get_ticks_ms(); }
 #endif
 
-/* NET-HARDENING-1 (RFC 6528-style ISN): draw the initial sequence number from
- * the kernel CSPRNG (RDRAND, or seeded xorshift128+ fallback) so a remote peer
- * cannot PREDICT it. The old version hashed now_ms(), which is invertible from
- * uptime -- and synq_on_ack's only anti-spoof gate is ack==isn+1, so a
- * predictable ISN let an off-path attacker forge the completing handshake ACK. */
+/* NET-HARDENING-1 ISN: draw from the kernel RNG, using its HIGH 32 bits (the low
+ * bits of an additive PRNG are the weakest). This replaces the old now_ms() hash,
+ * which was trivially predictable from uptime -- and synq_on_ack's only anti-spoof
+ * gate is ack==isn+1, so a predictable ISN let an off-path attacker forge the
+ * completing handshake ACK.
+ *
+ * HONEST CAVEAT (not overclaimed): rng_u64() is hardware-random only on RDRAND-
+ * capable CPUs. On RDRAND-less hardware (the T410 target, QEMU's default cpu) it
+ * is a boot-seeded xorshift128+ -- BEST-EFFORT unpredictable, NOT a true CSPRNG,
+ * so a determined off-path attacker observing many ISNs could in principle narrow
+ * the next. The robust fix is a keyed RFC 6528 construction (a per-boot secret
+ * hashed with the connection 4-tuple, independent of PRNG quality); deferred to
+ * NET-HARDENING-2 since it needs an in-kernel keyed hash. */
 static uint32_t gen_isn(void) {
-    return (uint32_t)rng_u64();
+    return (uint32_t)(rng_u64() >> 32);
 }
 
 /* Free space left in the receive ring (= what we advertise as rcv_wnd). */
@@ -1259,8 +1267,18 @@ void tcp_input(uint32_t src_ip, uint32_t dst_ip,
         if (flags & TCP_FIN) {
             /* TCP-ROBUST 2MSL: a FIN retransmitted by the peer during TIME_WAIT
              * (its ACK of our FIN was lost) is ABSORBED -- re-ACK it and restart
-             * the 2MSL linger (RFC 793) so the peer's close completes cleanly. */
-            if (s->state == TCP_TIME_WAIT) {
+             * the 2MSL linger (RFC 793) so the peer's close completes cleanly.
+             *
+             * NET-HARDENING-1 (FIN_WAIT-2 absorb fix): only absorb an ALREADY-
+             * consumed/duplicate FIN (seq < rcv_nxt). The active-close path
+             * collapses FIN_WAIT->TIME_WAIT on the ACK of our FIN BEFORE consuming
+             * the peer's FIN (no FIN_WAIT_2 state), so a FIRST-TIME in-order FIN
+             * (seq == rcv_nxt) can arrive here; it must fall through to the in-
+             * order branch below to advance rcv_nxt and ACK the peer's FIN with
+             * the correct cumulative ack (rcv_nxt+1). The old code re-ACKed a
+             * STALE rcv_nxt, so the peer never saw its FIN acknowledged and
+             * retransmitted to RTO exhaustion (clean close -> RST). */
+            if (s->state == TCP_TIME_WAIT && SEQ32_GT(s->rcv_nxt, seq)) {
                 tcp_send_ack(s);
                 s->time_wait_ms = now_ms();
                 return;

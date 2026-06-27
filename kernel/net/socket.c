@@ -58,7 +58,9 @@ static uint8_t g_tx[ETH_MAX_FRAME];
  * This bounds the kernel-stack depth to a single demux chain while preserving
  * SYNCHRONOUS completion (the peer's reply is delivered before the top-level
  * ip_tx() returns -- connect()/send() rely on that). */
-#define LO_Q_SLOTS  8
+#define LO_Q_SLOTS  16   /* NET-HARDENING F7: headroom for multi-client loopback
+                          * bursts (e.g. a server broadcasting one snapshot to
+                          * several connected clients per tick before a drain). */
 static uint8_t  lo_q[LO_Q_SLOTS][ETH_MAX_FRAME];
 static uint16_t lo_q_len[LO_Q_SLOTS];
 static int      lo_q_head;      /* next slot to deliver                        */
@@ -294,11 +296,16 @@ int ip_tx(uint32_t dst_ip, uint8_t proto, const void* seg, uint16_t seg_len) {
     if ((dst_ip >> 24) == 127u) {
         uint16_t iplen = (uint16_t)(sizeof(ipv4_hdr_t) + seg_len);
         if (iplen > ETH_MAX_FRAME) return -1;
-        /* Enqueue the wrapped packet. Drop if the ring is momentarily full (the
-         * transport peer retransmits; in practice <=3 packets are ever in flight
-         * on loopback, so this never trips). */
+        /* Enqueue the wrapped packet. NET-HARDENING F7: a momentarily-full ring
+         * is a BEST-EFFORT DROP, not an error -- return 0, never -1. TCP is
+         * reliable (the unacked segment is retransmitted) and UDP is lossy by
+         * definition, so losing one loopback frame under a transient full ring is
+         * recoverable. The old -1 propagated through tcp_xmit() -> tcp_send() as a
+         * hard SOCK_ECONN, tearing down the whole connection -- which would drop a
+         * live co-op client. The ring is drained empty between sends, so in
+         * practice this still never trips. */
         int next = (lo_q_tail + 1) % LO_Q_SLOTS;
-        if (next == lo_q_head) return -1;
+        if (next == lo_q_head) return 0;
         uint8_t* slot = lo_q[lo_q_tail];
         ipv4_hdr_t* ip = (ipv4_hdr_t*)slot;
         ip->ver_ihl   = 0x45;

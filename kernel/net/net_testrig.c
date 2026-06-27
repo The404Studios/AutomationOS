@@ -911,6 +911,301 @@ void net_testrig_selftest(void) {
                 has_lo, tx_inc, rx_inc, bytes_inc);
     }
 
+    /* ---------------------------------------------------------------- */
+    /* NET-HARDENING NETP1Q (F4): a pure WINDOW UPDATE is not a dup-ACK  */
+    /* (RFC 5681). With one segment outstanding, three same-ack/no-data  */
+    /* ACKs whose advertised window KEEPS CHANGING must NOT trip fast-    */
+    /* retransmit (that is the receiver moving its window, not loss);     */
+    /* three with an UNCHANGED window still must. The rig never calls     */
+    /* sock_poll(), so any captured retransmit is provably the fast path. */
+    /* ---------------------------------------------------------------- */
+    {
+        int armed = 0, no_rtx_on_winupd = 0, fires_on_dup = 0;
+        int fd = -1;
+        int l = sock_socket(SOCK_STREAM);
+        if (l >= 0 && sock_bind(l, 47016) == 0 && sock_listen(l, 2) == 0) {
+            g_cap_n = 0;
+            rig_inject_tcp(peer_ip, 43004, my_ip, 47016,
+                           14000, 0, TCP_SYN, 4096, NULL, 0);
+            if (g_cap_n >= 1) {
+                const tcp_hdr_t* th = (const tcp_hdr_t*)g_cap[0].seg;
+                uint32_t isn = net_ntohl(th->seq);
+                rig_inject_tcp(peer_ip, 43004, my_ip, 47016,
+                               14001, isn + 1, TCP_ACK, 4096, NULL, 0);
+                fd = sock_accept(l);
+            }
+        }
+        if (fd >= 0) {
+            sock_t* base = sock_table_base();
+            sock_t* c = base ? &base[fd] : (sock_t*)0;
+            if (c && c->state == TCP_ESTABLISHED) {
+                uint32_t S   = c->snd_nxt;     /* outstanding seg's seq       */
+                uint32_t una = c->snd_una;     /* dup-ACKs must equal this    */
+                c->rt_pending = true; c->rt_done = false;
+                c->rt_seq = S; c->rt_flags = TCP_ACK | TCP_PSH; c->rt_len = 8;
+                memcpy(c->rt_data, "WUPROBE!", 8);
+                c->snd_nxt = S + 8;
+                c->snd_wnd = 4096;             /* baseline advertised window  */
+                armed = 1;
+
+                /* Phase A -- three same-ack/no-data ACKs, each CHANGING the
+                 * window: window updates, never dup-ACKs -> NO fast rtx. */
+                g_cap_n = 0;
+                rig_inject_tcp(peer_ip, 43004, my_ip, 47016,
+                               14001, una, TCP_ACK,  8192, NULL, 0);
+                rig_inject_tcp(peer_ip, 43004, my_ip, 47016,
+                               14001, una, TCP_ACK, 16384, NULL, 0);
+                rig_inject_tcp(peer_ip, 43004, my_ip, 47016,
+                               14001, una, TCP_ACK, 32768, NULL, 0);
+                no_rtx_on_winupd = (g_cap_n == 0) ? 1 : 0;
+
+                /* Phase B -- window now held CONSTANT: genuine dup-ACKs, the
+                 * 3rd must fire fast retransmit (guards against over-
+                 * suppressing real dup-ACKs). */
+                g_cap_n = 0;
+                rig_inject_tcp(peer_ip, 43004, my_ip, 47016,
+                               14001, una, TCP_ACK, 32768, NULL, 0);
+                rig_inject_tcp(peer_ip, 43004, my_ip, 47016,
+                               14001, una, TCP_ACK, 32768, NULL, 0);
+                rig_inject_tcp(peer_ip, 43004, my_ip, 47016,
+                               14001, una, TCP_ACK, 32768, NULL, 0);
+                fires_on_dup = (g_cap_n == 1) ? 1 : 0;
+            }
+        }
+        sock_init();
+        kprintf("NETP1Q: WINUPD %s armed=%d no_rtx_on_winupd=%d fires_on_dup=%d\n",
+                (armed && no_rtx_on_winupd && fires_on_dup) ? "PASS" : "FAIL",
+                armed, no_rtx_on_winupd, fires_on_dup);
+    }
+
+    /* ---------------------------------------------------------------- */
+    /* NET-HARDENING NETP1R (F5): a retransmitted SYN resets the half-   */
+    /* open's SYN-ACK retry budget. Drive tcp_synq_tick() on the rig-    */
+    /* advanced clock to push retries to 3, inject a dup-SYN, then tick  */
+    /* twice more: the OLD code reaches TCP_SYNQ_MAX_RETRY and EVICTS    */
+    /* the entry, so the final handshake ACK finds nothing to promote.   */
+    /* With the reset the half-open survives and promotes to ESTABLISHED.*/
+    /* ---------------------------------------------------------------- */
+    {
+        extern void tcp_rig_advance_ms(uint64_t);
+        extern void tcp_rig_clock_reset(void);
+        int synack = 0, promoted = 0;
+        uint32_t isn = 0;
+        int l = sock_socket(SOCK_STREAM);
+        if (l >= 0 && sock_bind(l, 47017) == 0 && sock_listen(l, 4) == 0) {
+            tcp_rig_clock_reset();
+            g_cap_n = 0;
+            /* SYN -> half-open created + SYN-ACK captured (read our ISN). */
+            rig_inject_tcp(peer_ip, 43005, my_ip, 47017,
+                           15000, 0, TCP_SYN, 4096, NULL, 0);
+            if (g_cap_n >= 1) {
+                const tcp_hdr_t* th = (const tcp_hdr_t*)g_cap[0].seg;
+                isn = net_ntohl(th->seq);
+                synack = 1;
+            }
+            /* Three retransmit ticks -> retries climbs to 3 (< MAX_RETRY=4). */
+            for (int i = 0; i < 3; i++) {
+                tcp_rig_advance_ms(1000);     /* >= TCP_SYNQ_RETRY_MS */
+                tcp_synq_tick();
+            }
+            /* Dup-SYN: with the fix this resets retries back to 0. */
+            rig_inject_tcp(peer_ip, 43005, my_ip, 47017,
+                           15000, 0, TCP_SYN, 4096, NULL, 0);
+            /* Two more ticks: OLD code hits retries=4 here and evicts; the
+             * fixed entry is only at retries=2 and lives on. (Total elapsed
+             * 5000ms << TCP_SYNQ_TTL_MS, so the TTL never evicts here.) */
+            for (int i = 0; i < 2; i++) {
+                tcp_rig_advance_ms(1000);
+                tcp_synq_tick();
+            }
+            /* Final handshake ACK: promotes ONLY if the entry survived. */
+            if (synack) {
+                rig_inject_tcp(peer_ip, 43005, my_ip, 47017,
+                               15001, isn + 1, TCP_ACK, 4096, NULL, 0);
+                int fd = sock_accept(l);
+                promoted = (fd >= 0) ? 1 : 0;
+            }
+            tcp_rig_clock_reset();
+        }
+        sock_init();
+        kprintf("NETP1R: SYNQRETRY %s synack=%d promoted=%d\n",
+                (synack && promoted) ? "PASS" : "FAIL", synack, promoted);
+    }
+
+    /* ---------------------------------------------------------------- */
+    /* NET-HARDENING NETP1S (F7): a momentarily-full loopback ring is a  */
+    /* best-effort DROP, not a hard error. Enqueue far more TCP loopback */
+    /* frames than the ring holds WITHOUT draining (no sock_poll): every */
+    /* ip_tx() must return >= 0. The OLD code returned -1 once the ring  */
+    /* filled, and tcp_send() turned that into a connection-killing      */
+    /* SOCK_ECONN. The frames target a port with no socket, so they are  */
+    /* dropped at tcp_input -- harmless. A single drain clears the ring. */
+    /* ---------------------------------------------------------------- */
+    {
+        uint8_t    seg[sizeof(tcp_hdr_t)];
+        tcp_hdr_t* th = (tcp_hdr_t*)seg;
+        memset(th, 0, sizeof(*th));
+        th->src_port = net_htons(40100);
+        th->dst_port = net_htons(40101);      /* deliberately no listener */
+        th->data_off = (uint8_t)((sizeof(tcp_hdr_t) / 4) << 4);
+        th->flags    = TCP_ACK;
+        th->window   = net_htons(4096);
+        /* checksum left 0 -> tolerated by tcp_input for in-kernel injectors */
+
+        int all_nonneg = 1, bursts = 64;
+        for (int i = 0; i < bursts; i++) {
+            if (ip_tx(0x7F000001u, IPPROTO_TCP, seg, sizeof(seg)) < 0)
+                all_nonneg = 0;
+        }
+        sock_poll();    /* drain the ring (no-socket frames -> dropped) */
+        kprintf("NETP1S: LORING %s bursts=%d all_nonneg=%d\n",
+                all_nonneg ? "PASS" : "FAIL", bursts, all_nonneg);
+    }
+
+    /* ---------------------------------------------------------------- */
+    /* NET-HARDENING NETP1T (F10): a DUPLICATE FIN in CLOSE_WAIT must be */
+    /* re-ACKed (RFC 793). Peer's in-order FIN -> CLOSE_WAIT + one ACK;  */
+    /* a RETRANSMITTED identical FIN (its prior ACK was lost) must draw  */
+    /* a fresh ACK so the actively-closing peer stops retransmitting --  */
+    /* the OLD code ignored it (no re-ACK), letting the peer RESET.      */
+    /* ---------------------------------------------------------------- */
+    {
+        int established = 0, first_ack = 0, in_close_wait = 0, reack = 0;
+        uint32_t isn = 0;
+        int fd = -1;
+        int l = sock_socket(SOCK_STREAM);
+        if (l >= 0 && sock_bind(l, 47018) == 0 && sock_listen(l, 2) == 0) {
+            g_cap_n = 0;
+            rig_inject_tcp(peer_ip, 43006, my_ip, 47018,
+                           16000, 0, TCP_SYN, 4096, NULL, 0);
+            if (g_cap_n >= 1) {
+                const tcp_hdr_t* th = (const tcp_hdr_t*)g_cap[0].seg;
+                isn = net_ntohl(th->seq);
+                rig_inject_tcp(peer_ip, 43006, my_ip, 47018,
+                               16001, isn + 1, TCP_ACK, 4096, NULL, 0);
+                fd = sock_accept(l);
+            }
+        }
+        if (fd >= 0) {
+            sock_t* base = sock_table_base();
+            sock_t* c = base ? &base[fd] : (sock_t*)0;
+            if (c && c->state == TCP_ESTABLISHED) {
+                established = 1;
+                /* In-order FIN at rcv_nxt(=16001) -> CLOSE_WAIT + exactly 1 ACK. */
+                g_cap_n = 0;
+                rig_inject_tcp(peer_ip, 43006, my_ip, 47018,
+                               16001, isn + 1, TCP_FIN | TCP_ACK, 4096, NULL, 0);
+                first_ack      = (g_cap_n == 1) ? 1 : 0;
+                in_close_wait  = (c->state == TCP_CLOSE_WAIT) ? 1 : 0;
+                /* Retransmitted identical FIN (same seq) -> must be RE-ACKed. */
+                g_cap_n = 0;
+                rig_inject_tcp(peer_ip, 43006, my_ip, 47018,
+                               16001, isn + 1, TCP_FIN | TCP_ACK, 4096, NULL, 0);
+                reack = (g_cap_n == 1) ? 1 : 0;
+            }
+        }
+        sock_init();
+        kprintf("NETP1T: DUPFIN %s established=%d first_ack=%d in_close_wait=%d reack=%d\n",
+                (established && first_ack && in_close_wait && reack) ? "PASS" : "FAIL",
+                established, first_ack, in_close_wait, reack);
+    }
+
+    /* ---------------------------------------------------------------- */
+    /* NET-HARDENING NETP1U (F12, RFC 793/5961): a RST is VALIDATED.     */
+    /* (a) a stray RST to a LISTEN socket is IGNORED (the old code killed */
+    /* the listener + collapsed the synq); (b) an OUT-OF-WINDOW RST to an */
+    /* ESTABLISHED child is dropped; (c) an IN-WINDOW RST still resets.   */
+    /* ---------------------------------------------------------------- */
+    {
+        int listen_survives = 0, est_survives_oow = 0, est_resets_inwin = 0;
+
+        /* (a) LISTEN immune to a stray RST. */
+        int l = sock_socket(SOCK_STREAM);
+        if (l >= 0 && sock_bind(l, 47019) == 0 && sock_listen(l, 4) == 0) {
+            rig_inject_tcp(peer_ip, 45000, my_ip, 47019,
+                           99999, 0, TCP_RST, 0, NULL, 0);
+            sock_t* base = sock_table_base();
+            listen_survives = (base && base[l].state == TCP_LISTEN) ? 1 : 0;
+        }
+        sock_init();
+
+        /* Establish a child, then test (b) out-of-window + (c) in-window RST. */
+        int fd = -1;
+        uint32_t isn = 0;
+        int l2 = sock_socket(SOCK_STREAM);
+        if (l2 >= 0 && sock_bind(l2, 47020) == 0 && sock_listen(l2, 2) == 0) {
+            g_cap_n = 0;
+            rig_inject_tcp(peer_ip, 45001, my_ip, 47020,
+                           17000, 0, TCP_SYN, 4096, NULL, 0);
+            if (g_cap_n >= 1) {
+                const tcp_hdr_t* th = (const tcp_hdr_t*)g_cap[0].seg;
+                isn = net_ntohl(th->seq);
+                rig_inject_tcp(peer_ip, 45001, my_ip, 47020,
+                               17001, isn + 1, TCP_ACK, 4096, NULL, 0);
+                fd = sock_accept(l2);
+            }
+        }
+        if (fd >= 0) {
+            sock_t* base = sock_table_base();
+            sock_t* c = base ? &base[fd] : (sock_t*)0;
+            if (c && c->state == TCP_ESTABLISHED) {
+                /* (b) seq far beyond rcv_nxt(=17001); rcv_wnd caps at 65535, so
+                 * +100000 is provably out of window -> RST ignored. */
+                rig_inject_tcp(peer_ip, 45001, my_ip, 47020,
+                               17001 + 100000u, 0, TCP_RST, 0, NULL, 0);
+                est_survives_oow = (c->state == TCP_ESTABLISHED && !c->reset) ? 1 : 0;
+                /* (c) seq == rcv_nxt -> in window -> reset + CLOSED. */
+                rig_inject_tcp(peer_ip, 45001, my_ip, 47020,
+                               17001, 0, TCP_RST, 0, NULL, 0);
+                est_resets_inwin = (c->state == TCP_CLOSED && c->reset) ? 1 : 0;
+            }
+        }
+        sock_init();
+        kprintf("NETP1U: RSTVAL %s listen_survives=%d est_survives_oow=%d est_resets_inwin=%d\n",
+                (listen_survives && est_survives_oow && est_resets_inwin) ? "PASS" : "FAIL",
+                listen_survives, est_survives_oow, est_resets_inwin);
+    }
+
+    /* ---------------------------------------------------------------- */
+    /* NET-HARDENING NETP1V (F13, RFC 793 ACK acceptability): an ACK that */
+    /* acknowledges data we never sent (ack > snd_nxt) must NOT advance   */
+    /* snd_una (which would corrupt the send sequence space).             */
+    /* ---------------------------------------------------------------- */
+    {
+        int established = 0, snd_una_held = 0;
+        int fd = -1;
+        uint32_t isn = 0;
+        int l = sock_socket(SOCK_STREAM);
+        if (l >= 0 && sock_bind(l, 47021) == 0 && sock_listen(l, 2) == 0) {
+            g_cap_n = 0;
+            rig_inject_tcp(peer_ip, 45002, my_ip, 47021,
+                           18000, 0, TCP_SYN, 4096, NULL, 0);
+            if (g_cap_n >= 1) {
+                const tcp_hdr_t* th = (const tcp_hdr_t*)g_cap[0].seg;
+                isn = net_ntohl(th->seq);
+                rig_inject_tcp(peer_ip, 45002, my_ip, 47021,
+                               18001, isn + 1, TCP_ACK, 4096, NULL, 0);
+                fd = sock_accept(l);
+            }
+        }
+        if (fd >= 0) {
+            sock_t* base = sock_table_base();
+            sock_t* c = base ? &base[fd] : (sock_t*)0;
+            if (c && c->state == TCP_ESTABLISHED) {
+                established = 1;
+                uint32_t una0 = c->snd_una;       /* == isn+1; no data sent yet */
+                /* Forged ACK acking 50000 bytes beyond snd_nxt -> must be ignored. */
+                rig_inject_tcp(peer_ip, 45002, my_ip, 47021,
+                               18001, c->snd_nxt + 50000u, TCP_ACK, 4096, NULL, 0);
+                snd_una_held = (c->snd_una == una0) ? 1 : 0;
+            }
+        }
+        sock_init();
+        kprintf("NETP1V: ACKACC %s established=%d snd_una_held=%d\n",
+                (established && snd_una_held) ? "PASS" : "FAIL",
+                established, snd_una_held);
+    }
+
     g_rig_active = 0;
 
     /* CONFIG-STORE proof (independent of the net rig; reuses the NET_SELFTEST

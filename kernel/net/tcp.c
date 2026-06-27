@@ -443,10 +443,17 @@ static void synq_on_syn(sock_t* listener, uint32_t src_ip, uint16_t src_port,
         e->isn        = gen_isn();
         e->rcv_nxt    = seq + 1;          /* their SYN consumes one seq */
         e->born_ms    = now_ms();
-        e->retries    = 0;
     }
     e->peer_wnd   = peer_wnd;
     e->last_tx_ms = now_ms();
+    /* NET-HARDENING F5: a (re)transmitted SYN is fresh proof the peer is alive
+     * and still trying, so reset the SYN-ACK retransmit budget -- for BOTH a new
+     * half-open and a dup-SYN against an existing one. The old code reset it only
+     * on the new-entry path, so a peer that kept retransmitting its SYN (because
+     * it never saw our SYN-ACK) could still be evicted once tcp_synq_tick() hit
+     * TCP_SYNQ_MAX_RETRY. born_ms is left untouched so the TTL still caps the
+     * half-open's total lifetime -- a SYN flood can't pin an entry forever. */
+    e->retries    = 0;
     tcp_xmit_raw(src_ip, e->local_port, src_port, TCP_SYN | TCP_ACK,
                  e->isn, e->rcv_nxt, TCP_SYNQ_WND);
 }
@@ -697,6 +704,13 @@ int tcp_connect(sock_t* s, uint32_t dst_ip, uint16_t dst_port) {
         if (n != last) { last = n; frozen = 0; }
         else if (++frozen >= TCP_FROZEN_SPIN_CAP) break;
     }
+    /* NET-HARDENING F9: a timed-out/aborted active open must DROP its armed SYN
+     * retransmit before closing. Otherwise rt_pending stays true on a CLOSED
+     * socket and -- if the caller leaks the fd instead of close()ing it -- a later
+     * sock_poll()->tcp_tick() re-emits the stale SYN to the old remote (once the
+     * frozen wall-clock advances past the RTO), up to TCP_RTO_MAX_RETRIES times.
+     * Mirrors the disarm already done on the xmit-failure path above. */
+    tcp_disarm_retransmit(s);
     s->state = TCP_CLOSED;
     return SOCK_ETIMEDOUT;
 }
@@ -995,17 +1009,44 @@ void tcp_input(uint32_t src_ip, uint32_t dst_ip,
     const uint8_t* payload     = seg + ihl;
     uint16_t       payload_len = (uint16_t)(seg_len - ihl);
 
-    /* Update peer's advertised window on every non-RST segment. */
-    s->snd_wnd = net_ntohs(th->window);
-
-    /* RST: mark connection reset; clear retransmit; leave state alive
-     * so tcp_recv() can return SOCK_ECONN to the caller. */
+    /* RST handling. Done BEFORE the window update (NET-HARDENING F6): a RST
+     * carries no meaningful advertised window, so writing snd_wnd from it would
+     * clobber the peer's last real value.
+     *
+     * NET-HARDENING F12 (RFC 793 / RFC 5961): a RST must be VALIDATED before it
+     * is honored. The old code reset on ANY RST matching the 4-tuple, so a single
+     * stray/forged RST to a listening port set the LISTENER to CLOSED -- killing
+     * accept() and (via synq_listener()==NULL) collapsing every pending half-open
+     * -- and any off-path RST blind-tore-down an ESTABLISHED connection. */
     if (flags & TCP_RST) {
+        if (s->state == TCP_LISTEN)
+            return;                       /* RFC 793: ignore a RST in LISTEN */
+        if (s->state == TCP_SYN_SENT) {
+            /* RFC 793: a RST during active open is acceptable only if it ACKs
+             * the SYN we sent; otherwise it is not for this connection. */
+            if (!(flags & TCP_ACK) || !SEQ32_GEQ(ack, s->snd_nxt))
+                return;
+        } else {
+            /* RFC 5961: in a synchronized state honor the RST only if its seq is
+             * inside the current receive window (seq==rcv_nxt always qualifies,
+             * covering a zero window); an off-window / blind RST is dropped. */
+            uint32_t winhi = s->rcv_nxt + rcv_wnd(s);
+            if (seq != s->rcv_nxt &&
+                (!SEQ32_GEQ(seq, s->rcv_nxt) || SEQ32_GEQ(seq, winhi)))
+                return;
+        }
         s->reset = true;
         s->state = TCP_CLOSED;
         tcp_disarm_retransmit(s);
         return;
     }
+
+    /* Update peer's advertised window on every non-RST segment. Capture the
+     * PREVIOUS window first: RFC 5681 defines a duplicate ACK (the fast-
+     * retransmit trigger) as one whose advertised window is UNCHANGED -- a pure
+     * window update is NOT a dup-ACK (NET-HARDENING F4). */
+    uint16_t prev_snd_wnd = s->snd_wnd;
+    s->snd_wnd = net_ntohs(th->window);
 
     switch (s->state) {
     case TCP_LISTEN:
@@ -1068,7 +1109,12 @@ void tcp_input(uint32_t src_ip, uint32_t dst_ip,
          * ACK processing: free outstanding segment if fully covered.
          * CHANGED: SEQ32_GEQ for wraparound; also update snd_una.
          * ---------------------------------------------------------- */
-        if (flags & TCP_ACK) {
+        /* NET-HARDENING F13 (RFC 793 ACK acceptability): ignore an ACK that
+         * acknowledges data we never sent (ack > snd_nxt). Without this an
+         * off-path/forged ACK advances snd_una PAST snd_nxt, corrupting the send
+         * sequence space (every later SEQ32 comparison, RTT sampling, and the
+         * dup-ACK / fast-retransmit logic). Acceptable iff ack <= snd_nxt. */
+        if ((flags & TCP_ACK) && SEQ32_GEQ(s->snd_nxt, ack)) {
             int idx = sock_index(s);
             if (s->rt_pending) {
                 uint32_t end = s->rt_seq + s->rt_len +
@@ -1083,10 +1129,15 @@ void tcp_input(uint32_t src_ip, uint32_t dst_ip,
                     s->snd_una = ack;
                 } else if (ack == s->snd_una && payload_len == 0 &&
                            (flags & (TCP_SYN | TCP_FIN)) == 0 &&
+                           s->snd_wnd == prev_snd_wnd &&
                            s->state == TCP_ESTABLISHED) {
                     /* TCP-ROBUST (RFC 5681 fast retransmit): a duplicate ACK
-                     * does not advance snd_una and carries no data. The 3rd one
-                     * means a segment was almost certainly lost -> resend the
+                     * does not advance snd_una, carries no data, AND advertises
+                     * an UNCHANGED window (NET-HARDENING F4: a pure window update
+                     * -- same ack, no data, different window -- is the receiver
+                     * opening/shrinking its buffer, NOT a sign of loss; counting
+                     * it would spuriously trip fast-retransmit). The 3rd genuine
+                     * dup means a segment was almost certainly lost -> resend the
                      * oldest unacked segment NOW (~RTT recovery vs a full RTO).
                      * Fires exactly once at 3 (== not >=), so later dups don't
                      * re-storm the wire. */
@@ -1213,6 +1264,15 @@ void tcp_input(uint32_t src_ip, uint32_t dst_ip,
                 tcp_send_ack(s);
                 if (s->state == TCP_ESTABLISHED)   s->state = TCP_CLOSE_WAIT;
                 else if (s->state == TCP_FIN_WAIT) { s->state = TCP_TIME_WAIT; s->time_wait_ms = now_ms(); }
+            } else if (payload_len == 0 && SEQ32_GT(s->rcv_nxt, seq)) {
+                /* NET-HARDENING F10 (RFC 793): a DUPLICATE, already-consumed FIN
+                 * (seq < rcv_nxt) -- the peer retransmitted it because our ACK of
+                 * its FIN was lost. Re-ACK so the actively-closing peer's FIN is
+                 * acknowledged and it stops retransmitting; otherwise it exhausts
+                 * its RTO budget and turns what was a clean close into a RESET.
+                 * Mirrors the TIME_WAIT absorb above; fires only for an old pure
+                 * FIN, so it never re-ACKs in-order data and cannot ACK-storm. */
+                tcp_send_ack(s);
             }
             /* If FIN arrived OOO just ACK current position; we'll re-process
              * it when the gap fills (limitation: no FIN in OOO slot). */

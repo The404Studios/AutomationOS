@@ -54,8 +54,38 @@ fi
 if grep -qF "NETP1E:" "$LOG"; then
     grep -qF "NETP1E: SOCKMAX PASS n=32 heapok=1 extra_rejected=1" "$LOG" || P=0
 fi
-if grep -qiE "PANIC|CPU EXCEPTION|TRIPLE FAULT" "$LOG"; then
+# NET-HARDENING-0 (F4/F5/F7) markers
+if grep -qF "NETP1Q:" "$LOG"; then
+    grep -qF "NETP1Q: WINUPD PASS armed=1 no_rtx_on_winupd=1 fires_on_dup=1" "$LOG" || P=0
+fi
+if grep -qF "NETP1R:" "$LOG"; then
+    grep -qF "NETP1R: SYNQRETRY PASS synack=1 promoted=1" "$LOG" || P=0
+fi
+if grep -qF "NETP1S:" "$LOG"; then
+    grep -qF "NETP1S: LORING PASS bursts=64 all_nonneg=1" "$LOG" || P=0
+fi
+if grep -qF "NETP1T:" "$LOG"; then
+    grep -qF "NETP1T: DUPFIN PASS established=1 first_ack=1 in_close_wait=1 reack=1" "$LOG" || P=0
+fi
+if grep -qF "NETP1U:" "$LOG"; then
+    grep -qF "NETP1U: RSTVAL PASS listen_survives=1 est_survives_oow=1 est_resets_inwin=1" "$LOG" || P=0
+fi
+if grep -qF "NETP1V:" "$LOG"; then
+    grep -qF "NETP1V: ACKACC PASS established=1 snd_una_held=1" "$LOG" || P=0
+fi
+# Real unrecoverable kernel faults always fail.
+if grep -qiE "KERNEL PANIC|TRIPLE FAULT" "$LOG"; then
     echo "KERNEL FAULT during boot"; P=0
+fi
+# A "CPU EXCEPTION" that the kernel HANDLES by terminating the faulting ring-3
+# process is healthy -- e.g. the sigtest bad-handler-VA fail-safe deliberately
+# faults at userspace VA 0x4000 to prove the kernel survives. Only an exception
+# WITHOUT a matching "Terminating faulting process" (i.e. a kernel-context fault)
+# is a real failure.
+exc=$(grep -ciE "CPU EXCEPTION" "$LOG")
+handled=$(grep -ciE "Terminating faulting process" "$LOG")
+if [ "$exc" -gt "$handled" ]; then
+    echo "UNHANDLED KERNEL EXCEPTION during boot (exc=$exc handled=$handled)"; P=0
 fi
 if [ "$P" = "1" ]; then
     echo "NETRIG CHECK: PASS"

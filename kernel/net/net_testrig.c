@@ -1502,6 +1502,35 @@ void net_testrig_selftest(void) {
                 (int)NK, established, all_sent, all_recv);
     }
 
+    /* ---------------------------------------------------------------- */
+    /* NET-HARDENING-2 NETP1AD (keyed-ISN sanity): two SYNs from         */
+    /* DIFFERENT 4-tuples must yield DIFFERENT server ISNs -- the RFC    */
+    /* 6528 SipHash ISN varies by connection (a constant/broken ISN      */
+    /* would collide and is trivially spoofable).                       */
+    /* ---------------------------------------------------------------- */
+    {
+        int found_a = 0, found_b = 0, isns_differ = 0;
+        uint32_t isn_a = 0, isn_b = 0;
+        int l = sock_socket(SOCK_STREAM);
+        if (l >= 0 && sock_bind(l, 47030) == 0 && sock_listen(l, 4) == 0) {
+            g_cap_n = 0;
+            rig_inject_tcp(peer_ip, 46000, my_ip, 47030, 24000, 0, TCP_SYN, 4096, NULL, 0);
+            rig_inject_tcp(peer_ip, 46001, my_ip, 47030, 24000, 0, TCP_SYN, 4096, NULL, 0);
+            for (int c = 0; c < g_cap_n; c++) {
+                const tcp_hdr_t* th = (const tcp_hdr_t*)g_cap[c].seg;
+                if (g_cap[c].proto == IPPROTO_TCP && th->flags == (TCP_SYN | TCP_ACK)) {
+                    if (net_ntohs(th->dst_port) == 46000) { isn_a = net_ntohl(th->seq); found_a = 1; }
+                    if (net_ntohs(th->dst_port) == 46001) { isn_b = net_ntohl(th->seq); found_b = 1; }
+                }
+            }
+            isns_differ = (isn_a != isn_b) ? 1 : 0;
+        }
+        sock_init();
+        kprintf("NETP1AD: ISNKEY %s found_a=%d found_b=%d isns_differ=%d\n",
+                (found_a && found_b && isns_differ) ? "PASS" : "FAIL",
+                found_a, found_b, isns_differ);
+    }
+
     g_rig_active = 0;
 
     /* CONFIG-STORE proof (independent of the net rig; reuses the NET_SELFTEST

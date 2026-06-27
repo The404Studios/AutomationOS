@@ -194,21 +194,63 @@ uint64_t tcp_rig_now(void)   { return now_ms(); }
 static uint64_t now_ms(void) { return timer_get_ticks_ms(); }
 #endif
 
-/* NET-HARDENING-1 ISN: draw from the kernel RNG, using its HIGH 32 bits (the low
- * bits of an additive PRNG are the weakest). This replaces the old now_ms() hash,
- * which was trivially predictable from uptime -- and synq_on_ack's only anti-spoof
- * gate is ack==isn+1, so a predictable ISN let an off-path attacker forge the
- * completing handshake ACK.
- *
- * HONEST CAVEAT (not overclaimed): rng_u64() is hardware-random only on RDRAND-
- * capable CPUs. On RDRAND-less hardware (the T410 target, QEMU's default cpu) it
- * is a boot-seeded xorshift128+ -- BEST-EFFORT unpredictable, NOT a true CSPRNG,
- * so a determined off-path attacker observing many ISNs could in principle narrow
- * the next. The robust fix is a keyed RFC 6528 construction (a per-boot secret
- * hashed with the connection 4-tuple, independent of PRNG quality); deferred to
- * NET-HARDENING-2 since it needs an in-kernel keyed hash. */
-static uint32_t gen_isn(void) {
-    return (uint32_t)(rng_u64() >> 32);
+/* SipHash-2-4 (Aumasson/Bernstein) -- a fast keyed PRF. Used here as the keyed
+ * hash for the RFC 6528 ISN below; the only requirement for that use is that an
+ * attacker observing outputs cannot recover the key, which SipHash provides. */
+static inline uint64_t sip_rotl(uint64_t x, int b) {
+    return (x << b) | (x >> (64 - b));
+}
+static uint64_t siphash24(const uint8_t* in, uint32_t inlen,
+                          uint64_t k0, uint64_t k1) {
+    uint64_t v0 = 0x736f6d6570736575ULL ^ k0;
+    uint64_t v1 = 0x646f72616e646f6dULL ^ k1;
+    uint64_t v2 = 0x6c7967656e657261ULL ^ k0;
+    uint64_t v3 = 0x7465646279746573ULL ^ k1;
+    uint64_t b  = (uint64_t)inlen << 56;
+    uint32_t blocks = inlen & ~7u;
+#define SIP_ROUND() do {                                                  \
+        v0 += v1; v1 = sip_rotl(v1,13); v1 ^= v0; v0 = sip_rotl(v0,32);    \
+        v2 += v3; v3 = sip_rotl(v3,16); v3 ^= v2;                          \
+        v0 += v3; v3 = sip_rotl(v3,21); v3 ^= v0;                          \
+        v2 += v1; v1 = sip_rotl(v1,17); v1 ^= v2; v2 = sip_rotl(v2,32);    \
+    } while (0)
+    for (uint32_t off = 0; off < blocks; off += 8) {
+        uint64_t m = 0;
+        for (int i = 0; i < 8; i++) m |= (uint64_t)in[off + i] << (8 * i);
+        v3 ^= m; SIP_ROUND(); SIP_ROUND(); v0 ^= m;
+    }
+    for (uint32_t i = blocks; i < inlen; i++)
+        b |= (uint64_t)in[i] << (8 * (i - blocks));
+    v3 ^= b; SIP_ROUND(); SIP_ROUND(); v0 ^= b;
+    v2 ^= 0xff; SIP_ROUND(); SIP_ROUND(); SIP_ROUND(); SIP_ROUND();
+#undef SIP_ROUND
+    return v0 ^ v1 ^ v2 ^ v3;
+}
+
+/* NET-HARDENING-2 (RFC 6528 keyed ISN): ISN = M + SipHash(secret, 4-tuple). The
+ * 128-bit secret is drawn ONCE at boot from the RNG and never re-emitted, so an
+ * off-path attacker observing our ISNs cannot recover it (SipHash is a keyed PRF)
+ * and therefore cannot predict the ISN for a 4-tuple it wishes to spoof -- closing
+ * the synq_on_ack ack==isn+1 gate EVEN on RDRAND-less CPUs (T410 / QEMU default)
+ * where rng_u64() is a non-crypto xorshift128+: the remote attacker never sees the
+ * PRNG state, only ISNs, and SipHash does not leak the key through its outputs.
+ * (The prior gen_isn took the RNG's high bits directly, which a /dev/random reader
+ * who recovered the xorshift state could still predict -- a keyed hash removes that
+ * dependence on PRNG quality.) M is a coarse (~4us) timer so successive ISNs for
+ * the SAME 4-tuple advance, giving RFC 6528 old-incarnation safety after TIME_WAIT. */
+static uint32_t gen_isn(uint32_t l_ip, uint16_t l_port,
+                        uint32_t r_ip, uint16_t r_port) {
+    static uint64_t key0 = 0, key1 = 0;
+    static int      keyed = 0;
+    if (!keyed) { key0 = rng_u64(); key1 = rng_u64(); keyed = 1; }
+    uint8_t t[12];
+    t[0]=(uint8_t)(l_ip>>24); t[1]=(uint8_t)(l_ip>>16); t[2]=(uint8_t)(l_ip>>8); t[3]=(uint8_t)l_ip;
+    t[4]=(uint8_t)(l_port>>8); t[5]=(uint8_t)l_port;
+    t[6]=(uint8_t)(r_ip>>24); t[7]=(uint8_t)(r_ip>>16); t[8]=(uint8_t)(r_ip>>8); t[9]=(uint8_t)r_ip;
+    t[10]=(uint8_t)(r_port>>8); t[11]=(uint8_t)r_port;
+    uint64_t h = siphash24(t, 12, key0, key1);
+    uint32_t M = (uint32_t)(now_ms() * 250u);   /* ~4us tick (RFC 6528) */
+    return (uint32_t)h + M;
 }
 
 /* Free space left in the receive ring (= what we advertise as rcv_wnd). */
@@ -460,7 +502,8 @@ static void synq_on_syn(sock_t* listener, uint32_t src_ip, uint16_t src_port,
         e->src_ip     = src_ip;
         e->src_port   = src_port;
         e->local_port = listener->local_port;
-        e->isn        = gen_isn();
+        e->isn        = gen_isn(listener->local_ip, listener->local_port,
+                                src_ip, src_port);
         e->rcv_nxt    = seq + 1;          /* their SYN consumes one seq */
         e->born_ms    = now_ms();
     }
@@ -683,7 +726,8 @@ int tcp_connect(sock_t* s, uint32_t dst_ip, uint16_t dst_port) {
     tcp_rt_count[idx]       = 0;
     tcp_rt_rto_ms[idx]      = TCP_RTO_INIT_MS;
 
-    uint32_t isn = gen_isn();
+    uint32_t isn = gen_isn(s->local_ip, s->local_port,
+                           s->remote_ip, s->remote_port);
     s->snd_una   = isn;
     s->snd_nxt   = isn + 1;        /* SYN consumes one seq */
     s->rcv_nxt   = 0;

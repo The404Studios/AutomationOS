@@ -128,6 +128,10 @@ static uint8_t g_seg[ETH_MAX_FRAME];   /* transport segment scratch          */
  * Fragments bit) so the ipv4_demux fragment-drop guard can be exercised. */
 static int g_frag_mf = 0;
 
+/* NETP1Y: when set, rig_inject_tcp zeroes the TCP checksum FIELD after
+ * computing it, so the checksum-0-only-for-loopback gate can be exercised. */
+static int g_zero_cksum = 0;
+
 /* Wrap a transport segment in an IPv4 header and feed it to the demux. */
 static void rig_inject(uint32_t src_ip, uint32_t dst_ip, uint8_t proto,
                        const void* seg, uint16_t seg_len) {
@@ -187,6 +191,9 @@ static void rig_inject_tcp(uint32_t src_ip, uint16_t src_port,
     /* NETP1I: corrupt a payload byte AFTER checksumming so the stored checksum
      * no longer matches the data -> tcp_input must drop it. */
     if (g_corrupt_tcp && len) g_seg[sizeof(tcp_hdr_t)] ^= 0xFF;
+    /* NETP1Y: force the checksum FIELD to 0 (simulates a NIC frame that skipped
+     * the mandatory TCP checksum) -> tcp_input must drop it for non-loopback. */
+    if (g_zero_cksum) th->checksum = 0;
     rig_inject(src_ip, dst_ip, IPPROTO_TCP, g_seg, tlen);
 }
 
@@ -1263,6 +1270,102 @@ void net_testrig_selftest(void) {
         kprintf("NETP1X: IPFRAG %s frag_dropped=%d legit=%d\n",
                 (frag_dropped && legit_ok) ? "PASS" : "FAIL",
                 frag_dropped, legit_ok);
+    }
+
+    /* ---------------------------------------------------------------- */
+    /* NET-HARDENING-1 NETP1Y (checksum-0 only for loopback): a NIC TCP  */
+    /* segment whose checksum FIELD is 0 must be DROPPED (TCP checksum is */
+    /* mandatory off the wire); a good segment is still delivered.        */
+    /* ---------------------------------------------------------------- */
+    {
+        int established = 0, good_delivered = 0, zero_dropped = 0;
+        int fd = -1;
+        uint32_t isn = 0;
+        int l = sock_socket(SOCK_STREAM);
+        if (l >= 0 && sock_bind(l, 47025) == 0 && sock_listen(l, 2) == 0) {
+            g_cap_n = 0;
+            rig_inject_tcp(peer_ip, 45004, my_ip, 47025,
+                           20000, 0, TCP_SYN, 4096, NULL, 0);
+            if (g_cap_n >= 1) {
+                const tcp_hdr_t* th = (const tcp_hdr_t*)g_cap[0].seg;
+                isn = net_ntohl(th->seq);
+                rig_inject_tcp(peer_ip, 45004, my_ip, 47025,
+                               20001, isn + 1, TCP_ACK, 4096, NULL, 0);
+                fd = sock_accept(l);
+            }
+        }
+        if (fd >= 0) {
+            uint8_t buf[16];
+            established = 1;
+            /* good in-order segment -> delivered (rcv_nxt 20001 -> 20005). */
+            rig_inject_tcp(peer_ip, 45004, my_ip, 47025,
+                           20001, 0, TCP_ACK | TCP_PSH, 4096, "GOOD", 4);
+            int n1 = sock_recv(fd, buf, sizeof(buf));
+            good_delivered = (n1 == 4 && memcmp(buf, "GOOD", 4) == 0) ? 1 : 0;
+            /* NIC segment (non-loopback src) with checksum forced to 0 -> dropped. */
+            g_zero_cksum = 1;
+            rig_inject_tcp(peer_ip, 45004, my_ip, 47025,
+                           20005, 0, TCP_ACK | TCP_PSH, 4096, "ZERO", 4);
+            g_zero_cksum = 0;
+            int n2 = sock_recv(fd, buf, sizeof(buf));
+            zero_dropped = (n2 <= 0) ? 1 : 0;
+        }
+        sock_init();
+        kprintf("NETP1Y: CKSUM0 %s established=%d good=%d zero_dropped=%d\n",
+                (established && good_delivered && zero_dropped) ? "PASS" : "FAIL",
+                established, good_delivered, zero_dropped);
+    }
+
+    /* ---------------------------------------------------------------- */
+    /* NET-HARDENING-1 NETP1Z (SWS / receiver window reopen): fill the rx */
+    /* ring until the advertised window drops below one MSS, then read    */
+    /* >= one MSS -- a window-update ACK must be emitted immediately so a  */
+    /* window-blocked sender is not stalled until its own persist probe.  */
+    /* ---------------------------------------------------------------- */
+    {
+        int established = 0, filled = 0, reopen_ack = 0;
+        int fd = -1;
+        uint32_t isn = 0;
+        int l = sock_socket(SOCK_STREAM);
+        if (l >= 0 && sock_bind(l, 47026) == 0 && sock_listen(l, 2) == 0) {
+            g_cap_n = 0;
+            rig_inject_tcp(peer_ip, 45005, my_ip, 47026,
+                           21000, 0, TCP_SYN, 4096, NULL, 0);
+            if (g_cap_n >= 1) {
+                const tcp_hdr_t* th = (const tcp_hdr_t*)g_cap[0].seg;
+                isn = net_ntohl(th->seq);
+                rig_inject_tcp(peer_ip, 45005, my_ip, 47026,
+                               21001, isn + 1, TCP_ACK, 4096, NULL, 0);
+                fd = sock_accept(l);
+            }
+        }
+        if (fd >= 0) {
+            sock_t* base = sock_table_base();
+            sock_t* c = base ? &base[fd] : (sock_t*)0;
+            if (c && c->state == TCP_ESTABLISHED) {
+                established = 1;
+                static uint8_t seg[TCP_MSS];
+                for (int i = 0; i < TCP_MSS; i++) seg[i] = (uint8_t)(i & 0xFF);
+                /* Fill the ring until the advertised window drops below one MSS. */
+                int guard = 0;
+                while ((SOCK_RXBUF_SIZE - c->rx_used) >= TCP_MSS && guard < 40) {
+                    rig_inject_tcp(peer_ip, 45005, my_ip, 47026,
+                                   c->rcv_nxt, 0, TCP_ACK | TCP_PSH, 4096,
+                                   seg, TCP_MSS);
+                    guard++;
+                }
+                filled = ((SOCK_RXBUF_SIZE - c->rx_used) < TCP_MSS) ? 1 : 0;
+                /* Drain >= one MSS -> window reopens past one MSS -> update ACK. */
+                static uint8_t rbuf[2 * TCP_MSS];
+                g_cap_n = 0;
+                int got = sock_recv(fd, rbuf, sizeof(rbuf));
+                reopen_ack = (got > 0 && g_cap_n >= 1) ? 1 : 0;
+            }
+        }
+        sock_init();
+        kprintf("NETP1Z: SWSWND %s established=%d filled=%d reopen_ack=%d\n",
+                (established && filled && reopen_ack) ? "PASS" : "FAIL",
+                established, filled, reopen_ack);
     }
 
     g_rig_active = 0;

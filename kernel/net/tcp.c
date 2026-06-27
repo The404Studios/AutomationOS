@@ -920,7 +920,18 @@ int tcp_recv(sock_t* s, void* buf, uint16_t len) {
     if (s->reset) return SOCK_ECONN;
 
     if (s->rx_used > 0) {
-        return (int)rx_ring_pop(s, (uint8_t*)buf, len);
+        uint16_t wnd_before = rcv_wnd(s);
+        uint32_t got = rx_ring_pop(s, (uint8_t*)buf, len);
+        /* NET-HARDENING-1 (SWS / receiver window reopen, RFC 813): if draining the
+         * ring just reopened our advertised window from below one MSS to >= one
+         * MSS, emit an immediate window-update ACK. Otherwise a sender parked in
+         * its zero-window persist loop only learns of the reopened window via its
+         * own exponential-backoff probe (up to ~30 s later). Fires only on the
+         * below-MSS -> open transition, so it cannot ACK-storm. */
+        if (s->state == TCP_ESTABLISHED && wnd_before < TCP_MSS &&
+            rcv_wnd(s) >= TCP_MSS)
+            tcp_send_ack(s);
+        return (int)got;
     }
     /* Peer closed and ring drained -> EOF. */
     if (s->state == TCP_CLOSE_WAIT || s->state == TCP_CLOSED ||
@@ -987,11 +998,16 @@ void tcp_input(uint32_t src_ip, uint32_t dst_ip,
 
     /* TCP-ROBUST (RX checksum verification): the checksum covers the IPv4
      * pseudo-header + TCP header + payload, so a VALID segment sums to 0
-     * (net_transport_checksum returns the final ~sum). A checksum field of 0
-     * is technically illegal for TCP, but tolerate it so in-kernel loopback /
-     * test injectors that leave it 0 are not penalized. Corrupt -> silent drop
-     * (the peer retransmits); never let corrupt bytes reach the stream. */
-    if (th->checksum != 0 &&
+     * (net_transport_checksum returns the final ~sum). Corrupt -> silent drop
+     * (the peer retransmits); never let corrupt bytes reach the stream.
+     *
+     * NET-HARDENING-1: a checksum FIELD of 0 is tolerated ONLY for loopback
+     * (127/8) sources -- in-kernel injectors / lo_drain leave it 0. A NIC-
+     * delivered TCP segment MUST carry a real checksum (TCP checksum is
+     * mandatory; a 0 there is corruption or forgery), so it is verified
+     * unconditionally. The martian filter already guarantees a 127/8 src can
+     * only have arrived via lo_drain, so this cannot be spoofed from the wire. */
+    if (!(((src_ip >> 24) == 127u) && th->checksum == 0) &&
         net_transport_checksum(src_ip, dst_ip, IPPROTO_TCP, seg, seg_len) != 0) {
         return;
     }

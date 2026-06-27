@@ -341,6 +341,14 @@ static void tcp_parse_options(sock_t* s, const uint8_t* seg, uint16_t ihl) {
         if (len < 2 || i + len > ihl) break; /* malformed -> stop */
         switch (kind) {
             case 2:  if (len == 4)  s->peer_mss = (uint16_t)((seg[i+2] << 8) | seg[i+3]); break;
+            /* NET-HARDENING-2 (window-scaling decision): record the peer's shift
+             * count for diagnostics but DELIBERATELY do NOT apply it. RFC 7323
+             * window scaling is active only if BOTH peers send the WSCALE option
+             * in their SYN; this stack never EMITS one (our SYN/SYN-ACK carry no
+             * options), so the peer keeps its window UNSCALED and treating
+             * th->window as the literal window is correct. Applying snd_wscale
+             * without also advertising it would mis-scale a window the peer never
+             * scaled -- so it stays parsed-but-unused by design (not half-done). */
             case 3:  if (len == 3)  { uint8_t w = seg[i+2]; s->snd_wscale = (w > 14) ? 14 : w; } break;
             case 4:  if (len == 2)  s->peer_sack_ok = 1; break;
             case 8:  if (len == 10) s->peer_ts_ok = 1; break;

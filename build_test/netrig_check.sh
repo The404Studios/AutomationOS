@@ -91,6 +91,9 @@ fi
 if grep -qF "NETP1AB:" "$LOG"; then
     grep -qF "NETP1AB: SYNQACK PASS synack=1 wrong_rejected=1 right_promoted=1" "$LOG" || P=0
 fi
+if grep -qF "NETP1AC:" "$LOG"; then
+    grep -qF "NETP1AC: LOSCALE PASS n=6 established=1 all_sent=1 all_recv=1" "$LOG" || P=0
+fi
 # Real unrecoverable kernel faults always fail.
 if grep -qiE "KERNEL PANIC|TRIPLE FAULT" "$LOG"; then
     echo "KERNEL FAULT during boot"; P=0

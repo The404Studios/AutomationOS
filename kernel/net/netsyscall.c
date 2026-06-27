@@ -187,6 +187,20 @@ int64_t sys_net_config(uint64_t req_ptr, uint64_t a2, uint64_t a3,
      * ip_tx() all reflect the new configuration. */
     netif_sync_globals();
 
+    /* NET-HARDENING-2: re-seed the routing table from the NEW configuration.
+     * sys_net_config previously updated only the netif + globals, leaving the
+     * routing table holding the BOOT-time on-link route + default gateway -- so
+     * after a DHCP/manual reconfig onto a different subnet, route_lookup (which
+     * ip_tx consults first) returned a STALE gateway and all off-link TX failed.
+     * route_add() updates the matching entry in place, so on the QEMU path (lease
+     * == the boot seed 10.0.2.x) this is idempotent and changes nothing. */
+    if (nif && req.ip) {
+        extern int route_add(uint32_t dest, uint32_t mask, uint32_t gw, uint32_t iface);
+        uint32_t mask = req.netmask ? req.netmask : 0xFFFFFF00u;
+        route_add(req.ip & mask, mask, 0, req.ip);              /* on-link subnet */
+        if (req.gateway) route_add(0, 0, req.gateway, req.ip);  /* default route  */
+    }
+
     return 0;
 }
 

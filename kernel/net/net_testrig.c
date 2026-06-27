@@ -1455,6 +1455,53 @@ void net_testrig_selftest(void) {
                 synack, wrong_rejected, right_promoted);
     }
 
+    /* ---------------------------------------------------------------- */
+    /* NET-HARDENING-2 NETP1AC (multi-client loopback scale): establish  */
+    /* several CONCURRENT in-kernel loopback TCP connections to one       */
+    /* listener, broadcast to each, and verify all receive it with NO    */
+    /* reset -- exercises the F7 loopback ring (LO_Q_SLOTS=16) under fan- */
+    /* out beyond the 2-client DZ-MP-LIVE proof. (First rig test using a  */
+    /* real in-kernel sock_connect over 127/8.)                          */
+    /* ---------------------------------------------------------------- */
+    {
+        enum { NK = 6 };
+        int established = 0, all_sent = 0, all_recv = 0, est = 0;
+        int cli[NK], srv[NK];
+        for (int k = 0; k < NK; k++) { cli[k] = -1; srv[k] = -1; }
+        int lst = sock_socket(SOCK_STREAM);
+        if (lst >= 0 && sock_bind(lst, 47029) == 0 && sock_listen(lst, 8) == 0) {
+            for (int k = 0; k < NK; k++) {
+                cli[k] = sock_socket(SOCK_STREAM);
+                if (cli[k] < 0) break;
+                if (sock_connect(cli[k], 0x7F000001u, 47029) != SOCK_OK) break;
+                /* The client's final handshake ACK is enqueued on lo_q; pump so
+                 * the listener drains it + promotes the child before we accept. */
+                for (int p = 0; p < 8; p++) sock_poll();
+                srv[k] = sock_accept(lst);
+                if (srv[k] < 0) break;
+                est++;
+            }
+            established = (est == NK) ? 1 : 0;
+            if (established) {
+                int sent = 0;
+                for (int k = 0; k < NK; k++)
+                    if (sock_send(srv[k], "BCAST", 5) == 5) sent++;
+                all_sent = (sent == NK) ? 1 : 0;
+                int got = 0;
+                for (int k = 0; k < NK; k++) {
+                    uint8_t b[8];
+                    if (sock_recv(cli[k], b, sizeof(b)) == 5 &&
+                        memcmp(b, "BCAST", 5) == 0) got++;
+                }
+                all_recv = (got == NK) ? 1 : 0;
+            }
+        }
+        sock_init();
+        kprintf("NETP1AC: LOSCALE %s n=%d established=%d all_sent=%d all_recv=%d\n",
+                (established && all_sent && all_recv) ? "PASS" : "FAIL",
+                (int)NK, established, all_sent, all_recv);
+    }
+
     g_rig_active = 0;
 
     /* CONFIG-STORE proof (independent of the net rig; reuses the NET_SELFTEST

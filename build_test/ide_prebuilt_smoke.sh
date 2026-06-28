@@ -17,7 +17,7 @@ grep -q SUCCESS /tmp/idepb_qb.log || { echo "KERNEL BUILD FAIL"; tail -6 /tmp/id
 echo "[idepb] IDE=1 build_all (IDE autostart + DeadZone project)..."
 IDE=1 bash scripts/build_all.sh > /tmp/idepb_ba.log 2>&1
 # IDE compile errors? (scope the grep so unrelated lines don't trip it)
-if grep -qiE 'ide_(build|project|parse|model|pcore|pdecl|pstmt|pexpr|lex|ast)\.c.*error:|error:.*ide_|undefined reference' /tmp/idepb_ba.log; then
+if grep -qiE 'ide_(build|project|parse|model|pcore|pdecl|pstmt|pexpr|lex|ast|semantic|map|inspector|chrome)\.c.*error:|error:.*ide_|undefined reference' /tmp/idepb_ba.log; then
   echo "IDE COMPILE ERRORS:"; grep -iE 'error:|undefined reference' /tmp/idepb_ba.log | head; exit 1
 fi
 [ -s build/automationos.iso ] || { echo "no iso"; exit 1; }

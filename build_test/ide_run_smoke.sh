@@ -19,7 +19,7 @@ grep -q SUCCESS /tmp/iderun_qb.log || { echo "KERNEL BUILD FAIL"; tail -6 /tmp/i
 
 echo "[iderun] IDE=1 IDE_RUN_PROBE=1 build_all..."
 IDE=1 IDE_RUN_PROBE=1 bash scripts/build_all.sh > /tmp/iderun_ba.log 2>&1
-if grep -qiE 'ide_(build|project|parse|model|pcore|pdecl|pstmt|pexpr|lex|ast)\.c.*error:|error:.*ide_|undefined reference' /tmp/iderun_ba.log; then
+if grep -qiE 'ide_(build|project|parse|model|pcore|pdecl|pstmt|pexpr|lex|ast|semantic|map|inspector|chrome)\.c.*error:|error:.*ide_|undefined reference' /tmp/iderun_ba.log; then
   echo "IDE COMPILE ERRORS:"; grep -iE 'error:|undefined reference' /tmp/iderun_ba.log | head; exit 1
 fi
 [ -s build/automationos.iso ] || { echo "no iso"; exit 1; }

@@ -67,7 +67,23 @@ typedef struct {
 
     Port  ports[M_MAXPORTS]; int nports;            /* filled by semantic   */
     int   closed;                                   /* IDA-style UI collapse */
+
+    /* AUDIT honest-map (decouple coherence from M_MAXPORTS + "+N more"):
+     * nports_true counts EVERY intended port -- including those past the
+     * M_MAXPORTS=16 store cap -- so the map can show "(N of T)" instead of
+     * silently understating, and coherence can read the absent-gate INTENT
+     * (wants_*) rather than scanning the truncated 16-slot array. */
+    int           nports_true;                      /* true intended port count */
+    unsigned char wants_lifecycle;                  /* a claim/lifecycle gate is absent */
+    unsigned char wants_gate;                       /* a cooldown/control gate is absent */
 } Func;
+
+/* Count of items hidden past a cap (true - shown, clamped >=0). Pure; shared by
+ * the map + inspector renderers AND the host map_caps selftest, so the "+N more"
+ * overflow logic is provable headlessly (only the pixel blit itself is not). */
+static inline int ide_more(int shown, int truec) {
+    return (truec > shown) ? (truec - shown) : 0;
+}
 
 /* ---- a global/state entity ---- */
 typedef struct {

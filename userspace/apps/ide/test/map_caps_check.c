@@ -77,7 +77,62 @@ static int line(const char* label, int n, int cap) {
     return trunc;
 }
 
+/* ------------------------------------------------------------------------
+ * AUDIT honest-map selftest: prove HEADLESSLY that coherence is decoupled from
+ * M_MAXPORTS (#3) and that an overflowing function reports its true port count
+ * for the "+N more" marker (#5). Separate --selftest invocation so the
+ * real-source no-truncation assertion in main() is untouched. Needs
+ * model_analyze (ide_semantic.c), so the harness must link that TU.
+ * ---------------------------------------------------------------------- */
+static const char SELFTEST_SRC[] =
+    "int g_a,g_b,g_c,g_d,g_e,g_f,g_h,g_i,g_j,g_k,g_l,g_m,g_n,g_o,g_p,g_q,g_r,g_s,g_t,g_u;\n"
+    "void other(void){ g_a = 1; g_b = 2; }\n"           /* 2nd writer -> g_a,g_b shared */
+    "void hub(int p1, int p2){\n"
+    "  g_a=1; g_b=2; g_c=3; g_d=4; g_e=5; g_f=6; g_h=7; g_i=8; g_j=9; g_k=10;\n"
+    "  g_l=11; g_m=12; g_n=13; g_o=14; g_p=15; g_q=16; g_r=17; g_s=18;\n"
+    "  int x = g_t + g_u; (void)x;\n"
+    "}\n";
+/* hub: 2 params + 18 writes + 2 reads = 22 connected ports + 2 absent gates
+ * (no claim/cooldown call) = 24 intended ports >> M_MAXPORTS(16). g_a,g_b are
+ * written by BOTH hub and other -> writes_shared, so the absent gates ARE added
+ * but fall past slot 16. No reserved keyword (claim/lock/acquire/gate/reserve/
+ * cooldown/ready/can_) appears, so wants_lifecycle && wants_gate stay 1. */
+
+static int selftest(void) {
+    model_parse(&g_model, SELFTEST_SRC, (int)(sizeof(SELFTEST_SRC) - 1), "selftest.c");
+    int hi = find_func("hub");
+    if (hi < 0) { printf("HONEST-OVERFLOW FAIL (hub not parsed)\n"); return 1; }
+    g_model.focus = hi;
+    model_analyze(&g_model);
+    Func* f = &g_model.funcs[hi];
+
+    int more = ide_more(f->nports, f->nports_true);
+    /* PS_ABSENT ports actually STORED in the 16-slot array = what the OLD
+     * coherence loop could see. 0 here proves the absent gates were truncated
+     * (so the old code scored this function ~100, the bug) while the new
+     * wants_*-based coherence still penalizes them. */
+    int stored_absent = 0;
+    for (int i = 0; i < f->nports && i < M_MAXPORTS; i++)
+        if (f->ports[i].status == PS_ABSENT) stored_absent++;
+
+    printf("HONEST-PORTS nports=%d nports_true=%d\n", f->nports, f->nports_true);
+    printf("HONEST-MARKER +%d more ports\n", more);
+    printf("HONEST-COH coherence=%d wants_lc=%d wants_gate=%d stored_absent=%d\n",
+           g_model.coherence, f->wants_lifecycle, f->wants_gate, stored_absent);
+
+    int ok = (f->nports == M_MAXPORTS)        /* the 16-slot store cap was hit   */
+          && (f->nports_true > M_MAXPORTS)    /* but the TRUE count exceeds it    */
+          && (more > 0)                       /* -> a "+N more" marker is warranted */
+          && (f->wants_lifecycle == 1)        /* intent survives the truncation   */
+          && (f->wants_gate == 1)
+          && (g_model.coherence <= 80)        /* coherence PENALIZED the gates     */
+          && (stored_absent == 0);            /* which were NOT among the 16 stored */
+    printf("HONEST-OVERFLOW %s\n", ok ? "OK" : "FAIL");
+    return ok ? 0 : 1;
+}
+
 int main(int argc, char** argv) {
+    if (argc >= 2 && strcmp(argv[1], "--selftest") == 0) return selftest();
     if (argc < 2) { fprintf(stderr, "usage: %s <file.c>\n", argv[0]); return 2; }
     FILE* f = fopen(argv[1], "rb");
     if (!f) { fprintf(stderr, "cannot open %s\n", argv[1]); return 2; }

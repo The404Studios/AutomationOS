@@ -14,7 +14,7 @@ echo "[mapcaps] building host harness..."
 gcc -I "$IDE" -w -o "$BIN" \
    "$IDE/test/map_caps_check.c" "$IDE/ide_parse.c" "$IDE/ide_pcore.c" \
    "$IDE/ide_pdecl.c" "$IDE/ide_pstmt.c" "$IDE/ide_pexpr.c" \
-   "$IDE/ide_lex.c" "$IDE/ide_ast.c" 2> /tmp/mapcaps_build.log
+   "$IDE/ide_lex.c" "$IDE/ide_ast.c" "$IDE/ide_semantic.c" 2> /tmp/mapcaps_build.log
 if [ ! -x "$BIN" ]; then echo "HARNESS BUILD FAILED"; cat /tmp/mapcaps_build.log; exit 1; fi
 
 APPS="userspace/apps/deadzone/deadzone.c
@@ -34,6 +34,16 @@ while IFS= read -r app; do
   printf "  %-48s trunc=%s corrupt=%s  %s\n" "$(basename "$app")" "$trunc" "$corrupt" "$verdict"
   if [ "$trunc" -ne 0 ] || [ "$corrupt" -ne 0 ] || [ "$rc" -ge 2 ]; then fails=$((fails+1)); fi
 done <<< "$APPS"
+
+echo ""
+echo "--- AUDIT honest-map selftest: coherence decoupled from M_MAXPORTS (#3) + '+N more' overflow (#5) ---"
+st=$("$BIN" --selftest 2>&1); strc=$?
+printf '%s\n' "$st" | sed 's/^/  /'
+if [ "$strc" -ne 0 ] || ! printf '%s' "$st" | grep -q 'HONEST-OVERFLOW OK'; then
+  echo "  [FAIL] honest-map selftest (coherence/overflow regressed)"; fails=$((fails+1))
+else
+  echo "  [OK] honest-map selftest"
+fi
 
 echo ""
 echo "--- deadzone.c map detail (completeness + parser correctness) ---"

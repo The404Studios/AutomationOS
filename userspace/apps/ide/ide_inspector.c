@@ -465,6 +465,20 @@ static void insp_kv(Canvas* cv, Rect b, int y, const char* k, int v,
     insp_text(cv, x, y, insp_num, TH_TEXT, n * GFX_FW);
 }
 
+/* Like insp_kv but appends a "(+K)" overflow tag in orange when the true count
+ * exceeds the shown (capped) count -- AUDIT honest-map #5 for the inspector. */
+static void insp_kv_more(Canvas* cv, Rect b, int y, const char* k, int v, int more) {
+    int avail = b.w - 2 * PAD;
+    insp_text(cv, b.x + PAD, y, k, TH_TEXT_DIM, avail - 10 * GFX_FW);
+    int n = ide_itoa(v, insp_num);
+    insp_num[n++] = ' '; insp_num[n++] = '('; insp_num[n++] = '+';
+    n += ide_itoa(more, insp_num + n);
+    insp_num[n++] = ')';
+    insp_num[n]   = 0;
+    int x = b.x + b.w - PAD - n * GFX_FW;
+    insp_text(cv, x, y, insp_num, TH_ORANGE, n * GFX_FW);
+}
+
 static void insp_body_category(Ide* a, Canvas* cv, Rect b, Func* f) {
     int y = b.y - a->inspector_scroll;
     int npr = f->nreads  > M_MAXREFS  ? M_MAXREFS  : f->nreads;
@@ -472,7 +486,10 @@ static void insp_body_category(Ide* a, Canvas* cv, Rect b, Func* f) {
     int npc = f->ncalls  > M_MAXCALLS ? M_MAXCALLS : f->ncalls;
     int npp = f->nports  > M_MAXPORTS ? M_MAXPORTS : f->nports;
 
-    insp_kv(cv, b, y, "Ports",      npp, 0); y += ROW_H;
+    int port_more = ide_more(npp, f->nports_true);
+    if (port_more > 0) insp_kv_more(cv, b, y, "Ports", npp, port_more);
+    else               insp_kv(cv, b, y, "Ports",      npp, 0);
+    y += ROW_H;
     insp_kv(cv, b, y, "Reads",      npr, 0); y += ROW_H;
     insp_kv(cv, b, y, "Writes",     npw, 0); y += ROW_H;
     insp_kv(cv, b, y, "Calls",      npc, 0); y += ROW_H;

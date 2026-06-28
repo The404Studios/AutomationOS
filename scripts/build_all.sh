@@ -73,6 +73,14 @@ if [ "${DZ_GAMETEST:-0}" = "1" ]; then
     INIT_EXTRA="$INIT_EXTRA -DDZ_GAMETEST"
     echo "*** DZ_GAMETEST build: init spawns sbin/deadzone (selftest proof) ***"
 fi
+# TASKMAN_TEST=1 adds -DTASKMAN_TEST so init spawns sbin/taskman, which emits
+# [TASKMAN] starting + [TASKMAN] N procs (the TRUE live process count via
+# SYS_PROCLIST) -- proving the task manager reads real kernel data. Unset =>
+# normal boot never spawns it (taskman.elf still ships + is launchable normally).
+if [ "${TASKMAN_TEST:-0}" = "1" ]; then
+    INIT_EXTRA="$INIT_EXTRA -DTASKMAN_TEST"
+    echo "*** TASKMAN_TEST build: init spawns sbin/taskman (proclist proof) ***"
+fi
 # AUDIO_STREAMTEST=1 adds -DAUDIO_STREAMTEST so init spawns sbin/streamtest, the
 # userspace PCM-streaming proof (SYS_AUDIO_STREAM_WRITE). Pair with AUDIO_SELFTEST=1
 # (kernel, implies HDA_ENABLE). Unset => normal boot byte-for-byte unchanged.

@@ -200,6 +200,16 @@ void _start(void) {
     spawn("sbin/deadzone");
 #endif
 
+#ifdef TASKMAN_TEST
+    // TASKMAN_TEST (TASKMAN_TEST=1): spawn the real Task Manager so its launch
+    // emits [TASKMAN] starting + [TASKMAN] N procs (N = the TRUE live process
+    // count via SYS_PROCLIST, now honest -- no longer silently pinned at 12),
+    // proving the task manager reads real kernel data. Compositor is up by here,
+    // so wl_connect succeeds. Gated => default boot never spawns it.
+    print("[INIT] TASKMAN_TEST: spawning taskman (proclist proof)...\n");
+    spawn("sbin/taskman");
+#endif
+
 #ifdef AUDIO_STREAMTEST
     // AUDIO_STREAMTEST: prove a ring-3 app streams PCM via SYS_AUDIO_STREAM_WRITE
     // (the on_bcis ring consumer drains it into the HDA DMA). Gated => default boot

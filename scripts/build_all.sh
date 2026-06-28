@@ -37,6 +37,15 @@ if [ "${IDE:-0}" = "1" ]; then
     INIT_EXTRA="$INIT_EXTRA -DIDE_AUTOSTART"
     echo "*** IDE build: init compiled with -DIDE_AUTOSTART (auto-opens sbin/ide) ***"
 fi
+# IDE_RUN_PROBE=1 adds -DIDE_RUN_PROBE to the ide.c compile ONLY (AUDIT-9 end-to-
+# end proof: the IDE drives Build->Run on the loaded project at launch). Unset =>
+# ide.elf is byte-identical (IDE_CF empty -> the ide.c compile matches cc()).
+# Requires IDE=1 so init autostarts sbin/ide with the DeadZone project as argv[1].
+IDE_CF=""
+if [ "${IDE_RUN_PROBE:-0}" = "1" ]; then
+    IDE_CF="$IDE_CF -DIDE_RUN_PROBE"
+    echo "*** IDE_RUN_PROBE build: ide.c compiled with -DIDE_RUN_PROBE (drives Build->Run at launch) ***"
+fi
 if [ "${GAMETEST:-0}" = "1" ]; then
     INIT_EXTRA="$INIT_EXTRA -DGAMETEST_RUN"
     echo "*** GAMETEST build: init compiled with -DGAMETEST_RUN (spawns sbin/gametest) ***"
@@ -725,7 +734,13 @@ fi
 echo "[all] IDE (Semantic LEGO Map)..."
 IDE_SRCS="ide ide_sys ide_gfx ide_lex ide_ast ide_pcore ide_pdecl ide_pstmt ide_pexpr ide_astprint ide_parse ide_semantic ide_explorer ide_funcs ide_map ide_codeview ide_inspector ide_runtime ide_chrome ide_gen elf_write as_x64 cc_type cc_codegen cc_expr tc_driver ide_build ide_editor ide_term ide_library ide_complete ide_config ide_project"
 IDE_OBJS=""
-for s in $IDE_SRCS; do cc userspace/apps/ide/$s.c /tmp/ide_$s.o; IDE_OBJS="$IDE_OBJS /tmp/ide_$s.o"; done
+for s in $IDE_SRCS; do
+  # ide.c carries the optional -DIDE_RUN_PROBE; all other IDE TUs use plain cc().
+  # With IDE_RUN_PROBE unset, IDE_CF is empty so this matches cc() byte-for-byte.
+  if [ "$s" = "ide" ]; then gcc $CF $IDE_CF -c userspace/apps/ide/$s.c -o /tmp/ide_$s.o;
+  else cc userspace/apps/ide/$s.c /tmp/ide_$s.o; fi
+  IDE_OBJS="$IDE_OBJS /tmp/ide_$s.o"
+done
 # AUDIT-9: link crt0 FIRST so ide.elf gets the kernel argv frame (_start -> main
 # (argc,argv)). ide.c's entry is now int main(); crt0.o is assembled at :216 and
 # already consumed by the cc.elf link at :738, so it exists here. ide_ide.o is

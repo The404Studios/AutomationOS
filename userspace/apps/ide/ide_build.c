@@ -236,6 +236,28 @@ static int ide_build_prebuilt(Ide* a) {
                : ide_streq(a->project.lang, "cpp") ? LANG_CPP
                : LANG_C;
 
+    /* AUDIT-9: Build must not pass a path Run cannot spawn. SYS_SPAWN truncates
+     * the path at 127 chars and g_res.out_path is smaller than rt's IDE_PATH
+     * buffer, so a run_target whose full path exceeds either would Build-ok yet
+     * Run-fail (rc=-2). Fail the gate here so Build and Run agree. (DeadZone is
+     * 44 chars + PROJECT_NAME_MAX=32 keeps the shipped case well clear; this only
+     * fires for a pathological long project path.) */
+    {
+        int rl = ide_strlen(rt);
+        if (rl >= 127 || rl >= (int)sizeof(g_res.out_path) - 1) {
+            g_res.ok = 0;
+            g_res.prebuilt = 0;
+            g_res.out_path[0] = 0;
+            g_res.out_dir[0]  = 0;
+            ide_strlcpy(g_res.message,
+                        "prebuilt run_target path too long to Run: ",
+                        (int)sizeof(g_res.message));
+            int ml = ide_strlen(g_res.message);
+            ide_strlcpy(g_res.message + ml, rt, (int)sizeof(g_res.message) - ml);
+            return 1;
+        }
+    }
+
     if (!ide_is_elf(rt)) {                        /* shipped target absent/garbage  */
         g_res.ok = 0;
         g_res.prebuilt = 0;                        /* nothing runnable -> plain fail */
@@ -397,6 +419,22 @@ void ide_do_run(Ide* a) {
     }
 
     long pid = ide_sc(SYS_SPAWN, (long)g_res.out_path, 0, 0, 0, 0, 0);
+
+    /* AUDIT-9: permanent fail-closed spawn trace (fd1 -> serial) so step 7 of the
+     * Build->Run chain is greppable on EVERY Run (a live GUI Ctrl+R or the
+     * IDE_RUN_PROBE boot) -- a future no-op of this spawn then can't pass the
+     * smokes silently. Uses the RAW pid, NOT g_child_pid (the WNOHANG reap below
+     * zeroes that for a fast-exiting child, which would mis-report a real spawn). */
+    { char ln[256]; int k = 0;
+      const char* p = (pid > 0) ? "[IDE] run spawn pid=" : "[IDE] run spawn FAIL rc=";
+      for (int j = 0; p[j] && k < 255; j++) ln[k++] = p[j];
+      char nb[16]; int nl = ide_itoa((pid > 0) ? (int)pid : (int)(-pid), nb);
+      for (int j = 0; j < nl && k < 255; j++) ln[k++] = nb[j];
+      const char* po = " out=";
+      for (int j = 0; po[j] && k < 255; j++) ln[k++] = po[j];
+      for (int j = 0; g_res.out_path[j] && k < 255; j++) ln[k++] = g_res.out_path[j];
+      if (k < 255) ln[k++] = '\n';
+      ide_sc(3 /*SYS_WRITE*/, 1, (long)ln, k, 0, 0, 0); }
 
     int i = 0;
     if (pid > 0) {

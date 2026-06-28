@@ -2848,6 +2848,20 @@ int main(int argc, char** argv) {
         ide_exit(1);
     }
 
+#ifdef IDE_RUN_PROBE
+    /* AUDIT-9 end-to-end proof (IDE_RUN_PROBE build only -- separate from
+     * IDE_AUTOSTART so ide_prebuilt_smoke stays byte-stable). Drives the REAL
+     * Build->Run path once a project is loaded: ide_do_build runs the prebuilt
+     * gate (g_have=1, g_res.ok=1) and ide_do_run SYS_SPAWNs the resolved ELF,
+     * emitting the permanent '[IDE] run spawn pid=' marker; the launched DeadZone
+     * then reaches 'DEADZONE: ready'. Placed AFTER wl_create_window so the
+     * compositor is up and the spawned game connects as a 2nd client. */
+    if (a->project.active) {
+        ide_do_build(a);
+        ide_do_run(a);
+    }
+#endif
+
     /* Defensive: guarantee the landing view is the editable EDITOR workspace
      * with the editor (not the bottom terminal) owning the keyboard, so the
      * very first keystroke after launch lands in the editor. init() already

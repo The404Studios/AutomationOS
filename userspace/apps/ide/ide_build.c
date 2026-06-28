@@ -267,6 +267,30 @@ static int ide_build_prebuilt(Ide* a) {
     return 1;
 }
 
+/* AUDIT-9 headless proof: run the EXACT static prebuilt gate at runtime and
+ * emit a fail-closed serial verdict. This proves the prebuilt path actually
+ * FIRES and resolves the shipped ELF live (a precondition-only marker can't).
+ * Userspace + wl-free (only ide_is_elf + string ops); leaves g_have untouched
+ * so it does NOT trick Run into thinking a build happened. Idempotent. */
+void ide_prebuilt_probe(Ide* a) {
+    if (!a) return;
+    int handled = ide_build_prebuilt(a);     /* the EXACT gate ide_do_build runs */
+    int ok      = handled && g_res.ok;
+    char ln[256]; int k = 0;
+    const char* p1 = "[IDE] prebuilt probe handled=";
+    for (int i = 0; p1[i] && k < 255; i++) ln[k++] = p1[i];
+    if (k < 255) ln[k++] = handled ? '1' : '0';
+    const char* p2 = " ok=";
+    for (int i = 0; p2[i] && k < 255; i++) ln[k++] = p2[i];
+    if (k < 255) ln[k++] = ok ? '1' : '0';
+    const char* p3 = " out=";
+    for (int i = 0; p3[i] && k < 255; i++) ln[k++] = p3[i];
+    const char* op = ok ? g_res.out_path : "";
+    for (int i = 0; op[i] && k < 255; i++) ln[k++] = op[i];
+    if (k < 255) ln[k++] = '\n';
+    ide_sc(3 /*SYS_WRITE*/, 1, (long)ln, k, 0, 0, 0);
+}
+
 void ide_do_build(Ide* a) {
     /* Prebuilt/native project: Build resolves + presents the shipped ELF (no cc).
      * Runs even with no source tab open, since it never touches the source. */

@@ -37,6 +37,18 @@ if [ -f "$ELF" ]; then
 fi
 
 echo ""
+echo "=== compositor DI_PROJECT -> sbin/ide wiring (static, fail-closed) ==="
+# AUDIT-9: the desktop project icon must open the IDE (not the file manager).
+# The GUI double-click is QEMU-visual, but a refactor dropping the wiring must
+# not pass silently -- assert the DI_PROJECT branch spawns sbin/ide.
+if grep -q 'di->kind == DI_PROJECT' userspace/compositor/compositor_m8.c && \
+   grep -A8 'di->kind == DI_PROJECT' userspace/compositor/compositor_m8.c | grep -q 'sbin/ide'; then
+  echo "  [OK] DI_PROJECT double-click spawns sbin/ide"
+else
+  echo "  [FAIL] DI_PROJECT no longer spawns sbin/ide"; exit 1
+fi
+
+echo ""
 echo "=== boots with raised caps (35s) ==="
 SER=build_test/idepb_ser.log; rm -f "$SER"
 timeout 40 qemu-system-x86_64 -cdrom build/automationos.iso -m 512 \
@@ -54,16 +66,24 @@ for pat in 'PANIC' 'triple fault' 'double fault' 'KERNEL HALT'; do
 done
 LINES=$(wc -l < "$SER")
 AUTO=$(grep -cF 'IDE_AUTOSTART' "$SER")
-echo "  lines=$LINES  kernel_fatal=$CRASH  IDE_AUTOSTART=$AUTO"
+# AUDIT-9 RUNTIME PROOF (fail-closed). MARK proves the manifest was loaded LIVE
+# (a->project.active set at runtime); grep the FULL line incl. kind=prebuilt so a
+# default/garbage manifest (which prints kind=c) also fails. PROBE proves the
+# EXACT prebuilt gate FIRED and resolved the shipped ELF -- not just inspection.
+MARK=$(grep -acF '[IDE] project active root=/Desktop/Projects/DeadZone kind=prebuilt' "$SER")
+PROBE=$(grep -acF '[IDE] prebuilt probe handled=1 ok=1 out=/Desktop/Projects/DeadZone/build/deadzone.elf' "$SER")
+echo "  lines=$LINES  kernel_fatal=$CRASH  IDE_AUTOSTART=$AUTO  proj_active=$MARK  prebuilt_fired=$PROBE"
 echo "  (note: any 'CPU EXCEPTION' is sbin/sigtest's deliberate CR2=0x4000 fault-injection, handled)"
 echo "  --- tail 4 ---"; tail -4 "$SER" | sed 's/^/    /'
 
 echo ""
-if [ "$CRASH" -eq 0 ] && [ "$AUTO" -ge 1 ] && [ "$LINES" -ge 2000 ]; then
-  echo "IDE-PREBUILT: PASS (IDE compiles + ships DeadZone[kind=prebuilt] + boots clean with raised map caps)"
+if [ "$CRASH" -eq 0 ] && [ "$AUTO" -ge 1 ] && [ "$LINES" -ge 2000 ] && [ "$MARK" -ge 1 ] && [ "$PROBE" -ge 1 ]; then
+  echo "IDE-PREBUILT: PASS (IDE compiles + ships DeadZone[kind=prebuilt] + boots clean with raised map caps;"
+  echo "  project loaded at RUNTIME [proj_active=$MARK] + prebuilt gate FIRED on the shipped ELF [prebuilt_fired=$PROBE])"
   exit 0
 else
-  echo "IDE-PREBUILT: FAIL (kernel_fatal=$CRASH autostart=$AUTO lines=$LINES)"
+  echo "IDE-PREBUILT: FAIL (kernel_fatal=$CRASH autostart=$AUTO lines=$LINES proj_active=$MARK prebuilt_fired=$PROBE)"
+  echo "--- [IDE] markers seen ---"; grep -aF '[IDE] ' "$SER" | head
   echo "--- tail 20 ---"; tail -20 "$SER"
   exit 1
 fi

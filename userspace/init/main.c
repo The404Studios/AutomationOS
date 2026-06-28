@@ -644,8 +644,11 @@ void _start(void) {
     /* IDE=1 build: open the Semantic LEGO Map IDE last so it lands on TOP of the
      * default desktop apps (for IDE iteration + screenshots). Normal boot leaves
      * the IDE launchable from the dock/start-menu instead. */
-    print("[INIT] IDE_AUTOSTART: opening sbin/ide...\n");
-    spawn("sbin/ide");
+    print("[INIT] IDE_AUTOSTART: opening sbin/ide on the DeadZone project...\n");
+    /* AUDIT-9: hand the IDE the DeadZone project root as argv[1] so the boot
+     * drives the runtime project-load + prebuilt-gate path and emits the
+     * headless proof markers ([IDE] project active / [IDE] prebuilt probe). */
+    spawn_args("sbin/ide", "/Desktop/Projects/DeadZone");
 #endif
 
 #ifdef SHOWCASE

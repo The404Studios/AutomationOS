@@ -5301,7 +5301,19 @@ static int desk_handle_click(int32_t cx, int32_t cy, uint32_t W, uint32_t H, lon
     /* Identity is the full stored path -- never reconstruct it from the
      * (truncated) display label. Dispatch by kind: folders/projects open in the
      * file manager at their real directory; apps/files are spawned directly. */
-    if (di->kind == DI_FOLDER || di->kind == DI_PROJECT) {
+    if (di->kind == DI_PROJECT) {
+        /* AUDIT-9: a project folder opens IN the IDE, with its root passed as
+         * argv[1] (kernel splits the args string -> argv[1]=di->path). If the
+         * IDE fails to spawn, fall back to the file manager so the icon is
+         * never a dead end. */
+        long r = syscall(SYS_SPAWN, (long)"sbin/ide", (long)di->path, 0);
+        print("[SHELL] desktop ide "); print(di->path);
+        if (r < 0) {
+            print(" (ide spawn fail r="); print_num(r); print(" -> filemanager)");
+            syscall(SYS_SPAWN, (long)"sbin/filemanager", (long)di->path, 0);
+        }
+        print("\n");
+    } else if (di->kind == DI_FOLDER) {
         long r = syscall(SYS_SPAWN, (long)"sbin/filemanager", (long)di->path, 0);
         print("[SHELL] desktop open "); print(di->path);
         if (r < 0) { print(" (spawn fail r="); print_num(r); print(")"); }

@@ -184,7 +184,7 @@ static void tab_save_active(Ide* a) {
         g_tab_src[i][j] = a->src[j];
 }
 
-static void ide_parse_project_model(Ide* a);   /* IDE-XFILE-0 (defined below) */
+void ide_parse_project_model(Ide* a);          /* IDE-XFILE-0 (defined below; prototype in ide.h) */
 
 static void tab_restore(Ide* a, int idx) {
     if (idx < 0 || idx >= IDE_MAX_TABS || !a->tabs[idx].used) return;
@@ -659,7 +659,7 @@ static void ide_dirname(char* out, int cap, const char* path) {
     if (cut <= 0) { out[0] = '/'; out[1] = 0; } else out[cut] = 0;
 }
 
-static void ide_parse_project_model(Ide* a) {
+void ide_parse_project_model(Ide* a) {
     model_reset(&a->model);
     char dir[IDE_PATH];
     ide_dirname(dir, IDE_PATH, a->cur_file);

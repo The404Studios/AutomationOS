@@ -46,6 +46,8 @@
 /* In-game audio mixer -- defined below, forward-declared for try_shoot/bite. */
 static void audio_trigger(int kind);
 static void num_to_str(char *buf, int v);   /* defined later; used by extraction_step */
+static void mp_game_connect(void);          /* MP-GUI-1: defined after the mp seam   */
+static void mp_game_disconnect(void);       /* used by the connect menu (handle_ui_key) */
 
 /* ---- key scancodes ---- */
 #define KEY_ESC     1
@@ -64,6 +66,7 @@ static void num_to_str(char *buf, int v);   /* defined later; used by extraction
 #define KEY_ENTER  28
 #define KEY_1       2
 #define KEY_2       3
+#define KEY_M      50            /* MP-GUI-1: toggle the co-op connect menu  */
 
 typedef unsigned int   u32;
 typedef int            i32;
@@ -155,6 +158,14 @@ static u32 rng_next(void) { g_rng = g_rng * 1664525u + 1013904223u; return (g_rn
 static i32 g_hold_fwd, g_hold_back, g_hold_left, g_hold_right, g_hold_tl, g_hold_tr;
 static i32 g_shoot_held;
 static i32 g_have_mouse, g_last_mx;
+
+/* ---- MP-GUI-1: live co-op render state (gated on g_mp_on; default 0 => the
+ * single-player game is byte-identical). The render-facing fields live here,
+ * ahead of render_scene; the connection object lives by the mp seam below. */
+static i32 g_mp_on;                       /* 1 while joined to a server          */
+static i32 g_my_slot;                     /* our slot id (learned from DZ_HELLO)  */
+static fx  g_rx[DZP_MAX_CLIENTS], g_rz[DZP_MAX_CLIENTS];  /* other players' fx pos */
+static i32 g_ron[DZP_MAX_CLIENTS];        /* 1 if that slot is an active peer     */
 
 /* ---- Tarkov-lite systems: inventory grid + character attributes ---- */
 #define INV_COLS 6
@@ -801,6 +812,19 @@ static void render_scene(g3d_target *tgt, mat4 proj, vec3 light)
         blit_spr(g_spr_zombie, ZSPR_W, ZSPR_H, sx - w/2, syb - h, w, h, mul);
     }
 
+    /* MP-GUI-1: other co-op players from the latest snapshot, as billboards.
+     * Reuse the zombie sprite tinted cyan so teammates read as friendly. Gated
+     * on g_mp_on => single-player draws nothing here (g_ron is all-zero). */
+    for (int i = 0; g_mp_on && i < DZP_MAX_CLIENTS; i++) {
+        if (!g_ron[i]) continue;
+        int sx, syb; fx d;
+        if (!project_pt(view, g_rx[i], 0, g_rz[i], focal, &sx, &syb, &d)) continue;
+        int h = fx_to_int(fx_div(fx_mul(fx_ratio(16,10), focal), d));
+        if (h < 6) h = 6; if (h > 420) h = 420;
+        int w = h * ZSPR_W / ZSPR_H;
+        blit_spr(g_spr_zombie, ZSPR_W, ZSPR_H, sx - w/2, syb - h, w, h, 0xFF40C0FFu);
+    }
+
     /* loot pickups as billboarded crates on the ground (bob up/down) */
     for (int i = 0; i < MAX_PICKUPS; i++) {
         if (!g_pickup[i].alive) continue;
@@ -963,6 +987,8 @@ static void handle_ui_key(int a)
         if      (a == KEY_UP   && g_char_sel > 0) g_char_sel--;
         else if (a == KEY_DOWN && g_char_sel < 3) g_char_sel++;
         else if (a == KEY_ENTER)                  spend_point(g_char_sel);
+    } else if (g_ui_mode == 3) {     /* MP-GUI-1: co-op connect menu */
+        if (a == KEY_ENTER) { if (g_mp_on) mp_game_disconnect(); else mp_game_connect(); }
     }
 }
 static const char *item_label(u8 t)
@@ -994,6 +1020,24 @@ static void draw_ui_panel(wl_window *win)
                 font_draw_string(px,stride,tw,th, cxp+4,cyp+4,  item_label(g_inv[idx].type), 0xFFFFE0A0u);
                 font_draw_string(px,stride,tw,th, cxp+4,cyp+22, nb, 0xFFCFE8FFu);
             }
+        }
+    } else if (g_ui_mode == 3) {
+        font_draw_string(px,stride,tw,th, pxx+12,pyy+8,
+                         "CO-OP  (loopback 127.0.0.1:27015)", 0xFFFFFFFFu);
+        font_draw_string(px,stride,tw,th, pxx+12,pyy+44,
+                         g_mp_on ? "Status: CONNECTED" : "Status: offline",
+                         g_mp_on ? 0xFF3CCB5Au : 0xFFAAB2BFu);
+        if (g_mp_on) {
+            char nb[12]; num_to_str(nb, g_my_slot);
+            font_draw_string(px,stride,tw,th, pxx+12,pyy+72,  "Your slot:", 0xFFAAB2BFu);
+            font_draw_string(px,stride,tw,th, pxx+108,pyy+72, nb, 0xFFCFE8FFu);
+            font_draw_string(px,stride,tw,th, pxx+12,pyy+120,
+                             "ENTER = disconnect      M / ESC = close", 0xFFFFE060u);
+        } else {
+            font_draw_string(px,stride,tw,th, pxx+12,pyy+72,
+                             "Spawn 'deadzoned' first, then connect.", 0xFFAAB2BFu);
+            font_draw_string(px,stride,tw,th, pxx+12,pyy+120,
+                             "ENTER = connect         M / ESC = close", 0xFFFFE060u);
         }
     } else {
         char nb[12];
@@ -1336,6 +1380,98 @@ static int mp_poll_snapshot(dz_client *c, dz_snapshot_t *out)
     return got;
 }
 
+/* ====================================================================== *
+ *  MP-GUI-1: live co-op wiring. All of it is gated on g_mp_on (default 0),
+ *  so with no connection the single-player game is byte-for-byte identical.
+ *  Connection object + the wire<->fx coordinate bridge + per-frame
+ *  send-input / apply-snapshot + connect/disconnect.
+ * ====================================================================== */
+static dz_client     g_mpc;          /* the live connection                   */
+static dz_snapshot_t g_snap;         /* latest authoritative snapshot         */
+static u64           g_mp_last_send; /* ms of last input send (send cadence)  */
+
+/* The server world is [0..DZ_SRV_ARENA] (centre DZ_SRV_ARENA/2) on both axes;
+ * the game uses fx centred at 0 spanning +-ARENA_HALF_I. i64 intermediates =>
+ * no overflow even at the arena edge (|w-centre|*fx(28) ~ 9.2e9 > i32). */
+#define DZ_SRV_ARENA  10000
+static fx  wire_to_fx(dz_i32 w) {
+    g3d_i64 num = (g3d_i64)(w - DZ_SRV_ARENA/2) * (g3d_i64)fx_from_int(2*ARENA_HALF_I);
+    return (fx)(num / DZ_SRV_ARENA);
+}
+static dz_i32 fx_to_wire(fx d) {     /* a per-frame DELTA (no centring)        */
+    g3d_i64 num = (g3d_i64)d * (g3d_i64)DZ_SRV_ARENA;
+    return (dz_i32)(num / (g3d_i64)fx_from_int(2*ARENA_HALF_I));
+}
+
+/* Apply the freshest authoritative snapshot to local render/HUD state. In MP
+ * the server owns everything: our position/hp/score/wave, the zombie set, AND
+ * the other players. Everything is capped to the local array sizes. */
+static void mp_apply_snapshot(void)
+{
+    for (int i = 0; i < DZP_MAX_CLIENTS; i++) g_ron[i] = 0;
+    int np = (int)g_snap.n_players; if (np > DZP_MAX_CLIENTS) np = DZP_MAX_CLIENTS;
+    for (int i = 0; i < np; i++) {
+        dz_u32 id = g_snap.p[i].id;
+        if (id == DZ_SLOT_EMPTY) continue;                  /* phantom slot */
+        fx wx = wire_to_fx(g_snap.p[i].x), wz = wire_to_fx(g_snap.p[i].y);
+        if ((int)id == g_my_slot) {                         /* that's us */
+            g_px = wx; g_pz = wz;
+            g_hp = g_snap.p[i].hp; g_alive = (g_hp > 0);
+            g_kills = (i32)g_snap.p[i].score;
+        } else if (id < (dz_u32)DZP_MAX_CLIENTS) {          /* a teammate */
+            g_rx[id] = wx; g_rz[id] = wz; g_ron[id] = 1;
+        }
+    }
+    g_wave = (i32)g_snap.wave;
+    int nz = (int)g_snap.n_zombies; if (nz > MAX_Z) nz = MAX_Z;   /* 64 -> cap 24 */
+    for (int i = 0; i < MAX_Z; i++) g_z[i].alive = 0;
+    for (int i = 0; i < nz; i++) {
+        g_z[i].x = wire_to_fx(g_snap.z[i].x);
+        g_z[i].z = wire_to_fx(g_snap.z[i].y);
+        g_z[i].alive = 1; g_z[i].health = 1; g_z[i].hitflash = 0;
+    }
+}
+
+/* Translate the currently-held inputs into a server-wire move intent + fire bit
+ * and send it. Mirrors player_step's forward/right basis. Returns 0 / negative. */
+static int mp_pump_input(void)
+{
+    fx fdx = dirx(g_yaw), fdz = dirz(g_yaw);          /* forward */
+    fx rdx = dirz(g_yaw), rdz = -dirx(g_yaw);         /* right   */
+    fx mf = 0, ms = 0;
+    if (g_hold_fwd)  mf = fx_add(mf,  g_move_spd);
+    if (g_hold_back) mf = fx_sub(mf,  g_move_spd);
+    if (g_hold_right)ms = fx_add(ms,  g_move_spd);
+    if (g_hold_left) ms = fx_sub(ms,  g_move_spd);
+    fx wdx = fx_add(fx_mul(fdx, mf), fx_mul(rdx, ms));
+    fx wdz = fx_add(fx_mul(fdz, mf), fx_mul(rdz, ms));
+    dz_u32 btn = g_shoot_held ? DZ_BTN_FIRE : 0u;
+    return mp_send_input(&g_mpc, fx_to_wire(wdx), fx_to_wire(wdz), (dz_u32)g_yaw, btn);
+}
+
+/* Connect to the local server (loopback 127.0.0.1, host-ordered like dzclient).
+ * Learns our slot from the DZ_HELLO join-ack mp_connect already parsed. */
+static void mp_game_connect(void)
+{
+    if (g_mp_on) return;
+    g_ui_mode = 0;                                   /* drop the menu, show play */
+    if (mp_connect(&g_mpc, 0x7F000001u, DZ_GAME_PORT) != 0) { g_mp_on = 0; return; }
+    g_my_slot = (int)g_mpc.slot;
+    g_mp_last_send = 0; g_mp_on = 1;
+    for (int i = 0; i < DZP_MAX_CLIENTS; i++) g_ron[i] = 0;
+    print("DEADZONE: mp connected\n");
+}
+/* Graceful disconnect: drop the socket and fall back to a fresh single-player raid. */
+static void mp_game_disconnect(void)
+{
+    if (!g_mp_on) return;
+    sc(SYS_CLOSE_SK, g_mpc.fd, 0, 0, 0, 0, 0);
+    g_mp_on = 0;
+    for (int i = 0; i < DZP_MAX_CLIENTS; i++) g_ron[i] = 0;
+    deadzone_reset((u64)sc(SYS_GET_TICKS_MS,0,0,0,0,0,0));
+    print("DEADZONE: mp disconnected\n");
+}
+
 /* Headless proof that THIS binary speaks the shared protocol the server uses:
  * encode/decode both packet families through dzproto.h and assert round-trip.
  * Runs at launch like systems_selftest(); no network/peer required. */
@@ -1366,6 +1502,13 @@ static void mp_selftest(void)
     dz_u8 hbb[DZ_HELLO_BYTES]; dz_hello_encode(hbb, &h);
     if (!dz_hello_decode(hbb, &h2) || h2.slot != h.slot || h2.proto_ver != h.proto_ver) {
         print("DEADZONE: mp FAIL hello\n"); return;
+    }
+
+    /* MP-GUI-1: the wire<->fx coordinate bridge is sane -- the arena centre maps
+     * to the world origin, the edges straddle it, and the delta map keeps sign. */
+    if (wire_to_fx(DZ_SRV_ARENA/2) != 0 || wire_to_fx(0) >= 0
+        || wire_to_fx(DZ_SRV_ARENA) <= 0 || fx_to_wire(fx_from_int(1)) <= 0) {
+        print("DEADZONE: mp FAIL coord\n"); return;
     }
 
     print("DEADZONE: mp PASS (dzproto client wire ok)\n");
@@ -1423,6 +1566,7 @@ void _start(void)
             /* panel toggles work in any mode */
             if (down && a==KEY_TAB) { g_ui_mode=(g_ui_mode==1)?0:1; continue; }
             if (down && a==KEY_C)   { g_ui_mode=(g_ui_mode==2)?0:2; continue; }
+            if (down && a==KEY_M)   { g_ui_mode=(g_ui_mode==3)?0:3; continue; }  /* MP-GUI-1 */
             if (g_ui_mode != 0) { if (down) handle_ui_key(a); continue; }
             switch (a) {
             case KEY_W: case KEY_UP:    g_hold_fwd=down; break;
@@ -1444,7 +1588,7 @@ void _start(void)
         int steps=0;
         while (acc>=STEP_MS && steps<5) {
             acc-=STEP_MS; steps++;
-            if (!g_over && g_ui_mode==0) {   /* sim freezes while a panel is open */
+            if (!g_mp_on && !g_over && g_ui_mode==0) {   /* local sim; MP => server-authoritative, panel => frozen */
                 player_step();
                 if (g_shoot_held) try_shoot();
                 zombies_step();
@@ -1463,6 +1607,17 @@ void _start(void)
                     print("[DEADZONE] over wave "); print(b1); print(" kills "); print(b2); print("\n");
                 }
             }
+        }
+
+        /* MP-GUI-1: when joined, the server drives the world. Send our held
+         * input at ~30 Hz, then apply the freshest authoritative snapshot.
+         * A send failure (peer gone) drops us cleanly back to single-player. */
+        if (g_mp_on) {
+            if (now - g_mp_last_send >= 33) {
+                if (mp_pump_input() != 0) mp_game_disconnect();
+                else g_mp_last_send = now;
+            }
+            if (g_mp_on && mp_poll_snapshot(&g_mpc, &g_snap)) mp_apply_snapshot();
         }
 
         render_scene(&tgt, proj, light);   /* into the low-res PSX target */

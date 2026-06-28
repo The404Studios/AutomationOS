@@ -92,6 +92,17 @@ static int is_spec_word(Tok* t) {
     return 0;
 }
 
+/* Storage-class / qualifier words: they are valid in a specifier run but are
+ * NOT a "core" type. Tracking these separately lets the unknown-typedef
+ * heuristic still fire after a leading storage class -- e.g. `static mat4 foo`
+ * (mat4 from an unparsed header): without this, `static` alone would satisfy
+ * got_spec and `mat4` would be mis-taken as the declarator NAME, dropping foo. */
+static int is_storage_or_qual(Tok* t) {
+    return tok_is(t, "static")   || tok_is(t, "extern")  || tok_is(t, "inline")  ||
+           tok_is(t, "register") || tok_is(t, "auto")    || tok_is(t, "typedef") ||
+           tok_is(t, "const")    || tok_is(t, "volatile")|| tok_is(t, "restrict");
+}
+
 /* True if the current token can start / continue a type-specifier run. */
 static int at_type_spec(Parser* p) {
     Tok* t = pk(p);
@@ -139,7 +150,8 @@ AstNode* parse_type_and_declarator(Parser* p, char* type_out, char* name_out) {
     Tok* last  = first;
 
     /* ---- 1. type-specifier run --------------------------------------- */
-    int got_spec = 0;
+    int got_spec = 0;     /* saw ANY specifier (incl. storage/qualifier)      */
+    int got_core = 0;     /* saw a REAL type/typedef (NOT just storage/qual)   */
     while (!at(p, TK_EOF)) {
         if (at_record_kw(p)) {
             /* struct/union/enum [tag] [ { body } ] used as a TYPE. */
@@ -163,6 +175,7 @@ AstNode* parse_type_and_declarator(Parser* p, char* type_out, char* name_out) {
                 if (p->ntoks > 0 && p->pos > 0) last = &p->toks[p->pos - 1];
             }
             got_spec = 1;
+            got_core = 1;                 /* struct/union/enum IS a real type   */
             continue;
         }
         if (at_type_spec(p)) {
@@ -171,6 +184,7 @@ AstNode* parse_type_and_declarator(Parser* p, char* type_out, char* name_out) {
             d_append_tok(ty, TYPE_CAP, t);
             last = t;
             got_spec = 1;
+            if (!is_storage_or_qual(t)) got_core = 1;   /* real type material  */
             continue;
         }
         /* Heuristic: an unknown identifier that BEGINS a declaration is a type
@@ -178,7 +192,7 @@ AstNode* parse_type_and_declarator(Parser* p, char* type_out, char* name_out) {
          * covers typedefs from headers we never parsed (e.g. `enemy_t g_enemies`
          * where enemy_t is defined in an #include'd game.h). Consume exactly one
          * as the leading specifier, and remember it so later uses are known. */
-        if (!got_spec && at(p, TK_ID)) {
+        if (!got_core && at(p, TK_ID)) {
             Tok* t2 = pk2(p);
             if (t2 && (t2->kind == TK_ID ||
                        (t2->kind == TK_PUNCT && tok_is(t2, "*")))) {
@@ -187,6 +201,7 @@ AstNode* parse_type_and_declarator(Parser* p, char* type_out, char* name_out) {
                 d_append_tok(ty, TYPE_CAP, t);
                 last = t;
                 got_spec = 1;
+                got_core = 1;             /* the unknown typedef IS the type    */
                 continue;
             }
         }

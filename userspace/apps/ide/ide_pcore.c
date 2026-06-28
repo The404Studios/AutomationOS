@@ -230,6 +230,9 @@ void parser_init(Parser* p, const char* src, int src_len, Tok* toks, int max_tok
     p->toks    = toks;
     p->ntoks   = lex_tokenize(src, src_len, toks, max_toks);
     if (p->ntoks < 0) p->ntoks = 0;
+    if (p->ntoks > max_toks) p->ntoks = max_toks;   /* lex returns the LOGICAL
+        count (can exceed the array when a huge source overflows max_toks); clamp
+        so the strip/parse loops never read past toks[] -- OOB on >32768-tok files */
     /* Strip comment + preprocessor tokens so the grammar never trips over them.
      * Spans still index the original source, so comments survive in the text for
      * round-trip edits; the parser just doesn't see them. */

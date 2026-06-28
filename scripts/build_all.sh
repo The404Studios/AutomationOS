@@ -935,6 +935,13 @@ cp userspace/apps/ide/sample/native/* /tmp/ird/usr/src/native/ 2>/dev/null || tr
 # Semantic LEGO Map can visualize its car/AI/physics/render structure.
 mkdir -p /tmp/ird/usr/src/derby
 cp userspace/apps/derby/derby.c /tmp/ird/usr/src/derby/ 2>/dev/null || true
+# cube3d + ray: shipped 3D games (sbin/cube3d, sbin/ray) that link wl/bitfont/g3d
+# -- seed their source under /usr/src so the IDE can open/map/edit them and the
+# /sbin-twin prebuilt fallback (ide_try_prebuilt) makes Build+Run work like derby.
+mkdir -p /tmp/ird/usr/src/cube3d
+cp userspace/apps/cube3d/cube3d.c /tmp/ird/usr/src/cube3d/ 2>/dev/null || true
+mkdir -p /tmp/ird/usr/src/ray
+cp userspace/apps/ray/ray.c /tmp/ird/usr/src/ray/ 2>/dev/null || true
 # DeadZone: the runnable FPS zombie-survival game (sbin/deadzone) AND an IDE
 # project so the Semantic LEGO Map visualizes its FPS/zombie/wave/render structure.
 mkdir -p /tmp/ird/usr/src/deadzone
@@ -969,7 +976,7 @@ mkdir -p /tmp/ird/Desktop
 mkdir -p /tmp/ird/Desktop/Projects/DeadZone/src /tmp/ird/Desktop/Projects/DeadZone/build /tmp/ird/Desktop/Projects/DeadZone/res
 cp userspace/apps/deadzone/deadzone.c /tmp/ird/Desktop/Projects/DeadZone/src/ 2>/dev/null || true
 cp /tmp/deadzone.elf /tmp/ird/Desktop/Projects/DeadZone/build/deadzone.elf 2>/dev/null || true
-printf 'name=DeadZone\nlang=c\nentry=src/deadzone.c\nrun_target=build/deadzone.elf\n' > /tmp/ird/Desktop/Projects/DeadZone/project.json
+printf 'name=DeadZone\nlang=c\nentry=src/deadzone.c\nrun_target=build/deadzone.elf\nkind=prebuilt\n' > /tmp/ird/Desktop/Projects/DeadZone/project.json
 : > /tmp/ird/Desktop/Projects/DeadZone/res/.keep
 # Zombie Bastion: a Desktop FOLDER holding the game ELF. The compositor shows
 # /Desktop entries as icons; a folder opens the filemanager, where the .elf can

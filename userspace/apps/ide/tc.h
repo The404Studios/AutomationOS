@@ -75,6 +75,8 @@ typedef struct {
     char   asm_preview[1536];        /* first ~lines of generated asm      */
     TcDiag diags[TC_MAXDIAG]; int ndiags;
     char   message[160];             /* summary / why unsupported          */
+    int    prebuilt;                 /* 1 = presented a SHIPPED ELF (no cc   */
+                                     /* ran; src edits are NOT recompiled)   */
 } TcResult;
 
 /* extension -> language */

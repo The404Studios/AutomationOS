@@ -44,6 +44,7 @@ int ide_project_write_manifest(const IdeProject* p) {
     APP("lang=");       APP(p->lang[0] ? p->lang : "c");                 NL();
     APP("entry=");      APP(p->entry[0] ? p->entry : "src/main.c");      NL();
     APP("run_target="); APP(p->run_target[0] ? p->run_target : "build/main.elf"); NL();
+    APP("kind=");       APP(p->kind);                                    NL();
     APP("cflags=");                                                      NL();
 #undef APP
 #undef NL
@@ -71,6 +72,7 @@ int ide_project_load(IdeProject* p, const char* root) {
     ide_strlcpy(p->lang, "c", (int)sizeof(p->lang));
     ide_strlcpy(p->entry, "src/main.c", (int)sizeof(p->entry));
     pj_default_run_target(p->run_target, (int)sizeof(p->run_target), p->name);
+    p->kind[0] = 0;                              /* default: on-device compile      */
 
     char path[192];
     pj_path(path, (int)sizeof(path), root, "project.json");
@@ -94,6 +96,7 @@ int ide_project_load(IdeProject* p, const char* root) {
         else if (klen == 4  && ide_strneq(buf + ks, "lang", 4)        && val[0]) ide_strlcpy(p->lang, val, (int)sizeof(p->lang));
         else if (klen == 5  && ide_strneq(buf + ks, "entry", 5)       && val[0]) ide_strlcpy(p->entry, val, (int)sizeof(p->entry));
         else if (klen == 10 && ide_strneq(buf + ks, "run_target", 10) && val[0]) ide_strlcpy(p->run_target, val, (int)sizeof(p->run_target));
+        else if (klen == 4  && ide_strneq(buf + ks, "kind", 4)        && val[0]) ide_strlcpy(p->kind, val, (int)sizeof(p->kind));
         /* cflags: reserved, ignored in v0 */
         while (i < n && buf[i] != '\n') i++;
     }

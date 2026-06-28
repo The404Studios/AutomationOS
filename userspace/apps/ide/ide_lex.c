@@ -212,6 +212,14 @@ int lex_tokenize(const char* src, int len, Tok* toks, int max)
                 int scol = col;
                 int sline = line;
                 while (i < len && src[i] != '\n') {
+                    /* Stop at an inline comment so the comment scanners below
+                     * consume it. Otherwise a `/* ...` that OPENS a multi-line
+                     * block comment ON a #define line gets swallowed into this
+                     * PREPROC token, leaving the continuation lines -- and the
+                     * real declaration right after them -- mis-lexed (this is
+                     * how deadzone.c's g_world used to vanish from the map). */
+                    if (src[i] == '/' && i + 1 < len &&
+                        (src[i + 1] == '*' || src[i + 1] == '/')) break;
                     col++;
                     i++;
                 }

@@ -25,6 +25,10 @@ typedef struct {
     char lang[8];                     /* "c" / "asm" (Layer-2: "cpp"/"py")          */
     char entry[64];                   /* compiled source, rel to root ("src/main.c")*/
     char run_target[96];              /* ELF Run spawns, rel ("build/<Name>.elf")   */
+    char kind[16];                    /* "" / "c" = on-device compile; "prebuilt" / */
+                                      /* "native" = Build skips cc and Runs the     */
+                                      /* shipped run_target (a game linking wl/bf/   */
+                                      /* g3d the single-file compiler can't relink). */
 } IdeProject;
 
 /* Write <p->root>/project.json from p. Returns 0 or <0. */

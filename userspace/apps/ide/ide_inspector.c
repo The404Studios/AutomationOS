@@ -38,7 +38,7 @@ static const char* const INSP_TAB_LBL[INSP_NTABS] = {
 };
 
 /* ---- tiny shared scratch (no libc) ---- */
-static char insp_num[16];
+static char insp_num[24];   /* >=24: the "dCoherence +NNN" line overflowed [16] */
 
 /* draw `s` clipped to [x, x+maxw). */
 static void insp_text(Canvas* cv, int x, int y, const char* s,

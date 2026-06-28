@@ -17,16 +17,16 @@
 #define M_TYPE        48
 #define M_MAXPARAMS   12
 #define M_MAXPORTS    16
-#define M_MAXCALLS    16
-#define M_MAXREFS     16
-#define M_MAXFUNCS    64
-#define M_MAXGLOBALS  64
-#define M_MAXCONNS    48
+#define M_MAXCALLS    40   /* real game hubs exceed 16 (deadzone _start: 37 calls) */
+#define M_MAXREFS     32   /* real game hubs exceed 16 (deadzone_reset: 30 writes) */
+#define M_MAXFUNCS    128   /* real game files exceed 64 (deadzone.c: 66 funcs) */
+#define M_MAXGLOBALS  128   /* real game files exceed 64 (deadzone.c: ~70 globals) */
+#define M_MAXCONNS    80   /* _start's inbound+outbound edges exceed 48 */
 #define M_MAXRISKS    12
 #define M_MAXACTIONS  10
-#define M_MAXFLOW     16
+#define M_MAXFLOW     64   /* per-function flow steps for a big game function */
 #define M_MAXINCLUDES 32
-#define M_MAXMACROS   32
+#define M_MAXMACROS   128   /* real game files exceed 32 (deadzone.c: 89 macros) */
 #define M_MAXRECORDS  32
 #define M_MAXPROTOS   32
 

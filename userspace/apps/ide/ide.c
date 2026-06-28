@@ -980,6 +980,7 @@ static void np_confirm(Ide* a) {
         rt[n] = 0;
         ide_strlcpy(p->run_target, rt, (int)sizeof(p->run_target));
     }
+    p->kind[0] = 0;                  /* IDE-created projects compile on-device       */
     ide_project_write_manifest(p);
 
     /* Refresh the explorer, close the modal, open the project's main source.

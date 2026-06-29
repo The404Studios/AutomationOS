@@ -166,6 +166,7 @@ static i32 g_mp_on;                       /* 1 while joined to a server         
 static i32 g_my_slot;                     /* our slot id (learned from DZ_HELLO)  */
 static fx  g_rx[DZP_MAX_CLIENTS], g_rz[DZP_MAX_CLIENTS];  /* other players' fx pos */
 static i32 g_ron[DZP_MAX_CLIENTS];        /* 1 if that slot is an active peer     */
+static int g_demo_cyan_drawn;             /* DZ_MPGUI_DEMO: cyan teammate sprites drawn last frame */
 
 /* ---- Tarkov-lite systems: inventory grid + character attributes ---- */
 #define INV_COLS 6
@@ -835,6 +836,7 @@ static void render_scene(g3d_target *tgt, mat4 proj, vec3 light)
     /* MP-GUI-1: other co-op players from the latest snapshot, as billboards.
      * Reuse the zombie sprite tinted cyan so teammates read as friendly. Gated
      * on g_mp_on => single-player draws nothing here (g_ron is all-zero). */
+    g_demo_cyan_drawn = 0;
     for (int i = 0; g_mp_on && i < DZP_MAX_CLIENTS; i++) {
         if (!g_ron[i]) continue;
         int sx, syb; fx d;
@@ -843,6 +845,7 @@ static void render_scene(g3d_target *tgt, mat4 proj, vec3 light)
         if (h < 6) h = 6; if (h > 420) h = 420;
         int w = h * ZSPR_W / ZSPR_H;
         blit_spr(g_spr_zombie, ZSPR_W, ZSPR_H, sx - w/2, syb - h, w, h, 0xFF40C0FFu);
+        g_demo_cyan_drawn++;                /* DZ_MPGUI_DEMO render proof */
     }
 
     /* loot pickups as billboarded crates on the ground (bob up/down) */
@@ -1648,6 +1651,9 @@ void _start(void)
     audio_selftest();            /* headless proof: in-game SFX stream (or SKIP) */
     raid_selftest();             /* headless proof: extraction/raid lifecycle    */
     print("DEADZONE: ready\n");
+#ifdef DZ_MPGUI_DEMO
+    mp_game_connect();   /* 2-window co-op demo: auto-join the local deadzoned */
+#endif
 
     for (;;) {
         int kind,a,b,cev;
@@ -1719,6 +1725,15 @@ void _start(void)
          * input at ~30 Hz, then apply the freshest authoritative snapshot.
          * A send failure (peer gone) drops us cleanly back to single-player. */
         if (g_mp_on) {
+#ifdef DZ_MPGUI_DEMO
+            /* Self-driving demo (no keyboard input): FACE the other player -- they
+             * spawn on the x-axis, so slot 0 looks +x toward slot 1 and slot 1 looks
+             * -x toward slot 0 -- and slowly strafe so the cyan teammate stays
+             * dead-ahead AND visibly slides side to side. */
+            g_yaw = (g_my_slot == 1) ? (3 * G3D_ANG_STEPS / 4) : (G3D_ANG_STEPS / 4);
+            { static int dt = 0; int ph = ((dt++) / 45) & 1;
+              g_hold_left = ph; g_hold_right = !ph; g_hold_fwd = 0; g_hold_back = 0; }
+#endif
             g_mp_send_steps += steps;                 /* accumulate elapsed sim-steps */
             /* MP-FEEDBACK-FIX: the local sim (which decays these) is gated off in
              * MP, so advance the cosmetic shoot timers here -- else the muzzle flash
@@ -1733,6 +1748,13 @@ void _start(void)
         }
 
         render_scene(&tgt, proj, light);   /* into the low-res PSX target */
+#ifdef DZ_MPGUI_DEMO
+        /* Headless render proof: how many cyan teammate sprites this window actually
+         * DREW this frame (passed projection). >=1 => the co-op render is visible. */
+        { static int rprt = 0; if (g_mp_on && ++rprt >= 30) { rprt = 0; char nb[12];
+            print("DEADZONE: coop slot="); num_to_str(nb, g_my_slot); print(nb);
+            print(" drew_cyan="); num_to_str(nb, g_demo_cyan_drawn); print(nb); print("\n"); } }
+#endif
         upscale_blit(win);                  /* nearest-upscale to the window */
         draw_hud(win, (int)win->w, (int)win->h);  /* HUD at full res on top */
         draw_ui_panel(win);                 /* inventory / character overlay */

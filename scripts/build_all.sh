@@ -67,6 +67,16 @@ if [ "${DZ_MP2:-0}" = "1" ]; then
     DZ_MP2_FLAG="-DDZ_MP2"
     echo "*** DZ_MP2 build: dzclient compiled -DDZ_MP2 (2-connection co-op harness) ***"
 fi
+# DZ_MPGUI_DEMO=1 = on-screen (QEMU) 2-window LIVE co-op VISUAL demo: init spawns
+# deadzoned + TWO GUI DeadZone windows, and deadzone.c is compiled -DDZ_MPGUI_DEMO so
+# each window AUTO-JOINS the local server on launch (cyan teammate render). Unset =>
+# default boot + default deadzone.elf are byte-unchanged.
+DZ_GUI_DEMO_FLAG=""
+if [ "${DZ_MPGUI_DEMO:-0}" = "1" ]; then
+    DZ_GUI_DEMO_FLAG="-DDZ_MPGUI_DEMO"
+    INIT_EXTRA="$INIT_EXTRA -DDZ_MPGUI_DEMO"
+    echo "*** DZ_MPGUI_DEMO build: init spawns deadzoned + 2 auto-joining DeadZone windows ***"
+fi
 # DZ_GAMETEST=1 adds -DDZ_GAMETEST so init spawns sbin/deadzone, whose launch-time
 # headless selftests (systems/mp/loot) print to serial. Unset => normal boot.
 if [ "${DZ_GAMETEST:-0}" = "1" ]; then
@@ -678,7 +688,8 @@ $LD /tmp/ray.o    /tmp/wlc.o /tmp/bf.o /tmp/g3d.o -o /tmp/ray.elf
 cc userspace/apps/derby/derby.c   /tmp/derby.o
 $LD /tmp/derby.o  /tmp/wlc.o /tmp/bf.o /tmp/g3d.o -o /tmp/derby.elf
 # deadzone: first-person zombie-survival shooter (g3d FPS + waves). Same link set.
-cc userspace/apps/deadzone/deadzone.c /tmp/deadzone.o
+# $DZ_GUI_DEMO_FLAG (empty by default) adds -DDZ_MPGUI_DEMO for the 2-window co-op demo.
+gcc $CF $DZ_GUI_DEMO_FLAG -c userspace/apps/deadzone/deadzone.c -o /tmp/deadzone.o
 $LD /tmp/deadzone.o /tmp/wlc.o /tmp/bf.o /tmp/g3d.o -o /tmp/deadzone.elf
 # deadzoned: the DeadZone authoritative multiplayer game SERVER. A pure-syscall
 # TCP daemon (no wl/g3d) -- links only crt0, exactly like httpd/nc.

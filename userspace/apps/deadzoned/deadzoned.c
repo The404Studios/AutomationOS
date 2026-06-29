@@ -357,6 +357,22 @@ static void world_tick(World *w)
         }
     }
 
+    /* TPK-FIX: if EVERY active player is downed, zombies have no target
+     * (nearest_player returns -1) so the field never clears and the wave-clear
+     * revive below never fires -> the shared co-op world soft-locks forever. Detect
+     * a total-party-kill and revive the party (co-op forgiveness, like wave-clear). */
+    {
+        int any_active = 0, any_alive = 0;
+        for (u32 i = 0; i < MAX_CLIENTS; i++) {
+            if (!w->p[i].active) continue;
+            any_active = 1;
+            if (w->p[i].hp > 0) any_alive = 1;
+        }
+        if (any_active && !any_alive)
+            for (u32 i = 0; i < MAX_CLIENTS; i++)
+                if (w->p[i].active) w->p[i].hp = PLAYER_HP_MAX / 2;
+    }
+
     if (w->alive == 0) {
         w->wave++;
         u32 next = 4 + w->wave * 4;        /* endless, escalating waves      */

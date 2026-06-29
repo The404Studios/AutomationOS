@@ -166,7 +166,9 @@ static i32 g_mp_on;                       /* 1 while joined to a server         
 static i32 g_my_slot;                     /* our slot id (learned from DZ_HELLO)  */
 static fx  g_rx[DZP_MAX_CLIENTS], g_rz[DZP_MAX_CLIENTS];  /* other players' fx pos */
 static i32 g_ron[DZP_MAX_CLIENTS];        /* 1 if that slot is an active peer     */
+#ifdef DZ_MPGUI_DEMO
 static int g_demo_cyan_drawn;             /* DZ_MPGUI_DEMO: cyan teammate sprites drawn last frame */
+#endif
 
 /* ---- Tarkov-lite systems: inventory grid + character attributes ---- */
 #define INV_COLS 6
@@ -836,7 +838,9 @@ static void render_scene(g3d_target *tgt, mat4 proj, vec3 light)
     /* MP-GUI-1: other co-op players from the latest snapshot, as billboards.
      * Reuse the zombie sprite tinted cyan so teammates read as friendly. Gated
      * on g_mp_on => single-player draws nothing here (g_ron is all-zero). */
+#ifdef DZ_MPGUI_DEMO
     g_demo_cyan_drawn = 0;
+#endif
     for (int i = 0; g_mp_on && i < DZP_MAX_CLIENTS; i++) {
         if (!g_ron[i]) continue;
         int sx, syb; fx d;
@@ -845,7 +849,13 @@ static void render_scene(g3d_target *tgt, mat4 proj, vec3 light)
         if (h < 6) h = 6; if (h > 420) h = 420;
         int w = h * ZSPR_W / ZSPR_H;
         blit_spr(g_spr_zombie, ZSPR_W, ZSPR_H, sx - w/2, syb - h, w, h, 0xFF40C0FFu);
-        g_demo_cyan_drawn++;                /* DZ_MPGUI_DEMO render proof */
+#ifdef DZ_MPGUI_DEMO
+        /* render proof: count ONLY sprites that land on the visible target (passed
+         * projection AND overlap the framebuffer) -- so drew_cyan>=1 means the cyan
+         * teammate is genuinely ON SCREEN, not merely in front of the camera. */
+        if (sx + w/2 > 0 && sx - w/2 < LOWW && syb > 0 && syb - h < LOWH)
+            g_demo_cyan_drawn++;
+#endif
     }
 
     /* loot pickups as billboarded crates on the ground (bob up/down) */
@@ -1727,12 +1737,11 @@ void _start(void)
         if (g_mp_on) {
 #ifdef DZ_MPGUI_DEMO
             /* Self-driving demo (no keyboard input): FACE the other player -- they
-             * spawn on the x-axis, so slot 0 looks +x toward slot 1 and slot 1 looks
-             * -x toward slot 0 -- and slowly strafe so the cyan teammate stays
-             * dead-ahead AND visibly slides side to side. */
+             * spawn apart on the x-axis, so slot 0 looks +x toward slot 1 and slot 1
+             * looks -x toward slot 0 -- and stay put, so the cyan teammate is
+             * dead-centre + reliably on-screen (no confusing auto-motion). */
             g_yaw = (g_my_slot == 1) ? (3 * G3D_ANG_STEPS / 4) : (G3D_ANG_STEPS / 4);
-            { static int dt = 0; int ph = ((dt++) / 45) & 1;
-              g_hold_left = ph; g_hold_right = !ph; g_hold_fwd = 0; g_hold_back = 0; }
+            g_hold_fwd = g_hold_back = g_hold_left = g_hold_right = 0;
 #endif
             g_mp_send_steps += steps;                 /* accumulate elapsed sim-steps */
             /* MP-FEEDBACK-FIX: the local sim (which decays these) is gated off in

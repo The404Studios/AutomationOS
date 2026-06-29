@@ -273,7 +273,7 @@ static int world_join(World *w)
         if (!w->p[i].active) {
             w->p[i].active = 1;
             w->p[i].hp = PLAYER_HP_MAX;
-            w->p[i].x = ARENA / 2 + ((i32)i * 2 - 1) * 1200;  /* spread so players don't spawn stacked */
+            w->p[i].x = ARENA / 2 + ((i32)i - (i32)((MAX_CLIENTS - 1) / 2)) * (ARENA / (MAX_CLIENTS + 1));  /* spread, in-bounds for all slots */
             w->p[i].y = ARENA / 2;
             w->p[i].yaw = 0;
             w->p[i].score = 0;

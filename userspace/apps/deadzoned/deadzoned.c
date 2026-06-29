@@ -201,7 +201,11 @@ typedef struct {
 #define BTN_FIRE   0x1u
 
 #define PLAYER_HP_MAX   100
-#define PLAYER_SPEED    60          /* max world units / tick               */
+#define PLAYER_SPEED    256         /* max world units / packet -- covers the client's
+                                     * time-scaled multi-step send incl. leveled-AGI
+                                     * diagonal play (was 60 = a per-step cap that pinned
+                                     * co-op to ~half SP speed). Teleport stays bounded by
+                                     * the arena position-clamp below, so this is safe. */
 #define ZOMBIE_SPEED    24
 #define ZOMBIE_REACH    140         /* contact distance for melee           */
 #define ZOMBIE_DMG      6
@@ -378,6 +382,16 @@ static u32 snap_serialize(const World *w, u8 *buf, u32 cap)
     v->tick = w->tick; v->wave = w->wave;
     v->n_players = w->n_players; v->n_zombies = w->n_zombies;
     for (u32 i = 0; i < w->n_players; i++) {
+        /* MP-PHANTOM-FIX: honor the wire contract -- an UNOCCUPIED slot serializes
+         * as DZ_SLOT_EMPTY with neutralized fields, so the client's
+         * `if (id==DZ_SLOT_EMPTY) continue;` guard fires and no phantom teammate is
+         * rendered. (Before: every slot got id=i -> a solo co-op drew 7 ghosts.) */
+        if (!w->p[i].active) {
+            v->p[i].id    = DZ_SLOT_EMPTY;
+            v->p[i].x = 0; v->p[i].y = 0; v->p[i].hp = 0;
+            v->p[i].yaw = 0; v->p[i].score = 0;
+            continue;
+        }
         v->p[i].id    = i;
         v->p[i].x     = w->p[i].x;
         v->p[i].y     = w->p[i].y;
@@ -626,6 +640,22 @@ static int self_test(void)
         out_puts("DEADZONED SELFTEST: FAIL roundtrip_zombie\n"); return 1;
     }
 
+    /* (2b) MP-PHANTOM-FIX: only slot `slot` joined, so every OTHER slot must
+     * serialize + decode as DZ_SLOT_EMPTY (not a valid id) -- proving the producer
+     * honors the wire contract the client's phantom-skip guard relies on. Before
+     * the fix every slot carried id=i and the GUI client drew 7 ghost teammates. */
+    if (parsed.p[slot].id != (dz_u32)slot) {
+        out_puts("DEADZONED SELFTEST: FAIL active_id\n"); return 1;
+    }
+    {
+        u32 empties = 0;
+        for (u32 i = 0; i < parsed.n_players; i++)
+            if ((int)i != slot && parsed.p[i].id == DZ_SLOT_EMPTY) empties++;
+        if (empties != parsed.n_players - 1) {
+            out_puts("DEADZONED SELFTEST: FAIL phantom_slots\n"); return 1;
+        }
+    }
+
     /* (3) listening socket -- proves it can host ----------------------- */
     long fd = sc(SYS_SOCKET, SOCK_STREAM, 0, 0, 0, 0);
     if (fd < 0) { out_puts("DEADZONED SELFTEST: FAIL socket rc="); out_num(fd); out_puts("\n"); return 1; }
@@ -646,7 +676,7 @@ static int self_test(void)
     out_num((long)n);
     out_puts(" roundtrip=ok listen=ok port=");
     out_num(SELFTEST_PORT);
-    out_puts("\n");
+    out_puts(" phantoms_ok=1\n");
     return 0;
 }
 

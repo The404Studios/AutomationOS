@@ -337,6 +337,17 @@ static void extraction_step(void)
     }
 }
 
+/* Tag a concluding raid as a death-loss -- unless it already concluded as a
+ * TIMEOUT (set just before g_alive=0) or an EXTRACTED win. Without this, dying
+ * WHILE channeling extraction left g_raid_state stuck at RAID_EXTRACTING, so the
+ * green "EXTRACTING..." banner drew on top of the "YOU DIED" screen. Shared by
+ * the main loop's loss latch and the headless raid_selftest. */
+static void raid_tag_death(void)
+{
+    if (g_raid_state != RAID_TIMEOUT && g_raid_state != RAID_EXTRACTED)
+        g_raid_state = RAID_DIED;
+}
+
 static fx fx_clamp(fx v, fx lo, fx hi) { return v < lo ? lo : (v > hi ? hi : v); }
 static fx dirx(i32 h) { return fx_sin(h & G3D_ANG_MASK); }
 static fx dirz(i32 h) { return fx_cos(h & G3D_ANG_MASK); }
@@ -518,6 +529,20 @@ static void hurt_zombie(int i, int dmg)
 /* ====================================================================== *
  *  Input -> movement
  * ====================================================================== */
+/* Advance the per-shot cosmetic timers one sim-step: recoil decay, muzzle flash,
+ * fire cooldown, and reload completion. Shared by single-player player_step AND
+ * the MP loop (where player_step is gated off but these must still advance, or
+ * the muzzle flash / fire cooldown freeze after the first co-op shot). */
+static void decay_timers(void)
+{
+    if (g_recoil > 0) g_recoil = fx_mul(g_recoil, fx_ratio(80,100));
+    if (g_muzzle > 0) g_muzzle--;
+    if (g_fire_cd > 0) g_fire_cd--;
+    if (g_reload > 0) { g_reload--; if (g_reload == 0) {
+        int need = g_mag_size - g_mag; if (need > g_ammo) need = g_ammo;
+        g_mag += need; g_ammo -= need; } }
+}
+
 static void player_step(void)
 {
     if (!g_alive) return;
@@ -540,17 +565,12 @@ static void player_step(void)
     g_px = fx_clamp(nx, -lim, lim);
     g_pz = fx_clamp(nz, -lim, lim);
 
-    if (g_recoil > 0) g_recoil = fx_mul(g_recoil, fx_ratio(80,100));
-    if (g_muzzle > 0) g_muzzle--;
-    if (g_fire_cd > 0) g_fire_cd--;
-    if (g_reload > 0) { g_reload--; if (g_reload == 0) {
-        int need = g_mag_size - g_mag; if (need > g_ammo) need = g_ammo;
-        g_mag += need; g_ammo -= need; } }
+    decay_timers();
 }
 
 static void try_shoot(void)
 {
-    if (!g_alive || g_fire_cd > 0 || g_reload > 0) return;
+    if (!g_alive || g_over || g_fire_cd > 0 || g_reload > 0) return;   /* MP-WIN-FIX: no fire after a concluded raid */
     if (g_mag <= 0) { if (g_ammo > 0) g_reload = g_reload_steps; return; }
     g_mag--; g_fire_cd = FIRE_COOLDN; g_recoil = fx_ratio(6,100); g_muzzle = 3;
     audio_trigger(0);                                    /* gunshot SFX */
@@ -872,7 +892,10 @@ static void draw_hud(wl_window *win, int tw, int th)
     fill_rect(px,stride,tw,th, bx,by,hpw,bh, hpc);
     font_draw_string(px,stride,tw,th, bx+4,by, g_alive?"HP":"DEAD", 0xFFFFFFFFu);
 
-    /* weapon durability bar (below HP) */
+    /* weapon durability bar + armor/scrap readout. SP raid-economy values; in
+     * server-authoritative co-op they're frozen/meaningless, so hide them in MP
+     * (matches the RAID-timer !g_mp_on gate below). */
+    if (!g_mp_on) {
     int dby=by+bh+6, dbw=140, dbh=8;
     fill_rect(px,stride,tw,th, bx-2,dby-2,dbw+4,dbh+4, 0xFF000000u);
     fill_rect(px,stride,tw,th, bx,dby,dbw,dbh, 0xFF333A44u);
@@ -886,6 +909,7 @@ static void draw_hud(wl_window *win, int tw, int th)
       const char *sl="  SCRAP "; int mm=0; while(sl[mm]){lbl[p++]=sl[mm++];}
       num_to_str(b2,g_scrap); kk=0; while(b2[kk]){lbl[p++]=b2[kk++];} lbl[p]=0;
       font_draw_string(px,stride,tw,th, bx, dby+dbh+6, lbl, 0xFFBFC7D2u); }
+    }
 
     /* ammo bottom-right */
     n=0; const char *al="AMMO "; while(al[n]){lbl[n]=al[n];n++;}
@@ -902,8 +926,11 @@ static void draw_hud(wl_window *win, int tw, int th)
     num_to_str(buf, g_kills); k=0; while(buf[k]){lbl[n++]=buf[k++];} lbl[n]=0;
     font_draw_string(px,stride,tw,th, tw-12-(int)k_strlen(lbl)*FONT_W, 14, lbl, 0xFFFFFFFFu);
 
-    /* RAID timer (mm:ss) + SECURED(stash) / RISK(unsecured bag), top-center */
-    {
+    /* RAID timer (mm:ss) + SECURED(stash) / RISK(unsecured bag), top-center.
+     * MP-OVER-FIX (part 2): SP-only -- in server-authoritative co-op the local
+     * raid clock is frozen + the stash/bag are meaningless, so hide them (matches
+     * the game-over overlay's !g_mp_on gate below). */
+    if (!g_mp_on) {
         int secs = (g_raid_timer * STEP_MS) / 1000, mins = secs / 60; secs %= 60;
         n=0; const char *rl="RAID "; while(rl[n]){lbl[n]=rl[n];n++;}
         num_to_str(buf, mins); k=0; while(buf[k]){lbl[n++]=buf[k++];}
@@ -940,7 +967,7 @@ static void draw_hud(wl_window *win, int tw, int th)
                      "WASD move  MOUSE/A-D look(arrows)  LMB/SPACE fire  R reload  ESC quit",
                      0xFFAAB2BFu);
 
-    if (g_over) {
+    if (g_over && !g_mp_on) {   /* MP-OVER-FIX: the SP conclusion screen never bleeds into co-op */
         const char *msg; u32 mc;
         if      (g_raid_state == RAID_EXTRACTED) { msg="EXTRACTED -  Press R"; mc=0xFF3CCB5Au; } /* green */
         else if (g_raid_state == RAID_TIMEOUT)   { msg="TIME UP -  Press R";   mc=0xFFE9C46Au; } /* amber */
@@ -1155,12 +1182,22 @@ static void audio_step(void){
         aud_voice saved[AUD_VOICES];
         for (int i=0;i<AUD_VOICES;i++) saved[i] = g_av[i];
         audio_mix();
-        long n = sc(SYS_AUDIO_STREAM_WRITE, (long)g_aud_buf, (long)sizeof(g_aud_buf), 0,0,0,0);
-        if (n == AUD_EAGAIN){
-            for (int i=0;i<AUD_VOICES;i++) g_av[i] = saved[i];   /* undo advance */
-            break;
+        /* AUDIO-PARTIAL-FIX: SYS_AUDIO_STREAM_WRITE is byte-granular + (now) frame-
+         * aligned, so a SHORT accept means the ring filled mid-chunk. Advance an
+         * offset by what was accepted (never re-send the accepted prefix), and only
+         * REWIND the voices when NOTHING was accepted (ring full at the chunk start)
+         * so the common case has no waveform gap. */
+        long want = (long)sizeof(g_aud_buf), off = 0;
+        for (;;) {
+            long n = sc(SYS_AUDIO_STREAM_WRITE, (long)((char*)g_aud_buf + off),
+                        want - off, 0,0,0,0);
+            if (n < 0 && n != AUD_EAGAIN){ g_audio_off = 1; return; }   /* no device */
+            if (n > 0) off += n;                 /* kernel returns a frame-aligned count */
+            if (off >= want) break;              /* whole chunk emitted */
+            if (off == 0)                        /* ring full at start -> rewind, retry next frame */
+                for (int i=0;i<AUD_VOICES;i++) g_av[i] = saved[i];
+            return;                              /* ring is full; stop feeding this frame */
         }
-        if (n < 0){ g_audio_off = 1; break; }
         g_aud_streamed++;
     }
 }
@@ -1212,17 +1249,28 @@ static void raid_selftest(void)
     g_pickup[0].count=5; g_pickup[0].alive=1; g_pickup[0].bob=0;
     pickups_step();
     g_hp=0; g_alive=0;
-    if (g_raid_state==RAID_ACTIVE) g_raid_state=RAID_DIED;  /* mirror the loss-latch tag */
+    /* RAID-FIX proof: enter the extraction channel FIRST, so this proves a death
+     * MID-EXTRACTION is tagged DIED (not left stuck at RAID_EXTRACTING -> the stale
+     * "EXTRACTING..." banner bug). raid_tag_death() is the REAL loss-latch logic. */
+    g_raid_state = RAID_EXTRACTING;
+    raid_tag_death();
     int died = (g_raid_state==RAID_DIED) ? 1 : 0;
     int lost = (g_stash[ITEM_SCRAP]==stash_before) ? 1 : 0; /* bag (5) NOT secured */
 
-    int ok = bagged && extracted && kept && died && lost;
+    /* raid_tag_death must PRESERVE an already-terminal TIMEOUT/EXTRACTED tag (only a
+     * non-terminal state becomes DIED) -- else a win/timeout would relabel a death. */
+    g_raid_state = RAID_TIMEOUT;   raid_tag_death(); int keepT = (g_raid_state==RAID_TIMEOUT)   ? 1 : 0;
+    g_raid_state = RAID_EXTRACTED; raid_tag_death(); int keepX = (g_raid_state==RAID_EXTRACTED) ? 1 : 0;
+
+    int ok = bagged && extracted && kept && died && lost && keepT && keepX;
     print("DEADZONE: raid "); print(ok?"PASS":"FAIL");
     print(" bagged=");    num_to_str(nb,bagged);    print(nb);
     print(" extracted="); num_to_str(nb,extracted); print(nb);
     print(" kept=");      num_to_str(nb,kept);      print(nb);
     print(" died=");      num_to_str(nb,died);      print(nb);
     print(" lost=");      num_to_str(nb,lost);      print(nb);
+    print(" keepT=");     num_to_str(nb,keepT);     print(nb);
+    print(" keepX=");     num_to_str(nb,keepX);     print(nb);
     print("\n");
 
     for (int i=0;i<N_ITEM_TYPES;i++) g_stash[i]=save_stash[i];   /* restore persistent stash */
@@ -1389,13 +1437,20 @@ static int mp_poll_snapshot(dz_client *c, dz_snapshot_t *out)
 static dz_client     g_mpc;          /* the live connection                   */
 static dz_snapshot_t g_snap;         /* latest authoritative snapshot         */
 static u64           g_mp_last_send; /* ms of last input send (send cadence)  */
+static int           g_mp_send_steps;/* sim-steps elapsed since last send (MP-SPEED-FIX) */
 
 /* The server world is [0..DZ_SRV_ARENA] (centre DZ_SRV_ARENA/2) on both axes;
  * the game uses fx centred at 0 spanning +-ARENA_HALF_I. i64 intermediates =>
  * no overflow even at the arena edge (|w-centre|*fx(28) ~ 9.2e9 > i32). */
 #define DZ_SRV_ARENA  10000
 static fx  wire_to_fx(dz_i32 w) {
-    g3d_i64 num = (g3d_i64)(w - DZ_SRV_ARENA/2) * (g3d_i64)fx_from_int(2*ARENA_HALF_I);
+    /* COORD-FIX: clamp the untrusted server coord to the arena BEFORE converting --
+     * a corrupt/malicious snapshot can't teleport us out of bounds, and the centring
+     * is done in 64-bit so a pathological w (near INT_MIN) can't signed-overflow.
+     * Legit server coords are always in [0,DZ_SRV_ARENA], so this is a no-op for
+     * normal play. */
+    if (w < 0) w = 0; else if (w > DZ_SRV_ARENA) w = DZ_SRV_ARENA;
+    g3d_i64 num = ((g3d_i64)w - DZ_SRV_ARENA/2) * (g3d_i64)fx_from_int(2*ARENA_HALF_I);
     return (fx)(num / DZ_SRV_ARENA);
 }
 static dz_i32 fx_to_wire(fx d) {     /* a per-frame DELTA (no centring)        */
@@ -1432,10 +1487,16 @@ static void mp_apply_snapshot(void)
     }
 }
 
-/* Translate the currently-held inputs into a server-wire move intent + fire bit
- * and send it. Mirrors player_step's forward/right basis. Returns 0 / negative. */
-static int mp_pump_input(void)
+/* Compute the wire-space move intent for `nsteps` sim-steps from the held inputs
+ * (no send). Mirrors player_step's forward/right basis. MP-SPEED-FIX: scale the
+ * per-step displacement by the sim-steps elapsed since the last send, so movement
+ * is frame-rate-INDEPENDENT and approximates SP speed (the server clamps each axis
+ * to PLAYER_SPEED; at very high AGI / a multi-step stall a diagonal step may clip
+ * slightly, bounded). Factored out of mp_pump_input so the nsteps scaling is
+ * headlessly testable (mp_selftest). */
+static void mp_move_wire(int nsteps, dz_i32 *out_wx, dz_i32 *out_wz)
 {
+    if (nsteps < 1) nsteps = 1;
     fx fdx = dirx(g_yaw), fdz = dirz(g_yaw);          /* forward */
     fx rdx = dirz(g_yaw), rdz = -dirx(g_yaw);         /* right   */
     fx mf = 0, ms = 0;
@@ -1445,8 +1506,17 @@ static int mp_pump_input(void)
     if (g_hold_left) ms = fx_sub(ms,  g_move_spd);
     fx wdx = fx_add(fx_mul(fdx, mf), fx_mul(rdx, ms));
     fx wdz = fx_add(fx_mul(fdz, mf), fx_mul(rdz, ms));
+    *out_wx = fx_to_wire(wdx) * nsteps;
+    *out_wz = fx_to_wire(wdz) * nsteps;
+}
+
+/* Translate the held inputs into a server-wire move + fire bit and send it.
+ * Returns 0 / negative. */
+static int mp_pump_input(int nsteps)
+{
+    dz_i32 wx, wz; mp_move_wire(nsteps, &wx, &wz);
     dz_u32 btn = g_shoot_held ? DZ_BTN_FIRE : 0u;
-    return mp_send_input(&g_mpc, fx_to_wire(wdx), fx_to_wire(wdz), (dz_u32)g_yaw, btn);
+    return mp_send_input(&g_mpc, wx, wz, (dz_u32)g_yaw, btn);
 }
 
 /* Connect to the local server (loopback 127.0.0.1, host-ordered like dzclient).
@@ -1457,7 +1527,18 @@ static void mp_game_connect(void)
     g_ui_mode = 0;                                   /* drop the menu, show play */
     if (mp_connect(&g_mpc, 0x7F000001u, DZ_GAME_PORT) != 0) { g_mp_on = 0; return; }
     g_my_slot = (int)g_mpc.slot;
-    g_mp_last_send = 0; g_mp_on = 1;
+    g_mp_last_send = 0; g_mp_send_steps = 0; g_mp_on = 1;
+    /* MP-OVER-FIX: clear any single-player conclusion latch so a prior SP death/
+     * timeout/extraction can't bleed its game-over overlay over the live session. */
+    g_over = 0; g_alive = 1; g_raid_state = RAID_ACTIVE;
+    /* MP-JOIN-FIX: also blank the local render world so the frame(s) before the
+     * first server snapshot don't show the stale single-player world (old position/
+     * zombies/kills, or an empty bar still labelled "HP" after joining from an SP
+     * death where g_hp==0). mp_apply_snapshot overwrites these once a snap arrives. */
+    g_hp = g_hp_max; g_kills = 0; g_wave = 0; g_px = 0; g_pz = 0;
+    for (int i = 0; i < MAX_Z; i++) g_z[i].alive = 0;
+    for (int i = 0; i < MAX_PICKUPS; i++) g_pickup[i].alive = 0;   /* clear stale SP ground loot (drawn ungated) */
+    for (int i = 0; i < N_ITEM_TYPES; i++) g_raid_bag[i] = 0;      /* + the stale unsecured bag */
     for (int i = 0; i < DZP_MAX_CLIENTS; i++) g_ron[i] = 0;
     print("DEADZONE: mp connected\n");
 }
@@ -1509,6 +1590,31 @@ static void mp_selftest(void)
     if (wire_to_fx(DZ_SRV_ARENA/2) != 0 || wire_to_fx(0) >= 0
         || wire_to_fx(DZ_SRV_ARENA) <= 0 || fx_to_wire(fx_from_int(1)) <= 0) {
         print("DEADZONE: mp FAIL coord\n"); return;
+    }
+
+    /* COORD-FIX: an out-of-arena (corrupt/hostile) server coord must CLAMP to the
+     * arena edge, not signed-overflow into a garbage world position. */
+    if (wire_to_fx(99999) != wire_to_fx(DZ_SRV_ARENA)
+        || wire_to_fx(-99999) != wire_to_fx(0)) {
+        print("DEADZONE: mp FAIL coord_clamp\n"); return;
+    }
+
+    /* MP-SPEED-FIX: the wire move intent scales LINEARLY with sim-steps (frame-rate
+     * independence). Use a ~45-degree yaw so BOTH axes are non-zero (a per-axis
+     * scaling regression can't hide on a zero axis) and check the nsteps<1 clamp.
+     * Exercises the real mp_move_wire path (no harness drives the live GUI send). */
+    {
+        int s_fwd = g_hold_fwd; i32 s_yaw = g_yaw;
+        g_hold_fwd = 1; g_yaw = G3D_ANG_STEPS / 8;        /* dirx,dirz both != 0 */
+        dz_i32 wx0, wz0, wx1, wz1, wx2, wz2;
+        mp_move_wire(0, &wx0, &wz0);                       /* nsteps<1 -> clamps to 1 */
+        mp_move_wire(1, &wx1, &wz1);
+        mp_move_wire(2, &wx2, &wz2);
+        int ok = (wx1 != 0) && (wz1 != 0)                 /* both axes move */
+              && (wx0 == wx1) && (wz0 == wz1)             /* nsteps<1 clamp */
+              && (wx2 == 2 * wx1) && (wz2 == 2 * wz1);    /* linear in nsteps */
+        g_hold_fwd = s_fwd; g_yaw = s_yaw;
+        if (!ok) { print("DEADZONE: mp FAIL speed_scale\n"); return; }
     }
 
     print("DEADZONE: mp PASS (dzproto client wire ok)\n");
@@ -1601,7 +1707,7 @@ void _start(void)
                     g_raid_state = RAID_TIMEOUT; g_alive = 0;
                 }
                 if (!g_alive && !g_over) {
-                    if (g_raid_state == RAID_ACTIVE) g_raid_state = RAID_DIED;  /* death (timeout set above) */
+                    raid_tag_death();   /* RAID-FIX: DIED unless already TIMEOUT/EXTRACTED */
                     g_over = 1;
                     char b1[24], b2[24]; num_to_str(b1,g_wave); num_to_str(b2,g_kills);
                     print("[DEADZONE] over wave "); print(b1); print(" kills "); print(b2); print("\n");
@@ -1613,9 +1719,15 @@ void _start(void)
          * input at ~30 Hz, then apply the freshest authoritative snapshot.
          * A send failure (peer gone) drops us cleanly back to single-player. */
         if (g_mp_on) {
+            g_mp_send_steps += steps;                 /* accumulate elapsed sim-steps */
+            /* MP-FEEDBACK-FIX: the local sim (which decays these) is gated off in
+             * MP, so advance the cosmetic shoot timers here -- else the muzzle flash
+             * sticks ON and the fire cooldown freezes after the first co-op shot. */
+            for (int s = 0; s < steps; s++) decay_timers();
             if (now - g_mp_last_send >= 33) {
-                if (mp_pump_input() != 0) mp_game_disconnect();
-                else g_mp_last_send = now;
+                int ns = g_mp_send_steps > 0 ? g_mp_send_steps : 1;
+                if (mp_pump_input(ns) != 0) mp_game_disconnect();
+                else { g_mp_last_send = now; g_mp_send_steps = 0; }
             }
             if (g_mp_on && mp_poll_snapshot(&g_mpc, &g_snap)) mp_apply_snapshot();
         }

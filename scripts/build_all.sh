@@ -73,6 +73,20 @@ if [ "${DZ_GAMETEST:-0}" = "1" ]; then
     INIT_EXTRA="$INIT_EXTRA -DDZ_GAMETEST"
     echo "*** DZ_GAMETEST build: init spawns sbin/deadzone (selftest proof) ***"
 fi
+# DZ_SRVTEST=1 adds -DDZ_SRVTEST so init runs `deadzoned -t` (the authoritative
+# server self-test, which also proves inactive slots serialize as DZ_SLOT_EMPTY --
+# the MP phantom-teammate fix) and waits for it. Unset => normal boot unchanged.
+if [ "${DZ_SRVTEST:-0}" = "1" ]; then
+    INIT_EXTRA="$INIT_EXTRA -DDZ_SRVTEST"
+    echo "*** DZ_SRVTEST build: init runs deadzoned -t (phantom-slot proof) ***"
+fi
+# EX_ARGV_PROBE=1 adds -DEX_ARGV_PROBE so init spawns argvtest via SYS_SPAWN_EX_ARGV
+# with a spaced argv[1] -- proves the compositor's project-icon spawn ABI delivers a
+# path containing a space intact (no whitespace split). Unset => normal boot unchanged.
+if [ "${EX_ARGV_PROBE:-0}" = "1" ]; then
+    INIT_EXTRA="$INIT_EXTRA -DEX_ARGV_PROBE"
+    echo "*** EX_ARGV_PROBE build: init spawns argvtest via SYS_SPAWN_EX_ARGV (spaced-argv proof) ***"
+fi
 # TASKMAN_TEST=1 adds -DTASKMAN_TEST so init spawns sbin/taskman, which emits
 # [TASKMAN] starting + [TASKMAN] N procs (the TRUE live process count via
 # SYS_PROCLIST) -- proving the task manager reads real kernel data. Unset =>

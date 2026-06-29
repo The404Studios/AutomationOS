@@ -10,6 +10,7 @@ typedef unsigned long size_t;
 #define SYS_GETPID  8
 #define SYS_SLEEP   9
 #define SYS_SPAWN   16
+#define SYS_SPAWN_EX_ARGV 106
 #define SYS_WAITPID 6
 #define SYS_YIELD   15
 #define SYS_SHMGET  18
@@ -31,6 +32,16 @@ static inline long syscall(long n, long a1, long a2, long a3) {
         : "rcx", "r11", "memory"
     );
     return ret;
+}
+
+/* 6-arg syscall (r10/r8/r9 = a4/a5/a6) -- for SYS_SPAWN_EX_ARGV's stdio handles. */
+static inline long sc6(long n, long a1, long a2, long a3, long a4, long a5, long a6) {
+    long r;
+    register long r10 asm("r10") = a4, r8 asm("r8") = a5, r9 asm("r9") = a6;
+    asm volatile("syscall" : "=a"(r)
+                 : "a"(n), "D"(a1), "S"(a2), "d"(a3), "r"(r10), "r"(r8), "r"(r9)
+                 : "rcx", "r11", "memory");
+    return r;
 }
 
 static size_t strlen(const char* s) {
@@ -65,6 +76,18 @@ static int spawn(const char* path) {
 static int spawn_args(const char* path, const char* args) {
     int pid = (int)syscall(SYS_SPAWN, (long)path, (long)args, 0);
     if (pid < 0) { print("[INIT] Spawn failed for "); print(path); print("\n"); }
+    return pid;
+}
+
+/* Spawn with a SINGLE argv[1] entry via the explicit-vector ABI (NUL-separated
+ * byte buffer + byte length + explicit stdio=0) -- the convention the compositor's
+ * project-icon double-click uses, so a path containing a space survives intact. */
+static int spawn_ex_argv1(const char* path, const char* arg) {
+    char buf[256]; int n = 0;
+    for (const char* p = arg; *p && n < (int)sizeof(buf) - 1; ) buf[n++] = *p++;
+    buf[n++] = '\0';
+    int pid = (int)sc6(SYS_SPAWN_EX_ARGV, (long)path, (long)buf, (long)n, 0, 0, 0);
+    if (pid < 0) { print("[INIT] spawn_ex_argv1 failed for "); print(path); print("\n"); }
     return pid;
 }
 
@@ -301,6 +324,18 @@ void _start(void) {
     // (prints ARGVTEST: PASS with argv[0] = its spawn path).
     print("[INIT] Spawning argvtest...\n");
     spawn_args("sbin/argvtest", "hello world");
+
+#ifdef EX_ARGV_PROBE
+    /* EX_ARGV_PROBE=1: prove the compositor's project-icon spawn convention --
+     * SYS_SPAWN_EX_ARGV delivers a single argv[1] with embedded spaces INTACT (no
+     * whitespace split, unlike the legacy spawn_args above). Spawn argvtest with a
+     * spaced path + wait; the harness asserts the contiguous "My Game" survives. */
+    print("[INIT] EX_ARGV_PROBE: spawn argvtest via SYS_SPAWN_EX_ARGV (spaced argv[1])...\n");
+    {
+        int pid = spawn_ex_argv1("sbin/argvtest", "/Desktop/Projects/My Game");
+        if (pid > 0) { int st = 0; syscall(SYS_WAITPID, pid, (long)&st, 0); }
+    }
+#endif
 
     // CHANNEL-0 P5b: userspace CH_MSG send/recv round-trip. The parent creates a
     // CH_MSG channel, proves EAGAIN+EMSGSIZE, self-spawns a bound child, and
@@ -659,6 +694,17 @@ void _start(void) {
      * drives the runtime project-load + prebuilt-gate path and emits the
      * headless proof markers ([IDE] project active / [IDE] prebuilt probe). */
     spawn_args("sbin/ide", "/Desktop/Projects/DeadZone");
+#endif
+
+#ifdef DZ_SRVTEST
+    /* DZ_SRVTEST=1: run the authoritative server's headless self-test (which now
+     * also proves inactive slots serialize as DZ_SLOT_EMPTY -- the MP phantom-
+     * teammate fix) and WAIT for it so the boot storm can't starve it. */
+    print("[INIT] DZ_SRVTEST: running deadzoned -t...\n");
+    {
+        int srv = spawn_args("sbin/deadzoned", "-t");
+        if (srv > 0) { int st = 0; syscall(SYS_WAITPID, srv, (long)&st, 0); }
+    }
 #endif
 
 #ifdef SHOWCASE

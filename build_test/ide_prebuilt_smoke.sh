@@ -39,13 +39,17 @@ fi
 echo ""
 echo "=== compositor DI_PROJECT -> sbin/ide wiring (static, fail-closed) ==="
 # AUDIT-9: the desktop project icon must open the IDE (not the file manager).
-# The GUI double-click is QEMU-visual, but a refactor dropping the wiring must
-# not pass silently -- assert the DI_PROJECT branch spawns sbin/ide.
+# The GUI double-click is QEMU-visual, but a refactor dropping/breaking the wiring
+# must not pass silently. Pin the EXACT EX_ARGV call shape (opcode + path + buffer +
+# length args): a bare 'sbin/ide' string grep is blind to a wrong syscall/arg order
+# (the class of bug a prior audit found here), so assert the sc6(SYS_SPAWN_EX_ARGV,..)
+# call itself -- a revert to plain SYS_SPAWN or swapped buf/len args now FAILS.
 if grep -q 'di->kind == DI_PROJECT' userspace/compositor/compositor_m8.c && \
-   grep -A8 'di->kind == DI_PROJECT' userspace/compositor/compositor_m8.c | grep -q 'sbin/ide'; then
-  echo "  [OK] DI_PROJECT double-click spawns sbin/ide"
+   grep -A8 'di->kind == DI_PROJECT' userspace/compositor/compositor_m8.c \
+     | grep -q 'sc6(SYS_SPAWN_EX_ARGV, (long)"sbin/ide", (long)ide_av, (long)ide_n'; then
+  echo "  [OK] DI_PROJECT double-click spawns sbin/ide via SYS_SPAWN_EX_ARGV (buf+len)"
 else
-  echo "  [FAIL] DI_PROJECT no longer spawns sbin/ide"; exit 1
+  echo "  [FAIL] DI_PROJECT EX_ARGV spawn wiring missing/changed"; exit 1
 fi
 
 echo ""

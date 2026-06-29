@@ -289,7 +289,14 @@ static const char* sem_absent_name(const Func* f, PortType type)
         if (f->ports[i].status == PS_ABSENT && f->ports[i].type == type)
             return f->ports[i].name;
     }
-    return "gate";
+    /* MAP-HONESTY: the absent gate may have overflowed the 16-slot ports[] store
+     * (its INTENT survives in Func.wants_*), so the scan above misses it. Return
+     * the canonical name by type -- matching the literals sem_build_ports passes
+     * to sem_add_port -- so a real hub's labels stay honest instead of the generic
+     * "gate" fallback (the residual cap artifact from the map-honesty brick). */
+    return type == PORT_LIFECYCLE    ? "claim_slot"
+         : type == PORT_CONTROL_GATE ? "cooldown_gate"
+         : "gate";
 }
 
 /*

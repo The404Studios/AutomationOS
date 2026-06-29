@@ -111,6 +111,7 @@ typedef long                int64_t;    /* match <stdint.h> __INT64_TYPE__  (LP6
 #define SYS_YIELD         15
 #define SYS_SLEEP          9      /* blocking ms sleep (frees the CPU for clients) */
 #define SYS_SPAWN         16
+#define SYS_SPAWN_EX_ARGV 106   /* spawn with a NUL-split argv vector (spaces survive) */
 #define SYS_SHMAT         19
 #define SYS_SHMDT         20
 #define SYS_SHMCTL        21
@@ -5302,11 +5303,13 @@ static int desk_handle_click(int32_t cx, int32_t cy, uint32_t W, uint32_t H, lon
      * (truncated) display label. Dispatch by kind: folders/projects open in the
      * file manager at their real directory; apps/files are spawned directly. */
     if (di->kind == DI_PROJECT) {
-        /* AUDIT-9: a project folder opens IN the IDE, with its root passed as
-         * argv[1] (kernel splits the args string -> argv[1]=di->path). If the
-         * IDE fails to spawn, fall back to the file manager so the icon is
-         * never a dead end. */
-        long r = syscall(SYS_SPAWN, (long)"sbin/ide", (long)di->path, 0);
+        /* AUDIT-9 + IDE-PATH-FIX: open a project folder IN the IDE with its root as
+         * argv[1] via SYS_SPAWN_EX_ARGV (NUL-separated argv buffer + byte length +
+         * sc6 stdio=0) so a name with a space survives exec's NUL-only split. */
+        char ide_av[256]; int ide_n = 0;
+        for (const char *pp = di->path; *pp && ide_n < (int)sizeof(ide_av) - 1; ) ide_av[ide_n++] = *pp++;
+        ide_av[ide_n++] = '\0';                 /* one NUL-terminated argv[1] entry */
+        long r = sc6(SYS_SPAWN_EX_ARGV, (long)"sbin/ide", (long)ide_av, (long)ide_n, 0, 0, 0);
         print("[SHELL] desktop ide "); print(di->path);
         if (r < 0) {
             print(" (ide spawn fail r="); print_num(r); print(" -> filemanager)");

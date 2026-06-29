@@ -491,6 +491,9 @@ int audio_stream_write(const void* data, uint32_t len) {
     uint32_t count = (tail - head + HDA_RING_SIZE) % HDA_RING_SIZE;
     uint32_t freeb = (HDA_RING_SIZE - 1) - count; /* reserve 1 (full vs empty) */
     uint32_t n = (len < freeb) ? len : freeb;     /* BACK-PRESSURE: partial   */
+    n &= ~3u;   /* AUDIO-PARTIAL-FIX: keep the accepted count a whole 4-byte stereo
+                 * frame so ring_tail never lands mid-frame -- a non-frame-aligned
+                 * partial would permanently shift L/R for the rest of the stream */
     for (uint32_t i = 0; i < n; i++) {
         s->ring[tail] = src[i];
         tail++; if (tail >= HDA_RING_SIZE) tail = 0;

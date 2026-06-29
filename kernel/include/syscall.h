@@ -143,6 +143,31 @@
 #define SYS_AUDIO_TEST      122 // play a test tone (arg1=freq Hz, arg2=ms, ms capped)
 #define SYS_AUDIO_STATUS    123 // fill user audio_status_t {present,volume,muted,_pad,codec_vendor}
 #define SYS_WLAN_DIAG       124 // radio bring-up diagnostics (uapi_wlan_diag_t) -- moved off 118
+
+// A4 (SOCKET-PARITY-0): BSD socket options + half-close (kernel/net/socket.c)
+#define SYS_SETSOCKOPT      125 // sys_sock_setsockopt(s, level, optname, optval, optlen)
+#define SYS_GETSOCKOPT      126 // sys_sock_getsockopt(s, level, optname, optval, optlen)
+#define SYS_SHUTDOWN        127 // sys_sock_shutdown(s, how)  how=SHUT_RD|SHUT_WR|SHUT_RDWR
+
+// =============================================================================
+// Wave 0 SYSCALL-LEDGER (docs/ORIGINALITY_5X_CHARTER.md §4). A single fixed,
+// disjoint reservation so the net/sound/system/driver roadmap bricks never
+// collide on a syscall number -- the d5c9e05 "last-writer-wins" class of bug
+// (slot 128 was being quadruple-booked; one design even reclaimed live 124/125).
+// Numbers are RESERVED here; each brick wires its handler in syscall.c WHEN it
+// lands. Until then the slot has no registered handler and returns ENOTSUP,
+// exactly like SYS_AUDIO_OUTPUTS=120/SELECT=121. Adding these #defines does NOT
+// change any compiled code -> the kernel stays byte-identical. 136-140 spare.
+// =============================================================================
+#define SYS_AUDIO_STREAM_WRITE 128 // RESERVED: AUDIO-MIXER  (per-stream PCM write)
+#define SYS_AUDIO_STREAM_GAIN  129 // RESERVED: AUDIO-MIXER  (per-stream/master gain)
+#define SYS_AUDIO_RECORD       130 // RESERVED: AUDIO-FMT-CAPTURE (mic capture)
+#define SYS_SOCK_LIST          131 // RESERVED: NET-RESILIENCE-OBS (netstat/ss)
+#define SYS_PTY_SPAWN          132 // RESERVED: TERMINAL (/dev/ptmx + /bin/sh)
+#define SYS_CFG_GET            133 // RESERVED: CONFIG-STORE (durable config get)
+#define SYS_CFG_SET            134 // RESERVED: CONFIG-STORE (durable config set)
+#define SYS_DEVTREE            135 // RESERVED: DRIVER-FW (device-tree introspection)
+
 #define SYS_VMA_TEST    200 // VMA red-black tree testing and benchmarking
 
 // ---- SMP coprocessor offload (GATED: only registered under SMP_FOUNDATION) ----

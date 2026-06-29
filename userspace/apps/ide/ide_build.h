@@ -17,6 +17,10 @@
 void ide_do_build(Ide* a);
 /* Spawn the most recently built ELF (no-op message if nothing built / failed). */
 void ide_do_run(Ide* a);
+/* AUDIT-9 headless proof hook: run the EXACT prebuilt gate (ide_build_prebuilt)
+ * at runtime and emit a fail-closed serial verdict. Called once from init()
+ * after a project loads. Does NOT mark a build as present (Run still needs B). */
+void ide_prebuilt_probe(Ide* a);
 /* Poll for child exit (non-blocking WNOHANG). Returns 1 if state changed. */
 int  ide_run_poll(void);
 /* Render the BUILD panel into Rect r of cv. */

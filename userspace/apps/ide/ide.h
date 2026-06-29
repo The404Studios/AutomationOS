@@ -249,6 +249,8 @@ int  gen_apply_action(Ide* a, int idx);
 /* ---- helpers ide.c provides for panels (selection plumbing) ---- */
 /* Load file `path` into a->src, set cur_file, re-parse+re-analyze, focus 0. */
 void ide_open_file(Ide* a, const char* path);
+/* IDE-XFILE-0: rebuild the whole-directory model (used by open, Build, and Save #7). */
+void ide_parse_project_model(Ide* a);
 /* Re-scan the project tree and reveal `dir` (the build folder), auto-selecting
  * `sel_path` (the produced ELF) if present. Used after a successful build so the
  * artifact is visible + openable in the explorer. (ide.c) */

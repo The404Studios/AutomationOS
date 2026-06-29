@@ -105,6 +105,39 @@ static int64_t sys_audio_status(uint64_t user_ptr, uint64_t arg2, uint64_t arg3,
     return 0;
 }
 
+#ifdef HDA_ENABLE
+/* SYS_AUDIO_STREAM_WRITE=128 (AUDIO B1 part-2): push userspace PCM into the HDA
+ * streaming ring (S16_LE stereo @ the device rate). The on_bcis refill drains it
+ * into the DMA -- see audio_tone.c. NON-BLOCKING: copies in <=stage-sized bites,
+ * stops on the first short accept (ring full), returns bytes accepted (>=0) or a
+ * negative errno; never spins (the producer runs IF=0 -- a wait would deadlock
+ * the IRQ that drains the ring). Gated so the default kernel leaves slot 128
+ * NULL -> ENOTSUP (byte-identical). */
+extern int audio_stream_write(const void* data, uint32_t len);
+static int64_t sys_audio_stream_write(uint64_t user_ptr, uint64_t len,
+                                      uint64_t arg3, uint64_t arg4,
+                                      uint64_t arg5, uint64_t arg6) {
+    (void)arg3; (void)arg4; (void)arg5; (void)arg6;
+    if (user_ptr == 0 || len == 0) return EINVAL;
+    if (len > (1u << 20)) len = (1u << 20);          /* cap one call at 1 MiB */
+    static uint8_t stage[4096];                      /* bounded; IF=0 = no reentry */
+    uint64_t done = 0;
+    while (done < len) {
+        uint64_t chunk = len - done;
+        if (chunk > sizeof(stage)) chunk = sizeof(stage);
+        if (copy_from_user(stage, (const void*)(user_ptr + done),
+                           (size_t)chunk) != COPY_SUCCESS)
+            return done ? (int64_t)done : EFAULT;
+        int n = audio_stream_write(stage, (uint32_t)chunk);
+        if (n < 0)  return done ? (int64_t)done : ENODEV;
+        done += (uint64_t)n;
+        if ((uint32_t)n < chunk) break;              /* ring full -> stop (non-blocking) */
+    }
+    if (done == 0) return EAGAIN;                     /* full, nothing accepted */
+    return (int64_t)done;
+}
+#endif /* HDA_ENABLE */
+
 /* sys_poweroff / sys_reboot live in handlers.c (canonical definitions).
  * Removed duplicates that were here -- the syscall_table entries below
  * reference the handlers.c versions via the header declarations. */
@@ -191,6 +224,12 @@ void syscall_init(void) {
     syscall_table[SYS_AUDIO_MUTE]   = sys_audio_mute;
     syscall_table[SYS_AUDIO_TEST]   = sys_audio_test;
     syscall_table[SYS_AUDIO_STATUS] = sys_audio_status;
+#ifdef HDA_ENABLE
+    /* AUDIO B1 part-2: per-stream PCM write (ledger slot 128). Gated so the
+     * DEFAULT kernel leaves slot 128 NULL -> dispatch returns ENOTSUP, keeping
+     * the default kernel byte-identical. */
+    syscall_table[SYS_AUDIO_STREAM_WRITE] = sys_audio_stream_write;
+#endif
 
     // Power management: ACPI poweroff (S5) and reboot
     syscall_table[SYS_POWEROFF] = sys_poweroff;
@@ -251,6 +290,20 @@ void syscall_init(void) {
     syscall_table[SYS_BIND]      = (syscall_handler_t)sys_sock_bind;
     syscall_table[SYS_LISTEN]    = (syscall_handler_t)sys_sock_listen;
     syscall_table[SYS_ACCEPT]    = (syscall_handler_t)sys_sock_accept;
+    // A4 (SOCKET-PARITY-0): setsockopt/getsockopt + shutdown half-close
+    syscall_table[SYS_SETSOCKOPT] = (syscall_handler_t)sys_sock_setsockopt;
+    syscall_table[SYS_GETSOCKOPT] = (syscall_handler_t)sys_sock_getsockopt;
+    syscall_table[SYS_SHUTDOWN]   = (syscall_handler_t)sys_sock_shutdown;
+    // NET-RESILIENCE-OBS: socket table snapshot for netstat/ss (Wave0 ledger 131)
+    syscall_table[SYS_SOCK_LIST]  = (syscall_handler_t)sys_sock_list;
+
+    // CONFIG-STORE: durable namespaced K/V config (Wave0 ledger 133/134)
+    {
+        extern int64_t sys_cfg_get(uint64_t,uint64_t,uint64_t,uint64_t,uint64_t,uint64_t);
+        extern int64_t sys_cfg_set(uint64_t,uint64_t,uint64_t,uint64_t,uint64_t,uint64_t);
+        syscall_table[SYS_CFG_GET] = (syscall_handler_t)sys_cfg_get;
+        syscall_table[SYS_CFG_SET] = (syscall_handler_t)sys_cfg_set;
+    }
 
     // Network configuration (DHCP lease apply, routing, ARP table query)
     syscall_table[SYS_NET_CONFIG]  = (syscall_handler_t)sys_net_config;

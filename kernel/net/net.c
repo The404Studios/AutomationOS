@@ -39,11 +39,13 @@ static const uint8_t MAC_BROADCAST[ETH_ALEN] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
 /* Stack state                                                         */
 /* ------------------------------------------------------------------ */
 #define ARP_CACHE_SIZE  16
+#define ARP_TTL_MS      120000   /* ARP-AGING: evict entries older than 2 min */
 
 typedef struct {
     uint32_t ip;                 /* host byte order, 0 = empty slot     */
     uint8_t  mac[ETH_ALEN];
     bool     valid;
+    uint64_t learned_ms;         /* ARP-AGING: when this entry was learned */
 } arp_entry_t;
 
 /* ------------------------------------------------------------------ */
@@ -121,36 +123,69 @@ static uint16_t inet_checksum(const void* data, uint32_t len) {
 /* ------------------------------------------------------------------ */
 /* ARP cache                                                           */
 /* ------------------------------------------------------------------ */
+extern uint64_t timer_get_ticks_ms(void);
+#ifdef NET_SELFTEST
+/* ARP-AGING rig hook: the boot test rig has no wall-clock wait, so it advances
+ * this offset to make a cache entry deterministically exceed ARP_TTL_MS. Zero in
+ * normal runs; compiled out without NET_SELFTEST -> default kernel byte-identical. */
+static uint64_t g_net_rig_offset_ms = 0;
+void     net_rig_advance_ms(uint64_t ms) { g_net_rig_offset_ms += ms; }
+void     net_rig_clock_reset(void)       { g_net_rig_offset_ms = 0; }
+static uint64_t net_now_ms(void) { return timer_get_ticks_ms() + g_net_rig_offset_ms; }
+#else
+static uint64_t net_now_ms(void) { return timer_get_ticks_ms(); }
+#endif
+
 static void arp_insert(uint32_t ip, const uint8_t mac[ETH_ALEN]) {
+    uint64_t now = net_now_ms();
     /* Update existing entry if present. */
     for (int i = 0; i < ARP_CACHE_SIZE; i++) {
         if (net.arp[i].valid && net.arp[i].ip == ip) {
             memcpy(net.arp[i].mac, mac, ETH_ALEN);
+            net.arp[i].learned_ms = now;   /* ARP-AGING: refresh on relearn */
             return;
         }
     }
-    /* Otherwise take the first free slot (or slot 0 as a crude eviction). */
+    /* Take the first free slot, preferring to reclaim an EXPIRED entry over the
+     * old crude slot-0 stomp (ARP-AGING). */
     for (int i = 0; i < ARP_CACHE_SIZE; i++) {
-        if (!net.arp[i].valid) {
+        if (!net.arp[i].valid ||
+            (now - net.arp[i].learned_ms >= ARP_TTL_MS)) {
             net.arp[i].valid = true;
             net.arp[i].ip = ip;
             memcpy(net.arp[i].mac, mac, ETH_ALEN);
+            net.arp[i].learned_ms = now;
             return;
         }
     }
     net.arp[0].ip = ip;
     memcpy(net.arp[0].mac, mac, ETH_ALEN);
+    net.arp[0].learned_ms = now;
 }
 
 int net_arp_lookup(uint32_t ip, uint8_t out[ETH_ALEN]) {
     for (int i = 0; i < ARP_CACHE_SIZE; i++) {
         if (net.arp[i].valid && net.arp[i].ip == ip) {
+            /* ARP-AGING: a stale entry is invalidated + reported as a miss so the
+             * caller re-ARPs (a host that changed MAC / moved is re-resolved). */
+            if (net_now_ms() - net.arp[i].learned_ms >= ARP_TTL_MS) {
+                net.arp[i].valid = false;
+                return -1;
+            }
             memcpy(out, net.arp[i].mac, ETH_ALEN);
             return 0;
         }
     }
     return -1;
 }
+
+#ifdef NET_SELFTEST
+/* ARP-AGING proof hook: insert a cache entry directly (normally learned from an
+ * ARP reply) so the rig can age it out under the advanced clock. */
+void net_arp_rig_insert(uint32_t ip, const uint8_t mac[ETH_ALEN]) {
+    arp_insert(ip, mac);
+}
+#endif
 
 /* ------------------------------------------------------------------ */
 /* Ethernet framing                                                    */
@@ -537,11 +572,34 @@ static void ipv4_input(const eth_hdr_t* eh, const uint8_t* ip_start,
     if (tot > ip_avail) tot = ip_avail;
     if (tot < ihl) return;
 
+    /* NET-HARDENING-1 (martian filter on the NIC ICMP/ARP RX path): loopback
+     * (127/8) addresses must NEVER appear on a real interface. A NIC-delivered
+     * frame whose src OR dst is in 127/8 is spoofed -- drop it. Mirrors the
+     * socket.c ipv4_demux guard, which had been the only hardened RX path; this
+     * also prevents the OS echoing a martian ICMP reply onto the wire and a
+     * spoofed 127/8 source poisoning the ping echo bookkeeping below. */
+    if ((net_ntohl(ip->src) >> 24) == 127u || (net_ntohl(ip->dst) >> 24) == 127u)
+        return;
+
+    /* NET-HARDENING-2: verify the IPv4 header checksum (a valid header sums to 0).
+     * The socket.c ipv4_demux path already did this for the UDP/TCP frames; this
+     * NIC ICMP/ARP path did NOT, so a corrupt-header ICMP reached icmp_echo_reply
+     * and could poison the echo bookkeeping below. Mirrors ipv4_demux. */
+    if (inet_checksum(ip, ihl) != 0)
+        return;
+
     /* Check if packet is fragmented. */
     uint16_t frag_off_flags = net_ntohs(ip->frag_off);
     uint16_t frag_offset = (frag_off_flags & 0x1FFF) * 8;
     bool more_frags = (frag_off_flags & 0x2000) != 0;
     bool is_fragment = (frag_offset != 0 || more_frags);
+
+    /* NET-HARDENING-2: only the ICMP path here consumes a reassembled packet, so a
+     * fragmented NON-ICMP datagram must NOT drive the reassembly engine (a wasted
+     * 64KB buffer + hole scan an off-LAN host could use as an amplifier). UDP/TCP
+     * fragments are handled -- and dropped -- by the socket.c demux instead. */
+    if (is_fragment && ip->proto != IPPROTO_ICMP)
+        return;
 
     /* If fragmented, reassemble. */
     if (is_fragment) {
@@ -694,6 +752,8 @@ int net_init(void) {
         eth0.rx_poll = (g_nic == NIC_RTL8139) ? rtl8139_rx_poll : e1000_rx_poll;
         eth0.get_mac = (g_nic == NIC_RTL8139) ? rtl8139_get_mac : e1000_get_mac;
         netif_register(&eth0);
+        /* A4 (SOCKET-PARITY-0): register "lo" AFTER eth0 (eth0 stays default). */
+        netif_register_loopback();
     }
 
     /* Gateway ARP pre-resolve (settle loop).

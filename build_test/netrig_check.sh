@@ -34,7 +34,7 @@ timeout 60 qemu-system-x86_64 -cdrom build/automationos.iso -m 512 \
 sleep 2
 
 echo "=== result ==="
-grep -E "NETRIG:|NETP1[A-Z]:" "$LOG" || { echo "rig markers MISSING (see $LOG)"; exit 1; }
+grep -E "NETRIG:|NETP1[A-Z]+:" "$LOG" || { echo "rig markers MISSING (see $LOG)"; exit 1; }
 P=1
 grep -qF "NETRIG: PASS loopback=1 cap=1" "$LOG" || P=0
 # Per-brick markers: only assert the ones that exist in this build's serial
@@ -54,8 +54,65 @@ fi
 if grep -qF "NETP1E:" "$LOG"; then
     grep -qF "NETP1E: SOCKMAX PASS n=32 heapok=1 extra_rejected=1" "$LOG" || P=0
 fi
-if grep -qiE "PANIC|CPU EXCEPTION|TRIPLE FAULT" "$LOG"; then
+# NET-HARDENING-0 (F4/F5/F7) markers
+if grep -qF "NETP1Q:" "$LOG"; then
+    grep -qF "NETP1Q: WINUPD PASS armed=1 no_rtx_on_winupd=1 fires_on_dup=1" "$LOG" || P=0
+fi
+if grep -qF "NETP1R:" "$LOG"; then
+    grep -qF "NETP1R: SYNQRETRY PASS synack=1 promoted=1" "$LOG" || P=0
+fi
+if grep -qF "NETP1S:" "$LOG"; then
+    grep -qF "NETP1S: LORING PASS bursts=64 all_nonneg=1" "$LOG" || P=0
+fi
+if grep -qF "NETP1T:" "$LOG"; then
+    grep -qF "NETP1T: DUPFIN PASS established=1 first_ack=1 in_close_wait=1 reack=1" "$LOG" || P=0
+fi
+if grep -qF "NETP1U:" "$LOG"; then
+    grep -qF "NETP1U: RSTVAL PASS listen_survives=1 est_survives_oow=1 est_resets_inwin=1" "$LOG" || P=0
+fi
+if grep -qF "NETP1V:" "$LOG"; then
+    grep -qF "NETP1V: ACKACC PASS established=1 snd_una_held=1" "$LOG" || P=0
+fi
+if grep -qF "NETP1W:" "$LOG"; then
+    grep -qF "NETP1W: MARTIAN PASS spoof_src=1 spoof_dst=1 legit=1" "$LOG" || P=0
+fi
+if grep -qF "NETP1X:" "$LOG"; then
+    grep -qF "NETP1X: IPFRAG PASS frag_dropped=1 legit=1" "$LOG" || P=0
+fi
+if grep -qF "NETP1Y:" "$LOG"; then
+    grep -qF "NETP1Y: CKSUM0 PASS established=1 good=1 zero_dropped=1" "$LOG" || P=0
+fi
+if grep -qF "NETP1Z:" "$LOG"; then
+    grep -qF "NETP1Z: SWSWND PASS established=1 filled=1 reopen_ack=1" "$LOG" || P=0
+fi
+if grep -qF "NETP1AA:" "$LOG"; then
+    grep -qF "NETP1AA: FINWAIT2 PASS established=1 in_timewait=1 fin_acked=1" "$LOG" || P=0
+fi
+if grep -qF "NETP1AB:" "$LOG"; then
+    grep -qF "NETP1AB: SYNQACK PASS synack=1 wrong_rejected=1 right_promoted=1" "$LOG" || P=0
+fi
+if grep -qF "NETP1AC:" "$LOG"; then
+    grep -qF "NETP1AC: LOSCALE PASS n=6 established=1 all_sent=1 all_recv=1" "$LOG" || P=0
+fi
+if grep -qF "NETP1AD:" "$LOG"; then
+    grep -qF "NETP1AD: ISNKEY PASS found_a=1 found_b=1 isns_differ=1" "$LOG" || P=0
+fi
+if grep -qF "NETP1AE:" "$LOG"; then
+    grep -qF "NETP1AE: FINRTX PASS staged=1 fin_rtx=1 closed_on_ack=1 reaped=1" "$LOG" || P=0
+fi
+# Real unrecoverable kernel faults always fail.
+if grep -qiE "KERNEL PANIC|TRIPLE FAULT" "$LOG"; then
     echo "KERNEL FAULT during boot"; P=0
+fi
+# A "CPU EXCEPTION" that the kernel HANDLES by terminating the faulting ring-3
+# process is healthy -- e.g. the sigtest bad-handler-VA fail-safe deliberately
+# faults at userspace VA 0x4000 to prove the kernel survives. Only an exception
+# WITHOUT a matching "Terminating faulting process" (i.e. a kernel-context fault)
+# is a real failure.
+exc=$(grep -ciE "CPU EXCEPTION" "$LOG")
+handled=$(grep -ciE "Terminating faulting process" "$LOG")
+if [ "$exc" -gt "$handled" ]; then
+    echo "UNHANDLED KERNEL EXCEPTION during boot (exc=$exc handled=$handled)"; P=0
 fi
 if [ "$P" = "1" ]; then
     echo "NETRIG CHECK: PASS"

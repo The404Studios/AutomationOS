@@ -10,6 +10,7 @@ typedef unsigned long size_t;
 #define SYS_GETPID  8
 #define SYS_SLEEP   9
 #define SYS_SPAWN   16
+#define SYS_SPAWN_EX_ARGV 106
 #define SYS_WAITPID 6
 #define SYS_YIELD   15
 #define SYS_SHMGET  18
@@ -31,6 +32,16 @@ static inline long syscall(long n, long a1, long a2, long a3) {
         : "rcx", "r11", "memory"
     );
     return ret;
+}
+
+/* 6-arg syscall (r10/r8/r9 = a4/a5/a6) -- for SYS_SPAWN_EX_ARGV's stdio handles. */
+static inline long sc6(long n, long a1, long a2, long a3, long a4, long a5, long a6) {
+    long r;
+    register long r10 asm("r10") = a4, r8 asm("r8") = a5, r9 asm("r9") = a6;
+    asm volatile("syscall" : "=a"(r)
+                 : "a"(n), "D"(a1), "S"(a2), "d"(a3), "r"(r10), "r"(r8), "r"(r9)
+                 : "rcx", "r11", "memory");
+    return r;
 }
 
 static size_t strlen(const char* s) {
@@ -65,6 +76,18 @@ static int spawn(const char* path) {
 static int spawn_args(const char* path, const char* args) {
     int pid = (int)syscall(SYS_SPAWN, (long)path, (long)args, 0);
     if (pid < 0) { print("[INIT] Spawn failed for "); print(path); print("\n"); }
+    return pid;
+}
+
+/* Spawn with a SINGLE argv[1] entry via the explicit-vector ABI (NUL-separated
+ * byte buffer + byte length + explicit stdio=0) -- the convention the compositor's
+ * project-icon double-click uses, so a path containing a space survives intact. */
+static int spawn_ex_argv1(const char* path, const char* arg) {
+    char buf[256]; int n = 0;
+    for (const char* p = arg; *p && n < (int)sizeof(buf) - 1; ) buf[n++] = *p++;
+    buf[n++] = '\0';
+    int pid = (int)sc6(SYS_SPAWN_EX_ARGV, (long)path, (long)buf, (long)n, 0, 0, 0);
+    if (pid < 0) { print("[INIT] spawn_ex_argv1 failed for "); print(path); print("\n"); }
     return pid;
 }
 
@@ -125,6 +148,31 @@ void _start(void) {
         print("[INIT] ERROR: Failed to spawn compositor!\n");
     }
 
+#ifdef DZ_MPLIVE
+    // DEADZONE-MP-LIVE-0: prove LIVE networked co-op over the kernel's loopback
+    // datapath. Spawn the authoritative server, give it a moment to bind/listen
+    // and start ticking, then spawn the headless client -- it connects to
+    // 127.0.0.1:27015, plays a scripted session, and prints
+    //   "DEADZONE: mp LIVE PASS ..."   (verified server applied our inputs).
+    // Loopback needs no NIC; this is the first userspace two-process TCP exchange
+    // in the OS. Gated -DDZ_MPLIVE => the default boot never spawns either, so it
+    // is byte-behaviorally invisible (the smoke gate stays unchanged).
+    print("[INIT] DZ_MPLIVE: spawning deadzoned (authoritative server)...\n");
+    spawn("sbin/deadzoned");
+    sleep(800);
+    print("[INIT] DZ_MPLIVE: spawning dzclient (live loopback co-op client)...\n");
+    int dz_client_pid = spawn("sbin/dzclient");
+    if (dz_client_pid > 0) {
+        // Block init on the client's scripted session so it gets CPU promptly --
+        // otherwise the ~70-process self-test storm spawned below would starve the
+        // cooperative client and it would never finish before the smoke timeout.
+        // The server keeps running (init waits ONLY on the client).
+        int dz_status = 0;
+        syscall(SYS_WAITPID, dz_client_pid, (long)&dz_status, 0);
+        print("[INIT] DZ_MPLIVE: dzclient session complete\n");
+    }
+#endif
+
     // Auto-DHCP: spawns in the background, sleeps 2s (NIC PHY negotiate),
     // checks link, runs DHCP if up, applies lease, exits. Non-blocking --
     // init does not wait for it. If no NIC or DHCP fails, exits silently.
@@ -166,6 +214,38 @@ void _start(void) {
         print("[INIT] ERROR: Failed to spawn filemanager!\n");
     }
 
+#ifdef DZ_GAMETEST
+    // DZ_GAMETEST (DZ_GAMETEST=1): spawn the DeadZone GUI game so its launch-time
+    // headless selftests (systems / mp / loot) print to serial for the loot proof.
+    // The compositor is up by here, so wl_connect succeeds; deadzone runs its game
+    // loop afterward (harmless headless). Gated => default boot never spawns it.
+    print("[INIT] DZ_GAMETEST: spawning deadzone (selftest proof)...\n");
+    spawn("sbin/deadzone");
+#endif
+
+#ifdef TASKMAN_TEST
+    // TASKMAN_TEST (TASKMAN_TEST=1): spawn the real Task Manager so its launch
+    // emits [TASKMAN] starting + [TASKMAN] N procs (N = the TRUE live process
+    // count via SYS_PROCLIST, now honest -- no longer silently pinned at 12),
+    // proving the task manager reads real kernel data. Compositor is up by here,
+    // so wl_connect succeeds. Gated => default boot never spawns it.
+    print("[INIT] TASKMAN_TEST: spawning taskman (proclist proof)...\n");
+    spawn("sbin/taskman");
+#endif
+
+#ifdef AUDIO_STREAMTEST
+    // AUDIO_STREAMTEST: prove a ring-3 app streams PCM via SYS_AUDIO_STREAM_WRITE
+    // (the on_bcis ring consumer drains it into the HDA DMA). Gated => default boot
+    // never spawns it. Pair with a kernel built AUDIO_SELFTEST=1 (implies HDA_ENABLE)
+    // so the syscall handler + ring exist. Wait on it (it streams ~1-2s) so it gets
+    // CPU before the self-test storm.
+    print("[INIT] AUDIO_STREAMTEST: spawning streamtest (userspace PCM stream proof)...\n");
+    {
+        int stt_pid = spawn("sbin/streamtest");
+        if (stt_pid > 0) { int stt_st = 0; syscall(SYS_WAITPID, stt_pid, (long)&stt_st, 0); }
+    }
+#endif
+
     // NOTE: the right-side dock IS the launcher now, so we no longer auto-open
     // the Applications grid window (it duplicated the dock + covered the desktop).
     // DECLUTTER: dateapp ("Date & Time") is no longer auto-opened either -- it
@@ -176,6 +256,12 @@ void _start(void) {
     // prioritytest's pid (referenced by the reaper loop). Declared here so it is
     // visible in BOTH the full and DESKTOP_MINIMAL builds; -1 means "never spawned".
     int prioritytest_pid = -1;
+    // agentd's pid is likewise referenced by the reaper loop (the AGENT-LEDGER
+    // re-verify on agentd's reap) in BOTH builds, but agentd is only spawned in the
+    // full build. Declare it unconditionally (-1 = "never spawned") so the
+    // DESKTOP_MINIMAL build compiles -- it was previously declared inside the
+    // #ifndef DESKTOP_MINIMAL storm, which broke the minimal build.
+    int agentd_pid = -1;
 
     // ── DESKTOP_MINIMAL boot trim ───────────────────────────────────────────
     // When built with -DDESKTOP_MINIMAL (the T410 desktop profile), init spawns
@@ -238,6 +324,18 @@ void _start(void) {
     // (prints ARGVTEST: PASS with argv[0] = its spawn path).
     print("[INIT] Spawning argvtest...\n");
     spawn_args("sbin/argvtest", "hello world");
+
+#ifdef EX_ARGV_PROBE
+    /* EX_ARGV_PROBE=1: prove the compositor's project-icon spawn convention --
+     * SYS_SPAWN_EX_ARGV delivers a single argv[1] with embedded spaces INTACT (no
+     * whitespace split, unlike the legacy spawn_args above). Spawn argvtest with a
+     * spaced path + wait; the harness asserts the contiguous "My Game" survives. */
+    print("[INIT] EX_ARGV_PROBE: spawn argvtest via SYS_SPAWN_EX_ARGV (spaced argv[1])...\n");
+    {
+        int pid = spawn_ex_argv1("sbin/argvtest", "/Desktop/Projects/My Game");
+        if (pid > 0) { int st = 0; syscall(SYS_WAITPID, pid, (long)&st, 0); }
+    }
+#endif
 
     // CHANNEL-0 P5b: userspace CH_MSG send/recv round-trip. The parent creates a
     // CH_MSG channel, proves EAGAIN+EMSGSIZE, self-spawns a bound child, and
@@ -367,7 +465,7 @@ void _start(void) {
     // Bring it to life with `python3 scripts/nemotron_mock.py` (zero-cost) or
     // `node scripts/nemotron_broker.js` (live NVIDIA/Puter Nemotron) + boot -netdev.
     print("[INIT] Spawning agentd (Nemotron gated OS-automation agent)...\n");
-    int agentd_pid = spawn("sbin/agentd");
+    agentd_pid = spawn("sbin/agentd");
 
 #ifdef COCKPIT_PROOF
     // AGENTCOCKPIT-0 headless seam proof: launch the cockpit in --proof mode so it
@@ -591,8 +689,22 @@ void _start(void) {
     /* IDE=1 build: open the Semantic LEGO Map IDE last so it lands on TOP of the
      * default desktop apps (for IDE iteration + screenshots). Normal boot leaves
      * the IDE launchable from the dock/start-menu instead. */
-    print("[INIT] IDE_AUTOSTART: opening sbin/ide...\n");
-    spawn("sbin/ide");
+    print("[INIT] IDE_AUTOSTART: opening sbin/ide on the DeadZone project...\n");
+    /* AUDIT-9: hand the IDE the DeadZone project root as argv[1] so the boot
+     * drives the runtime project-load + prebuilt-gate path and emits the
+     * headless proof markers ([IDE] project active / [IDE] prebuilt probe). */
+    spawn_args("sbin/ide", "/Desktop/Projects/DeadZone");
+#endif
+
+#ifdef DZ_SRVTEST
+    /* DZ_SRVTEST=1: run the authoritative server's headless self-test (which now
+     * also proves inactive slots serialize as DZ_SLOT_EMPTY -- the MP phantom-
+     * teammate fix) and WAIT for it so the boot storm can't starve it. */
+    print("[INIT] DZ_SRVTEST: running deadzoned -t...\n");
+    {
+        int srv = spawn_args("sbin/deadzoned", "-t");
+        if (srv > 0) { int st = 0; syscall(SYS_WAITPID, srv, (long)&st, 0); }
+    }
 #endif
 
 #ifdef SHOWCASE

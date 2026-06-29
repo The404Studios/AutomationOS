@@ -742,13 +742,23 @@ void panel_map(Ide* a, Canvas* cv, Rect r)
     gfx_text_clip(cv, cx + PAD, cy + (cardhdr_h - GFX_FH) / 2,
                   buf, TH_BG, cx + PAD, card_w - 2 * PAD);
 
-    /* "Ports (N)" sub-heading. */
+    /* "Ports (N)" sub-heading -- or "Ports (N of T)" + orange tint when the
+     * 16-slot port array hid intended ports, so the map never silently
+     * understates a function (AUDIT honest-map #5). */
     int sub_y = cy + cardhdr_h + PAD;
+    int port_more = ide_more(nports, f->nports_true);
     buf[0] = '\0';
     map_cat(buf, "Ports (", sizeof(buf));
     { char nb[12]; ide_itoa(nports, nb); map_cat(buf, nb, sizeof(buf)); }
+    if (port_more > 0) {
+        char nb2[12];
+        map_cat(buf, " of ", sizeof(buf));
+        ide_itoa(f->nports_true, nb2);
+        map_cat(buf, nb2, sizeof(buf));
+    }
     map_cat(buf, ")", sizeof(buf));
-    gfx_text_clip(cv, cx + PAD, sub_y, buf, TH_TEXT_DIM,
+    gfx_text_clip(cv, cx + PAD, sub_y, buf,
+                  port_more > 0 ? TH_ORANGE : TH_TEXT_DIM,
                   cx + PAD, card_w - 2 * PAD);
 
     /*

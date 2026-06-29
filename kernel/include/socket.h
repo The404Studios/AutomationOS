@@ -58,6 +58,26 @@
 #define SOCK_ETIMEDOUT -110
 
 /* ------------------------------------------------------------------ */
+/* A4 (SOCKET-PARITY-0): setsockopt/getsockopt + shutdown surface.     */
+/* ------------------------------------------------------------------ */
+/* Option level (only SOL_SOCKET is supported). */
+#define SOL_SOCKET      1
+
+/* Option names (SOL_SOCKET). All are int-valued; timeouts are in ms. */
+#define SO_REUSEADDR    2   /* relax the bind() duplicate-port check     */
+#define SO_TYPE         3   /* read-only: SOCK_STREAM | SOCK_DGRAM       */
+#define SO_ERROR        4   /* read-only: 0 or a negative SOCK_E*        */
+#define SO_BROADCAST    6   /* permit sendto() to a broadcast address    */
+#define SO_RCVTIMEO     20  /* receive timeout in milliseconds (int)     */
+#define SO_SNDTIMEO     21  /* send timeout in milliseconds (int)        */
+#define SO_KEEPALIVE    9   /* enable TCP keepalive (stored; advisory)   */
+
+/* shutdown(2) "how". */
+#define SHUT_RD         0   /* disable further receives                  */
+#define SHUT_WR         1   /* disable further sends (TCP: emit FIN)     */
+#define SHUT_RDWR       2   /* both                                      */
+
+/* ------------------------------------------------------------------ */
 /* Wire-format transport headers (big-endian fields).                  */
 /* ------------------------------------------------------------------ */
 #ifndef PACKED
@@ -99,7 +119,8 @@ typedef enum {
     TCP_ESTABLISHED,
     TCP_FIN_WAIT,      /* we sent FIN, awaiting ACK / peer FIN           */
     TCP_CLOSE_WAIT,    /* peer sent FIN; we may still send, must FIN     */
-    TCP_TIME_WAIT
+    TCP_TIME_WAIT,
+    TCP_LAST_ACK       /* NET-HARDENING-2: passive close, awaiting ACK of our FIN */
 } tcp_state_t;
 
 /* ------------------------------------------------------------------ */
@@ -170,6 +191,32 @@ struct sock {
     uint8_t     rt_data[TCP_MSS];
 
     bool        reset;         /* peer sent RST / fatal error           */
+    bool        orphaned;      /* NET-HARDENING-2: app closed but our FIN is    */
+                               /* un-acked; background tcp_tick retransmits +   */
+                               /* reaps it (no owning fd)                       */
+
+    /* --- A4 (SOCKET-PARITY-0): socket options + half-close state --- */
+    uint8_t     so_reuseaddr;  /* SO_REUSEADDR: relax bind dup check     */
+    uint8_t     so_broadcast;  /* SO_BROADCAST: allow broadcast sendto   */
+    uint8_t     so_keepalive;  /* SO_KEEPALIVE: stored (advisory)        */
+    uint8_t     shut_rd;       /* shutdown(SHUT_RD): recv returns EOF    */
+    uint8_t     shut_wr;       /* shutdown(SHUT_WR): send is rejected    */
+    uint32_t    so_rcvtimeo_ms;/* SO_RCVTIMEO (ms; 0 = none)             */
+    uint32_t    so_sndtimeo_ms;/* SO_SNDTIMEO (ms; 0 = none)             */
+
+    /* --- TCP-ROBUST 2MSL: when this socket entered TIME_WAIT (ms). --- */
+    uint64_t    time_wait_ms;
+
+    /* --- TCP-ROBUST adaptive RTO (RFC 6298, integer ms) --- */
+    uint32_t    srtt_ms;       /* smoothed RTT (0 = no sample yet)        */
+    uint32_t    rttvar_ms;     /* RTT variance                            */
+    uint32_t    base_rto_ms;   /* current un-backed-off RTO (0 = none)    */
+
+    /* --- TCP-ROBUST options negotiated from the peer's SYN/SYN-ACK --- */
+    uint16_t    peer_mss;      /* peer's advertised MSS (0 = unknown)     */
+    uint8_t     snd_wscale;    /* peer's window-scale shift (0..14)       */
+    uint8_t     peer_sack_ok;  /* peer sent SACK-permitted                */
+    uint8_t     peer_ts_ok;    /* peer sent the timestamp option          */
 };
 
 /* ------------------------------------------------------------------ */
@@ -280,6 +327,16 @@ int sock_recvfrom(int s, void* buf, uint32_t len,
 /* Close (TCP: send FIN if connected). 0 / negative. */
 int sock_close(int s);
 
+/* A4: half-close. how = SHUT_RD | SHUT_WR | SHUT_RDWR. After SHUT_RD a recv
+ * returns 0 (EOF); after SHUT_WR a send is rejected (TCP also emits a FIN).
+ * The socket stays open until sock_close. 0 / negative. */
+int sock_shutdown(int s, int how);
+
+/* A4: set/get a socket option. level must be SOL_SOCKET. Values are int
+ * (timeouts in ms). Returns 0 / negative SOCK_E*. */
+int sock_setsockopt(int s, int level, int optname, int value);
+int sock_getsockopt(int s, int level, int optname, int* out_value);
+
 /* Close all sockets owned by a dying process. Called from process_unref(). */
 void sock_cleanup_process(uint32_t pid);
 
@@ -317,6 +374,24 @@ typedef struct {
     uint16_t _pad;
 } sock_addr_t;
 
+/* NET-RESILIENCE-OBS: one row of the live socket table for netstat/ss
+ * (SYS_SOCK_LIST=131). All host byte order. type=SOCK_STREAM|SOCK_DGRAM;
+ * state=tcp_state_t (0 for UDP); owner_pid is the creating process. */
+typedef struct {
+    uint8_t  type;
+    uint8_t  state;
+    uint16_t local_port;
+    uint16_t remote_port;
+    uint16_t reserved;
+    uint32_t local_ip;
+    uint32_t remote_ip;
+    uint32_t owner_pid;
+} sock_info_t;
+_Static_assert(sizeof(sock_info_t) == 20, "sock_info_t ABI must be 20 bytes");
+
+/* Fill `out` (up to `max` rows) with the live socket table; returns row count. */
+int sock_get_list(sock_info_t* out, int max);
+
 int64_t sys_sock_socket(uint64_t type, uint64_t a2, uint64_t a3,
                         uint64_t a4, uint64_t a5, uint64_t a6);
 int64_t sys_sock_connect(uint64_t s, uint64_t ip, uint64_t port,
@@ -339,5 +414,15 @@ int64_t sys_sock_listen(uint64_t s, uint64_t backlog, uint64_t a3,
                         uint64_t a4, uint64_t a5, uint64_t a6);
 int64_t sys_sock_accept(uint64_t s, uint64_t a2, uint64_t a3,
                         uint64_t a4, uint64_t a5, uint64_t a6);
+/* A4 (SOCKET-PARITY-0): SYS_SETSOCKOPT=125, SYS_GETSOCKOPT=126, SYS_SHUTDOWN=127. */
+int64_t sys_sock_setsockopt(uint64_t s, uint64_t level, uint64_t optname,
+                            uint64_t optval, uint64_t optlen, uint64_t a6);
+int64_t sys_sock_getsockopt(uint64_t s, uint64_t level, uint64_t optname,
+                            uint64_t optval, uint64_t optlen, uint64_t a6);
+int64_t sys_sock_shutdown(uint64_t s, uint64_t how, uint64_t a3,
+                          uint64_t a4, uint64_t a5, uint64_t a6);
+/* NET-RESILIENCE-OBS: SYS_SOCK_LIST=131 -- copy the socket table to userspace. */
+int64_t sys_sock_list(uint64_t out_ptr, uint64_t max_entries, uint64_t a3,
+                      uint64_t a4, uint64_t a5, uint64_t a6);
 
 #endif /* SOCKET_H */

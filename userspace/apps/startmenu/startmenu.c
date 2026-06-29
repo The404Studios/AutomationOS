@@ -198,12 +198,12 @@ static const char *PIN_PATHS[PIN_COUNT] = {
     /* row 1 */
     "sbin/editor",      "sbin/sysmon",      "sbin/mines",       "sbin/game2048",
     "sbin/breakout",    "sbin/pong",        "sbin/invaders",    "sbin/solitaire",
-    /* row 2 */
+    /* row 2 -- de-clutter: tracker/kanban/reader were never built (dead tiles) */
     "sbin/notes",       "sbin/calendar",    "sbin/musicplayer", "sbin/aiconsole",
-    "sbin/tracker",     "sbin/kanban",      "sbin/reader",      "sbin/bench",
-    /* row 3 */
-    "sbin/taskman",     "sbin/sysinfo",     "sbin/procmon",     "sbin/soundtest",
-    "sbin/gallery",     "sbin/screenshot",  "sbin/dateapp",     "sbin/powermenu",
+    "sbin/chess",       "sbin/asteroids",   "sbin/sudoku",      "sbin/bench",
+    /* row 3 -- de-clutter: soundtest(demo)->soundman, gallery/powermenu(dead) */
+    "sbin/taskman",     "sbin/sysinfo",     "sbin/procmon",     "sbin/soundman",
+    "sbin/photos",      "sbin/screenshot",  "sbin/dateapp",     "sbin/controlcenter",
     /* row 4 -- CLAUDE-APP-0 */
     "sbin/claudechat",  "sbin/anthropic",
 };
@@ -213,9 +213,9 @@ static const char *PIN_LABELS[PIN_COUNT] = {
     "Editor",   "SysMon",  "Mines",   "2048",
     "Breakout", "Pong",    "Invaders","Solitaire",
     "Notes",    "Calendar","Music",   "AI Shell",
-    "Tracker",  "Kanban",  "Reader",  "Bench",
+    "Chess",    "Asteroid","Sudoku",  "Bench",
     "TaskMgr",  "SysInfo", "ProcMon", "Sound",
-    "Gallery",  "Screenshot","Date",  "Power",
+    "Photos",   "Screenshot","Date",  "Control",
     "Claude",   "Anthropic",
 };
 static const char PIN_ICON_CHAR[PIN_COUNT] = {
@@ -247,12 +247,12 @@ static app_entry_t g_rec[REC_COUNT];
 static const char *REC_PATHS[REC_COUNT] = {
     "sbin/snake",    "sbin/synth",     "sbin/tetris",  "sbin/piano",
     "sbin/welcome",  "sbin/stopwatch", "sbin/dashboard","sbin/netman",
-    "sbin/sheet",    "sbin/vpaint",    "sbin/scicalc", "sbin/stress",
+    "sbin/sheet",    "sbin/pacman",    "sbin/clockapp","sbin/bubbletd",
 };
 static const char *REC_LABELS[REC_COUNT] = {
     "Snake", "Synth", "Tetris", "Piano",
     "Welcome","Stopwatch","Dashboard","NetMgr",
-    "Sheet", "VPaint","SciCalc","Stress",
+    "Sheet", "Pac-Man","Clock+","Bubbles",
 };
 
 /* -------------------------------------------------------------------------

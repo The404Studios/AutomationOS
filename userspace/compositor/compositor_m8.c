@@ -111,6 +111,7 @@ typedef long                int64_t;    /* match <stdint.h> __INT64_TYPE__  (LP6
 #define SYS_YIELD         15
 #define SYS_SLEEP          9      /* blocking ms sleep (frees the CPU for clients) */
 #define SYS_SPAWN         16
+#define SYS_SPAWN_EX_ARGV 106   /* spawn with a NUL-split argv vector (spaces survive) */
 #define SYS_SHMAT         19
 #define SYS_SHMDT         20
 #define SYS_SHMCTL        21
@@ -874,7 +875,7 @@ static int32_t g_task_w = 0;   /* 0 = not yet computed (set before first use) */
 #define RDOCK_FAN_SPARKLES    8   /* sparkle dots drawn around a hovered icon */
 
 /* Number of app entries and folders */
-#define RDOCK_NICONS  19   /* DESKTOP-REVAMP-0: +Claude chat +Anthropic panel +Cockpit +Sound */
+#define RDOCK_NICONS  20   /* DESKTOP-REVAMP-0: +Claude chat +Anthropic panel +Cockpit +Sound +DeadZone */
 #define RDOCK_NFOLDERS 2
 
 /* App descriptor */
@@ -918,6 +919,7 @@ static const rdock_app_t rdock_apps[RDOCK_NICONS] = {
     { "An", "sbin/anthropic",   0xFFB8865Au },  /* 16 Anthropic  */
     { "Ck", "sbin/cockpit",     0xFF6B5B95u },  /* 17 Cockpit    -- the agent console */
     { "Au", "sbin/soundman",    0xFF1DB954u },  /* 18 Sound      -- HDA volume/mute/test */
+    { "Dz", "sbin/deadzone",    0xFF8B0000u },  /* 19 DeadZone   -- FPS zombie survival  */
 };
 
 /* ---- Folder table (Games + Tools); members[] index into rdock_apps[] ---- */
@@ -5300,7 +5302,21 @@ static int desk_handle_click(int32_t cx, int32_t cy, uint32_t W, uint32_t H, lon
     /* Identity is the full stored path -- never reconstruct it from the
      * (truncated) display label. Dispatch by kind: folders/projects open in the
      * file manager at their real directory; apps/files are spawned directly. */
-    if (di->kind == DI_FOLDER || di->kind == DI_PROJECT) {
+    if (di->kind == DI_PROJECT) {
+        /* AUDIT-9 + IDE-PATH-FIX: open a project folder IN the IDE with its root as
+         * argv[1] via SYS_SPAWN_EX_ARGV (NUL-separated argv buffer + byte length +
+         * sc6 stdio=0) so a name with a space survives exec's NUL-only split. */
+        char ide_av[256]; int ide_n = 0;
+        for (const char *pp = di->path; *pp && ide_n < (int)sizeof(ide_av) - 1; ) ide_av[ide_n++] = *pp++;
+        ide_av[ide_n++] = '\0';                 /* one NUL-terminated argv[1] entry */
+        long r = sc6(SYS_SPAWN_EX_ARGV, (long)"sbin/ide", (long)ide_av, (long)ide_n, 0, 0, 0);
+        print("[SHELL] desktop ide "); print(di->path);
+        if (r < 0) {
+            print(" (ide spawn fail r="); print_num(r); print(" -> filemanager)");
+            syscall(SYS_SPAWN, (long)"sbin/filemanager", (long)di->path, 0);
+        }
+        print("\n");
+    } else if (di->kind == DI_FOLDER) {
         long r = syscall(SYS_SPAWN, (long)"sbin/filemanager", (long)di->path, 0);
         print("[SHELL] desktop open "); print(di->path);
         if (r < 0) { print(" (spawn fail r="); print_num(r); print(")"); }

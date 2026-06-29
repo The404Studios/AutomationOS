@@ -544,6 +544,10 @@ compile kernel/net/net.c                      c_net
 compile kernel/drivers/hda.c                  c_hda
 compile kernel/drivers/hda_stream.c           c_hda_stream
 compile kernel/drivers/audio/audio_core.c     c_audio_core
+# AUDIO-FMT: PCM format/channel/sample-rate converter (FPU-free). Pure utility.
+compile kernel/drivers/audio/audio_fmt.c      c_audio_fmt
+# AUDIO-MIXER core: N-stream sum + per-stream/master gain + clamp (FPU-free).
+compile kernel/drivers/audio/audio_mix.c      c_audio_mix
 compile kernel/drivers/audio/audio_tone.c     c_audio_tone
 compile kernel/net/route.c                    c_route
 compile kernel/net/netif.c                   c_netif
@@ -628,6 +632,9 @@ compile kernel/fs/fat32.c                    c_fat32
 # diskfs: durable superblock over AHCI (persistence #57). Self-contained, only
 # touches a fixed LBA via ahci_read/write; no-op when no disk is attached.
 compile kernel/fs/diskfs.c                   c_diskfs
+# CONFIG-STORE: durable namespaced K/V over diskfs (SYS_CFG_GET/SET). Self-
+# contained, lazy-init, RAM-fallback when diskless -> safe in every build.
+compile kernel/fs/config_store.c             c_config_store
 compile kernel/init/initrd.c                 c_initrd
 compile kernel/fs/elf_loader.c               c_elf_loader
 compile kernel/fs/exec.c                     c_exec

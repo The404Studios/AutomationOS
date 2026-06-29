@@ -250,6 +250,27 @@ typedef struct {
 
     // Stream position
     uint32_t position;                    // Current position in buffer (bytes)
+#ifdef HDA_ENABLE
+    /* AUDIO B1 gapless streaming: the DMA plays the 8-entry BDL cyclically and
+     * raises one BCIS per chunk; on each BCIS the IRQ handler refills the
+     * just-completed chunk via refill_cb, so playback continues past the initial
+     * 64 KB (true gapless streaming, not a looped buffer). All HDA_ENABLE-gated
+     * so the default (HDA-off) kernel is byte-identical. */
+    uint32_t chunk_size;                  // bytes per BDL chunk (buffer_size/bdl_entries)
+    uint32_t refill_next;                 // next chunk index on_bcis will refill
+    volatile uint32_t refill_count;       // chunks refilled (proof counter)
+    void (*refill_cb)(void* stream, uint32_t chunk_idx);  // NULL = not streaming
+    /* AUDIO B1 part-2: SPSC software ring for userspace streaming. Producer =
+     * SYS_AUDIO_STREAM_WRITE (task ctx, IF=0, owns ring_tail); consumer =
+     * stream_refill_ring in on_bcis IRQ ctx (owns ring_head). pmm-allocated (not
+     * inline/static -- avoids a 64KB kmalloc + .bss bloat). volatile + aligned
+     * 32-bit cursors, single-writer-each => race-safe on the single-core default
+     * (SMP would need release/acquire -- HDA streaming is single-core only). */
+    uint8_t* ring;                        // pmm_alloc_pages(16) == 64KB, or NULL
+    volatile uint32_t ring_head;          // CONSUMER pop cursor (IRQ owns)
+    volatile uint32_t ring_tail;          // PRODUCER push cursor (syscall owns)
+    volatile uint32_t underruns;          // chunks zero-filled (ring empty at BCIS)
+#endif
 } hda_stream_t;
 
 // HDA Controller

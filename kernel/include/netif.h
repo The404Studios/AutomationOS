@@ -66,6 +66,11 @@ typedef uapi_arp_info_t    arp_info_t;
 /* Interface registry API (kernel/net/netif.c)                         */
 /* ------------------------------------------------------------------ */
 int      netif_register(const netif_t* nif);
+/* A4 (SOCKET-PARITY-0): register the cosmetic "lo" 127.0.0.1 interface for
+ * ifconfig/netstat visibility. Loopback delivery itself is handled by ip_tx's
+ * 127/8 short-circuit (no Ethernet tx), so lo carries no tx callback. Call AFTER
+ * eth0 so netif_get_default() (first UP) still returns the real NIC. */
+void     netif_register_loopback(void);
 netif_t* netif_get(const char* name);
 netif_t* netif_get_default(void);       /* first UP interface           */
 netif_t* netif_get_by_index(int idx);

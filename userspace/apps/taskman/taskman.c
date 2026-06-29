@@ -165,6 +165,9 @@ static void tm_cat_uint(char **p, unsigned long v, int w, char pad)
 #define WIN_W       680   /* widened to fit TICKS + CTXSW columns */
 #define WIN_H       460
 #define MAX_ROWS     12   /* visible process rows */
+#define PROC_CAP    256   /* SYS_PROCLIST probe capacity = kernel MAX_PROCESSES, */
+                          /* so proc_count is the TRUE total, not silently pinned */
+                          /* at MAX_ROWS (we still render only MAX_ROWS rows).    */
 #define TICK_PERIOD  30   /* refresh proc list every N frames */
 
 /* Row geometry inside the list panel */
@@ -210,9 +213,10 @@ typedef struct {
  * Global application state.
  * ----------------------------------------------------------------------- */
 typedef struct {
-    /* Process list buffer */
-    procinfo_t procs[MAX_ROWS];
-    int        proc_count;   /* live entries in procs[] */
+    /* Process list buffer (PROC_CAP so we can fetch the TRUE total; the kernel
+       fills up to PROC_CAP entries -- we only RENDER the first MAX_ROWS). */
+    procinfo_t procs[PROC_CAP];
+    int        proc_count;   /* TRUE live process count (may exceed MAX_ROWS) */
 
     /* Own PID -- never offered as a kill target */
     unsigned int own_pid;
@@ -319,38 +323,52 @@ static void serial_int(long v)
  * ----------------------------------------------------------------------- */
 static void refresh_proclist(taskman_t *st)
 {
-    long cnt = sc(SYS_PROCLIST, (long)st->procs, (long)MAX_ROWS, 0);
+    long cnt = sc(SYS_PROCLIST, (long)st->procs, (long)PROC_CAP, 0);
     if (cnt < 0) cnt = 0;
-    if (cnt > MAX_ROWS) cnt = MAX_ROWS;
-    st->proc_count = (int)cnt;
+    if (cnt > PROC_CAP) cnt = PROC_CAP;
+    st->proc_count = (int)cnt;                  /* TRUE total live process count */
 
-    /* Serial report */
+    int shown = st->proc_count < MAX_ROWS ? st->proc_count : MAX_ROWS;
+
+    /* Serial report -- the HONEST total now (was silently pinned at MAX_ROWS). */
     tm_write("[TASKMAN] ");
-    serial_uint((unsigned long)cnt);
+    serial_uint((unsigned long)st->proc_count);
     tm_write(" procs\n");
 
-    /* Update row labels and background panels */
+    /* Update row labels and APPLY the panel color live. Previously the computed
+       color was discarded with (void)bg -- the selected row never highlighted,
+       which made the task manager look bugged. ui_widget_set_bg (ui.c) sets
+       w->bg, which UI_PANEL re-reads every frame; the highlight renders behind
+       the legible label (panel child precedes label child within the list). */
     for (int i = 0; i < MAX_ROWS; i++) {
-        if (i < st->proc_count) {
+        if (i < shown) {
             char row_buf[64];
             fmt_row(row_buf, &st->procs[i]);
             ui_label_set_text(st->row_labels[i], row_buf);
 
-            /* Choose panel color */
             unsigned int bg;
-            if (i == st->selected) {
-                bg = C_ROW_SEL;
-            } else if (i == st->killed_idx) {
-                bg = C_ROW_DEAD;
-            } else {
-                bg = (i & 1) ? C_ROW_ODD : C_ROW_EVEN;
-            }
-            /* We can't change the panel color after creation through the
-               public API, so we repaint the label color to indicate state. */
-            (void)bg; /* panel color is set at creation; see _start */
+            if (i == st->selected)        bg = C_ROW_SEL;
+            else if (i == st->killed_idx) bg = C_ROW_DEAD;
+            else                          bg = (i & 1) ? C_ROW_ODD : C_ROW_EVEN;
+            ui_widget_set_bg(st->row_panels[i], bg);
         } else {
             ui_label_set_text(st->row_labels[i], "");
+            ui_widget_set_bg(st->row_panels[i], (i & 1) ? C_ROW_ODD : C_ROW_EVEN);
         }
+    }
+
+    /* Honest cap indicator when idle (no selection / no just-killed row, so we
+       don't clobber an action message): "N processes (showing K)". */
+    if (st->selected < 0 && st->killed_idx < 0) {
+        char *p = st->status_buf;
+        tm_cat_uint(&p, (unsigned long)st->proc_count, 0, ' ');
+        tm_cat(&p, " processes");
+        if (st->proc_count > shown) {
+            tm_cat(&p, " (showing ");
+            tm_cat_uint(&p, (unsigned long)shown, 0, ' ');
+            tm_cat(&p, ")");
+        }
+        ui_label_set_text(st->lbl_status, st->status_buf);
     }
 }
 
@@ -380,18 +398,14 @@ static void on_row_click(void *ud)
     tm_cat(&p, ")");
     ui_label_set_text(st->lbl_status, st->status_buf);
 
-    /* Visually reflect selection: update label colors.
-       Since the toolkit stores colors on labels, we update the row labels
-       to indicate selection by blanking then re-setting text (color stays).
-       The actual bg highlight is done at refresh time via panel color --
-       we don't have a color-change API on panels, so we use the label
-       text color as the indicator: bright for selected. */
+    /* Immediately reflect the selection (don't wait up to TICK_PERIOD for the
+       next refresh): recolor every row panel now. C_ROW_SEL on the selected
+       row, killed/zebra otherwise. */
     for (int i = 0; i < MAX_ROWS; i++) {
-        if (i < st->proc_count) {
-            char row_buf[64];
-            fmt_row(row_buf, &st->procs[i]);
-            ui_label_set_text(st->row_labels[i], row_buf);
-        }
+        unsigned int bg = (i == st->selected)        ? C_ROW_SEL
+                        : (i == st->killed_idx)      ? C_ROW_DEAD
+                        : (i & 1) ? C_ROW_ODD : C_ROW_EVEN;
+        ui_widget_set_bg(st->row_panels[i], bg);
     }
 }
 

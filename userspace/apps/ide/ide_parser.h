@@ -34,7 +34,7 @@
 #include "ide_ast.h"
 #include "ide_lex.h"     /* Tok, TokKind, lex_tokenize */
 
-#define PARSE_MAX_TOKS   16384
+#define PARSE_MAX_TOKS   32768   /* fits real game sources (deadzone.c ~16k toks; 16384 left only ~3% headroom) */
 #define PARSE_MAX_TYPES  256
 #define PARSE_MAX_DIAGS  128
 

@@ -673,8 +673,12 @@ int ide_editor_save(struct Ide* a) {
     if (r == 0) {
         a->editor.dirty = 0;
         a->editor.edits_since_save = 0;   /* IDE-CONTEXT-0 */
-        /* Re-run analysis so the LEGO workspace + status bar reflect edits. */
-        model_parse(&a->model, a->src, a->src_len, a->cur_file);
+        /* Re-run analysis so the LEGO workspace + status bar reflect edits.
+         * IDE #7: rebuild the WHOLE-DIRECTORY model (IDE-XFILE-0), not just this
+         * file, so cross-file collapse/dependency edges reflect the save -- the
+         * same path ide_open_file (ide.c) and Build use. ide_parse_project_model
+         * appends the live edited buffer (a->src) last, so it sees the new text. */
+        ide_parse_project_model(a);
         if (a->model.nfuncs > 0) {
             if (a->focus_func >= a->model.nfuncs) a->focus_func = 0;
             a->model.focus = a->focus_func;

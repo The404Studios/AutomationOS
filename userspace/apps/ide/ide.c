@@ -184,7 +184,7 @@ static void tab_save_active(Ide* a) {
         g_tab_src[i][j] = a->src[j];
 }
 
-static void ide_parse_project_model(Ide* a);   /* IDE-XFILE-0 (defined below) */
+void ide_parse_project_model(Ide* a);          /* IDE-XFILE-0 (defined below; prototype in ide.h) */
 
 static void tab_restore(Ide* a, int idx) {
     if (idx < 0 || idx >= IDE_MAX_TABS || !a->tabs[idx].used) return;
@@ -659,7 +659,7 @@ static void ide_dirname(char* out, int cap, const char* path) {
     if (cut <= 0) { out[0] = '/'; out[1] = 0; } else out[cut] = 0;
 }
 
-static void ide_parse_project_model(Ide* a) {
+void ide_parse_project_model(Ide* a) {
     model_reset(&a->model);
     char dir[IDE_PATH];
     ide_dirname(dir, IDE_PATH, a->cur_file);
@@ -980,6 +980,7 @@ static void np_confirm(Ide* a) {
         rt[n] = 0;
         ide_strlcpy(p->run_target, rt, (int)sizeof(p->run_target));
     }
+    p->kind[0] = 0;                  /* IDE-created projects compile on-device       */
     ide_project_write_manifest(p);
 
     /* Refresh the explorer, close the modal, open the project's main source.
@@ -1043,7 +1044,7 @@ static int np_key(Ide* a, int keycode, char ch) {
  * init: set the root, scan, choose an initial file, set initial view tabs.
  * ==========================================================================*/
 
-static void init(Ide* a) {
+static void init(Ide* a, int argc, char** argv) {
     /* Root the explorer at /usr/src so EVERY packaged project (towerdefense,
      * bubbledefense, native, ...) is browsable + editable from the file tree,
      * not just the single towerdefense demo. scan_dir() recurses into the
@@ -1059,6 +1060,42 @@ static void init(Ide* a) {
     a->tab_count = 0;
     a->tab_active = -1;
     for (int ti = 0; ti < IDE_MAX_TABS; ti++) a->tabs[ti].used = 0;
+
+    /* AUDIT-9: a project root may be handed in as argv[1] -- from a compositor
+     * DI_PROJECT double-click, or the IDE_AUTOSTART proof boot. Validate before
+     * adopting; any missing/garbage input keeps the /usr/src default above.
+     *   - a real project dir (has project.json) -> load the manifest. This is
+     *     the SOLE runtime setter of a->project.active=1 (ide_project.c), which
+     *     is the single gate unblocking prebuilt Build/Run (ide_build.c). Root
+     *     the explorer at it and emit two headless proof markers.
+     *   - a real-but-non-project dir -> just browse it (active stays 0) so the
+     *     clicked icon shows that folder instead of silently falling back. */
+    if (argc >= 2 && argv && argv[1] && argv[1][0]) {
+        if (ide_project_is_project_dir(argv[1])) {
+            ide_project_load(&a->project, argv[1]);      /* sets project.active=1 */
+            ide_strlcpy(a->root, a->project.root, IDE_PATH);
+
+            /* MARKER 1 (fd1 -> serial): runtime proof the manifest was PARSED
+             * live -- kind=prebuilt can only appear if project.json was read
+             * (default kind is empty -> printed "c"), so it is not inspection. */
+            { char ln[256]; int k = 0;
+              const char* p1 = "[IDE] project active root=";
+              for (int i = 0; p1[i] && k < 255; i++) ln[k++] = p1[i];
+              for (int i = 0; a->project.root[i] && k < 255; i++) ln[k++] = a->project.root[i];
+              const char* p2 = " kind=";
+              for (int i = 0; p2[i] && k < 255; i++) ln[k++] = p2[i];
+              const char* kd = a->project.kind[0] ? a->project.kind : "c";
+              for (int i = 0; kd[i] && k < 255; i++) ln[k++] = kd[i];
+              if (k < 255) ln[k++] = '\n';
+              ide_sc(3 /*SYS_WRITE*/, 1, (long)ln, k, 0, 0, 0); }
+
+            /* MARKER 2: run the EXACT prebuilt gate now -> proves it FIRES and
+             * resolves the shipped ELF at runtime (precondition alone wouldn't). */
+            ide_prebuilt_probe(a);
+        } else {
+            ide_strlcpy(a->root, argv[1], IDE_PATH);     /* browse a plain folder */
+        }
+    }
 
     scan_project(a);
 
@@ -2789,14 +2826,18 @@ static void handle_key(Ide* a, int keycode, int pressed) {
 }
 
 /* ===========================================================================
- * _start -- entry point (matches the wl-direct app convention in notes.c:
- * a bare `void _start(void)`, no argc/argv, no return).
+ * main -- entry point. AUDIT-9: the IDE is now crt0-linked (build_all.sh links
+ * /tmp/crt0.o first) so it gets the kernel-built SysV argv frame -- the same
+ * proven path filemanager/cc/sed use. argv[1], when present, is an optional
+ * project root (compositor DI_PROJECT double-click, or the IDE_AUTOSTART proof
+ * boot); init() validates it. The event loop never returns; the trailing
+ * `return 0;` exists only to satisfy the int return type.
  * ==========================================================================*/
 
-void _start(void) {
+int main(int argc, char** argv) {
     Ide* a = &g_ide;
 
-    init(a);
+    init(a, argc, argv);
 
     if (wl_connect() != 0) {
         ide_exit(1);
@@ -2806,6 +2847,20 @@ void _start(void) {
     if (!win) {
         ide_exit(1);
     }
+
+#ifdef IDE_RUN_PROBE
+    /* AUDIT-9 end-to-end proof (IDE_RUN_PROBE build only -- separate from
+     * IDE_AUTOSTART so ide_prebuilt_smoke stays byte-stable). Drives the REAL
+     * Build->Run path once a project is loaded: ide_do_build runs the prebuilt
+     * gate (g_have=1, g_res.ok=1) and ide_do_run SYS_SPAWNs the resolved ELF,
+     * emitting the permanent '[IDE] run spawn pid=' marker; the launched DeadZone
+     * then reaches 'DEADZONE: ready'. Placed AFTER wl_create_window so the
+     * compositor is up and the spawned game connects as a 2nd client. */
+    if (a->project.active) {
+        ide_do_build(a);
+        ide_do_run(a);
+    }
+#endif
 
     /* Defensive: guarantee the landing view is the editable EDITOR workspace
      * with the editor (not the bottom terminal) owning the keyboard, so the
@@ -3033,5 +3088,6 @@ void _start(void) {
          * poll above. */
         ide_sc(SYS_YIELD, 0, 0, 0, 0, 0, 0);
     }
+    return 0;   /* unreachable: the event loop above never exits */
 }
 

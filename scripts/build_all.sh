@@ -37,9 +37,70 @@ if [ "${IDE:-0}" = "1" ]; then
     INIT_EXTRA="$INIT_EXTRA -DIDE_AUTOSTART"
     echo "*** IDE build: init compiled with -DIDE_AUTOSTART (auto-opens sbin/ide) ***"
 fi
+# IDE_RUN_PROBE=1 adds -DIDE_RUN_PROBE to the ide.c compile ONLY (AUDIT-9 end-to-
+# end proof: the IDE drives Build->Run on the loaded project at launch). Unset =>
+# ide.elf is byte-identical (IDE_CF empty -> the ide.c compile matches cc()).
+# Requires IDE=1 so init autostarts sbin/ide with the DeadZone project as argv[1].
+IDE_CF=""
+if [ "${IDE_RUN_PROBE:-0}" = "1" ]; then
+    IDE_CF="$IDE_CF -DIDE_RUN_PROBE"
+    echo "*** IDE_RUN_PROBE build: ide.c compiled with -DIDE_RUN_PROBE (drives Build->Run at launch) ***"
+fi
 if [ "${GAMETEST:-0}" = "1" ]; then
     INIT_EXTRA="$INIT_EXTRA -DGAMETEST_RUN"
     echo "*** GAMETEST build: init compiled with -DGAMETEST_RUN (spawns sbin/gametest) ***"
+fi
+# DZ_MPLIVE=1 adds -DDZ_MPLIVE to the init compile ONLY, so init spawns the
+# authoritative deadzoned server + the headless dzclient (DEADZONE-MP-LIVE-0):
+# a LIVE loopback co-op exchange that prints "DEADZONE: mp LIVE PASS". Unset =>
+# the normal boot is byte-for-byte unchanged (neither is ever spawned).
+if [ "${DZ_MPLIVE:-0}" = "1" ]; then
+    INIT_EXTRA="$INIT_EXTRA -DDZ_MPLIVE"
+    echo "*** DZ_MPLIVE build: init spawns deadzoned + dzclient (live loopback co-op proof) ***"
+fi
+# DZ_MP2=1 compiles dzclient.c with -DDZ_MP2 so the (single) spawned dzclient opens
+# TWO connections internally -- the MP-HELLO-0 headless 2-client proof (distinct
+# slots via DZ_HELLO). Use together with DZ_MPLIVE=1 (init spawns deadzoned + the
+# one dzclient). Unset => the normal single-connection dzclient.
+DZ_MP2_FLAG=""
+if [ "${DZ_MP2:-0}" = "1" ]; then
+    DZ_MP2_FLAG="-DDZ_MP2"
+    echo "*** DZ_MP2 build: dzclient compiled -DDZ_MP2 (2-connection co-op harness) ***"
+fi
+# DZ_GAMETEST=1 adds -DDZ_GAMETEST so init spawns sbin/deadzone, whose launch-time
+# headless selftests (systems/mp/loot) print to serial. Unset => normal boot.
+if [ "${DZ_GAMETEST:-0}" = "1" ]; then
+    INIT_EXTRA="$INIT_EXTRA -DDZ_GAMETEST"
+    echo "*** DZ_GAMETEST build: init spawns sbin/deadzone (selftest proof) ***"
+fi
+# DZ_SRVTEST=1 adds -DDZ_SRVTEST so init runs `deadzoned -t` (the authoritative
+# server self-test, which also proves inactive slots serialize as DZ_SLOT_EMPTY --
+# the MP phantom-teammate fix) and waits for it. Unset => normal boot unchanged.
+if [ "${DZ_SRVTEST:-0}" = "1" ]; then
+    INIT_EXTRA="$INIT_EXTRA -DDZ_SRVTEST"
+    echo "*** DZ_SRVTEST build: init runs deadzoned -t (phantom-slot proof) ***"
+fi
+# EX_ARGV_PROBE=1 adds -DEX_ARGV_PROBE so init spawns argvtest via SYS_SPAWN_EX_ARGV
+# with a spaced argv[1] -- proves the compositor's project-icon spawn ABI delivers a
+# path containing a space intact (no whitespace split). Unset => normal boot unchanged.
+if [ "${EX_ARGV_PROBE:-0}" = "1" ]; then
+    INIT_EXTRA="$INIT_EXTRA -DEX_ARGV_PROBE"
+    echo "*** EX_ARGV_PROBE build: init spawns argvtest via SYS_SPAWN_EX_ARGV (spaced-argv proof) ***"
+fi
+# TASKMAN_TEST=1 adds -DTASKMAN_TEST so init spawns sbin/taskman, which emits
+# [TASKMAN] starting + [TASKMAN] N procs (the TRUE live process count via
+# SYS_PROCLIST) -- proving the task manager reads real kernel data. Unset =>
+# normal boot never spawns it (taskman.elf still ships + is launchable normally).
+if [ "${TASKMAN_TEST:-0}" = "1" ]; then
+    INIT_EXTRA="$INIT_EXTRA -DTASKMAN_TEST"
+    echo "*** TASKMAN_TEST build: init spawns sbin/taskman (proclist proof) ***"
+fi
+# AUDIO_STREAMTEST=1 adds -DAUDIO_STREAMTEST so init spawns sbin/streamtest, the
+# userspace PCM-streaming proof (SYS_AUDIO_STREAM_WRITE). Pair with AUDIO_SELFTEST=1
+# (kernel, implies HDA_ENABLE). Unset => normal boot byte-for-byte unchanged.
+if [ "${AUDIO_STREAMTEST:-0}" = "1" ]; then
+    INIT_EXTRA="$INIT_EXTRA -DAUDIO_STREAMTEST"
+    echo "*** AUDIO_STREAMTEST build: init spawns sbin/streamtest (userspace stream proof) ***"
 fi
 # SHOWCASE=1: init auto-opens a curated set of headline GUI apps (sound manager,
 # AI cockpit, a game, the IDE) on top of the desktop, for documentation
@@ -616,6 +677,27 @@ $LD /tmp/ray.o    /tmp/wlc.o /tmp/bf.o /tmp/g3d.o -o /tmp/ray.elf
 # derby: 3D demolition derby (g3d arena + AI). Same link set as cube3d.
 cc userspace/apps/derby/derby.c   /tmp/derby.o
 $LD /tmp/derby.o  /tmp/wlc.o /tmp/bf.o /tmp/g3d.o -o /tmp/derby.elf
+# deadzone: first-person zombie-survival shooter (g3d FPS + waves). Same link set.
+cc userspace/apps/deadzone/deadzone.c /tmp/deadzone.o
+$LD /tmp/deadzone.o /tmp/wlc.o /tmp/bf.o /tmp/g3d.o -o /tmp/deadzone.elf
+# deadzoned: the DeadZone authoritative multiplayer game SERVER. A pure-syscall
+# TCP daemon (no wl/g3d) -- links only crt0, exactly like httpd/nc.
+cc userspace/apps/deadzoned/deadzoned.c /tmp/deadzoned.o
+$LD /tmp/crt0.o /tmp/deadzoned.o -o /tmp/deadzoned.elf
+# dzproto_test: headless cross-check of the shared dzproto.h wire protocol
+# (encode/decode round-trip for both packet families). Console binary.
+cc userspace/apps/deadzoned/dzproto_test.c /tmp/dzproto_test.o
+$LD /tmp/crt0.o /tmp/dzproto_test.o -o /tmp/dzproto_test.elf
+# dzclient: the DEADZONE-MP-LIVE-0 headless co-op client -- connects to deadzoned
+# over loopback (127.0.0.1), plays a scripted session, prints "DEADZONE: mp LIVE
+# PASS". Pure-syscall (no wl/g3d), links only crt0 like deadzoned. Always built;
+# only spawned when init is compiled with -DDZ_MPLIVE (DZ_MPLIVE=1).
+gcc $CF $DZ_MP2_FLAG -c userspace/apps/dzclient/dzclient.c -o /tmp/dzclient.o
+$LD /tmp/crt0.o /tmp/dzclient.o -o /tmp/dzclient.elf
+# streamtest: AUDIO B1 part-2 userspace PCM-streaming proof. Pure-syscall (no
+# wl/g3d), links only crt0. Always built; spawned only under -DAUDIO_STREAMTEST.
+cc userspace/apps/streamtest/streamtest.c /tmp/streamtest.o
+$LD /tmp/crt0.o /tmp/streamtest.o -o /tmp/streamtest.elf
 build_wl_app userspace/apps/sudoku/sudoku.c           sudoku
 build_wl_app userspace/apps/pacman/pacman.c           pacman
 build_wl_app userspace/apps/clockapp/clockapp.c       clockapp
@@ -674,8 +756,18 @@ fi
 echo "[all] IDE (Semantic LEGO Map)..."
 IDE_SRCS="ide ide_sys ide_gfx ide_lex ide_ast ide_pcore ide_pdecl ide_pstmt ide_pexpr ide_astprint ide_parse ide_semantic ide_explorer ide_funcs ide_map ide_codeview ide_inspector ide_runtime ide_chrome ide_gen elf_write as_x64 cc_type cc_codegen cc_expr tc_driver ide_build ide_editor ide_term ide_library ide_complete ide_config ide_project"
 IDE_OBJS=""
-for s in $IDE_SRCS; do cc userspace/apps/ide/$s.c /tmp/ide_$s.o; IDE_OBJS="$IDE_OBJS /tmp/ide_$s.o"; done
-$LD $IDE_OBJS /tmp/wlc.o /tmp/bf.o /tmp/font2.o /tmp/keymap.o -o /tmp/ide.elf
+for s in $IDE_SRCS; do
+  # ide.c carries the optional -DIDE_RUN_PROBE; all other IDE TUs use plain cc().
+  # With IDE_RUN_PROBE unset, IDE_CF is empty so this matches cc() byte-for-byte.
+  if [ "$s" = "ide" ]; then gcc $CF $IDE_CF -c userspace/apps/ide/$s.c -o /tmp/ide_$s.o;
+  else cc userspace/apps/ide/$s.c /tmp/ide_$s.o; fi
+  IDE_OBJS="$IDE_OBJS /tmp/ide_$s.o"
+done
+# AUDIT-9: link crt0 FIRST so ide.elf gets the kernel argv frame (_start -> main
+# (argc,argv)). ide.c's entry is now int main(); crt0.o is assembled at :216 and
+# already consumed by the cc.elf link at :738, so it exists here. ide_ide.o is
+# NOT in cc.elf's object list, so the _start->main rename can't collide there.
+$LD /tmp/crt0.o $IDE_OBJS /tmp/wlc.o /tmp/bf.o /tmp/font2.o /tmp/keymap.o -o /tmp/ide.elf
 
 # cc: the on-device C compiler (the self-hosting flagship). It is a thin driver
 # that REUSES the IDE's verified toolchain objects (lexer/parser/codegen/
@@ -692,7 +784,7 @@ $LD /tmp/crt0.o /tmp/cc.o \
     -o /tmp/cc.elf
 
 echo "[all] canary check (all must be 0):"
-for e in comp init filemanager calculator clock sysinfo settings sysmon uidemo dateapp applauncher taskman terminal editor snake paint synth tetris game2048 sheet notes calendar stopwatch mines piano dashboard welcome bench breakout pong invaders procmon soundtest solitaire aiconsole screenshot stress musicplayer ide bubbletd zombietd pacman clockapp forktest sigtest pollselftest threadtest reaploop forkfdtest forkregtest matmuljobs aibroker sed awk tar pkg make meminfo argvtest msgtest rpctest toolrun echoproof echoargs agenthost tool_read tool_ls tool_stat codeagent toolset_host chainhost modelbridge agentd tool_write tool_cc tool_exec tool_mkdir tool_mv tool_rm tool_spawn tool_kill tool_ps tool_shell tool_mouse tool_key tool_rollback ledgerver cockpit claudehost initrdp initrdalias floattest sleeptest prioritytest matbench tensortest cpuburn blk ps kill free uptime find diff cmp tee wcx xargs gzip cc nettest sockettest cpu1offload smpstress wget netman soundman cryptotest wlanctl wpasupp libtest ping nc netinfo netscan tcping dig httpget pktmon httpd traceroute arp grep head tail sort uniq cut tr nl du touch basename dirname uname hostname whoami date less hexdump lspci tlsprobe certtool dhcpc autodhcp apidemo gsignin js futextest epolltest sendfiletest perftest batchtest domtest htmltest csstest layouttest webtest browser2 webapitest cube3d ray chess asteroids sudoku photos startmenu controlcenter claudechat anthropic gametest exectest execchild; do
+for e in comp init filemanager calculator clock sysinfo settings sysmon uidemo dateapp applauncher taskman terminal editor snake paint synth tetris game2048 sheet notes calendar stopwatch mines piano dashboard welcome bench breakout pong invaders procmon soundtest solitaire aiconsole screenshot stress musicplayer ide bubbletd zombietd pacman clockapp forktest sigtest pollselftest threadtest reaploop forkfdtest forkregtest matmuljobs aibroker sed awk tar pkg make meminfo argvtest msgtest rpctest toolrun echoproof echoargs agenthost tool_read tool_ls tool_stat codeagent toolset_host chainhost modelbridge agentd tool_write tool_cc tool_exec tool_mkdir tool_mv tool_rm tool_spawn tool_kill tool_ps tool_shell tool_mouse tool_key tool_rollback ledgerver cockpit claudehost initrdp initrdalias floattest sleeptest prioritytest matbench tensortest cpuburn blk ps kill free uptime find diff cmp tee wcx xargs gzip cc nettest sockettest cpu1offload smpstress wget netman soundman cryptotest wlanctl wpasupp libtest ping nc netinfo netscan tcping dig httpget pktmon httpd traceroute arp grep head tail sort uniq cut tr nl du touch basename dirname uname hostname whoami date less hexdump lspci tlsprobe certtool dhcpc autodhcp apidemo gsignin js futextest epolltest sendfiletest perftest batchtest domtest htmltest csstest layouttest webtest browser2 webapitest cube3d ray derby deadzone deadzoned dzproto_test dzclient streamtest chess asteroids sudoku photos startmenu controlcenter claudechat anthropic gametest exectest execchild; do
     n=$(objdump -d /tmp/$e.elf 2>/dev/null | grep -c "fs:0x28" || true)
     echo "  $e=$n"
 done
@@ -714,7 +806,7 @@ if [ "${SELFHEAL:-0}" != "1" ]; then rm -f /tmp/ird/sbin/cwatchdog; fi
 rm -f /tmp/ird/sbin/browser /tmp/ird/bin/browser
 cp /tmp/comp.elf /tmp/ird/sbin/compositor
 cp /tmp/init.elf /tmp/ird/sbin/init
-for e in filemanager calculator clock sysinfo settings sysmon uidemo dateapp applauncher taskman terminal editor snake paint synth tetris game2048 sheet notes calendar stopwatch mines piano dashboard welcome bench breakout pong invaders procmon soundtest solitaire aiconsole screenshot stress musicplayer ide bubbletd startmenu controlcenter claudechat anthropic chess asteroids sudoku photos pacman clockapp zombietd forktest sigtest pollselftest threadtest reaploop forkfdtest forkregtest matmuljobs cube3d ray derby exectest; do
+for e in filemanager calculator clock sysinfo settings sysmon uidemo dateapp applauncher taskman terminal editor snake paint synth tetris game2048 sheet notes calendar stopwatch mines piano dashboard welcome bench breakout pong invaders procmon soundtest solitaire aiconsole screenshot stress musicplayer ide bubbletd startmenu controlcenter claudechat anthropic chess asteroids sudoku photos pacman clockapp zombietd forktest sigtest pollselftest threadtest reaploop forkfdtest forkregtest matmuljobs cube3d ray derby deadzone deadzoned dzproto_test dzclient streamtest exectest; do
     cp /tmp/$e.elf /tmp/ird/sbin/$e
 done
 [ "$IV_OK" = "1" ] && cp /tmp/imageviewer.elf /tmp/ird/sbin/imageviewer
@@ -884,6 +976,21 @@ cp userspace/apps/ide/sample/native/* /tmp/ird/usr/src/native/ 2>/dev/null || tr
 # Semantic LEGO Map can visualize its car/AI/physics/render structure.
 mkdir -p /tmp/ird/usr/src/derby
 cp userspace/apps/derby/derby.c /tmp/ird/usr/src/derby/ 2>/dev/null || true
+# cube3d + ray: shipped 3D games (sbin/cube3d, sbin/ray) that link wl/bitfont/g3d
+# -- seed their source under /usr/src so the IDE can open/map/edit them and the
+# /sbin-twin prebuilt fallback (ide_try_prebuilt) makes Build+Run work like derby.
+mkdir -p /tmp/ird/usr/src/cube3d
+cp userspace/apps/cube3d/cube3d.c /tmp/ird/usr/src/cube3d/ 2>/dev/null || true
+mkdir -p /tmp/ird/usr/src/ray
+cp userspace/apps/ray/ray.c /tmp/ird/usr/src/ray/ 2>/dev/null || true
+# DeadZone: the runnable FPS zombie-survival game (sbin/deadzone) AND an IDE
+# project so the Semantic LEGO Map visualizes its FPS/zombie/wave/render structure.
+mkdir -p /tmp/ird/usr/src/deadzone
+cp userspace/apps/deadzone/deadzone.c /tmp/ird/usr/src/deadzone/ 2>/dev/null || true
+# DeadZone multiplayer SERVER source as its own IDE project (authoritative sim +
+# wire protocol + bind/listen/accept loop -- the "host a server" half).
+mkdir -p /tmp/ird/usr/src/deadzoned
+cp userspace/apps/deadzoned/deadzoned.c /tmp/ird/usr/src/deadzoned/ 2>/dev/null || true
 # IDE "complex" library: editable disk snippets (*.snip) loaded at IDE startup
 # (built-in core lives in ide_library.c; this dir extends it without recompiling).
 mkdir -p /tmp/ird/usr/lib/snippets
@@ -902,6 +1009,16 @@ cp userspace/apps/ide/sample/gamestarter/*    /tmp/ird/usr/src/templates/gamesta
 cp userspace/apps/ide/sample/appstarter/*     /tmp/ird/usr/src/templates/appstarter/     2>/dev/null || true
 cp userspace/apps/ide/sample/servicestarter/* /tmp/ird/usr/src/templates/servicestarter/ 2>/dev/null || true
 mkdir -p /tmp/ird/Desktop
+# DeadZone as a FIRST-CLASS IDE PROJECT: a real /Desktop/Projects/DeadZone tree
+# (project.json manifest + src + prebuilt run target) so the in-OS Semantic-LEGO
+# IDE lists it under /Desktop/Projects, opens+parses the source, and Run launches
+# the fully-linked game (deadzone.c needs wl/bf/g3d, so the run target is the
+# prebuilt ELF -- on-device cc can't relink it, but open/browse/run all work).
+mkdir -p /tmp/ird/Desktop/Projects/DeadZone/src /tmp/ird/Desktop/Projects/DeadZone/build /tmp/ird/Desktop/Projects/DeadZone/res
+cp userspace/apps/deadzone/deadzone.c /tmp/ird/Desktop/Projects/DeadZone/src/ 2>/dev/null || true
+cp /tmp/deadzone.elf /tmp/ird/Desktop/Projects/DeadZone/build/deadzone.elf 2>/dev/null || true
+printf 'name=DeadZone\nlang=c\nentry=src/deadzone.c\nrun_target=build/deadzone.elf\nkind=prebuilt\n' > /tmp/ird/Desktop/Projects/DeadZone/project.json
+: > /tmp/ird/Desktop/Projects/DeadZone/res/.keep
 # Zombie Bastion: a Desktop FOLDER holding the game ELF. The compositor shows
 # /Desktop entries as icons; a folder opens the filemanager, where the .elf can
 # be launched. (The dock "Zt" icon launches it directly too.)

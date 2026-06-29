@@ -102,7 +102,9 @@ static void sem_add_port(Func* f, const char* name, PortType type,
                          PortDir dir, int fit, PortStatus status)
 {
     Port* p;
-    if (!f || f->nports >= M_MAXPORTS) return;
+    if (!f) return;
+    f->nports_true++;                       /* count EVERY intended port (incl. those */
+    if (f->nports >= M_MAXPORTS) return;    /* dropped past the 16-slot store cap)    */
     p = &f->ports[f->nports++];
     sem_cpy(p->name, name, M_NAME);
     p->type   = type;
@@ -152,6 +154,9 @@ static void sem_build_ports(Model* m, Func* f)
     int writes_shared = 0;
 
     f->nports = 0;
+    f->nports_true = 0;                 /* reset the cap-independent true count   */
+    f->wants_lifecycle = 0;            /* and the absent-gate intent (set below)  */
+    f->wants_gate = 0;
 
     /* PORT_INPUT per parameter. fit walks 90..96 then holds at 96. */
     for (i = 0; i < f->nparams && i < M_MAXPARAMS; i++) {
@@ -187,12 +192,16 @@ static void sem_build_ports(Model* m, Func* f)
         static const char* const gate_keys[] =
             { "cooldown", "gate", "ready", "can_", 0 };
 
-        /* Missing claim/lifecycle hook. */
+        /* Missing claim/lifecycle hook. Record the INTENT independently of
+         * whether the port fits in the 16-slot array, so coherence + the
+         * absent-gate risks/actions stay honest even when ports[] truncated. */
         if (!sem_calls_any(f, claim_keys)) {
+            f->wants_lifecycle = 1;
             sem_add_port(f, "claim_slot", PORT_LIFECYCLE, DIR_OUT, 94, PS_ABSENT);
         }
         /* Missing cooldown/control gate. */
         if (!sem_calls_any(f, gate_keys)) {
+            f->wants_gate = 1;
             sem_add_port(f, "cooldown_gate", PORT_CONTROL_GATE, DIR_OUT, 91, PS_ABSENT);
         }
     }
@@ -280,7 +289,14 @@ static const char* sem_absent_name(const Func* f, PortType type)
         if (f->ports[i].status == PS_ABSENT && f->ports[i].type == type)
             return f->ports[i].name;
     }
-    return "gate";
+    /* MAP-HONESTY: the absent gate may have overflowed the 16-slot ports[] store
+     * (its INTENT survives in Func.wants_*), so the scan above misses it. Return
+     * the canonical name by type -- matching the literals sem_build_ports passes
+     * to sem_add_port -- so a real hub's labels stay honest instead of the generic
+     * "gate" fallback (the residual cap artifact from the map-honesty brick). */
+    return type == PORT_LIFECYCLE    ? "claim_slot"
+         : type == PORT_CONTROL_GATE ? "cooldown_gate"
+         : "gate";
 }
 
 /*
@@ -322,8 +338,13 @@ static int sem_is_pool_like(const char* g)
 static void sem_analyze_focus(Model* m, Func* f, int focus)
 {
     int i;
-    int has_lifecycle = sem_has_absent(f, PORT_LIFECYCLE);
-    int has_gate      = sem_has_absent(f, PORT_CONTROL_GATE);
+    /* AUDIT honest-map (#3): read the absent-gate INTENT (set in sem_build_ports)
+     * rather than scanning the 16-slot ports[] -- otherwise a function whose
+     * absent gates were pushed past M_MAXPORTS loses its risks/actions AND keeps
+     * coherence=100, a pure cap artifact. Equivalent to the old sem_has_absent
+     * when not truncated (those gates are the only PS_ABSENT ports ever made). */
+    int has_lifecycle = f->wants_lifecycle;
+    int has_gate      = f->wants_gate;
     int coherence     = 100;
     char buf[64];
     char root[M_NAME];
@@ -445,10 +466,10 @@ static void sem_analyze_focus(Model* m, Func* f, int focus)
 
     /* ---------- COHERENCE ---------- */
 
-    /* -10 per absent port. */
-    for (i = 0; i < f->nports && i < M_MAXPORTS; i++) {
-        if (f->ports[i].status == PS_ABSENT) coherence -= 10;
-    }
+    /* -10 per absent gate, read from INTENT not the truncated ports[] array
+     * (#3: makes the score cap-independent; same result when not truncated). */
+    if (f->wants_lifecycle) coherence -= 10;
+    if (f->wants_gate)      coherence -= 10;
     /* -6 per high-severity risk (>75), -3 otherwise. */
     for (i = 0; i < m->nrisks && i < M_MAXRISKS; i++) {
         coherence -= (m->risks[i].score > 75) ? 6 : 3;
@@ -492,7 +513,8 @@ void model_analyze(Model* m)
     sem_analyze_focus(m, f, m->focus);
 
     /* (3) done. */
-    (void)sem_has_port;   /* retained helper; silence unused warning */
+    (void)sem_has_port;   /* retained helpers; silence unused warning */
+    (void)sem_has_absent; /* superseded by wants_* intent (#3) but kept */
     m->analyzed = 1;
 }
 

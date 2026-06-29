@@ -17,16 +17,16 @@
 #define M_TYPE        48
 #define M_MAXPARAMS   12
 #define M_MAXPORTS    16
-#define M_MAXCALLS    16
-#define M_MAXREFS     16
-#define M_MAXFUNCS    64
-#define M_MAXGLOBALS  64
-#define M_MAXCONNS    48
+#define M_MAXCALLS    40   /* real game hubs exceed 16 (deadzone _start: 37 calls) */
+#define M_MAXREFS     32   /* real game hubs exceed 16 (deadzone_reset: 30 writes) */
+#define M_MAXFUNCS    128   /* real game files exceed 64 (deadzone.c: 66 funcs) */
+#define M_MAXGLOBALS  128   /* real game files exceed 64 (deadzone.c: ~70 globals) */
+#define M_MAXCONNS    80   /* _start's inbound+outbound edges exceed 48 */
 #define M_MAXRISKS    12
 #define M_MAXACTIONS  10
-#define M_MAXFLOW     16
+#define M_MAXFLOW     64   /* per-function flow steps for a big game function */
 #define M_MAXINCLUDES 32
-#define M_MAXMACROS   32
+#define M_MAXMACROS   128   /* real game files exceed 32 (deadzone.c: 89 macros) */
 #define M_MAXRECORDS  32
 #define M_MAXPROTOS   32
 
@@ -67,7 +67,23 @@ typedef struct {
 
     Port  ports[M_MAXPORTS]; int nports;            /* filled by semantic   */
     int   closed;                                   /* IDA-style UI collapse */
+
+    /* AUDIT honest-map (decouple coherence from M_MAXPORTS + "+N more"):
+     * nports_true counts EVERY intended port -- including those past the
+     * M_MAXPORTS=16 store cap -- so the map can show "(N of T)" instead of
+     * silently understating, and coherence can read the absent-gate INTENT
+     * (wants_*) rather than scanning the truncated 16-slot array. */
+    int           nports_true;                      /* true intended port count */
+    unsigned char wants_lifecycle;                  /* a claim/lifecycle gate is absent */
+    unsigned char wants_gate;                       /* a cooldown/control gate is absent */
 } Func;
+
+/* Count of items hidden past a cap (true - shown, clamped >=0). Pure; shared by
+ * the map + inspector renderers AND the host map_caps selftest, so the "+N more"
+ * overflow logic is provable headlessly (only the pixel blit itself is not). */
+static inline int ide_more(int shown, int truec) {
+    return (truec > shown) ? (truec - shown) : 0;
+}
 
 /* ---- a global/state entity ---- */
 typedef struct {

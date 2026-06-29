@@ -63,6 +63,7 @@
 #include "../include/string.h"
 #include "../include/drivers.h"   /* timer_get_ticks_ms */
 #include "../include/mem.h"       /* kmalloc (heap-backed OOO side-table)  */
+#include "../include/rng.h"       /* rng_u64 (unpredictable ISN)           */
 
 /* ------------------------------------------------------------------ */
 /* Timeouts and retransmit parameters                                  */
@@ -72,6 +73,17 @@
 #define TCP_RTO_MAX_RETRIES   8       /* give up after this many retransmits*/
 #define TCP_CONNECT_MS        8000    /* total connect budget (ms)          */
 #define TCP_CLOSE_MS          4000    /* wait for FIN/ACK on close          */
+#define TCP_CLOSE_DRAIN_ITERS 4096    /* NET-HARDENING-2: short close-drain spin --
+                                       * loopback completes in a few iterations; a
+                                       * lossy close defers to background tcp_tick */
+/* Frozen-tick backstop: any wall-clock-bounded spin INSIDE a syscall must also
+ * cap consecutive iterations where now_ms() did not advance, because the PIT IRQ
+ * (the only thing that bumps the ms clock) cannot fire while the syscall runs
+ * with IF=0 -- so a pure wall-clock guard can never trip. Same value + pattern as
+ * resolve_mac's iter_cap (socket.c) and the zero-window persist loop below. */
+#define TCP_FROZEN_SPIN_CAP   200000
+#define TCP_TIMEWAIT_MS       60000   /* 2MSL linger before TIME_WAIT->CLOSED*/
+#define TCP_RTO_MIN_MS        200     /* RFC 6298 RTO floor (ms)            */
 
 /* sock_poll lives in socket.c. */
 int sock_poll(void);
@@ -142,6 +154,9 @@ static void tcp_ooo_clear(int idx) {
  */
 static uint8_t  tcp_rt_count[TCP_OOO_SLOTS];   /* retransmit attempt count */
 static uint32_t tcp_rt_rto_ms[TCP_OOO_SLOTS];  /* current RTO for backoff  */
+/* TCP-ROBUST (RFC 5681 fast retransmit): consecutive duplicate-ACK count per
+ * socket. Reset on every fresh arm/disarm and whenever snd_una advances. */
+static uint8_t  tcp_dupack[TCP_OOO_SLOTS];
 
 /*
  * Resolve a sock_t* to its stable slot index by scanning the socket
@@ -166,12 +181,79 @@ static int sock_index(const sock_t* s) {
 /* ------------------------------------------------------------------ */
 /* Helpers                                                             */
 /* ------------------------------------------------------------------ */
+#ifdef NET_SELFTEST
+/* RIG-TIME-HOOK: the boot test rig never calls sock_poll(), so timer-driven
+ * features (2MSL TIME_WAIT, RTO, ARP aging) cannot fire by inject->assert. This
+ * offset lets the rig fast-forward the clock deterministically (no wall-clock
+ * wait) so a directly-invoked tcp_tick() sees a deadline as expired. It is 0 in
+ * normal NET_SELFTEST runs (existing NETP1 tests do not advance it). Compiled
+ * out entirely without NET_SELFTEST -> the default kernel is byte-identical. */
+static uint64_t g_rig_clock_offset_ms = 0;
+void     tcp_rig_advance_ms(uint64_t ms) { g_rig_clock_offset_ms += ms; }
+void     tcp_rig_clock_reset(void)       { g_rig_clock_offset_ms = 0; }
+static uint64_t now_ms(void) { return timer_get_ticks_ms() + g_rig_clock_offset_ms; }
+uint64_t tcp_rig_now(void)   { return now_ms(); }
+#else
 static uint64_t now_ms(void) { return timer_get_ticks_ms(); }
+#endif
 
-/* A simple-ish ISN. Not security-relevant here; derive from the clock. */
-static uint32_t gen_isn(void) {
-    uint32_t t = (uint32_t)now_ms();
-    return (t * 2654435761u) ^ 0xDEADBEEFu;
+/* SipHash-2-4 (Aumasson/Bernstein) -- a fast keyed PRF. Used here as the keyed
+ * hash for the RFC 6528 ISN below; the only requirement for that use is that an
+ * attacker observing outputs cannot recover the key, which SipHash provides. */
+static inline uint64_t sip_rotl(uint64_t x, int b) {
+    return (x << b) | (x >> (64 - b));
+}
+static uint64_t siphash24(const uint8_t* in, uint32_t inlen,
+                          uint64_t k0, uint64_t k1) {
+    uint64_t v0 = 0x736f6d6570736575ULL ^ k0;
+    uint64_t v1 = 0x646f72616e646f6dULL ^ k1;
+    uint64_t v2 = 0x6c7967656e657261ULL ^ k0;
+    uint64_t v3 = 0x7465646279746573ULL ^ k1;
+    uint64_t b  = (uint64_t)inlen << 56;
+    uint32_t blocks = inlen & ~7u;
+#define SIP_ROUND() do {                                                  \
+        v0 += v1; v1 = sip_rotl(v1,13); v1 ^= v0; v0 = sip_rotl(v0,32);    \
+        v2 += v3; v3 = sip_rotl(v3,16); v3 ^= v2;                          \
+        v0 += v3; v3 = sip_rotl(v3,21); v3 ^= v0;                          \
+        v2 += v1; v1 = sip_rotl(v1,17); v1 ^= v2; v2 = sip_rotl(v2,32);    \
+    } while (0)
+    for (uint32_t off = 0; off < blocks; off += 8) {
+        uint64_t m = 0;
+        for (int i = 0; i < 8; i++) m |= (uint64_t)in[off + i] << (8 * i);
+        v3 ^= m; SIP_ROUND(); SIP_ROUND(); v0 ^= m;
+    }
+    for (uint32_t i = blocks; i < inlen; i++)
+        b |= (uint64_t)in[i] << (8 * (i - blocks));
+    v3 ^= b; SIP_ROUND(); SIP_ROUND(); v0 ^= b;
+    v2 ^= 0xff; SIP_ROUND(); SIP_ROUND(); SIP_ROUND(); SIP_ROUND();
+#undef SIP_ROUND
+    return v0 ^ v1 ^ v2 ^ v3;
+}
+
+/* NET-HARDENING-2 (RFC 6528 keyed ISN): ISN = M + SipHash(secret, 4-tuple). The
+ * 128-bit secret is drawn ONCE at boot from the RNG and never re-emitted, so an
+ * off-path attacker observing our ISNs cannot recover it (SipHash is a keyed PRF)
+ * and therefore cannot predict the ISN for a 4-tuple it wishes to spoof -- closing
+ * the synq_on_ack ack==isn+1 gate EVEN on RDRAND-less CPUs (T410 / QEMU default)
+ * where rng_u64() is a non-crypto xorshift128+: the remote attacker never sees the
+ * PRNG state, only ISNs, and SipHash does not leak the key through its outputs.
+ * (The prior gen_isn took the RNG's high bits directly, which a /dev/random reader
+ * who recovered the xorshift state could still predict -- a keyed hash removes that
+ * dependence on PRNG quality.) M is a coarse (~4us) timer so successive ISNs for
+ * the SAME 4-tuple advance, giving RFC 6528 old-incarnation safety after TIME_WAIT. */
+static uint32_t gen_isn(uint32_t l_ip, uint16_t l_port,
+                        uint32_t r_ip, uint16_t r_port) {
+    static uint64_t key0 = 0, key1 = 0;
+    static int      keyed = 0;
+    if (!keyed) { key0 = rng_u64(); key1 = rng_u64(); keyed = 1; }
+    uint8_t t[12];
+    t[0]=(uint8_t)(l_ip>>24); t[1]=(uint8_t)(l_ip>>16); t[2]=(uint8_t)(l_ip>>8); t[3]=(uint8_t)l_ip;
+    t[4]=(uint8_t)(l_port>>8); t[5]=(uint8_t)l_port;
+    t[6]=(uint8_t)(r_ip>>24); t[7]=(uint8_t)(r_ip>>16); t[8]=(uint8_t)(r_ip>>8); t[9]=(uint8_t)r_ip;
+    t[10]=(uint8_t)(r_port>>8); t[11]=(uint8_t)r_port;
+    uint64_t h = siphash24(t, 12, key0, key1);
+    uint32_t M = (uint32_t)(now_ms() * 250u);   /* ~4us tick (RFC 6528) */
+    return (uint32_t)h + M;
 }
 
 /* Free space left in the receive ring (= what we advertise as rcv_wnd). */
@@ -190,6 +272,17 @@ static uint16_t rcv_wnd(const sock_t* s) {
  * CHANGED: advertises rcv_wnd(s) (our free rx ring space) instead of
  * s->snd_wnd (peer's window), so the server knows when it can keep sending.
  */
+/* The IP source address for a TCP segment to `dst`. A loopback destination
+ * (127/8) must use a loopback source so the peer's replies are themselves
+ * loopback-routed by ip_tx -- otherwise a SYN-ACK addressed to net_get_ip()
+ * escapes to the NIC and the in-OS (client+server in one kernel) handshake never
+ * completes. Non-loopback returns net_get_ip() exactly as before (no behavior
+ * change for real-NIC TCP). The pseudo-header checksum is computed with this same
+ * source so it verifies against the source ip_tx actually stamps. */
+static inline uint32_t tcp_src_ip(uint32_t dst) {
+    return ((dst >> 24) == 127u) ? dst : net_get_ip();
+}
+
 static int tcp_xmit(sock_t* s, uint8_t flags, uint32_t seq, uint32_t ack,
                     const void* data, uint16_t len) {
     if (len > TCP_MSS) len = TCP_MSS;
@@ -211,7 +304,7 @@ static int tcp_xmit(sock_t* s, uint8_t flags, uint32_t seq, uint32_t ack,
     if (len && data) memcpy(seg + sizeof(tcp_hdr_t), data, len);
     uint16_t seg_len = (uint16_t)(sizeof(tcp_hdr_t) + len);
 
-    uint16_t ck = net_transport_checksum(net_get_ip(), s->remote_ip,
+    uint16_t ck = net_transport_checksum(tcp_src_ip(s->remote_ip), s->remote_ip,
                                          IPPROTO_TCP, seg, seg_len);
     th->checksum = net_htons(ck);
 
@@ -233,7 +326,10 @@ static void tcp_arm_retransmit(sock_t* s, uint8_t flags, uint32_t seq,
     s->rt_len        = (len > TCP_MSS) ? TCP_MSS : len;
     if (s->rt_len && data) memcpy(s->rt_data, data, s->rt_len);
     tcp_rt_count[idx] = 0;
-    tcp_rt_rto_ms[idx] = TCP_RTO_INIT_MS;
+    /* TCP-ROBUST adaptive RTO: seed from the smoothed estimate once we have one,
+     * else the conservative initial RTO. tcp_tick still doubles this on loss. */
+    tcp_rt_rto_ms[idx] = s->base_rto_ms ? s->base_rto_ms : TCP_RTO_INIT_MS;
+    tcp_dupack[idx] = 0;
 }
 
 /* Clear the retransmit machinery for this socket. */
@@ -243,11 +339,82 @@ static void tcp_disarm_retransmit(sock_t* s) {
     s->rt_done          = false;
     tcp_rt_count[idx]   = 0;
     tcp_rt_rto_ms[idx]  = TCP_RTO_INIT_MS;
+    tcp_dupack[idx]     = 0;
 }
 
 /* Send a pure ACK for the current rcv_nxt (no retransmit tracking). */
 static void tcp_send_ack(sock_t* s) {
     tcp_xmit(s, TCP_ACK, s->snd_nxt, s->rcv_nxt, NULL, 0);
+}
+
+/*
+ * TCP-ROBUST adaptive RTO (RFC 6298): fold one RTT sample into the smoothed
+ * estimator and recompute the base (un-backed-off) RTO. Integer fixed point;
+ * alpha=1/8, beta=1/4; clamped to [TCP_RTO_MIN_MS, TCP_RTO_MAX_MS]. Karn's
+ * rule (skip retransmitted segments) is enforced by the caller.
+ */
+static void tcp_rtt_update(sock_t* s, uint32_t r_ms) {
+    if (s->srtt_ms == 0) {
+        s->srtt_ms   = r_ms;          /* first sample */
+        s->rttvar_ms = r_ms / 2;
+    } else {
+        uint32_t srtt  = s->srtt_ms;
+        uint32_t delta = (srtt > r_ms) ? (srtt - r_ms) : (r_ms - srtt);
+        s->rttvar_ms = (3 * s->rttvar_ms + delta) / 4;   /* (1-1/4)var + 1/4|d| */
+        s->srtt_ms   = (7 * srtt + r_ms) / 8;            /* (1-1/8)srtt + 1/8 R  */
+    }
+    uint32_t rto = s->srtt_ms + 4 * s->rttvar_ms;
+    if (rto < TCP_RTO_MIN_MS) rto = TCP_RTO_MIN_MS;
+    if (rto > TCP_RTO_MAX_MS) rto = TCP_RTO_MAX_MS;
+    s->base_rto_ms = rto;
+}
+
+/*
+ * TCP-ROBUST: parse the TCP options that sit between the 20-byte fixed header
+ * and the data offset (ihl). Extracts MSS, window-scale, SACK-permitted, and
+ * timestamps. Walks kind/length defensively (bounded by ihl, malformed -> stop)
+ * since the segment is untrusted input. Stores onto the socket.
+ */
+static void tcp_parse_options(sock_t* s, const uint8_t* seg, uint16_t ihl) {
+    uint16_t i = sizeof(tcp_hdr_t);
+    while (i < ihl) {
+        uint8_t kind = seg[i];
+        if (kind == 0) break;               /* End-of-options */
+        if (kind == 1) { i++; continue; }   /* NOP */
+        if (i + 1 >= ihl) break;
+        uint8_t len = seg[i + 1];
+        if (len < 2 || i + len > ihl) break; /* malformed -> stop */
+        switch (kind) {
+            case 2:  if (len == 4)  s->peer_mss = (uint16_t)((seg[i+2] << 8) | seg[i+3]); break;
+            /* NET-HARDENING-2 (window-scaling decision): record the peer's shift
+             * count for diagnostics but DELIBERATELY do NOT apply it. RFC 7323
+             * window scaling is active only if BOTH peers send the WSCALE option
+             * in their SYN; this stack never EMITS one (our SYN/SYN-ACK carry no
+             * options), so the peer keeps its window UNSCALED and treating
+             * th->window as the literal window is correct. Applying snd_wscale
+             * without also advertising it would mis-scale a window the peer never
+             * scaled -- so it stays parsed-but-unused by design (not half-done). */
+            case 3:  if (len == 3)  { uint8_t w = seg[i+2]; s->snd_wscale = (w > 14) ? 14 : w; } break;
+            case 4:  if (len == 2)  s->peer_sack_ok = 1; break;
+            case 8:  if (len == 10) s->peer_ts_ok = 1; break;
+            default: break;
+        }
+        i += len;
+    }
+}
+
+/*
+ * TCP-ROBUST (RFC 5681 fast retransmit): resend the oldest unacked segment
+ * IMMEDIATELY on the 3rd duplicate ACK, instead of waiting a full RTO. Resets
+ * the RTO clock so the timer does not also fire right after. Does not touch the
+ * back-off count (that stays owned by tcp_tick).
+ */
+static void tcp_fast_retransmit(sock_t* s) {
+    if (!s->rt_pending) return;
+    uint32_t ack_val = (s->state == TCP_SYN_SENT) ? 0 : s->rcv_nxt;
+    tcp_xmit(s, s->rt_flags, s->rt_seq, ack_val,
+             s->rt_len ? s->rt_data : NULL, s->rt_len);
+    s->rt_time_ms = now_ms();
 }
 
 /* ------------------------------------------------------------------ */
@@ -301,7 +468,7 @@ static int tcp_xmit_raw(uint32_t remote_ip, uint16_t local_port,
     th->data_off = (uint8_t)((sizeof(tcp_hdr_t) / 4) << 4);
     th->flags    = flags;
     th->window   = net_htons(window);
-    th->checksum = net_htons(net_transport_checksum(net_get_ip(), remote_ip,
+    th->checksum = net_htons(net_transport_checksum(tcp_src_ip(remote_ip), remote_ip,
                                                     IPPROTO_TCP, seg,
                                                     sizeof(tcp_hdr_t)));
     return ip_tx(remote_ip, IPPROTO_TCP, seg, sizeof(tcp_hdr_t));
@@ -338,13 +505,21 @@ static void synq_on_syn(sock_t* listener, uint32_t src_ip, uint16_t src_port,
         e->src_ip     = src_ip;
         e->src_port   = src_port;
         e->local_port = listener->local_port;
-        e->isn        = gen_isn();
+        e->isn        = gen_isn(listener->local_ip, listener->local_port,
+                                src_ip, src_port);
         e->rcv_nxt    = seq + 1;          /* their SYN consumes one seq */
         e->born_ms    = now_ms();
-        e->retries    = 0;
     }
     e->peer_wnd   = peer_wnd;
     e->last_tx_ms = now_ms();
+    /* NET-HARDENING F5: a (re)transmitted SYN is fresh proof the peer is alive
+     * and still trying, so reset the SYN-ACK retransmit budget -- for BOTH a new
+     * half-open and a dup-SYN against an existing one. The old code reset it only
+     * on the new-entry path, so a peer that kept retransmitting its SYN (because
+     * it never saw our SYN-ACK) could still be evicted once tcp_synq_tick() hit
+     * TCP_SYNQ_MAX_RETRY. born_ms is left untouched so the TTL still caps the
+     * half-open's total lifetime -- a SYN flood can't pin an entry forever. */
+    e->retries    = 0;
     tcp_xmit_raw(src_ip, e->local_port, src_port, TCP_SYN | TCP_ACK,
                  e->isn, e->rcv_nxt, TCP_SYNQ_WND);
 }
@@ -554,27 +729,55 @@ int tcp_connect(sock_t* s, uint32_t dst_ip, uint16_t dst_port) {
     tcp_rt_count[idx]       = 0;
     tcp_rt_rto_ms[idx]      = TCP_RTO_INIT_MS;
 
-    uint32_t isn = gen_isn();
+    uint32_t isn = gen_isn(s->local_ip, s->local_port,
+                           s->remote_ip, s->remote_port);
     s->snd_una   = isn;
     s->snd_nxt   = isn + 1;        /* SYN consumes one seq */
     s->rcv_nxt   = 0;
     s->state     = TCP_SYN_SENT;
     s->reset     = false;
 
+    /* Arm BEFORE transmitting (see tcp_send): on the in-kernel loopback path the
+     * SYN-ACK is delivered + processed by lo_drain() inside the sock_poll() pump
+     * BELOW -- ip_tx() only ENQUEUES TCP loopback packets; their delivery is
+     * deferred to lo_drain() in sock_poll() -- and that processing disarms the
+     * retransmit. Arming AFTER the xmit would leave rt_pending re-armed for the
+     * (by then already-ACKed) SYN once the deferred ACK is processed, and nothing
+     * could clear it (the ms clock is frozen inside this IF=0 syscall, so no
+     * RTO-retransmit ever fires). Only the ORDER matters (arm before the disarm),
+     * not WHERE the disarm happens. */
+    tcp_arm_retransmit(s, TCP_SYN, isn, NULL, 0);
     if (tcp_xmit(s, TCP_SYN, isn, 0, NULL, 0) != 0) {
+        tcp_disarm_retransmit(s);
         s->state = TCP_CLOSED;
         return SOCK_ECONN;
     }
-    tcp_arm_retransmit(s, TCP_SYN, isn, NULL, 0);
 
-    /* Pump until ESTABLISHED, RST, or timeout. */
+    /* Pump until ESTABLISHED, RST, or timeout. The wall-clock guard ALONE cannot
+     * terminate this loop: now_ms() is frozen inside this IF=0 syscall, so a SYN
+     * to a non-listening loopback port (which tcp_input drops with NO RST) would
+     * spin forever and hang the whole cooperative OS. The frozen-tick backstop
+     * guarantees we bail to SOCK_ETIMEDOUT -- exactly the negative rc callers
+     * (e.g. dzclient's connect-retry) expect when the peer is not yet listening. */
     uint64_t start = now_ms();
+    uint64_t last  = start;
+    uint32_t frozen = 0;
     while (now_ms() - start < TCP_CONNECT_MS) {
         sock_poll();
         if (s->reset)                     { s->state = TCP_CLOSED; return SOCK_ECONN; }
         if (s->state == TCP_ESTABLISHED)  return SOCK_OK;
         if (s->state == TCP_CLOSED)       return SOCK_ECONN;
+        uint64_t n = now_ms();
+        if (n != last) { last = n; frozen = 0; }
+        else if (++frozen >= TCP_FROZEN_SPIN_CAP) break;
     }
+    /* NET-HARDENING F9: a timed-out/aborted active open must DROP its armed SYN
+     * retransmit before closing. Otherwise rt_pending stays true on a CLOSED
+     * socket and -- if the caller leaks the fd instead of close()ing it -- a later
+     * sock_poll()->tcp_tick() re-emits the stale SYN to the old remote (once the
+     * frozen wall-clock advances past the RTO), up to TCP_RTO_MAX_RETRIES times.
+     * Mirrors the disarm already done on the xmit-failure path above. */
+    tcp_disarm_retransmit(s);
     s->state = TCP_CLOSED;
     return SOCK_ETIMEDOUT;
 }
@@ -613,6 +816,8 @@ int tcp_send(sock_t* s, const void* data, uint16_t len) {
         if (in_flight >= TCP_CWND_INIT || s->rt_pending) {
             uint32_t old_una = s->snd_una;
             uint64_t start = now_ms();
+            uint64_t last  = start;
+            uint32_t frozen = 0;
             while (now_ms() - start < TCP_CONNECT_MS) {
                 sock_poll();
                 if (s->reset) return sent ? (int)sent : SOCK_ECONN;
@@ -630,6 +835,10 @@ int tcp_send(sock_t* s, const void* data, uint16_t len) {
                     in_flight = 0;
                     break;
                 }
+                /* Frozen-tick backstop (IF=0 syscall: now_ms() can't advance). */
+                uint64_t n = now_ms();
+                if (n != last) { last = n; frozen = 0; }
+                else if (++frozen >= TCP_FROZEN_SPIN_CAP) break;
             }
             /* If snd_una still hasn't moved, check if rt timed out. */
             if (in_flight >= TCP_CWND_INIT) {
@@ -644,9 +853,12 @@ int tcp_send(sock_t* s, const void* data, uint16_t len) {
             }
         }
 
-        /* Determine this segment's size: min(remaining, MSS, peer window). */
+        /* Determine this segment's size: min(remaining, effective-MSS, peer wnd).
+         * TCP-ROBUST: cap to the peer's advertised MSS when smaller than ours so
+         * we never oversize a segment a real server told us it won't accept. */
+        uint16_t eff_mss = (s->peer_mss && s->peer_mss < TCP_MSS) ? s->peer_mss : TCP_MSS;
         uint16_t chunk = (uint16_t)(len - sent);
-        if (chunk > TCP_MSS) chunk = TCP_MSS;
+        if (chunk > eff_mss) chunk = eff_mss;
         /* Respect peer's advertised send window (never send 0-window data).
          * NET-P1-C: the old guard (`snd_wnd > 0 && ...`) skipped the clamp
          * exactly when the window was ZERO, so the persist branch below was
@@ -697,15 +909,28 @@ int tcp_send(sock_t* s, const void* data, uint16_t len) {
         }
 
         uint32_t seq = s->snd_nxt;
-        if (tcp_xmit(s, TCP_ACK | TCP_PSH, seq, s->rcv_nxt,
-                     ptr + sent, chunk) != 0)
-            return sent ? (int)sent : SOCK_ECONN;
-
-        s->snd_nxt += chunk;
-        /* Arm retransmit for this latest segment (overwrites previous -- only
-         * the tail of the pipeline is retransmittable, which is acceptable for
-         * the common no-loss case and matches the single-slot rt_data design). */
+        /* Arm the retransmit BEFORE transmitting. On the in-kernel loopback path
+         * (127/8) ip_tx() only ENQUEUES the segment; it is delivered to the peer
+         * socket later by lo_drain() inside the sock_poll() pump below (the L855
+         * post-send poll and the final drain), the peer ACKs, and that ACK is
+         * processed (disarming rt_pending) -- all still WITHIN this tcp_send()
+         * call, just not literally inside tcp_xmit(). Arming first guarantees the
+         * arm precedes that deferred disarm; arming AFTER could leave rt_pending
+         * set with nothing able to clear it -- the only other trigger is an
+         * RTO-driven retransmit, but the ms clock is frozen inside this IF=0
+         * syscall (the drains rely on the frozen-tick backstop), so the "final
+         * drain" below would otherwise spin (this is what hung in-OS loopback
+         * data transfer). Only the ORDER matters, not where the disarm happens;
+         * on the NIC path the ACK arrives even later via sock_poll(). Overwrites
+         * any previous arm -- only the pipeline tail is retransmittable, matching
+         * the single-slot rt_data design. */
         tcp_arm_retransmit(s, TCP_ACK | TCP_PSH, seq, ptr + sent, chunk);
+        if (tcp_xmit(s, TCP_ACK | TCP_PSH, seq, s->rcv_nxt,
+                     ptr + sent, chunk) != 0) {
+            tcp_disarm_retransmit(s);
+            return sent ? (int)sent : SOCK_ECONN;
+        }
+        s->snd_nxt += chunk;
         sent = (uint16_t)(sent + chunk);
         in_flight++;
 
@@ -717,12 +942,19 @@ int tcp_send(sock_t* s, const void* data, uint16_t len) {
     }
 
     /* Final drain: wait briefly for the last segment's ACK so the caller
-     * doesn't close the connection before the peer has confirmed receipt. */
+     * doesn't close the connection before the peer has confirmed receipt. The
+     * frozen-tick backstop is essential: now_ms() can't advance inside this IF=0
+     * syscall, so without it a never-ACKed loopback segment would spin forever. */
     if (s->rt_pending) {
         uint64_t start = now_ms();
+        uint64_t last  = start;
+        uint32_t frozen = 0;
         while (s->rt_pending && now_ms() - start < TCP_CONNECT_MS) {
             sock_poll();
             if (s->reset) break;
+            uint64_t n = now_ms();
+            if (n != last) { last = n; frozen = 0; }
+            else if (++frozen >= TCP_FROZEN_SPIN_CAP) break;
         }
     }
 
@@ -751,7 +983,18 @@ int tcp_recv(sock_t* s, void* buf, uint16_t len) {
     if (s->reset) return SOCK_ECONN;
 
     if (s->rx_used > 0) {
-        return (int)rx_ring_pop(s, (uint8_t*)buf, len);
+        uint16_t wnd_before = rcv_wnd(s);
+        uint32_t got = rx_ring_pop(s, (uint8_t*)buf, len);
+        /* NET-HARDENING-1 (SWS / receiver window reopen, RFC 813): if draining the
+         * ring just reopened our advertised window from below one MSS to >= one
+         * MSS, emit an immediate window-update ACK. Otherwise a sender parked in
+         * its zero-window persist loop only learns of the reopened window via its
+         * own exponential-backoff probe (up to ~30 s later). Fires only on the
+         * below-MSS -> open transition, so it cannot ACK-storm. */
+        if (s->state == TCP_ESTABLISHED && wnd_before < TCP_MSS &&
+            rcv_wnd(s) >= TCP_MSS)
+            tcp_send_ack(s);
+        return (int)got;
     }
     /* Peer closed and ring drained -> EOF. */
     if (s->state == TCP_CLOSE_WAIT || s->state == TCP_CLOSED ||
@@ -775,13 +1018,31 @@ int tcp_close(sock_t* s) {
         tcp_xmit(s, TCP_FIN | TCP_ACK, seq, s->rcv_nxt, NULL, 0);
         s->snd_nxt += 1;   /* FIN consumes one seq */
         tcp_arm_retransmit(s, TCP_FIN | TCP_ACK, seq, NULL, 0);
-        s->state = (s->state == TCP_CLOSE_WAIT) ? TCP_TIME_WAIT : TCP_FIN_WAIT;
+        /* NET-HARDENING-2: passive close (CLOSE_WAIT) -> LAST_ACK so tcp_tick
+         * RETRANSMITS our FIN until the peer ACKs it (the old CLOSE_WAIT->TIME_WAIT
+         * never retransmitted a lost passive-close FIN); active close -> FIN_WAIT. */
+        s->state = (s->state == TCP_CLOSE_WAIT) ? TCP_LAST_ACK : TCP_FIN_WAIT;
+        s->time_wait_ms = now_ms();
 
-        uint64_t start = now_ms();
-        while (now_ms() - start < TCP_CLOSE_MS) {
+        /* Brief drain: on loopback the peer ACKs our FIN within a few polls and
+         * the close completes synchronously (-> CLOSED/TIME_WAIT, freed below). A
+         * short iteration cap keeps the syscall fast; if our FIN is still un-acked
+         * when it expires (a lossy NIC close), DEFER teardown to background. */
+        uint32_t spins = 0;
+        while (spins++ < TCP_CLOSE_DRAIN_ITERS) {
             sock_poll();
             if (s->state == TCP_CLOSED || s->state == TCP_TIME_WAIT) break;
+            if (!s->rt_pending) break;   /* our FIN was acked */
         }
+
+        /* DEFERRED TEARDOWN: if our FIN is still outstanding, leave the socket in
+         * its closing state (FIN_WAIT / LAST_ACK) with rt_pending armed. sock_close()
+         * orphans it and tcp_tick() retransmits the FIN under the advancing clock,
+         * reaping it once the FIN is acked or the retry budget is exhausted. On a
+         * completed (loopback) close rt_pending is clear, so we fall through to
+         * CLOSED and the slot is freed immediately as before. */
+        if (s->rt_pending && s->state != TCP_CLOSED && s->state != TCP_TIME_WAIT)
+            return SOCK_OK;
     }
     s->state = TCP_CLOSED;
     return SOCK_OK;
@@ -805,10 +1066,26 @@ int tcp_close(sock_t* s) {
  */
 void tcp_input(uint32_t src_ip, uint32_t dst_ip,
                const uint8_t* seg, uint16_t seg_len) {
-    (void)dst_ip;
     if (seg_len < sizeof(tcp_hdr_t)) return;
 
     const tcp_hdr_t* th = (const tcp_hdr_t*)seg;
+
+    /* TCP-ROBUST (RX checksum verification): the checksum covers the IPv4
+     * pseudo-header + TCP header + payload, so a VALID segment sums to 0
+     * (net_transport_checksum returns the final ~sum). Corrupt -> silent drop
+     * (the peer retransmits); never let corrupt bytes reach the stream.
+     *
+     * NET-HARDENING-1: a checksum FIELD of 0 is tolerated ONLY for loopback
+     * (127/8) sources -- in-kernel injectors / lo_drain leave it 0. A NIC-
+     * delivered TCP segment MUST carry a real checksum (TCP checksum is
+     * mandatory; a 0 there is corruption or forgery), so it is verified
+     * unconditionally. The martian filter already guarantees a 127/8 src can
+     * only have arrived via lo_drain, so this cannot be spoofed from the wire. */
+    if (!(((src_ip >> 24) == 127u) && th->checksum == 0) &&
+        net_transport_checksum(src_ip, dst_ip, IPPROTO_TCP, seg, seg_len) != 0) {
+        return;
+    }
+
     uint16_t src_port = net_ntohs(th->src_port);
     uint16_t dst_port = net_ntohs(th->dst_port);
 
@@ -826,17 +1103,44 @@ void tcp_input(uint32_t src_ip, uint32_t dst_ip,
     const uint8_t* payload     = seg + ihl;
     uint16_t       payload_len = (uint16_t)(seg_len - ihl);
 
-    /* Update peer's advertised window on every non-RST segment. */
-    s->snd_wnd = net_ntohs(th->window);
-
-    /* RST: mark connection reset; clear retransmit; leave state alive
-     * so tcp_recv() can return SOCK_ECONN to the caller. */
+    /* RST handling. Done BEFORE the window update (NET-HARDENING F6): a RST
+     * carries no meaningful advertised window, so writing snd_wnd from it would
+     * clobber the peer's last real value.
+     *
+     * NET-HARDENING F12 (RFC 793 / RFC 5961): a RST must be VALIDATED before it
+     * is honored. The old code reset on ANY RST matching the 4-tuple, so a single
+     * stray/forged RST to a listening port set the LISTENER to CLOSED -- killing
+     * accept() and (via synq_listener()==NULL) collapsing every pending half-open
+     * -- and any off-path RST blind-tore-down an ESTABLISHED connection. */
     if (flags & TCP_RST) {
+        if (s->state == TCP_LISTEN)
+            return;                       /* RFC 793: ignore a RST in LISTEN */
+        if (s->state == TCP_SYN_SENT) {
+            /* RFC 793: a RST during active open is acceptable only if it ACKs
+             * the SYN we sent; otherwise it is not for this connection. */
+            if (!(flags & TCP_ACK) || !SEQ32_GEQ(ack, s->snd_nxt))
+                return;
+        } else {
+            /* RFC 5961: in a synchronized state honor the RST only if its seq is
+             * inside the current receive window (seq==rcv_nxt always qualifies,
+             * covering a zero window); an off-window / blind RST is dropped. */
+            uint32_t winhi = s->rcv_nxt + rcv_wnd(s);
+            if (seq != s->rcv_nxt &&
+                (!SEQ32_GEQ(seq, s->rcv_nxt) || SEQ32_GEQ(seq, winhi)))
+                return;
+        }
         s->reset = true;
         s->state = TCP_CLOSED;
         tcp_disarm_retransmit(s);
         return;
     }
+
+    /* Update peer's advertised window on every non-RST segment. Capture the
+     * PREVIOUS window first: RFC 5681 defines a duplicate ACK (the fast-
+     * retransmit trigger) as one whose advertised window is UNCHANGED -- a pure
+     * window update is NOT a dup-ACK (NET-HARDENING F4). */
+    uint16_t prev_snd_wnd = s->snd_wnd;
+    s->snd_wnd = net_ntohs(th->window);
 
     switch (s->state) {
     case TCP_LISTEN:
@@ -876,6 +1180,9 @@ void tcp_input(uint32_t src_ip, uint32_t dst_ip,
         if ((flags & TCP_SYN) && (flags & TCP_ACK)) {
             /* CHANGED: SEQ32_GEQ for wraparound-safe ack check. */
             if (!SEQ32_GEQ(ack, s->snd_nxt)) { /* unexpected ack */ return; }
+            /* TCP-ROBUST: learn the server's options (MSS/wscale/SACK/TS) from
+             * its SYN-ACK so our send path can size segments to the peer's MSS. */
+            tcp_parse_options(s, seg, ihl);
             s->rcv_nxt = seq + 1;          /* their SYN consumes one seq */
             s->snd_una = ack;
             tcp_disarm_retransmit(s);       /* our SYN is acked */
@@ -891,26 +1198,63 @@ void tcp_input(uint32_t src_ip, uint32_t dst_ip,
     case TCP_ESTABLISHED:
     case TCP_CLOSE_WAIT:
     case TCP_FIN_WAIT:
+    case TCP_LAST_ACK:        /* NET-HARDENING-2: process the peer's ACK of our FIN */
     case TCP_TIME_WAIT: {
         /* ----------------------------------------------------------
          * ACK processing: free outstanding segment if fully covered.
          * CHANGED: SEQ32_GEQ for wraparound; also update snd_una.
          * ---------------------------------------------------------- */
-        if (flags & TCP_ACK) {
+        /* NET-HARDENING F13 (RFC 793 ACK acceptability): ignore an ACK that
+         * acknowledges data we never sent (ack > snd_nxt). Without this an
+         * off-path/forged ACK advances snd_una PAST snd_nxt, corrupting the send
+         * sequence space (every later SEQ32 comparison, RTT sampling, and the
+         * dup-ACK / fast-retransmit logic). Acceptable iff ack <= snd_nxt. */
+        if ((flags & TCP_ACK) && SEQ32_GEQ(s->snd_nxt, ack)) {
+            int idx = sock_index(s);
             if (s->rt_pending) {
                 uint32_t end = s->rt_seq + s->rt_len +
                                ((s->rt_flags & (TCP_SYN | TCP_FIN)) ? 1u : 0u);
                 if (SEQ32_GEQ(ack, end)) {
-                    tcp_disarm_retransmit(s);
+                    /* TCP-ROBUST adaptive RTO (RFC6298 + Karn): sample RTT only
+                     * for a segment that was NOT retransmitted (count==0), so an
+                     * ambiguous ACK never corrupts the estimator. */
+                    if (tcp_rt_count[idx] == 0)
+                        tcp_rtt_update(s, (uint32_t)(now_ms() - s->rt_time_ms));
+                    tcp_disarm_retransmit(s);   /* also resets tcp_dupack[idx] */
                     s->snd_una = ack;
+                } else if (ack == s->snd_una && payload_len == 0 &&
+                           (flags & (TCP_SYN | TCP_FIN)) == 0 &&
+                           s->snd_wnd == prev_snd_wnd &&
+                           s->state == TCP_ESTABLISHED) {
+                    /* TCP-ROBUST (RFC 5681 fast retransmit): a duplicate ACK
+                     * does not advance snd_una, carries no data, AND advertises
+                     * an UNCHANGED window (NET-HARDENING F4: a pure window update
+                     * -- same ack, no data, different window -- is the receiver
+                     * opening/shrinking its buffer, NOT a sign of loss; counting
+                     * it would spuriously trip fast-retransmit). The 3rd genuine
+                     * dup means a segment was almost certainly lost -> resend the
+                     * oldest unacked segment NOW (~RTT recovery vs a full RTO).
+                     * Fires exactly once at 3 (== not >=), so later dups don't
+                     * re-storm the wire. */
+                    if (++tcp_dupack[idx] == 3) {
+                        tcp_fast_retransmit(s);
+                    }
                 }
             } else {
                 /* Update snd_una even if no retransmit is pending (covers
                  * cumulative ACKs for previously delivered segments). */
-                if (SEQ32_GT(ack, s->snd_una)) s->snd_una = ack;
+                if (SEQ32_GT(ack, s->snd_una)) { s->snd_una = ack; tcp_dupack[idx] = 0; }
             }
             if (s->state == TCP_FIN_WAIT && SEQ32_GEQ(ack, s->snd_nxt)) {
                 s->state = TCP_TIME_WAIT;   /* our FIN acked */
+                s->time_wait_ms = now_ms(); /* 2MSL: start the linger clock */
+            }
+            /* NET-HARDENING-2: in passive close (LAST_ACK) the peer ACKing our
+             * FIN completes the close -> CLOSED (an orphaned socket is then
+             * reaped by tcp_tick). */
+            if (s->state == TCP_LAST_ACK && SEQ32_GEQ(ack, s->snd_nxt)) {
+                tcp_disarm_retransmit(s);
+                s->state = TCP_CLOSED;
             }
         }
 
@@ -951,8 +1295,14 @@ void tcp_input(uint32_t src_ip, uint32_t dst_ip,
                  * slot FARTHEST from rcv_nxt if this segment is nearer
                  * (earlier data fills the gap sooner). No buffer (alloc
                  * failed at boot) degrades to drop + re-ACK: correct, the
-                 * peer retransmits in order. */
-                if (tcp_ooo) {
+                 * peer retransmits in order.
+                 * NET-HARDENING-2 (RFC 793 receive-window acceptability): only
+                 * buffer a future segment that falls WITHIN the advertised window
+                 * [rcv_nxt, rcv_nxt + rcv_wnd). An out-of-window (arbitrarily far)
+                 * segment is dropped (not buffered) so a peer/attacker cannot
+                 * pollute the OOO slots with data that can never drain; we still
+                 * re-ACK rcv_nxt so a legitimate sender retransmits in window. */
+                if (tcp_ooo && !SEQ32_GEQ(seq, s->rcv_nxt + rcv_wnd(s))) {
                     int idx = sock_index(s);
                     tcp_ooo_slot_t* dst = NULL;
                     tcp_ooo_slot_t* far = NULL;
@@ -995,18 +1345,52 @@ void tcp_input(uint32_t src_ip, uint32_t dst_ip,
          * consumed above (seq + payload_len == rcv_nxt after push).
          * ---------------------------------------------------------- */
         if (flags & TCP_FIN) {
+            /* TCP-ROBUST 2MSL: a FIN retransmitted by the peer during TIME_WAIT
+             * (its ACK of our FIN was lost) is ABSORBED -- re-ACK it and restart
+             * the 2MSL linger (RFC 793) so the peer's close completes cleanly.
+             *
+             * NET-HARDENING-1 (FIN_WAIT-2 absorb fix): only absorb an ALREADY-
+             * consumed/duplicate FIN (seq < rcv_nxt). The active-close path
+             * collapses FIN_WAIT->TIME_WAIT on the ACK of our FIN BEFORE consuming
+             * the peer's FIN (no FIN_WAIT_2 state), so a FIRST-TIME in-order FIN
+             * (seq == rcv_nxt) can arrive here; it must fall through to the in-
+             * order branch below to advance rcv_nxt and ACK the peer's FIN with
+             * the correct cumulative ack (rcv_nxt+1). The old code re-ACKed a
+             * STALE rcv_nxt, so the peer never saw its FIN acknowledged and
+             * retransmitted to RTO exhaustion (clean close -> RST). */
+            if (s->state == TCP_TIME_WAIT && SEQ32_GT(s->rcv_nxt, seq)) {
+                tcp_send_ack(s);
+                s->time_wait_ms = now_ms();
+                return;
+            }
             /* In-order FIN: advance rcv_nxt. */
             if (seq + payload_len == s->rcv_nxt) {
                 s->rcv_nxt += 1;   /* FIN consumes one seq */
                 tcp_send_ack(s);
                 if (s->state == TCP_ESTABLISHED)   s->state = TCP_CLOSE_WAIT;
-                else if (s->state == TCP_FIN_WAIT) s->state = TCP_TIME_WAIT;
-            } else if (seq == s->rcv_nxt) {
-                /* FIN with no data (common simultaneous FIN). */
+                else if (s->state == TCP_FIN_WAIT) { s->state = TCP_TIME_WAIT; s->time_wait_ms = now_ms(); }
+            } else if (seq == s->rcv_nxt && payload_len == 0) {
+                /* FIN with no data (common simultaneous FIN). The payload_len==0
+                 * guard is load-bearing: a FIN piggybacked on in-order data whose
+                 * payload was DROPPED (rx ring full -> rx_ring_push returned 0, so
+                 * rcv_nxt did not advance) leaves seq==rcv_nxt with payload_len>0.
+                 * Without the guard this branch would consume the FIN at the wrong
+                 * sequence (rcv_nxt += 1 mid-stream) and falsely ACK dropped bytes.
+                 * Excluding it lets the segment fall through + re-ACK current
+                 * rcv_nxt, so the peer retransmits data+FIN together. */
                 s->rcv_nxt += 1;
                 tcp_send_ack(s);
                 if (s->state == TCP_ESTABLISHED)   s->state = TCP_CLOSE_WAIT;
-                else if (s->state == TCP_FIN_WAIT) s->state = TCP_TIME_WAIT;
+                else if (s->state == TCP_FIN_WAIT) { s->state = TCP_TIME_WAIT; s->time_wait_ms = now_ms(); }
+            } else if (payload_len == 0 && SEQ32_GT(s->rcv_nxt, seq)) {
+                /* NET-HARDENING F10 (RFC 793): a DUPLICATE, already-consumed FIN
+                 * (seq < rcv_nxt) -- the peer retransmitted it because our ACK of
+                 * its FIN was lost. Re-ACK so the actively-closing peer's FIN is
+                 * acknowledged and it stops retransmitting; otherwise it exhausts
+                 * its RTO budget and turns what was a clean close into a RESET.
+                 * Mirrors the TIME_WAIT absorb above; fires only for an old pure
+                 * FIN, so it never re-ACKs in-order data and cannot ACK-storm. */
+                tcp_send_ack(s);
             }
             /* If FIN arrived OOO just ACK current position; we'll re-process
              * it when the gap fills (limitation: no FIN in OOO slot). */
@@ -1029,6 +1413,25 @@ void tcp_input(uint32_t src_ip, uint32_t dst_ip,
  * counters tcp_rt_count[] / tcp_rt_rto_ms[].
  */
 void tcp_tick(sock_t* s) {
+    /* NET-HARDENING-2 (orphan reaper): a socket the app already closed but whose
+     * FIN was DEFERRED (orphaned by sock_close) is freed the moment its close
+     * completes -- as soon as it reaches CLOSED or TIME_WAIT. An orphan gets NO
+     * 2MSL linger, so even a lossy-NIC close cannot pin a slot (the audit's
+     * table-exhaustion hazard); it only lived long enough to retransmit the FIN. */
+    if (s->orphaned && (s->state == TCP_CLOSED || s->state == TCP_TIME_WAIT)) {
+        memset(s, 0, sizeof(*s));
+        return;
+    }
+
+    /* TCP-ROBUST 2MSL: reap a TIME_WAIT socket once the 2MSL linger elapses, so
+     * it no longer sits in TIME_WAIT forever (the prior behavior). A TIME_WAIT
+     * socket has no outstanding segment, so this must precede the rt_pending
+     * early-return. (Proven deterministically via the RIG-TIME-HOOK clock.) */
+    if (s->state == TCP_TIME_WAIT) {
+        if (now_ms() - s->time_wait_ms >= TCP_TIMEWAIT_MS) s->state = TCP_CLOSED;
+        return;
+    }
+
     if (!s->rt_pending) return;
 
     int idx        = sock_index(s);
@@ -1040,9 +1443,9 @@ void tcp_tick(sock_t* s) {
         /* Exhausted retries: give up. */
         tcp_disarm_retransmit(s);
         if (s->state == TCP_SYN_SENT || s->state == TCP_ESTABLISHED ||
-            s->state == TCP_FIN_WAIT) {
+            s->state == TCP_FIN_WAIT || s->state == TCP_LAST_ACK) {
             s->reset = true;
-            s->state = TCP_CLOSED;
+            s->state = TCP_CLOSED;   /* orphan reaped on the next tick */
         }
         return;
     }

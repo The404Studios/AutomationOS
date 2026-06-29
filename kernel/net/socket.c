@@ -47,6 +47,29 @@ static uint16_t g_next_port = 49152;   /* ephemeral range start */
 static uint8_t g_rx[ETH_MAX_FRAME];
 /* TX scratch for ip_tx(). */
 static uint8_t g_tx[ETH_MAX_FRAME];
+/* A4: loopback (127/8) delivery. A self-addressed IPv4 packet is fed back into
+ * the demux, never near ARP/Ethernet/the NIC. Delivery is ITERATIVE via a small
+ * ring, NOT a synchronous recursive call into ipv4_demux(): a TCP data exchange
+ * loops as send -> demux -> peer ACKs -> ip_tx -> demux -> ..., and doing that
+ * recursively overflows the 8 KB kernel stack (each tcp_xmit carries a ~1.5 KB
+ * on-stack segment buffer). So ip_tx() ENQUEUES the loopback packet and, unless a
+ * drain is already running, drains the ring in a loop; nested ip_tx() calls made
+ * from inside the drain just enqueue and return -- the outer loop delivers them.
+ * This bounds the kernel-stack depth to a single demux chain while preserving
+ * SYNCHRONOUS completion (the peer's reply is delivered before the top-level
+ * ip_tx() returns -- connect()/send() rely on that). */
+#define LO_Q_SLOTS  16   /* NET-HARDENING F7: headroom for multi-client loopback
+                          * bursts (e.g. a server broadcasting one snapshot to
+                          * several connected clients per tick before a drain). */
+static uint8_t  lo_q[LO_Q_SLOTS][ETH_MAX_FRAME];
+static uint16_t lo_q_len[LO_Q_SLOTS];
+static int      lo_q_head;      /* next slot to deliver                        */
+static int      lo_q_tail;      /* next slot to fill                           */
+static int      lo_draining;    /* re-entrancy guard: 1 while the drain runs    */
+
+/* ipv4_demux() is defined later in this file; the A4 loopback short-circuit at
+ * the head of ip_tx() needs it. */
+static void ipv4_demux(const uint8_t* ip_start, uint16_t ip_avail, int from_loopback);
 
 static sock_t* sock_from_fd(int fd) {
     if (!g_socks) return NULL;
@@ -226,7 +249,10 @@ static int ip_send_fragment(uint8_t dmac[ETH_ALEN], uint32_t dst_ip,
         netif_t* nif = 0;
         if (netif_get_by_ip(net_get_ip(), &nif) != 0) nif = 0;
         if (!nif) nif = netif_get_default();
-        if (nif && nif->tx) return (nif->tx(f, total) > 0) ? 0 : -1;
+        if (nif && nif->tx) {
+            nif->tx_packets++; nif->tx_bytes += total;   /* NET-RESILIENCE-OBS */
+            return (nif->tx(f, total) > 0) ? 0 : -1;
+        }
     }
     return (net_send(f, total) > 0) ? 0 : -1;
 }
@@ -239,8 +265,92 @@ static int ip_send_fragment(uint8_t dmac[ETH_ALEN], uint32_t dst_ip,
  * Fragments if seg_len > MTU payload (1480 bytes).
  * Returns 0 on success.
  */
+/* Deliver all queued loopback packets, one demux chain at a time. The guard
+ * makes a nested ip_tx() issued from inside ipv4_demux() during the drain only
+ * ENQUEUE (this loop then picks it up), so the kernel-stack depth stays bounded
+ * to a single demux chain no matter how many packets ping-pong. Called inline by
+ * ip_tx() for UDP (one-way) and from sock_poll() for TCP (whose reply cascade
+ * would otherwise stack multiple ~1.5 KB tcp_xmit frames and overflow). */
+static void lo_drain(void) {
+    if (lo_draining) return;
+    lo_draining = 1;
+    while (lo_q_head != lo_q_tail) {
+        uint8_t*  p    = lo_q[lo_q_head];
+        uint16_t  plen = lo_q_len[lo_q_head];
+        ipv4_demux(p, plen, 1);   /* trusted loopback path */
+        lo_q_head = (lo_q_head + 1) % LO_Q_SLOTS;
+    }
+    lo_draining = 0;
+}
+
 int ip_tx(uint32_t dst_ip, uint8_t proto, const void* seg, uint16_t seg_len) {
     static uint16_t ip_id = 1;
+
+    /* A4 (SOCKET-PARITY-0): loopback. Anything to 127.0.0.0/8 is delivered
+     * locally by wrapping the segment in an IPv4 header and feeding it straight
+     * to the demux -- no ARP, no Ethernet, no NIC, works even with net DOWN.
+     * Placed BEFORE the test-rig tap so loopback always loops (the tap is for
+     * on-the-wire segments). UDP uses net_get_ip() as the source so its
+     * checksum (computed by udp.c with net_get_ip()) verifies on receive. TCP
+     * stamps the loopback DESTINATION as the source instead (see below). */
+    if ((dst_ip >> 24) == 127u) {
+        uint16_t iplen = (uint16_t)(sizeof(ipv4_hdr_t) + seg_len);
+        if (iplen > ETH_MAX_FRAME) return -1;
+        /* Enqueue the wrapped packet. NET-HARDENING F7: a momentarily-full ring
+         * is a BEST-EFFORT DROP, not an error -- return 0, never -1. TCP is
+         * reliable (the unacked segment is retransmitted) and UDP is lossy by
+         * definition, so losing one loopback frame under a transient full ring is
+         * recoverable. The old -1 propagated through tcp_xmit() -> tcp_send() as a
+         * hard SOCK_ECONN, tearing down the whole connection -- which would drop a
+         * live co-op client. The ring is drained empty between sends, so in
+         * practice this still never trips. */
+        int next = (lo_q_tail + 1) % LO_Q_SLOTS;
+        if (next == lo_q_head) return 0;
+        uint8_t* slot = lo_q[lo_q_tail];
+        ipv4_hdr_t* ip = (ipv4_hdr_t*)slot;
+        ip->ver_ihl   = 0x45;
+        ip->tos       = 0;
+        ip->total_len = net_htons(iplen);
+        ip->id        = net_htons(ip_id++);
+        ip->frag_off  = 0;
+        ip->ttl       = 64;
+        ip->proto     = proto;
+        ip->checksum  = 0;
+        /* TCP replies must loop back too: a passive open records the SYN's IP
+         * source as the peer, and the SYN-ACK/data are then addressed there.
+         * Stamping net_get_ip() would send them to the real NIC and the in-OS
+         * handshake would never complete. So for TCP we stamp the (loopback)
+         * destination as the source -- src==dst in 127/8, so the entire
+         * handshake + data path loops. UDP stays one-way with net_get_ip() (the
+         * NETP1H proof). The TCP checksum uses this same source (tcp_src_ip()). */
+        ip->src       = net_htonl((proto == IPPROTO_TCP) ? dst_ip : net_get_ip());
+        ip->dst       = net_htonl(dst_ip);
+        ip->checksum  = net_htons(net_inet_checksum(ip, sizeof(ipv4_hdr_t)));
+        memcpy(slot + sizeof(ipv4_hdr_t), seg, seg_len);
+        lo_q_len[lo_q_tail] = iplen;
+        lo_q_tail = next;
+        /* NET-RESILIENCE-OBS: account loopback traffic on the lo interface (it
+         * both "transmits" and "receives" the same packet). */
+        {
+            netif_t* lo = netif_get("lo");
+            if (lo) {
+                lo->tx_packets++; lo->tx_bytes += iplen;
+                lo->rx_packets++; lo->rx_bytes += iplen;
+            }
+        }
+        /* TCP's loopback reply cascade recurses (send -> demux -> peer ACK ->
+         * ip_tx -> demux -> ...). Delivering it HERE, inside the caller's
+         * tcp_xmit() frame (a ~1.5 KB on-stack segment), would stack two such
+         * frames and overflow the 8 KB kernel stack. So defer TCP loopback
+         * delivery to lo_drain() in sock_poll(), which runs ABOVE tcp_xmit() --
+         * tcp_send/connect/recv all pump sock_poll(), so the reply is still
+         * processed before they return, but only ONE tcp_xmit frame is ever live.
+         * UDP is one-way (no cascade) -> deliver inline to keep its synchronous
+         * semantics (the NETP1H loopback proof). */
+        if (proto != IPPROTO_TCP)
+            lo_drain();
+        return 0;
+    }
 
 #ifdef NET_SELFTEST
     /* NET-P1-A0: while the in-kernel test rig is live it swallows every
@@ -355,13 +465,19 @@ sock_t* sock_find_tcp(uint32_t remote_ip, uint16_t remote_port,
 /* ------------------------------------------------------------------ */
 /* Demux one IPv4 packet (UDP/TCP) into the owning socket. ARP/ICMP were
  * already handled inside net_recv() before we get here. */
-static void ipv4_demux(const uint8_t* ip_start, uint16_t ip_avail) {
+static void ipv4_demux(const uint8_t* ip_start, uint16_t ip_avail, int from_loopback) {
     if (ip_avail < sizeof(ipv4_hdr_t)) return;
     const ipv4_hdr_t* ip = (const ipv4_hdr_t*)ip_start;
 
     if ((ip->ver_ihl >> 4) != 4) return;
     uint16_t ihl = (uint16_t)((ip->ver_ihl & 0x0F) * 4);
     if (ihl < sizeof(ipv4_hdr_t)) return;
+    if (ihl > ip_avail) return;
+
+    /* TCP-ROBUST (RX checksum verification): a valid IPv4 header sums to 0
+     * (the stored checksum is included in the sum). Corrupt header -> drop
+     * before it reaches UDP/TCP. net_inet_checksum returns the final ~sum. */
+    if (net_inet_checksum(ip, ihl) != 0) return;
 
     uint16_t tot = net_ntohs(ip->total_len);
     if (tot > ip_avail) tot = ip_avail;
@@ -370,8 +486,26 @@ static void ipv4_demux(const uint8_t* ip_start, uint16_t ip_avail) {
     uint32_t src = net_ntohl(ip->src);
     uint32_t dst = net_ntohl(ip->dst);
 
-    /* Only packets destined for us (or broadcast) are interesting. */
-    if (dst != net_get_ip() && dst != 0xFFFFFFFFu) return;
+    /* NET-HARDENING-1 (martian filter): loopback (127/8) addresses must NEVER
+     * appear on a real interface. A frame from the NIC or the test injector
+     * (from_loopback==0) whose src OR dst is in 127/8 is spoofed -- drop it so an
+     * off-LAN host cannot inject into / RST the in-OS loopback co-op session.
+     * Genuine loopback is delivered only via lo_drain() (from_loopback==1). */
+    if (!from_loopback && ((src >> 24) == 127u || (dst >> 24) == 127u))
+        return;
+
+    /* NET-HARDENING-1 (fragment drop): ipv4_demux does NOT reassemble (only the
+     * ICMP path in net.c does), so an IP fragment would reach udp_input/tcp_input
+     * as a TRUNCATED datagram. Drop any packet with a non-zero fragment offset or
+     * the More-Fragments bit set (mask 0x3FFF = offset|MF; the 0x4000 Don't-
+     * Fragment bit is intentionally left untouched). */
+    if ((net_ntohs(ip->frag_off) & 0x3FFF) != 0)
+        return;
+
+    /* Only packets destined for us (or broadcast, or loopback) are
+     * interesting. A4: accept 127.0.0.0/8 so loopback delivery (ip_tx's
+     * 127/8 short-circuit) reaches udp_input/tcp_input. */
+    if (dst != net_get_ip() && dst != 0xFFFFFFFFu && (dst >> 24) != 127u) return;
 
     const uint8_t* seg = ip_start + ihl;
     uint16_t seg_len = (uint16_t)(tot - ihl);
@@ -388,11 +522,17 @@ static void ipv4_demux(const uint8_t* ip_start, uint16_t ip_avail) {
  * (kernel/net/net_testrig.c) -- hands a crafted packet to the SAME demux
  * the NIC path uses, so rig-tested behavior is real-path behavior. */
 void sock_testrig_inject_ipv4(const uint8_t* ip_start, uint16_t ip_avail) {
-    ipv4_demux(ip_start, ip_avail);
+    ipv4_demux(ip_start, ip_avail, 0);   /* simulates an untrusted NIC arrival */
 }
 #endif
 
 int sock_poll(void) {
+    /* Deliver any deferred loopback packets FIRST -- before the net_up() gate,
+     * since 127/8 loopback works even with the NIC down. This is where in-OS TCP
+     * loopback data is actually delivered (ip_tx() only enqueues TCP packets to
+     * keep the kernel-stack depth bounded). tcp_send/connect/recv all pump
+     * sock_poll(), so the peer's reply is processed before they return. */
+    lo_drain();
     if (!net_up() || !g_socks) return 0;
     int frames = 0;
 
@@ -401,11 +541,16 @@ int sock_poll(void) {
         int n = net_recv(g_rx, sizeof(g_rx));
         if (n <= 0) break;
         frames++;
+        /* NET-RESILIENCE-OBS: account inbound frames on the receiving (default) interface. */
+        {
+            netif_t* dn = netif_get_default();
+            if (dn) { dn->rx_packets++; dn->rx_bytes += (uint64_t)n; }
+        }
         if ((uint16_t)n < ETH_HLEN) continue;
 
         const eth_hdr_t* eh = (const eth_hdr_t*)g_rx;
         if (net_ntohs(eh->ethertype) == ETH_P_IP) {
-            ipv4_demux(g_rx + ETH_HLEN, (uint16_t)(n - ETH_HLEN));
+            ipv4_demux(g_rx + ETH_HLEN, (uint16_t)(n - ETH_HLEN), 0);  /* untrusted NIC */
         }
     }
 
@@ -417,6 +562,12 @@ int sock_poll(void) {
     }
     /* NET-P1-A: half-open side-table timers (SYN-ACK retransmit + expiry). */
     tcp_synq_tick();
+    /* tcp_tick()/tcp_synq_tick() above may have ENQUEUED a loopback retransmit or
+     * SYN-ACK (TCP loopback only enqueues -- delivery is deferred to lo_drain).
+     * The leading lo_drain() already ran, so drain again here to deliver those in
+     * THIS poll instead of leaving them stranded until the next sock_poll(). The
+     * lo_draining guard makes this safe + cheap (no-op when the ring is empty). */
+    lo_drain();
     return frames;
 }
 
@@ -502,11 +653,14 @@ int sock_socket(int type) {
 int sock_bind(int s, uint16_t local_port) {
     sock_t* so = sock_from_fd(s);
     if (!so) return SOCK_EBADF;
-    /* Reject if another socket of the same type already owns the port. */
-    for (int i = 0; i < SOCK_MAX; i++) {
-        if (i != s && g_socks[i].used && g_socks[i].type == so->type &&
-            g_socks[i].local_port == local_port) {
-            return SOCK_EINVAL;
+    /* Reject if another socket of the same type already owns the port -- UNLESS
+     * this socket set SO_REUSEADDR (A4), which relaxes the duplicate check. */
+    if (!so->so_reuseaddr) {
+        for (int i = 0; i < SOCK_MAX; i++) {
+            if (i != s && g_socks[i].used && g_socks[i].type == so->type &&
+                g_socks[i].local_port == local_port) {
+                return SOCK_EINVAL;
+            }
         }
     }
     so->local_port = local_port;
@@ -573,6 +727,7 @@ int sock_send(int s, const void* buf, uint32_t len) {
     sock_t* so = sock_from_fd(s);
     if (!so) return SOCK_EBADF;
     if (buf == NULL || len == 0) return SOCK_EINVAL;
+    if (so->shut_wr) return SOCK_ECONN;   /* A4: send half shut down */
 
     if (so->type == SOCK_DGRAM) {
         if (so->remote_port == 0) return SOCK_ECONN;   /* not "connected" */
@@ -590,6 +745,7 @@ int sock_recv(int s, void* buf, uint32_t len) {
     sock_t* so = sock_from_fd(s);
     if (!so) return SOCK_EBADF;
     if (buf == NULL || len == 0) return SOCK_EINVAL;
+    if (so->shut_rd) return 0;            /* A4: recv half shut down -> EOF */
 
     if (so->type == SOCK_DGRAM) {
         return sock_recvfrom(s, buf, len, NULL, NULL);
@@ -609,6 +765,7 @@ int sock_sendto(int s, const void* buf, uint32_t len,
     if (!so) return SOCK_EBADF;
     if (so->type != SOCK_DGRAM) return SOCK_EINVAL;
     if (buf == NULL || len == 0) return SOCK_EINVAL;
+    if (so->shut_wr) return SOCK_ECONN;   /* A4: send half shut down */
     if (len > UDP_DGRAM_MAX) len = UDP_DGRAM_MAX;
     return udp_send_to(so, ip, port, buf, (uint16_t)len);
 }
@@ -619,6 +776,7 @@ int sock_recvfrom(int s, void* buf, uint32_t len,
     if (!so) return SOCK_EBADF;
     if (so->type != SOCK_DGRAM) return SOCK_EINVAL;
     if (buf == NULL || len == 0) return SOCK_EINVAL;
+    if (so->shut_rd) return 0;            /* A4: recv half shut down -> EOF */
 
     if (so->dq_count == 0) return SOCK_EAGAIN;
 
@@ -639,9 +797,17 @@ int sock_close(int s) {
     sock_t* so = sock_from_fd(s);
     if (!so) return SOCK_EBADF;
 
+    int deferred = 0;
     if (so->type == SOCK_STREAM &&
         (so->state == TCP_ESTABLISHED || so->state == TCP_CLOSE_WAIT)) {
         tcp_close(so);   /* send FIN, drive a few polls */
+        /* NET-HARDENING-2 (deferred teardown): tcp_close leaves the socket in a
+         * closing state (FIN_WAIT / LAST_ACK) with rt_pending set when our FIN was
+         * NOT acked within its short drain (a lossy NIC close). Keep the slot so
+         * background tcp_tick() can retransmit the FIN and reap it once acked --
+         * freeing it now would lose the FIN forever. On loopback / a completed
+         * close tcp_close reached CLOSED, so deferred stays 0 and we free below. */
+        if (so->state != TCP_CLOSED && so->rt_pending) deferred = 1;
     }
 
     /* Unlink from listener bookkeeping BEFORE zeroing, so no accept_queue /
@@ -715,8 +881,69 @@ int sock_close(int s) {
         }
     }
 
+    if (deferred) {
+        /* Orphan: detach from owner/parent but keep the slot used so its 4-tuple
+         * still matches the peer's ACK and tcp_tick() services + reaps it. */
+        so->orphaned  = true;
+        so->owner_pid = 0;
+        so->parent    = NULL;
+        return SOCK_OK;
+    }
     memset(so, 0, sizeof(*so));
     return SOCK_OK;
+}
+
+/* ------------------------------------------------------------------ */
+/* A4 (SOCKET-PARITY-0): shutdown + setsockopt/getsockopt              */
+/* ------------------------------------------------------------------ */
+int sock_shutdown(int s, int how) {
+    sock_t* so = sock_from_fd(s);
+    if (!so) return SOCK_EBADF;
+    if (how != SHUT_RD && how != SHUT_WR && how != SHUT_RDWR) return SOCK_EINVAL;
+
+    if (how == SHUT_RD || how == SHUT_RDWR) so->shut_rd = 1;
+    if (how == SHUT_WR || how == SHUT_RDWR) {
+        so->shut_wr = 1;
+        /* TCP write-half shutdown: emit a FIN now (half-close) but keep the
+         * socket so the read half can still drain. Reuses the proven FIN path;
+         * sock_close() later does the final teardown. */
+        if (so->type == SOCK_STREAM &&
+            (so->state == TCP_ESTABLISHED || so->state == TCP_CLOSE_WAIT)) {
+            tcp_close(so);
+        }
+    }
+    return SOCK_OK;
+}
+
+int sock_setsockopt(int s, int level, int optname, int value) {
+    sock_t* so = sock_from_fd(s);
+    if (!so) return SOCK_EBADF;
+    if (level != SOL_SOCKET) return SOCK_EINVAL;
+    switch (optname) {
+        case SO_REUSEADDR: so->so_reuseaddr   = value ? 1 : 0;            return SOCK_OK;
+        case SO_BROADCAST: so->so_broadcast   = value ? 1 : 0;            return SOCK_OK;
+        case SO_KEEPALIVE: so->so_keepalive   = value ? 1 : 0;            return SOCK_OK;
+        case SO_RCVTIMEO:  so->so_rcvtimeo_ms = (value < 0) ? 0u : (uint32_t)value; return SOCK_OK;
+        case SO_SNDTIMEO:  so->so_sndtimeo_ms = (value < 0) ? 0u : (uint32_t)value; return SOCK_OK;
+        default:           return SOCK_EINVAL;   /* SO_TYPE/SO_ERROR are read-only */
+    }
+}
+
+int sock_getsockopt(int s, int level, int optname, int* out_value) {
+    sock_t* so = sock_from_fd(s);
+    if (!so) return SOCK_EBADF;
+    if (!out_value) return SOCK_EINVAL;
+    if (level != SOL_SOCKET) return SOCK_EINVAL;
+    switch (optname) {
+        case SO_REUSEADDR: *out_value = so->so_reuseaddr;        return SOCK_OK;
+        case SO_BROADCAST: *out_value = so->so_broadcast;        return SOCK_OK;
+        case SO_KEEPALIVE: *out_value = so->so_keepalive;        return SOCK_OK;
+        case SO_RCVTIMEO:  *out_value = (int)so->so_rcvtimeo_ms; return SOCK_OK;
+        case SO_SNDTIMEO:  *out_value = (int)so->so_sndtimeo_ms; return SOCK_OK;
+        case SO_TYPE:      *out_value = so->type;                return SOCK_OK;
+        case SO_ERROR:     *out_value = so->reset ? SOCK_ECONN : 0; return SOCK_OK;
+        default:           return SOCK_EINVAL;
+    }
 }
 
 /* ------------------------------------------------------------------ */
@@ -901,4 +1128,68 @@ int64_t sys_sock_accept(uint64_t s, uint64_t a2, uint64_t a3,
                         uint64_t a4, uint64_t a5, uint64_t a6) {
     (void)a2;(void)a3;(void)a4;(void)a5;(void)a6;
     return sock_accept((int)s);
+}
+
+/* A4 (SOCKET-PARITY-0): optval is a user pointer to an int; optlen is the
+ * byte count available (a plain value, not a pointer -- the kernel reads/writes
+ * exactly one int). */
+int64_t sys_sock_setsockopt(uint64_t s, uint64_t level, uint64_t optname,
+                            uint64_t optval, uint64_t optlen, uint64_t a6) {
+    (void)a6;
+    if (optval == 0 || optlen < sizeof(int)) return SOCK_EINVAL;
+    int value = 0;
+    if (copy_from_user(&value, (const void*)optval, sizeof(int)) != COPY_SUCCESS)
+        return SOCK_EINVAL;
+    return sock_setsockopt((int)s, (int)level, (int)optname, value);
+}
+
+int64_t sys_sock_getsockopt(uint64_t s, uint64_t level, uint64_t optname,
+                            uint64_t optval, uint64_t optlen, uint64_t a6) {
+    (void)a6;
+    if (optval == 0 || optlen == 0) return SOCK_EINVAL;
+    int value = 0;
+    int r = sock_getsockopt((int)s, (int)level, (int)optname, &value);
+    if (r != SOCK_OK) return r;
+    size_t n = (optlen < sizeof(int)) ? (size_t)optlen : sizeof(int);
+    if (copy_to_user((void*)optval, &value, n) != COPY_SUCCESS) return SOCK_EINVAL;
+    return SOCK_OK;
+}
+
+int64_t sys_sock_shutdown(uint64_t s, uint64_t how, uint64_t a3,
+                          uint64_t a4, uint64_t a5, uint64_t a6) {
+    (void)a3;(void)a4;(void)a5;(void)a6;
+    return sock_shutdown((int)s, (int)how);
+}
+
+/* NET-RESILIENCE-OBS: snapshot the live socket table (for netstat/ss). */
+int sock_get_list(sock_info_t* out, int max) {
+    if (!g_socks || !out || max <= 0) return 0;
+    int n = 0;
+    for (int i = 0; i < SOCK_MAX && n < max; i++) {
+        if (!g_socks[i].used) continue;
+        sock_info_t* e = &out[n++];
+        e->type        = (uint8_t)g_socks[i].type;
+        e->state       = (uint8_t)g_socks[i].state;
+        e->local_port  = g_socks[i].local_port;
+        e->remote_port = g_socks[i].remote_port;
+        e->reserved    = 0;
+        e->local_ip    = g_socks[i].local_ip;
+        e->remote_ip   = g_socks[i].remote_ip;
+        e->owner_pid   = g_socks[i].owner_pid;
+    }
+    return n;
+}
+
+int64_t sys_sock_list(uint64_t out_ptr, uint64_t max_entries, uint64_t a3,
+                      uint64_t a4, uint64_t a5, uint64_t a6) {
+    (void)a3;(void)a4;(void)a5;(void)a6;
+    if (out_ptr == 0 || max_entries == 0) return SOCK_EINVAL;
+    int cap = (int)max_entries;
+    if (cap > SOCK_MAX) cap = SOCK_MAX;
+    sock_info_t kbuf[SOCK_MAX];
+    int n = sock_get_list(kbuf, cap);
+    if (n <= 0) return 0;
+    if (copy_to_user((void*)out_ptr, kbuf, (size_t)n * sizeof(sock_info_t)) != COPY_SUCCESS)
+        return SOCK_EINVAL;
+    return n;
 }

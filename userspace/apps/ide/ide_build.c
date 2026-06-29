@@ -193,6 +193,7 @@ static int ide_try_prebuilt(Ide* a) {
     ide_strlcpy(g_res.out_path, sbinp, (int)sizeof(g_res.out_path));
     ide_strlcpy(g_res.out_dir, "/sbin", (int)sizeof(g_res.out_dir));
     g_res.ok = 1;
+    g_res.prebuilt = 1;                  /* shipped /sbin binary, not a compile */
     g_res.elf_len = 0;
     g_res.ndiags = 0;
     g_res.message[0] = 0;
@@ -204,7 +205,129 @@ static int ide_try_prebuilt(Ide* a) {
     return 1;
 }
 
+/* A project may declare kind=prebuilt/native + run_target for a program the
+ * single-file on-device compiler can't relink (links wl/bitfont/g3d, has global
+ * arrays + string literals -- e.g. DeadZone). For those, Build does NOT compile:
+ * it resolves <root>/<run_target>, verifies the shipped ELF, and presents it as
+ * the runnable result so Run launches the real prebuilt binary. Returns 1 if it
+ * handled the build (success OR a clean "prebuilt missing" failure); 0 = fall
+ * through to the normal on-device compile path. */
+static int ide_build_prebuilt(Ide* a) {
+    if (!a->project.active) return 0;
+    if (!ide_streq(a->project.kind, "prebuilt") &&
+        !ide_streq(a->project.kind, "native")) return 0;
+    if (!a->project.run_target[0]) return 0;
+
+    /* <root>/<run_target> */
+    char rt[IDE_PATH];
+    int n = ide_strlen(a->project.root);
+    ide_strlcpy(rt, a->project.root, IDE_PATH);
+    if (n < IDE_PATH - 1) rt[n++] = '/';
+    ide_strlcpy(rt + n, a->project.run_target, IDE_PATH - n);
+
+    g_res.ndiags   = 0;
+    g_res.elf_len  = 0;
+    g_res.code_len = 0;
+    g_res.asm_preview[0] = 0;
+    g_res.message[0]     = 0;
+    g_res.prebuilt = 1;                           /* a shipped ELF, not a compile   */
+    /* language for the panel label (no tc_build runs to set it) */
+    g_res.lang = ide_streq(a->project.lang, "asm") ? LANG_ASM
+               : ide_streq(a->project.lang, "cpp") ? LANG_CPP
+               : LANG_C;
+
+    /* AUDIT-9: Build must not pass a path Run cannot spawn. SYS_SPAWN truncates
+     * the path at 127 chars and g_res.out_path is smaller than rt's IDE_PATH
+     * buffer, so a run_target whose full path exceeds either would Build-ok yet
+     * Run-fail (rc=-2). Fail the gate here so Build and Run agree. (DeadZone is
+     * 44 chars + PROJECT_NAME_MAX=32 keeps the shipped case well clear; this only
+     * fires for a pathological long project path.) */
+    {
+        int rl = ide_strlen(rt);
+        if (rl >= 127 || rl >= (int)sizeof(g_res.out_path) - 1) {
+            g_res.ok = 0;
+            g_res.prebuilt = 0;
+            g_res.out_path[0] = 0;
+            g_res.out_dir[0]  = 0;
+            ide_strlcpy(g_res.message,
+                        "prebuilt run_target path too long to Run: ",
+                        (int)sizeof(g_res.message));
+            int ml = ide_strlen(g_res.message);
+            ide_strlcpy(g_res.message + ml, rt, (int)sizeof(g_res.message) - ml);
+            return 1;
+        }
+    }
+
+    if (!ide_is_elf(rt)) {                        /* shipped target absent/garbage  */
+        g_res.ok = 0;
+        g_res.prebuilt = 0;                        /* nothing runnable -> plain fail */
+        g_res.out_path[0] = 0;
+        g_res.out_dir[0]  = 0;
+        ide_strlcpy(g_res.message,
+                    "prebuilt run_target missing or not an ELF: ",
+                    (int)sizeof(g_res.message));
+        int ml = ide_strlen(g_res.message);
+        ide_strlcpy(g_res.message + ml, rt, (int)sizeof(g_res.message) - ml);
+        return 1;
+    }
+
+    ide_strlcpy(g_res.out_path, rt, (int)sizeof(g_res.out_path));
+    /* out_dir = <root>/build, for the post-build file reveal */
+    char od[IDE_PATH];
+    int m = ide_strlen(a->project.root);
+    ide_strlcpy(od, a->project.root, IDE_PATH);
+    if (m < IDE_PATH - 1) od[m++] = '/';
+    ide_strlcpy(od + m, "build", IDE_PATH - m);
+    ide_strlcpy(g_res.out_dir, od, (int)sizeof(g_res.out_dir));
+
+    g_res.ok = 1;
+    ide_strlcpy(g_res.message,
+                "prebuilt project (links external libs the single-file compiler "
+                "can't) -- press R to Run ", (int)sizeof(g_res.message));
+    int ml = ide_strlen(g_res.message);
+    ide_strlcpy(g_res.message + ml, rt, (int)sizeof(g_res.message) - ml);
+    return 1;
+}
+
+/* AUDIT-9 headless proof: run the EXACT static prebuilt gate at runtime and
+ * emit a fail-closed serial verdict. This proves the prebuilt path actually
+ * FIRES and resolves the shipped ELF live (a precondition-only marker can't).
+ * Userspace + wl-free (only ide_is_elf + string ops); leaves g_have untouched
+ * so it does NOT trick Run into thinking a build happened. Idempotent. */
+void ide_prebuilt_probe(Ide* a) {
+    if (!a) return;
+    int handled = ide_build_prebuilt(a);     /* the EXACT gate ide_do_build runs */
+    int ok      = handled && g_res.ok;
+    char ln[256]; int k = 0;
+    const char* p1 = "[IDE] prebuilt probe handled=";
+    for (int i = 0; p1[i] && k < 255; i++) ln[k++] = p1[i];
+    if (k < 255) ln[k++] = handled ? '1' : '0';
+    const char* p2 = " ok=";
+    for (int i = 0; p2[i] && k < 255; i++) ln[k++] = p2[i];
+    if (k < 255) ln[k++] = ok ? '1' : '0';
+    const char* p3 = " out=";
+    for (int i = 0; p3[i] && k < 255; i++) ln[k++] = p3[i];
+    const char* op = ok ? g_res.out_path : "";
+    for (int i = 0; op[i] && k < 255; i++) ln[k++] = op[i];
+    if (k < 255) ln[k++] = '\n';
+    ide_sc(3 /*SYS_WRITE*/, 1, (long)ln, k, 0, 0, 0);
+}
+
 void ide_do_build(Ide* a) {
+    /* Prebuilt/native project: Build resolves + presents the shipped ELF (no cc).
+     * Runs even with no source tab open, since it never touches the source. */
+    if (a && a->project.active && ide_build_prebuilt(a)) {
+        g_have = 1;
+        g_runmsg[0] = 0;
+        g_scroll = 0;
+        g_build_ms = 0;
+        g_flash_ms  = FLASH_DURATION;
+        /* ORANGE, not GREEN: a prebuilt "build" ran no compiler, so it must not
+         * look like a successful compile of the (possibly just-edited) source. */
+        g_flash_col = g_res.ok ? TH_ORANGE : TH_RED;
+        if (g_res.ok) ide_reveal_dir(a, g_res.out_dir, g_res.out_path);
+        return;
+    }
     if (!a || !a->cur_file[0]) {
         g_have = 1;
         g_res.ok = 0;
@@ -218,6 +341,7 @@ void ide_do_build(Ide* a) {
         g_res.out_path[0] = 0;
         g_res.out_dir[0] = 0;
         g_res.asm_preview[0] = 0;
+        g_res.prebuilt = 0;
         g_runmsg[0] = 0;
         g_build_ms = 0;
         g_flash_ms  = FLASH_DURATION;
@@ -249,6 +373,7 @@ void ide_do_build(Ide* a) {
         tc_set_output_override(out_dir, a->project.name);
     }
 
+    g_res.prebuilt = 0;                              /* a real compile, not prebuilt */
     long t0 = ide_ticks_ms();
     tc_build(src_to_build, &g_res);
     long t1 = ide_ticks_ms();
@@ -274,14 +399,42 @@ void ide_do_build(Ide* a) {
         ide_reveal_dir(a, g_res.out_dir, g_res.out_path);
 }
 
+int ide_run_poll(void);   /* defined below; used by the re-entrancy guard */
+
 void ide_do_run(Ide* a) {
     (void)a;
     if (!g_have || !g_res.ok) {
         ide_strlcpy(g_runmsg, "nothing built -- press B first", (int)sizeof(g_runmsg));
         return;
     }
+    /* Don't launch a second instance while the first is still alive: Run now
+     * targets long-running fullscreen GAMES (DeadZone, derby, ...), and a second
+     * Ctrl+R would orphan the prior PID as an unreaped zombie AND stack two
+     * fullscreen windows. Poll first so a since-exited child clears the slot. */
+    ide_run_poll();
+    if (g_child_pid > 0 && !g_child_done) {
+        ide_strlcpy(g_runmsg, "already running -- close it first",
+                    (int)sizeof(g_runmsg));
+        return;
+    }
 
     long pid = ide_sc(SYS_SPAWN, (long)g_res.out_path, 0, 0, 0, 0, 0);
+
+    /* AUDIT-9: permanent fail-closed spawn trace (fd1 -> serial) so step 7 of the
+     * Build->Run chain is greppable on EVERY Run (a live GUI Ctrl+R or the
+     * IDE_RUN_PROBE boot) -- a future no-op of this spawn then can't pass the
+     * smokes silently. Uses the RAW pid, NOT g_child_pid (the WNOHANG reap below
+     * zeroes that for a fast-exiting child, which would mis-report a real spawn). */
+    { char ln[256]; int k = 0;
+      const char* p = (pid > 0) ? "[IDE] run spawn pid=" : "[IDE] run spawn FAIL rc=";
+      for (int j = 0; p[j] && k < 255; j++) ln[k++] = p[j];
+      char nb[16]; int nl = ide_itoa((pid > 0) ? (int)pid : (int)(-pid), nb);
+      for (int j = 0; j < nl && k < 255; j++) ln[k++] = nb[j];
+      const char* po = " out=";
+      for (int j = 0; po[j] && k < 255; j++) ln[k++] = po[j];
+      for (int j = 0; g_res.out_path[j] && k < 255; j++) ln[k++] = g_res.out_path[j];
+      if (k < 255) ln[k++] = '\n';
+      ide_sc(3 /*SYS_WRITE*/, 1, (long)ln, k, 0, 0, 0); }
 
     int i = 0;
     if (pid > 0) {
@@ -458,8 +611,8 @@ void panel_build(Ide* a, Canvas* cv, Rect r) {
     {
         char buf[80];
         int i = 0;
-        const char* st = g_res.ok ? "OK" : "FAILED";
-        uint32_t stc = g_res.ok ? TH_GREEN : TH_RED;
+        const char* st = g_res.ok ? (g_res.prebuilt ? "PREBUILT" : "OK") : "FAILED";
+        uint32_t stc = g_res.ok ? (g_res.prebuilt ? TH_ORANGE : TH_GREEN) : TH_RED;
         bp_append(buf, (int)sizeof(buf), &i, st);
         bp_append(buf, (int)sizeof(buf), &i, " [");
         bp_append(buf, (int)sizeof(buf), &i, bp_lang_name(g_res.lang));
@@ -481,15 +634,20 @@ void panel_build(Ide* a, Canvas* cv, Rect r) {
         y = bp_line(cv, x, y, w, bot, buf, TH_TEXT_DIM, &row_idx);
     }
 
-    /* sizes */
+    /* sizes (or, for a prebuilt result, an honest no-recompile note instead of
+     * a misleading "code 0b  elf 0b" -- no cc ran, so there are no fresh sizes) */
     {
-        char buf[48];
+        char buf[64];
         int i = 0;
-        bp_append(buf, (int)sizeof(buf), &i, "code ");
-        bp_append_int(buf, (int)sizeof(buf), &i, g_res.code_len);
-        bp_append(buf, (int)sizeof(buf), &i, "b  elf ");
-        bp_append_int(buf, (int)sizeof(buf), &i, g_res.elf_len);
-        bp_append(buf, (int)sizeof(buf), &i, "b");
+        if (g_res.prebuilt) {
+            bp_append(buf, (int)sizeof(buf), &i, "shipped binary -- src not recompiled");
+        } else {
+            bp_append(buf, (int)sizeof(buf), &i, "code ");
+            bp_append_int(buf, (int)sizeof(buf), &i, g_res.code_len);
+            bp_append(buf, (int)sizeof(buf), &i, "b  elf ");
+            bp_append_int(buf, (int)sizeof(buf), &i, g_res.elf_len);
+            bp_append(buf, (int)sizeof(buf), &i, "b");
+        }
         y = bp_line(cv, x, y, w, bot, buf, TH_TEXT_DIM, &row_idx);
     }
 

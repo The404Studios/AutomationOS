@@ -35,6 +35,20 @@ int netif_register(const netif_t* nif) {
     return 0;
 }
 
+/* A4 (SOCKET-PARITY-0): the cosmetic loopback interface. 127.0.0.1/8, UP, no
+ * driver callbacks -- ip_tx() delivers 127/8 traffic directly to the demux. This
+ * row exists so ifconfig/netstat can show "lo". MUST be registered after eth0 so
+ * netif_get_default() (the first UP interface) keeps returning the real NIC. */
+void netif_register_loopback(void) {
+    netif_t lo;
+    memset(&lo, 0, sizeof(lo));
+    memcpy(lo.name, "lo", 3);
+    lo.ip      = 0x7F000001u;   /* 127.0.0.1   */
+    lo.netmask = 0xFF000000u;   /* 255.0.0.0   */
+    lo.up      = true;
+    netif_register(&lo);        /* no-op if "lo" already exists */
+}
+
 netif_t* netif_get(const char* name) {
     for (int i = 0; i < g_netif_count; i++) {
         if (strcmp(g_netifs[i].name, name) == 0)

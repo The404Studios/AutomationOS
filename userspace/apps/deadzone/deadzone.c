@@ -574,9 +574,16 @@ static void player_step(void)
 static void try_shoot(void)
 {
     if (!g_alive || g_over || g_fire_cd > 0 || g_reload > 0) return;   /* MP-WIN-FIX: no fire after a concluded raid */
-    if (g_mag <= 0) { if (g_ammo > 0) g_reload = g_reload_steps; return; }
-    g_mag--; g_fire_cd = FIRE_COOLDN; g_recoil = fx_ratio(6,100); g_muzzle = 3;
+    if (!g_mp_on && g_mag <= 0) { if (g_ammo > 0) g_reload = g_reload_steps; return; }   /* SP ammo gate */
+    g_fire_cd = FIRE_COOLDN; g_recoil = fx_ratio(6,100); g_muzzle = 3;
     audio_trigger(0);                                    /* gunshot SFX */
+    /* MP-FIRE-FIX: in co-op the SERVER owns the hitscan, ammo, kills and loot (we
+     * already send the fire as DZ_BTN_FIRE via mp_pump_input); keep ONLY the local
+     * muzzle/recoil/audio feedback above and skip every authoritative effect --
+     * otherwise a local click runs the local ray test against server-owned zombies
+     * and spawns uncollectable phantom loot crates + desyncs ammo/kills. */
+    if (g_mp_on) return;
+    g_mag--;
     if (g_weap_dur > 0) g_weap_dur -= WEAP_DUR_PERSHOT;   /* weapon wears with use */
 
     fx fdx = dirx(g_yaw), fdz = dirz(g_yaw);
@@ -792,8 +799,14 @@ static int project_pt(mat4 view, fx wx, fx wy, fx wz, fx focal, int *sx, int *sy
     vec3 e = mat4_mul_point(view, v3(wx, wy, wz));
     fx d = -e.z;
     if (d <= fx_ratio(2,10)) return 0;                /* behind / too near */
-    *sx  = LOWW/2 + fx_to_int(fx_mul(fx_div(e.x, d), focal));
-    *syb = LOWH/2 - fx_to_int(fx_mul(fx_div(e.y, d), focal));
+    /* PROJ-OVF-FIX: clamp the lateral ratio so fx_mul can't signed-overflow for a
+     * far off-axis point near the near-plane gate (on-screen ratio is < ~0.7, so this
+     * only bounds off-screen garbage; the result is clipped by blit_spr regardless). */
+    fx rx = fx_div(e.x, d), ry = fx_div(e.y, d), lim = fx_from_int(8);
+    if (rx >  lim) rx =  lim; else if (rx < -lim) rx = -lim;
+    if (ry >  lim) ry =  lim; else if (ry < -lim) ry = -lim;
+    *sx  = LOWW/2 + fx_to_int(fx_mul(rx, focal));
+    *syb = LOWH/2 - fx_to_int(fx_mul(ry, focal));
     *depth = d;
     return 1;
 }
@@ -1484,7 +1497,9 @@ static void mp_apply_snapshot(void)
         fx wx = wire_to_fx(g_snap.p[i].x), wz = wire_to_fx(g_snap.p[i].y);
         if ((int)id == g_my_slot) {                         /* that's us */
             g_px = wx; g_pz = wz;
-            g_hp = g_snap.p[i].hp; g_alive = (g_hp > 0);
+            g_hp = g_snap.p[i].hp;                          /* HP-OVF-FIX: clamp untrusted snapshot hp */
+            if (g_hp < 0) g_hp = 0; else if (g_hp > g_hp_max) g_hp = g_hp_max;  /* (HP-bar width = bw*g_hp) */
+            g_alive = (g_hp > 0);
             g_kills = (i32)g_snap.p[i].score;
         } else if (id < (dz_u32)DZP_MAX_CLIENTS) {          /* a teammate */
             g_rx[id] = wx; g_rz[id] = wz; g_ron[id] = 1;
@@ -1494,6 +1509,7 @@ static void mp_apply_snapshot(void)
     int nz = (int)g_snap.n_zombies; if (nz > MAX_Z) nz = MAX_Z;   /* 64 -> cap 24 */
     for (int i = 0; i < MAX_Z; i++) g_z[i].alive = 0;
     for (int i = 0; i < nz; i++) {
+        if (g_snap.z[i].state != 1) continue;   /* MP-ZSTATE-FIX: render only ALIVE server zombies (state 1); dead (0) stay cleared */
         g_z[i].x = wire_to_fx(g_snap.z[i].x);
         g_z[i].z = wire_to_fx(g_snap.z[i].y);
         g_z[i].alive = 1; g_z[i].health = 1; g_z[i].hitflash = 0;
@@ -1686,9 +1702,12 @@ void _start(void)
             if (kind!=WL_EVENT_KEY) continue;
             i32 down=(b==1);
             /* panel toggles work in any mode */
-            if (down && a==KEY_TAB) { g_ui_mode=(g_ui_mode==1)?0:1; continue; }
-            if (down && a==KEY_C)   { g_ui_mode=(g_ui_mode==2)?0:2; continue; }
-            if (down && a==KEY_M)   { g_ui_mode=(g_ui_mode==3)?0:3; continue; }  /* MP-GUI-1 */
+            /* INPUT-LATCH-FIX: clear held inputs on any panel toggle -- a key held while
+             * opening a panel never gets its key-UP (handle_ui_key swallows it), which
+             * otherwise latches into stuck movement when the panel closes. */
+            if (down && a==KEY_TAB) { g_ui_mode=(g_ui_mode==1)?0:1; g_hold_fwd=g_hold_back=g_hold_left=g_hold_right=g_hold_tl=g_hold_tr=g_shoot_held=0; continue; }
+            if (down && a==KEY_C)   { g_ui_mode=(g_ui_mode==2)?0:2; g_hold_fwd=g_hold_back=g_hold_left=g_hold_right=g_hold_tl=g_hold_tr=g_shoot_held=0; continue; }
+            if (down && a==KEY_M)   { g_ui_mode=(g_ui_mode==3)?0:3; g_hold_fwd=g_hold_back=g_hold_left=g_hold_right=g_hold_tl=g_hold_tr=g_shoot_held=0; continue; }  /* MP-GUI-1 */
             if (g_ui_mode != 0) { if (down) handle_ui_key(a); continue; }
             switch (a) {
             case KEY_W: case KEY_UP:    g_hold_fwd=down; break;

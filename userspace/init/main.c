@@ -173,6 +173,20 @@ void _start(void) {
     }
 #endif
 
+#ifdef DZ_MPGUI_DEMO
+    /* DZ_MPGUI_DEMO: on-screen (QEMU) 2-window LIVE co-op demo. Spawn the
+     * authoritative server, then TWO GUI DeadZone windows that AUTO-JOIN it
+     * (deadzone.c auto-connects under -DDZ_MPGUI_DEMO). The compositor shows two
+     * game windows, each rendering the OTHER player as a cyan teammate sprite.
+     * GUI-visual validation only; gated, so the default boot is unaffected. */
+    print("[INIT] DZ_MPGUI_DEMO: spawning deadzoned + 2 DeadZone co-op windows...\n");
+    spawn("sbin/deadzoned");
+    sleep(1200);                       /* server binds/listens + compositor settles */
+    spawn("sbin/deadzone");
+    sleep(400);
+    spawn("sbin/deadzone");
+#endif
+
     // Auto-DHCP: spawns in the background, sleeps 2s (NIC PHY negotiate),
     // checks link, runs DHCP if up, applies lease, exits. Non-blocking --
     // init does not wait for it. If no NIC or DHCP fails, exits silently.

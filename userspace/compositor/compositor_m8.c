@@ -976,6 +976,7 @@ static int32_t     g_menu_x = 0, g_menu_y = 0;
 static int         g_menu_n = 0;
 static int         g_menu_hover = -1;
 static int         g_menu_target_slot = -1;  /* window the ctx menu acts on, -1=desktop */
+static int32_t     g_menu_target_winid = 0;  /* #9: STABLE id of that window (slot-recycle safe) */
 static const char *g_menu_label[MENU_MAX];
 static const char *g_menu_path[MENU_MAX];
 static int         g_menu_action[MENU_MAX];
@@ -1305,6 +1306,10 @@ typedef struct {
     int32_t   x, y;             /* placement of window FRAME (titlebar top)*/
     char      title[WL_TITLE_MAX];
     int       dirty;            /* set on commit (informational)           */
+    int       reaped;           /* #3: close was triggered by the liveness reap
+                                 * (owner process already dead) -> destroy_slot
+                                 * must NOT SIGTERM the pid, which may have been
+                                 * recycled to an innocent new process */
 
     /* ---- M5 animation state ---- */
     int32_t   phase;            /* PH_NONE / OPENING / CLOSING / MINIMIZING / RESTORING / SNAPPING */
@@ -4316,8 +4321,14 @@ static void handle_commit(const wl_req_commit_t *req) {
         /* Clamp to the client's actual buffer extent. */
         if (cdx > win->buf_w) cdx = win->buf_w;
         if (cdy > win->buf_h) cdy = win->buf_h;
-        if (cdx + cdw > win->buf_w) cdw = win->buf_w - cdx;
-        if (cdy + cdh > win->buf_h) cdh = win->buf_h - cdy;
+        /* OVERFLOW-SAFE clamp (#4/#6/#8): cdx/cdy are already pinned to <= buf_w/
+         * buf_h above, so the remaining span (buf_w - cdx) is a non-negative
+         * uint32. Comparing cdw against that span -- instead of the wrap-prone
+         * sum (cdx + cdw) -- stops a huge client cdw from wrapping uint32 under
+         * the bound and leaving an inverted/garbage scissor that blanks the whole
+         * desktop for a frame. */
+        if (cdw > win->buf_w - cdx) cdw = win->buf_w - cdx;
+        if (cdh > win->buf_h - cdy) cdh = win->buf_h - cdy;
         if (cdw > 0 && cdh > 0) {
             /* Translate buffer coords to screen coords (client area starts at
              * win->x, win->y + TITLEBAR_H). */
@@ -4355,7 +4366,8 @@ static void handle_commit(const wl_req_commit_t *req) {
 static void destroy_slot(int slot) {
     if (slot < 0 || slot >= MAX_WINDOWS || !g_windows[slot].used) return;
     window_t *win = &g_windows[slot];
-    int32_t pid = win->client_pid;
+    int32_t pid    = win->client_pid;
+    int     reaped = win->reaped;   /* capture before the slot is zeroed below (#3) */
     if (win->shm_vaddr) {
         sc6(SYS_SHMDT, (long)win->shm_vaddr, 0, 0, 0, 0, 0);
     }
@@ -4367,8 +4379,11 @@ static void destroy_slot(int slot) {
     for (size_t i = 0; i < sizeof(*win); i++) ((char *)win)[i] = 0;
     /* Signal the client AFTER clearing the slot so the compositor never renders
      * a window whose process is mid-teardown. pid <= 1 guards against killing
-     * init or the compositor itself. */
-    if (pid > 1) {
+     * init or the compositor itself. `reaped` (#3) means this close was triggered
+     * BECAUSE the owner already exited (liveness reap) -- signalling it then is
+     * pointless and dangerous: by now the pid may have been recycled to an
+     * innocent new process, so skip the SIGTERM entirely. */
+    if (pid > 1 && !reaped) {
         syscall(SYS_KILL, pid, SIGTERM, 0);
     }
 #ifdef SELFHEAL
@@ -4414,6 +4429,48 @@ static void handle_resize(const wl_req_resize_t *req) {
         return;
     }
     window_t *win = &g_windows[slot];
+    /* OWNERSHIP (#7/#2): the segment named by a resize MUST belong to this
+     * window's owner. Without this, any client could send WL_REQ_RESIZE for a
+     * victim's win_id pointing at ITS OWN shm (which passes the extent check
+     * against the attacker segment) and repaint arbitrary content into the
+     * victim window -- e.g. a fake credential prompt. shm_cpid is kernel-recorded
+     * and unforgeable; win->client_pid was bound the same way at create. */
+    {
+        int32_t scpid = shm_segment_cpid(req->shm_id);
+        if (scpid <= 0 || scpid != win->client_pid) {
+            print("[COMP] rejecting resize: shm owner "); print_num(scpid);
+            print(" != win owner "); print_num(win->client_pid);
+            print(" win="); print_num(req->win_id); print("\n");
+            return;
+        }
+    }
+    /* SAME-SEGMENT RESIZE (#1): a client may resize WITHIN its existing segment
+     * (req->shm_id == the one already attached). Re-attaching returns the same
+     * deterministic VA, so the shmdt(old) below would unmap the LIVE buffer that
+     * win->pixels still points at -> the next composite faults and crashes the
+     * whole desktop; the redundant attach also leaks an attach_count. Handle it
+     * as an in-place metadata update: re-validate the new extent fits the existing
+     * segment, then just adopt buf_w/buf_h/stride. */
+    if (req->shm_id == win->shm_id) {
+        uint64_t need = (uint64_t)req->w * (uint64_t)req->h * 4u;
+        uint64_t have = shm_segment_size(win->shm_id);
+        if (have == 0 || need > have) {
+            print("[COMP] rejecting in-place resize: buf "); print_num((long)need);
+            print(" > shm "); print_num((long)have); print("\n");
+            return;
+        }
+        win->buf_w  = req->w;
+        win->buf_h  = req->h;
+        win->stride = req->w;
+        win->dirty  = 1;
+        mark_dirty();
+        g_full_damage_cooldown = FULL_DAMAGE_COOLDOWN_FRAMES;
+        damage_add_full();
+        print("[COMP] resize(in-place) win="); print_num(req->win_id);
+        print(" to "); print_num((long)req->w); print("x"); print_num((long)req->h);
+        print("\n");
+        return;
+    }
     long addr = sc6(SYS_SHMAT, (long)req->shm_id, 0, 0, 0, 0, 0);
     if (addr <= 0) {
         print("[COMP] resize shmat FAILED shm_id="); print_num(req->shm_id);
@@ -4445,7 +4502,10 @@ static void handle_resize(const wl_req_resize_t *req) {
     /* Damage-scissor: resize changes the window footprint globally. */
     g_full_damage_cooldown = FULL_DAMAGE_COOLDOWN_FRAMES;
     damage_add_full();
-    if (old_vaddr) sc6(SYS_SHMDT, (long)old_vaddr, 0, 0, 0, 0, 0);
+    /* Only detach the OLD mapping when the new attach landed at a DIFFERENT VA
+     * (defense-in-depth on the same-segment guard above): detaching a VA equal to
+     * win->pixels would unmap the live buffer out from under the next composite. */
+    if (old_vaddr && (uint64_t)addr != old_vaddr) sc6(SYS_SHMDT, (long)old_vaddr, 0, 0, 0, 0, 0);
     print("[COMP] resize win="); print_num(req->win_id);
     print(" to "); print_num((long)req->w); print("x"); print_num((long)req->h);
     print("\n");
@@ -4858,6 +4918,10 @@ static void reap_dead_windows(void) {
         if (rc < 0) {
             print("[SHELL] reaping dead win "); print_num(g_windows[s].win_id);
             print(" (pid "); print_num(pid); print(" gone)\n");
+            /* #3: mark this as a reap so destroy_slot skips the teardown SIGTERM
+             * (the process is already gone; the pid may be recycled by the time
+             * the close animation finishes). */
+            g_windows[s].reaped = 1;
             begin_close(s);
         }
     }
@@ -5153,6 +5217,12 @@ static void open_context_menu(int32_t cx, int32_t cy, int target_slot,
                               uint32_t W, uint32_t H) {
     g_menu_n = 0; g_menu_is_ctx = 1;
     g_menu_target_slot = target_slot;
+    /* #9: also capture the window's STABLE id. The slot index can be recycled by
+     * a DIFFERENT window while the menu is open, so menu_run re-resolves by id
+     * (slot_by_win_id) and never acts on whatever window now occupies the slot. */
+    g_menu_target_winid = (target_slot >= 0 && target_slot < MAX_WINDOWS &&
+                           g_windows[target_slot].used)
+                          ? g_windows[target_slot].win_id : 0;
     if (target_slot >= 0 && target_slot < MAX_WINDOWS && g_windows[target_slot].used) {
         /* window context: actions on that specific window (same code paths as
          * the title-bar minimize/maximize/close buttons). */
@@ -5247,9 +5317,10 @@ static void menu_run(int idx) {
                g_menu_action[idx] == MACT_WIN_SNAP_RIGHT ||
                g_menu_action[idx] == MACT_WIN_CLOSE) {
         /* Act on the window the menu was opened over, mirroring the title-bar
-         * button handlers exactly. Re-validate the slot in case the window was
-         * closed/reaped while the menu was open. */
-        int slot = g_menu_target_slot;
+         * button handlers exactly. #9: re-resolve the target by its STABLE id, not
+         * the (recyclable) slot index, so a close/reuse race while the menu is open
+         * can't make this act on the WRONG window now occupying that slot. */
+        int slot = (g_menu_target_winid > 0) ? slot_by_win_id(g_menu_target_winid) : -1;
         if (slot >= 0 && slot < MAX_WINDOWS && g_windows[slot].used &&
             g_windows[slot].phase != PH_CLOSING &&
             g_windows[slot].phase != PH_MINIMIZING) {
@@ -5408,6 +5479,10 @@ static void handle_mouse(uint32_t W, uint32_t H) {
      * offers desktop actions. Right-clicks on the dock/icons fall through. */
     if (g_rclick_latch) {
         g_rclick_latch = 0;
+        /* #5: never open a context menu mid-drag. Cancel the in-flight drag first
+         * so the window isn't left stuck to the cursor (and no snap preview lingers)
+         * behind the menu. */
+        if (g_drag_slot >= 0) { g_drag_slot = -1; g_snap_armed = SNAP_NONE; }
         int in_region = (g_rclick_cx < (int32_t)W - RDOCK_W &&
                          g_rclick_cy > PANEL_H && g_rclick_cy < (int32_t)H - DOCK_H);
         int on_icon = (desk_icon_at(g_rclick_cx, g_rclick_cy, W, H) >= 0);

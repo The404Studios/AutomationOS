@@ -4124,6 +4124,22 @@ static uint64_t shm_segment_size(int shm_id) {
     return (uint64_t)ds.shm_segsz;
 }
 
+/* The KERNEL-recorded creator pid (shm_cpid) of an shm segment. The compositor uses
+ * THIS -- not the client-supplied req->pid -- as a window's owner for teardown
+ * SIGTERM/SIGKILL, so a malicious client cannot make it signal an arbitrary victim
+ * pid (a daemon, a sibling app, or the compositor itself). 0 if it can't be read. */
+static int32_t shm_segment_cpid(int shm_id) {
+    struct {
+        unsigned int  shm_perm_uid, shm_perm_gid, shm_perm_mode;
+        unsigned long shm_segsz, shm_atime, shm_dtime, shm_ctime;
+        unsigned int  shm_cpid, shm_lpid, shm_nattch;
+    } ds;
+    ds.shm_cpid = 0;
+    long r = sc6(SYS_SHMCTL, (long)shm_id, IPC_STAT, (long)&ds, 0, 0, 0);
+    if (r != 0) return 0;
+    return (int32_t)ds.shm_cpid;
+}
+
 static void handle_create(const wl_req_create_t *req) {
     int slot = find_free_slot();
     if (slot < 0) {
@@ -4140,8 +4156,13 @@ static void handle_create(const wl_req_create_t *req) {
      * so every blit still source-clamps within the mapped segment (no OOB read).
      * The client re-reads its own win->w/h and reflows; on a screen at least as
      * large as the request (the common case) nothing is clamped. */
-    if (req->w == 0 || req->h == 0) {
-        print("[COMP] rejecting create: zero geometry w="); print_num((long)req->w);
+    /* OVERFLOW-FIX: cap the client-supplied dimensions to a sane absolute maximum
+     * (16384 -- beyond any real surface). Without this, the w*h*4 extent check below
+     * can wrap uint64 (0x80000000 * 0x80000000 * 4 == 2^64 -> 0), defeating the
+     * SHM-fits validation and poisoning stride/buf_w/buf_h -> a giant stride makes
+     * the composite blit read ~8GB past the mapping -> page fault -> desktop DoS. */
+    if (req->w == 0 || req->h == 0 || req->w > 16384u || req->h > 16384u) {
+        print("[COMP] rejecting create: bad geometry w="); print_num((long)req->w);
         print(" h="); print_num((long)req->h); print(" pid="); print_num(req->pid);
         print("\n");
         return;
@@ -4158,7 +4179,11 @@ static void handle_create(const wl_req_create_t *req) {
      * signed int wraps to 0 or negative, breaking slot_by_win_id lookups. Reset
      * to 1 on wrap so IDs are always valid positive integers. */
     if (g_next_win_id <= 0) g_next_win_id = 1;
-    win->client_pid = req->pid;
+    /* PID-FIX: the window owner is the SHM segment's KERNEL-recorded creator
+     * (shm_cpid), NOT the forgeable client-supplied req->pid -- otherwise a client
+     * could set req->pid to a victim and trigger window teardown to make the
+     * compositor SIGTERM/SIGKILL it. A bad shm_id aborts the create below anyway. */
+    { int32_t cpid = shm_segment_cpid(req->shm_id); win->client_pid = (cpid > 0) ? cpid : req->pid; }
     win->reply_qid  = -1;
     win->shm_id     = req->shm_id;
     win->w          = disp_w;   /* DISPLAY size: clamped to the framebuffer    */

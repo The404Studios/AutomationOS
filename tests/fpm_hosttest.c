@@ -243,6 +243,25 @@ static void test_trig(void)
         printf("  fx_atan2 extremes (FX_MAX/FX_MIN corners): worst = %.4f brad\n", exmax);
         CHECK(exfail == 0, "fx_atan2 extreme-magnitude corners <= 1 brad");
     }
+
+    /* round-2 differential-fuzz REGRESSION: SMALL RAW integer coordinates
+     * (e.g. pixel deltas) -- these lost all bits in the un-normalized CORDIC
+     * (measured 57 brad error on atan2(1,-2)). Now pre-normalized. Sweep all
+     * raw pairs |x|,|y| <= 8 (incl. axes), require <= 1 brad. */
+    {
+        double smax = 0; int sfail = 0; long sp = 0;
+        for (int yi = -8; yi <= 8; yi++) for (int xi = -8; xi <= 8; xi++) {
+            if (xi == 0 && yi == 0) continue;
+            fx got = fx_atan2((fx)yi, (fx)xi);      /* RAW ints, not <<16 */
+            double ref = atan2((double)yi, (double)xi) * BRAD_PER_RAD;
+            double e = fabs(wrap_brad((double)got/65536.0 - ref));
+            if (e > smax) smax = e;
+            if (e > 1.0) sfail++;
+            sp++;
+        }
+        printf("  fx_atan2 small raw coords (|x|,|y|<=8): worst = %.4f brad over %ld\n", smax, sp);
+        CHECK(sfail == 0, "REGRESSION: fx_atan2 small raw coords <= 1 brad (was 57)");
+    }
 }
 
 /* ------------------------------------------------------------------ *
@@ -277,6 +296,14 @@ static void test_vectors(void)
     /* zero vector -> zero (no divide by zero) */
     fxv3 z = fxv3_normalize(fxv3_mk(0,0,0));
     CHECK(z.x == 0 && z.y == 0 && z.z == 0, "normalize(0)=0");
+
+    /* round-2 audit REGRESSION: raw (1,1,1) (|v| ~ 2.6e-5 real) hits the
+     * unique rsqrt Newton-collapse input v32=3 and returned the ZERO vector
+     * for a NONZERO input. The reciprocal now saturates instead: components
+     * must be nonzero (magnitude inherently clamped, direction preserved). */
+    fxv3 tiny = fxv3_normalize(fxv3_mk(1, 1, 1));
+    CHECK(tiny.x > 0 && tiny.y > 0 && tiny.z > 0,
+          "REGRESSION: normalize(raw 1,1,1) nonzero (was zero vector)");
 }
 
 /* double-precision column-major 4x4 reference helpers */
@@ -421,6 +448,9 @@ static void test_coverage(void)
     CHECK(fx_from_int(-40000) == FX_MIN, "REGRESSION: fx_from_int(-40000) saturates (was sign flip)");
     CHECK(fx_from_int(-32768) == FX_MIN, "fx_from_int(-32768) exact FX_MIN");
     CHECK(fx_round((fx)0x7FFF8000) == FX_MAX, "REGRESSION: round(32767.5) == ceil(32767.5) == FX_MAX");
+    /* round-2 audit: a+0.5 lands EXACTLY on FX_MAX (no overflow) for
+     * a = FX_MAX-FX_HALF; correct answer is floor = 32767.0, not FX_MAX */
+    CHECK(fx_round(FX_MAX - FX_HALF) == (fx)0x7FFF0000, "REGRESSION-2: round(FX_MAX-0.5) = 32767.0 (not FX_MAX)");
     {   /* dot wrap: each term fits int32, the sum does not (2*181^2 > 32767) */
         fxv2 v = fxv2_mk(fx_from_int(181), fx_from_int(181));
         CHECK(fxv2_dot(v, v) == FX_MAX, "REGRESSION: fxv2_dot saturates (was negative len^2)");
@@ -598,6 +628,116 @@ static void test_coverage(void)
         }
         printf("  inverse_affine sweep (scale 0.01..200, rot+T): worst |M*Minv-I| = %.5f\n", wworst);
         CHECK(wfail == 0, "fxm4_inverse_affine round-trips across scales 0.01..200");
+    }
+
+    /* round-2 REGRESSION (inverse-core auditor): high-dynamic-range invertible
+     * matrix. The single-global-scale core mis-classified this as singular and
+     * returned identity (|M*Minv-I| ~ 3000); the exact 128-bit core inverts it.
+     * A_real = [[3000,0,0],[0,0.01,0.02],[0,0.02,0.05]] (col-major storage). */
+    {
+        fxm3 A; for (int i = 0; i < 9; i++) A.m[i] = 0;
+        A.m[0] = fx_from_int(3000);                 /* (0,0) */
+        A.m[4] = fx_ratio(1,100); A.m[5] = fx_ratio(2,100);   /* col1: (1,1),(2,1) */
+        A.m[7] = fx_ratio(2,100); A.m[8] = fx_ratio(5,100);   /* col2: (1,2),(2,2) */
+        fxm3 Ai = fxm3_inverse(A);
+        fxm3 I = fxm3_mul(A, Ai);
+        double w = 0; int bad = 0;
+        for (int c = 0; c < 3; c++) for (int r = 0; r < 3; r++) {
+            double e = fabs(fxd(I.m[c*3+r]) - (c==r?1.0:0.0));
+            if (e > w) w = e;
+            if (e > 1e-2) bad++;
+        }
+        printf("  fxm3_inverse high-dynamic-range: worst |A*Ainv-I| = %.5f\n", w);
+        CHECK(bad == 0, "REGRESSION: fxm3_inverse high-dynamic-range (was false-singular->identity)");
+    }
+
+    /* round-2 REGRESSION (Cramer auditor): large scale + large translation.
+     * The truncate-then-upshift translation lost the low bits and the round
+     * trip amplified them by scale (|M*Minv-I| ~ 0.39 at scale 164, t 20000);
+     * the exact-division Cramer path fixes it. */
+    {
+        double sworst = 0; int sbad = 0;
+        double sc[] = { 41.0, 82.0, 164.0, 200.0 };
+        for (int k = 0; k < 4; k++) {
+            fx s = (fx)llround(sc[k] * 65536.0);
+            fxm4 M = fxm4_mul(fxm4_translate(fx_from_int(20000), fx_from_int(-15000), fx_from_int(18000)),
+                              fxm4_mul(fxm4_rotate_y(105), fxm4_scale(s, s, s)));
+            fxm4 I = fxm4_mul(M, fxm4_inverse_affine(M));
+            for (int c = 0; c < 4; c++) for (int r = 0; r < 4; r++) {
+                double e = fabs(fxd(I.m[c*4+r]) - (c==r?1.0:0.0));
+                if (e > sworst) sworst = e;
+                if (e > 1e-2) sbad++;
+            }
+        }
+        printf("  inverse_affine large scale+translation: worst |M*Minv-I| = %.5f\n", sworst);
+        CHECK(sbad == 0, "REGRESSION: inverse_affine large scale+large translation (was 0.39)");
+    }
+
+    /* --- INTEGRATION: the full rendering pipeline this library exists for.
+     * 8 cube corners through model(rotY+T) * lookat * perspective -> clip ->
+     * NDC, fx pipeline vs the identical double pipeline (same brad-quantized
+     * angles, same lookat/perspective construction). --- */
+    {
+        int mb = 80;                                  /* model rotation, brads */
+        fxm4 model = fxm4_mul(fxm4_translate(fx_ratio(3,10), fx_ratio(-2,5), fx_ratio(1,2)),
+                              fxm4_rotate_y(mb));
+        fxv3 eye = fxv3_mk(fx_from_int(3), fx_from_int(2), fx_from_int(5));
+        fxm4 view = fxm4_lookat(eye, fxv3_mk(0,0,0), fxv3_mk(0, FX_ONE, 0));
+        fxm4 proj = fxm4_perspective(fpm_deg(60), fx_ratio(4,3), fx_ratio(1,10), fx_from_int(100));
+        fxm4 mvp  = fxm4_mul(proj, fxm4_mul(view, model));
+
+        /* double reference with the same quantized angles + construction */
+        double am = 2.0*M_PI*mb/1024.0;
+        double dmodel[16] = {0};
+        dmodel[0]=cos(am); dmodel[2]=-sin(am); dmodel[5]=1.0;
+        dmodel[8]=sin(am); dmodel[10]=cos(am); dmodel[15]=1.0;
+        dmodel[12]=0.3; dmodel[13]=-0.4; dmodel[14]=0.5;
+        double ex=3, ey=2, ez=5;
+        double fl = sqrt(ex*ex+ey*ey+ez*ez);
+        double fwx=-ex/fl, fwy=-ey/fl, fwz=-ez/fl;             /* forward     */
+        double rsx = fwy*0.0 - fwz*1.0;                        /* s = f x up  */
+        double rsy = fwz*0.0 - fwx*0.0;
+        double rsz = fwx*1.0 - fwy*0.0;
+        double sl = sqrt(rsx*rsx+rsy*rsy+rsz*rsz);
+        rsx/=sl; rsy/=sl; rsz/=sl;
+        double uxx = rsy*fwz-rsz*fwy, uyy = rsz*fwx-rsx*fwz, uzz = rsx*fwy-rsy*fwx;
+        double dview[16] = {0};
+        dview[0]=rsx;  dview[4]=rsy;  dview[8]=rsz;
+        dview[1]=uxx;  dview[5]=uyy;  dview[9]=uzz;
+        dview[2]=-fwx; dview[6]=-fwy; dview[10]=-fwz;
+        dview[12]=-(rsx*ex+rsy*ey+rsz*ez);
+        dview[13]=-(uxx*ex+uyy*ey+uzz*ez);
+        dview[14]= (fwx*ex+fwy*ey+fwz*ez);
+        dview[15]=1.0;
+        int hb = fpm_deg(60)/2;                       /* 85 brads, as fx does */
+        double ah = 2.0*M_PI*hb/1024.0;
+        double f2 = cos(ah)/sin(ah), asp = 4.0/3.0, zn = 0.1, zf = 100.0;
+        double dproj[16] = {0};
+        dproj[0]=f2/asp; dproj[5]=f2; dproj[10]=(zf+zn)/(zn-zf);
+        dproj[11]=-1.0; dproj[14]=2.0*zf*zn/(zn-zf);
+        double dvm[16], dmvp[16];
+        dmul(dview, dmodel, dvm); dmul(dproj, dvm, dmvp);
+
+        double pworst = 0; int pbad = 0;
+        for (int corner = 0; corner < 8; corner++) {
+            fx cxv = (corner & 1) ? FX_ONE : -FX_ONE;
+            fx cyv = (corner & 2) ? FX_ONE : -FX_ONE;
+            fx czv = (corner & 4) ? FX_ONE : -FX_ONE;
+            /* fx clip coords (rows 0,1,3 of the column-major mvp) */
+            fx X = fx_mul(mvp.m[0],cxv)+fx_mul(mvp.m[4],cyv)+fx_mul(mvp.m[8], czv)+mvp.m[12];
+            fx Y = fx_mul(mvp.m[1],cxv)+fx_mul(mvp.m[5],cyv)+fx_mul(mvp.m[9], czv)+mvp.m[13];
+            fx W = fx_mul(mvp.m[3],cxv)+fx_mul(mvp.m[7],cyv)+fx_mul(mvp.m[11],czv)+mvp.m[15];
+            double pc[4] = { fxd(cxv), fxd(cyv), fxd(czv), 1.0 }, oc[4];
+            dpoint(dmvp, pc, oc);
+            if (W <= 0 || oc[3] <= 0) { pbad++; continue; }   /* all in front */
+            double e1 = fabs(fxd(X)/fxd(W) - oc[0]/oc[3]);
+            double e2 = fabs(fxd(Y)/fxd(W) - oc[1]/oc[3]);
+            if (e1 > pworst) pworst = e1;
+            if (e2 > pworst) pworst = e2;
+            if (e1 > 1e-2 || e2 > 1e-2) pbad++;
+        }
+        printf("  pipeline (8 cube corners -> NDC vs double): worst = %.5f\n", pworst);
+        CHECK(pbad == 0, "INTEGRATION: cube corners -> NDC within 1e-2 of double pipeline");
     }
 }
 

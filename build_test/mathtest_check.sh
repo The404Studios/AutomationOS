@@ -3,8 +3,11 @@
 # Shape cloned from w1b_check.sh, but this script wires NO kernel/ISO build and
 # NO QEMU boot -- the main session owns those (shared build dir). It gates:
 #   (a) fpm.c compiles standalone with the repo userspace flags and its object
-#       is integer-only: 0 xmm/float instructions, 0 stack canaries.
-#   (b) the host KAT battery (tests/fpm_hosttest.c vs libm) is green.
+#       is integer-only AND fully self-contained: 0 xmm/float instructions,
+#       0 stack canaries, 0 undefined symbols, 0 libgcc 128-bit helpers
+#       (__multi3/__divti3/... -- the exact inverse core must stay inline).
+#   (b) the host KAT battery (tests/fpm_hosttest.c vs libm) is green, AND the
+#       ~5.7M-input differential fuzz (tests/fpm_fuzz.c) reports 0 violations.
 #   (c) a PROVIDED serial log (arg $1) contains the [MATHTEST] boot markers.
 #       The main session wires sbin/mathtest into build_all.sh + the boot, then
 #       runs:  bash build_test/mathtest_check.sh <serial.log>
@@ -22,9 +25,11 @@ gcc -std=gnu11 -ffreestanding -nostdlib -fno-builtin -fno-stack-protector \
 
 XMM=$(objdump -d /tmp/fpm_gate.o 2>/dev/null | grep -ciE 'xmm|movss|movsd')
 CANARY=$(objdump -d /tmp/fpm_gate.o 2>/dev/null | grep -c 'fs:0x28')
-echo "fpm.o: xmm/float=$XMM canary=$CANARY (both must be 0)"
+LIBGCC=$(objdump -dr /tmp/fpm_gate.o 2>/dev/null | grep -cE '__(mul|div|udiv|mod|umod|ashl|ashr|lshr|neg)ti3|__negti2')
+UNDEF=$(nm -u /tmp/fpm_gate.o 2>/dev/null | grep -c .)
+echo "fpm.o: xmm/float=$XMM canary=$CANARY libgcc128=$LIBGCC undef=$UNDEF (all must be 0)"
 
-# --- (b) host KAT battery (dense sweeps vs libm double references) ---
+# --- (b) host KAT battery + differential fuzz (both vs libm doubles) ---
 echo "[math0a] host KAT battery..."
 HOST=0
 gcc -std=gnu11 -O2 -DFPM_HOSTTEST -I userspace/lib/fpm \
@@ -32,6 +37,14 @@ gcc -std=gnu11 -O2 -DFPM_HOSTTEST -I userspace/lib/fpm \
   && /tmp/fpm_hosttest > /tmp/fpm_hosttest.log 2>&1 \
   && grep -q 'FPM HOSTTEST: PASS' /tmp/fpm_hosttest.log && HOST=1
 grep -E 'worst|FPM HOSTTEST' /tmp/fpm_hosttest.log | sed 's/^/  /'
+
+echo "[math0a] differential fuzz (~5.7M inputs, fixed seed)..."
+FUZZ=0
+gcc -std=gnu11 -O2 -DFPM_HOSTTEST -I userspace/lib/fpm \
+    tests/fpm_fuzz.c -o /tmp/fpm_fuzz -lm \
+  && /tmp/fpm_fuzz > /tmp/fpm_fuzz.log 2>&1 \
+  && grep -q 'FPM FUZZ: PASS' /tmp/fpm_fuzz.log && FUZZ=1
+grep -E 'worst|VIOLATION|FPM FUZZ' /tmp/fpm_fuzz.log | head -12 | sed 's/^/  /'
 
 # --- (c) boot markers from the provided serial log ---
 BOOT=-1
@@ -48,12 +61,14 @@ else
 fi
 
 echo ""
-echo "xmm=$XMM canary=$CANARY host_kat=$HOST boot=$BOOT"
-if [ "$XMM" = "0" ] && [ "$CANARY" = "0" ] && [ "$HOST" = "1" ] && [ "$BOOT" = "1" ]; then
-  echo "MATH-0a: PASS (fpm integer-only; host KATs green; boot battery green)"
+echo "xmm=$XMM canary=$CANARY libgcc128=$LIBGCC undef=$UNDEF host_kat=$HOST fuzz=$FUZZ boot=$BOOT"
+STATIC_OK=0
+[ "$XMM" = "0" ] && [ "$CANARY" = "0" ] && [ "$LIBGCC" = "0" ] && [ "$UNDEF" = "0" ] && STATIC_OK=1
+if [ "$STATIC_OK" = "1" ] && [ "$HOST" = "1" ] && [ "$FUZZ" = "1" ] && [ "$BOOT" = "1" ]; then
+  echo "MATH-0a: PASS (fpm self-contained integer-only; host KATs + fuzz green; boot battery green)"
   exit 0
-elif [ "$XMM" = "0" ] && [ "$CANARY" = "0" ] && [ "$HOST" = "1" ] && [ "$BOOT" = "-1" ]; then
-  echo "MATH-0a: PARTIAL (static + host gates green; no serial log yet -- boot unproven)"
+elif [ "$STATIC_OK" = "1" ] && [ "$HOST" = "1" ] && [ "$FUZZ" = "1" ] && [ "$BOOT" = "-1" ]; then
+  echo "MATH-0a: PARTIAL (static + host + fuzz gates green; no serial log yet -- boot unproven)"
   exit 2
 else
   echo "MATH-0a: FAIL"

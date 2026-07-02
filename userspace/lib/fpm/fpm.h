@@ -126,7 +126,10 @@ void fpm_init(void);            /* generate the sine table (idempotent)         
 fx fx_sin(fpm_i32 brad);        /* sin(2*pi*brad/1024), Q16.16 in [-1,1]        */
 fx fx_cos(fpm_i32 brad);        /* cos(2*pi*brad/1024)                          */
 /* CORDIC (from scratch, no libm): results in brads. */
-fx fx_atan2(fx y, fx x);        /* angle of (x,y) in brads, all quadrants; (0,0)->0 */
+/* angle of (x,y) in brads, all quadrants; (0,0)->0. Inputs are pre-normalized
+ * so accuracy is ~1 brad even for small integer coordinates (e.g. pixel
+ * deltas). Result is approximately (-512,512] brads, exact to ~1 brad. */
+fx fx_atan2(fx y, fx x);
 fx fx_asin(fx a);               /* asin(a), a in [-1,1], result in brads        */
 fx fx_acos(fx a);               /* acos(a), a in [-1,1], result in brads        */
 
@@ -172,8 +175,9 @@ static inline fxv3 fxv3_cross(fxv3 a, fxv3 b) {
 }
 fx   fxv3_len(fxv3 a);                          /* overflow-safe */
 /* normalize precision note: the reciprocal length is a Q16.16 quantity, so the
- * relative error grows like |v|/65536 -- keep |v| <= ~1000 for <1% length
- * error (the KAT-proven envelope). Zero vector -> zero. */
+ * relative error grows with |v|. Fuzz-measured envelope: |len-1| < 1% for
+ * |v| <~ 655, reaching ~1.5% at |v| = 1000; stay <~ 655 for <1% length error.
+ * Zero vector -> zero. */
 fxv3 fxv3_normalize(fxv3 a);                    /* a/|a| via rsqrt; zero->zero */
 
 /* ====================================================================== *

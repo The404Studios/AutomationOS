@@ -88,15 +88,19 @@ fx fx_ceil(fx a)
     return (f == a) ? f : fx_sat_add(f, FX_ONE);
 }
 
-/* Round half up (toward +inf): floor(a + 0.5). When a + 0.5 saturates (a in
- * [32767.5, FX_MAX]) return FX_MAX un-floored: the ideal result 32768.0 is
+/* Round half up (toward +inf): floor(a + 0.5). When a + 0.5 OVERFLOWS (a >=
+ * 32767.5) return FX_MAX un-floored: the ideal result 32768.0 is
  * unrepresentable, and flooring the clamped sum would un-saturate back down to
- * 32767.0 -- returning FX_MAX keeps round consistent with fx_ceil's saturation
- * convention (round(x) must never be < ceil(x) - 1). */
+ * 32767.0 -- FX_MAX keeps round consistent with fx_ceil's saturation
+ * convention. The guard tests the UNSATURATED int64 sum, NOT `== FX_MAX`:
+ * the sum lands on FX_MAX exactly WITHOUT overflowing for the single input
+ * a = FX_MAX - FX_HALF (32767.49998), whose correct answer is
+ * floor(32767.99998) = 32767.0 (round-2 audit finding). */
 fx fx_round(fx a)
 {
-    fx s = fx_sat_add(a, FX_HALF);
-    return (s == FX_MAX) ? FX_MAX : fx_floor(s);
+    fpm_i64 s = (fpm_i64)a + FX_HALF;
+    if (s > FX_MAX) return FX_MAX;
+    return fx_floor((fx)s);
 }
 
 /* ====================================================================== *
@@ -139,7 +143,7 @@ fx fx_sqrt(fx a)
  * intermediate) so precision is not lost forming y^2 for small y.
  *
  * ERROR BOUND: over V in [1e-3, 30000] the measured worst-case relative error is
- * ~2e-3 (inside the 5e-3 contract); for the normalize magnitudes 1e-2..1e3 the
+ * ~2.6e-3 (inside the 5e-3 contract); for the normalize magnitudes 1e-2..1e3 the
  * resulting |len-1| stays < 1e-2 -- see fpm_hosttest.
  */
 static fx rsqrt_q32(fpm_u64 v32)
@@ -152,6 +156,13 @@ static fx rsqrt_q32(fpm_u64 v32)
         fpm_i64 h  = (fpm_i64)((v32 * (fpm_u64)y) >> 32);   /* V*y   (Q16.16) */
         fpm_i64 e  = (h * y) >> FX_SHIFT;                   /* V*y^2 (Q16.16) */
         fpm_i64 tm = ((fpm_i64)3 << FX_SHIFT) - e;          /* 3 - V*y^2      */
+        /* tm <= 0 means V*y^2 >= 3, only reachable when the seed overshoots by
+         * >= sqrt(3) -- max(V*seed^2) = 1 + 2/root, which hits 3 solely at
+         * v32 == 3 (root == 1), where the true reciprocal (~2.5e9 raw) is far
+         * out of range. Saturate; multiplying by tm would zero y and make
+         * normalize() return a ZERO vector for a NONZERO input (round-2 audit,
+         * exhaustively scanned v32 in [1, 3e7]). */
+        if (tm <= 0) { y = FX_MAX; break; }
         y = (y * tm) >> (FX_SHIFT + 1);                     /* * 0.5          */
         if (y > FX_MAX) y = FX_MAX;
         if (y < 0)      y = 0;
@@ -298,6 +309,22 @@ fx fx_atan2(fx y, fx x)
         vx = -vx; vy = -vy;
         base = (y >= 0) ? (fpm_i64)512 * FX_ONE : -(fpm_i64)512 * FX_ONE;
     }
+
+    /* PRE-NORMALIZE (round-2 differential-fuzz fix): the CORDIC uses vx>>i /
+     * vy>>i, so small integer coordinates lose all their bits after a few
+     * iterations and the rotation can't refine -- measured up to 57 brad error
+     * for e.g. atan2(1,-2). The angle is scale-invariant, so left-shift both
+     * coordinates until max(|vx|,|vy|) reaches bit ~28, giving >=13 bits of
+     * headroom even at i=15. Multiply (not <<) because vy may be negative
+     * (left shift of a negative value is UB). Growth to ~2^29 * CORDIC gain
+     * 1.65 stays far below int64. */
+    fpm_i64 m = (vx > vy ? vx : vy);
+    fpm_i64 my = (vy < 0 ? -vy : vy);
+    if (my > m) m = my;                              /* m = max(|vx|,|vy|) >= 1 */
+    int k = 0;
+    while ((m << k) < ((fpm_i64)1 << 28) && k < 40) k++;
+    if (k) { fpm_i64 sc = (fpm_i64)1 << k; vx *= sc; vy *= sc; }
+
     fpm_i64 ang = 0;
     for (int i = 0; i < 16; i++) {
         fpm_i64 dx = vx >> i, dy = vy >> i;
@@ -381,108 +408,107 @@ fxm3 fxm3_transpose(fxm3 a)
     return r;
 }
 
-/* 2x2 minor a*d - b*c in Q16.16, UNSATURATED in int64 (inputs are the
- * normalized entries below, < 2^24, so |minor| < 2^33 -- exact). */
-static fpm_i64 minor2_i64(fx a, fx b, fx c, fx d)
-{
-    return ((fpm_i64)a * d - (fpm_i64)b * c) >> FX_SHIFT;
-}
-
-/* value * 2^k with saturation, for undoing the normalization shifts below.
- * The +-2^37 pre-clamp makes the scale-up (k up to 25 across all callers)
- * overflow-free; anything that large saturates to FX_MAX/FX_MIN anyway.
- * Scale-up is a MULTIPLY by (1<<k), not `v << k`: left-shifting a negative
- * value is UB in C11 (UBSan-caught); the multiply is value-identical. */
-static fx unshift_sat(fpm_i64 v, int k)
-{
-    if (k >= 0) {
-        const fpm_i64 LIM = (fpm_i64)1 << 37;
-        if (v >  LIM) return FX_MAX;
-        if (v < -LIM) return FX_MIN;
-        return fpm_sat_i64(v * ((fpm_i64)1 << k));
-    }
-    return fpm_sat_i64(v >> -k);
-}
-
 /*
- * Shared normalized-adjugate core for fxm3_inverse / fxm4_inverse_affine.
+ * Exact 3x3 inverse core (round-2 audit rewrite).
  *
- * A naive Q16.16 adjugate breaks in both directions: minors saturate at int32
- * once entries exceed ~32 (det ~ entry^3), and for tiny entries (uniform scale
- * 0.01 -> minors of ~7 raw units) the quotients lose all precision. So we first
- * scale the whole matrix by a power of two so its max |entry| lands in
- * [2^18, 2^24) (raw), and build the adjugate + det of that well-conditioned
- * copy exactly in int64 (minors < 2^33, det terms < 2^57, sum < 2^59 -- no
- * saturation possible). Callers undo the scale: inv(A * 2^s) = inv(A) * 2^-s.
+ * The earlier power-of-two-normalized int64 core mis-classified invertible
+ * matrices with intra-matrix dynamic range beyond ~2^16 as singular (the
+ * global downscale truncated the small entries' minors to 0), and its
+ * truncate-then-upshift translation path lost precision proportional to
+ * scale * 2^st. This core is EXACT instead: 2x2 minors are held in Q32.32
+ * (int64 products, 128-bit difference), the determinant in Q48.48 (128-bit),
+ * so the singularity test has NO truncation at all, and each inverse entry
+ * suffers exactly ONE rounding -- the final truncating division to Q16.16.
+ *
+ * FREESTANDING NOTE: gcc __int128 add/sub/compare/multiply(64x64) and
+ * CONSTANT shifts are inline on x86-64 (no libgcc). 128-bit DIVISION is not
+ * (__divti3), so div128_sat below is a restoring long division built from
+ * shift-by-1/compare/subtract only. The objdump gate proves 0 external calls.
  */
+typedef __int128          fpm_i128;
+typedef unsigned __int128 fpm_u128;
+
+/* Saturating ROUND-TO-NEAREST division: fx = clamp(round(num / det)),
+ * 128/128-bit. Round-to-nearest (not truncate) halves the worst-case
+ * quantization of each inverse entry, which matters on the round trip when a
+ * large matrix entry amplifies a small inverse entry's error (round-2 audit:
+ * high-dynamic-range inverse). */
+static fx div128_sat(fpm_i128 num, fpm_i128 det)
+{
+    int neg = 0;
+    fpm_u128 n, d;
+    if (num < 0) { n = (fpm_u128)(-num); neg ^= 1; } else n = (fpm_u128)num;
+    if (det < 0) { d = (fpm_u128)(-det); neg ^= 1; } else d = (fpm_u128)det;
+
+    /* MSB-first restoring division; all shifts are by constant 1/127. */
+    fpm_u128 q = 0, r = 0;
+    for (int i = 0; i < 128; i++) {
+        r = (r << 1) | (n >> 127);
+        n <<= 1;
+        q <<= 1;
+        if (r >= d) { r -= d; q |= 1; }
+        /* early saturation: quotient already beyond any fx */
+        if (q > (fpm_u128)0xFFFFFFFFu)
+            return neg ? FX_MIN : FX_MAX;
+    }
+    if ((r << 1) >= d) q += 1;                       /* round half up */
+    fpm_i64 qi = (fpm_i64)(fpm_u64)q;
+    return fpm_sat_i64(neg ? -qi : qi);
+}
+
+/* Exact adjugate (Q32.32) + determinant (Q48.48) of A, result layout
+ * adj[col*3+row] = numerator of inv(A)[row][col]. det == 0 <=> singular,
+ * with no false positives (every product is exact). */
 typedef struct {
-    fpm_i64 adj[9];    /* adjugate of B, stored in RESULT layout [col*3+row] */
-    fpm_i64 det;       /* det(B), Q16.16 in int64 (0 => singular)           */
-    int     s;         /* A = B * 2^s, s in [-18, 7]                        */
+    fpm_i128 adj[9];
+    fpm_i128 det;
 } fpm_inv3;
+
+/* Q32.32 minor a*d - b*c: int64 products (<= 2^62), difference exact in 128. */
+static inline fpm_i128 minor_q32(fx a, fx b, fx c, fx d)
+{
+    return (fpm_i128)((fpm_i64)a * d) - (fpm_i128)((fpm_i64)b * c);
+}
 
 static fpm_inv3 inv3_prepare(fxm3 A)
 {
     fpm_inv3 c;
-    c.det = 0; c.s = 0;
+    /* element(row,col) = A.m[col*3+row] */
+    fx m00 = A.m[0], m10 = A.m[1], m20 = A.m[2];
+    fx m01 = A.m[3], m11 = A.m[4], m21 = A.m[5];
+    fx m02 = A.m[6], m12 = A.m[7], m22 = A.m[8];
 
-    /* --- normalize: B = A * 2^-s with max|B| in [2^18, 2^24) --- */
-    fpm_i64 maxe = 0;
-    for (int i = 0; i < 9; i++) {
-        fpm_i64 v = A.m[i];
-        if (v < 0) v = -v;                 /* int64: |INT32_MIN| is fine */
-        if (v > maxe) maxe = v;
-    }
-    if (maxe == 0) return c;                /* zero matrix: singular */
+    c.adj[0] = minor_q32(m11, m12, m21, m22);   /* inv(0,0) */
+    c.adj[1] = minor_q32(m12, m10, m22, m20);   /* inv(1,0) */
+    c.adj[2] = minor_q32(m10, m11, m20, m21);   /* inv(2,0) */
+    c.adj[3] = minor_q32(m02, m01, m22, m21);   /* inv(0,1) */
+    c.adj[4] = minor_q32(m00, m02, m20, m22);   /* inv(1,1) */
+    c.adj[5] = minor_q32(m01, m00, m21, m20);   /* inv(2,1) */
+    c.adj[6] = minor_q32(m01, m02, m11, m12);   /* inv(0,2) */
+    c.adj[7] = minor_q32(m02, m00, m12, m10);   /* inv(1,2) */
+    c.adj[8] = minor_q32(m00, m01, m10, m11);   /* inv(2,2) */
 
-    int s = 0;
-    while (maxe >= ((fpm_i64)1 << 24)) { maxe >>= 1; s++; }              /* s <=  7 */
-    while (maxe <  ((fpm_i64)1 << 18) && s > -18) { maxe <<= 1; s--; }   /* s >= -18 */
-    c.s = s;
-
-    fx B[9];
-    for (int i = 0; i < 9; i++) {
-        fpm_i64 v = A.m[i];
-        /* scale-up via multiply (v can be negative; << would be UB) */
-        B[i] = (fx)(s >= 0 ? (v >> s) : (v * ((fpm_i64)1 << -s)));  /* < 2^24 */
-    }
-
-    /* element(row,col) = B[col*3+row] */
-    fx m00 = B[0], m10 = B[1], m20 = B[2];
-    fx m01 = B[3], m11 = B[4], m21 = B[5];
-    fx m02 = B[6], m12 = B[7], m22 = B[8];
-
-    /* adjugate in result layout: adj[col*3+row] = numerator of inv(B)[row,col] */
-    c.adj[0] = minor2_i64(m11, m12, m21, m22);   /* inv(0,0) */
-    c.adj[1] = minor2_i64(m12, m10, m22, m20);   /* inv(1,0) */
-    c.adj[2] = minor2_i64(m10, m11, m20, m21);   /* inv(2,0) */
-    c.adj[3] = minor2_i64(m02, m01, m22, m21);   /* inv(0,1) */
-    c.adj[4] = minor2_i64(m00, m02, m20, m22);   /* inv(1,1) */
-    c.adj[5] = minor2_i64(m01, m00, m21, m20);   /* inv(2,1) */
-    c.adj[6] = minor2_i64(m01, m02, m11, m12);   /* inv(0,2) */
-    c.adj[7] = minor2_i64(m02, m00, m12, m10);   /* inv(1,2) */
-    c.adj[8] = minor2_i64(m00, m01, m10, m11);   /* inv(2,2) */
-
-    /* det(B) by cofactor expansion along column 0:
-     * det = B[0,0]*C00 + B[1,0]*C10 + B[2,0]*C20, and C(k,0) is exactly the
-     * adjugate entry adj[0,k] = our adj[k*3 + 0] slots -> adj[0], adj[3],
-     * adj[6]. Terms < 2^57, sum < 2^59: exact in int64. */
-    c.det = ((fpm_i64)m00 * c.adj[0] + (fpm_i64)m10 * c.adj[3]
-           + (fpm_i64)m20 * c.adj[6]) >> FX_SHIFT;
+    /* det by cofactor expansion along column 0: C(k,0) = adj[k*3 + 0]
+     * (slots adj[0], adj[3], adj[6]). Terms <= 2^31 * 2^63 = 2^94: exact. */
+    c.det = (fpm_i128)m00 * c.adj[0] + (fpm_i128)m10 * c.adj[3]
+          + (fpm_i128)m20 * c.adj[6];
     return c;
 }
 
-/* General 3x3 inverse: see inv3_prepare. Singular -> identity. */
+/* General 3x3 inverse: see inv3_prepare. Singular -> identity.
+ * inv[i][j] = adj_real/det_real = (adj/2^32)/(det/2^48) -> Q16.16 needs
+ * *2^16, so the dividend is adj << (48 - 32 + 16 - 16) ... adj*2^32/det. */
 fxm3 fxm3_inverse(fxm3 A)
 {
     fpm_inv3 c = inv3_prepare(A);
     if (c.det == 0) return fxm3_identity();
 
     fxm3 r;
-    for (int i = 0; i < 9; i++) {
-        fpm_i64 q = (c.adj[i] * FX_ONE) / c.det;       /* inv(B) entry, Q16.16 */
-        r.m[i] = unshift_sat(q, -c.s);                 /* inv(A) = inv(B)*2^-s */
-    }
+    /* adj*2^32 (not adj<<32): adj may be negative and left-shifting a negative
+     * __int128 is UB (UBSan-caught); the multiply is value-identical. */
+    const fpm_i128 SH32 = (fpm_i128)1 << 32;
+    for (int i = 0; i < 9; i++)
+        r.m[i] = div128_sat(c.adj[i] * SH32, c.det);
     return r;
 }
 
@@ -576,8 +602,10 @@ fxm4 fxm4_perspective(fpm_i32 fov, fx aspect, fx znear, fx zfar)
     for (int i = 0; i < 16; i++) r.m[i] = 0;
     r.m[0]  = fx_div(f, aspect);
     r.m[5]  = f;
-    fx nf   = znear - zfar;
-    r.m[10] = fx_div(zfar + znear, nf);
+    /* saturating add/sub: pathological far-apart planes (e.g. znear=FX_MAX,
+     * zfar=FX_MIN) would wrap a raw int32 sum/difference (round-2 audit) */
+    fx nf   = fx_sat_sub(znear, zfar);
+    r.m[10] = fx_div(fx_sat_add(zfar, znear), nf);
     r.m[11] = fx_from_int(-1);
     r.m[14] = fx_div(fx_mul(fx_mul(fx_from_int(2), zfar), znear), nf);
     r.m[15] = 0;
@@ -610,11 +638,13 @@ fxm4 fxm4_lookat(fxv3 eye, fxv3 target, fxv3 up)
  * ONLY -- the bottom row must be (0,0,0,1). If the 3x3 is singular the result
  * carries an identity rotation block and translation -t (not a full identity).
  *
- * The translation is computed straight from the UNROUNDED adjugate (Cramer):
- *   nt = -inv(U)*t = -(adj(B)*t') / det * 2^(st - s)
- * instead of multiplying the already-quantized inv(U) by t -- that double
- * rounding is amplified by |U| on the round trip (measured 0.044 identity
- * error at uniform scale 200 vs ~0.004 this way). */
+ * Both blocks come from the EXACT 128-bit adjugate core (round-2 audit): the
+ * rotation/scale block is div128_sat(adj<<32, det); the translation is Cramer
+ * with a SINGLE exact rounding -- num = -Sigma adj[.][row]*t (Q48.48, exact in
+ * 128-bit), divided once by det (Q48.48) to Q16.16. The earlier
+ * truncate-to-Q16.16-then-upshift path lost the low bits of the translation and
+ * the round trip amplified that by |U| (measured 0.39 identity error at scale
+ * 164 + translation 20000); the exact division removes it. */
 fxm4 fxm4_inverse_affine(fxm4 A)
 {
     fxm3 U;
@@ -633,30 +663,24 @@ fxm4 fxm4_inverse_affine(fxm4 A)
         return r;
     }
 
-    /* rotation/scale block: inv(U) = (adj(B)/det) * 2^-s */
-    for (int i = 0; i < 9; i++) {
-        fpm_i64 q = (c.adj[i] * FX_ONE) / c.det;
-        r.m[(i / 3) * 4 + (i % 3)] = unshift_sat(q, -c.s);
-    }
+    /* rotation/scale block: inv(U)[row][col] = adj[col*3+row]/det, exact div.
+     * adj*2^32 via multiply (adj may be negative; <<32 would be UB). */
+    const fpm_i128 SH32 = (fpm_i128)1 << 32;
+    for (int i = 0; i < 9; i++)
+        r.m[(i / 3) * 4 + (i % 3)] = div128_sat(c.adj[i] * SH32, c.det);
 
-    /* translation: normalize t to t' = t * 2^-st with |t'| < 2^24, then
-     * nt_row = -((adj(B) * t')_row / det) * 2^(st - s).
-     * adj terms < 2^33, t' < 2^24 -> products < 2^57, 3-term sum < 2^59;
-     * (Q16.16 adj * Q16.16 t' sum) / (Q16.16 det) lands directly in Q16.16. */
-    fpm_i64 t64[3] = { A.m[12], A.m[13], A.m[14] };
-    fpm_i64 maxt = 0;
-    for (int i = 0; i < 3; i++) {
-        fpm_i64 v = t64[i] < 0 ? -t64[i] : t64[i];
-        if (v > maxt) maxt = v;
-    }
-    int st = 0;
-    while (maxt >= ((fpm_i64)1 << 24)) { maxt >>= 1; st++; }   /* st <= 7 */
+    /* translation nt = -inv(U)*t, one exact division per row.
+     * num_row = Sigma_col adj[col*3+row]*t[col]: adj is Q32.32, t Q16.16, so
+     * each product is Q48.48 (<= 2^63*2^31 = 2^94) and the sum is exact in
+     * 128-bit. num/det is Q48.48/Q48.48 = a plain ratio, so scale by 2^16 to
+     * land in Q16.16; the sign is folded into that scale factor. */
     for (int row = 0; row < 3; row++) {
-        fpm_i64 num = c.adj[0*3+row] * (t64[0] >> st)
-                    + c.adj[1*3+row] * (t64[1] >> st)
-                    + c.adj[2*3+row] * (t64[2] >> st);
-        fpm_i64 y = num / c.det;                     /* (inv(B)*t')_row, Q16.16 */
-        r.m[12 + row] = unshift_sat(-y, st - c.s);   /* negate + undo scales */
+        fpm_i128 num = c.adj[0*3+row] * (fpm_i128)A.m[12]
+                     + c.adj[1*3+row] * (fpm_i128)A.m[13]
+                     + c.adj[2*3+row] * (fpm_i128)A.m[14];
+        /* num * -65536, not -(num << 16): left-shifting a negative value is
+         * UB (the last UBSan finding); the multiply is value-identical. */
+        r.m[12 + row] = div128_sat(num * (fpm_i128)-65536, c.det);
     }
     return r;
 }

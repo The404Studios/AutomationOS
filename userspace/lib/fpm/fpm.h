@@ -4,10 +4,12 @@
  *
  * A self-contained Q16.16 fixed-point math kernel for the software renderer,
  * the games, and any userspace that must do real-number math with NO floating
- * point, NO libm, and NO libc. It is a proper superset of the ad-hoc Q16.16
- * core embedded in userspace/lib/g3d/g3d.c, factored out and hardened:
+ * point, NO libm, and NO libc. It is a FUNCTIONAL superset of the ad-hoc Q16.16
+ * core embedded in userspace/lib/g3d/g3d.c (not source-compatible: types and
+ * some names differ -- vec3->fxv3, mat4->fxm4, fx_round returns fx), hardened:
  *
- *   - saturating arithmetic (fx_mul/div never trap or wrap silently),
+ *   - saturating arithmetic (fx_mul/div never trap or wrap silently; the
+ *     vector/matrix combining sums saturate too, via int64 accumulation),
  *   - a real Newton fx_rsqrt (not 1/sqrt(x) round-tripped),
  *   - from-scratch CORDIC fx_atan2/asin/acos (no tables of floats, no libm),
  *   - overflow-safe magnitudes (fx_len2/fx_len3),
@@ -16,8 +18,10 @@
  * DESIGN CONSTRAINTS (identical rationale to g3d.c / asteroids.c):
  *   - value = real * 65536, carried in int32 with int64 intermediates.
  *   - Our own fixed-width typedefs (no <stdint.h>).
- *   - The freestanding build links no soft-float/libc helpers, so the same
- *     `objdump | grep -E 'xmm|fs:0x28'` gate the games pass also passes here.
+ *   - The freestanding build links no soft-float/libc helpers and passes a
+ *     STRICTER gate than the games' canary-only grep: fpm.o must objdump to
+ *     0 xmm AND 0 fs:0x28 (see build_test/mathtest_check.sh and the pragma
+ *     block at the top of fpm.c).
  *
  * DUAL COMPILE: this same source compiles under the freestanding ring-3
  * toolchain (link fpm.o into an app) AND under a normal host gcc so the pure
@@ -62,26 +66,41 @@ typedef fpm_i32 fx;                     /* Q16.16 fixed-point scalar */
 #define FPM_ANG_STEPS  1024
 #define FPM_ANG_MASK   (FPM_ANG_STEPS - 1)
 
-/* ---- int <-> fx (trivial, inline; correct in every build) ---- */
-static inline fx      fx_from_int(fpm_i32 i) { return (fx)((fpm_u32)i << FX_SHIFT); }
-/* Truncate toward -inf (arithmetic shift) -- matches g3d fx_to_int. */
+/* Clamp a 64-bit intermediate into the fx range. This is THE saturation
+ * primitive: every combining operation (incl. the vector/matrix inlines below)
+ * funnels its int64 intermediate through here so no int32 add/negate can wrap
+ * or hit signed-overflow UB. */
+static inline fx fpm_sat_i64(fpm_i64 v) {
+    if (v > FX_MAX) return FX_MAX;
+    if (v < FX_MIN) return FX_MIN;
+    return (fx)v;
+}
+
+/* ---- int <-> fx ---- */
+/* Saturates outside [-32768, 32767] (32768.0 is not representable). */
+static inline fx fx_from_int(fpm_i32 i) {
+    return fpm_sat_i64((fpm_i64)i << FX_SHIFT);
+}
+/* Floor toward -inf (arithmetic shift; NOT truncate-toward-zero for negatives)
+ * -- same shift g3d's fx_to_int does. */
 static inline fpm_i32 fx_to_int(fx a)        { return (fpm_i32)(a >> FX_SHIFT); }
 /* Fractional part in [0,1) consistent with floor: fx_floor(a) + fx_frac(a) == a. */
 static inline fx      fx_frac(fx a)          { return (fx)((fpm_u32)a & 0xFFFFu); }
 
-static inline fx fx_abs(fx a)        { return a < 0 ? -a : a; }
+/* |FX_MIN| = 32768.0 is unrepresentable -> saturates to FX_MAX (negating
+ * INT32_MIN directly would be signed-overflow UB). */
+static inline fx fx_abs(fx a)        { return a < 0 ? fpm_sat_i64(-(fpm_i64)a) : a; }
 static inline fx fx_min(fx a, fx b)  { return a < b ? a : b; }
 static inline fx fx_max(fx a, fx b)  { return a > b ? a : b; }
 static inline fx fx_clamp(fx v, fx lo, fx hi) { return v < lo ? lo : (v > hi ? hi : v); }
 
 /* fx from a rational n/d (d==0 -> saturate by sign of n). Inline: used to build
- * literals like 3/2 without FP; deterministic and always available. */
+ * literals like 3/2 without FP; deterministic and always available.
+ * (n * FX_ONE rather than n << 16: identical value/codegen, but the multiply is
+ * defined for negative n in strict C, where the left shift is not.) */
 static inline fx fx_ratio(fpm_i32 n, fpm_i32 d) {
     if (d == 0) return n < 0 ? FX_MIN : FX_MAX;
-    fpm_i64 q = ((fpm_i64)n << FX_SHIFT) / (fpm_i64)d;
-    if (q > FX_MAX) return FX_MAX;
-    if (q < FX_MIN) return FX_MIN;
-    return (fx)q;
+    return fpm_sat_i64(((fpm_i64)n * FX_ONE) / (fpm_i64)d);
 }
 
 /* ---- scalar core (implemented in fpm.c; saturating) ---- */
@@ -120,25 +139,39 @@ static inline fpm_i32 fpm_deg(fpm_i32 deg) {
 typedef struct { fx x, y; }    fxv2;
 typedef struct { fx x, y, z; } fxv3;
 
+/* fpm_mul_i64: one Q16.16 product term kept UNSATURATED in int64 -- bit-
+ * identical to fx_mul for any in-range result (same >>16 on the same int64
+ * product), but lets dot/cross/matrix rows accumulate WITHOUT the int32 wrap
+ * that plain `fx_mul(..) + fx_mul(..)` suffers (e.g. dot((181,181),(181,181)):
+ * each term fits, the int32 sum does not). Sums of <=4 terms stay < 2^48. */
+static inline fpm_i64 fpm_mul_i64(fx a, fx b) {
+    return ((fpm_i64)a * (fpm_i64)b) >> FX_SHIFT;
+}
+
 static inline fxv2 fxv2_mk(fx x, fx y)        { fxv2 r; r.x=x; r.y=y; return r; }
-static inline fxv2 fxv2_add(fxv2 a, fxv2 b)   { return fxv2_mk(a.x+b.x, a.y+b.y); }
-static inline fxv2 fxv2_sub(fxv2 a, fxv2 b)   { return fxv2_mk(a.x-b.x, a.y-b.y); }
+static inline fxv2 fxv2_add(fxv2 a, fxv2 b)   { return fxv2_mk(fpm_sat_i64((fpm_i64)a.x+b.x), fpm_sat_i64((fpm_i64)a.y+b.y)); }
+static inline fxv2 fxv2_sub(fxv2 a, fxv2 b)   { return fxv2_mk(fpm_sat_i64((fpm_i64)a.x-b.x), fpm_sat_i64((fpm_i64)a.y-b.y)); }
 static inline fxv2 fxv2_scale(fxv2 a, fx s)   { return fxv2_mk(fx_mul(a.x,s), fx_mul(a.y,s)); }
-static inline fx   fxv2_dot(fxv2 a, fxv2 b)   { return fx_mul(a.x,b.x) + fx_mul(a.y,b.y); }
+static inline fx   fxv2_dot(fxv2 a, fxv2 b)   { return fpm_sat_i64(fpm_mul_i64(a.x,b.x) + fpm_mul_i64(a.y,b.y)); }
 fx   fxv2_len(fxv2 a);                          /* overflow-safe */
 fxv2 fxv2_normalize(fxv2 a);                    /* a/|a| via rsqrt; zero->zero */
 
 static inline fxv3 fxv3_mk(fx x, fx y, fx z)  { fxv3 r; r.x=x; r.y=y; r.z=z; return r; }
-static inline fxv3 fxv3_add(fxv3 a, fxv3 b)   { return fxv3_mk(a.x+b.x, a.y+b.y, a.z+b.z); }
-static inline fxv3 fxv3_sub(fxv3 a, fxv3 b)   { return fxv3_mk(a.x-b.x, a.y-b.y, a.z-b.z); }
+static inline fxv3 fxv3_add(fxv3 a, fxv3 b)   { return fxv3_mk(fpm_sat_i64((fpm_i64)a.x+b.x), fpm_sat_i64((fpm_i64)a.y+b.y), fpm_sat_i64((fpm_i64)a.z+b.z)); }
+static inline fxv3 fxv3_sub(fxv3 a, fxv3 b)   { return fxv3_mk(fpm_sat_i64((fpm_i64)a.x-b.x), fpm_sat_i64((fpm_i64)a.y-b.y), fpm_sat_i64((fpm_i64)a.z-b.z)); }
 static inline fxv3 fxv3_scale(fxv3 a, fx s)   { return fxv3_mk(fx_mul(a.x,s), fx_mul(a.y,s), fx_mul(a.z,s)); }
-static inline fx   fxv3_dot(fxv3 a, fxv3 b)   { return fx_mul(a.x,b.x) + fx_mul(a.y,b.y) + fx_mul(a.z,b.z); }
+static inline fx   fxv3_dot(fxv3 a, fxv3 b) {
+    return fpm_sat_i64(fpm_mul_i64(a.x,b.x) + fpm_mul_i64(a.y,b.y) + fpm_mul_i64(a.z,b.z));
+}
 static inline fxv3 fxv3_cross(fxv3 a, fxv3 b) {
-    return fxv3_mk(fx_mul(a.y,b.z) - fx_mul(a.z,b.y),
-                   fx_mul(a.z,b.x) - fx_mul(a.x,b.z),
-                   fx_mul(a.x,b.y) - fx_mul(a.y,b.x));
+    return fxv3_mk(fpm_sat_i64(fpm_mul_i64(a.y,b.z) - fpm_mul_i64(a.z,b.y)),
+                   fpm_sat_i64(fpm_mul_i64(a.z,b.x) - fpm_mul_i64(a.x,b.z)),
+                   fpm_sat_i64(fpm_mul_i64(a.x,b.y) - fpm_mul_i64(a.y,b.x)));
 }
 fx   fxv3_len(fxv3 a);                          /* overflow-safe */
+/* normalize precision note: the reciprocal length is a Q16.16 quantity, so the
+ * relative error grows like |v|/65536 -- keep |v| <= ~1000 for <1% length
+ * error (the KAT-proven envelope). Zero vector -> zero. */
 fxv3 fxv3_normalize(fxv3 a);                    /* a/|a| via rsqrt; zero->zero */
 
 /* ====================================================================== *
@@ -152,7 +185,9 @@ fxm3 fxm3_identity(void);
 fxm3 fxm3_mul(fxm3 a, fxm3 b);          /* a*b (apply b first)  */
 fxv3 fxm3_mul_vec(fxm3 m, fxv3 v);
 fxm3 fxm3_transpose(fxm3 a);
-/* General 3x3 inverse (adjugate/det). Singular -> identity. */
+/* General 3x3 inverse (adjugate/det with power-of-two magnitude normalization,
+ * so it stays accurate from tiny (~0.01) through large (~1000+) uniform scales
+ * -- see fpm.c). Singular -> identity. */
 fxm3 fxm3_inverse(fxm3 a);
 
 /* --- 4x4 --- */
@@ -173,7 +208,8 @@ fxm4 fxm4_lookat(fxv3 eye, fxv3 target, fxv3 up);
 /* Inverse of an AFFINE 4x4 (upper-left 3x3 invertible, bottom row 0,0,0,1).
  * Handles rotation + (possibly non-uniform) scale + translation -- exactly the
  * class used for model/view matrices and normal transforms. NOT valid for a
- * projection matrix (perspective). Singular 3x3 -> identity. */
+ * projection matrix (perspective). Singular 3x3 -> identity rotation block
+ * with translation -t (not a full identity matrix). */
 fxm4 fxm4_inverse_affine(fxm4 a);
 
 #endif /* FPM_H */

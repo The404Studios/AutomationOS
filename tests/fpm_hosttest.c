@@ -143,10 +143,10 @@ static void test_roots(void)
         double rel = sq[i].want > 1e-9 ? fabs(got - sq[i].want)/sq[i].want
                                        : fabs(got - sq[i].want);
         if (rel > smax) smax = rel;
-        if (rel > 1e-3) sfail++;
+        if (rel > 1e-4) sfail++;    /* spec 1e-3; observed worst 9.7e-6 */
     }
     printf("  fx_sqrt: worst rel err = %.2e\n", smax);
-    CHECK(sfail == 0, "fx_sqrt spot values rel err <= 1e-3");
+    CHECK(sfail == 0, "fx_sqrt spot values rel err <= 1e-4 (spec 1e-3)");
 
     /* rsqrt over [1e-3, 30000], geometric sweep. */
     double rmax = 0; int rfail = 0; double rworst_x = 0;
@@ -180,10 +180,13 @@ static void test_trig(void)
         double ec = fabs(fxd(fx_cos(b)) - cos(ang));
         if (es > tmax) tmax = es;
         if (ec > tmax) tmax = ec;
-        if (es > 0.002 || ec > 0.002) tfail++;
+        /* spec bound is 0.002; assert the ~4x-observed regression bound 2e-4
+         * (observed worst 3e-5) -- integer math is deterministic, so any
+         * loosening beyond this is a real regression, not platform noise */
+        if (es > 2e-4 || ec > 2e-4) tfail++;
     }
     printf("  fx_sin/cos: worst abs err over all 1024 brads = %.5f\n", tmax);
-    CHECK(tfail == 0, "fx_sin/fx_cos abs err <= 0.002 for every brad");
+    CHECK(tfail == 0, "fx_sin/fx_cos abs err <= 2e-4 (spec 0.002) for every brad");
 
     /* atan2: >10000 (y,x) pairs, all quadrants + axes, err <= 1 brad */
     double amax = 0; int afail = 0; long apairs = 0;
@@ -197,11 +200,11 @@ static void test_trig(void)
         /* got is a brad value in Q16.16; compare in brad units, wrapped */
         double e = fabs(wrap_brad((double)got/65536.0 - ref));
         if (e > amax) amax = e;
-        if (e > 1.0) afail++;
+        if (e > 0.05) afail++;      /* spec 1 brad; observed worst 0.0052 */
         apairs++;
     }
     printf("  fx_atan2: worst err = %.4f brad over %ld pairs\n", amax, apairs);
-    CHECK(afail == 0, "fx_atan2 err <= 1 brad (all quadrants + axes)");
+    CHECK(afail == 0, "fx_atan2 err <= 0.05 brad (spec 1) all quadrants + axes");
 
     /* asin/acos: sweep [-1,1] step 1/512, err <= 2 brads */
     double asmax = 0, acmax = 0; int asfail = 0, acfail = 0;
@@ -215,12 +218,31 @@ static void test_trig(void)
         double eac = fabs(wrap_brad((double)fx_acos(af)/65536.0 - rac));
         if (eas > asmax) asmax = eas;
         if (eac > acmax) acmax = eac;
-        if (eas > 2.0) asfail++;
-        if (eac > 2.0) acfail++;
+        if (eas > 0.1) asfail++;    /* spec 2 brads; observed worst 0.0136 */
+        if (eac > 0.1) acfail++;
     }
     printf("  fx_asin: worst err = %.4f brad; fx_acos: worst = %.4f brad\n", asmax, acmax);
-    CHECK(asfail == 0, "fx_asin err <= 2 brads over [-1,1]");
-    CHECK(acfail == 0, "fx_acos err <= 2 brads over [-1,1]");
+    CHECK(asfail == 0, "fx_asin err <= 0.1 brad (spec 2) over [-1,1]");
+    CHECK(acfail == 0, "fx_acos err <= 0.1 brad (spec 2) over [-1,1]");
+
+    /* extreme aspect ratios + FX_MIN corners (CORDIC folding stress).
+     * References use the RAW int values -- atan2 is scale-invariant. */
+    {
+        struct { fx y, x; } ex[] = {
+            { FX_MAX, 1 }, { 1, FX_MAX }, { FX_MIN, 1 }, { 1, FX_MIN },
+            { FX_MIN, FX_MIN }, { FX_MAX, FX_MIN }, { FX_MIN, FX_MAX },
+        };
+        int exfail = 0; double exmax = 0;
+        for (int i = 0; i < 7; i++) {
+            fx got = fx_atan2(ex[i].y, ex[i].x);
+            double ref = atan2((double)ex[i].y, (double)ex[i].x) * BRAD_PER_RAD;
+            double e = fabs(wrap_brad((double)got/65536.0 - ref));
+            if (e > exmax) exmax = e;
+            if (e > 1.0) exfail++;
+        }
+        printf("  fx_atan2 extremes (FX_MAX/FX_MIN corners): worst = %.4f brad\n", exmax);
+        CHECK(exfail == 0, "fx_atan2 extreme-magnitude corners <= 1 brad");
+    }
 }
 
 /* ------------------------------------------------------------------ *
@@ -382,6 +404,203 @@ static void test_matrices(void)
     }
 }
 
+/* ------------------------------------------------------------------ *
+ * 6. Coverage + regression KATs (from the 10-agent audit):            *
+ *    - every previously-untested public symbol gets a direct assert   *
+ *    - each fixed bug gets a pin (these FAIL against the pre-audit    *
+ *      code: fx_abs UB, fx_from_int wrap, round/ceil divergence,      *
+ *      dot/matrix int32 accumulation wrap, fxm3_inverse saturation)   *
+ * ------------------------------------------------------------------ */
+static void test_coverage(void)
+{
+    printf("[coverage+regression]\n");
+
+    /* --- regression pins for the audit fixes --- */
+    CHECK(fx_abs(FX_MIN) == FX_MAX, "REGRESSION: fx_abs(FX_MIN) saturates (was UB negative)");
+    CHECK(fx_from_int(32768) == FX_MAX, "REGRESSION: fx_from_int(32768) saturates (was wrap to FX_MIN)");
+    CHECK(fx_from_int(-40000) == FX_MIN, "REGRESSION: fx_from_int(-40000) saturates (was sign flip)");
+    CHECK(fx_from_int(-32768) == FX_MIN, "fx_from_int(-32768) exact FX_MIN");
+    CHECK(fx_round((fx)0x7FFF8000) == FX_MAX, "REGRESSION: round(32767.5) == ceil(32767.5) == FX_MAX");
+    {   /* dot wrap: each term fits int32, the sum does not (2*181^2 > 32767) */
+        fxv2 v = fxv2_mk(fx_from_int(181), fx_from_int(181));
+        CHECK(fxv2_dot(v, v) == FX_MAX, "REGRESSION: fxv2_dot saturates (was negative len^2)");
+        fxv3 w = fxv3_mk(fx_from_int(150), fx_from_int(150), fx_from_int(150));
+        CHECK(fxv3_dot(w, w) == FX_MAX, "REGRESSION: fxv3_dot saturates (3*150^2 > max)");
+        fxv3 big = fxv3_mk(FX_MAX, FX_MAX, FX_MAX);
+        fxv3 sum = fxv3_add(big, big);
+        CHECK(sum.x == FX_MAX && sum.y == FX_MAX && sum.z == FX_MAX,
+              "REGRESSION: fxv3_add saturates (was int32 wrap)");
+    }
+    {   /* mul_point row wrap: scale-181 point + big translate */
+        fxm4 M = fxm4_mul(fxm4_translate(fx_from_int(30000), 0, 0),
+                          fxm4_scale(fx_from_int(181), fx_from_int(181), fx_from_int(181)));
+        fxv3 q = fxm4_mul_point(M, fxv3_mk(fx_from_int(181), 0, 0));
+        CHECK(q.x == FX_MAX, "REGRESSION: fxm4_mul_point row sum saturates (was wrap)");
+    }
+    {   /* fxm3_inverse beyond the old int32-minor ceiling (scale 200) */
+        fxm3 S; for (int i = 0; i < 9; i++) S.m[i] = 0;
+        S.m[0] = S.m[4] = S.m[8] = fx_from_int(200);
+        fxm3 Si = fxm3_inverse(S);
+        double e = fabs(fxd(Si.m[0]) - 0.005);
+        printf("  inverse(diag 200).m[0] = %.6f (want 0.005)\n", fxd(Si.m[0]));
+        CHECK(e < 1e-4, "REGRESSION: fxm3_inverse handles scale 200 (was saturated det)");
+    }
+
+    /* --- scalars with no prior direct coverage --- */
+    CHECK(fx_to_int(fx_ratio(5,2)) == 2,   "fx_to_int(2.5) = 2 (floor)");
+    CHECK(fx_to_int(fx_ratio(-5,2)) == -3, "fx_to_int(-2.5) = -3 (floor, not truncate)");
+    CHECK(fx_min(fx_from_int(3), fx_from_int(-7)) == fx_from_int(-7), "fx_min");
+    CHECK(fx_max(fx_from_int(3), fx_from_int(-7)) == fx_from_int(3),  "fx_max");
+    CHECK(fx_ratio(40000, 1) == FX_MAX, "fx_ratio saturation (40000/1 > max)");
+    CHECK(fx_ceil(fx_from_int(2)) == fx_from_int(2),  "fx_ceil exact-integer path");
+    CHECK(fx_floor(fx_from_int(2)) == fx_from_int(2), "fx_floor exact integer");
+    CHECK(fx_round(fx_from_int(2)) == fx_from_int(2), "fx_round exact integer");
+    CHECK(fpm_deg(360) == 1024 && fpm_deg(90) == 256, "fpm_deg(360)=1024, (90)=256");
+    CHECK(fx_lerp(FX_MIN, FX_MAX, FX_ONE) == FX_MAX, "fx_lerp endpoint t=1 across full range");
+
+    /* --- lengths --- */
+    CHECK(fx_len2(fx_from_int(3), fx_from_int(4)) == fx_from_int(5), "fx_len2(3,4)=5");
+    CHECK(fx_len3(fx_from_int(2), fx_from_int(3), fx_from_int(6)) == fx_from_int(7), "fx_len3(2,3,6)=7");
+    CHECK(fxv2_len(fxv2_mk(fx_from_int(3), fx_from_int(4))) == fx_from_int(5), "fxv2_len(3,4)=5");
+    CHECK(fxv3_len(fxv3_mk(fx_from_int(2), fx_from_int(3), fx_from_int(6))) == fx_from_int(7), "fxv3_len=7");
+    CHECK(fx_len3(FX_MAX, FX_MAX, FX_MAX) == FX_MAX, "fx_len3 saturates at max components");
+
+    /* --- 2D/3D vector ops --- */
+    {
+        fxv2 a2 = fxv2_mk(fx_from_int(1), fx_from_int(2));
+        fxv2 b2 = fxv2_mk(fx_from_int(3), fx_from_int(-1));
+        fxv2 s2 = fxv2_add(a2, b2);
+        fxv2 d2 = fxv2_sub(a2, b2);
+        fxv2 c2 = fxv2_scale(a2, FX_HALF);
+        CHECK(s2.x == fx_from_int(4) && s2.y == fx_from_int(1), "fxv2_add");
+        CHECK(d2.x == fx_from_int(-2) && d2.y == fx_from_int(3), "fxv2_sub");
+        CHECK(c2.x == FX_HALF && c2.y == FX_ONE, "fxv2_scale by 0.5");
+        CHECK(fxv2_dot(a2, b2) == fx_from_int(1), "fxv2_dot((1,2),(3,-1))=1");
+
+        fxv3 a3 = fxv3_mk(fx_from_int(1), fx_from_int(2), fx_from_int(3));
+        fxv3 b3 = fxv3_mk(fx_from_int(-2), fx_from_int(1), fx_from_int(4));
+        fxv3 s3 = fxv3_add(a3, b3);
+        fxv3 c3 = fxv3_scale(a3, fx_from_int(2));
+        CHECK(s3.x == -FX_ONE && s3.y == fx_from_int(3) && s3.z == fx_from_int(7), "fxv3_add");
+        CHECK(c3.x == fx_from_int(2) && c3.y == fx_from_int(4) && c3.z == fx_from_int(6), "fxv3_scale");
+
+        /* basis identities, asserted directly (not via lookat) */
+        fxv3 X = fxv3_mk(FX_ONE, 0, 0), Y = fxv3_mk(0, FX_ONE, 0);
+        fxv3 Z = fxv3_cross(X, Y);
+        CHECK(Z.x == 0 && Z.y == 0 && Z.z == FX_ONE, "cross(x,y) = z");
+        CHECK(fxv3_dot(X, Y) == 0, "dot(x,y) = 0");
+    }
+
+    /* --- fxm3 family, direct --- */
+    {
+        /* mul: diag(2,3,4) * diag(0.5, 2, 0.25) = diag(1, 6, 1) */
+        fxm3 D1; for (int i = 0; i < 9; i++) D1.m[i] = 0;
+        D1.m[0] = fx_from_int(2); D1.m[4] = fx_from_int(3); D1.m[8] = fx_from_int(4);
+        fxm3 D2; for (int i = 0; i < 9; i++) D2.m[i] = 0;
+        D2.m[0] = FX_HALF; D2.m[4] = fx_from_int(2); D2.m[8] = fx_ratio(1,4);
+        fxm3 P = fxm3_mul(D1, D2);
+        CHECK(P.m[0] == FX_ONE && P.m[4] == fx_from_int(6) && P.m[8] == FX_ONE
+              && P.m[1] == 0 && P.m[3] == 0, "fxm3_mul diag product");
+
+        /* transpose: build asymmetric, check slots + double-transpose identity */
+        fxm3 A; for (int i = 0; i < 9; i++) A.m[i] = fx_from_int(i + 1);
+        fxm3 At = fxm3_transpose(A);
+        CHECK(At.m[1] == A.m[3] && At.m[3] == A.m[1] && At.m[2] == A.m[6], "fxm3_transpose swaps");
+        fxm3 Att = fxm3_transpose(At);
+        int same = 1; for (int i = 0; i < 9; i++) if (Att.m[i] != A.m[i]) same = 0;
+        CHECK(same, "fxm3_transpose is an involution");
+
+        /* mul_vec: diag(2,3,4) * (1,1,1) = (2,3,4) */
+        fxv3 mv = fxm3_mul_vec(D1, fxv3_mk(FX_ONE, FX_ONE, FX_ONE));
+        CHECK(mv.x == fx_from_int(2) && mv.y == fx_from_int(3) && mv.z == fx_from_int(4), "fxm3_mul_vec");
+
+        /* inverse, direct: inv(diag(2,4,5)) = diag(0.5, 0.25, 0.2) */
+        fxm3 D3; for (int i = 0; i < 9; i++) D3.m[i] = 0;
+        D3.m[0] = fx_from_int(2); D3.m[4] = fx_from_int(4); D3.m[8] = fx_from_int(5);
+        fxm3 D3i = fxm3_inverse(D3);
+        CHECK(fabs(fxd(D3i.m[0]) - 0.5)  < 1e-4 &&
+              fabs(fxd(D3i.m[4]) - 0.25) < 1e-4 &&
+              fabs(fxd(D3i.m[8]) - 0.2)  < 1e-4, "fxm3_inverse diag(2,4,5)");
+
+        /* singular -> identity (fxm3_identity's only reachable path) */
+        fxm3 Zm; for (int i = 0; i < 9; i++) Zm.m[i] = 0;
+        fxm3 Zi = fxm3_inverse(Zm);
+        CHECK(Zi.m[0] == FX_ONE && Zi.m[4] == FX_ONE && Zi.m[8] == FX_ONE && Zi.m[1] == 0,
+              "fxm3_inverse(singular) = identity");
+    }
+
+    /* --- fxm4: mul_dir / transpose / rotate_x / rotate_z --- */
+    {
+        fxm4 T = fxm4_translate(fx_from_int(5), fx_from_int(6), fx_from_int(7));
+        fxv3 d = fxm4_mul_dir(T, fxv3_mk(FX_ONE, fx_from_int(2), fx_from_int(3)));
+        CHECK(d.x == FX_ONE && d.y == fx_from_int(2) && d.z == fx_from_int(3),
+              "fxm4_mul_dir ignores translation");
+
+        fxm4 Tt = fxm4_transpose(T);
+        CHECK(Tt.m[3] == fx_from_int(5) && Tt.m[7] == fx_from_int(6) && Tt.m[11] == fx_from_int(7),
+              "fxm4_transpose moves translation to bottom row");
+        fxm4 Ttt = fxm4_transpose(Tt);
+        int same4 = 1; for (int i = 0; i < 16; i++) if (Ttt.m[i] != T.m[i]) same4 = 0;
+        CHECK(same4, "fxm4_transpose is an involution");
+
+        /* rotate_x / rotate_z vs libm at the brad-quantized angle 105 */
+        int brad = fpm_deg(37);                      /* 105 brads */
+        double ang = 2.0 * M_PI * brad / 1024.0;     /* the QUANTIZED angle */
+        fxv3 ry = fxm4_mul_dir(fxm4_rotate_x(brad), fxv3_mk(0, FX_ONE, 0));
+        CHECK(fabs(fxd(ry.y) - cos(ang)) < 1e-3 && fabs(fxd(ry.z) - sin(ang)) < 1e-3,
+              "fxm4_rotate_x: (0,1,0) -> (0,cos,sin)");
+        fxv3 rx = fxm4_mul_dir(fxm4_rotate_z(brad), fxv3_mk(FX_ONE, 0, 0));
+        CHECK(fabs(fxd(rx.x) - cos(ang)) < 1e-3 && fabs(fxd(rx.y) - sin(ang)) < 1e-3,
+              "fxm4_rotate_z: (1,0,0) -> (cos,sin,0)");
+    }
+
+    /* --- fxm4_mul vs an INDEPENDENT double reference (audit: the original
+     * test derived its reference from the fx matrices themselves, which
+     * cannot catch builder quantization) --- */
+    {
+        int brad = fpm_deg(37);
+        double ang = 2.0 * M_PI * brad / 1024.0;
+        fxm4 M = fxm4_mul(fxm4_translate(fx_from_int(3), fx_from_int(-2), fx_from_int(5)),
+                          fxm4_mul(fxm4_rotate_y(brad),
+                                   fxm4_scale(fx_from_int(2), fx_ratio(1,2), fx_from_int(3))));
+        /* independent column-major reference: T * Ry(ang) * S */
+        double dM[16] = {0};
+        double cc = cos(ang), ss = sin(ang);
+        dM[0] = 2*cc;  dM[2] = 2*-ss; dM[5] = 0.5;
+        dM[8] = 3*ss;  dM[10] = 3*cc; dM[15] = 1.0;
+        dM[12] = 3; dM[13] = -2; dM[14] = 5;
+        double GM[16]; m2d(M, GM);
+        double we = 0; int wf = 0;
+        for (int i = 0; i < 16; i++) {
+            double e = fabs(GM[i] - dM[i]);
+            if (e > we) we = e;
+            if (e > 1e-3) wf++;
+        }
+        printf("  fxm4 T*R*S vs independent double ref: worst abs err = %.2e\n", we);
+        CHECK(wf == 0, "fxm4_mul chain matches independent double reference (1e-3)");
+    }
+
+    /* --- inverse_affine scale sweep (audit: single well-conditioned case) --- */
+    {
+        double scales[] = { 0.01, 0.5, 2.0, 50.0, 200.0 };
+        double wworst = 0; int wfail = 0;
+        for (int si = 0; si < 5; si++) {
+            fx s = (fx)llround(scales[si] * 65536.0);
+            fxm4 M = fxm4_mul(fxm4_translate(fx_from_int(7), fx_from_int(-3), fx_from_int(11)),
+                              fxm4_mul(fxm4_rotate_y(105), fxm4_scale(s, s, s)));
+            fxm4 I = fxm4_mul(M, fxm4_inverse_affine(M));
+            for (int c = 0; c < 4; c++) for (int r = 0; r < 4; r++) {
+                double want = (c == r) ? 1.0 : 0.0;
+                double e = fabs(fxd(I.m[c*4+r]) - want);
+                if (e > wworst) wworst = e;
+                if (e > 1e-2) wfail++;
+            }
+        }
+        printf("  inverse_affine sweep (scale 0.01..200, rot+T): worst |M*Minv-I| = %.5f\n", wworst);
+        CHECK(wfail == 0, "fxm4_inverse_affine round-trips across scales 0.01..200");
+    }
+}
+
 int main(void)
 {
     BRAD_PER_RAD = 1024.0 / (2.0 * M_PI);
@@ -391,6 +610,7 @@ int main(void)
     test_trig();
     test_vectors();
     test_matrices();
+    test_coverage();
     if (g_fail) printf("\nFPM HOSTTEST: FAIL n=%d\n", g_fail);
     else        printf("\nFPM HOSTTEST: PASS\n");
     return g_fail ? 1 : 0;

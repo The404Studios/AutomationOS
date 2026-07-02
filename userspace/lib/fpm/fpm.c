@@ -46,30 +46,25 @@
 #include "fpm.h"
 
 /* ====================================================================== *
- *  Scalar core (saturating)
+ *  Scalar core (saturating). The clamp primitive fpm_sat_i64 and the
+ *  unsaturated product term fpm_mul_i64 live in fpm.h so the header's
+ *  vector inlines share them.
  * ====================================================================== */
-
-/* Clamp a 64-bit intermediate into the fx range. */
-static inline fx sat64(fpm_i64 v)
-{
-    if (v > FX_MAX) return FX_MAX;
-    if (v < FX_MIN) return FX_MIN;
-    return (fx)v;
-}
 
 fx fx_mul(fx a, fx b)
 {
     /* product is Q32.32 in an int64 (max |a*b| = 2^62); shift back to Q16.16. */
-    fpm_i64 p = ((fpm_i64)a * (fpm_i64)b) >> FX_SHIFT;
-    return sat64(p);
+    return fpm_sat_i64(fpm_mul_i64(a, b));
 }
 
 fx fx_div(fx a, fx b)
 {
-    /* 0-divisor: saturate by the sign of the numerator (no trap, no wrap). */
+    /* 0-divisor: saturate by the sign of the numerator (no trap, no wrap).
+     * (a * FX_ONE, not a << 16: identical value/codegen, but the multiply is
+     * defined for negative a in strict C where the left shift is not.) */
     if (b == 0) return a < 0 ? FX_MIN : FX_MAX;
-    fpm_i64 q = ((fpm_i64)a << FX_SHIFT) / (fpm_i64)b;
-    return sat64(q);
+    fpm_i64 q = ((fpm_i64)a * FX_ONE) / (fpm_i64)b;
+    return fpm_sat_i64(q);
 }
 
 fx fx_lerp(fx a, fx b, fx t)
@@ -77,11 +72,11 @@ fx fx_lerp(fx a, fx b, fx t)
     /* a + (b-a)*t, all in int64 so (b-a) can exceed int32 without wrapping. */
     fpm_i64 d = (fpm_i64)b - (fpm_i64)a;
     fpm_i64 m = (d * (fpm_i64)t) >> FX_SHIFT;
-    return sat64((fpm_i64)a + m);
+    return fpm_sat_i64((fpm_i64)a + m);
 }
 
-fx fx_sat_add(fx a, fx b) { return sat64((fpm_i64)a + (fpm_i64)b); }
-fx fx_sat_sub(fx a, fx b) { return sat64((fpm_i64)a - (fpm_i64)b); }
+fx fx_sat_add(fx a, fx b) { return fpm_sat_i64((fpm_i64)a + (fpm_i64)b); }
+fx fx_sat_sub(fx a, fx b) { return fpm_sat_i64((fpm_i64)a - (fpm_i64)b); }
 
 /* Largest integer <= a, as fx: mask off the fractional bits (arithmetic floor
  * for negatives because the mask keeps the sign bits). */
@@ -93,8 +88,16 @@ fx fx_ceil(fx a)
     return (f == a) ? f : fx_sat_add(f, FX_ONE);
 }
 
-/* Round half up (toward +inf): floor(a + 0.5). */
-fx fx_round(fx a) { return fx_floor(fx_sat_add(a, FX_HALF)); }
+/* Round half up (toward +inf): floor(a + 0.5). When a + 0.5 saturates (a in
+ * [32767.5, FX_MAX]) return FX_MAX un-floored: the ideal result 32768.0 is
+ * unrepresentable, and flooring the clamped sum would un-saturate back down to
+ * 32767.0 -- returning FX_MAX keeps round consistent with fx_ceil's saturation
+ * convention (round(x) must never be < ceil(x) - 1). */
+fx fx_round(fx a)
+{
+    fx s = fx_sat_add(a, FX_HALF);
+    return (s == FX_MAX) ? FX_MAX : fx_floor(s);
+}
 
 /* ====================================================================== *
  *  Roots
@@ -235,6 +238,11 @@ static void sin_table_init(void)
         else                            s = -poly_sin_rad(TWO_PI - theta);
         g_sin_tab[i] = s;
     }
+    /* Publish the table before the ready flag: the barrier stops the compiler
+     * from sinking table stores past the flag store (single-threaded per
+     * process, but a signal handler calling fx_sin mid-init must never see
+     * ready==1 with a half-written table). */
+    __asm__ __volatile__("" ::: "memory");
     g_sin_ready = 1;
 }
 
@@ -344,22 +352,26 @@ fxm3 fxm3_identity(void)
     r.m[0] = r.m[4] = r.m[8] = FX_ONE;
     return r;
 }
+/* Row sums accumulate the UNSATURATED int64 product terms (fpm_mul_i64) and
+ * clamp once: bit-identical to per-term fx_mul + int32 adds whenever the sum is
+ * in range, but immune to the int32 wrap those adds suffer (terms <= 2^46 each,
+ * so a 4-term sum stays < 2^48, far inside int64). */
 fxm3 fxm3_mul(fxm3 a, fxm3 b)
 {
     fxm3 r;
     for (int c = 0; c < 3; c++) for (int row = 0; row < 3; row++) {
-        fx s = 0;
-        for (int k = 0; k < 3; k++) s += fx_mul(a.m[k*3+row], b.m[c*3+k]);
-        r.m[c*3+row] = s;
+        fpm_i64 s = 0;
+        for (int k = 0; k < 3; k++) s += fpm_mul_i64(a.m[k*3+row], b.m[c*3+k]);
+        r.m[c*3+row] = fpm_sat_i64(s);
     }
     return r;
 }
 fxv3 fxm3_mul_vec(fxm3 m, fxv3 v)
 {
     return fxv3_mk(
-        fx_mul(m.m[0], v.x) + fx_mul(m.m[3], v.y) + fx_mul(m.m[6], v.z),
-        fx_mul(m.m[1], v.x) + fx_mul(m.m[4], v.y) + fx_mul(m.m[7], v.z),
-        fx_mul(m.m[2], v.x) + fx_mul(m.m[5], v.y) + fx_mul(m.m[8], v.z));
+        fpm_sat_i64(fpm_mul_i64(m.m[0], v.x) + fpm_mul_i64(m.m[3], v.y) + fpm_mul_i64(m.m[6], v.z)),
+        fpm_sat_i64(fpm_mul_i64(m.m[1], v.x) + fpm_mul_i64(m.m[4], v.y) + fpm_mul_i64(m.m[7], v.z)),
+        fpm_sat_i64(fpm_mul_i64(m.m[2], v.x) + fpm_mul_i64(m.m[5], v.y) + fpm_mul_i64(m.m[8], v.z)));
 }
 fxm3 fxm3_transpose(fxm3 a)
 {
@@ -369,39 +381,105 @@ fxm3 fxm3_transpose(fxm3 a)
     return r;
 }
 
-/* 2x2 determinant a*d - b*c in Q16.16 (int64 intermediate keeps full precision). */
-static fx det2(fx a, fx b, fx c, fx d)
+/* 2x2 minor a*d - b*c in Q16.16, UNSATURATED in int64 (inputs are the
+ * normalized entries below, < 2^24, so |minor| < 2^33 -- exact). */
+static fpm_i64 minor2_i64(fx a, fx b, fx c, fx d)
 {
-    return sat64(((fpm_i64)a * d - (fpm_i64)b * c) >> FX_SHIFT);
+    return ((fpm_i64)a * d - (fpm_i64)b * c) >> FX_SHIFT;
 }
 
+/* value * 2^k with saturation, for undoing the normalization shifts below.
+ * The +-2^37 pre-clamp makes the left shift (k up to 25 across all callers)
+ * overflow-free; anything that large saturates to FX_MAX/FX_MIN anyway. */
+static fx unshift_sat(fpm_i64 v, int k)
+{
+    if (k >= 0) {
+        const fpm_i64 LIM = (fpm_i64)1 << 37;
+        if (v >  LIM) return FX_MAX;
+        if (v < -LIM) return FX_MIN;
+        return fpm_sat_i64(v << k);
+    }
+    return fpm_sat_i64(v >> -k);
+}
+
+/*
+ * Shared normalized-adjugate core for fxm3_inverse / fxm4_inverse_affine.
+ *
+ * A naive Q16.16 adjugate breaks in both directions: minors saturate at int32
+ * once entries exceed ~32 (det ~ entry^3), and for tiny entries (uniform scale
+ * 0.01 -> minors of ~7 raw units) the quotients lose all precision. So we first
+ * scale the whole matrix by a power of two so its max |entry| lands in
+ * [2^18, 2^24) (raw), and build the adjugate + det of that well-conditioned
+ * copy exactly in int64 (minors < 2^33, det terms < 2^57, sum < 2^59 -- no
+ * saturation possible). Callers undo the scale: inv(A * 2^s) = inv(A) * 2^-s.
+ */
+typedef struct {
+    fpm_i64 adj[9];    /* adjugate of B, stored in RESULT layout [col*3+row] */
+    fpm_i64 det;       /* det(B), Q16.16 in int64 (0 => singular)           */
+    int     s;         /* A = B * 2^s, s in [-18, 7]                        */
+} fpm_inv3;
+
+static fpm_inv3 inv3_prepare(fxm3 A)
+{
+    fpm_inv3 c;
+    c.det = 0; c.s = 0;
+
+    /* --- normalize: B = A * 2^-s with max|B| in [2^18, 2^24) --- */
+    fpm_i64 maxe = 0;
+    for (int i = 0; i < 9; i++) {
+        fpm_i64 v = A.m[i];
+        if (v < 0) v = -v;                 /* int64: |INT32_MIN| is fine */
+        if (v > maxe) maxe = v;
+    }
+    if (maxe == 0) return c;                /* zero matrix: singular */
+
+    int s = 0;
+    while (maxe >= ((fpm_i64)1 << 24)) { maxe >>= 1; s++; }              /* s <=  7 */
+    while (maxe <  ((fpm_i64)1 << 18) && s > -18) { maxe <<= 1; s--; }   /* s >= -18 */
+    c.s = s;
+
+    fx B[9];
+    for (int i = 0; i < 9; i++) {
+        fpm_i64 v = A.m[i];
+        B[i] = (fx)(s >= 0 ? (v >> s) : (v << -s));   /* < 2^24 by construction */
+    }
+
+    /* element(row,col) = B[col*3+row] */
+    fx m00 = B[0], m10 = B[1], m20 = B[2];
+    fx m01 = B[3], m11 = B[4], m21 = B[5];
+    fx m02 = B[6], m12 = B[7], m22 = B[8];
+
+    /* adjugate in result layout: adj[col*3+row] = numerator of inv(B)[row,col] */
+    c.adj[0] = minor2_i64(m11, m12, m21, m22);   /* inv(0,0) */
+    c.adj[1] = minor2_i64(m12, m10, m22, m20);   /* inv(1,0) */
+    c.adj[2] = minor2_i64(m10, m11, m20, m21);   /* inv(2,0) */
+    c.adj[3] = minor2_i64(m02, m01, m22, m21);   /* inv(0,1) */
+    c.adj[4] = minor2_i64(m00, m02, m20, m22);   /* inv(1,1) */
+    c.adj[5] = minor2_i64(m01, m00, m21, m20);   /* inv(2,1) */
+    c.adj[6] = minor2_i64(m01, m02, m11, m12);   /* inv(0,2) */
+    c.adj[7] = minor2_i64(m02, m00, m12, m10);   /* inv(1,2) */
+    c.adj[8] = minor2_i64(m00, m01, m10, m11);   /* inv(2,2) */
+
+    /* det(B) by cofactor expansion along column 0:
+     * det = B[0,0]*C00 + B[1,0]*C10 + B[2,0]*C20, and C(k,0) is exactly the
+     * adjugate entry adj[0,k] = our adj[k*3 + 0] slots -> adj[0], adj[3],
+     * adj[6]. Terms < 2^57, sum < 2^59: exact in int64. */
+    c.det = ((fpm_i64)m00 * c.adj[0] + (fpm_i64)m10 * c.adj[3]
+           + (fpm_i64)m20 * c.adj[6]) >> FX_SHIFT;
+    return c;
+}
+
+/* General 3x3 inverse: see inv3_prepare. Singular -> identity. */
 fxm3 fxm3_inverse(fxm3 A)
 {
-    /* element(row,col) = A.m[col*3+row] */
-    fx m00 = A.m[0], m10 = A.m[1], m20 = A.m[2];
-    fx m01 = A.m[3], m11 = A.m[4], m21 = A.m[5];
-    fx m02 = A.m[6], m12 = A.m[7], m22 = A.m[8];
-
-    /* cofactor / adjugate entries (each a 2x2 minor) */
-    fx i00 = det2(m11, m12, m21, m22);   /* inv(0,0) */
-    fx i01 = det2(m02, m01, m22, m21);   /* inv(0,1) */
-    fx i02 = det2(m01, m02, m11, m12);   /* inv(0,2) */
-    fx i10 = det2(m12, m10, m22, m20);   /* inv(1,0) */
-    fx i11 = det2(m00, m02, m20, m22);   /* inv(1,1) */
-    fx i12 = det2(m02, m00, m12, m10);   /* inv(1,2) */
-    fx i20 = det2(m10, m11, m20, m21);   /* inv(2,0) */
-    fx i21 = det2(m01, m00, m21, m20);   /* inv(2,1) */
-    fx i22 = det2(m00, m01, m10, m11);   /* inv(2,2) */
-
-    /* det = m00*i00 + m01*i10 + m02*i20 (int64 accumulate) */
-    fpm_i64 det = ((fpm_i64)m00 * i00 + (fpm_i64)m01 * i10 + (fpm_i64)m02 * i20) >> FX_SHIFT;
-    if (det == 0) return fxm3_identity();
-    fx d = sat64(det);
+    fpm_inv3 c = inv3_prepare(A);
+    if (c.det == 0) return fxm3_identity();
 
     fxm3 r;
-    r.m[0] = fx_div(i00, d); r.m[1] = fx_div(i10, d); r.m[2] = fx_div(i20, d);
-    r.m[3] = fx_div(i01, d); r.m[4] = fx_div(i11, d); r.m[5] = fx_div(i21, d);
-    r.m[6] = fx_div(i02, d); r.m[7] = fx_div(i12, d); r.m[8] = fx_div(i22, d);
+    for (int i = 0; i < 9; i++) {
+        fpm_i64 q = (c.adj[i] * FX_ONE) / c.det;       /* inv(B) entry, Q16.16 */
+        r.m[i] = unshift_sat(q, -c.s);                 /* inv(A) = inv(B)*2^-s */
+    }
     return r;
 }
 
@@ -415,29 +493,30 @@ fxm4 fxm4_identity(void)
     r.m[0] = r.m[5] = r.m[10] = r.m[15] = FX_ONE;
     return r;
 }
+/* Same int64-accumulate + single-clamp discipline as fxm3_mul (see above). */
 fxm4 fxm4_mul(fxm4 a, fxm4 b)
 {
     fxm4 r;
     for (int c = 0; c < 4; c++) for (int row = 0; row < 4; row++) {
-        fx s = 0;
-        for (int k = 0; k < 4; k++) s += fx_mul(a.m[k*4+row], b.m[c*4+k]);
-        r.m[c*4+row] = s;
+        fpm_i64 s = 0;
+        for (int k = 0; k < 4; k++) s += fpm_mul_i64(a.m[k*4+row], b.m[c*4+k]);
+        r.m[c*4+row] = fpm_sat_i64(s);
     }
     return r;
 }
 fxv3 fxm4_mul_point(fxm4 m, fxv3 p)
 {
     return fxv3_mk(
-        fx_mul(m.m[0], p.x) + fx_mul(m.m[4], p.y) + fx_mul(m.m[8],  p.z) + m.m[12],
-        fx_mul(m.m[1], p.x) + fx_mul(m.m[5], p.y) + fx_mul(m.m[9],  p.z) + m.m[13],
-        fx_mul(m.m[2], p.x) + fx_mul(m.m[6], p.y) + fx_mul(m.m[10], p.z) + m.m[14]);
+        fpm_sat_i64(fpm_mul_i64(m.m[0], p.x) + fpm_mul_i64(m.m[4], p.y) + fpm_mul_i64(m.m[8],  p.z) + m.m[12]),
+        fpm_sat_i64(fpm_mul_i64(m.m[1], p.x) + fpm_mul_i64(m.m[5], p.y) + fpm_mul_i64(m.m[9],  p.z) + m.m[13]),
+        fpm_sat_i64(fpm_mul_i64(m.m[2], p.x) + fpm_mul_i64(m.m[6], p.y) + fpm_mul_i64(m.m[10], p.z) + m.m[14]));
 }
 fxv3 fxm4_mul_dir(fxm4 m, fxv3 v)
 {
     return fxv3_mk(
-        fx_mul(m.m[0], v.x) + fx_mul(m.m[4], v.y) + fx_mul(m.m[8],  v.z),
-        fx_mul(m.m[1], v.x) + fx_mul(m.m[5], v.y) + fx_mul(m.m[9],  v.z),
-        fx_mul(m.m[2], v.x) + fx_mul(m.m[6], v.y) + fx_mul(m.m[10], v.z));
+        fpm_sat_i64(fpm_mul_i64(m.m[0], v.x) + fpm_mul_i64(m.m[4], v.y) + fpm_mul_i64(m.m[8],  v.z)),
+        fpm_sat_i64(fpm_mul_i64(m.m[1], v.x) + fpm_mul_i64(m.m[5], v.y) + fpm_mul_i64(m.m[9],  v.z)),
+        fpm_sat_i64(fpm_mul_i64(m.m[2], v.x) + fpm_mul_i64(m.m[6], v.y) + fpm_mul_i64(m.m[10], v.z)));
 }
 fxm4 fxm4_translate(fx x, fx y, fx z)
 {
@@ -512,16 +591,27 @@ fxm4 fxm4_lookat(fxv3 eye, fxv3 target, fxv3 up)
     fxm4 r = fxm4_identity();
     r.m[0] = s.x;  r.m[4] = s.y;  r.m[8]  = s.z;
     r.m[1] = u.x;  r.m[5] = u.y;  r.m[9]  = u.z;
-    r.m[2] = -f.x; r.m[6] = -f.y; r.m[10] = -f.z;
-    r.m[12] = -fxv3_dot(s, eye);
-    r.m[13] = -fxv3_dot(u, eye);
-    r.m[14] =  fxv3_dot(f, eye);
+    /* basis components are unit-scale (|v| <= ~1), but negate via int64 anyway
+     * so a saturated FX_MIN can never be UB-negated */
+    r.m[2]  = fpm_sat_i64(-(fpm_i64)f.x);
+    r.m[6]  = fpm_sat_i64(-(fpm_i64)f.y);
+    r.m[10] = fpm_sat_i64(-(fpm_i64)f.z);
+    r.m[12] = fpm_sat_i64(-(fpm_i64)fxv3_dot(s, eye));
+    r.m[13] = fpm_sat_i64(-(fpm_i64)fxv3_dot(u, eye));
+    r.m[14] = fxv3_dot(f, eye);
     return r;
 }
 
 /* Inverse of an affine 4x4 (see fpm.h): invert the upper-left 3x3 and map the
  * translation by -Uinv * t. Valid for rotation + (non-uniform) scale + translate
- * ONLY -- the bottom row must be (0,0,0,1). */
+ * ONLY -- the bottom row must be (0,0,0,1). If the 3x3 is singular the result
+ * carries an identity rotation block and translation -t (not a full identity).
+ *
+ * The translation is computed straight from the UNROUNDED adjugate (Cramer):
+ *   nt = -inv(U)*t = -(adj(B)*t') / det * 2^(st - s)
+ * instead of multiplying the already-quantized inv(U) by t -- that double
+ * rounding is amplified by |U| on the round trip (measured 0.044 identity
+ * error at uniform scale 200 vs ~0.004 this way). */
 fxm4 fxm4_inverse_affine(fxm4 A)
 {
     fxm3 U;
@@ -529,15 +619,41 @@ fxm4 fxm4_inverse_affine(fxm4 A)
     U.m[3] = A.m[4]; U.m[4] = A.m[5]; U.m[5] = A.m[6];
     U.m[6] = A.m[8]; U.m[7] = A.m[9]; U.m[8] = A.m[10];
 
-    fxm3 Ui = fxm3_inverse(U);
-    fxv3 t  = fxv3_mk(A.m[12], A.m[13], A.m[14]);
-    fxv3 nt = fxm3_mul_vec(Ui, t);
-    nt = fxv3_mk(-nt.x, -nt.y, -nt.z);
+    fpm_inv3 c = inv3_prepare(U);
 
     fxm4 r = fxm4_identity();
-    r.m[0] = Ui.m[0]; r.m[1] = Ui.m[1]; r.m[2]  = Ui.m[2];
-    r.m[4] = Ui.m[3]; r.m[5] = Ui.m[4]; r.m[6]  = Ui.m[5];
-    r.m[8] = Ui.m[6]; r.m[9] = Ui.m[7]; r.m[10] = Ui.m[8];
-    r.m[12] = nt.x; r.m[13] = nt.y; r.m[14] = nt.z;
+    if (c.det == 0) {
+        /* singular: identity block, translation -t */
+        r.m[12] = fpm_sat_i64(-(fpm_i64)A.m[12]);
+        r.m[13] = fpm_sat_i64(-(fpm_i64)A.m[13]);
+        r.m[14] = fpm_sat_i64(-(fpm_i64)A.m[14]);
+        return r;
+    }
+
+    /* rotation/scale block: inv(U) = (adj(B)/det) * 2^-s */
+    for (int i = 0; i < 9; i++) {
+        fpm_i64 q = (c.adj[i] * FX_ONE) / c.det;
+        r.m[(i / 3) * 4 + (i % 3)] = unshift_sat(q, -c.s);
+    }
+
+    /* translation: normalize t to t' = t * 2^-st with |t'| < 2^24, then
+     * nt_row = -((adj(B) * t')_row / det) * 2^(st - s).
+     * adj terms < 2^33, t' < 2^24 -> products < 2^57, 3-term sum < 2^59;
+     * (Q16.16 adj * Q16.16 t' sum) / (Q16.16 det) lands directly in Q16.16. */
+    fpm_i64 t64[3] = { A.m[12], A.m[13], A.m[14] };
+    fpm_i64 maxt = 0;
+    for (int i = 0; i < 3; i++) {
+        fpm_i64 v = t64[i] < 0 ? -t64[i] : t64[i];
+        if (v > maxt) maxt = v;
+    }
+    int st = 0;
+    while (maxt >= ((fpm_i64)1 << 24)) { maxt >>= 1; st++; }   /* st <= 7 */
+    for (int row = 0; row < 3; row++) {
+        fpm_i64 num = c.adj[0*3+row] * (t64[0] >> st)
+                    + c.adj[1*3+row] * (t64[1] >> st)
+                    + c.adj[2*3+row] * (t64[2] >> st);
+        fpm_i64 y = num / c.det;                     /* (inv(B)*t')_row, Q16.16 */
+        r.m[12 + row] = unshift_sat(-y, st - c.s);   /* negate + undo scales */
+    }
     return r;
 }

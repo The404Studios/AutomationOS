@@ -4,8 +4,9 @@
  * math library (userspace/lib/fpm). Cryptotest-style: bare _start, own syscalls,
  * NO libc, NO floating point. Runs a COMPACT subset of the host KAT sweep on the
  * device -- table init, then 32 spot values per scalar function family plus a
- * vector normalize and a matrix inverse round-trip -- comparing against expected
- * Q16.16 integer constants precomputed on the host.
+ * vector normalize, a matrix inverse round-trip, and 8 saturation/UB regression
+ * pins -- comparing against expected Q16.16 integer constants precomputed on
+ * the host (12 families, 316 checks).
  *
  * WHY EXACT EQUALITY: fpm is integer-only and deterministic, and the device
  * links the SAME fpm.c the host generator ran (the freestanding pragmas change
@@ -238,6 +239,30 @@ void _start(void)
           checks++; if (d > TOL) f++;
       } }
     report("fxm4_inverse_affine roundtrip (16)", f); fails += f;
+
+    /* saturation/UB regression pins from the 10-agent audit (hand-computed
+     * expected values; every one of these FAILED against the pre-audit
+     * library: fx_abs(FX_MIN) was UB-negative, fx_from_int wrapped with a
+     * sign flip, round(32767.5) disagreed with ceil, dot/add sums wrapped
+     * int32, and fxm3_inverse's det saturated for scales beyond ~32). */
+    f = 0;
+    { checks++; if (fx_abs(FX_MIN) != FX_MAX) f++;
+      checks++; if (fx_from_int(32768) != FX_MAX) f++;
+      checks++; if (fx_round((fx)0x7FFF8000) != FX_MAX) f++;
+      fxv2 v2 = fxv2_mk(fx_from_int(181), fx_from_int(181));
+      checks++; if (fxv2_dot(v2, v2) != FX_MAX) f++;    /* 2*181^2 > 32767 */
+      fxv3 mx = fxv3_mk(FX_MAX, FX_MAX, FX_MAX);
+      fxv3 sm = fxv3_add(mx, mx);
+      checks++; if (sm.x != FX_MAX) f++;
+      checks++; if (sm.y != FX_MAX) f++;
+      checks++; if (sm.z != FX_MAX) f++;
+      fxm3 S; for (int i = 0; i < 9; i++) S.m[i] = 0;
+      S.m[0] = S.m[4] = S.m[8] = fx_from_int(200);
+      /* inv(diag 200).m[0]: adj = 200^2 * 2^16 = 2621440000, det = 200^3 *
+       * 2^16 = 524288000000 (both Q16.16 in int64, s=0), so the entry is
+       * adj*65536/det = 327 exactly (truncating division). */
+      checks++; if (fxm3_inverse(S).m[0] != 327) f++; }
+    report("sat/abs regression pins (8)", f); fails += f;
 
     print("MATHTEST: ");
     if (fails == 0) { print("PASS n="); print_uint((unsigned)checks); print("\n"); }

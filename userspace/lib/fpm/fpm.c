@@ -389,15 +389,17 @@ static fpm_i64 minor2_i64(fx a, fx b, fx c, fx d)
 }
 
 /* value * 2^k with saturation, for undoing the normalization shifts below.
- * The +-2^37 pre-clamp makes the left shift (k up to 25 across all callers)
- * overflow-free; anything that large saturates to FX_MAX/FX_MIN anyway. */
+ * The +-2^37 pre-clamp makes the scale-up (k up to 25 across all callers)
+ * overflow-free; anything that large saturates to FX_MAX/FX_MIN anyway.
+ * Scale-up is a MULTIPLY by (1<<k), not `v << k`: left-shifting a negative
+ * value is UB in C11 (UBSan-caught); the multiply is value-identical. */
 static fx unshift_sat(fpm_i64 v, int k)
 {
     if (k >= 0) {
         const fpm_i64 LIM = (fpm_i64)1 << 37;
         if (v >  LIM) return FX_MAX;
         if (v < -LIM) return FX_MIN;
-        return fpm_sat_i64(v << k);
+        return fpm_sat_i64(v * ((fpm_i64)1 << k));
     }
     return fpm_sat_i64(v >> -k);
 }
@@ -441,7 +443,8 @@ static fpm_inv3 inv3_prepare(fxm3 A)
     fx B[9];
     for (int i = 0; i < 9; i++) {
         fpm_i64 v = A.m[i];
-        B[i] = (fx)(s >= 0 ? (v >> s) : (v << -s));   /* < 2^24 by construction */
+        /* scale-up via multiply (v can be negative; << would be UB) */
+        B[i] = (fx)(s >= 0 ? (v >> s) : (v * ((fpm_i64)1 << -s)));  /* < 2^24 */
     }
 
     /* element(row,col) = B[col*3+row] */

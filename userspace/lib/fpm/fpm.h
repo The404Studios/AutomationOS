@@ -77,9 +77,11 @@ static inline fx fpm_sat_i64(fpm_i64 v) {
 }
 
 /* ---- int <-> fx ---- */
-/* Saturates outside [-32768, 32767] (32768.0 is not representable). */
+/* Saturates outside [-32768, 32767] (32768.0 is not representable).
+ * (i * FX_ONE, not i << 16: left-shifting a negative value is UB in C11 --
+ * UBSan-caught; the multiply is identical in value and codegen.) */
 static inline fx fx_from_int(fpm_i32 i) {
-    return fpm_sat_i64((fpm_i64)i << FX_SHIFT);
+    return fpm_sat_i64((fpm_i64)i * FX_ONE);
 }
 /* Floor toward -inf (arithmetic shift; NOT truncate-toward-zero for negatives)
  * -- same shift g3d's fx_to_int does. */

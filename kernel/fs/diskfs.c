@@ -466,7 +466,15 @@ static int dfs_mount_from_sb(const diskfs_superblock_t* sb)
         sb->inode_count == 0 || sb->inode_count > DFS_INODE_COUNT ||
         sb->block_size != DFS_BLOCK_SIZE ||
         sb->block_count > DFS_BLOCK_COUNT ||   /* AUDIT FIX (gap-org): bound by real capacity (3584), not bitmap bits (4096) */
-        sb->bitmap_lba == 0 || sb->inode_lba == 0 || sb->data_lba == 0) {
+        /* FS-ROBUST: the region-start LBAs drive the LBA of every subsequent
+         * read/write; a crafted (checksum-valid) superblock with e.g.
+         * data_lba=0xFFFFFFF8 would wrap the write LBA to a low sector and
+         * clobber the MBR/superblock/inode table. The v2 layout is fixed, so
+         * pin them to the constants (like inode_size/block_size) rather than
+         * only rejecting zero. */
+        sb->bitmap_lba != DFS_BITMAP_LBA ||
+        sb->inode_lba  != DFS_INODE_LBA  ||
+        sb->data_lba   != DFS_DATA_LBA) {
         kprintf("[DISKFS] superblock layout out of range -- refusing mount\n");
         return -1;
     }

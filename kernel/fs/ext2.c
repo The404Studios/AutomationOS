@@ -572,8 +572,13 @@ vfs_superblock_t* ext2_mount(const char* source, uint32_t flags) {
     memset(fs_data, 0, sizeof(ext2_fs_data_t));
     fs_data->block_device = dev;
 
-    // Read superblock (1024 bytes at offset 1024)
-    fs_data->superblock = kmalloc(sizeof(ext2_superblock_t));
+    // Read superblock (a full 1024-byte block at offset 1024). FS-ROBUST: the
+    // struct type is only ~412 bytes (it truncates the on-disk superblock), so
+    // sizing the buffer by sizeof(ext2_superblock_t) made block_read(...,2,...)
+    // write 1024 bytes into a 512-byte slab object -- a 512-byte heap overflow
+    // with attacker-controlled on-disk bytes on every mount. Allocate the full
+    // block (matching ext2_detect); the struct simply reads its prefix.
+    fs_data->superblock = kmalloc(1024);
     if (!fs_data->superblock) {
         kfree(fs_data);
         return NULL;

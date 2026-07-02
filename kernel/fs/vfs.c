@@ -1533,7 +1533,15 @@ static ssize_t ramfs_write(vfs_file_t* file, const void* buf, size_t count) {
     int initrd_backed = (inode->flags & VFS_DATA_INITRD_BACKED) ? 1 : 0;
 
     if (initrd_backed || required > inode->data_capacity) {
-        size_t new_capacity = required * 2;  // grow with headroom
+        /* FS-ROBUST: an initrd-backed inode is forced through this CoW branch
+         * even for a write SMALLER than the file. Size the new buffer to cover
+         * the whole existing file, not just `required` -- otherwise a small
+         * write drops data_capacity below inode->size (which stays unchanged),
+         * and a later read of inode->size bytes over-reads the heap and leaks
+         * it to userspace. */
+        size_t need = required;
+        if (inode->size > need) need = inode->size;
+        size_t new_capacity = need * 2;  // grow with headroom
         if (new_capacity < 16) {
             new_capacity = 16;
         }

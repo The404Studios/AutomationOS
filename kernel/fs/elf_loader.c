@@ -67,9 +67,13 @@ int elf_validate_header(const elf64_ehdr_t* ehdr) {
         return 0;
     }
 
-    // Check entry point (must be in user space)
-    if (ehdr->e_entry >= KERNEL_SPACE_START) {
-        kprintf("[ELF] Entry point 0x%016lx is in kernel space\n", ehdr->e_entry);
+    // Check entry point (must be in user space). FS-ROBUST: reject anything at
+    // or above USER_SPACE_END, not just KERNEL_SPACE_START -- an e_entry in the
+    // non-canonical hole [USER_SPACE_END, KERNEL_SPACE_START) passed the old
+    // check, then iretq to that non-canonical RIP #GP(0)s in ring 0 (kernel DoS
+    // on the /sbin/init load and every sys_spawn/sys_execve of a crafted ELF).
+    if (ehdr->e_entry >= USER_SPACE_END) {
+        kprintf("[ELF] Entry point 0x%016lx is not in user space\n", ehdr->e_entry);
         return 0;
     }
 

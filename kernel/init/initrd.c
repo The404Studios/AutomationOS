@@ -189,14 +189,26 @@ int initrd_mount(void) {
         uint64_t file_size = octal_to_int(header->size, sizeof(header->size));
         char type = header->typeflag;
 
-        kprintf("[INITRD] Extracting: %s (%lu bytes)\n", raw_name, file_size);
+        /* FS-ROBUST: the tar name field is at most 100 bytes and is NOT
+         * guaranteed NUL-terminated; copy it into a bounded, terminated buffer
+         * before ANY %s use. kprintf's %s does an unbounded strlen, so printing
+         * the raw field would over-read past the 512-byte header and off the end
+         * of the initrd image (boot-log info-leak + a fatal boot page fault). */
+        char safe_name[101];
+        {
+            int _n = 0;
+            while (_n < 100 && raw_name[_n]) { safe_name[_n] = raw_name[_n]; _n++; }
+            safe_name[_n] = '\0';
+        }
+
+        kprintf("[INITRD] Extracting: %s (%lu bytes)\n", safe_name, file_size);
 
         // Build path with leading slash
-        if (raw_name[0] == '/') {
-            vfs_strcpy(fullpath, raw_name, 256);
+        if (safe_name[0] == '/') {
+            vfs_strcpy(fullpath, safe_name, 256);
         } else {
             fullpath[0] = '/';
-            vfs_strcpy(fullpath + 1, raw_name, 255);
+            vfs_strcpy(fullpath + 1, safe_name, 255);
         }
 
         // Move to file data
@@ -212,7 +224,7 @@ int initrd_mount(void) {
             // initrd image (offset already points past the 512-byte header).
             if (file_size > initrd_size || offset + file_size > initrd_size) {
                 kprintf("[INITRD] '%s' (%lu B) extends past initrd end -- malformed, stopping\n",
-                        raw_name, file_size);
+                        safe_name, file_size);
                 break;
             }
             const void* file_data = (const void*)(initrd_addr + offset);
@@ -429,7 +441,16 @@ void initrd_list_files(void) {
             type_char = 'd';  // Directory
         }
 
-        kprintf("  %c %8lu  %s\n", type_char, file_size, filename);
+        /* FS-ROBUST: bound + terminate the 100-byte tar name before %s (same
+         * unbounded-strlen OOB read as initrd_mount). */
+        char safe_name[101];
+        {
+            int _n = 0;
+            while (_n < 100 && filename[_n]) { safe_name[_n] = filename[_n]; _n++; }
+            safe_name[_n] = '\0';
+        }
+
+        kprintf("  %c %8lu  %s\n", type_char, file_size, safe_name);
 
         file_count++;
 

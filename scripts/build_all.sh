@@ -138,9 +138,18 @@ fi
 # ~70 self-test programs (the boot "storm"). This is the T410 desktop profile --
 # fast/smooth/low-churn boot, no long no-yield compute blocks freezing the
 # cooperative scheduler, no process-churn stressing the PCID teardown path.
-if [ "${DESKTOP_MINIMAL:-0}" = "1" ]; then
+# LEANER-BOOT-0: the lean desktop (compositor+terminal+filemanager+netman+
+# browser+ide only, NO ~70-app self-test storm) is now the DEFAULT boot -- fast,
+# smooth, low-churn (the storm held the cooperative CPU for seconds and stressed
+# the PCID teardown path, and false-tripped the self-heal watchdog). The storm
+# IS the dev smoke suite, so it compiles in ONLY with FULL=1; smoke_boot-driven
+# regression scripts pass FULL=1. DESKTOP_MINIMAL=1 remains an explicit alias for
+# the (now default) lean profile. Adding FULL is always a safe SUPERSET.
+if [ "${FULL:-0}" = "1" ]; then
+    echo "*** FULL build: init spawns the complete self-test storm (dev smoke suite) ***"
+else
     INIT_EXTRA="$INIT_EXTRA -DDESKTOP_MINIMAL"
-    echo "*** DESKTOP_MINIMAL build: init spawns desktop apps only (no self-test storm) ***"
+    echo "*** LEAN build (default): desktop apps only; pass FULL=1 for the self-test storm ***"
 fi
 # SMOKE_SELFTEST=1: spawn the two BOUNDED browser2 self-test runs (--smoke +
 # about:imgtest) that exist only to feed the smoke / img / alias verify gates.

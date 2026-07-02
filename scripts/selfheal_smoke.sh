@@ -42,7 +42,7 @@ FAILS=0
 build_iso() {
     local kernel="$1"
     info "build_all.sh (SELFHEAL=${SELFHEAL:-0} FREEZE_TEST=${FREEZE_TEST:-0} FREEZE_MODE=${FREEZE_MODE:-0})"
-    if ! bash scripts/build_all.sh > /tmp/selfheal_build.log 2>&1; then
+    if ! FULL=1 bash scripts/build_all.sh > /tmp/selfheal_build.log 2>&1; then
         fail "build_all.sh failed:"; tail -25 /tmp/selfheal_build.log; return 1
     fi
     cp "$kernel" "$ROOT/iso/boot/kernel.elf"

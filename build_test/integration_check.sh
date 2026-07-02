@@ -17,7 +17,7 @@ kerr() { grep -qiE 'error:|^FAIL:|undefined reference' "$1" && { echo "  BUILD E
 echo "=== [1/4] WIFI_SIM+HDA+AUDIO / WPA3 connect+confirm ==="
 WIFI_SIM=1 HDA_ENABLE=1 AUDIO_SELFTEST=1 bash scripts/quick_build.sh > /tmp/i1q.log 2>&1; kerr /tmp/i1q.log || PASS=0
 grep -q SUCCESS /tmp/i1q.log || { echo "  k1 no SUCCESS"; PASS=0; }
-WIFI_DEMO_WPA3=1 bash scripts/build_all.sh > /tmp/i1b.log 2>&1; grep -qiE 'error:|undefined reference' /tmp/i1b.log && { echo "  u1 ERR"; grep -iE 'error:|undefined reference' /tmp/i1b.log|head; PASS=0; }
+WIFI_DEMO_WPA3=1 FULL=1 bash scripts/build_all.sh > /tmp/i1b.log 2>&1; grep -qiE 'error:|undefined reference' /tmp/i1b.log && { echo "  u1 ERR"; grep -iE 'error:|undefined reference' /tmp/i1b.log|head; PASS=0; }
 S=$(boot wpa3 "-audiodev none,id=snd0 -device intel-hda -device hda-output,audiodev=snd0")
 grep -aE 'CRYPTOTEST: PASS|SAE confirm|CONNECTED ssid=Secure|AUDIO: tone done' "$S" | head
 { grep -qaE 'CRYPTOTEST: PASS' "$S" && grep -qaE '\[CRYPTOTEST\] sae .*: PASS' "$S"; } || { echo "  crypto/sae FAIL"; PASS=0; }
@@ -27,7 +27,7 @@ grep -qaE 'All services started' "$S" || { echo "  desktop1 FAIL"; PASS=0; }
 
 echo "=== [2/4] WIFI_SIM / wrong-passphrase -> WLAN_FAILED ==="
 WIFI_SIM=1 bash scripts/quick_build.sh > /tmp/i2q.log 2>&1; grep -q SUCCESS /tmp/i2q.log || { echo "  k2 no SUCCESS"; PASS=0; }
-WIFI_DEMO_FAIL=1 bash scripts/build_all.sh > /tmp/i2b.log 2>&1; grep -qiE 'error:|undefined reference' /tmp/i2b.log && { echo "  u2 ERR"; PASS=0; }
+WIFI_DEMO_FAIL=1 FULL=1 bash scripts/build_all.sh > /tmp/i2b.log 2>&1; grep -qiE 'error:|undefined reference' /tmp/i2b.log && { echo "  u2 ERR"; PASS=0; }
 S=$(boot fail "")
 grep -aE 'WIFISIM:.*FAILED|WPASUPP: did not associate' "$S" | head
 { grep -qaE 'WIFISIM: connect .* FAILED' "$S" && grep -qaE 'WPASUPP: did not associate' "$S"; } || { echo "  FAILED-path FAIL"; PASS=0; }
@@ -36,7 +36,7 @@ echo "=== [3/4] IWLWIFI compile (incl iwl-trans) + IWL-FW 5 negatives + no-card 
 IWLWIFI=1 bash scripts/quick_build.sh > /tmp/i3q.log 2>&1; kerr /tmp/i3q.log || PASS=0
 grep -q SUCCESS /tmp/i3q.log || { echo "  k3 no SUCCESS"; PASS=0; }
 grep -qE 'iwl-trans.c' /tmp/i3q.log && echo "  iwl-trans.c compiled OK" || echo "  WARN: iwl-trans.c not in compile log"
-bash scripts/build_all.sh > /tmp/i3b.log 2>&1; grep -qiE 'error:|undefined reference' /tmp/i3b.log && { echo "  u3 ERR"; PASS=0; }
+FULL=1 bash scripts/build_all.sh > /tmp/i3b.log 2>&1; grep -qiE 'error:|undefined reference' /tmp/i3b.log && { echo "  u3 ERR"; PASS=0; }
 S=$(boot iwl "")
 grep -aE 'IWL:|IWL-FW:' "$S" | head
 { grep -qaE 'IWL-FW: PASS' "$S" && grep -qaE 'IWL: no Intel WiFi card found' "$S" && grep -qaE 'All services started' "$S"; } || { echo "  iwlwifi FAIL"; PASS=0; }
@@ -44,7 +44,7 @@ grep -aE 'IWL:|IWL-FW:' "$S" | head
 echo "=== [4/4] default (no flags) regression ==="
 bash scripts/quick_build.sh > /tmp/i4q.log 2>&1; kerr /tmp/i4q.log || PASS=0
 grep -q SUCCESS /tmp/i4q.log || { echo "  k4 no SUCCESS"; PASS=0; }
-bash scripts/build_all.sh > /tmp/i4b.log 2>&1; grep -qiE 'error:|undefined reference' /tmp/i4b.log && { echo "  u4 ERR"; PASS=0; }
+FULL=1 bash scripts/build_all.sh > /tmp/i4b.log 2>&1; grep -qiE 'error:|undefined reference' /tmp/i4b.log && { echo "  u4 ERR"; PASS=0; }
 S=$(boot def "")
 { grep -qaE 'All services started' "$S" && grep -qaE 'CRYPTOTEST: PASS' "$S"; } || { echo "  default FAIL"; PASS=0; }
 grep -aE 'All services started|CRYPTOTEST: PASS' "$S" | head -2

@@ -16,7 +16,7 @@ bash scripts/quick_build.sh > /tmp/br_qb.log 2>&1
 grep -qF 'SUCCESS: build/kernel.elf' /tmp/br_qb.log || { echo "KERNEL BUILD FAILED"; tail -8 /tmp/br_qb.log; exit 1; }
 
 echo "[br] BLOCKRECV_TEST=1 build_all ..."
-BLOCKRECV_TEST=1 bash scripts/build_all.sh > /tmp/br_ba.log 2>&1
+BLOCKRECV_TEST=1 FULL=1 bash scripts/build_all.sh > /tmp/br_ba.log 2>&1
 grep -qE 'error:|undefined reference' /tmp/br_ba.log && { echo "BUILD ERRORS"; grep -E 'error:|undefined reference' /tmp/br_ba.log | head; exit 1; }
 grep -qF 'blockrecv' iso/boot/initrd.img || { echo "blockrecv NOT in initrd"; exit 1; }
 
@@ -49,7 +49,7 @@ fi
 grep -qiE 'KERNEL PANIC|TRIPLE FAULT' "$SER" && { echo "  kernel fault"; PASS=0; }
 
 echo "[br] default build (flag unset) must NOT contain NET-BLOCK markers ..."
-bash scripts/build_all.sh > /tmp/br_ba_def.log 2>&1
+FULL=1 bash scripts/build_all.sh > /tmp/br_ba_def.log 2>&1
 grep -qF 'blockrecv' iso/boot/initrd.img && DEF_HAS=1 || DEF_HAS=0
 # blockrecv.elf still SHIPS (inert) but init must not SPAWN it without the flag;
 # proven by the boot below carrying no BLOCKRECV marker.

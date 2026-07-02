@@ -11,8 +11,10 @@
 # smpstress SKIPs; THIS script is the separate run that proves the real 2-CPU path.
 # It must be the green light BEFORE any per-CPU scheduler / dispatch change lands.
 #
-# Prereq: run `IDE=1 bash scripts/build_all.sh` first so iso/boot/initrd.img holds
-# the current sbin/smpstress. Run: wsl -d Arch bash -lc 'bash scripts/smp_smoke.sh'
+# Prereq: run `IDE=1 FULL=1 bash scripts/build_all.sh` first so iso/boot/initrd.img
+# holds the current sbin/smpstress + the self-test storm (LEANER-BOOT-0: FULL=1
+# is now required for the storm; the default build_all is lean).
+# Run: wsl -d Arch bash -lc 'bash scripts/smp_smoke.sh'
 set -u
 ROOT=/mnt/c/Users/wilde/Desktop/Kernel
 cd "$ROOT" || exit 9

@@ -5,7 +5,7 @@
 cd /mnt/c/Users/wilde/Desktop/Kernel || exit 1
 
 echo "[crypto] build_all (userspace)..."
-bash scripts/build_all.sh > /tmp/crypto_ba.log 2>&1
+FULL=1 bash scripts/build_all.sh > /tmp/crypto_ba.log 2>&1
 if grep -qiE 'error:|undefined reference|redefinition|conflicting types' /tmp/crypto_ba.log; then
   echo "BUILD ERRORS:"; grep -iE 'error:|undefined reference|redefinition|conflicting types' /tmp/crypto_ba.log | head; exit 1
 fi

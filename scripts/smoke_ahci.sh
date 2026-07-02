@@ -57,7 +57,7 @@ maybe_build() {
     [[ $DO_BUILD -eq 1 ]] || return 0
     header "Step 0: Building kernel + ISO"
     bash "${KERNEL_ROOT}/scripts/quick_build.sh" || { echo "quick_build.sh failed" >&2; exit 1; }
-    bash "${KERNEL_ROOT}/scripts/build_all.sh"   || { echo "build_all.sh failed"   >&2; exit 1; }
+    FULL=1 bash "${KERNEL_ROOT}/scripts/build_all.sh"   || { echo "build_all.sh failed"   >&2; exit 1; }
 }
 
 # Build the test disk image (regular file). Prefer python3; fall back to perl.

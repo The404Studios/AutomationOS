@@ -5,7 +5,7 @@
 cd /mnt/c/Users/wilde/Desktop/Kernel || exit 1
 
 echo "[sae] build_all (sae.c + modified p256.c)..."
-bash scripts/build_all.sh > /tmp/sae_ba.log 2>&1
+FULL=1 bash scripts/build_all.sh > /tmp/sae_ba.log 2>&1
 if grep -qiE 'error:|undefined reference|redefinition|conflicting types' /tmp/sae_ba.log; then
   echo "BUILD ERRORS:"; grep -iE 'error:|undefined reference|redefinition|conflicting types' /tmp/sae_ba.log | head -20; exit 1
 fi

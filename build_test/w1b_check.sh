@@ -7,7 +7,7 @@
 cd /mnt/c/Users/wilde/Desktop/Kernel || exit 1
 
 echo "[w1b] build_all (crypto ccmp/gcmp + ui toolkit)..."
-bash scripts/build_all.sh > /tmp/w1b_ba.log 2>&1
+FULL=1 bash scripts/build_all.sh > /tmp/w1b_ba.log 2>&1
 if grep -qiE 'error:|undefined reference|redefinition|conflicting types' /tmp/w1b_ba.log; then
   echo "BUILD ERRORS:"; grep -iE 'error:|undefined reference|redefinition|conflicting types' /tmp/w1b_ba.log | head -20; exit 1
 fi

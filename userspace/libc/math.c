@@ -118,9 +118,26 @@ float roundf(float x)  { return (float)round((double)x); }
  * ====================================================================== */
 
 double fmod(double x, double y) {
-    if (y == 0.0) return 0.0;  /* undefined; return 0 */
-    long long n = (long long)(x / y);
-    return x - (double)n * y;
+    /* MATH-0b: C99 domain errors are NaN, not a silent 0 -- and the old
+     * (long long)(x/y) truncation is UB for |x/y| >= 2^63, so
+     * fmod(1e300, 7.0) came back UNREDUCED. */
+    if (y == 0.0 || x != x || y != y ||
+        fabs(x) == bits_to_double(0x7FF0000000000000ULL))
+        return bits_to_double(0x7FF8000000000000ULL);   /* quiet NaN */
+    double ax = fabs(x), ay = fabs(y);
+    if (ax < ay) return x;
+    /* Exponent-scaled binary reduction: subtract y*2^k for k from
+     * ilogb(x)-ilogb(y) downward. Each step subtracts an exact power-of-two
+     * multiple of y, so at most ~2046 iterations reduce any finite double;
+     * y*2^k never overflows because k <= exp(ax)-exp(ay). */
+    int ex, ey;
+    frexp(ax, &ex);
+    frexp(ay, &ey);
+    for (int k = ex - ey; k >= 0 && ax >= ay; k--) {
+        double d = ldexp(ay, k);
+        if (d <= ax) ax -= d;
+    }
+    return (x < 0.0) ? -ax : ax;   /* result carries the sign of x (C99) */
 }
 
 float fmodf(float x, float y) { return (float)fmod((double)x, (double)y); }
@@ -145,7 +162,10 @@ double ldexp(double x, int e) {
     if (exp_field == 0 || exp_field == 0x7FF) return x; /* 0 / inf / nan */
     exp_field += e;
     if (exp_field <= 0)   return copysign(0.0, x);
-    if (exp_field >= 0x7FF) return copysign((double)((u64)0x7FF0000000000000ULL), x);
+    /* MATH-0b: overflow is +/-inf. The old code CAST the u64 bit pattern to
+     * double arithmetically (= 9.22e18), not a bit-reinterpretation. */
+    if (exp_field >= 0x7FF)
+        return copysign(bits_to_double(0x7FF0000000000000ULL), x);
     bits = (bits & ~(u64)0x7FF0000000000000ULL) | ((u64)exp_field << 52);
     return bits_to_double(bits);
 }
@@ -174,7 +194,9 @@ double modf(double x, double *iptr) {
  * ====================================================================== */
 
 double sqrt(double x) {
-    if (x < 0.0) return -1.0; /* NaN substitute — graphics code won't hit this */
+    /* MATH-0b: sqrt of a negative is NaN (the old -1.0 "substitute" silently
+     * poisoned downstream arithmetic with a plausible-looking value). */
+    if (x < 0.0) return bits_to_double(0x7FF8000000000000ULL);
     if (x == 0.0) return 0.0;
 
     /* Initial estimate: halve the exponent */
@@ -204,8 +226,8 @@ float sqrtf(float x) { return (float)sqrt((double)x); }
 
 /* Polynomial coefficients for exp(r)-1 on [-0.347, 0.347] */
 double exp(double x) {
-    /* Clamp to avoid overflow in 2^n (double range ~±709) */
-    if (x >  709.0) return 8.98846567431e+307; /* ~DBL_MAX */
+    /* Overflow is +inf (MATH-0b; was a ~DBL_MAX sentinel); underflow is 0. */
+    if (x >  709.0) return bits_to_double(0x7FF0000000000000ULL);
     if (x < -745.0) return 0.0;
 
     /* n = round(x / ln2) */
@@ -242,7 +264,9 @@ float expf(float x) { return (float)exp((double)x); }
  * ====================================================================== */
 
 double log(double x) {
-    if (x <= 0.0) return -8.98846567431e+307; /* -inf substitute */
+    /* MATH-0b (C99): log(0) = -inf, log(negative) = NaN -- not sentinels. */
+    if (x == 0.0) return bits_to_double(0xFFF0000000000000ULL);
+    if (x <  0.0) return bits_to_double(0x7FF8000000000000ULL);
 
     int e;
     double m = frexp(x, &e);   /* x = m * 2^e, m in [0.5, 1) */
@@ -283,11 +307,14 @@ double log10(double x) { return log(x) * 4.34294481903251828e-1; }
 double pow(double x, double y) {
     if (y == 0.0)  return 1.0;
     if (x == 1.0)  return 1.0;
-    if (x == 0.0)  return (y > 0.0) ? 0.0 : 8.98846567431e+307;
+    /* MATH-0b: pow(0, negative) is +inf; pow(negative, non-integer) is NaN
+     * (both were plausible-looking sentinels: DBL_MAX-ish / 0.0). */
+    if (x == 0.0)  return (y > 0.0) ? 0.0
+                                    : bits_to_double(0x7FF0000000000000ULL);
     if (x < 0.0) {
         /* Only valid for integer exponents */
         long long n = (long long)y;
-        if ((double)n != y) return 0.0; /* undefined for non-integer */
+        if ((double)n != y) return bits_to_double(0x7FF8000000000000ULL);
         double result = exp((double)n * log(-x));
         return (n & 1) ? -result : result;
     }
@@ -355,7 +382,9 @@ double cos(double x) {
 
 double tan(double x) {
     double c = cos(x);
-    if (c == 0.0) return 8.98846567431e+307;
+    /* MATH-0b: a pole is +/-inf carrying sin's sign, not a DBL_MAX sentinel. */
+    if (c == 0.0)
+        return copysign(bits_to_double(0x7FF0000000000000ULL), sin(x));
     return sin(x) / c;
 }
 
@@ -631,6 +660,30 @@ int math_selftest(void) {
     CHECK(22, round(2.5),         3.0);
 
 #undef CHECK
+
+    /* MATH-0b hardening checks (these FAIL against the pre-fix code, which
+     * returned plausible-looking sentinels instead of NaN/inf and left
+     * huge-quotient fmod unreduced). Domain results can't use the EPS CHECK:
+     * NaN compares unequal to everything, inf needs the r*2==r identity. */
+#define CHECK_NAN(i, got) \
+    do { double _g = (double)(got); \
+         if (!(_g != _g)) failures |= (1 << (i)); } while (0)
+#define CHECK_PINF(i, got) \
+    do { double _g = (double)(got); \
+         if (!(_g > 0.0 && _g * 2 == _g)) failures |= (1 << (i)); } while (0)
+
+    CHECK_NAN (23, sqrt(-1.0));
+    { double _r = fmod(1e300, 7.0);                 /* reduced, in [0,7) */
+      if (!(_r >= 0.0 && _r < 7.0)) failures |= (1 << 24); }
+    CHECK_NAN (25, fmod(5.0, 0.0));
+    { double _l = log(0.0);                         /* true -inf */
+      if (!(_l < 0.0 && _l * 2 == _l)) failures |= (1 << 26); }
+    CHECK_NAN (27, pow(-2.0, 0.5));
+    CHECK_PINF(28, exp(1000.0));
+    CHECK_PINF(29, ldexp(1.0, 5000));
+
+#undef CHECK_NAN
+#undef CHECK_PINF
 
     return failures;
 }

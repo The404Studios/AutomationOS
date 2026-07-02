@@ -479,6 +479,11 @@ cc userspace/apps/wget/wget.c /tmp/wget.o; $LD /tmp/crt0.o /tmp/wget.o $HTTPS_OB
 # cryptotest app: runs the full crypto/TLS KAT battery at boot (bare _start -- no crt0).
 cc userspace/apps/cryptotest/cryptotest.c /tmp/cryptotest.o
 $LD /tmp/cryptotest.o $CRYPTO_OBJS -o /tmp/cryptotest.elf
+# mathtest app: MATH-0 fpm (Q16.16) KAT battery at boot (bare _start -- no crt0).
+# fpm.c carries its own no-sse pragmas; build_test/mathtest_check.sh gates 0-xmm.
+cc userspace/lib/fpm/fpm.c /tmp/fpm.o
+cc userspace/apps/mathtest/mathtest.c /tmp/mathtest.o
+$LD /tmp/mathtest.o /tmp/fpm.o -o /tmp/mathtest.elf
 # wlanctl: WiFi control-plane probe -- SYS_WLAN_SCAN proof (bare _start, no crt0).
 cc userspace/apps/wlanctl/wlanctl.c /tmp/wlanctl.o
 $LD /tmp/wlanctl.o -o /tmp/wlanctl.elf
@@ -984,6 +989,7 @@ for t in ping nc netinfo netscan tcping dig httpget pktmon httpd traceroute arp 
 done
 # KAT self-test harnesses -> /sbin (init spawns them at boot).
 cp /tmp/cryptotest.elf /tmp/ird/sbin/cryptotest
+cp /tmp/mathtest.elf /tmp/ird/sbin/mathtest
 cp /tmp/wlanctl.elf    /tmp/ird/sbin/wlanctl
 cp /tmp/wpasupp.elf    /tmp/ird/sbin/wpasupp
 cp /tmp/libtest.elf    /tmp/ird/sbin/libtest

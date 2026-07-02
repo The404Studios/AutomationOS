@@ -514,6 +514,9 @@ void _start(void) {
     print("[INIT] Self-testing crypto + libs...\n");
     spawn("sbin/cryptotest");
     spawn("sbin/libtest");
+    // MATH-0: fpm (Q16.16 fixed-point) KAT battery -- 308 bit-exact checks
+    // against host-libm-derived constants. Deterministic; exits.
+    spawn("sbin/mathtest");
 
     // JavaScript engine self-test (runs the embedded ES5 script battery).
     spawn("bin/js");

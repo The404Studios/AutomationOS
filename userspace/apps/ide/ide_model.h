@@ -30,6 +30,20 @@
 #define M_MAXRECORDS  32
 #define M_MAXPROTOS   32
 
+/* IDE-MAPCLAMP-0: clamp a vertical map pan/scroll offset so it can never run
+ * past the content into blank space (the map's arrow/wheel/drag handlers add
+ * to map_oy with no bound; the overview render calls this with the known tile-
+ * grid extent, writing the result back so the next input read starts bounded).
+ * Convention: oy <= 0, 0 = top. Returns 0 when the content fits the view;
+ * otherwise clamps to [-(content_h - view_h), 0]. Pure -> host-KAT-testable. */
+static inline int ide_map_clamp_oy(int oy, int content_h, int view_h) {
+    if (content_h <= view_h) return 0;          /* everything fits: no scroll */
+    int min_oy = -(content_h - view_h);         /* most-scrolled (last row visible) */
+    if (oy > 0)      return 0;                  /* can't scroll above the top */
+    if (oy < min_oy) return min_oy;             /* can't scroll past the bottom */
+    return oy;
+}
+
 /* ---- port semantics (the heart of the "LEGO" model) ---- */
 typedef enum {
     PORT_INPUT = 0,      /* function parameter                 */

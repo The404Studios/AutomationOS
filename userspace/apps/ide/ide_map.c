@@ -412,6 +412,24 @@ void panel_map(Ide* a, Canvas* cv, Rect r)
          * on every focus transition, so the overview always opens at the top
          * row and never inherits a focused-view pan. (Globals carry no source
          * line, so a cross-section line sort is intentionally not attempted.) */
+        /* IDE-MAPCLAMP-0: the arrow/wheel/drag handlers add to map_oy with no
+         * bound. Clamp it HERE, where the full tile-grid extent is known, so a
+         * pan can't scroll past the last row into blank space. Total tiles =
+         * the sum of the section counts (each capped like its loop below). */
+        {
+            int total_tiles =
+                (m->nincludes < M_MAXINCLUDES ? m->nincludes : M_MAXINCLUDES) +
+                (m->nmacros   < M_MAXMACROS   ? m->nmacros   : M_MAXMACROS)   +
+                (m->nrecords  < M_MAXRECORDS  ? m->nrecords  : M_MAXRECORDS)  +
+                (m->nglobals  < M_MAXGLOBALS  ? m->nglobals  : M_MAXGLOBALS)  +
+                (m->nprotos   < M_MAXPROTOS   ? m->nprotos   : M_MAXPROTOS)   +
+                (m->nfuncs    < M_MAXFUNCS    ? m->nfuncs    : M_MAXFUNCS);
+            int rows_total = (total_tiles + cols - 1) / cols;
+            if (rows_total < 1) rows_total = 1;
+            int content_h = rows_total * (OV_TILE_H + OV_GAP_Y) + 2 * PAD;
+            int view_h    = body.h;
+            a->map_oy = ide_map_clamp_oy(a->map_oy, content_h, view_h);
+        }
         int scroll_y = a->map_oy;
 
         /* Helper macro to place a tile and record it in the satellite table.

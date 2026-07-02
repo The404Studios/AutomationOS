@@ -86,7 +86,20 @@ if grep -qF "NETP1Z:" "$LOG"; then
     grep -qF "NETP1Z: SWSWND PASS established=1 filled=1 reopen_ack=1" "$LOG" || P=0
 fi
 if grep -qF "NETP1AA:" "$LOG"; then
-    grep -qF "NETP1AA: FINWAIT2 PASS established=1 in_timewait=1 fin_acked=1" "$LOG" || P=0
+    grep -qF "NETP1AA: FINWAIT2 PASS established=1 in_fw2=1 fin_acked=1" "$LOG" || P=0
+fi
+# NET-GAPS markers (N1 rtx queue / N2 SYN options / N3 FIN_WAIT_2 / N4 cwnd)
+if grep -qF "NETP1AF:" "$LOG"; then
+    grep -qF "NETP1AF: SYNOPT PASS synack_mss=1 syn_mss=1 established=1" "$LOG" || P=0
+fi
+if grep -qF "NETP1AG:" "$LOG"; then
+    grep -qF "NETP1AG: RTXQ PASS staged=1 first_rtx=1 second_rtx=1" "$LOG" || P=0
+fi
+if grep -qF "NETP1AH:" "$LOG"; then
+    grep -qF "NETP1AH: CWND PASS init=1 growth=1 rto=1" "$LOG" || P=0
+fi
+if grep -qF "NETP1AI:" "$LOG"; then
+    grep -qF "NETP1AI: FW2 PASS fw2=1 data_ok=1 tw_on_fin=1 reaped=1" "$LOG" || P=0
 fi
 if grep -qF "NETP1AB:" "$LOG"; then
     grep -qF "NETP1AB: SYNQACK PASS synack=1 wrong_rejected=1 right_promoted=1" "$LOG" || P=0

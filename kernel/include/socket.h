@@ -120,7 +120,11 @@ typedef enum {
     TCP_FIN_WAIT,      /* we sent FIN, awaiting ACK / peer FIN           */
     TCP_CLOSE_WAIT,    /* peer sent FIN; we may still send, must FIN     */
     TCP_TIME_WAIT,
-    TCP_LAST_ACK       /* NET-HARDENING-2: passive close, awaiting ACK of our FIN */
+    TCP_LAST_ACK,      /* NET-HARDENING-2: passive close, awaiting ACK of our FIN */
+    /* NET-GAPS N3: our FIN is ACKed but the peer has not FINed yet (RFC 793
+     * FIN-WAIT-2). Appended at the END of the enum so existing numeric state
+     * values (sock_info_t.state consumers: netstat/ss) are unchanged. */
+    TCP_FIN_WAIT_2
 } tcp_state_t;
 
 /* ------------------------------------------------------------------ */

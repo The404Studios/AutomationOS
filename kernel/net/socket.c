@@ -752,8 +752,12 @@ int sock_recv(int s, void* buf, uint32_t len) {
     }
     /* TCP: pull from the stream ring; pump the wire a bit if empty. */
     int r = tcp_recv(so, buf, (uint16_t)(len > 0xFFFF ? 0xFFFF : len));
-    if (r == 0 && so->state == TCP_ESTABLISHED) {
-        /* Nothing buffered yet but still connected -> would-block. */
+    if (r == 0 && (so->state == TCP_ESTABLISHED ||
+                   so->state == TCP_FIN_WAIT ||
+                   so->state == TCP_FIN_WAIT_2)) {
+        /* Nothing buffered yet but the receive half is still open (NET-GAPS
+         * N3: after shutdown(SHUT_WR) the peer may still send) -> would-block,
+         * NOT EOF. EOF is only CLOSE_WAIT/TIME_WAIT/CLOSED with a drained ring. */
         return SOCK_EAGAIN;
     }
     return r;

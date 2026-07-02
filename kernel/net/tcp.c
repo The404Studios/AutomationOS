@@ -40,16 +40,15 @@
  *   7. Timeouts scaled up: TCP_CONNECT_MS=8000, TCP_CLOSE_MS=4000,
  *      initial RTO=1000 ms (Internet-realistic RTTs can exceed 500 ms).
  *
- * LIMITATIONS (documented, not in scope):
- *   - No SACK (selective acknowledgement).
+ * LIMITATIONS (documented, not in scope) -- REFRESHED by NET-GAPS (several
+ * older entries here were fixed by later bricks and are now features above):
+ *   - No SACK (selective acknowledgement) -- parsed from the peer, unused.
+ *   - No window scaling on our side (deliberate; see tcp_parse_options).
  *   - No Nagle / delayed-ACK.
- *   - No congestion control (send window is fixed at SOCK_RXBUF_SIZE).
+ *   - Passive open does not record the peer's MSS from its SYN (the synq
+ *     entry doesn't store it), so servers segment at our own TCP_MSS.
  *   - Simultaneous open not hardened (rare in active-open clients).
- *   - No TIME_WAIT 2MSL wait (state goes straight to CLOSED on close).
- *   - OOO buffer is a single slot per socket (handles the common case of
- *     one out-of-order segment but not arbitrary reordering).  If an
- *     integrator adds a larger OOO array to sock_t this file should be
- *     updated to use it; see comment at TCP_OOO_SLOTS.
+ *   - Retransmission is go-back-N from snd_una (no out-of-order TX repair).
  *   - No IPv6.
  *
  * Driven by socket.c: tcp_input() is called for inbound TCP segments and
@@ -127,6 +126,43 @@ typedef struct {
 
 static tcp_ooo_slot_t (*tcp_ooo)[TCP_OOO_DEPTH] = NULL;   /* [SOCK_MAX][4] */
 
+/* ------------------------------------------------------------------ */
+/* NET-GAPS N1: per-socket TX retransmit queue                          */
+/* ------------------------------------------------------------------ */
+/*
+ * The old design kept ONE retransmittable segment (rt_data): with segments
+ * pipelined, loss of anything but the tail was unrepairable (stall -> RTO
+ * give-up -> reset). This ring remembers every UNACKED payload byte in
+ * [snd_una, snd_nxt); retransmission always resumes at snd_una (go-back-N
+ * head, resegmented to the effective MSS -- legal TCP). The rt_* single slot
+ * REMAINS for control segments (SYN via tcp_connect, FIN via tcp_close) and
+ * as the degrade path if this heap allocation ever fails.
+ *
+ * HEAP-BACKED like the OOO table: 32 sockets x ~16.4 KB = ~525 KB.
+ * (Types + globals live up here because tcp_buffers_init just below
+ * allocates them; the ring helpers follow now_ms further down.)
+ */
+#define TCP_TXQ_SIZE 16384
+typedef struct {
+    uint8_t  buf[TCP_TXQ_SIZE];  /* ring of unacked payload bytes            */
+    uint32_t head;               /* ring offset of the byte at seq snd_una   */
+    uint32_t used;               /* payload bytes in [snd_una, snd_nxt)      */
+    uint64_t sent_ms;            /* when the current oldest byte was (re)sent*/
+    uint8_t  rtx_count;          /* RTO retries for the current oldest       */
+    uint32_t rto_ms;             /* current (backed-off) queue RTO           */
+    /* NET-GAPS N4: congestion control (RFC 5681-lite, byte-counted). */
+    uint32_t cwnd;               /* congestion window (bytes)                */
+    uint32_t ssthresh;           /* slow-start threshold (bytes)             */
+} tcp_txq_t;
+
+static tcp_txq_t* tcp_txq = NULL;          /* [SOCK_MAX], kmalloc'd         */
+static uint8_t    tcp_rtx_buf[TCP_MSS];    /* single-threaded linearize buf */
+
+#define TCP_CWND_INIT_B   (4u * TCP_MSS)   /* IW: parity with the old fixed */
+                                           /* 4-segment pipeline            */
+#define TCP_SSTHRESH_INIT 65535u           /* start in slow start; cap cwnd */
+                                           /* at the 16-bit window world    */
+
 /* Allocate + zero the OOO side-table (idempotent; re-call re-zeroes). */
 void tcp_buffers_init(void) {
     if (tcp_ooo == NULL) {
@@ -134,11 +170,22 @@ void tcp_buffers_init(void) {
             kmalloc(sizeof(tcp_ooo_slot_t) * TCP_OOO_SLOTS * TCP_OOO_DEPTH);
         if (tcp_ooo == NULL) {
             kprintf("[TCP] ooo buffer alloc failed: degrading to no-OOO\n");
-            return;
         }
     }
-    memset(tcp_ooo, 0,
-           sizeof(tcp_ooo_slot_t) * TCP_OOO_SLOTS * TCP_OOO_DEPTH);
+    if (tcp_ooo)
+        memset(tcp_ooo, 0,
+               sizeof(tcp_ooo_slot_t) * TCP_OOO_SLOTS * TCP_OOO_DEPTH);
+
+    /* NET-GAPS N1: the TX retransmit queues (heap, ~525 KB). Alloc failure
+     * degrades CORRECTLY: tcp_send falls back to the single-slot stop-and-
+     * wait path (rt_data), exactly the pre-N1 behavior. */
+    if (tcp_txq == NULL) {
+        tcp_txq = (tcp_txq_t*)kmalloc(sizeof(tcp_txq_t) * SOCK_MAX);
+        if (tcp_txq == NULL)
+            kprintf("[TCP] txq alloc failed: degrading to tail-only retransmit\n");
+    }
+    if (tcp_txq)
+        memset(tcp_txq, 0, sizeof(tcp_txq_t) * SOCK_MAX);
 }
 
 /* Invalidate every OOO slot belonging to socket index `idx`. */
@@ -196,6 +243,92 @@ uint64_t tcp_rig_now(void)   { return now_ms(); }
 #else
 static uint64_t now_ms(void) { return timer_get_ticks_ms(); }
 #endif
+
+/* ------------------------------------------------------------------ */
+/* NET-GAPS N1: TX-queue ring helpers (type + globals above, with the  */
+/* OOO table; these live below sock_index()/now_ms() which they use).  */
+/* ------------------------------------------------------------------ */
+static inline tcp_txq_t* txq_of(sock_t* s) {
+    return tcp_txq ? &tcp_txq[sock_index(s)] : NULL;
+}
+
+/* Reset per-connection TX/congestion state (active connect + passive promote). */
+static void txq_reset(sock_t* s) {
+    tcp_txq_t* q = txq_of(s);
+    if (!q) return;
+    q->head = 0;  q->used = 0;
+    q->sent_ms = 0;
+    q->rtx_count = 0;
+    q->rto_ms = TCP_RTO_INIT_MS;
+    q->cwnd = TCP_CWND_INIT_B;
+    q->ssthresh = TCP_SSTHRESH_INIT;
+}
+
+static uint32_t txq_free_bytes(sock_t* s) {
+    tcp_txq_t* q = txq_of(s);
+    return q ? (TCP_TXQ_SIZE - q->used) : 0;
+}
+
+/* Append payload (caller checked space). Arms the queue timer if it was empty. */
+static void txq_append(sock_t* s, const uint8_t* p, uint16_t n) {
+    tcp_txq_t* q = txq_of(s);
+    if (!q || n == 0) return;
+    uint32_t tail = (q->head + q->used) % TCP_TXQ_SIZE;
+    uint32_t c1 = TCP_TXQ_SIZE - tail;
+    if (c1 > n) c1 = n;
+    memcpy(q->buf + tail, p, c1);
+    if (n - c1) memcpy(q->buf, p + c1, (uint32_t)(n - c1));
+    if (q->used == 0) {
+        q->sent_ms   = now_ms();
+        q->rtx_count = 0;
+        q->rto_ms    = s->base_rto_ms ? s->base_rto_ms : TCP_RTO_INIT_MS;
+    }
+    q->used += n;
+}
+
+/* Drop the NEWEST n bytes (rollback right after an append whose xmit failed). */
+static void txq_rollback(sock_t* s, uint16_t n) {
+    tcp_txq_t* q = txq_of(s);
+    if (q && q->used >= n) q->used -= n;
+}
+
+/* Copy the oldest min(used, max_n) bytes (the bytes at snd_una) into dst. */
+static uint16_t txq_peek_oldest(sock_t* s, uint8_t* dst, uint16_t max_n) {
+    tcp_txq_t* q = txq_of(s);
+    if (!q || q->used == 0) return 0;
+    uint16_t n = (q->used < max_n) ? (uint16_t)q->used : max_n;
+    uint32_t c1 = TCP_TXQ_SIZE - q->head;
+    if (c1 > n) c1 = n;
+    memcpy(dst, q->buf + q->head, c1);
+    if (n - c1) memcpy(dst + c1, q->buf, (uint32_t)(n - c1));
+    return n;
+}
+
+/* N4: an ACK advanced snd_una -> slow start below ssthresh (+MSS per ACK),
+ * congestion avoidance above it (+MSS*MSS/cwnd per ACK ~= +MSS per RTT). */
+static void cwnd_on_ack(sock_t* s) {
+    tcp_txq_t* q = txq_of(s);
+    if (!q) return;
+    if (q->cwnd < q->ssthresh) {
+        q->cwnd += TCP_MSS;
+    } else {
+        uint32_t inc = ((uint32_t)TCP_MSS * TCP_MSS) / (q->cwnd ? q->cwnd : 1);
+        q->cwnd += inc ? inc : 1;
+    }
+    if (q->cwnd > TCP_SSTHRESH_INIT) q->cwnd = TCP_SSTHRESH_INIT;
+}
+
+/* N4: multiplicative decrease. hard_rto=1 -> collapse to 1*MSS (RFC 5681
+ * RTO); hard_rto=0 -> fast-retransmit halving (cwnd = new ssthresh). */
+static void cwnd_on_loss(sock_t* s, int hard_rto) {
+    tcp_txq_t* q = txq_of(s);
+    if (!q) return;
+    uint32_t flight = s->snd_nxt - s->snd_una;
+    uint32_t half   = flight / 2;
+    if (half < 2u * TCP_MSS) half = 2u * TCP_MSS;
+    q->ssthresh = half;
+    q->cwnd     = hard_rto ? TCP_MSS : q->ssthresh;
+}
 
 /* SipHash-2-4 (Aumasson/Bernstein) -- a fast keyed PRF. Used here as the keyed
  * hash for the RFC 6528 ISN below; the only requirement for that use is that an
@@ -287,22 +420,35 @@ static int tcp_xmit(sock_t* s, uint8_t flags, uint32_t seq, uint32_t ack,
                     const void* data, uint16_t len) {
     if (len > TCP_MSS) len = TCP_MSS;
 
-    uint8_t seg[sizeof(tcp_hdr_t) + TCP_MSS];
+    uint8_t seg[sizeof(tcp_hdr_t) + 4 + TCP_MSS];
     tcp_hdr_t* th = (tcp_hdr_t*)seg;
     memset(th, 0, sizeof(*th));
     th->src_port = net_htons(s->local_port);
     th->dst_port = net_htons(s->remote_port);
     th->seq      = net_htonl(seq);
     th->ack      = net_htonl(ack);
-    th->data_off = (uint8_t)((sizeof(tcp_hdr_t) / 4) << 4);  /* 5 words, no options */
     th->flags    = flags;
     /* CHANGED: advertise our free rx buffer space as the receive window. */
     th->window   = net_htons(rcv_wnd(s));
     th->urgent   = 0;
     th->checksum = 0;
 
-    if (len && data) memcpy(seg + sizeof(tcp_hdr_t), data, len);
-    uint16_t seg_len = (uint16_t)(sizeof(tcp_hdr_t) + len);
+    /* NET-GAPS N2: every SYN we emit advertises our real MSS (kind 2). Without
+     * it an RFC-conservative peer assumes the 536-byte default and caps our RX
+     * throughput. Done here (not at the call sites) so SYN RETRANSMITS via
+     * tcp_tick()'s rt slot carry the same option as the original. */
+    uint16_t hlen = sizeof(tcp_hdr_t);
+    if (flags & TCP_SYN) {
+        uint8_t* opt = seg + hlen;
+        opt[0] = 2; opt[1] = 4;
+        opt[2] = (uint8_t)(TCP_MSS >> 8);
+        opt[3] = (uint8_t)(TCP_MSS & 0xFF);
+        hlen += 4;
+    }
+    th->data_off = (uint8_t)((hlen / 4) << 4);
+
+    if (len && data) memcpy(seg + hlen, data, len);
+    uint16_t seg_len = (uint16_t)(hlen + len);
 
     uint16_t ck = net_transport_checksum(tcp_src_ip(s->remote_ip), s->remote_ip,
                                          IPPROTO_TCP, seg, seg_len);
@@ -410,6 +556,20 @@ static void tcp_parse_options(sock_t* s, const uint8_t* seg, uint16_t ihl) {
  * back-off count (that stays owned by tcp_tick).
  */
 static void tcp_fast_retransmit(sock_t* s) {
+    /* NET-GAPS N1: with a TX queue, loss recovery restarts at the OLDEST
+     * unacked byte (snd_una), resegmented to the effective MSS. */
+    tcp_txq_t* q = txq_of(s);
+    if (q && q->used) {
+        uint16_t eff_mss = (s->peer_mss && s->peer_mss < TCP_MSS)
+                               ? s->peer_mss : TCP_MSS;
+        uint16_t n = txq_peek_oldest(s, tcp_rtx_buf, eff_mss);
+        if (n) {
+            tcp_xmit(s, TCP_ACK | TCP_PSH, s->snd_una, s->rcv_nxt,
+                     tcp_rtx_buf, n);
+            q->sent_ms = now_ms();
+        }
+        return;
+    }
     if (!s->rt_pending) return;
     uint32_t ack_val = (s->state == TCP_SYN_SENT) ? 0 : s->rcv_nxt;
     tcp_xmit(s, s->rt_flags, s->rt_seq, ack_val,
@@ -458,20 +618,29 @@ static tcp_synq_ent_t tcp_synq[TCP_SYNQ_MAX];
 static int tcp_xmit_raw(uint32_t remote_ip, uint16_t local_port,
                         uint16_t remote_port, uint8_t flags,
                         uint32_t seq, uint32_t ack, uint16_t window) {
-    uint8_t seg[sizeof(tcp_hdr_t)];
+    uint8_t seg[sizeof(tcp_hdr_t) + 4];
     tcp_hdr_t* th = (tcp_hdr_t*)seg;
     memset(th, 0, sizeof(*th));
     th->src_port = net_htons(local_port);
     th->dst_port = net_htons(remote_port);
     th->seq      = net_htonl(seq);
     th->ack      = net_htonl(ack);
-    th->data_off = (uint8_t)((sizeof(tcp_hdr_t) / 4) << 4);
     th->flags    = flags;
     th->window   = net_htons(window);
+    /* NET-GAPS N2: a SYN-ACK from the side-table advertises our MSS too
+     * (synq_on_syn + the tcp_synq_tick retransmit both route through here). */
+    uint16_t hlen = sizeof(tcp_hdr_t);
+    if (flags & TCP_SYN) {
+        uint8_t* opt = seg + hlen;
+        opt[0] = 2; opt[1] = 4;
+        opt[2] = (uint8_t)(TCP_MSS >> 8);
+        opt[3] = (uint8_t)(TCP_MSS & 0xFF);
+        hlen += 4;
+    }
+    th->data_off = (uint8_t)((hlen / 4) << 4);
     th->checksum = net_htons(net_transport_checksum(tcp_src_ip(remote_ip), remote_ip,
-                                                    IPPROTO_TCP, seg,
-                                                    sizeof(tcp_hdr_t)));
-    return ip_tx(remote_ip, IPPROTO_TCP, seg, sizeof(tcp_hdr_t));
+                                                    IPPROTO_TCP, seg, hlen));
+    return ip_tx(remote_ip, IPPROTO_TCP, seg, hlen);
 }
 
 static tcp_synq_ent_t* synq_find(uint32_t src_ip, uint16_t src_port,
@@ -580,6 +749,7 @@ static void synq_on_ack(sock_t* listener, uint32_t src_ip, uint16_t src_port,
     tcp_ooo_clear(child_idx);
     tcp_rt_count[child_idx]   = 0;
     tcp_rt_rto_ms[child_idx]  = TCP_RTO_INIT_MS;
+    txq_reset(child);         /* NET-GAPS N1+N4: fresh TX queue + cwnd */
 
     /* Accept queue (same push the old SYN_RCVD promotion used). */
     child->accept_next      = listener->accept_queue;
@@ -728,6 +898,7 @@ int tcp_connect(sock_t* s, uint32_t dst_ip, uint16_t dst_port) {
     tcp_ooo_clear(idx);
     tcp_rt_count[idx]       = 0;
     tcp_rt_rto_ms[idx]      = TCP_RTO_INIT_MS;
+    txq_reset(s);            /* NET-GAPS N1+N4: fresh TX queue + cwnd */
 
     uint32_t isn = gen_isn(s->local_ip, s->local_port,
                            s->remote_ip, s->remote_port);
@@ -786,73 +957,31 @@ int tcp_connect(sock_t* s, uint32_t dst_ip, uint16_t dst_port) {
 /* Send                                                                */
 /* ------------------------------------------------------------------ */
 /*
- * Pipelined TCP send with a simple congestion window.
+ * NET-GAPS N1+N4: windowed TCP send over the per-socket TX retransmit queue.
  *
- * Instead of stop-and-wait (1 segment in flight, wait for ACK, send next),
- * we allow up to TCP_CWND_INIT segments in flight before blocking for ACKs.
- * This is a ~4x throughput improvement on typical LAN RTTs.
+ * Every transmitted payload byte is remembered in the tcp_txq ring until the
+ * peer's cumulative ACK covers it, so loss ANYWHERE in the pipeline is
+ * repairable from snd_una (tcp_tick RTO / 3-dup-ACK fast retransmit) -- the
+ * old design could only resend the newest segment. In-flight bytes are gated
+ * by min(cwnd, peer window): cwnd starts at 4*MSS (parity with the old fixed
+ * 4-segment pipeline), slow-starts +MSS per ACK, and collapses on loss
+ * (RFC 5681-lite; see cwnd_on_ack/cwnd_on_loss).
  *
- * The retransmit bookkeeping only tracks the LAST outstanding segment (the
- * sock_t structure has a single rt_data slot), so true loss recovery is still
- * limited.  But for the common no-loss case, pipelining eliminates the
- * round-trip wait between every segment.
+ * Degrade path (txq alloc failed at boot): single-outstanding stop-and-wait
+ * through the rt_* slot -- the exact pre-N1 behavior.
  *
  * Returns total bytes accepted (may be less than `len` on error mid-way).
  */
-#define TCP_CWND_INIT  4   /* segments in flight before we must wait for ACK */
-
 int tcp_send(sock_t* s, const void* data, uint16_t len) {
     if (s->state != TCP_ESTABLISHED && s->state != TCP_CLOSE_WAIT)
         return SOCK_ECONN;
     if (len == 0) return 0;
 
-    const uint8_t* ptr   = (const uint8_t*)data;
-    uint16_t       sent  = 0;
-    uint32_t       in_flight = 0;   /* segments sent but not yet ACKed */
+    tcp_txq_t*     q    = txq_of(s);
+    const uint8_t* ptr  = (const uint8_t*)data;
+    uint16_t       sent = 0;
 
     while (sent < len) {
-        /* If we've hit the cwnd limit, drain until at least one ACK comes back.
-         * We detect ACKs by watching snd_una advance. */
-        if (in_flight >= TCP_CWND_INIT || s->rt_pending) {
-            uint32_t old_una = s->snd_una;
-            uint64_t start = now_ms();
-            uint64_t last  = start;
-            uint32_t frozen = 0;
-            while (now_ms() - start < TCP_CONNECT_MS) {
-                sock_poll();
-                if (s->reset) return sent ? (int)sent : SOCK_ECONN;
-                /* ACKs advanced snd_una -- we can send more. */
-                if (SEQ32_GT(s->snd_una, old_una)) {
-                    /* Estimate how many segments were ACKed. */
-                    uint32_t acked_bytes = s->snd_una - old_una;
-                    uint32_t acked_segs = (acked_bytes + TCP_MSS - 1) / TCP_MSS;
-                    if (acked_segs > in_flight) acked_segs = in_flight;
-                    in_flight -= acked_segs;
-                    break;
-                }
-                /* If retransmit cleared (single outstanding acked), we're good. */
-                if (!s->rt_pending && in_flight > 0) {
-                    in_flight = 0;
-                    break;
-                }
-                /* Frozen-tick backstop (IF=0 syscall: now_ms() can't advance). */
-                uint64_t n = now_ms();
-                if (n != last) { last = n; frozen = 0; }
-                else if (++frozen >= TCP_FROZEN_SPIN_CAP) break;
-            }
-            /* If snd_una still hasn't moved, check if rt timed out. */
-            if (in_flight >= TCP_CWND_INIT) {
-                if (s->rt_pending) {
-                    /* Still waiting -- one more brief drain attempt. */
-                    sock_poll();
-                    if (s->reset) return sent ? (int)sent : SOCK_ECONN;
-                    if (!s->rt_pending) { in_flight = 0; continue; }
-                    return sent ? (int)sent : SOCK_ETIMEDOUT;
-                }
-                in_flight = 0;  /* all ACKed if nothing pending */
-            }
-        }
-
         /* Determine this segment's size: min(remaining, effective-MSS, peer wnd).
          * TCP-ROBUST: cap to the peer's advertised MSS when smaller than ours so
          * we never oversize a segment a real server told us it won't accept. */
@@ -908,48 +1037,74 @@ int tcp_send(sock_t* s, const void* data, uint16_t len) {
             continue;
         }
 
+        /* NET-GAPS N1+N4 send gate: this chunk must fit the congestion window
+         * (bytes in flight + chunk <= min(cwnd, peer wnd)) AND the TX queue
+         * must have room to remember it. Fallback (no txq): single outstanding
+         * segment, stop-and-wait via rt_pending. */
+        uint32_t flight = s->snd_nxt - s->snd_una;
+        uint32_t limit  = q ? q->cwnd : TCP_MSS;
+        if (limit > s->snd_wnd) limit = s->snd_wnd;
+        bool must_wait = q ? (flight + chunk > limit ||
+                              txq_free_bytes(s) < chunk)
+                           : s->rt_pending;
+        if (must_wait) {
+            /* Drain until an ACK frees window/queue space. The wall-clock
+             * guard alone cannot terminate this inside an IF=0 syscall (the
+             * ms clock is frozen), so the frozen-tick backstop is load-
+             * bearing, exactly as in tcp_connect. */
+            uint32_t old_una = s->snd_una;
+            uint64_t start = now_ms();
+            uint64_t last  = start;
+            uint32_t frozen = 0;
+            bool progress = false;
+            while (now_ms() - start < TCP_CONNECT_MS) {
+                sock_poll();
+                if (s->reset) return sent ? (int)sent : SOCK_ECONN;
+                if (SEQ32_GT(s->snd_una, old_una) ||
+                    (q == NULL && !s->rt_pending)) { progress = true; break; }
+                uint64_t n = now_ms();
+                if (n != last) { last = n; frozen = 0; }
+                else if (++frozen >= TCP_FROZEN_SPIN_CAP) break;
+            }
+            if (!progress)
+                return sent ? (int)sent : SOCK_ETIMEDOUT;
+            continue;   /* re-evaluate window + chunk sizing */
+        }
+
         uint32_t seq = s->snd_nxt;
-        /* Arm the retransmit BEFORE transmitting. On the in-kernel loopback path
-         * (127/8) ip_tx() only ENQUEUES the segment; it is delivered to the peer
-         * socket later by lo_drain() inside the sock_poll() pump below (the L855
-         * post-send poll and the final drain), the peer ACKs, and that ACK is
-         * processed (disarming rt_pending) -- all still WITHIN this tcp_send()
-         * call, just not literally inside tcp_xmit(). Arming first guarantees the
-         * arm precedes that deferred disarm; arming AFTER could leave rt_pending
-         * set with nothing able to clear it -- the only other trigger is an
-         * RTO-driven retransmit, but the ms clock is frozen inside this IF=0
-         * syscall (the drains rely on the frozen-tick backstop), so the "final
-         * drain" below would otherwise spin (this is what hung in-OS loopback
-         * data transfer). Only the ORDER matters, not where the disarm happens;
-         * on the NIC path the ACK arrives even later via sock_poll(). Overwrites
-         * any previous arm -- only the pipeline tail is retransmittable, matching
-         * the single-slot rt_data design. */
-        tcp_arm_retransmit(s, TCP_ACK | TCP_PSH, seq, ptr + sent, chunk);
+        /* Remember the bytes BEFORE transmitting. On the in-kernel loopback
+         * path (127/8) ip_tx() only ENQUEUES the segment; it is delivered by
+         * lo_drain() inside a later sock_poll() still within this call, the
+         * peer ACKs, and that ACK CONSUMES the queued bytes. The remember
+         * must precede that deferred consume (the old single-slot code had
+         * the same arm-before-xmit rule for the same reason). */
+        if (q) txq_append(s, ptr + sent, chunk);
+        else   tcp_arm_retransmit(s, TCP_ACK | TCP_PSH, seq, ptr + sent, chunk);
         if (tcp_xmit(s, TCP_ACK | TCP_PSH, seq, s->rcv_nxt,
                      ptr + sent, chunk) != 0) {
-            tcp_disarm_retransmit(s);
+            if (q) txq_rollback(s, chunk);
+            else   tcp_disarm_retransmit(s);
             return sent ? (int)sent : SOCK_ECONN;
         }
         s->snd_nxt += chunk;
         sent = (uint16_t)(sent + chunk);
-        in_flight++;
 
         /* Non-blocking poll: pick up any ACKs that arrived while we were
          * building and transmitting, without waiting a full RTT. */
         sock_poll();
         if (s->reset) return sent ? (int)sent : SOCK_ECONN;
-        if (!s->rt_pending) in_flight = 0;
     }
 
-    /* Final drain: wait briefly for the last segment's ACK so the caller
+    /* Final drain: wait briefly until everything sent is ACKed so the caller
      * doesn't close the connection before the peer has confirmed receipt. The
      * frozen-tick backstop is essential: now_ms() can't advance inside this IF=0
      * syscall, so without it a never-ACKed loopback segment would spin forever. */
-    if (s->rt_pending) {
+    {
         uint64_t start = now_ms();
         uint64_t last  = start;
         uint32_t frozen = 0;
-        while (s->rt_pending && now_ms() - start < TCP_CONNECT_MS) {
+        while (((q && q->used > 0) || (!q && s->rt_pending)) &&
+               now_ms() - start < TCP_CONNECT_MS) {
             sock_poll();
             if (s->reset) break;
             uint64_t n = now_ms();
@@ -973,9 +1128,12 @@ int tcp_recv(sock_t* s, void* buf, uint16_t len) {
     /* Return RST error immediately. */
     if (s->reset) return SOCK_ECONN;
 
-    /* Pump the wire so data has a chance to arrive. */
+    /* Pump the wire so data has a chance to arrive. NET-GAPS N3: FIN_WAIT /
+     * FIN_WAIT_2 pump too -- our send half is closed but the peer may still be
+     * streaming data at us (half-close). */
     if (s->rx_used == 0 &&
-        (s->state == TCP_ESTABLISHED || s->state == TCP_CLOSE_WAIT)) {
+        (s->state == TCP_ESTABLISHED || s->state == TCP_CLOSE_WAIT ||
+         s->state == TCP_FIN_WAIT    || s->state == TCP_FIN_WAIT_2)) {
         for (int i = 0; i < 32 && s->rx_used == 0 && !s->reset; i++)
             sock_poll();
     }
@@ -1031,8 +1189,11 @@ int tcp_close(sock_t* s) {
         uint32_t spins = 0;
         while (spins++ < TCP_CLOSE_DRAIN_ITERS) {
             sock_poll();
-            if (s->state == TCP_CLOSED || s->state == TCP_TIME_WAIT) break;
-            if (!s->rt_pending) break;   /* our FIN was acked */
+            if (s->state == TCP_CLOSED || s->state == TCP_TIME_WAIT ||
+                s->state == TCP_FIN_WAIT_2) break;
+            /* Our FIN acked AND every queued data byte acked (N1). */
+            if (!s->rt_pending &&
+                (!tcp_txq || tcp_txq[sock_index(s)].used == 0)) break;
         }
 
         /* DEFERRED TEARDOWN: if our FIN is still outstanding, leave the socket in
@@ -1041,9 +1202,13 @@ int tcp_close(sock_t* s) {
          * reaping it once the FIN is acked or the retry budget is exhausted. On a
          * completed (loopback) close rt_pending is clear, so we fall through to
          * CLOSED and the slot is freed immediately as before. */
-        if (s->rt_pending && s->state != TCP_CLOSED && s->state != TCP_TIME_WAIT)
+        if ((s->rt_pending || (tcp_txq && tcp_txq[sock_index(s)].used > 0)) &&
+            s->state != TCP_CLOSED && s->state != TCP_TIME_WAIT &&
+            s->state != TCP_FIN_WAIT_2)
             return SOCK_OK;
     }
+    if (s->state == TCP_FIN_WAIT_2)
+        return SOCK_OK;   /* N3: linger for the peer's FIN; tick reaps idle FW2 */
     s->state = TCP_CLOSED;
     return SOCK_OK;
 }
@@ -1198,6 +1363,7 @@ void tcp_input(uint32_t src_ip, uint32_t dst_ip,
     case TCP_ESTABLISHED:
     case TCP_CLOSE_WAIT:
     case TCP_FIN_WAIT:
+    case TCP_FIN_WAIT_2:      /* NET-GAPS N3: receive stays open until the peer FINs */
     case TCP_LAST_ACK:        /* NET-HARDENING-2: process the peer's ACK of our FIN */
     case TCP_TIME_WAIT: {
         /* ----------------------------------------------------------
@@ -1211,43 +1377,77 @@ void tcp_input(uint32_t src_ip, uint32_t dst_ip,
          * dup-ACK / fast-retransmit logic). Acceptable iff ack <= snd_nxt. */
         if ((flags & TCP_ACK) && SEQ32_GEQ(s->snd_nxt, ack)) {
             int idx = sock_index(s);
-            if (s->rt_pending) {
-                uint32_t end = s->rt_seq + s->rt_len +
-                               ((s->rt_flags & (TCP_SYN | TCP_FIN)) ? 1u : 0u);
-                if (SEQ32_GEQ(ack, end)) {
-                    /* TCP-ROBUST adaptive RTO (RFC6298 + Karn): sample RTT only
-                     * for a segment that was NOT retransmitted (count==0), so an
-                     * ambiguous ACK never corrupts the estimator. */
-                    if (tcp_rt_count[idx] == 0)
-                        tcp_rtt_update(s, (uint32_t)(now_ms() - s->rt_time_ms));
-                    tcp_disarm_retransmit(s);   /* also resets tcp_dupack[idx] */
-                    s->snd_una = ack;
-                } else if (ack == s->snd_una && payload_len == 0 &&
-                           (flags & (TCP_SYN | TCP_FIN)) == 0 &&
-                           s->snd_wnd == prev_snd_wnd &&
-                           s->state == TCP_ESTABLISHED) {
-                    /* TCP-ROBUST (RFC 5681 fast retransmit): a duplicate ACK
-                     * does not advance snd_una, carries no data, AND advertises
-                     * an UNCHANGED window (NET-HARDENING F4: a pure window update
-                     * -- same ack, no data, different window -- is the receiver
-                     * opening/shrinking its buffer, NOT a sign of loss; counting
-                     * it would spuriously trip fast-retransmit). The 3rd genuine
-                     * dup means a segment was almost certainly lost -> resend the
-                     * oldest unacked segment NOW (~RTT recovery vs a full RTO).
-                     * Fires exactly once at 3 (== not >=), so later dups don't
-                     * re-storm the wire. */
-                    if (++tcp_dupack[idx] == 3) {
-                        tcp_fast_retransmit(s);
+            tcp_txq_t* q = txq_of(s);
+
+            if (SEQ32_GT(ack, s->snd_una)) {
+                /* --- Advancing cumulative ACK --- */
+                /* NET-GAPS N1: consume the TX queue's acked prefix. */
+                if (q && q->used) {
+                    uint32_t acked = ack - s->snd_una;
+                    uint32_t da = (acked < q->used) ? acked : q->used;
+                    q->head  = (q->head + da) % TCP_TXQ_SIZE;
+                    q->used -= da;
+                    if (q->used == 0) {
+                        /* Karn: sample RTT only when nothing in this window
+                         * was retransmitted; conservatively only on a full
+                         * drain (the oldest byte's send time is exact then). */
+                        if (q->rtx_count == 0 && q->sent_ms)
+                            tcp_rtt_update(s, (uint32_t)(now_ms() - q->sent_ms));
+                    } else {
+                        q->sent_ms = now_ms();   /* timer restarts for the new oldest */
+                    }
+                    q->rtx_count = 0;
+                    q->rto_ms = s->base_rto_ms ? s->base_rto_ms : TCP_RTO_INIT_MS;
+                    /* NET-GAPS N4: grow cwnd once per advancing ACK. */
+                    cwnd_on_ack(s);
+                }
+                /* Control-slot coverage (SYN/FIN, or data on the no-txq
+                 * degrade path). TCP-ROBUST adaptive RTO (RFC6298 + Karn):
+                 * sample RTT only for a segment that was NOT retransmitted
+                 * (count==0), so an ambiguous ACK never corrupts the
+                 * estimator. */
+                if (s->rt_pending) {
+                    uint32_t end = s->rt_seq + s->rt_len +
+                                   ((s->rt_flags & (TCP_SYN | TCP_FIN)) ? 1u : 0u);
+                    if (SEQ32_GEQ(ack, end)) {
+                        if (tcp_rt_count[idx] == 0)
+                            tcp_rtt_update(s, (uint32_t)(now_ms() - s->rt_time_ms));
+                        tcp_disarm_retransmit(s);
                     }
                 }
-            } else {
-                /* Update snd_una even if no retransmit is pending (covers
-                 * cumulative ACKs for previously delivered segments). */
-                if (SEQ32_GT(ack, s->snd_una)) { s->snd_una = ack; tcp_dupack[idx] = 0; }
+                s->snd_una = ack;
+                tcp_dupack[idx] = 0;
+            } else if (ack == s->snd_una && payload_len == 0 &&
+                       (flags & (TCP_SYN | TCP_FIN)) == 0 &&
+                       s->snd_wnd == prev_snd_wnd &&
+                       s->state == TCP_ESTABLISHED &&
+                       (s->rt_pending || (q && q->used))) {
+                /* TCP-ROBUST (RFC 5681 fast retransmit): a duplicate ACK
+                 * does not advance snd_una, carries no data, AND advertises
+                 * an UNCHANGED window (NET-HARDENING F4: a pure window update
+                 * -- same ack, no data, different window -- is the receiver
+                 * opening/shrinking its buffer, NOT a sign of loss; counting
+                 * it would spuriously trip fast-retransmit). The 3rd genuine
+                 * dup means a segment was almost certainly lost -> resend the
+                 * oldest unacked segment NOW (~RTT recovery vs a full RTO).
+                 * Fires exactly once at 3 (== not >=), so later dups don't
+                 * re-storm the wire. Counted only while something is actually
+                 * outstanding (TX queue bytes or the control slot). */
+                if (++tcp_dupack[idx] == 3) {
+                    cwnd_on_loss(s, 0);       /* N4: halve into recovery */
+                    tcp_fast_retransmit(s);   /* N1: resends from snd_una */
+                }
             }
             if (s->state == TCP_FIN_WAIT && SEQ32_GEQ(ack, s->snd_nxt)) {
-                s->state = TCP_TIME_WAIT;   /* our FIN acked */
-                s->time_wait_ms = now_ms(); /* 2MSL: start the linger clock */
+                /* NET-GAPS N3 (RFC 793 FIN-WAIT-2): our FIN is acked but the
+                 * peer has NOT closed its half yet -- wait for its FIN with
+                 * receive still open. The old collapse straight to TIME_WAIT
+                 * dropped any data the peer was still sending (half-close data
+                 * loss). time_wait_ms doubles as the FIN_WAIT_2 idle stamp so
+                 * a peer that never FINs cannot pin the slot (reaped in
+                 * tcp_tick after TCP_TIMEWAIT_MS). */
+                s->state = TCP_FIN_WAIT_2;
+                s->time_wait_ms = now_ms();
             }
             /* NET-HARDENING-2: in passive close (LAST_ACK) the peer ACKing our
              * FIN completes the close -> CLOSED (an orphaned socket is then
@@ -1263,8 +1463,10 @@ void tcp_input(uint32_t src_ip, uint32_t dst_ip,
          * CHANGED: in-order accepted + OOO-drain; duplicates re-ACKed;
          * OOO saved in side-table for later in-order arrival.
          * ---------------------------------------------------------- */
-        if (payload_len > 0 && s->state != TCP_FIN_WAIT &&
-            s->state != TCP_TIME_WAIT) {
+        /* NET-GAPS N3: data is accepted in FIN_WAIT and FIN_WAIT_2 too -- our
+         * close only shut the SEND half; the receive half stays open until the
+         * peer's FIN arrives (RFC 793). Only TIME_WAIT refuses new data. */
+        if (payload_len > 0 && s->state != TCP_TIME_WAIT) {
 
             uint32_t seg_end = seq + payload_len;
 
@@ -1368,7 +1570,8 @@ void tcp_input(uint32_t src_ip, uint32_t dst_ip,
                 s->rcv_nxt += 1;   /* FIN consumes one seq */
                 tcp_send_ack(s);
                 if (s->state == TCP_ESTABLISHED)   s->state = TCP_CLOSE_WAIT;
-                else if (s->state == TCP_FIN_WAIT) { s->state = TCP_TIME_WAIT; s->time_wait_ms = now_ms(); }
+                else if (s->state == TCP_FIN_WAIT ||
+                         s->state == TCP_FIN_WAIT_2) { s->state = TCP_TIME_WAIT; s->time_wait_ms = now_ms(); }
             } else if (seq == s->rcv_nxt && payload_len == 0) {
                 /* FIN with no data (common simultaneous FIN). The payload_len==0
                  * guard is load-bearing: a FIN piggybacked on in-order data whose
@@ -1381,7 +1584,8 @@ void tcp_input(uint32_t src_ip, uint32_t dst_ip,
                 s->rcv_nxt += 1;
                 tcp_send_ack(s);
                 if (s->state == TCP_ESTABLISHED)   s->state = TCP_CLOSE_WAIT;
-                else if (s->state == TCP_FIN_WAIT) { s->state = TCP_TIME_WAIT; s->time_wait_ms = now_ms(); }
+                else if (s->state == TCP_FIN_WAIT ||
+                         s->state == TCP_FIN_WAIT_2) { s->state = TCP_TIME_WAIT; s->time_wait_ms = now_ms(); }
             } else if (payload_len == 0 && SEQ32_GT(s->rcv_nxt, seq)) {
                 /* NET-HARDENING F10 (RFC 793): a DUPLICATE, already-consumed FIN
                  * (seq < rcv_nxt) -- the peer retransmitted it because our ACK of
@@ -1432,6 +1636,45 @@ void tcp_tick(sock_t* s) {
         return;
     }
 
+    /* NET-GAPS N3: an idle FIN_WAIT_2 (our FIN acked, peer never sends its own
+     * FIN) is reaped after the same linger, so a vanished peer cannot pin the
+     * slot forever. time_wait_ms was stamped at the FIN_WAIT->FIN_WAIT_2
+     * transition. Our FIN was acked to get here, so no retransmit is pending. */
+    if (s->state == TCP_FIN_WAIT_2) {
+        if (now_ms() - s->time_wait_ms >= TCP_TIMEWAIT_MS) s->state = TCP_CLOSED;
+        return;
+    }
+
+    /* NET-GAPS N1: TX-queue RTO -- retransmit the OLDEST unacked bytes
+     * (go-back-N head, resegmented to the effective MSS) with the same
+     * backoff + give-up budget as the control slot. Runs BEFORE the control
+     * slot so a lost data segment is repaired ahead of a queued FIN. */
+    if (tcp_txq && s->state != TCP_CLOSED) {
+        tcp_txq_t* q = &tcp_txq[sock_index(s)];
+        if (q->used > 0 && now_ms() - q->sent_ms >= (uint64_t)q->rto_ms) {
+            if (q->rtx_count >= TCP_RTO_MAX_RETRIES) {
+                /* Exhausted: same fate as the control slot's give-up. */
+                q->used = 0;
+                tcp_disarm_retransmit(s);
+                s->reset = true;
+                s->state = TCP_CLOSED;
+                return;
+            }
+            uint16_t eff_mss = (s->peer_mss && s->peer_mss < TCP_MSS)
+                                   ? s->peer_mss : TCP_MSS;
+            uint16_t n = txq_peek_oldest(s, tcp_rtx_buf, eff_mss);
+            if (n) {
+                cwnd_on_loss(s, 1);   /* N4: an RTO is hard loss -> 1*MSS */
+                tcp_xmit(s, TCP_ACK | TCP_PSH, s->snd_una, s->rcv_nxt,
+                         tcp_rtx_buf, n);
+            }
+            q->rtx_count++;
+            q->rto_ms *= 2;
+            if (q->rto_ms > TCP_RTO_MAX_MS) q->rto_ms = TCP_RTO_MAX_MS;
+            q->sent_ms = now_ms();
+        }
+    }
+
     if (!s->rt_pending) return;
 
     int idx        = sock_index(s);
@@ -1463,3 +1706,28 @@ void tcp_tick(sock_t* s) {
     s->rt_time_ms      = now_ms();
     s->rt_done         = true;   /* keep rt_done semantics for any code that reads it */
 }
+
+#ifdef NET_SELFTEST
+/* ------------------------------------------------------------------ */
+/* NET-GAPS rig hooks (NET_SELFTEST only; compiled out of default)     */
+/* ------------------------------------------------------------------ */
+/* Stage `len` bytes (<= TCP_MSS) as one SENT-but-UNACKED segment starting at
+ * snd_nxt, WITHOUT transmitting -- a deterministic mirror of what tcp_send()'s
+ * remembering does per segment, minus its blocking drains (unusable at boot,
+ * see NETP1K). The rig drives retransmission via tcp_tick() + the
+ * RIG-TIME-HOOK clock and asserts on what hits the tx tap. */
+void tcp_rig_stage_tx(sock_t* s, const void* data, uint16_t len) {
+    if (len > TCP_MSS) len = TCP_MSS;
+    if (tcp_txq)
+        txq_append(s, (const uint8_t*)data, len);
+    else
+        tcp_arm_retransmit(s, TCP_ACK | TCP_PSH, s->snd_nxt, data, len);
+    s->snd_nxt += len;
+}
+
+/* Congestion-window observer for the rig (N4). */
+uint32_t tcp_rig_cwnd(sock_t* s) {
+    tcp_txq_t* q = txq_of(s);
+    return q ? q->cwnd : 0;
+}
+#endif /* NET_SELFTEST */

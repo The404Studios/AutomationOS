@@ -70,6 +70,21 @@ static uint32_t g_zw_peer_seq;
  * was computed (so the stored checksum stays non-zero but no longer matches). */
 static int g_corrupt_ip = 0, g_corrupt_tcp = 0;
 
+/* NET-GAPS synresp: while armed, the tap answers OUR outbound SYN with a
+ * matching SYN-ACK injected from inside the tap (same single-threaded call
+ * stack, like the zero-window autoresponder), so an active open completes
+ * instantly at boot -- no wall-clock pump. The handshake ACK it provokes is
+ * captured but not answered, terminating the recursion. */
+static int g_synresp_armed = 0;
+
+/* tcp.c rig hooks (NET_SELFTEST-gated there): deterministic clock + NET-GAPS
+ * staging/observers (see tcp.c end-of-file rig block). */
+void     tcp_rig_advance_ms(uint64_t ms);
+void     tcp_rig_clock_reset(void);
+uint64_t tcp_rig_now(void);
+void     tcp_rig_stage_tx(sock_t* s, const void* data, uint16_t len);
+uint32_t tcp_rig_cwnd(sock_t* s);
+
 static void rig_inject_tcp(uint32_t src_ip, uint16_t src_port,
                            uint32_t dst_ip, uint16_t dst_port,
                            uint32_t seq, uint32_t ack, uint8_t flags,
@@ -115,7 +130,41 @@ int net_testrig_tx_tap(uint32_t dst_ip, uint8_t proto,
             }
         }
     }
+
+    /* NET-GAPS synresp: answer a pure SYN with a SYN-ACK (see decl above). */
+    if (g_synresp_armed && proto == IPPROTO_TCP && seg_len >= sizeof(tcp_hdr_t)) {
+        const tcp_hdr_t* th = (const tcp_hdr_t*)seg;
+        if ((th->flags & (TCP_SYN | TCP_ACK)) == TCP_SYN) {
+            rig_inject_tcp(dst_ip, net_ntohs(th->dst_port),
+                           net_get_ip(), net_ntohs(th->src_port),
+                           90000, net_ntohl(th->seq) + 1,
+                           TCP_SYN | TCP_ACK, 4096, NULL, 0);
+        }
+    }
     return 1;
+}
+
+/* NET-GAPS: return the MSS advertised in a captured segment's TCP options
+ * (0 = no MSS option present). Bounded by the capture head-byte window. */
+static uint16_t rig_cap_mss(const rig_cap_t* c) {
+    if (c->proto != IPPROTO_TCP || c->seg_len < sizeof(tcp_hdr_t)) return 0;
+    const tcp_hdr_t* th = (const tcp_hdr_t*)c->seg;
+    uint8_t ihl = (uint8_t)((th->data_off >> 4) * 4);
+    if (ihl <= sizeof(tcp_hdr_t)) return 0;
+    uint16_t lim = (ihl < RIG_CAP_BYTES) ? ihl : RIG_CAP_BYTES;
+    uint16_t i = sizeof(tcp_hdr_t);
+    while (i < lim) {
+        uint8_t kind = c->seg[i];
+        if (kind == 0) break;
+        if (kind == 1) { i++; continue; }
+        if (i + 1 >= lim) break;
+        uint8_t olen = c->seg[i + 1];
+        if (olen < 2 || i + olen > lim) break;
+        if (kind == 2 && olen == 4)
+            return (uint16_t)((c->seg[i + 2] << 8) | c->seg[i + 3]);
+        i += olen;
+    }
+    return 0;
 }
 
 /* ------------------------------------------------------------------ */
@@ -1369,14 +1418,14 @@ void net_testrig_selftest(void) {
     }
 
     /* ---------------------------------------------------------------- */
-    /* NET-HARDENING-1 NETP1AA (FIN_WAIT-2 absorb fix): the active-close */
-    /* path collapses FIN_WAIT->TIME_WAIT on the ACK of our FIN before    */
-    /* consuming the peer's FIN. A first-time in-order peer FIN arriving   */
-    /* in TIME_WAIT must be CONSUMED (rcv_nxt+1) and ACKed correctly, not  */
-    /* re-ACKed at a stale rcv_nxt by the dup-FIN absorb branch.           */
+    /* NET-HARDENING-1 NETP1AA (first-time peer FIN after our FIN's ACK): */
+    /* NET-GAPS N3 gave the active close a true FIN_WAIT_2, so the ACK of */
+    /* our FIN now parks there (rcv_nxt held) and the peer's first-time    */
+    /* in-order FIN must be CONSUMED (rcv_nxt+1) and ACKed correctly --    */
+    /* the original absorb-fix property this test was born to guard.       */
     /* ---------------------------------------------------------------- */
     {
-        int established = 0, in_timewait = 0, fin_acked = 0;
+        int established = 0, in_fw2 = 0, fin_acked = 0;
         int fd = -1;
         uint32_t isn = 0;
         int l = sock_socket(SOCK_STREAM);
@@ -1401,10 +1450,10 @@ void net_testrig_selftest(void) {
                 /* Simulate our active close: FIN sent -> FIN_WAIT, snd_nxt past it. */
                 c->state   = TCP_FIN_WAIT;
                 c->snd_nxt = c->snd_una + 1;         /* our FIN consumes one seq */
-                /* Peer ACKs our FIN -> premature FIN_WAIT->TIME_WAIT (rcv_nxt held). */
+                /* Peer ACKs our FIN -> FIN_WAIT_2 (NET-GAPS N3; rcv_nxt held). */
                 rig_inject_tcp(peer_ip, 45006, my_ip, 47027,
                                R, c->snd_nxt, TCP_ACK, 4096, NULL, 0);
-                in_timewait = (c->state == TCP_TIME_WAIT && c->rcv_nxt == R) ? 1 : 0;
+                in_fw2 = (c->state == TCP_FIN_WAIT_2 && c->rcv_nxt == R) ? 1 : 0;
                 /* Peer's first-time in-order FIN -> must advance rcv_nxt + ACK R+1. */
                 g_cap_n = 0;
                 rig_inject_tcp(peer_ip, 45006, my_ip, 47027,
@@ -1416,9 +1465,9 @@ void net_testrig_selftest(void) {
             }
         }
         sock_init();
-        kprintf("NETP1AA: FINWAIT2 %s established=%d in_timewait=%d fin_acked=%d\n",
-                (established && in_timewait && fin_acked) ? "PASS" : "FAIL",
-                established, in_timewait, fin_acked);
+        kprintf("NETP1AA: FINWAIT2 %s established=%d in_fw2=%d fin_acked=%d\n",
+                (established && in_fw2 && fin_acked) ? "PASS" : "FAIL",
+                established, in_fw2, fin_acked);
     }
 
     /* ---------------------------------------------------------------- */
@@ -1595,6 +1644,235 @@ void net_testrig_selftest(void) {
         kprintf("NETP1AE: FINRTX %s staged=%d fin_rtx=%d closed_on_ack=%d reaped=%d\n",
                 (staged && fin_rtx && closed_on_ack && reaped) ? "PASS" : "FAIL",
                 staged, fin_rtx, closed_on_ack, reaped);
+    }
+
+    /* ---------------------------------------------------------------- */
+    /* NET-GAPS NETP1AF (SYN options): our SYN and our SYN-ACK must both  */
+    /* advertise an MSS option (kind 2 = TCP_MSS). Today neither carries  */
+    /* ANY options, so an RFC-conservative peer falls back to a 536-byte  */
+    /* MSS and our RX throughput is capped for no reason.                 */
+    /* ---------------------------------------------------------------- */
+    {
+        int synack_mss = 0, syn_mss = 0, established = 0;
+        int l = sock_socket(SOCK_STREAM);
+        if (l >= 0 && sock_bind(l, 47040) == 0 && sock_listen(l, 2) == 0) {
+            g_cap_n = 0;
+            rig_inject_tcp(peer_ip, 45100, my_ip, 47040,
+                           61000, 0, TCP_SYN, 4096, NULL, 0);
+            if (g_cap_n >= 1)
+                synack_mss = (rig_cap_mss(&g_cap[0]) == TCP_MSS) ? 1 : 0;
+        }
+        int a = sock_socket(SOCK_STREAM);
+        if (a >= 0) {
+            g_cap_n = 0;
+            g_synresp_armed = 1;
+            int rc = sock_connect(a, peer_ip, 47555);
+            g_synresp_armed = 0;
+            established = (rc == 0) ? 1 : 0;
+            /* g_cap[0] is OUR SYN (the tap captures before synresp answers). */
+            if (g_cap_n >= 1)
+                syn_mss = (rig_cap_mss(&g_cap[0]) == TCP_MSS) ? 1 : 0;
+        }
+        sock_init();
+        kprintf("NETP1AF: SYNOPT %s synack_mss=%d syn_mss=%d established=%d\n",
+                (synack_mss && syn_mss && established) ? "PASS" : "FAIL",
+                synack_mss, syn_mss, established);
+    }
+
+    /* ---------------------------------------------------------------- */
+    /* NET-GAPS NETP1AG (retransmit queue): with THREE segments in flight */
+    /* and only the FIRST acked, the RTO must retransmit from snd_una     */
+    /* (segment 2, then segment 3 after it is acked) -- not the pipeline  */
+    /* tail. Today a single rt_data slot holds only the LAST segment, so  */
+    /* mid-pipeline loss can never be repaired (stall -> RTO give-up).    */
+    /* ---------------------------------------------------------------- */
+    {
+        int staged = 0, first_rtx = 0, second_rtx = 0;
+        int fd = -1;
+        int l = sock_socket(SOCK_STREAM);
+        if (l >= 0 && sock_bind(l, 47041) == 0 && sock_listen(l, 2) == 0) {
+            g_cap_n = 0;
+            rig_inject_tcp(peer_ip, 45101, my_ip, 47041,
+                           62000, 0, TCP_SYN, 4096, NULL, 0);
+            if (g_cap_n >= 1) {
+                const tcp_hdr_t* th = (const tcp_hdr_t*)g_cap[0].seg;
+                rig_inject_tcp(peer_ip, 45101, my_ip, 47041,
+                               62001, net_ntohl(th->seq) + 1,
+                               TCP_ACK, 4096, NULL, 0);
+                fd = sock_accept(l);
+            }
+        }
+        if (fd >= 0) {
+            sock_t* base = sock_table_base();
+            sock_t* c = base ? &base[fd] : (sock_t*)0;
+            if (c && c->state == TCP_ESTABLISHED) {
+                uint8_t seg[100];
+                uint32_t S = c->snd_nxt;
+                memset(seg, 'A', sizeof(seg)); tcp_rig_stage_tx(c, seg, 100);
+                memset(seg, 'B', sizeof(seg)); tcp_rig_stage_tx(c, seg, 100);
+                memset(seg, 'C', sizeof(seg)); tcp_rig_stage_tx(c, seg, 100);
+                staged = (c->snd_nxt == S + 300) ? 1 : 0;
+                /* Peer ACKs ONLY segment 1. */
+                rig_inject_tcp(peer_ip, 45101, my_ip, 47041,
+                               62001, S + 100, TCP_ACK, 4096, NULL, 0);
+                /* RTO: the retransmit MUST resume at snd_una = S+100 ('B'). */
+                g_cap_n = 0;
+                tcp_rig_advance_ms(4000);
+                tcp_tick(c);
+                if (g_cap_n >= 1) {
+                    const tcp_hdr_t* rt = (const tcp_hdr_t*)g_cap[0].seg;
+                    uint8_t ihl = (uint8_t)((rt->data_off >> 4) * 4);
+                    first_rtx = (net_ntohl(rt->seq) == S + 100 &&
+                                 g_cap[0].seg_len > ihl &&
+                                 g_cap[0].seg[ihl] == 'B') ? 1 : 0;
+                }
+                /* Peer ACKs segment 2; the next RTO must resend segment 3. */
+                rig_inject_tcp(peer_ip, 45101, my_ip, 47041,
+                               62001, S + 200, TCP_ACK, 4096, NULL, 0);
+                g_cap_n = 0;
+                tcp_rig_advance_ms(8000);
+                tcp_tick(c);
+                if (g_cap_n >= 1) {
+                    const tcp_hdr_t* rt = (const tcp_hdr_t*)g_cap[0].seg;
+                    uint8_t ihl = (uint8_t)((rt->data_off >> 4) * 4);
+                    second_rtx = (net_ntohl(rt->seq) == S + 200 &&
+                                  g_cap[0].seg_len > ihl &&
+                                  g_cap[0].seg[ihl] == 'C') ? 1 : 0;
+                }
+                tcp_rig_clock_reset();
+            }
+        }
+        sock_init();
+        kprintf("NETP1AG: RTXQ %s staged=%d first_rtx=%d second_rtx=%d\n",
+                (staged && first_rtx && second_rtx) ? "PASS" : "FAIL",
+                staged, first_rtx, second_rtx);
+    }
+
+    /* ---------------------------------------------------------------- */
+    /* NET-GAPS NETP1AH (congestion window): slow start must exist.       */
+    /* IW = 4*MSS; +MSS per ACK that advances snd_una; an RTO collapses   */
+    /* cwnd to 1*MSS (and retransmits). Today there is NO cwnd at all     */
+    /* (fixed 4-segment pipeline): tcp_rig_cwnd honestly reports 0.       */
+    /* ---------------------------------------------------------------- */
+    {
+        int init_ok = 0, growth_ok = 0, rto_ok = 0;
+        int fd = -1;
+        int l = sock_socket(SOCK_STREAM);
+        if (l >= 0 && sock_bind(l, 47042) == 0 && sock_listen(l, 2) == 0) {
+            g_cap_n = 0;
+            rig_inject_tcp(peer_ip, 45102, my_ip, 47042,
+                           63000, 0, TCP_SYN, 4096, NULL, 0);
+            if (g_cap_n >= 1) {
+                const tcp_hdr_t* th = (const tcp_hdr_t*)g_cap[0].seg;
+                rig_inject_tcp(peer_ip, 45102, my_ip, 47042,
+                               63001, net_ntohl(th->seq) + 1,
+                               TCP_ACK, 4096, NULL, 0);
+                fd = sock_accept(l);
+            }
+        }
+        if (fd >= 0) {
+            sock_t* base = sock_table_base();
+            sock_t* c = base ? &base[fd] : (sock_t*)0;
+            if (c && c->state == TCP_ESTABLISHED) {
+                uint32_t MSSb = TCP_MSS;
+                init_ok = (tcp_rig_cwnd(c) == 4u * MSSb) ? 1 : 0;
+                uint8_t seg[200];
+                memset(seg, 'D', sizeof(seg));
+                uint32_t S = c->snd_nxt;
+                tcp_rig_stage_tx(c, seg, 200);
+                tcp_rig_stage_tx(c, seg, 200);
+                tcp_rig_stage_tx(c, seg, 200);
+                tcp_rig_stage_tx(c, seg, 200);
+                /* Two ACKs that each advance snd_una -> cwnd 4*MSS + 2*MSS. */
+                rig_inject_tcp(peer_ip, 45102, my_ip, 47042,
+                               63001, S + 200, TCP_ACK, 4096, NULL, 0);
+                rig_inject_tcp(peer_ip, 45102, my_ip, 47042,
+                               63001, S + 400, TCP_ACK, 4096, NULL, 0);
+                growth_ok = (tcp_rig_cwnd(c) == 6u * MSSb) ? 1 : 0;
+                /* Loss (RTO on the two still-unacked segments): cwnd -> 1*MSS. */
+                g_cap_n = 0;
+                tcp_rig_advance_ms(4000);
+                tcp_tick(c);
+                rto_ok = (tcp_rig_cwnd(c) == 1u * MSSb && g_cap_n >= 1) ? 1 : 0;
+                tcp_rig_clock_reset();
+            }
+        }
+        sock_init();
+        kprintf("NETP1AH: CWND %s init=%d growth=%d rto=%d\n",
+                (init_ok && growth_ok && rto_ok) ? "PASS" : "FAIL",
+                init_ok, growth_ok, rto_ok);
+    }
+
+    /* ---------------------------------------------------------------- */
+    /* NET-GAPS NETP1AI (true FIN_WAIT_2): after the peer ACKs our FIN    */
+    /* the socket must sit in FIN_WAIT_2 with receive still OPEN (in-     */
+    /* flight data accepted + ACKed), reach TIME_WAIT only on the peer's  */
+    /* FIN, and an idle FIN_WAIT_2 must be reaped, not leak the slot.     */
+    /* Today the bare ACK jumps straight to TIME_WAIT and post-close data */
+    /* from the peer is silently dropped (half-close data loss).          */
+    /* ---------------------------------------------------------------- */
+    {
+        int fw2 = 0, data_ok = 0, tw_on_fin = 0, reaped = 0;
+        int fd = -1;
+        int l = sock_socket(SOCK_STREAM);
+        if (l >= 0 && sock_bind(l, 47043) == 0 && sock_listen(l, 2) == 0) {
+            g_cap_n = 0;
+            rig_inject_tcp(peer_ip, 45103, my_ip, 47043,
+                           64000, 0, TCP_SYN, 4096, NULL, 0);
+            if (g_cap_n >= 1) {
+                const tcp_hdr_t* th = (const tcp_hdr_t*)g_cap[0].seg;
+                rig_inject_tcp(peer_ip, 45103, my_ip, 47043,
+                               64001, net_ntohl(th->seq) + 1,
+                               TCP_ACK, 4096, NULL, 0);
+                fd = sock_accept(l);
+            }
+        }
+        if (fd >= 0) {
+            sock_t* base = sock_table_base();
+            sock_t* c = base ? &base[fd] : (sock_t*)0;
+            if (c && c->state == TCP_ESTABLISHED) {
+                uint32_t R = c->rcv_nxt;
+                /* Simulate our active close (as NETP1AA stages it). */
+                c->state   = TCP_FIN_WAIT;
+                c->snd_nxt = c->snd_una + 1;      /* our FIN consumes one seq */
+                /* Peer ACKs our FIN (no FIN of its own yet) -> FIN_WAIT_2. */
+                rig_inject_tcp(peer_ip, 45103, my_ip, 47043,
+                               R, c->snd_nxt, TCP_ACK, 4096, NULL, 0);
+                fw2 = (c->state == TCP_FIN_WAIT_2) ? 1 : 0;
+                /* Receive stays open: in-flight data accepted + ACKed R+8. */
+                g_cap_n = 0;
+                rig_inject_tcp(peer_ip, 45103, my_ip, 47043,
+                               R, c->snd_nxt, TCP_ACK | TCP_PSH, 4096,
+                               "HALFOPEN", 8);
+                if (c->rcv_nxt == R + 8 && g_cap_n >= 1) {
+                    const tcp_hdr_t* ath =
+                        (const tcp_hdr_t*)g_cap[g_cap_n - 1].seg;
+                    data_ok = (net_ntohl(ath->ack) == R + 8) ? 1 : 0;
+                }
+                /* The peer's FIN then moves us to TIME_WAIT (ack = R+9). */
+                g_cap_n = 0;
+                rig_inject_tcp(peer_ip, 45103, my_ip, 47043,
+                               R + 8, c->snd_nxt, TCP_FIN | TCP_ACK, 4096,
+                               NULL, 0);
+                if (c->state == TCP_TIME_WAIT && c->rcv_nxt == R + 9 &&
+                    g_cap_n >= 1) {
+                    const tcp_hdr_t* ath =
+                        (const tcp_hdr_t*)g_cap[g_cap_n - 1].seg;
+                    tw_on_fin = (net_ntohl(ath->ack) == R + 9) ? 1 : 0;
+                }
+                /* An idle FIN_WAIT_2 (peer never FINs) must be reaped. */
+                c->state        = TCP_FIN_WAIT_2;
+                c->time_wait_ms = tcp_rig_now();
+                tcp_rig_advance_ms(61000);   /* > TCP_TIMEWAIT_MS */
+                tcp_tick(c);
+                reaped = (c->state == TCP_CLOSED) ? 1 : 0;
+                tcp_rig_clock_reset();
+            }
+        }
+        sock_init();
+        kprintf("NETP1AI: FW2 %s fw2=%d data_ok=%d tw_on_fin=%d reaped=%d\n",
+                (fw2 && data_ok && tw_on_fin && reaped) ? "PASS" : "FAIL",
+                fw2, data_ok, tw_on_fin, reaped);
     }
 
     g_rig_active = 0;

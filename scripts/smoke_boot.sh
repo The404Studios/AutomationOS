@@ -600,9 +600,11 @@ check_crypto() {
 }
 
 check_libs() {
-    # init spawns sbin/libtest: JSON parser + DHCP packet + image-codec KATs.
+    # init spawns sbin/libtest: JSON parser + DHCP packet + image-codec +
+    # libc math (MATH-0e) KATs. A math_selftest failure flips the summary
+    # to LIBTEST: FAIL, so the math battery is smoke-gated on every run.
     if grep -qF 'LIBTEST: PASS' "$LOG"; then
-        pass "lib KATs verified (json + dhcp + image codecs)"
+        pass "lib KATs verified (json + dhcp + image codecs + libc math)"
         return 0
     elif grep -qF 'LIBTEST: FAIL' "$LOG"; then
         fail "lib KAT failure: $(grep -F '[LIBTEST]' "$LOG" | grep -i fail | head -2 | tr '\n' ' ')"

@@ -9,6 +9,13 @@
 #include "../../lib/net/dhcp.h"         /* dhcp_selftest()     */
 #include "../../lib/imgcodec/imgcodec.h" /* imgcodec_selftest() */
 
+/* MATH-0e: the libc double-precision math battery (userspace/libc/math.c,
+ * linked as /tmp/lmath.o). Returns a bitmask of failed checks (0 = PASS).
+ * Ring-3 float/SSE is safe (eager FXSAVE per context switch); this was
+ * never invoked anywhere at boot before, which hid a 0.0355 atan() error
+ * at x=1 for the library's whole life. */
+extern int math_selftest(void);
+
 #define SYS_EXIT  0
 #define SYS_WRITE 3
 
@@ -25,13 +32,15 @@ void _start(void) {
     int json = json_selftest();   /* 0 = pass */
     int dhcp = dhcp_selftest();
     int img  = imgcodec_selftest();
+    int math = math_selftest();   /* 0 = pass; else failed-check bitmask */
 
     print(json == 0 ? "[LIBTEST] json: PASS\n"     : "[LIBTEST] json: FAIL\n");
     print(dhcp == 0 ? "[LIBTEST] dhcp: PASS\n"     : "[LIBTEST] dhcp: FAIL\n");
     print(img  == 0 ? "[LIBTEST] imgcodec: PASS\n" : "[LIBTEST] imgcodec: FAIL\n");
+    print(math == 0 ? "[LIBTEST] math: PASS\n"     : "[LIBTEST] math: FAIL\n");
 
-    if (json == 0 && dhcp == 0 && img == 0)
-        print("LIBTEST: PASS (json+dhcp+imgcodec KATs)\n");
+    if (json == 0 && dhcp == 0 && img == 0 && math == 0)
+        print("LIBTEST: PASS (json+dhcp+imgcodec+math KATs)\n");
     else
         print("LIBTEST: FAIL\n");
 

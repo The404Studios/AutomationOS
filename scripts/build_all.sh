@@ -504,7 +504,10 @@ cc userspace/lib/imgcodec/png.c     /tmp/img_png.o
 cc userspace/lib/imgcodec/gif.c     /tmp/img_gif.o
 cc userspace/lib/imgcodec/imgcodec.c /tmp/img_codec.o
 cc userspace/apps/libtest/libtest.c /tmp/libtest.o
-$LD /tmp/libtest.o /tmp/json.o /tmp/dhcp.o \
+# MATH-0e: libtest now also runs math_selftest() (libc math battery) so the
+# always-run smoke gate covers the double-precision math library too.
+cc userspace/libc/math.c /tmp/lmath.o
+$LD /tmp/libtest.o /tmp/json.o /tmp/dhcp.o /tmp/lmath.o \
     /tmp/img_bmp.o /tmp/img_png.o /tmp/img_gif.o /tmp/img_codec.o /tmp/deflate.o /tmp/lstring.o -o /tmp/libtest.elf
 # dhcpc: obtain + print a DHCP lease (crt0+main; links dhcp).
 cc userspace/apps/dhcpc/dhcpc.c /tmp/dhcpc.o; $LD /tmp/crt0.o /tmp/dhcpc.o /tmp/dhcp.o -o /tmp/dhcpc.elf

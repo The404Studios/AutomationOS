@@ -126,6 +126,22 @@ double fmod(double x, double y) {
         return bits_to_double(0x7FF8000000000000ULL);   /* quiet NaN */
     double ax = fabs(x), ay = fabs(y);
     if (ax < ay) return x;
+    /* MATH-0d: frexp/ldexp are exponent-FIELD based and treat a subnormal y
+     * as exponent 0 without normalizing the mantissa, so the exponent-scaled
+     * loop below cannot build y*2^k for subnormal y -- fmod(1.0, 5e-324) came
+     * back UNREDUCED. Use an exact doubling ladder instead: every d is
+     * ay*2^k exactly, d never overflows (the guard keeps d <= ax/2 before
+     * doubling), each subtraction is exact (d <= ax < 2d), and each outer
+     * pass at least halves ax -- bounded by ~1074^2/2 iterations at the very
+     * extreme (x ~ 1, y = the smallest subnormal). */
+    if (((double_to_bits(ay) >> 52) & 0x7FF) == 0) {
+        while (ax >= ay) {
+            double d = ay;
+            while (ax - d >= d) d += d;
+            ax -= d;
+        }
+        return (x < 0.0) ? -ax : ax;
+    }
     /* Exponent-scaled binary reduction: subtract y*2^k for k from
      * ilogb(x)-ilogb(y) downward. Each step subtracts an exact power-of-two
      * multiple of y, so at most ~2046 iterations reduce any finite double;
@@ -195,7 +211,11 @@ double modf(double x, double *iptr) {
 
 double sqrt(double x) {
     /* MATH-0b: sqrt of a negative is NaN (the old -1.0 "substitute" silently
-     * poisoned downstream arithmetic with a plausible-looking value). */
+     * poisoned downstream arithmetic with a plausible-looking value).
+     * MATH-0d: NaN propagates; sqrt(+inf) is +inf (the Newton loop fed with
+     * the inf bit pattern produced -nan). */
+    if (x != x) return x;
+    if (double_to_bits(x) == 0x7FF0000000000000ULL) return x;
     if (x < 0.0) return bits_to_double(0x7FF8000000000000ULL);
     if (x == 0.0) return 0.0;
 
@@ -264,7 +284,11 @@ float expf(float x) { return (float)exp((double)x); }
  * ====================================================================== */
 
 double log(double x) {
-    /* MATH-0b (C99): log(0) = -inf, log(negative) = NaN -- not sentinels. */
+    /* MATH-0b (C99): log(0) = -inf, log(negative) = NaN -- not sentinels.
+     * MATH-0d: NaN propagates (it compared false against everything and fell
+     * into frexp garbage: log(NaN) returned 710.19); log(+inf) = +inf. */
+    if (x != x) return x;
+    if (double_to_bits(x) == 0x7FF0000000000000ULL) return x;
     if (x == 0.0) return bits_to_double(0xFFF0000000000000ULL);
     if (x <  0.0) return bits_to_double(0x7FF8000000000000ULL);
 
@@ -305,8 +329,12 @@ double log10(double x) { return log(x) * 4.34294481903251828e-1; }
  * ====================================================================== */
 
 double pow(double x, double y) {
-    if (y == 0.0)  return 1.0;
+    if (y == 0.0)  return 1.0;             /* C99: pow(x, 0) = 1 even for NaN x */
     if (x == 1.0)  return 1.0;
+    /* MATH-0d: NaN operands propagate (pow(NaN,2) went through
+     * exp(2*log(NaN)) and came back +inf). */
+    if (x != x) return x;
+    if (y != y) return y;
     /* MATH-0b: pow(0, negative) is +inf; pow(negative, non-integer) is NaN
      * (both were plausible-looking sentinels: DBL_MAX-ish / 0.0). */
     if (x == 0.0)  return (y > 0.0) ? 0.0
@@ -401,7 +429,12 @@ float tanf(float x)  { return (float)tan((double)x); }
  * interval. Alternatively: simple degree-13 series after reduction to <=1.
  * ====================================================================== */
 
-/* Degree-13 minimax for atan on [0, 1] */
+/* Degree-13 Taylor for atan -- accurate ONLY for |x| <= tan(pi/8) ~= 0.4142
+ * (odd powers, so negative arguments work). MATH-0d: this series was being
+ * used all the way to x=1, where the alternating series has barely started
+ * converging -- atan(1) returned 0.8209 instead of pi/4 (error 0.0355!),
+ * which also broke atan2/asin/acos near the diagonal and made math_selftest
+ * check 11 structurally unpassable. */
 static double atan_core(double x) {
     double x2 = x * x;
     return x * (1.0
@@ -413,15 +446,26 @@ static double atan_core(double x) {
         + x2 *   7.69230769230769231e-2))))));
 }
 
+/* atan on [0, 1]: keep the series argument small. For x above tan(pi/8) use
+ * the half-angle identity atan(x) = pi/4 + atan((x-1)/(x+1)), which maps
+ * (tan(pi/8), 1] onto (-tan(pi/8), 0] -- the series truncation error there
+ * is < 2e-7 (vs 0.0355 at x=1 without the reduction). x=1 becomes exact. */
+static double atan_reduced(double x) {
+    if (x > 0.41421356237309503)
+        return M_PI_4 + atan_core((x - 1.0) / (x + 1.0));
+    return atan_core(x);
+}
+
 double atan(double x) {
+    if (x != x) return x;                  /* MATH-0d: NaN propagates */
     int neg = (x < 0.0);
     if (neg) x = -x;
 
     double result;
     if (x > 1.0) {
-        result = M_PI_2 - atan_core(1.0 / x);
+        result = M_PI_2 - atan_reduced(1.0 / x);
     } else {
-        result = atan_core(x);
+        result = atan_reduced(x);
     }
 
     return neg ? -result : result;
@@ -681,6 +725,20 @@ int math_selftest(void) {
     CHECK_NAN (27, pow(-2.0, 0.5));
     CHECK_PINF(28, exp(1000.0));
     CHECK_PINF(29, ldexp(1.0, 5000));
+
+    /* MATH-0d specials (each FAILED pre-fix): sqrt/log at +inf, pow NaN
+     * propagation, and subnormal-divisor fmod actually reducing. atan's
+     * x=1 convergence fix is already pinned by check 11 (atan2(1,1)). */
+    {
+        double inf = bits_to_double(0x7FF0000000000000ULL);
+        double nan = bits_to_double(0x7FF8000000000000ULL);
+        double sy  = bits_to_double(1ULL);         /* smallest subnormal */
+        double fr  = fmod(1.0, sy);
+        int ok = (sqrt(inf) == inf) && (log(inf) == inf) &&
+                 (pow(nan, 2.0) != pow(nan, 2.0)) &&
+                 (fr >= 0.0 && fr < sy);
+        if (!ok) failures |= (1 << 30);
+    }
 
 #undef CHECK_NAN
 #undef CHECK_PINF

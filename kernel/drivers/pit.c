@@ -191,6 +191,15 @@ static void timer_handler(void) {
         uhci_poll();
     }
 #endif
+#ifdef EHCI_USB
+    /* USB-EHCI-0: poll the EHCI HID interrupt endpoint ~every 8 ms, same cadence
+     * and bounded discipline as the UHCI poll above. No-op until ehci_init()
+     * selects a mouse path (E2/E3); E1 ehci_poll() is an empty bounded stub. */
+    if ((timer_ticks & 7u) == 0) {
+        extern void ehci_poll(void);
+        ehci_poll();
+    }
+#endif
     // Real-sleep wakeups: re-ready any process whose blocking-sleep deadline has
     // arrived (1 tick == 1 ms at 1000 Hz). Runs once per tick here (the
     // cooperative IRQ0 path); the PREEMPTIVE build does the equivalent at the top

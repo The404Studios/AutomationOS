@@ -52,26 +52,45 @@ typedef g3d_i32 fx;                 /* Q16.16 fixed-point scalar */
 #define FX_SHIFT   16
 #define FX_ONE     (1 << FX_SHIFT)              /* 1.0 in Q16.16   */
 #define FX_HALF    (FX_ONE >> 1)                /* 0.5             */
+#define FX_MAX     ((fx)0x7FFFFFFF)             /* +32767.99998    */
+#define FX_MIN     ((fx)0x80000000)             /* -32768.0        */
+
+/* G3D-FPM-0: THE saturation primitive (mirrors userspace/lib/fpm/fpm.c). Every
+ * combining op funnels its int64 intermediate through here so no int32 add/mul/
+ * negate can wrap or hit signed-overflow UB. In-range results are byte-identical
+ * to the old code; only formerly-UB/overflowing cases now clamp instead. */
+static inline fx g3d_sat_i64(g3d_i64 v) {
+    if (v > FX_MAX) return FX_MAX;
+    if (v < FX_MIN) return FX_MIN;
+    return (fx)v;
+}
+/* Unsaturated Q16.16 product term (Q32.32 -> Q16.16), for i64 accumulation. */
+static inline g3d_i64 g3d_mul_i64(fx a, fx b) {
+    return ((g3d_i64)a * (g3d_i64)b) >> FX_SHIFT;
+}
 
 /* int <-> fx conversions */
-static inline fx  fx_from_int(g3d_i32 i) { return (fx)(i << FX_SHIFT); }
+/* Saturates outside [-32768, 32767]; i * FX_ONE, not i << 16 (left-shifting a
+ * negative value is UB in C). */
+static inline fx  fx_from_int(g3d_i32 i) { return g3d_sat_i64((g3d_i64)i * FX_ONE); }
 static inline g3d_i32 fx_to_int(fx a)    { return (g3d_i32)(a >> FX_SHIFT); }
-/* round-to-nearest fx -> int */
-static inline g3d_i32 fx_round(fx a)     { return (g3d_i32)((a + FX_HALF) >> FX_SHIFT); }
+/* round-to-nearest fx -> int (int64 sum so a near FX_MAX cannot overflow). */
+static inline g3d_i32 fx_round(fx a)     { return (g3d_i32)(((g3d_i64)a + FX_HALF) >> FX_SHIFT); }
 
-static inline fx fx_add(fx a, fx b) { return a + b; }
-static inline fx fx_sub(fx a, fx b) { return a - b; }
-static inline fx fx_abs(fx a)       { return a < 0 ? -a : a; }
-static inline fx fx_mul(fx a, fx b) { return (fx)(((g3d_i64)a * (g3d_i64)b) >> FX_SHIFT); }
+static inline fx fx_add(fx a, fx b) { return g3d_sat_i64((g3d_i64)a + (g3d_i64)b); }
+static inline fx fx_sub(fx a, fx b) { return g3d_sat_i64((g3d_i64)a - (g3d_i64)b); }
+/* |FX_MIN| = 32768.0 is unrepresentable -> saturates (negating INT32_MIN is UB). */
+static inline fx fx_abs(fx a)       { return a < 0 ? g3d_sat_i64(-(g3d_i64)a) : a; }
+static inline fx fx_mul(fx a, fx b) { return g3d_sat_i64(g3d_mul_i64(a, b)); }
 static inline fx fx_div(fx a, fx b) {
-    if (b == 0) return 0;
-    return (fx)(((g3d_i64)a << FX_SHIFT) / (g3d_i64)b);
+    if (b == 0) return 0;   /* g3d's existing contract (not UB); kept */
+    return g3d_sat_i64(((g3d_i64)a * FX_ONE) / (g3d_i64)b);
 }
 
 /* fx from a rational n/d (handy for literals like 3/2 without FP). */
 static inline fx fx_ratio(g3d_i32 n, g3d_i32 d) {
     if (d == 0) return 0;
-    return (fx)(((g3d_i64)n << FX_SHIFT) / (g3d_i64)d);
+    return g3d_sat_i64(((g3d_i64)n * FX_ONE) / (g3d_i64)d);
 }
 
 /* Integer square root of a Q16.16 value, returned as Q16.16. */
@@ -110,11 +129,16 @@ static inline vec3 v3(fx x, fx y, fx z) { vec3 r; r.x = x; r.y = y; r.z = z; ret
 static inline vec3 v3_add(vec3 a, vec3 b){ return v3(a.x+b.x, a.y+b.y, a.z+b.z); }
 static inline vec3 v3_sub(vec3 a, vec3 b){ return v3(a.x-b.x, a.y-b.y, a.z-b.z); }
 static inline vec3 v3_scale(vec3 a, fx s){ return v3(fx_mul(a.x,s), fx_mul(a.y,s), fx_mul(a.z,s)); }
-static inline fx   v3_dot(vec3 a, vec3 b){ return fx_mul(a.x,b.x) + fx_mul(a.y,b.y) + fx_mul(a.z,b.z); }
+/* G3D-FPM-0: accumulate the products in int64 and clamp ONCE, so a dot of two
+ * ordinary vectors (e.g. |v|~181 -> squared length ~98304 > 32767) no longer
+ * overflows int32 into a NEGATIVE squared length. */
+static inline fx   v3_dot(vec3 a, vec3 b){
+    return g3d_sat_i64(g3d_mul_i64(a.x,b.x) + g3d_mul_i64(a.y,b.y) + g3d_mul_i64(a.z,b.z));
+}
 static inline vec3 v3_cross(vec3 a, vec3 b){
-    return v3(fx_mul(a.y,b.z) - fx_mul(a.z,b.y),
-              fx_mul(a.z,b.x) - fx_mul(a.x,b.z),
-              fx_mul(a.x,b.y) - fx_mul(a.y,b.x));
+    return v3(g3d_sat_i64(g3d_mul_i64(a.y,b.z) - g3d_mul_i64(a.z,b.y)),
+              g3d_sat_i64(g3d_mul_i64(a.z,b.x) - g3d_mul_i64(a.x,b.z)),
+              g3d_sat_i64(g3d_mul_i64(a.x,b.y) - g3d_mul_i64(a.y,b.x)));
 }
 fx   v3_len(vec3 a);                 /* |a| as Q16.16 */
 vec3 v3_normalize(vec3 a);           /* a / |a| (zero vector -> zero) */

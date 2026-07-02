@@ -75,6 +75,32 @@ static void test_scalars(void)
     fx a = fx_ratio(7, 3);             /* 2.333... */
     fx b = fx_mul(a, fx_from_int(3));  /* ~7.0     */
     CHECK(fabs(fxd(b) - 7.0) < 0.001, "fx_mul: (7/3)*3 ~= 7");
+
+    /* G3D-FPM-0 regression pins -- each FAILS against the pre-hardening core
+     * (int32 overflow / INT_MIN-negation / non-saturating conversion UB).
+     * Expected values are literals (not new g3d.h symbols) so this block
+     * compiles against the OLD g3d too -> a genuine RED before the fix. */
+    const long FXMAXv = 0x7FFFFFFFL;          /* +32767.99998 in Q16.16 */
+    const long FXMINv = -0x80000000L;         /* -32768.0               */
+
+    /* dot of two ordinary vectors: |v|~181 -> squared length ~98304, which
+     * overflowed int32 into a NEGATIVE value before the i64-accumulate fix. */
+    vec3 vv = v3(fx_from_int(181), fx_from_int(181), fx_from_int(181));
+    fx dp = v3_dot(vv, vv);
+    CHECK(dp > 0, "v3_dot large vector is POSITIVE (no int32 wrap)");
+    CHECK((long)dp == FXMAXv, "v3_dot saturates past +32767 instead of wrapping");
+
+    /* fx_abs(FX_MIN): -INT32_MIN is UB; must saturate, never return negative. */
+    CHECK((long)fx_abs((fx)FXMINv) == FXMAXv, "fx_abs(FX_MIN) saturates (not negative)");
+
+    /* fx_from_int out of range must saturate, not sign-flip-wrap. */
+    CHECK((long)fx_from_int(100000)  == FXMAXv, "fx_from_int(100000) saturates to FX_MAX");
+    CHECK((long)fx_from_int(-100000) == FXMINv, "fx_from_int(-100000) saturates to FX_MIN");
+
+    /* mat4_mul of two large-scale matrices: row sums must saturate, not wrap. */
+    mat4 big = mat4_scale(fx_from_int(300), fx_from_int(300), fx_from_int(300));
+    mat4 sq  = mat4_mul(big, big);   /* diagonal 90000 -> overflows fx */
+    CHECK((long)sq.m[0] == FXMAXv, "mat4_mul row sum saturates (no int32 wrap)");
 }
 
 /* ------------------------------------------------------------------ */

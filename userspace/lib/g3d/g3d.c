@@ -166,10 +166,12 @@ mat4 mat4_mul(mat4 a, mat4 b)
     mat4 r;
     for (int col = 0; col < 4; col++) {
         for (int row = 0; row < 4; row++) {
-            fx s = 0;
+            /* G3D-FPM-0: accumulate in int64, clamp once (the 4-term sum of
+             * fx products can exceed int32 for large matrices). */
+            g3d_i64 s = 0;
             for (int k = 0; k < 4; k++)
-                s += fx_mul(a.m[k * 4 + row], b.m[col * 4 + k]);
-            r.m[col * 4 + row] = s;
+                s += g3d_mul_i64(a.m[k * 4 + row], b.m[col * 4 + k]);
+            r.m[col * 4 + row] = g3d_sat_i64(s);
         }
     }
     return r;
@@ -178,9 +180,11 @@ mat4 mat4_mul(mat4 a, mat4 b)
 /* Transform a point (implicit w=1), perspective-divide NOT applied here. */
 vec3 mat4_mul_point(mat4 m, vec3 p)
 {
-    fx x = fx_mul(m.m[0], p.x) + fx_mul(m.m[4], p.y) + fx_mul(m.m[8],  p.z) + m.m[12];
-    fx y = fx_mul(m.m[1], p.x) + fx_mul(m.m[5], p.y) + fx_mul(m.m[9],  p.z) + m.m[13];
-    fx z = fx_mul(m.m[2], p.x) + fx_mul(m.m[6], p.y) + fx_mul(m.m[10], p.z) + m.m[14];
+    /* G3D-FPM-0: int64-accumulate each row (3 products + the Q16.16 translation
+     * term) and clamp once. */
+    fx x = g3d_sat_i64(g3d_mul_i64(m.m[0], p.x) + g3d_mul_i64(m.m[4], p.y) + g3d_mul_i64(m.m[8],  p.z) + (g3d_i64)m.m[12]);
+    fx y = g3d_sat_i64(g3d_mul_i64(m.m[1], p.x) + g3d_mul_i64(m.m[5], p.y) + g3d_mul_i64(m.m[9],  p.z) + (g3d_i64)m.m[13]);
+    fx z = g3d_sat_i64(g3d_mul_i64(m.m[2], p.x) + g3d_mul_i64(m.m[6], p.y) + g3d_mul_i64(m.m[10], p.z) + (g3d_i64)m.m[14]);
     return v3(x, y, z);
 }
 

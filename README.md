@@ -28,6 +28,11 @@ A hobby operating system written from the ground up — no Linux, no BSD, no exi
 
 AutomationOS boots via GRUB (Multiboot, legacy BIOS) into a 64-bit higher-half kernel, brings up its own memory management, scheduler, drivers, filesystems and network stack, then hands off to a from-scratch compositor desktop with real applications.
 
+### Self-hosting toolchain
+- **`cc`** — an on-device C compiler (`userspace/apps/cc`) that lexes, parses, type-checks, generates x86-64, assembles, and writes ELF, entirely on the running OS
+- The **Semantic LEGO IDE** (`userspace/apps/ide`) — designed as a *prosthetic working memory for programmers with aphantasia*: a live semantic map of functions-as-bricks with state ports and dashed-red **absent** cards, a project-wide coherence score, ONE selection model syncing editor↔map↔inspector↔breadcrumb, plus file tree, syntax-highlighting editor, project-symbol completion, integrated terminal, and **Ctrl+B** on-device builds → **[full showcase with screenshots](docs/IDE_SEMANTIC_LEGO.md)**
+- The compiler reuses the IDE's verified toolchain objects (lexer/parser/codegen/assembler/ELF writer), so the editor and the compiler share one front end
+
 It runs in QEMU, and it boots from a USB stick on actual hardware: a 2010 Lenovo ThinkPad T410 (Intel Core i5-M520 "Westmere", NVIDIA NVS 3100M). The system is RAM-rooted — it boots into a ramfs root and runs entirely from memory.
 
 Every layer below was built by hand: the bootstrap into long mode, the allocators, the scheduler, the drivers, the TCP/IP stack, the TLS stack, the compositor, the C compiler, the web browser, and the WiFi driver. There is no libc underneath the userland — userspace is freestanding and talks to the kernel through a hand-written syscall surface.

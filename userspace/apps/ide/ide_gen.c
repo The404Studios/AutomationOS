@@ -170,7 +170,10 @@ int gen_apply_action(Ide* a, int idx) {
         gen_append(stub, &p, (int)sizeof stub, ret);
         gen_append(stub, &p, (int)sizeof stub, " ");
         gen_append(stub, &p, (int)sizeof stub, name);
-        gen_append(stub, &p, (int)sizeof stub, "(...) {\n    ");
+        /* IDE-FORGE-0 audit fix: a bare "(...)" parameter list is invalid C
+         * -- the on-device compiler rejected the very stubs GENERATE wrote.
+         * "(void)" matches the spliced no-arg call site and compiles. */
+        gen_append(stub, &p, (int)sizeof stub, "(void) {\n    ");
         gen_append(stub, &p, (int)sizeof stub, body);
         gen_append(stub, &p, (int)sizeof stub, "\n}\n");
 

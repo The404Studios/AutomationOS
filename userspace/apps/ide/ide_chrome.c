@@ -12,8 +12,15 @@
  */
 #include "ide.h"
 #include "ide_theme.h"
+#include "ide_marks.h"   /* IDE-FORGE-0: STAR watch chips + MUTE warn chip */
 
 #define CHR_NTABS 6
+
+/* WATCH chip hit-test table: rebuilt every panel_status() render, read by
+ * panel_status_click() to jump the selection to a starred function. */
+typedef struct { int x, y, w, h, fi; } ChrWatch;
+static ChrWatch g_watch[3];
+static int      g_watch_n;
 
 /* Tab numbers ("VIZ-1".."VIZ-6") and the words beside them are drawn
  * separately so the number can be BLUE and the word dim. */
@@ -269,31 +276,77 @@ void panel_status(Ide* a, Canvas* cv, Rect r) {
     x = chr_dot(cv, x, cy, m->parsed,   "PARSED",   clip_x, clip_w) + GFX_FW;
     x = chr_dot(cv, x, cy, m->analyzed, "ANALYZED", clip_x, clip_w) + GFX_FW;
 
-    /* Optional "WARN <n>" chip in ORANGE when the model carries risks. */
+    /* Optional "WARN <n>" chip in ORANGE when the model carries risks. When the
+     * FOCUSED function is muted (a MARK knob), render it faint + "(muted)" so the
+     * user sees the warning is acknowledged, not gone (IDE-FORGE-0 Knob 4). */
     if (m->nrisks > 0) {
+        int muted = 0;
+        if (a->focus_func >= 0 && a->focus_func < m->nfuncs) {
+            SymMark* fmk = marks_find(m->funcs[a->focus_func].name);
+            muted = (fmk && fmk->mute);
+        }
+        uint32_t wc = muted ? TH_TEXT_FAINT : TH_ORANGE;
         x += GFX_FW;
-        gfx_text_clip(cv, x, ty, "WARN", TH_ORANGE, clip_x, clip_w);
+        gfx_text_clip(cv, x, ty, "WARN", wc, clip_x, clip_w);
         x += gfx_textw("WARN") + GFX_FW;
         {
             char num[16];
             int n = ide_itoa(m->nrisks, num);
             num[n] = 0;
-            gfx_text_clip(cv, x, ty, num, TH_ORANGE, clip_x, clip_w);
-            x += n * GFX_FW + 2 * GFX_FW;
+            gfx_text_clip(cv, x, ty, num, wc, clip_x, clip_w);
+            x += n * GFX_FW + GFX_FW;
         }
+        if (muted) {
+            gfx_text_clip(cv, x, ty, "(muted)", TH_TEXT_FAINT, clip_x, clip_w);
+            x += gfx_textw("(muted)") + GFX_FW;
+        }
+        x += GFX_FW;
+    }
+
+    /* "WATCH:" chips -- up to 3 starred functions, always visible (the STAR knob
+     * consequence). Each is a rounded chip; clicking it jumps the selection
+     * (panel_status_click). Reuses the closed-function chip style. */
+    g_watch_n = 0;
+    {
+        int needlbl = 1;
+        for (int i = 0; i < m->nfuncs && i < M_MAXFUNCS && g_watch_n < 3; i++) {
+            SymMark* mk = marks_find(m->funcs[i].name);
+            if (!mk || !mk->star) continue;
+            if (needlbl) {
+                gfx_text_clip(cv, x, ty, "WATCH:", TH_TEXT_DIM, clip_x, clip_w);
+                x += gfx_textw("WATCH:") + GFX_FW;
+                needlbl = 0;
+            }
+            const char* nm = m->funcs[i].name;
+            int cw = gfx_textw(nm) + 2 * PAD;
+            if (x + cw > clip_x + clip_w) break;
+            gfx_round(cv, x, r.y + 2, cw, r.h - 4, 4, TH_PANEL2);
+            gfx_text_clip(cv, x + PAD, ty, nm, TH_YELLOW, clip_x, clip_w);
+            g_watch[g_watch_n].x = x; g_watch[g_watch_n].y = r.y + 2;
+            g_watch[g_watch_n].w = cw; g_watch[g_watch_n].h = r.h - 4;
+            g_watch[g_watch_n].fi = i;
+            g_watch_n++;
+            x += cw + GFX_FW;
+        }
+        if (!needlbl) x += GFX_FW;     /* gap after the watch strip */
     }
 
     /* ---------- RIGHT: shortcut legend + MODE ---------- *
      * Drawn left-to-right starting at sx; if it runs past the right edge the
      * clip simply drops the overflow (draw as many as fit). We start it after
      * the left block so the two never overlap. */
+    /* IDE-FORGE-0 audit fix: the old legend advertised ELEVEN verbs
+     * (EXPLAIN/CONNECT/WARN/BUG/../TRACE) of which only G was real -- B and
+     * R were wired to build/run under the WRONG names (BUG/RECYCLE) and the
+     * other eight had no handlers at all. For a tool whose law is "the
+     * chrome always tells the truth," a lying legend is a critical defect.
+     * This legend lists exactly what the LEGO key router binds. */
     static const char  CHR_KEYS[] =
-        { 'E','C','W','B','G','I','R','D','S','P','T' };
+        { 'B','R','G' };
     static const char* const CHR_WORDS[] = {
-        "EXPLAIN","CONNECT","WARN","BUG","GENERATE","ISOLATE",
-        "RECYCLE","REMOVE","SEPARATE","PROMOTE","TRACE"
+        "BUILD","RUN","GENERATE"
     };
-    enum { CHR_NSHORT = 11 };
+    enum { CHR_NSHORT = 3 };
 
     int sx = x + 2 * GFX_FW;                   /* leave a gap after dots */
     for (int i = 0; i < CHR_NSHORT; i++) {
@@ -308,4 +361,19 @@ void panel_status(Ide* a, Canvas* cv, Rect r) {
         sx += gfx_textw("MODE:") + GFX_FW;
         gfx_text_clip(cv, sx, ty, "SEMANTIC", TH_GREEN, clip_x, clip_w);
     }
+}
+
+/* Click in the status bar: hit-test the WATCH chips and jump the selection to
+ * the starred function (the STAR knob's clickable consequence). Returns 1 if
+ * the click was inside the bar (always consumed there). */
+int panel_status_click(Ide* a, Rect r, int mx, int my) {
+    if (!a || !rect_hit(r, mx, my)) return 0;
+    for (int i = 0; i < g_watch_n && i < 3; i++) {
+        if (mx >= g_watch[i].x && mx < g_watch[i].x + g_watch[i].w &&
+            my >= g_watch[i].y && my < g_watch[i].y + g_watch[i].h) {
+            ide_sel_jump(a, g_watch[i].fi, PANE_INSPECTOR);
+            return 1;
+        }
+    }
+    return 1;   /* consume clicks anywhere in the status bar */
 }

@@ -50,6 +50,34 @@ typedef struct { Rect r; int step; } RtHit;
 static RtHit rt_hits[M_MAXFLOW];
 static int   rt_nhits;
 
+/* ---- real COH history ring (IDE-FORGE-0) ------------------------------------
+ * Replaces the old hardcoded `trend[]` sparkline with a genuine 10-sample
+ * history, pushed once per analysis (from ide_set_focus after model_analyze).
+ * Both the VIZ-3 sparkline and the Pulse read this real history. */
+#define COH_HIST_N 10
+static int g_coh_hist[COH_HIST_N];
+static int g_coh_head;    /* next write index (ring) */
+static int g_coh_count;   /* number of valid samples (<= COH_HIST_N) */
+
+void ide_coh_push(int coh) {
+    if (coh < 0) coh = 0;
+    if (coh > 100) coh = 100;
+    g_coh_hist[g_coh_head] = coh;
+    g_coh_head = (g_coh_head + 1) % COH_HIST_N;
+    if (g_coh_count < COH_HIST_N) g_coh_count++;
+}
+int ide_coh_count(void) { return g_coh_count; }
+/* Display index i in [0, COH_HIST_N): oldest..newest, right-aligned so the
+ * newest sits at index COH_HIST_N-1. Returns -1 for not-yet-filled slots. */
+int ide_coh_hist(int i) {
+    if (i < 0 || i >= COH_HIST_N || g_coh_count <= 0) return -1;
+    int empties = COH_HIST_N - g_coh_count;
+    if (i < empties) return -1;
+    int j = i - empties;          /* 0..count-1 (oldest..newest) */
+    int oldest = ((g_coh_head - g_coh_count) % COH_HIST_N + COH_HIST_N) % COH_HIST_N;
+    return g_coh_hist[(oldest + j) % COH_HIST_N];
+}
+
 /* tiny streq (freestanding; no libc): 1 if equal */
 static int rt_streq(const char* a, const char* b) {
     int i = 0;
@@ -119,8 +147,8 @@ static int rt_title(Canvas* cv, int x, int y, const char* s, int maxw) {
  * scanning the bounding box and selecting pixels whose distance to centre is
  * within the ring band, then choosing colour by their angle quadrant-fraction.
  * Pure integer maths, fully bounded -- no trig/float. */
-static void rt_ring(Canvas* cv, int cx, int cy, int rad, int thick,
-                    int pct, uint32_t fg, uint32_t track) {
+void rt_ring(Canvas* cv, int cx, int cy, int rad, int thick,
+             int pct, uint32_t fg, uint32_t track) {
     if (rad < 4) return;
     int rout = rad;
     int rin  = rad - thick;
@@ -359,12 +387,12 @@ static void rt_draw_coherence(Ide* a, Canvas* cv, int x, int y, int w, int h) {
 
     int spark_y = cap_y + GFX_FH + 2;
     if (spark_y + RT_SPARK_H <= bot) {
-        /* fixed pseudo-trend (heights 0..RT_SPARK_H), nudged toward `coh`. */
-        static const int trend[RT_SPARK_N] = { 4, 7, 5, 9, 6, 11, 8, 13, 10, 15 };
+        /* REAL history (IDE-FORGE-0): each bar is a recorded coherence sample,
+         * newest at the right. Empty slots (no sample yet) draw a stub. */
         int base = spark_y + RT_SPARK_H;
         for (int i = 0; i < RT_SPARK_N; i++) {
-            int bh = trend[i] + (coh * RT_SPARK_H) / 200;   /* lift by score */
-            bh = rt_clamp(bh, 2, RT_SPARK_H);
+            int hv = ide_coh_hist(i);
+            int bh = (hv < 0) ? 2 : rt_clamp((hv * RT_SPARK_H) / 100, 2, RT_SPARK_H);
             int bxx = x + i * (RT_SPARK_W + RT_SPARK_GAP);
             if (bxx + RT_SPARK_W > x + w) break;
             /* the most recent bar (last) is the live one -> band colour; the
@@ -402,7 +430,14 @@ static void rt_draw_warnings(Ide* a, Canvas* cv, int x, int y, int w, int h) {
     int bot = y + h;
 
     if (nrisks == 0) {
-        gfx_text_clip(cv, x, top, "No analysis yet", TH_TEXT_FAINT, x, w);
+        /* IDE-FORGE-0: "LIVE WARNINGS (0)" + "No analysis yet" was a
+         * contradiction once the model HAD been analyzed (it just found no
+         * risks). Say "No warnings" when analyzed, the honest "No analysis yet"
+         * only before the first analyze. */
+        if (m->analyzed)
+            gfx_text_clip(cv, x, top, "No warnings", TH_GREEN, x, w);
+        else
+            gfx_text_clip(cv, x, top, "No analysis yet", TH_TEXT_FAINT, x, w);
         return;
     }
 

@@ -5,6 +5,15 @@
 #include "ide_complete.h"
 #include "ide_library.h"
 #include "ide_sys.h"
+/* IDE-FORGE-0: the teaching dictionaries -- C language, x86-64 asm, and the
+ * AutomationOS API surface. Every entry carries a signature + a one-line doc
+ * that renders in the popup preview, so a user never recalls a signature from
+ * memory; the OS table doubles as "the header" for on-device coding (the
+ * on-device cc has no #include). Content verified against kernel/userspace
+ * sources by the dictionary agent; see each header's banner. */
+#include "ide_dict_c.h"
+#include "ide_dict_asm.h"
+#include "ide_dict_os.h"
 
 /* Editor insertion entry points (implemented in ide_editor.c). */
 void ide_editor_apply_completion(struct Ide* a, const char* text,
@@ -13,6 +22,7 @@ void ide_editor_apply_completion(struct Ide* a, const char* text,
 /* Parallel metadata for the editor's ac_matches[] (same index space). */
 static int g_kind[AC_MAX_MATCHES];
 static int g_snip[AC_MAX_MATCHES];   /* library index for CK_SNIPPET, else -1 */
+static const IdeDictEntry* g_dict[AC_MAX_MATCHES];  /* dict entry, else 0 */
 
 /* C keywords + types offered as completions (kept compact; the parser/lexer has
  * its own authoritative lists, but a local copy avoids a cross-module dep). */
@@ -54,7 +64,28 @@ static void try_add(Editor* e, const char* text, int kind, int snip,
     e->ac_matches[e->ac_count][k] = 0;
     g_kind[e->ac_count] = kind;
     g_snip[e->ac_count] = snip;
+    g_dict[e->ac_count] = 0;          /* plain candidate: no dict metadata */
     e->ac_count++;
+}
+
+/* Dict kind char -> CK_* chip colour. */
+static int dict_ck(char k) {
+    switch (k) {
+    case 't': return CK_TYPE;   case 'f': return CK_FUNC;
+    case 'm': case 'd': return CK_MACRO; case 's': return CK_SNIPPET;
+    case 'r': return CK_GLOBAL; default:  return CK_KEYWORD;
+    }
+}
+
+/* Merge a dictionary table, remembering which entry produced each candidate
+ * (try_add appends at index ac_count only when it actually accepts). */
+static void try_add_dict(Editor* e, const IdeDictEntry* tab, int n,
+                         const char* pf, int plen) {
+    for (int i = 0; i < n; i++) {
+        int before = e->ac_count;
+        try_add(e, tab[i].word, dict_ck(tab[i].kind), -1, pf, plen);
+        if (e->ac_count > before) g_dict[before] = &tab[i];
+    }
 }
 
 void complete_refresh(struct Ide* a) {
@@ -78,9 +109,7 @@ void complete_refresh(struct Ide* a) {
     for (int i = 0; i < m->nprotos  && i < M_MAXPROTOS;  i++) try_add(e, m->protos[i].name,  CK_FUNC,   -1, pf, plen);
     for (int i = 0; i < m->nrecords && i < M_MAXRECORDS; i++) try_add(e, m->records[i].name, CK_TYPE,   -1, pf, plen);
     for (int i = 0; i < m->nmacros  && i < M_MAXMACROS;  i++) try_add(e, m->macros[i].name,  CK_MACRO,  -1, pf, plen);
-    /* 3. C keywords / types. */
-    for (int i = 0; g_kw[i]; i++) try_add(e, g_kw[i], CK_KEYWORD, -1, pf, plen);
-    /* 4. library complex triggers (offer the snippet body on accept). */
+    /* 3. library complex triggers (offer the snippet body on accept). */
     {
         int n = lib_count();
         for (int i = 0; i < n; i++) {
@@ -88,6 +117,15 @@ void complete_refresh(struct Ide* a) {
             if (s) try_add(e, s->trigger, CK_SNIPPET, i, pf, plen);
         }
     }
+    /* 4. the teaching dictionaries (IDE-FORGE-0). Merged BEFORE the bare
+     * keyword list deliberately: dedup keeps the FIRST occurrence, so every
+     * keyword the C dict covers arrives with its signature + doc for the
+     * preview pane instead of as a bare word. */
+    try_add_dict(e, IDE_DICT_C,   IDE_DICT_C_COUNT,   pf, plen);
+    try_add_dict(e, IDE_DICT_OS,  IDE_DICT_OS_COUNT,  pf, plen);
+    try_add_dict(e, IDE_DICT_ASM, IDE_DICT_ASM_COUNT, pf, plen);
+    /* 5. bare C keywords / types (fallback for anything the dict lacks). */
+    for (int i = 0; g_kw[i]; i++) try_add(e, g_kw[i], CK_KEYWORD, -1, pf, plen);
 
     /* Clamp to the visible-rows Settings knob (AC_MAX_MATCHES is the array cap;
      * g_ac_visible just limits how many of the top matches we keep/show). */
@@ -107,8 +145,37 @@ int complete_kind(int i) {
     return g_kind[i];
 }
 
+/* Compose a dict entry's preview: signature, blank line, doc, blank line,
+ * snippet. The preview pane clips each line at ~28 visible chars, so the
+ * sig/doc are word-wrapped to 28 (the snippet keeps its own line breaks). */
+static char g_dictpv[640];
+static int pv_word(char* o, int oc, int p, const char* s, int wrap) {
+    int col = 0;
+    for (int i = 0; s[i] && p < oc - 1; i++) {
+        if (s[i] == ' ' && col >= wrap) { o[p++] = '\n'; col = 0; continue; }
+        o[p++] = s[i];
+        col = (s[i] == '\n') ? 0 : col + 1;
+    }
+    return p;
+}
+static const char* dict_compose(const IdeDictEntry* d) {
+    int p = 0, oc = (int)sizeof(g_dictpv);
+    if (d->sig)  p = pv_word(g_dictpv, oc, p, d->sig, 28);
+    if (d->doc) {
+        if (p < oc - 2) { g_dictpv[p++] = '\n'; g_dictpv[p++] = '\n'; }
+        p = pv_word(g_dictpv, oc, p, d->doc, 28);
+    }
+    if (d->snippet) {
+        if (p < oc - 2) { g_dictpv[p++] = '\n'; g_dictpv[p++] = '\n'; }
+        p = pv_word(g_dictpv, oc, p, d->snippet, 60);
+    }
+    g_dictpv[p < oc ? p : oc - 1] = 0;
+    return g_dictpv;
+}
+
 const char* complete_preview(int i) {
     if (i < 0 || i >= AC_MAX_MATCHES) return 0;
+    if (g_dict[i]) return dict_compose(g_dict[i]);   /* every dict entry teaches */
     if (g_kind[i] != CK_SNIPPET) return 0;
     const Snippet* s = lib_get(g_snip[i]);
     return s ? s->body : 0;
@@ -118,6 +185,17 @@ void complete_accept(struct Ide* a) {
     Editor* e = &a->editor;
     if (!e->ac_active || e->ac_count == 0) return;
     if (e->ac_sel < 0 || e->ac_sel >= e->ac_count) return;   /* bounds guard */
+    if (g_dict[e->ac_sel]) {
+        /* dict entry: a snippet expands with tab-stops, else the bare word */
+        const IdeDictEntry* d = g_dict[e->ac_sel];
+        if (d->snippet && d->snippet[0])
+            ide_editor_apply_completion(a, d->snippet, 1, e->ac_prefix_len);
+        else
+            ide_editor_apply_completion(a, d->word, 0, e->ac_prefix_len);
+        e->ac_active = 0;
+        e->ac_count = 0;
+        return;
+    }
     int kind = g_kind[e->ac_sel];
     if (kind == CK_SNIPPET) {
         const Snippet* s = lib_get(g_snip[e->ac_sel]);

@@ -1,0 +1,46 @@
+# Makefile for mkinitrd tool
+
+CC = gcc
+CFLAGS = -Wall -Wextra -O2 -g
+LDFLAGS =
+
+BUILD_DIR = ../build
+TARGET = $(BUILD_DIR)/mkinitrd
+
+SRC = mkinitrd.c
+OBJ = $(BUILD_DIR)/mkinitrd.o
+
+.PHONY: all clean test
+
+all: $(TARGET)
+
+$(TARGET): $(OBJ)
+	@echo "Linking mkinitrd..."
+	$(CC) $(LDFLAGS) -o $@ $^
+	@echo "Built: $@"
+
+$(OBJ): $(SRC)
+	@mkdir -p $(BUILD_DIR)
+	@echo "Compiling $<..."
+	$(CC) $(CFLAGS) -c -o $@ $<
+
+clean:
+	@echo "Cleaning mkinitrd..."
+	rm -f $(OBJ) $(TARGET)
+
+# Test mkinitrd
+test: $(TARGET)
+	@echo "Testing mkinitrd..."
+	@mkdir -p $(BUILD_DIR)/test_initrd/sbin
+	@mkdir -p $(BUILD_DIR)/test_initrd/lib
+	@echo "#!/bin/sh" > $(BUILD_DIR)/test_initrd/sbin/init
+	@echo "echo 'Init process started'" >> $(BUILD_DIR)/test_initrd/sbin/init
+	@chmod +x $(BUILD_DIR)/test_initrd/sbin/init
+	$(TARGET) -o $(BUILD_DIR)/test_initrd.img -d $(BUILD_DIR)/test_initrd
+	@echo "Created test initrd: $(BUILD_DIR)/test_initrd.img"
+	@ls -lh $(BUILD_DIR)/test_initrd.img
+
+install: $(TARGET)
+	@echo "Installing mkinitrd to /usr/local/bin..."
+	sudo cp $(TARGET) /usr/local/bin/
+	@echo "Installed."

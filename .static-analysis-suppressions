@@ -1,0 +1,62 @@
+# Static Analysis Suppressions for AutomationOS
+#
+# Format: <tool>:<file>:<line>:<check>:<reason>
+#
+# This file documents known false positives and intentional patterns
+# that trigger static analysis warnings but are actually correct.
+
+# Higher-half kernel mapping guarantees non-NULL after boot
+clang-analyzer:kernel/arch/x86_64/paging.c:*:core.NullDereference:Higher-half mapping guaranteed non-NULL after boot sequence
+
+# Inline assembly initializes these variables
+cppcheck:kernel/arch/x86_64/gdt.c:*:uninitvar:GDT/IDT initialized by inline assembly load instructions
+cppcheck:kernel/arch/x86_64/idt.c:*:uninitvar:Interrupt tables initialized by assembly
+
+# Physical address casting is intentional for memory management
+sparse:kernel/core/mem/vmm.c:*:address-space:Physical addresses intentionally cast for page table setup
+sparse:kernel/arch/x86_64/paging.c:*:address-space:Direct physical memory access required for paging
+
+# Infinite loops are expected in kernel code
+cppcheck:kernel/kernel.c:*:infiniteLoop:Kernel main loop intentionally infinite - this is the OS
+cppcheck:kernel/core/sched/scheduler.c:*:infiniteLoop:Scheduler runs continuously
+
+# Intentional null pointer arithmetic for low memory access
+cppcheck:kernel/core/mem/pmm.c:*:nullPointerArithmetic:Physical memory base address calculation
+sparse:kernel/arch/x86_64/paging.c:*:null-pointer-arithmetic:Page table base address setup
+
+# Hardware initialization requires specific timing/ordering
+clang-tidy:kernel/drivers/pit.c:*:performance-no-int-to-ptr:Hardware register access requires address casting
+clang-tidy:kernel/drivers/serial.c:*:performance-no-int-to-ptr:I/O port access via inline assembly
+
+# Bitwise operations on hardware registers look like logic errors
+clang-analyzer:kernel/drivers/ps2.c:*:core.BitwiseShift:Hardware protocol requires specific bit manipulation
+cppcheck:kernel/drivers/framebuffer.c:*:clarifyCondition:Pixel format bit masking intentional
+
+# Counter variables incremented in assembly or by hardware
+clang-analyzer:kernel/core/perf.c:*:deadcode.DeadStores:Performance counter updated by CPU
+
+# Intentional truncation for hash/checksum functions
+cppcheck:kernel/crypto/sha256.c:*:truncLongCastAssignment:SHA-256 algorithm requires 32-bit wrap
+clang-tidy:kernel/crypto/rsa.c:*:bugprone-narrowing-conversions:Crypto math uses modular arithmetic
+
+# Security features with complex control flow
+clang-analyzer:kernel/security/seccomp/filter.c:*:core.NonNullParamChecker:Filter validated before use
+cppcheck:kernel/audit/buffer.c:*:redundantAssignment:Ring buffer requires initialization pattern
+
+# Namespace/capability code uses pointer tricks
+sparse:kernel/security/namespace.c:*:context:Namespace transitions affect context
+clang-tidy:kernel/core/capability/cap_table.c:*:readability-function-cognitive-complexity:Capability checking inherently complex
+
+# Test code
+clang-analyzer:kernel/test_serial.c:*:*:Test code, not production
+cppcheck:kernel/test_serial.c:*:*:Test code excluded from production builds
+
+# Library functions with unusual patterns
+cppcheck:kernel/lib/string.c:*:wrongPrintfScanfArgNum:Custom printf implementation
+clang-analyzer:kernel/lib/printf.c:*:valist.Uninitialized:va_list handled correctly
+
+# Scheduler context switching has assembly
+cppcheck:kernel/core/sched/context.c:*:uninitvar:Register state saved/restored by inline assembly
+
+# Resource limits checked at higher level
+clang-analyzer:kernel/core/rlimit/*.c:*:unix.Malloc:Memory ownership transferred to caller

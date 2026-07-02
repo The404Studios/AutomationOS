@@ -1,0 +1,30 @@
+# AutomationOS Window Manager Service
+# Manages window placement, animations, and desktop interactions
+
+[Service]
+Description=Window Manager with Animations
+Type=simple
+ExecStart=/usr/bin/window-manager
+WorkingDirectory=/
+
+# Dependencies
+Requires=compositor
+After=compositor
+
+# Restart policy
+Restart=always
+RestartDelay=2
+
+# Resource limits
+CPUQuota=50
+MemoryLimit=256M
+TaskLimit=10
+FileLimit=1024
+
+# Timeouts
+TimeoutStartSec=30
+TimeoutStopSec=10
+
+# User and permissions
+User=root
+Group=root

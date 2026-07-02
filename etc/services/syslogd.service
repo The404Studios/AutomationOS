@@ -1,0 +1,19 @@
+[Service]
+Description=System Logging Service
+Type=simple
+
+ExecStart=/usr/sbin/syslogd
+WorkingDirectory=/var/log
+
+User=root
+Group=root
+
+# No dependencies - starts first
+Restart=always
+RestartDelay=2s
+
+CPUQuota=10%
+MemoryLimit=50M
+
+TimeoutStartSec=15s
+TimeoutStopSec=10s

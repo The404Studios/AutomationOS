@@ -1,0 +1,21 @@
+[Service]
+Description=Audio Server Service
+Type=simple
+
+ExecStart=/usr/sbin/audiod
+WorkingDirectory=/var/lib/audio
+
+User=audio
+Group=audio
+
+Requires=dbus.service
+After=dbus.service
+
+Restart=always
+RestartDelay=2s
+
+CPUQuota=30%
+MemoryLimit=100M
+
+TimeoutStartSec=30s
+TimeoutStopSec=20s

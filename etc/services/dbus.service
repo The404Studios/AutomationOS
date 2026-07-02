@@ -1,0 +1,21 @@
+[Service]
+Description=D-Bus System Message Bus
+Type=simple
+
+ExecStart=/usr/bin/dbus-daemon --system --nofork
+WorkingDirectory=/run/dbus
+
+User=messagebus
+Group=messagebus
+
+After=syslogd.service
+Requires=syslogd.service
+
+Restart=always
+RestartDelay=2s
+
+CPUQuota=20%
+MemoryLimit=100M
+
+TimeoutStartSec=30s
+TimeoutStopSec=15s

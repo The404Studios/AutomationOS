@@ -1,0 +1,31 @@
+[Service]
+Description=Network Management Service
+Type=simple
+
+ExecStart=/usr/sbin/networkd
+ExecReload=/bin/kill -HUP $MAINPID
+ExecStop=/bin/kill -TERM $MAINPID
+WorkingDirectory=/var/lib/network
+
+User=network
+Group=network
+
+Requires=dbus.service
+After=dbus.service
+
+Restart=always
+RestartDelay=5s
+RestartMaxAttempts=5
+
+# Resource limits
+CPUQuota=50%
+MemoryLimit=100M
+TaskLimit=100
+FileLimit=1024
+
+# Timeouts
+TimeoutStartSec=30s
+TimeoutStopSec=30s
+
+# Watchdog
+WatchdogSec=60s

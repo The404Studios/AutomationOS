@@ -1,0 +1,96 @@
+diff --git a/scripts/build_all.sh b/scripts/build_all.sh
+index 8df610f..308402c 100644
+--- a/scripts/build_all.sh
++++ b/scripts/build_all.sh
+@@ -22,6 +22,10 @@ if [ "${STRESS:-0}" = "1" ]; then
+     INIT_EXTRA="$INIT_EXTRA -DPREEMPT_STRESS"
+     echo "*** STRESS build: init compiled with -DPREEMPT_STRESS (spawns cpuburners) ***"
+ fi
++if [ "${FAIRTEST:-0}" = "1" ]; then
++    INIT_EXTRA="$INIT_EXTRA -DFAIRTEST"
++    echo "*** FAIRTEST build: init spawns pure burners + a sleeper (SCHED-FAIRNESS-0) ***"
++fi
+ # GAMETEST=1 adds -DGAMETEST_RUN to the init compile ONLY, so init spawns
+ # sbin/gametest (the spawn+survive harness over all games + key apps). Unset =>
+ # the normal boot is byte-for-byte unchanged.
+@@ -107,6 +111,17 @@ $LD /tmp/forkfdtest.o -o /tmp/forkfdtest.elf
+ # FORKREGTEST RESULT: PASS iff fork() inherits the parent register set.
+ cc userspace/apps/forkregtest/forkregtest.c /tmp/forkregtest.o
+ $LD /tmp/forkregtest.o -o /tmp/forkregtest.elf
++# EXECVE-INPLACE-0: exectest driver (bare _start, no crt0 -- like forktest). It
++# execve()s sbin/execchild over its own image. (execchild is crt0-linked and
++# built below, after crt0.o is assembled.)
++cc userspace/apps/exectest/exectest.c /tmp/exectest.o
++$LD /tmp/exectest.o -o /tmp/exectest.elf
++# pureburn + fairwake: SCHED-FAIRNESS-0 proof (a pure non-syscalling ring-3
++# burner + a sleeper that must still wake). Spawned by init only under FAIRTEST=1.
++cc userspace/apps/pureburn/pureburn.c /tmp/pureburn.o
++$LD /tmp/pureburn.o -o /tmp/pureburn.elf
++cc userspace/apps/fairwake/fairwake.c /tmp/fairwake.o
++$LD /tmp/fairwake.o -o /tmp/fairwake.elf
+ # threadtest: standalone REAL-THREADS probe (no libs), spawned by init. Proves
+ # shared address space + independent stacks + independent FPU across 4 threads.
+ cc userspace/apps/threadtest/threadtest.c /tmp/threadtest.o
+@@ -139,6 +154,9 @@ cc userspace/apps/tar/tar.c     /tmp/tar.o;     $LD /tmp/crt0.o /tmp/tar.o     -
+ cc userspace/apps/pkg/pkg.c     /tmp/pkg.o;     $LD /tmp/crt0.o /tmp/pkg.o     -o /tmp/pkg.elf
+ cc userspace/apps/make/make.c   /tmp/make.o;    $LD /tmp/crt0.o /tmp/make.o    -o /tmp/make.elf
+ cc userspace/apps/argvtest/argvtest.c /tmp/argvtest.o; $LD /tmp/crt0.o /tmp/argvtest.o -o /tmp/argvtest.elf
++# EXECVE-INPLACE-0: execchild = the post-execve image, linked WITH crt0 so it gets
++# main(argc,argv,envp). Reached ONLY via exectest's execve().
++cc userspace/apps/execchild/execchild.c /tmp/execchild.o; $LD /tmp/crt0.o /tmp/execchild.o -o /tmp/execchild.elf
+ # msgtest: CHANNEL-0 P5b proof -- a userspace CH_MSG send/recv round-trip via a
+ # self-spawned bound child (also proves EAGAIN + EMSGSIZE). crt0-linked; uses
+ # userspace/lib/channel.h. Prints MSGTEST: PASS/FAIL to serial.
+@@ -411,6 +429,25 @@ $LD /tmp/crt0.o /tmp/browser2.o $WEB_OBJS $JS_OBJS $JS_WEB_OBJS $HTTPS_OBJS /tmp
+ cc userspace/apps/webapitest/webapitest.c /tmp/webapitest.o
+ $LD /tmp/crt0.o /tmp/webapitest.o $WEB_OBJS $JS_OBJS $JS_WEB_OBJS $HTTPS_OBJS -o /tmp/webapitest.elf
+ 
++# --- B1 · TLS-REQUIRE-0 -------------------------------------------------------
++# tls.c declares x509_verify_chain() as a WEAK symbol, so a TLS binary that fails
++# to link x509_verify.o would build cleanly and then run HTTPS connections flagged
++# unauthenticated (silent MITM). Convert that latent risk into a HARD build failure:
++# assert the validator is a DEFINED text symbol (nm 'T') in every binary that links
++# $HTTPS_OBJS. ($CRYPTO_OBJS already carries x509_verify.o today; this guards against
++# a future refactor silently dropping it.)
++echo "[all] B1 TLS validator link check..."
++TLS_BINS="wget tlsprobe apidemo webtest browser2 webapitest"
++for b in $TLS_BINS; do
++    if ! nm "/tmp/$b.elf" 2>/dev/null | grep -qE ' T x509_verify_chain$'; then
++        echo "[all] FATAL B1: /tmp/$b.elf does NOT define x509_verify_chain --"
++        echo "       HTTPS certificate validation would be silently bypassed."
++        echo "       Ensure userspace/lib/tls/x509_verify.c is linked (it is in \$CRYPTO_OBJS)."
++        exit 1
++    fi
++done
++echo "TLSREQUIRE: PASS validator_linked=1 bins=\"$TLS_BINS\""
++
+ # ---- Networking tools (link the dns lib) ----
+ echo "[all] net tools (ping/nc)..."
+ cc userspace/apps/ping/ping.c /tmp/ping.o; $LD /tmp/crt0.o /tmp/ping.o /tmp/dns.o -o /tmp/ping.elf
+@@ -570,7 +607,7 @@ $LD /tmp/crt0.o /tmp/cc.o \
+     -o /tmp/cc.elf
+ 
+ echo "[all] canary check (all must be 0):"
+-for e in comp init filemanager calculator clock sysinfo settings sysmon uidemo dateapp applauncher taskman terminal editor snake paint synth tetris game2048 sheet notes calendar stopwatch mines piano dashboard welcome bench breakout pong invaders procmon soundtest solitaire aiconsole screenshot stress musicplayer ide bubbletd zombietd pacman clockapp forktest sigtest pollselftest threadtest reaploop forkfdtest forkregtest matmuljobs aibroker sed awk tar pkg make meminfo argvtest msgtest rpctest toolrun echoproof echoargs agenthost tool_read tool_ls tool_stat toolset_host chainhost modelbridge initrdp initrdalias floattest sleeptest prioritytest matbench tensortest cpuburn blk ps kill free uptime find diff cmp tee wcx xargs gzip cc nettest sockettest cpu1offload smpstress wget netman browser cryptotest libtest ping nc netinfo netscan tcping dig httpget pktmon httpd traceroute arp grep head tail sort uniq cut tr nl du touch basename dirname uname hostname whoami date less hexdump lspci tlsprobe certtool dhcpc autodhcp apidemo js futextest epolltest sendfiletest perftest batchtest domtest htmltest csstest layouttest webtest browser2 webapitest cube3d ray chess asteroids sudoku photos startmenu controlcenter gametest; do
++for e in comp init filemanager calculator clock sysinfo settings sysmon uidemo dateapp applauncher taskman terminal editor snake paint synth tetris game2048 sheet notes calendar stopwatch mines piano dashboard welcome bench breakout pong invaders procmon soundtest solitaire aiconsole screenshot stress musicplayer ide bubbletd zombietd pacman clockapp forktest sigtest pollselftest pureburn fairwake threadtest reaploop forkfdtest forkregtest matmuljobs aibroker sed awk tar pkg make meminfo argvtest msgtest rpctest toolrun echoproof echoargs agenthost tool_read tool_ls tool_stat toolset_host chainhost modelbridge initrdp initrdalias floattest sleeptest prioritytest matbench tensortest cpuburn blk ps kill free uptime find diff cmp tee wcx xargs gzip cc nettest sockettest cpu1offload smpstress wget netman browser cryptotest libtest ping nc netinfo netscan tcping dig httpget pktmon httpd traceroute arp grep head tail sort uniq cut tr nl du touch basename dirname uname hostname whoami date less hexdump lspci tlsprobe certtool dhcpc autodhcp apidemo js futextest epolltest sendfiletest perftest batchtest domtest htmltest csstest layouttest webtest browser2 webapitest cube3d ray chess asteroids sudoku photos startmenu controlcenter gametest exectest execchild; do
+     n=$(objdump -d /tmp/$e.elf 2>/dev/null | grep -c "fs:0x28" || true)
+     echo "  $e=$n"
+ done
+@@ -589,7 +626,7 @@ rm -rf /tmp/ird && mkdir -p /tmp/ird/sbin /tmp/ird/bin
+ if [ "${SELFHEAL:-0}" != "1" ]; then rm -f /tmp/ird/sbin/cwatchdog; fi
+ cp /tmp/comp.elf /tmp/ird/sbin/compositor
+ cp /tmp/init.elf /tmp/ird/sbin/init
+-for e in filemanager calculator clock sysinfo settings sysmon uidemo dateapp applauncher taskman terminal editor snake paint synth tetris game2048 sheet notes calendar stopwatch mines piano dashboard welcome bench breakout pong invaders procmon soundtest solitaire aiconsole screenshot stress musicplayer ide bubbletd startmenu controlcenter chess asteroids sudoku photos pacman clockapp zombietd forktest sigtest pollselftest threadtest reaploop forkfdtest forkregtest matmuljobs cube3d ray derby; do
++for e in filemanager calculator clock sysinfo settings sysmon uidemo dateapp applauncher taskman terminal editor snake paint synth tetris game2048 sheet notes calendar stopwatch mines piano dashboard welcome bench breakout pong invaders procmon soundtest solitaire aiconsole screenshot stress musicplayer ide bubbletd startmenu controlcenter chess asteroids sudoku photos pacman clockapp zombietd forktest sigtest pollselftest pureburn fairwake threadtest reaploop forkfdtest forkregtest matmuljobs cube3d ray derby exectest; do
+     cp /tmp/$e.elf /tmp/ird/sbin/$e
+ done
+ [ "$IV_OK" = "1" ] && cp /tmp/imageviewer.elf /tmp/ird/sbin/imageviewer
+@@ -604,6 +641,8 @@ cp /tmp/pkg.elf      /tmp/ird/bin/pkg
+ cp /tmp/make.elf     /tmp/ird/bin/make
+ cp /tmp/meminfo.elf  /tmp/ird/bin/meminfo
+ cp /tmp/argvtest.elf /tmp/ird/sbin/argvtest
++# EXECVE-INPLACE-0: execchild -> /sbin (reached only via exectest's execve()).
++cp /tmp/execchild.elf /tmp/ird/sbin/execchild
+ # msgtest -> /sbin (init spawns it at boot; it self-spawns sbin/msgtest as a
+ # bound child for the CHANNEL-0 P5b CH_MSG round-trip proof).
+ cp /tmp/msgtest.elf /tmp/ird/sbin/msgtest

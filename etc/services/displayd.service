@@ -1,0 +1,22 @@
+[Service]
+Description=Display Manager Service
+Type=simple
+
+ExecStart=/usr/sbin/displayd
+WorkingDirectory=/var/lib/display
+
+User=display
+Group=display
+
+Requires=dbus.service devmgr.service
+After=dbus.service devmgr.service audiod.service
+Wants=audiod.service
+
+Restart=always
+RestartDelay=3s
+
+CPUQuota=80%
+MemoryLimit=500M
+
+TimeoutStartSec=60s
+TimeoutStopSec=30s

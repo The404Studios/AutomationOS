@@ -1,0 +1,20 @@
+[Service]
+Description=System Update Service
+Type=simple
+
+ExecStart=/usr/sbin/updated
+WorkingDirectory=/var/lib/updates
+
+User=root
+Group=root
+
+Requires=networking.service
+After=networking.service
+
+Restart=on-failure
+RestartDelay=10s
+
+CPUQuota=50%
+MemoryLimit=200M
+
+TimeoutStartSec=60s

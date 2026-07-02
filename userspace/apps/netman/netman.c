@@ -228,6 +228,30 @@ static char          g_connecting_ssid[33];
 static int           g_connecting = 0;    /* 1 while a connect is in flight */
 static char          g_connected_ssid[33];/* SSID we believe is connected   */
 
+/* CFG-CONSUME-0: persist the credentials of a successful connect via the
+ * durable config store (SYS_CFG_SET), and auto-rejoin on the next boot when
+ * the saved SSID reappears in a scan. This is the config store's first real
+ * userspace consumer (C0 was done infra with no consumer). */
+#define SYS_CFG_GET   133
+#define SYS_CFG_SET   134
+static unsigned char g_connecting_sec = 0;      /* sec of the in-flight connect */
+static char          g_connecting_pass[64];     /* pass of the in-flight connect */
+static int           g_saved = 0;               /* creds already persisted?     */
+static char          g_autojoin_ssid[33];       /* saved SSID to rejoin (or "") */
+static char          g_autojoin_pass[64];
+static unsigned char g_autojoin_sec = 0;
+static int           g_autojoin_done = 0;        /* one-shot rejoin guard        */
+
+/* SYS_CFG_SET(key, val, len) -> 0 on success. */
+static void cfg_put(const char *key, const void *val, int len) {
+    sc(SYS_CFG_SET, (long)key, (long)val, (long)len, 0, 0);
+}
+/* SYS_CFG_GET(key, buf, cap) -> bytes copied, or <0 absent. */
+static int cfg_take(const char *key, void *buf, int cap) {
+    return (int)sc(SYS_CFG_GET, (long)key, (long)buf, (long)cap, 0, 0);
+}
+static int nm_strlen(const char *s){ int n=0; while(s[n]) n++; return n; }
+
 /* Modal passphrase dialog (created/freed on demand). */
 static ui_widget_t *g_modal_root = 0;     /* whole modal subtree (dim+panel)*/
 static ui_widget_t *g_modal_pass = 0;     /* masked textbox                 */
@@ -474,6 +498,15 @@ static void begin_connect(const char *ssid, unsigned char sec, const char *pass)
         while (ssid[i] && i < 32) { g_connecting_ssid[i] = ssid[i]; i++; }
         g_connecting_ssid[i] = '\0';
     }
+    /* CFG-CONSUME-0: stash sec + pass so poll_wlan_status can persist them ONLY
+     * on a successful CONNECTED (a failed attempt must not overwrite good creds). */
+    g_connecting_sec = sec;
+    {
+        int i = 0;
+        if (pass) while (pass[i] && i < 63) { g_connecting_pass[i] = pass[i]; i++; }
+        g_connecting_pass[i] = '\0';
+    }
+    g_saved = 0;
     g_connecting = 1;
     g_connected_ssid[0] = '\0';
 
@@ -551,6 +584,21 @@ static void poll_wlan_status(void)
             }
             g_connected_ssid[i] = '\0';
             g_connecting = 0;
+
+            /* CFG-CONSUME-0: persist the winning creds durably (write-through to
+             * diskfs config.db) so the next boot can auto-rejoin. Once only. */
+            if (!g_saved) {
+                unsigned char sec = g_connecting_sec;
+                cfg_put("wifi.ssid", g_connected_ssid, nm_strlen(g_connected_ssid));
+                cfg_put("wifi.psk",  g_connecting_pass, nm_strlen(g_connecting_pass));
+                cfg_put("wifi.sec",  &sec, 1);
+                g_saved = 1;
+                char pline[64];
+                int p = str_append(pline, 0, "[NETMAN] saved wifi.ssid=");
+                p = str_append(pline, p, g_connected_ssid);
+                pline[p++] = '\n'; pline[p] = '\0';
+                serial_print(pline);
+            }
         }
         hide_connecting();
 
@@ -683,6 +731,25 @@ static void do_scan(void)
         if (g_row_bars[i])
             ui_signal_bars_set(g_row_bars[i], dbm_to_bars(bss[i].signal));
         /* (list_row text is set at creation; SSIDs are stable in wifisim.) */
+    }
+
+    /* CFG-CONSUME-0: auto-rejoin. If we booted with a saved SSID (g_autojoin_*)
+     * and are not already connected/connecting, and that SSID is now in range,
+     * kick a connect with the persisted passphrase. One-shot per boot. */
+    if (g_autojoin_ssid[0] && !g_autojoin_done && !g_connecting &&
+        g_connected_ssid[0] == '\0') {
+        for (int i = 0; i < (int)count; i++) {
+            if (str_eq(g_ssid[i], g_autojoin_ssid)) {
+                char rline[64];
+                int p = str_append(rline, 0, "[NETMAN] auto-rejoin ");
+                p = str_append(rline, p, g_autojoin_ssid);
+                rline[p++] = '\n'; rline[p] = '\0';
+                serial_print(rline);
+                g_autojoin_done = 1;
+                begin_connect(g_autojoin_ssid, g_autojoin_sec, g_autojoin_pass);
+                break;
+            }
+        }
     }
 
     /* Report the count when it changes. */

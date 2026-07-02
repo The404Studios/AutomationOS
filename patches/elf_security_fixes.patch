@@ -1,0 +1,122 @@
+diff --git a/kernel/fs/exec.c b/kernel/fs/exec.c
+index original..fixed
+--- a/kernel/fs/exec.c
++++ b/kernel/fs/exec.c
+@@ -227,10 +227,21 @@ int elf_load_and_exec(void* elf_data, size_t elf_size, const char* name) {
+             ehdr->e_phnum, ehdr->e_phoff);
+
++    // Validate e_phnum has reasonable upper bound (prevent overflow)
++    if (ehdr->e_phnum > 65535) {
++        kprintf("[EXEC] ERROR: Excessive program header count (%d)\n", ehdr->e_phnum);
++        return ELF_ERR_INVALID;
++    }
++
+     // Check program header table is within buffer bounds
+     uint64_t phdr_end = ehdr->e_phoff + (ehdr->e_phnum * ehdr->e_phentsize);
+     if (phdr_end > elf_size) {
+         kprintf("[EXEC] Program header table extends beyond buffer\n");
++        return ELF_ERR_INVALID;
++    }
++
++    // Additional safety check against multiplication overflow
++    if (ehdr->e_phentsize > 1024) {
++        kprintf("[EXEC] ERROR: Invalid program header entry size (%d)\n", ehdr->e_phentsize);
+         return ELF_ERR_INVALID;
+     }
+
+@@ -238,6 +249,69 @@ int elf_load_and_exec(void* elf_data, size_t elf_size, const char* name) {
+     // (Using the same segment loading logic as elf_load())
+     const elf64_phdr_t* phdr = (const elf64_phdr_t*)((uint8_t*)elf_data + ehdr->e_phoff);
+
++    // First pass: Validate all PT_LOAD segments and check for overlaps
++    kprintf("[EXEC] Validating segment layout...\n");
++    int load_segment_count = 0;
++
++    for (int i = 0; i < ehdr->e_phnum; i++) {
++        if (phdr[i].p_type != PT_LOAD) continue;
++        load_segment_count++;
++
++        // Check for invalid filesz > memsz
++        if (phdr[i].p_filesz > phdr[i].p_memsz) {
++            kprintf("[EXEC] ERROR: Segment %d filesz (0x%lx) > memsz (0x%lx)\n",
++                    i, phdr[i].p_filesz, phdr[i].p_memsz);
++            return ELF_ERR_INVALID;
++        }
++
++        // Check for address overflow: p_vaddr + p_memsz
++        if (phdr[i].p_vaddr > USER_SPACE_END - phdr[i].p_memsz) {
++            kprintf("[EXEC] ERROR: Segment %d size causes address overflow\n", i);
++            kprintf("[EXEC]   vaddr=0x%lx memsz=0x%lx\n", phdr[i].p_vaddr, phdr[i].p_memsz);
++            return ELF_ERR_INVALID;
++        }
++
++        // Calculate segment boundaries
++        uint64_t seg_start = ALIGN_DOWN(phdr[i].p_vaddr, PAGE_SIZE);
++        uint64_t seg_end = ALIGN_UP(phdr[i].p_vaddr + phdr[i].p_memsz, PAGE_SIZE);
++
++        // Check for segment overlaps with other PT_LOAD segments
++        for (int j = i + 1; j < ehdr->e_phnum; j++) {
++            if (phdr[j].p_type != PT_LOAD) continue;
++
++            uint64_t other_start = ALIGN_DOWN(phdr[j].p_vaddr, PAGE_SIZE);
++            uint64_t other_end = ALIGN_UP(phdr[j].p_vaddr + phdr[j].p_memsz, PAGE_SIZE);
++
++            // Check for overlap: seg1_start < seg2_end AND seg2_start < seg1_end
++            if (seg_start < other_end && other_start < seg_end) {
++                kprintf("[EXEC] ERROR: Overlapping segments %d and %d\n", i, j);
++                kprintf("[EXEC]   Segment %d: 0x%016lx - 0x%016lx\n", i, seg_start, seg_end);
++                kprintf("[EXEC]   Segment %d: 0x%016lx - 0x%016lx\n", j, other_start, other_end);
++                return ELF_ERR_INVALID;
++            }
++        }
++
++        // Check segment doesn't overlap with stack
++        #define USER_STACK_SIZE (8 * 1024 * 1024)
++        #define USER_STACK_TOP  0x00007FFFFFFFE000ULL
++        uint64_t stack_bottom = USER_STACK_TOP - USER_STACK_SIZE;
++
++        if (seg_start < USER_STACK_TOP && stack_bottom < seg_end) {
++            kprintf("[EXEC] WARNING: Segment %d overlaps with stack area\n", i);
++            kprintf("[EXEC]   Segment: 0x%016lx - 0x%016lx\n", seg_start, seg_end);
++            kprintf("[EXEC]   Stack:   0x%016lx - 0x%016lx\n", stack_bottom, USER_STACK_TOP);
++            // Don't reject - let it proceed (user might want non-standard layout)
++        }
++    }
++
++    if (load_segment_count == 0) {
++        kprintf("[EXEC] ERROR: No PT_LOAD segments found\n");
++        return ELF_ERR_INVALID;
++    }
++
++    kprintf("[EXEC] Segment validation passed (%d PT_LOAD segments)\n", load_segment_count);
++
++    // Second pass: Load segments into memory
+     for (int i = 0; i < ehdr->e_phnum; i++) {
+         kprintf("[EXEC]   Segment %d: type=0x%x offset=0x%lx filesz=0x%lx memsz=0x%lx\n",
+                 i, phdr[i].p_type, phdr[i].p_offset, phdr[i].p_filesz, phdr[i].p_memsz);
+@@ -318,7 +392,7 @@ int elf_load_and_exec(void* elf_data, size_t elf_size, const char* name) {
+     }
+
+     // Setup user stack
+-    #define USER_STACK_SIZE (8 * 1024 * 1024)  // 8MB
++    #undef USER_STACK_SIZE
+     #define USER_STACK_TOP  0x00007FFFFFFFE000ULL
+     uint64_t stack_bottom = USER_STACK_TOP - USER_STACK_SIZE;
+     uint64_t num_stack_pages = USER_STACK_SIZE / PAGE_SIZE;
+@@ -326,6 +400,15 @@ int elf_load_and_exec(void* elf_data, size_t elf_size, const char* name) {
+     kprintf("[EXEC] Setting up user stack: 0x%016lx - 0x%016lx (%lu pages)\n",
+             stack_bottom, USER_STACK_TOP, num_stack_pages);
+
++    // Allocate guard page (first page not mapped)
++    kprintf("[EXEC] Guard page: 0x%016lx (unmapped)\n", stack_bottom);
++
++    // Note: Guard page at stack_bottom is left unmapped
++    // Access to guard page will cause page fault
++    // This detects stack overflow
++
++    // Start allocating from second page
++    num_stack_pages--;  // Reserve first page as guard
++    stack_bottom += PAGE_SIZE;  // Skip guard page
++
+     for (uint64_t i = 0; i < num_stack_pages; i++) {
+         uint64_t vaddr = stack_bottom + (i * PAGE_SIZE);

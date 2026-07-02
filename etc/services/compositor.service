@@ -1,0 +1,54 @@
+# AutomationOS Compositor Service
+# GPU-accelerated display server
+
+[Service]
+Name=compositor
+Description=GPU-accelerated display compositor
+Type=forking
+ExecStart=/usr/bin/compositord --daemon
+ExecStop=/usr/bin/killall compositord
+ExecReload=/usr/bin/killall -HUP compositord
+
+# Dependencies (names must match .service filenames without extension)
+Requires=devmgr
+After=devmgr
+Before=displayd window-manager
+
+# Process management
+Restart=always
+RestartDelay=1000
+RestartMaxAttempts=5
+TimeoutStart=10
+TimeoutStop=5
+
+# User and permissions
+User=root
+Group=video
+Umask=0022
+
+# Environment
+Environment=DISPLAY=:0
+Environment=XDG_RUNTIME_DIR=/run
+
+# Resource limits
+CPUQuota=80
+MemoryLimit=512M
+TaskLimit=100
+FileLimit=1024
+
+# Logging
+LogPath=/var/log/services/compositor.log
+
+# Watchdog
+WatchdogEnabled=true
+WatchdogTimeout=30
+
+# Working directory
+WorkingDirectory=/
+
+# Capabilities (for GPU access)
+# CAP_SYS_ADMIN for DRM/KMS
+# CAP_SYS_RESOURCE for memory locks
+
+[Install]
+WantedBy=graphical.target

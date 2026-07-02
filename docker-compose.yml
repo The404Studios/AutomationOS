@@ -1,0 +1,69 @@
+version: '3.8'
+
+services:
+  # Build environment container
+  build:
+    build:
+      context: .
+      dockerfile: Dockerfile.build
+      cache_from:
+        - automationos-build:latest
+    image: automationos-build:latest
+    container_name: automationos-build
+    volumes:
+      # Mount source code
+      - .:/workspace
+      # Cache build artifacts
+      - build-cache:/workspace/build
+      # Cache cross-compiler
+      - toolchain-cache:/opt/cross
+    working_dir: /workspace
+    command: make all
+    environment:
+      - MAKEFLAGS=-j4
+
+  # Development environment with shell access
+  dev:
+    image: automationos-build:latest
+    container_name: automationos-dev
+    volumes:
+      - .:/workspace
+      - build-cache:/workspace/build
+      - toolchain-cache:/opt/cross
+    working_dir: /workspace
+    command: /bin/bash
+    stdin_open: true
+    tty: true
+
+  # QEMU test environment
+  test:
+    image: automationos-build:latest
+    container_name: automationos-test
+    volumes:
+      - .:/workspace
+      - build-cache:/workspace/build
+    working_dir: /workspace
+    command: make test
+    depends_on:
+      - build
+
+  # Continuous build watcher
+  watch:
+    image: automationos-build:latest
+    container_name: automationos-watch
+    volumes:
+      - .:/workspace
+      - build-cache:/workspace/build
+    working_dir: /workspace
+    command: bash -c "while true; do make all; inotifywait -r -e modify,create,delete kernel/ boot/ userspace/; done"
+    depends_on:
+      - build
+
+volumes:
+  # Persistent build cache
+  build-cache:
+    driver: local
+
+  # Persistent toolchain cache
+  toolchain-cache:
+    driver: local

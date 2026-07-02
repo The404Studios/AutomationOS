@@ -1,0 +1,24 @@
+[Service]
+Description=Desktop Shell (Panel, Dock, Desktop Environment)
+Type=simple
+
+ExecStart=/usr/bin/desktop-shell
+WorkingDirectory=/var/lib/desktop
+
+User=root
+Group=root
+
+Requires=window-manager displayd
+After=window-manager displayd
+
+Restart=always
+RestartDelay=2s
+
+Environment=DISPLAY=:0
+Environment=WM_SOCKET=/run/wm.sock
+
+CPUQuota=60%
+MemoryLimit=400M
+
+TimeoutStartSec=30s
+TimeoutStopSec=15s

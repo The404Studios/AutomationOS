@@ -1,0 +1,45 @@
+#!/bin/sh
+# AutomationOS startup script
+# Executed at boot after all kernel subsystems are initialized
+
+echo "Running startup scripts..."
+
+# Mount filesystems
+if [ -e /dev/sda1 ]; then
+    mount /dev/sda1 /mnt/data
+    echo "  ✓ Mounted /mnt/data"
+fi
+
+# Start network services
+ifconfig eth0 up
+echo "  ✓ Network interface eth0 up"
+
+# DHCP client (if available)
+if [ -x /sbin/dhcpclient ]; then
+    dhcpclient eth0 &
+    echo "  ✓ DHCP client started"
+fi
+
+# Start system daemons
+if [ -x /sbin/httpd ]; then
+    httpd &
+    echo "  ✓ HTTP server started"
+fi
+
+if [ -x /sbin/sshd ]; then
+    sshd &
+    echo "  ✓ SSH daemon started"
+fi
+
+if [ -x /sbin/audiomixerd ]; then
+    audiomixerd &
+    echo "  ✓ Audio mixer daemon started"
+fi
+
+# Display welcome message
+if [ -f /etc/motd ]; then
+    cat /etc/motd
+fi
+
+echo ""
+echo "AutomationOS ready!"

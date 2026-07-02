@@ -1,0 +1,22 @@
+ABL -- "A Bootable Last-known-good" working-copy snapshot
+=========================================================
+Created: 2026-05-28  (verified milestone, smoke boot 10/10)
+
+WHAT THIS IS
+  A rollback point taken right before the risky ABLoader (#23) bootloader
+  rewrite. Contains the working OS image plus the full source needed to
+  rebuild it -- including the UNTRACKED kernel files (kernel/fs/exec.c,
+  kernel/core/mem/vmm.c) that `git checkout` cannot restore.
+
+CONTENTS
+  automationos.iso        Bootable image (flash directly to USB to recover).
+  kernel.elf              The matching verified kernel binary.
+  source-snapshot.tar.gz  Full source tree (excludes build/, .git/, ABL/).
+
+TO RESTORE THE SOURCE (from repo root C:\Users\wilde\Desktop\Kernel)
+  tar.exe -xzf ABL\source-snapshot.tar.gz -C C:\Users\wilde\Desktop\Kernel
+  # then rebuild:
+  bash scripts/quick_build.sh && bash scripts/build_all.sh && bash scripts/smoke_boot.sh
+
+TO RECOVER A BOOTABLE OS WITHOUT REBUILDING
+  Flash ABL\automationos.iso to the USB / boot media.

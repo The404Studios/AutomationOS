@@ -1,0 +1,147 @@
+# AutomationOS Build Environment
+# Production-grade Docker container with all build tools
+
+FROM ubuntu:22.04
+
+LABEL maintainer="AutomationOS Team"
+LABEL description="Cross-compiler build environment for AutomationOS"
+LABEL version="1.0"
+
+# Prevent interactive prompts during package installation
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Install base dependencies
+RUN apt-get update && apt-get install -y \
+    # Build essentials
+    build-essential \
+    gcc \
+    g++ \
+    make \
+    cmake \
+    autoconf \
+    automake \
+    libtool \
+    pkg-config \
+    \
+    # Cross-compiler dependencies
+    bison \
+    flex \
+    texinfo \
+    libgmp-dev \
+    libmpfr-dev \
+    libmpc-dev \
+    \
+    # Assembly and utilities
+    nasm \
+    yasm \
+    \
+    # Python tools
+    python3 \
+    python3-pip \
+    python3-dev \
+    \
+    # QEMU for testing
+    qemu-system-x86 \
+    qemu-utils \
+    \
+    # ISO creation tools
+    xorriso \
+    mtools \
+    genisoimage \
+    grub-common \
+    grub-pc-bin \
+    \
+    # Version control
+    git \
+    \
+    # Debugging and analysis
+    gdb \
+    valgrind \
+    strace \
+    ltrace \
+    \
+    # Static analysis
+    cppcheck \
+    clang-tidy \
+    \
+    # Download tools
+    wget \
+    curl \
+    ca-certificates \
+    \
+    # Utilities
+    vim \
+    nano \
+    tree \
+    file \
+    && rm -rf /var/lib/apt/lists/*
+
+# Set up working directory
+WORKDIR /tmp/toolchain
+
+# Download and build x86_64-elf cross-compiler
+ENV BINUTILS_VERSION=2.41
+ENV GCC_VERSION=13.2.0
+ENV PREFIX=/opt/cross
+ENV TARGET=x86_64-elf
+ENV PATH="$PREFIX/bin:$PATH"
+
+# Build binutils
+RUN wget -q https://ftp.gnu.org/gnu/binutils/binutils-${BINUTILS_VERSION}.tar.xz && \
+    tar -xf binutils-${BINUTILS_VERSION}.tar.xz && \
+    cd binutils-${BINUTILS_VERSION} && \
+    ./configure --target=$TARGET --prefix=$PREFIX --with-sysroot --disable-nls --disable-werror && \
+    make -j$(nproc) && \
+    make install && \
+    cd .. && \
+    rm -rf binutils-${BINUTILS_VERSION}*
+
+# Build GCC (with libgcc)
+RUN wget -q https://ftp.gnu.org/gnu/gcc/gcc-${GCC_VERSION}/gcc-${GCC_VERSION}.tar.xz && \
+    tar -xf gcc-${GCC_VERSION}.tar.xz && \
+    cd gcc-${GCC_VERSION} && \
+    ./configure --target=$TARGET --prefix=$PREFIX --disable-nls --enable-languages=c,c++ --without-headers && \
+    make -j$(nproc) all-gcc && \
+    make -j$(nproc) all-target-libgcc && \
+    make install-gcc && \
+    make install-target-libgcc && \
+    cd .. && \
+    rm -rf gcc-${GCC_VERSION}*
+
+# Clean up build artifacts
+RUN rm -rf /tmp/toolchain
+
+# Install Python packages for build scripts
+RUN pip3 install --no-cache-dir \
+    colorama \
+    pyyaml \
+    jinja2 \
+    pytest
+
+# Set up build user (non-root for security)
+RUN useradd -m -s /bin/bash builder && \
+    mkdir -p /workspace && \
+    chown -R builder:builder /workspace
+
+# Set environment variables
+ENV CC=x86_64-elf-gcc
+ENV LD=x86_64-elf-ld
+ENV AS=nasm
+ENV AR=x86_64-elf-ar
+ENV OBJCOPY=x86_64-elf-objcopy
+ENV PATH="/opt/cross/bin:${PATH}"
+
+# Working directory for builds
+WORKDIR /workspace
+
+# Switch to non-root user
+USER builder
+
+# Verify toolchain
+RUN x86_64-elf-gcc --version && \
+    x86_64-elf-ld --version && \
+    nasm --version && \
+    qemu-system-x86_64 --version
+
+# Default command
+CMD ["/bin/bash"]

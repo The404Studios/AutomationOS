@@ -1,0 +1,21 @@
+[Service]
+Description=Device Manager Service
+Type=simple
+
+ExecStart=/usr/sbin/devmgr
+WorkingDirectory=/var/lib/devices
+
+User=root
+Group=root
+
+After=syslogd.service
+Requires=syslogd.service
+
+Restart=always
+RestartDelay=3s
+
+CPUQuota=30%
+MemoryLimit=150M
+
+TimeoutStartSec=45s
+TimeoutStopSec=20s

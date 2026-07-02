@@ -1,0 +1,573 @@
+#!/bin/bash
+#
+# AutomationOS Configuration Script
+#
+# This script configures the build system for AutomationOS, checking dependencies,
+# setting up build options, and generating configuration files.
+#
+# Usage:
+#   ./configure [OPTIONS]
+#
+# Options:
+#   --prefix=DIR              Installation prefix (default: /usr)
+#   --target=TARGET           Target triplet (default: x86_64-automationos)
+#   --enable-debug            Enable debug build
+#   --enable-release          Enable release build (default)
+#   --enable-smp              Enable SMP support (default)
+#   --disable-smp             Disable SMP support
+#   --enable-tests            Enable test suite (default)
+#   --disable-tests           Disable test suite
+#   --with-drivers=LIST       Comma-separated list of drivers to build
+#   --enable-security         Enable security features (default)
+#   --enable-optimization=N   Optimization level (0,1,2,3,s,fast) (default: 2)
+#   --enable-lto              Enable link-time optimization
+#   --enable-sanitizer=TYPE   Enable sanitizer (address,thread,undefined)
+#   --with-toolchain=DIR      Cross-compiler toolchain directory
+#   --help                    Show this help message
+
+set -e
+
+# Colors
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m' # No Color
+
+# Default configuration values
+PREFIX="/usr"
+TARGET="x86_64-automationos"
+BUILD_TYPE="release"
+ENABLE_SMP=1
+ENABLE_TESTS=1
+ENABLE_SECURITY=1
+OPTIMIZATION_LEVEL=2
+ENABLE_LTO=0
+SANITIZER=""
+TOOLCHAIN_DIR=""
+DRIVERS="nvme,ahci,e1000,rtl8139,usb_hcd,usb_hid,keyboard,mouse"
+
+# Script directory
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+#
+# Print functions
+#
+print_banner() {
+    echo -e "${BLUE}=========================================${NC}"
+    echo -e "${BLUE}  AutomationOS Configuration${NC}"
+    echo -e "${BLUE}=========================================${NC}"
+    echo ""
+}
+
+print_section() {
+    echo ""
+    echo -e "${GREEN}>>> $1${NC}"
+}
+
+print_success() {
+    echo -e "${GREEN}✓${NC} $1"
+}
+
+print_warning() {
+    echo -e "${YELLOW}⚠${NC} $1"
+}
+
+print_error() {
+    echo -e "${RED}✗${NC} $1"
+}
+
+print_help() {
+    cat << EOF
+AutomationOS Configuration Script
+
+Usage: $0 [OPTIONS]
+
+Installation Options:
+  --prefix=DIR              Installation prefix (default: /usr)
+  --target=TARGET           Target triplet (default: x86_64-automationos)
+
+Build Options:
+  --enable-debug            Enable debug build with symbols
+  --enable-release          Enable release build (default)
+  --enable-optimization=N   Optimization level (0,1,2,3,s,fast) (default: 2)
+  --enable-lto              Enable link-time optimization
+  --enable-sanitizer=TYPE   Enable sanitizer (address,thread,undefined,memory)
+
+Feature Options:
+  --enable-smp              Enable SMP support (default)
+  --disable-smp             Disable SMP support
+  --enable-tests            Enable test suite (default)
+  --disable-tests           Disable test suite
+  --enable-security         Enable security features (default)
+  --disable-security        Disable security features
+  --with-drivers=LIST       Comma-separated driver list (default: all)
+
+Toolchain Options:
+  --with-toolchain=DIR      Cross-compiler toolchain directory
+  --cc=COMPILER             C compiler (default: x86_64-elf-gcc)
+  --ld=LINKER              Linker (default: x86_64-elf-ld)
+  --as=ASSEMBLER           Assembler (default: nasm)
+
+Other Options:
+  --help                    Show this help message
+  --version                 Show version information
+
+Available Drivers:
+  nvme      - NVMe SSD driver
+  ahci      - AHCI SATA driver
+  e1000     - Intel E1000 network driver
+  rtl8139   - Realtek RTL8139 network driver
+  usb_hcd   - USB host controller driver
+  usb_hid   - USB HID (keyboard/mouse) driver
+  keyboard  - PS/2 keyboard driver
+  mouse     - PS/2 mouse driver
+
+Examples:
+  ./configure                                    # Default configuration
+  ./configure --enable-debug                     # Debug build
+  ./configure --prefix=/opt/automationos         # Custom prefix
+  ./configure --with-drivers=nvme,ahci,e1000     # Select specific drivers
+  ./configure --enable-sanitizer=address         # Enable AddressSanitizer
+  ./configure --enable-lto --enable-optimization=3  # Maximum optimization
+
+EOF
+}
+
+#
+# Parse command line arguments
+#
+parse_args() {
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            --help)
+                print_help
+                exit 0
+                ;;
+            --version)
+                echo "AutomationOS build configuration v1.0.0"
+                exit 0
+                ;;
+            --prefix=*)
+                PREFIX="${1#*=}"
+                shift
+                ;;
+            --target=*)
+                TARGET="${1#*=}"
+                shift
+                ;;
+            --enable-debug)
+                BUILD_TYPE="debug"
+                OPTIMIZATION_LEVEL=0
+                shift
+                ;;
+            --enable-release)
+                BUILD_TYPE="release"
+                shift
+                ;;
+            --enable-smp)
+                ENABLE_SMP=1
+                shift
+                ;;
+            --disable-smp)
+                ENABLE_SMP=0
+                shift
+                ;;
+            --enable-tests)
+                ENABLE_TESTS=1
+                shift
+                ;;
+            --disable-tests)
+                ENABLE_TESTS=0
+                shift
+                ;;
+            --enable-security)
+                ENABLE_SECURITY=1
+                shift
+                ;;
+            --disable-security)
+                ENABLE_SECURITY=0
+                shift
+                ;;
+            --enable-optimization=*)
+                OPTIMIZATION_LEVEL="${1#*=}"
+                shift
+                ;;
+            --enable-lto)
+                ENABLE_LTO=1
+                shift
+                ;;
+            --enable-sanitizer=*)
+                SANITIZER="${1#*=}"
+                shift
+                ;;
+            --with-drivers=*)
+                DRIVERS="${1#*=}"
+                shift
+                ;;
+            --with-toolchain=*)
+                TOOLCHAIN_DIR="${1#*=}"
+                shift
+                ;;
+            --cc=*)
+                CC="${1#*=}"
+                shift
+                ;;
+            --ld=*)
+                LD="${1#*=}"
+                shift
+                ;;
+            --as=*)
+                AS="${1#*=}"
+                shift
+                ;;
+            *)
+                print_error "Unknown option: $1"
+                echo "Use --help for usage information"
+                exit 1
+                ;;
+        esac
+    done
+}
+
+#
+# Check for required tools
+#
+check_dependencies() {
+    print_section "Checking Dependencies"
+
+    local missing=()
+
+    # Core build tools
+    for tool in make python3 git; do
+        if command -v $tool &> /dev/null; then
+            print_success "$tool found: $(command -v $tool)"
+        else
+            print_error "$tool not found"
+            missing+=("$tool")
+        fi
+    done
+
+    # Cross-compiler toolchain
+    if [ -n "$TOOLCHAIN_DIR" ]; then
+        export PATH="$TOOLCHAIN_DIR/bin:$PATH"
+    fi
+
+    CC="${CC:-x86_64-elf-gcc}"
+    LD="${LD:-x86_64-elf-ld}"
+    AS="${AS:-nasm}"
+
+    for tool in "$CC" "$LD" "$AS"; do
+        if command -v $tool &> /dev/null; then
+            print_success "$tool found: $(command -v $tool)"
+            if [ "$tool" = "$CC" ]; then
+                echo "         Version: $($CC --version | head -n1)"
+            fi
+        else
+            print_error "$tool not found"
+            missing+=("$tool")
+        fi
+    done
+
+    # QEMU for testing
+    if command -v qemu-system-x86_64 &> /dev/null; then
+        print_success "qemu-system-x86_64 found: $(command -v qemu-system-x86_64)"
+    else
+        print_warning "qemu-system-x86_64 not found (needed for testing)"
+    fi
+
+    # ISO creation tools
+    if command -v xorriso &> /dev/null; then
+        print_success "xorriso found: $(command -v xorriso)"
+    else
+        print_warning "xorriso not found (needed for ISO creation)"
+    fi
+
+    # Optional tools
+    for tool in clang-format clang-tidy cppcheck lcov; do
+        if command -v $tool &> /dev/null; then
+            print_success "$tool found (optional): $(command -v $tool)"
+        else
+            print_warning "$tool not found (optional, for code quality)"
+        fi
+    done
+
+    if [ ${#missing[@]} -ne 0 ]; then
+        echo ""
+        print_error "Missing required dependencies:"
+        for dep in "${missing[@]}"; do
+            echo "  - $dep"
+        done
+        echo ""
+        echo "Install instructions:"
+        echo "  Ubuntu/Debian:"
+        echo "    sudo apt install build-essential nasm python3 git gcc-x86-64-elf binutils-x86-64-elf"
+        echo "  Arch Linux:"
+        echo "    sudo pacman -S base-devel nasm python git x86_64-elf-gcc x86_64-elf-binutils"
+        echo "  macOS:"
+        echo "    brew install nasm python git x86_64-elf-gcc x86_64-elf-binutils"
+        echo ""
+        exit 1
+    fi
+}
+
+#
+# Validate configuration
+#
+validate_config() {
+    print_section "Validating Configuration"
+
+    # Check optimization level
+    case "$OPTIMIZATION_LEVEL" in
+        0|1|2|3|s|fast)
+            print_success "Optimization level: -O$OPTIMIZATION_LEVEL"
+            ;;
+        *)
+            print_error "Invalid optimization level: $OPTIMIZATION_LEVEL"
+            exit 1
+            ;;
+    esac
+
+    # Check sanitizer
+    if [ -n "$SANITIZER" ]; then
+        case "$SANITIZER" in
+            address|thread|undefined|memory)
+                print_success "Sanitizer: $SANITIZER"
+                ;;
+            *)
+                print_error "Invalid sanitizer: $SANITIZER"
+                exit 1
+                ;;
+        esac
+    fi
+
+    # Validate drivers
+    IFS=',' read -ra DRIVER_LIST <<< "$DRIVERS"
+    local valid_drivers=("nvme" "ahci" "e1000" "rtl8139" "usb_hcd" "usb_hid" "keyboard" "mouse")
+    for driver in "${DRIVER_LIST[@]}"; do
+        if [[ " ${valid_drivers[@]} " =~ " ${driver} " ]]; then
+            print_success "Driver enabled: $driver"
+        else
+            print_error "Invalid driver: $driver"
+            exit 1
+        fi
+    done
+}
+
+#
+# Generate config.mk
+#
+generate_config_mk() {
+    print_section "Generating build configuration"
+
+    local config_file="$SCRIPT_DIR/config.mk"
+
+    cat > "$config_file" << EOF
+# AutomationOS Build Configuration
+# Generated by configure script on $(date)
+
+# Installation paths
+PREFIX = $PREFIX
+TARGET = $TARGET
+
+# Build type
+BUILD_TYPE = $BUILD_TYPE
+
+# Toolchain
+CC = $CC
+LD = $LD
+AS = $AS
+AR = ${TARGET}-ar
+OBJCOPY = ${TARGET}-objcopy
+OBJDUMP = ${TARGET}-objdump
+NM = ${TARGET}-nm
+STRIP = ${TARGET}-strip
+
+# Optimization
+OPTIMIZATION = -O$OPTIMIZATION_LEVEL
+
+# LTO
+EOF
+
+    if [ $ENABLE_LTO -eq 1 ]; then
+        echo "LTO_FLAGS = -flto" >> "$config_file"
+    else
+        echo "LTO_FLAGS = " >> "$config_file"
+    fi
+
+    # Sanitizer
+    if [ -n "$SANITIZER" ]; then
+        echo "SANITIZER_FLAGS = -fsanitize=$SANITIZER" >> "$config_file"
+    else
+        echo "SANITIZER_FLAGS = " >> "$config_file"
+    fi
+
+    # Debug flags
+    if [ "$BUILD_TYPE" = "debug" ]; then
+        cat >> "$config_file" << EOF
+
+# Debug build flags
+DEBUG_FLAGS = -g -DDEBUG -fno-omit-frame-pointer
+STRIP_SYMBOLS = 0
+EOF
+    else
+        cat >> "$config_file" << EOF
+
+# Release build flags
+DEBUG_FLAGS = -DNDEBUG
+STRIP_SYMBOLS = 1
+EOF
+    fi
+
+    # Feature flags
+    cat >> "$config_file" << EOF
+
+# Features
+ENABLE_SMP = $ENABLE_SMP
+ENABLE_TESTS = $ENABLE_TESTS
+ENABLE_SECURITY = $ENABLE_SECURITY
+
+# Drivers
+DRIVERS = $DRIVERS
+
+# Directories
+BUILD_DIR = \$(PWD)/build
+ISO_DIR = \$(PWD)/iso
+
+# Common CFLAGS
+COMMON_CFLAGS = -std=gnu11 -ffreestanding -nostdlib -mno-red-zone \\
+                -mcmodel=kernel -Wall -Wextra \$(OPTIMIZATION) \$(DEBUG_FLAGS) \\
+                \$(LTO_FLAGS) \$(SANITIZER_FLAGS)
+
+# Common LDFLAGS
+COMMON_LDFLAGS = -nostdlib -z max-page-size=0x1000 \$(LTO_FLAGS)
+
+# Assembly flags
+ASFLAGS = -f elf64
+
+# Export all variables
+export
+EOF
+
+    print_success "Generated: $config_file"
+}
+
+#
+# Generate config.h
+#
+generate_config_h() {
+    local config_h="$SCRIPT_DIR/include/config.h"
+    mkdir -p "$(dirname "$config_h")"
+
+    cat > "$config_h" << EOF
+/* AutomationOS Configuration Header */
+/* Generated by configure script on $(date) */
+
+#ifndef _CONFIG_H
+#define _CONFIG_H
+
+/* Build type */
+#ifdef DEBUG
+#define CONFIG_DEBUG 1
+#else
+#define CONFIG_DEBUG 0
+#endif
+
+/* Features */
+#define CONFIG_SMP $ENABLE_SMP
+#define CONFIG_SECURITY $ENABLE_SECURITY
+
+/* Drivers */
+EOF
+
+    # Generate driver defines
+    IFS=',' read -ra DRIVER_LIST <<< "$DRIVERS"
+    for driver in "${DRIVER_LIST[@]}"; do
+        driver_upper=$(echo "$driver" | tr '[:lower:]' '[:upper:]')
+        echo "#define CONFIG_DRIVER_${driver_upper} 1" >> "$config_h"
+    done
+
+    cat >> "$config_h" << EOF
+
+/* Version */
+#define AUTOMATIONOS_VERSION_MAJOR 1
+#define AUTOMATIONOS_VERSION_MINOR 0
+#define AUTOMATIONOS_VERSION_PATCH 0
+
+#endif /* _CONFIG_H */
+EOF
+
+    print_success "Generated: $config_h"
+}
+
+#
+# Generate build summary
+#
+print_summary() {
+    echo ""
+    echo -e "${BLUE}=========================================${NC}"
+    echo -e "${BLUE}  Configuration Summary${NC}"
+    echo -e "${BLUE}=========================================${NC}"
+    echo ""
+    echo "Installation:"
+    echo "  Prefix:           $PREFIX"
+    echo "  Target:           $TARGET"
+    echo ""
+    echo "Build Options:"
+    echo "  Build Type:       $BUILD_TYPE"
+    echo "  Optimization:     -O$OPTIMIZATION_LEVEL"
+    echo "  LTO:              $([ $ENABLE_LTO -eq 1 ] && echo 'enabled' || echo 'disabled')"
+    if [ -n "$SANITIZER" ]; then
+        echo "  Sanitizer:        $SANITIZER"
+    fi
+    echo ""
+    echo "Features:"
+    echo "  SMP Support:      $([ $ENABLE_SMP -eq 1 ] && echo 'enabled' || echo 'disabled')"
+    echo "  Security:         $([ $ENABLE_SECURITY -eq 1 ] && echo 'enabled' || echo 'disabled')"
+    echo "  Tests:            $([ $ENABLE_TESTS -eq 1 ] && echo 'enabled' || echo 'disabled')"
+    echo ""
+    echo "Toolchain:"
+    echo "  CC:               $CC"
+    echo "  LD:               $LD"
+    echo "  AS:               $AS"
+    echo ""
+    echo "Drivers:"
+    IFS=',' read -ra DRIVER_LIST <<< "$DRIVERS"
+    for driver in "${DRIVER_LIST[@]}"; do
+        echo "  - $driver"
+    done
+    echo ""
+    echo -e "${GREEN}Configuration complete!${NC}"
+    echo ""
+    echo "Next steps:"
+    echo "  make all       # Build everything"
+    echo "  make iso       # Create bootable ISO"
+    echo "  make qemu      # Test in QEMU"
+    echo "  make help      # Show all targets"
+    echo ""
+}
+
+#
+# Main
+#
+main() {
+    print_banner
+
+    # Parse command line
+    parse_args "$@"
+
+    # Check dependencies
+    check_dependencies
+
+    # Validate configuration
+    validate_config
+
+    # Generate configuration files
+    generate_config_mk
+    generate_config_h
+
+    # Print summary
+    print_summary
+}
+
+main "$@"

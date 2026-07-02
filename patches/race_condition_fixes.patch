@@ -1,0 +1,83 @@
+diff --git a/kernel/core/sched/process.c b/kernel/core/sched/process.c
+index abc1234..def5678 100644
+--- a/kernel/core/sched/process.c
++++ b/kernel/core/sched/process.c
+@@ -4,17 +4,21 @@
+ #include "../../include/x86_64.h"
+ #include "../../include/namespace.h"
++#include "../../include/spinlock.h"
+
+ #define MAX_PROCESSES 256
+ #define KERNEL_STACK_SIZE 8192  // 8KB kernel stack per process
+
+ // Process table
+ static process_t* process_table[MAX_PROCESSES];
+ static uint32_t next_pid = 1;  // PID 0 reserved for kernel/idle
+ static process_t* current_process = NULL;
+
+-// Simple PID allocation
++// RACE-002 fix: Process table lock protects process_table[] access
++static spinlock_t process_table_lock;
++
++// RACE-003 fix: Atomic PID allocation (prevents duplicate PIDs)
+ static uint32_t allocate_pid(void) {
+-    uint32_t pid = next_pid++;
++    uint32_t pid = __atomic_fetch_add(&next_pid, 1, __ATOMIC_SEQ_CST);
+     if (pid >= MAX_PROCESSES) {
+         kernel_panic("Process table full");
+     }
+@@ -23,6 +27,9 @@ static uint32_t allocate_pid(void) {
+
+ void process_init(void) {
+     kprintf("[PROCESS] Initializing process management...\n");
++
++    // RACE-002 fix: Initialize process table lock
++    spin_lock_init(&process_table_lock);
+
+     // Clear process table
+     for (int i = 0; i < MAX_PROCESSES; i++) {
+@@ -116,7 +123,9 @@ process_t* process_create(const char* name, void* entry_point) {
+     // Initialize sandbox flags
+     proc->sandbox_flags = 0;
+
+-    // Add to process table
++    // RACE-002 fix: Add to process table with lock
++    spin_lock(&process_table_lock);
+     process_table[pid] = proc;
++    spin_unlock(&process_table_lock);
+
+     kprintf("[PROCESS] Created process '%s' (PID %d) at entry %p\n",
+             proc->name, proc->pid, entry_point);
+@@ -146,8 +155,12 @@ void process_unref(process_t* proc) {
+                 proc->name, proc->pid);
+
+         // Remove from process table
++        spin_lock(&process_table_lock);
+         if (proc->pid < MAX_PROCESSES) {
+             process_table[proc->pid] = NULL;
+         }
++        spin_unlock(&process_table_lock);
+
+         // Free kernel stack
+         if (proc->kernel_stack) {
+@@ -181,9 +194,23 @@ void process_destroy(process_t* proc) {
+ }
+
+ process_t* process_get_by_pid(uint32_t pid) {
+     if (pid >= MAX_PROCESSES) {
+         return NULL;
+     }
+-    return process_table[pid];
++
++    // RACE-002 fix: Read process table with lock and take reference
++    spin_lock(&process_table_lock);
++    process_t* proc = process_table[pid];
++    if (proc) {
++        // Take reference before returning (caller must call process_unref when done)
++        process_ref(proc);
++    }
++    spin_unlock(&process_table_lock);
++    return proc;
+ }
+
+ process_t* process_get_current(void) {

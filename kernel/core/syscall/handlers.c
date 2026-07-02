@@ -1510,8 +1510,11 @@ int64_t sys_yield(uint64_t arg1, uint64_t arg2, uint64_t arg3,
  * matmul) is the first real CPU-heavy threaded BATCH workload to join.
  *
  * DO NOT add arbitrary threaded apps. Only explicit allowlist entries that
- * rely on the inheritance predicate. No blanket "all threaded on CPU1". */
-static const char* const dsplit_allow[] = { "batchdemo", "bklstorm", "matmuljobs" };
+ * rely on the inheritance predicate. No blanket "all threaded on CPU1".
+ * SMP-RENDER-0: renderworker joins -- the compositor's phase-1 scan worker
+ * (single-threaded, reads SHM scene buffers, never touches the fb). */
+static const char* const dsplit_allow[] = { "batchdemo", "bklstorm", "matmuljobs",
+                                            "renderworker" };
 
 static int dsplit_basename_match(const char* kpath, const char* name) {
     /* find the basename (after the last '/') */

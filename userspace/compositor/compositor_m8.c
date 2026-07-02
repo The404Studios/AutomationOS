@@ -3932,6 +3932,218 @@ static uint32_t present_diff(uint32_t *fb, uint32_t *back, uint32_t *prev,
     return total_px;
 }
 
+#ifdef COMP_SMP_RENDER
+/* ==================================================================== */
+/* SMP-RENDER-0: split present_diff()'s phase-1 scan with a CPU1 worker. */
+/* See smprender.h for the protocol. Everything here is compiled ONLY    */
+/* under -DCOMP_SMP_RENDER (SMP_RENDER=1 build_all); the default build   */
+/* keeps the solo present_diff verbatim (byte-identity gate in           */
+/* build_test/smprender_check.sh).                                       */
+/* ==================================================================== */
+#include "smprender.h"
+
+static volatile smpr_job_t *g_smpr = 0;   /* job page (SysV SHM)          */
+static int g_smpr_dead = 0;               /* worker missed a join -> solo */
+
+#define SMPR_JOIN_CAP     8000000u   /* per-frame join spin cap            */
+#define SMPR_READY_SPINS  2000000u   /* startup wait for worker_ready      */
+
+/* Create + publish the job page, spawn the worker, wait for it (bounded).
+ * Returns 1 when the worker is live. */
+static int smpr_init(long back_id, long prev_id,
+                     uint32_t W, uint32_t H, uint32_t stride) {
+    long id = sc6(SYS_SHMGET, (long)SMPR_JOB_KEY, (long)SMPR_JOB_BYTES,
+                  (long)(IPC_CREAT | 0666), 0, 0, 0);
+    if (id < 0) return 0;
+    long p = sc6(SYS_SHMAT, id, 0, 0, 0, 0, 0);
+    if (p <= 0) return 0;
+    volatile char *z = (volatile char *)p;              /* shm won't zero  */
+    for (int i = 0; i < (int)sizeof(smpr_job_t); i++) z[i] = 0;
+    volatile smpr_job_t *job = (volatile smpr_job_t *)p;
+    job->back_shm_id = (int)back_id;
+    job->prev_shm_id = (int)prev_id;
+    job->w = W; job->h = H; job->stride = stride;
+    job->magic = SMPR_JOB_MAGIC;                        /* publish LAST    */
+    g_smpr = job;
+    syscall(SYS_SPAWN, (long)"sbin/renderworker", 0, 0);
+    for (uint32_t i = 0; i < SMPR_READY_SPINS; i++) {
+        if (job->worker_ready == SMPR_JOB_MAGIC) return 1;
+        if ((i & 255u) == 0) syscall(SYS_YIELD, 0, 0, 0);
+    }
+    return 0;
+}
+
+/* Post the top band [0,mid) to the worker for the CURRENT back/prev content.
+ * Returns the job generation to join on. */
+static uint32_t smpr_post(uint32_t mid) {
+    g_smpr->y0 = 0; g_smpr->y1 = mid;
+    uint32_t g = g_smpr->gen + 1;
+    g_smpr->gen = g;                                    /* publish LAST    */
+    return g;
+}
+
+/* Join the worker's result for generation `g` (bounded spin, yielding).
+ * Returns 1 with the partial bbox, 0 on timeout. */
+static int smpr_join(uint32_t g, uint32_t *minx, uint32_t *miny,
+                     uint32_t *maxx, uint32_t *maxy, uint32_t *any) {
+    for (uint32_t i = 0; i < SMPR_JOIN_CAP; i++) {
+        if (g_smpr->done_gen == g) {
+            *minx = g_smpr->r_minx; *miny = g_smpr->r_miny;
+            *maxx = g_smpr->r_maxx; *maxy = g_smpr->r_maxy;
+            *any  = g_smpr->r_any;
+            return 1;
+        }
+        if ((i & 1023u) == 0) syscall(SYS_YIELD, 0, 0, 0);
+    }
+    return 0;
+}
+
+/* Merge partial bbox b into a (both only meaningful when their any is set). */
+static void smpr_bbox_merge(uint32_t a_any, uint32_t *amnx, uint32_t *amny,
+                            uint32_t *amxx, uint32_t *amxy,
+                            uint32_t b_any, uint32_t bmnx, uint32_t bmny,
+                            uint32_t bmxx, uint32_t bmxy, uint32_t *out_any) {
+    if (!a_any && b_any) {
+        *amnx = bmnx; *amny = bmny; *amxx = bmxx; *amxy = bmxy;
+    } else if (a_any && b_any) {
+        if (bmnx < *amnx) *amnx = bmnx;
+        if (bmny < *amny) *amny = bmny;
+        if (bmxx > *amxx) *amxx = bmxx;
+        if (bmxy > *amxy) *amxy = bmxy;
+    }
+    *out_any = (a_any || b_any) ? 1u : 0u;
+}
+
+/* Band-split present_diff: phase 1 runs on BOTH cores (worker: top band,
+ * compositor: bottom band, overlapped), phase 2 (all framebuffer writes)
+ * stays wholly on this CPU. Any worker absence/timeout falls back to the
+ * solo path -- the output is identical either way (phase 2 derives purely
+ * from the merged bbox; the boot selftest PROVES bbox identity). */
+static uint32_t present_diff_smp(uint32_t *fb, uint32_t *back, uint32_t *prev,
+                                 uint32_t w, uint32_t h, uint32_t stride) {
+    if (!g_smpr || g_smpr_dead || g_smpr->worker_ready != SMPR_JOB_MAGIC)
+        return present_diff(fb, back, prev, w, h, stride);
+
+    uint32_t mid = h / 2;
+    uint32_t gen = smpr_post(mid);
+    uint32_t mnx, mny, mxx, mxy;             /* our (bottom) partial bbox  */
+    int bany = smpr_scan_band(back, prev, w, stride, mid, h,
+                              &mnx, &mny, &mxx, &mxy);
+    uint32_t wmnx, wmny, wmxx, wmxy, wany;
+    if (!smpr_join(gen, &wmnx, &wmny, &wmxx, &wmxy, &wany)) {
+        /* Worker missed the deadline: scan its band ourselves and stop
+         * delegating (one honest note; correctness unaffected). */
+        g_smpr_dead = 1;
+        print("[SMPRENDER] worker join timeout -- solo fallback\n");
+        uint32_t tmnx, tmny, tmxx, tmxy;
+        wany = (uint32_t)smpr_scan_band(back, prev, w, stride, 0, mid,
+                                        &tmnx, &tmny, &tmxx, &tmxy);
+        wmnx = tmnx; wmny = tmny; wmxx = tmxx; wmxy = tmxy;
+    }
+    uint32_t any;
+    smpr_bbox_merge((uint32_t)bany, &mnx, &mny, &mxx, &mxy,
+                    wany, wmnx, wmny, wmxx, wmxy, &any);
+    if (!any) return 0;
+
+    /* PHASE 2: identical to present_diff's span-copy (bbox-driven). */
+    uint32_t minx = mnx, miny = mny, maxx = mxx, maxy = mxy;
+    uint32_t total_px = 0;
+    for (uint32_t y = miny; y <= maxy; y++) {
+        uint32_t off = y * stride;
+        uint32_t rx0 = maxx + 1, rx1 = minx;
+        for (uint32_t x = minx; x <= maxx; x++) {
+            if (back[off + x] != prev[off + x]) {
+                if (x < rx0) rx0 = x;
+                rx1 = x;
+            }
+        }
+        if (rx0 > rx1) continue;
+        uint32_t span = rx1 - rx0 + 1;
+        total_px += span;
+        uint32_t *fb_row   = &fb[off + rx0];
+        uint32_t *back_row = &back[off + rx0];
+        uint32_t *prev_row = &prev[off + rx0];
+        uint32_t pairs = span >> 1;
+        uint32_t tail  = span & 1u;
+        uint64_t *d64 = (uint64_t *)fb_row;
+        uint64_t *s64 = (uint64_t *)back_row;
+        for (uint32_t i = 0; i < pairs; i++)
+            d64[i] = s64[i];
+        if (tail)
+            fb_row[span - 1] = back_row[span - 1];
+        uint64_t *p64 = (uint64_t *)prev_row;
+        for (uint32_t i = 0; i < pairs; i++)
+            p64[i] = s64[i];
+        if (tail)
+            prev_row[span - 1] = back_row[span - 1];
+    }
+    return total_px;
+}
+
+/* Boot selftest: solo full-scan vs split scan must produce the IDENTICAL
+ * dirty bbox on synthetic patterns (top-band-only, bottom-band-only,
+ * band-SPANNING, sparse diagonal). Buffers are left zeroed afterwards. */
+static void smpr_selftest(uint32_t *back, uint32_t *prev,
+                          uint32_t W, uint32_t H, uint32_t stride,
+                          int worker_up) {
+    int match = 0;
+    const int rounds = 4;
+    if (worker_up) {
+        for (int r = 0; r < rounds; r++) {
+            for (uint32_t i = 0; i < H * stride; i++) { back[i] = 0; prev[i] = 0; }
+            if (r == 0) {
+                for (uint32_t y = 5; y < 20; y++)
+                    for (uint32_t x = 10; x < 50; x++)
+                        back[y * stride + x] = 0xA0B0C0D0u;
+            } else if (r == 1) {
+                for (uint32_t y = H - 30; y < H - 10; y++)
+                    for (uint32_t x = 100; x < 200; x++)
+                        back[y * stride + x] = 0xA0B0C0D1u;
+            } else if (r == 2) {
+                for (uint32_t y = H / 2 - 8; y < H / 2 + 8; y++)
+                    for (uint32_t x = 30; x < 90; x++)
+                        back[y * stride + x] = 0xA0B0C0D2u;
+            } else {
+                for (uint32_t y = 0; y < H; y += 37)
+                    back[y * stride + (y % W)] = 0xDEADBEEFu;
+            }
+            uint32_t smnx, smny, smxx, smxy;             /* solo reference */
+            int sany = smpr_scan_band(back, prev, W, stride, 0, H,
+                                      &smnx, &smny, &smxx, &smxy);
+            uint32_t gen = smpr_post(H / 2);             /* split */
+            uint32_t mnx, mny, mxx, mxy;
+            int bany = smpr_scan_band(back, prev, W, stride, H / 2, H,
+                                      &mnx, &mny, &mxx, &mxy);
+            uint32_t wmnx, wmny, wmxx, wmxy, wany;
+            if (!smpr_join(gen, &wmnx, &wmny, &wmxx, &wmxy, &wany)) break;
+            uint32_t any;
+            smpr_bbox_merge((uint32_t)bany, &mnx, &mny, &mxx, &mxy,
+                            wany, wmnx, wmny, wmxx, wmxy, &any);
+            if ((int)any == sany &&
+                (!any || (mnx == smnx && mny == smny &&
+                          mxx == smxx && mxy == smxy)))
+                match++;
+        }
+        for (uint32_t i = 0; i < H * stride; i++) { back[i] = 0; prev[i] = 0; }
+    }
+    /* ONE assembled write: multi-call prints tear under SMP serial
+     * interleaving (another CPU's log spliced mid-marker on the first
+     * soak), and the check script greps the exact line. */
+    {
+        char line[64]; int o = 0;
+        const char *s = "[SMPRENDER] selftest scan_match=";
+        while (*s) line[o++] = *s++;
+        line[o++] = (match == rounds) ? '1' : '0';
+        s = " rounds=4 worker=";
+        while (*s) line[o++] = *s++;
+        line[o++] = worker_up ? '1' : '0';
+        line[o++] = '\n'; line[o] = 0;
+        print(line);
+    }
+    if (!worker_up || match != rounds) g_smpr_dead = 1;
+}
+#endif /* COMP_SMP_RENDER */
+
 /* SMOOTH-MOUSE FAST PATH state: where the cursor sprite is currently painted on
  * the framebuffer (so we can erase it from there), and whether the pointer moved
  * this frame. `back` is the cursor-less scene; `prev` mirrors it. */
@@ -5949,7 +6161,20 @@ void _start(void) {
 
     /* 2. Allocate the back buffer. */
     size_t bb_bytes = (size_t)fb.pitch * H;
+#ifdef COMP_SMP_RENDER
+    /* SMP-RENDER-0: back/prev live in SysV SHM so the CPU1 renderworker can
+     * attach them (shm ids travel via the job page). SHM is NOT zeroed by
+     * the kernel -- both buffers are cleared in the bring-up block below.
+     * Any SHM failure falls back to plain mmap (worker stays disabled). */
+    long smpr_back_id = sc6(SYS_SHMGET, (long)SMPR_BACK_KEY, (long)bb_bytes,
+                            (long)(IPC_CREAT | 0666), 0, 0, 0);
+    long bbp = (smpr_back_id >= 0)
+                   ? sc6(SYS_SHMAT, smpr_back_id, 0, 0, 0, 0, 0)
+                   : syscall(SYS_MMAP, 0, (long)bb_bytes,
+                             VMM_PROT_READ | VMM_PROT_WRITE);
+#else
     long bbp = syscall(SYS_MMAP, 0, (long)bb_bytes, VMM_PROT_READ | VMM_PROT_WRITE);
+#endif
     uint32_t *hw   = (uint32_t *)fb.vaddr;
     uint32_t *back;
     if (bbp > 0) {
@@ -5983,12 +6208,35 @@ void _start(void) {
      * and full-copies once, then tracks deltas. Only used when double-buffered. */
     uint32_t *prev = (uint32_t *)0;
     if (back != hw) {
+#ifdef COMP_SMP_RENDER
+        long smpr_prev_id = sc6(SYS_SHMGET, (long)SMPR_PREV_KEY, (long)bb_bytes,
+                                (long)(IPC_CREAT | 0666), 0, 0, 0);
+        long pvp = (smpr_prev_id >= 0)
+                       ? sc6(SYS_SHMAT, smpr_prev_id, 0, 0, 0, 0, 0)
+                       : syscall(SYS_MMAP, 0, (long)bb_bytes,
+                                 VMM_PROT_READ | VMM_PROT_WRITE);
+#else
         long pvp = syscall(SYS_MMAP, 0, (long)bb_bytes,
                            VMM_PROT_READ | VMM_PROT_WRITE);
+#endif
         if (pvp > 0) {
             prev = (uint32_t *)pvp;
             print("[SHELL] dirty-rect present enabled\n");
         }
+#ifdef COMP_SMP_RENDER
+        /* SMP-RENDER-0 bring-up: needs BOTH scene buffers in SHM. Clear them
+         * (SHM isn't zeroed; prev MUST start all-zero for the first-frame
+         * full present), publish the job page, spawn the worker, and prove
+         * split-scan == solo-scan before the first real frame. */
+        if (prev && smpr_back_id >= 0 && smpr_prev_id >= 0) {
+            for (uint32_t i = 0; i < H * stride; i++) { back[i] = 0; prev[i] = 0; }
+            int up = smpr_init(smpr_back_id, smpr_prev_id, W, H, stride);
+            smpr_selftest(back, prev, W, H, stride, up);
+        } else {
+            g_smpr_dead = 1;
+            print("[SMPRENDER] shm scene buffers unavailable -- solo\n");
+        }
+#endif
     }
 
     /* Center-to-corner distance: the radius the circular boot iris grows to so
@@ -6187,7 +6435,11 @@ void _start(void) {
                 } else {
                     uint32_t px = 0;
                     if (scene) {
+#ifdef COMP_SMP_RENDER
+                        if (prev) px = present_diff_smp(hw, back, prev, W, H, stride);
+#else
                         if (prev) px = present_diff(hw, back, prev, W, H, stride);
+#endif
                         else      { present(hw, back, H, stride); px = W * H; }
                         splash = (uint32_t *)0;  /* fade complete: stop blending */
                     }

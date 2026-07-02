@@ -202,7 +202,15 @@ cc userspace/lib/audio/audio.c  /tmp/audio.o
 cc userspace/lib/icon/icon.c    /tmp/icon.o
 
 echo "[all] compositor (m8: right-side dock w/ hover-magnify, folders, bounce) + init..."
-gcc $CF $SELFHEAL_EXTRA $FREEZE_EXTRA -c userspace/compositor/compositor_m8.c -o /tmp/cm6.o
+# SMP-RENDER-0: SMP_RENDER=1 compiles the band-split present path + worker
+# spawn into the compositor. Default builds get NO define -> byte-identical
+# compositor (gated in build_test/smprender_check.sh).
+SMPR_EXTRA=""
+if [ "${SMP_RENDER:-0}" = "1" ]; then
+    SMPR_EXTRA="-DCOMP_SMP_RENDER"
+    echo "[all]   SMP_RENDER=1 -> compositor band-split present enabled"
+fi
+gcc $CF $SELFHEAL_EXTRA $FREEZE_EXTRA $SMPR_EXTRA -c userspace/compositor/compositor_m8.c -o /tmp/cm6.o
 $LD /tmp/cm6.o /tmp/bf.o /tmp/font2.o /tmp/icon.o -o /tmp/comp.elf
 gcc $CF $INIT_EXTRA -c userspace/init/main.c -o /tmp/init.o
 $LD /tmp/init.o -o /tmp/init.elf
@@ -517,6 +525,9 @@ cc userspace/tests/batchdemo.c /tmp/batchdemo.o; $LD /tmp/crt0.o /tmp/batchdemo.
 # threads). Shipped always (tiny); only the SMP_THREAD_INHERIT kernel spawns it
 # (BATCH->CPU1; the workers inherit the parent's CPU1 placement).
 cc userspace/tests/threadprobe.c /tmp/threadprobe.o; $LD /tmp/crt0.o /tmp/threadprobe.o -o /tmp/threadprobe.elf
+# renderworker: SMP-RENDER-0 CPU1 scan worker (inert unless a COMP_SMP_RENDER
+# compositor spawns it; ships always like the other SMP probes).
+cc userspace/apps/renderworker/renderworker.c /tmp/renderworker.o; $LD /tmp/crt0.o /tmp/renderworker.o -o /tmp/renderworker.elf
 # apidemo: fetch http(s) URL + pretty-print JSON (crt0+main; HTTPS + json).
 cc userspace/apps/apidemo/apidemo.c /tmp/apidemo.o; $LD /tmp/crt0.o /tmp/apidemo.o /tmp/json.o $HTTPS_OBJS -o /tmp/apidemo.elf
 # gsignin: "Sign in with Google" via OAuth 2.0 Device Flow (RFC 8628); HTTPS POST + json.
@@ -947,6 +958,8 @@ cp /tmp/bklstorm.elf /tmp/ird/sbin/bklstorm
 cp /tmp/batchdemo.elf /tmp/ird/sbin/batchdemo
 # threadprobe -> /sbin (SMP-THREAD-INHERIT-0; inert unless that kernel spawns it).
 cp /tmp/threadprobe.elf /tmp/ird/sbin/threadprobe
+# renderworker -> /sbin (SMP-RENDER-0; inert unless the SMP_RENDER compositor spawns it).
+cp /tmp/renderworker.elf /tmp/ird/sbin/renderworker
 # cpu1offload -> /sbin (init spawns it at boot; prints PASS on SMP, SKIP on default).
 cp /tmp/cpu1offload.elf /tmp/ird/sbin/cpu1offload
 # smpstress -> /sbin (init spawns it; PASS on SMP after thousands of CPU1 jobs, SKIP on default).

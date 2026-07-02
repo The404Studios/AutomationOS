@@ -236,11 +236,22 @@ int virtio_net_tx(const void* frame, uint16_t len) {
     if (len == 0) return 0;
     if (len > 1514) len = 1514;
 
-    uint16_t slot = vnet.tx_next;
+    /* NET-ROBUST: cycle TX slots within the buffers we actually allocated
+     * (min(VNET_TX_BUFS, qsize)); a device reporting a queue smaller than
+     * VNET_TX_BUFS would otherwise index a NULL tx_buf and stamp a descriptor
+     * past the real ring. */
+    uint16_t txcap = (vnet.txq.qsize < VNET_TX_BUFS) ? vnet.txq.qsize : VNET_TX_BUFS;
+    if (txcap == 0) return -1;
+    uint16_t slot = (uint16_t)(vnet.tx_next % txcap);
     uint8_t* buf = vnet.tx_bufs[slot];
+    if (!buf) return -1;
     memset(buf, 0, VNET_HDR_LEN);                 /* zeroed legacy hdr */
     memcpy(buf + VNET_HDR_LEN, frame, len);
     uint32_t total = VNET_HDR_LEN + (uint32_t)((len < 60) ? 60 : len);  /* pad runt */
+    /* NET-ROBUST: zero the runt padding so stale page / prior-frame bytes are
+     * never leaked onto the wire (etherleak) -- pmm pages are not pre-zeroed and
+     * the 16 TX buffers are reused round-robin. */
+    if (len < 60) memset(buf + VNET_HDR_LEN + len, 0, 60u - len);
 
     /* Use descriptor `slot` in the TX queue. */
     vnet.txq.desc[slot].addr  = (uint64_t)(uintptr_t)buf;
@@ -254,7 +265,7 @@ int virtio_net_tx(const void* frame, uint16_t len) {
     desc_wmb();
     outw(vnet.iobase + VR_QUEUE_NOTIFY, 1);       /* doorbell: TX queue */
 
-    vnet.tx_next = (uint16_t)((vnet.tx_next + 1) % VNET_TX_BUFS);
+    vnet.tx_next = (uint16_t)((vnet.tx_next + 1) % txcap);
 
     /* Bounded wait for this completion so the caller sees a sent frame (the
      * used ring index advances). Timeout still returns len (queued). */
@@ -275,8 +286,12 @@ int virtio_net_rx_poll(void* out, uint16_t buf_len) {
 
     uint16_t slot = vnet.rxq.last_used % vnet.rxq.qsize;
     vring_used_elem_t e = { vnet.rxq.used->ring[slot].id, vnet.rxq.used->ring[slot].len };
+    /* NET-ROBUST: the used-ring id is device-supplied; bound it against the
+     * buffers we actually posted (min(VNET_RX_BUFS, qsize)), not the compile-
+     * time array size, so a bogus id can't deref an unposted (NULL) rx_buf. */
+    uint16_t rxcap = (vnet.rxq.qsize < VNET_RX_BUFS) ? vnet.rxq.qsize : VNET_RX_BUFS;
     int rc;
-    if (e.id >= VNET_RX_BUFS || e.len < VNET_HDR_LEN) {
+    if (e.id >= rxcap || e.len < VNET_HDR_LEN) {
         rc = -1;                                              /* malformed; recycle below */
     } else {
         uint32_t flen = e.len - VNET_HDR_LEN;
@@ -287,7 +302,7 @@ int virtio_net_rx_poll(void* out, uint16_t buf_len) {
     }
 
     /* Recycle this buffer back into the avail ring (repost the same id). */
-    uint16_t rid = (uint16_t)(e.id < VNET_RX_BUFS ? e.id : 0);
+    uint16_t rid = (uint16_t)(e.id < rxcap ? e.id : 0);
     vnet.rxq.avail->ring[vnet.rxq.avail_shadow % vnet.rxq.qsize] = rid;
     desc_wmb();
     vnet.rxq.avail->idx = ++vnet.rxq.avail_shadow;

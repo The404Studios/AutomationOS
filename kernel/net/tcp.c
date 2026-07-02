@@ -749,6 +749,9 @@ static void synq_on_ack(sock_t* listener, uint32_t src_ip, uint16_t src_port,
     tcp_ooo_clear(child_idx);
     tcp_rt_count[child_idx]   = 0;
     tcp_rt_rto_ms[child_idx]  = TCP_RTO_INIT_MS;
+    tcp_dupack[child_idx]     = 0;   /* NET-ROBUST: reset the 3rd side-table too;
+                                      * a reused slot must not inherit a stale
+                                      * dup-ACK count and trip fast-retransmit. */
     txq_reset(child);         /* NET-GAPS N1+N4: fresh TX queue + cwnd */
 
     /* Accept queue (same push the old SYN_RCVD promotion used). */
@@ -1300,12 +1303,30 @@ void tcp_input(uint32_t src_ip, uint32_t dst_ip,
         return;
     }
 
-    /* Update peer's advertised window on every non-RST segment. Capture the
-     * PREVIOUS window first: RFC 5681 defines a duplicate ACK (the fast-
-     * retransmit trigger) as one whose advertised window is UNCHANGED -- a pure
-     * window update is NOT a dup-ACK (NET-HARDENING F4). */
+    /* Update peer's advertised window. Capture the PREVIOUS window first: RFC
+     * 5681 defines a duplicate ACK (the fast-retransmit trigger) as one whose
+     * advertised window is UNCHANGED -- a pure window update is NOT a dup-ACK
+     * (NET-HARDENING F4). */
     uint16_t prev_snd_wnd = s->snd_wnd;
-    s->snd_wnd = net_ntohs(th->window);
+    uint16_t seg_wnd      = net_ntohs(th->window);
+    /* NET-ROBUST (RFC 793 window update): once synchronized, only let a
+     * *current* segment move the send window -- one whose ACK lies in
+     * [snd_una, snd_nxt] and whose seq sits inside our receive window. This
+     * stops a blind off-path segment or a stale duplicate from clobbering
+     * snd_wnd (e.g. forging window=0 to stall TX into the persist loop). The
+     * handshake states (LISTEN/SYN_SENT/SYN_RCVD) adopt the initial window
+     * verbatim; other states aren't sending, so the gate is harmless there. */
+    if (s->state == TCP_LISTEN || s->state == TCP_SYN_SENT ||
+        s->state == TCP_SYN_RCVD) {
+        s->snd_wnd = seg_wnd;
+    } else {
+        uint32_t winhi  = s->rcv_nxt + rcv_wnd(s);
+        int      seq_ok = (seq == s->rcv_nxt) ||
+                          (SEQ32_GEQ(seq, s->rcv_nxt) && SEQ32_GT(winhi, seq));
+        int      ack_ok = (flags & TCP_ACK) &&
+                          SEQ32_GEQ(ack, s->snd_una) && SEQ32_GEQ(s->snd_nxt, ack);
+        if (seq_ok && ack_ok) s->snd_wnd = seg_wnd;
+    }
 
     switch (s->state) {
     case TCP_LISTEN:
@@ -1325,8 +1346,10 @@ void tcp_input(uint32_t src_ip, uint32_t dst_ip,
     case TCP_SYN_RCVD:
         /* Server-side: waiting for final ACK of 3-way handshake. */
         if (flags & TCP_ACK) {
-            /* Verify the ACK covers our SYN-ACK. */
-            if (!SEQ32_GEQ(ack, s->snd_nxt)) return;  /* unexpected ack */
+            /* Verify the ACK covers our SYN-ACK exactly. NET-ROBUST: an ack
+             * strictly > snd_nxt would set snd_una past snd_nxt below, wedging
+             * every later send (flight = snd_nxt - snd_una underflows). */
+            if (ack != s->snd_nxt) return;  /* unexpected ack */
 
             s->snd_una = ack;
             tcp_disarm_retransmit(s);
@@ -1343,8 +1366,9 @@ void tcp_input(uint32_t src_ip, uint32_t dst_ip,
     case TCP_SYN_SENT:
         /* Expect SYN|ACK acking our ISN+1. */
         if ((flags & TCP_SYN) && (flags & TCP_ACK)) {
-            /* CHANGED: SEQ32_GEQ for wraparound-safe ack check. */
-            if (!SEQ32_GEQ(ack, s->snd_nxt)) { /* unexpected ack */ return; }
+            /* NET-ROBUST: the SYN-ACK must ack our ISN+1 exactly; an ack > snd_nxt
+             * would set snd_una past snd_nxt and wedge the send path. */
+            if (ack != s->snd_nxt) { /* unexpected ack */ return; }
             /* TCP-ROBUST: learn the server's options (MSS/wscale/SACK/TS) from
              * its SYN-ACK so our send path can size segments to the peer's MSS. */
             tcp_parse_options(s, seg, ihl);
@@ -1433,7 +1457,13 @@ void tcp_input(uint32_t src_ip, uint32_t dst_ip,
                  * Fires exactly once at 3 (== not >=), so later dups don't
                  * re-storm the wire. Counted only while something is actually
                  * outstanding (TX queue bytes or the control slot). */
-                if (++tcp_dupack[idx] == 3) {
+                /* NET-ROBUST: saturate the counter so it fires EXACTLY once at 3
+                 * and never wraps back through 3. A sustained dup-ACK flood would
+                 * otherwise re-trip fast-retransmit every 256 dups, collapsing
+                 * cwnd/ssthresh to the 2*MSS floor. Resets to 0 when snd_una
+                 * advances (a new ACK begins the next loss episode). */
+                if (tcp_dupack[idx] < 255) tcp_dupack[idx]++;
+                if (tcp_dupack[idx] == 3) {
                     cwnd_on_loss(s, 0);       /* N4: halve into recovery */
                     tcp_fast_retransmit(s);   /* N1: resends from snd_una */
                 }
@@ -1685,8 +1715,12 @@ void tcp_tick(sock_t* s) {
     if (tcp_rt_count[idx] >= TCP_RTO_MAX_RETRIES) {
         /* Exhausted retries: give up. */
         tcp_disarm_retransmit(s);
-        if (s->state == TCP_SYN_SENT || s->state == TCP_ESTABLISHED ||
+        if (s->state == TCP_SYN_SENT || s->state == TCP_SYN_RCVD ||
+            s->state == TCP_ESTABLISHED || s->state == TCP_CLOSE_WAIT ||
             s->state == TCP_FIN_WAIT || s->state == TCP_LAST_ACK) {
+            /* NET-ROBUST: also tear down CLOSE_WAIT/SYN_RCVD so an exhausted
+             * retransmit (e.g. on the txq-alloc-failed degrade path) surfaces
+             * an error instead of leaving a half-alive socket with silent loss. */
             s->reset = true;
             s->state = TCP_CLOSED;   /* orphan reaped on the next tick */
         }

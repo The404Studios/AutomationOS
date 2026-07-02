@@ -673,13 +673,19 @@ int sock_connect(int s, uint32_t ip, uint16_t port) {
     sock_t* so = sock_from_fd(s);
     if (!so) return SOCK_EBADF;
 
-    so->remote_ip   = ip;
-    so->remote_port = port;
-
     if (so->type == SOCK_DGRAM) {
         /* UDP "connect" just records the default peer. */
+        so->remote_ip   = ip;
+        so->remote_port = port;
         return SOCK_OK;
     }
+    /* NET-ROBUST: a connect() is only valid on a fresh socket. Reject on a
+     * LISTEN/ESTABLISHED/closing socket so it can't clobber remote_ip/port and
+     * yank the socket into a new active open (orphaning any accept-queue /
+     * SYN_RCVD children that still point at it as their parent). */
+    if (so->state != TCP_CLOSED) return SOCK_EINVAL;
+    so->remote_ip   = ip;
+    so->remote_port = port;
     /* TCP: perform the active-open handshake (pumps sock_poll internally). */
     return tcp_connect(so, ip, port);
 }
@@ -1031,15 +1037,32 @@ int64_t sys_sock_socket(uint64_t type, uint64_t a2, uint64_t a3,
     return sock_socket((int)type);
 }
 
+/* NET-ISOLATION: a socket "fd" is a raw global g_socks[] index, so without an
+ * ownership gate any process could read/write/close another process's socket
+ * just by naming its index. Every userspace socket syscall below checks that
+ * the caller owns the fd. Kernel/internal callers (pid 0, and the in-kernel
+ * sock_* users -- DHCP/ARP helpers, the net rig, sock_poll) never come through
+ * these sys_ wrappers, so they are unaffected. A bad/free fd returns 1 here so
+ * the underlying op still yields its normal SOCK_EBADF. */
+static int sock_fd_owned(int fd) {
+    sock_t* so = sock_from_fd(fd);
+    if (!so) return 1;
+    process_t* cur = process_get_current();
+    uint32_t pid = cur ? cur->pid : 0;
+    return (pid == 0) || (so->owner_pid == pid);
+}
+
 int64_t sys_sock_connect(uint64_t s, uint64_t ip, uint64_t port,
                          uint64_t a4, uint64_t a5, uint64_t a6) {
     (void)a4;(void)a5;(void)a6;
+    if (!sock_fd_owned((int)s)) return SOCK_EBADF;
     return sock_connect((int)s, (uint32_t)ip, (uint16_t)port);
 }
 
 int64_t sys_sock_send(uint64_t s, uint64_t buf, uint64_t len,
                       uint64_t a4, uint64_t a5, uint64_t a6) {
     (void)a4;(void)a5;(void)a6;
+    if (!sock_fd_owned((int)s)) return SOCK_EBADF;
     if (buf == 0 || len == 0) return SOCK_EINVAL;
     if (len > 0xFFFF) len = 0xFFFF;
 
@@ -1132,6 +1155,7 @@ static int sock_block_op(sock_t* so, blk_ctx_t* ctx, const char* label) {
 int64_t sys_sock_recv(uint64_t s, uint64_t buf, uint64_t len,
                       uint64_t a4, uint64_t a5, uint64_t a6) {
     (void)a4;(void)a5;(void)a6;
+    if (!sock_fd_owned((int)s)) return SOCK_EBADF;
     if (buf == 0 || len == 0) return SOCK_EINVAL;
     uint8_t kbuf[4096];
     uint32_t cap = (len > sizeof(kbuf)) ? sizeof(kbuf) : (uint32_t)len;
@@ -1147,12 +1171,14 @@ int64_t sys_sock_recv(uint64_t s, uint64_t buf, uint64_t len,
 int64_t sys_sock_close(uint64_t s, uint64_t a2, uint64_t a3,
                        uint64_t a4, uint64_t a5, uint64_t a6) {
     (void)a2;(void)a3;(void)a4;(void)a5;(void)a6;
+    if (!sock_fd_owned((int)s)) return SOCK_EBADF;
     return sock_close((int)s);
 }
 
 int64_t sys_sock_sendto(uint64_t s, uint64_t buf, uint64_t len,
                         uint64_t ip, uint64_t port, uint64_t a6) {
     (void)a6;
+    if (!sock_fd_owned((int)s)) return SOCK_EBADF;
     if (buf == 0 || len == 0) return SOCK_EINVAL;
     if (len > UDP_DGRAM_MAX) len = UDP_DGRAM_MAX;
     uint8_t kbuf[UDP_DGRAM_MAX];
@@ -1164,6 +1190,7 @@ int64_t sys_sock_sendto(uint64_t s, uint64_t buf, uint64_t len,
 int64_t sys_sock_recvfrom(uint64_t s, uint64_t buf, uint64_t len,
                           uint64_t out_addr, uint64_t a5, uint64_t a6) {
     (void)a5;(void)a6;
+    if (!sock_fd_owned((int)s)) return SOCK_EBADF;
     if (buf == 0 || len == 0) return SOCK_EINVAL;
     uint8_t kbuf[UDP_DGRAM_MAX];
     uint32_t cap = (len > sizeof(kbuf)) ? sizeof(kbuf) : (uint32_t)len;
@@ -1190,18 +1217,21 @@ int64_t sys_sock_poll(uint64_t a1, uint64_t a2, uint64_t a3,
 int64_t sys_sock_bind(uint64_t s, uint64_t port, uint64_t a3,
                       uint64_t a4, uint64_t a5, uint64_t a6) {
     (void)a3;(void)a4;(void)a5;(void)a6;
+    if (!sock_fd_owned((int)s)) return SOCK_EBADF;
     return sock_bind((int)s, (uint16_t)port);
 }
 
 int64_t sys_sock_listen(uint64_t s, uint64_t backlog, uint64_t a3,
                         uint64_t a4, uint64_t a5, uint64_t a6) {
     (void)a3;(void)a4;(void)a5;(void)a6;
+    if (!sock_fd_owned((int)s)) return SOCK_EBADF;
     return sock_listen((int)s, (int)backlog);
 }
 
 int64_t sys_sock_accept(uint64_t s, uint64_t a2, uint64_t a3,
                         uint64_t a4, uint64_t a5, uint64_t a6) {
     (void)a2;(void)a3;(void)a4;(void)a5;(void)a6;
+    if (!sock_fd_owned((int)s)) return SOCK_EBADF;
     /* NET-BLOCK-0: blocks when the listener has SO_BLOCKING / SO_RCVTIMEO set;
      * default stays non-blocking EAGAIN. */
     blk_ctx_t ctx = { BLK_ACCEPT, (int)s, 0, 0, 0, 0 };   /* stack-local */

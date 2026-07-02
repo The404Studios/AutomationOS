@@ -58,6 +58,15 @@ if [ "${DZ_MPLIVE:-0}" = "1" ]; then
     INIT_EXTRA="$INIT_EXTRA -DDZ_MPLIVE"
     echo "*** DZ_MPLIVE build: init spawns deadzoned + dzclient (live loopback co-op proof) ***"
 fi
+# E2E=1 adds -DE2E_TEST to the init compile ONLY, so init spawns sbin/e2etest
+# (the FS/exec end-to-end integration proof: VFS ls /bin -> load+run
+# /bin/hello.elf -> tool_shell runs a command) BEFORE the desktop and waitpid's
+# it. Also gates the compile+package of hello_e2e/e2etest below. Unset => the
+# default initrd is byte-for-byte unchanged (neither test binary ships).
+if [ "${E2E:-0}" = "1" ]; then
+    INIT_EXTRA="$INIT_EXTRA -DE2E_TEST"
+    echo "*** E2E build: init spawns sbin/e2etest (end-to-end integration proof) ***"
+fi
 # DZ_MP2=1 compiles dzclient.c with -DDZ_MP2 so the (single) spawned dzclient opens
 # TWO connections internally -- the MP-HELLO-0 headless 2-client proof (distinct
 # slots via DZ_HELLO). Use together with DZ_MPLIVE=1 (init spawns deadzoned + the
@@ -871,6 +880,19 @@ cp /tmp/tar.elf      /tmp/ird/bin/tar
 cp /tmp/pkg.elf      /tmp/ird/bin/pkg
 cp /tmp/make.elf     /tmp/ird/bin/make
 cp /tmp/meminfo.elf  /tmp/ird/bin/meminfo
+# FS-E2E (E2E=1 only): the end-to-end integration proof binaries. hello_e2e is
+# the ELF-loader target, packaged as BOTH /bin/hello.elf (direct spawn test) and
+# /bin/hello (so tool_shell's bare-name resolution runs it). e2etest is the
+# orchestrator init spawns under -DE2E_TEST. Gated => the default initrd is
+# byte-for-byte unchanged.
+if [ "${E2E:-0}" = "1" ]; then
+    cc userspace/tests/hello_e2e.c /tmp/hello_e2e.o; $LD /tmp/crt0.o /tmp/hello_e2e.o -o /tmp/hello_e2e.elf
+    cp /tmp/hello_e2e.elf /tmp/ird/bin/hello.elf
+    cp /tmp/hello_e2e.elf /tmp/ird/bin/hello
+    cc userspace/tests/e2etest.c /tmp/e2etest.o;   $LD /tmp/crt0.o /tmp/e2etest.o -o /tmp/e2etest.elf
+    cp /tmp/e2etest.elf /tmp/ird/sbin/e2etest
+    echo "[all] E2E: packaged /bin/hello.elf + /bin/hello + /sbin/e2etest"
+fi
 cp /tmp/argvtest.elf /tmp/ird/sbin/argvtest
 # EXECVE-INPLACE-0: execchild -> /sbin (reached only via exectest's execve()).
 cp /tmp/execchild.elf /tmp/ird/sbin/execchild

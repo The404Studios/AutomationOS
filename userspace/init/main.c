@@ -111,6 +111,26 @@ void _start(void) {
         syscall(SYS_EXIT, 1, 0, 0);
     }
 
+#ifdef E2E_TEST
+    /* FS-E2E (E2E build only): run the end-to-end integration proof BEFORE the
+     * desktop, so it is a clean headless proof. init (itself loaded from the
+     * initrd by the ELF loader) spawns e2etest, which does VFS ls /bin, loads +
+     * runs /bin/hello.elf, and drives tool_shell to run a command. We waitpid it
+     * so build_test/e2e_boot.sh sees its markers deterministically. Boot then
+     * continues normally into the desktop. */
+    print("[INIT] E2E_TEST: running end-to-end integration proof...\n");
+    {
+        int e2e_pid = spawn("sbin/e2etest");
+        if (e2e_pid > 0) {
+            int e2e_st = 0;
+            syscall(SYS_WAITPID, e2e_pid, (long)&e2e_st, 0);
+        } else {
+            print("[INIT] E2E_TEST: FAILED to spawn sbin/e2etest\n");
+        }
+        print("[INIT] E2E_TEST: integration proof complete\n");
+    }
+#endif
+
 #ifdef SELFHEAL
     /* SELFHEAL: init (PID 1, immortal) CREATES + OWNS the compositor heartbeat
      * segment, then zeroes the page (sys_shmget does NOT zero page contents), so

@@ -247,6 +247,19 @@ void _start(void) {
     spawn("sbin/taskman");
 #endif
 
+#ifdef BLOCKRECV_TEST
+    // NET-BLOCK-0 (BLOCKRECV_TEST=1): two sbin/blockrecv instances rendezvous
+    // over loopback -- the first binds the port (SERVER: blocking accept, then
+    // sleep+send), the second's bind fails (CLIENT: blocking recv). Proves
+    // blocking accept + blocking recv wait at zero CPU (the [NETBLOCK] slice
+    // markers) and return the data, instead of busy-spinning on EAGAIN. Net is
+    // up by here (autodhcp ran above; loopback needs no NIC). Gated => default
+    // boot never spawns it.
+    print("[INIT] BLOCKRECV_TEST: spawning blockrecv x2 (NET-BLOCK-0 proof)...\n");
+    spawn("sbin/blockrecv");
+    spawn("sbin/blockrecv");
+#endif
+
 #ifdef AUDIO_STREAMTEST
     // AUDIO_STREAMTEST: prove a ring-3 app streams PCM via SYS_AUDIO_STREAM_WRITE
     // (the on_bcis ring consumer drains it into the HDA DMA). Gated => default boot

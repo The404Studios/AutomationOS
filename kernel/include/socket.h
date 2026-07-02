@@ -71,6 +71,9 @@
 #define SO_RCVTIMEO     20  /* receive timeout in milliseconds (int)     */
 #define SO_SNDTIMEO     21  /* send timeout in milliseconds (int)        */
 #define SO_KEEPALIVE    9   /* enable TCP keepalive (stored; advisory)   */
+#define SO_BLOCKING     22  /* NET-BLOCK-0: recv/accept block (0=default */
+                            /* non-blocking EAGAIN; 1=block; SO_RCVTIMEO */
+                            /* >0 also blocks, bounded by the timeout)   */
 
 /* shutdown(2) "how". */
 #define SHUT_RD         0   /* disable further receives                  */
@@ -203,6 +206,7 @@ struct sock {
     uint8_t     so_reuseaddr;  /* SO_REUSEADDR: relax bind dup check     */
     uint8_t     so_broadcast;  /* SO_BROADCAST: allow broadcast sendto   */
     uint8_t     so_keepalive;  /* SO_KEEPALIVE: stored (advisory)        */
+    uint8_t     so_blocking;   /* NET-BLOCK-0: SO_BLOCKING (0 default)   */
     uint8_t     shut_rd;       /* shutdown(SHUT_RD): recv returns EOF    */
     uint8_t     shut_wr;       /* shutdown(SHUT_WR): send is rejected    */
     uint32_t    so_rcvtimeo_ms;/* SO_RCVTIMEO (ms; 0 = none)             */

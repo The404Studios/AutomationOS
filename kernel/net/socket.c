@@ -28,6 +28,8 @@
 #include "../include/mem.h"       /* kmalloc + copy_from_user/copy_to_user */
 #include "../include/sched.h"    /* process_get_current (for owner_pid)   */
 #include "../include/netif.h"    /* K1: per-interface tx routing          */
+#include "../include/poll.h"     /* NET-BLOCK-0: poll_pump/poll_sleep_slice */
+#include "../include/time.h"     /* NET-BLOCK-0: ms_to_ticks_atleast1     */
 
 /* ------------------------------------------------------------------ */
 /* Socket table                                                        */
@@ -929,6 +931,7 @@ int sock_setsockopt(int s, int level, int optname, int value) {
         case SO_KEEPALIVE: so->so_keepalive   = value ? 1 : 0;            return SOCK_OK;
         case SO_RCVTIMEO:  so->so_rcvtimeo_ms = (value < 0) ? 0u : (uint32_t)value; return SOCK_OK;
         case SO_SNDTIMEO:  so->so_sndtimeo_ms = (value < 0) ? 0u : (uint32_t)value; return SOCK_OK;
+        case SO_BLOCKING:  so->so_blocking    = value ? 1 : 0;             return SOCK_OK;
         default:           return SOCK_EINVAL;   /* SO_TYPE/SO_ERROR are read-only */
     }
 }
@@ -944,6 +947,7 @@ int sock_getsockopt(int s, int level, int optname, int* out_value) {
         case SO_KEEPALIVE: *out_value = so->so_keepalive;        return SOCK_OK;
         case SO_RCVTIMEO:  *out_value = (int)so->so_rcvtimeo_ms; return SOCK_OK;
         case SO_SNDTIMEO:  *out_value = (int)so->so_sndtimeo_ms; return SOCK_OK;
+        case SO_BLOCKING:  *out_value = so->so_blocking;         return SOCK_OK;
         case SO_TYPE:      *out_value = so->type;                return SOCK_OK;
         case SO_ERROR:     *out_value = so->reset ? SOCK_ECONN : 0; return SOCK_OK;
         default:           return SOCK_EINVAL;
@@ -1059,13 +1063,80 @@ int64_t sys_sock_send(uint64_t s, uint64_t buf, uint64_t len,
     return (int64_t)total_sent;
 }
 
+/* ------------------------------------------------------------------ */
+/* NET-BLOCK-0: opt-in blocking wait for recv/accept.                   */
+/* ------------------------------------------------------------------ */
+/* Per-call op context. MUST live on the CALLER's (per-process) kernel stack,
+ * NOT in file-static state: poll_sleep_slice() below cooperatively switches to
+ * another process, which may ALSO be mid blocking-recv -- file-static buffer
+ * args would be clobbered by that sibling and the resumed caller would read/
+ * write the wrong buffer (observed: 9 bytes of another stream's data). */
+enum { BLK_RECV = 0, BLK_RECVFROM = 1, BLK_ACCEPT = 2 };
+typedef struct {
+    int      kind;
+    int      fd;
+    uint8_t* buf;
+    uint32_t cap;
+    uint32_t fip;   /* recvfrom: filled sender ip   */
+    uint16_t fp;    /* recvfrom: filled sender port */
+} blk_ctx_t;
+
+static int blk_do_op(blk_ctx_t* c) {
+    switch (c->kind) {
+        case BLK_RECV:     return sock_recv(c->fd, c->buf, c->cap);
+        case BLK_RECVFROM: return sock_recvfrom(c->fd, c->buf, c->cap, &c->fip, &c->fp);
+        case BLK_ACCEPT:   return sock_accept(c->fd);
+        default:           return SOCK_EINVAL;
+    }
+}
+
+/*
+ * Wraps a one-shot socket op that returns SOCK_EAGAIN when nothing is ready.
+ * DEFAULT (so_blocking==0 && so_rcvtimeo_ms==0) is byte-compatible: run the op
+ * once, return its result (EAGAIN included). Otherwise loop pump/check/sleep --
+ * built on the SAME poll_pump()+poll_sleep_slice() the proven poll/select path
+ * uses (kernel/core/syscall/poll.c), so it is immune to the B7 lost-wakeup race
+ * (timed slices, never a pure event block) and burns ~0 CPU: each blocked
+ * waiter itself pumps sock_poll between 5 ms yielding sleeps, so RX advances
+ * even if EVERY process is blocked (the idle core sti;hlt's, the PIT re-readies
+ * a waiter, it pumps). Returns the op's terminal result, or SOCK_EAGAIN on
+ * timeout (POSIX SO_RCVTIMEO convention). `label` tags the zero-CPU marker.
+ *
+ * so points at the socket whose policy governs the wait (the listener for
+ * accept, the connection for recv). ctx (on the caller's stack) carries the op.
+ */
+static int sock_block_op(sock_t* so, blk_ctx_t* ctx, const char* label) {
+    int r = blk_do_op(ctx);
+    if (r != SOCK_EAGAIN) return r;                 /* ready / EOF / error */
+    if (!so || (!so->so_blocking && so->so_rcvtimeo_ms == 0))
+        return r;                                   /* default: non-blocking EAGAIN */
+
+    int      bounded  = (so->so_rcvtimeo_ms > 0);
+    uint64_t deadline = bounded
+        ? timer_get_ticks() + ms_to_ticks((uint64_t)so->so_rcvtimeo_ms) : 0;
+    uint32_t slices = 0;
+    for (;;) {
+        poll_pump();                                /* advance RX for everyone */
+        r = blk_do_op(ctx);
+        if (r != SOCK_EAGAIN) break;
+        if (bounded && timer_get_ticks() >= deadline) { r = SOCK_EAGAIN; break; }
+        uint64_t until = timer_get_ticks() + ms_to_ticks_atleast1(5);
+        poll_sleep_slice(until);                    /* zero-CPU yield to `until` */
+        slices++;
+    }
+    /* Zero-CPU evidence: slices ~= waited_ms/5, NOT a busy-spin iteration count. */
+    kprintf("[NETBLOCK] %s blocked slices=%u\n", label, slices);
+    return r;
+}
+
 int64_t sys_sock_recv(uint64_t s, uint64_t buf, uint64_t len,
                       uint64_t a4, uint64_t a5, uint64_t a6) {
     (void)a4;(void)a5;(void)a6;
     if (buf == 0 || len == 0) return SOCK_EINVAL;
     uint8_t kbuf[4096];
     uint32_t cap = (len > sizeof(kbuf)) ? sizeof(kbuf) : (uint32_t)len;
-    int r = sock_recv((int)s, kbuf, cap);
+    blk_ctx_t ctx = { BLK_RECV, (int)s, kbuf, cap, 0, 0 };   /* stack-local: yield-safe */
+    int r = sock_block_op(sock_from_fd((int)s), &ctx, "recv");
     if (r > 0) {
         if (copy_to_user((void*)buf, kbuf, (size_t)r) != COPY_SUCCESS)
             return SOCK_EINVAL;
@@ -1096,13 +1167,13 @@ int64_t sys_sock_recvfrom(uint64_t s, uint64_t buf, uint64_t len,
     if (buf == 0 || len == 0) return SOCK_EINVAL;
     uint8_t kbuf[UDP_DGRAM_MAX];
     uint32_t cap = (len > sizeof(kbuf)) ? sizeof(kbuf) : (uint32_t)len;
-    uint32_t fip = 0; uint16_t fp = 0;
-    int r = sock_recvfrom((int)s, kbuf, cap, &fip, &fp);
+    blk_ctx_t ctx = { BLK_RECVFROM, (int)s, kbuf, cap, 0, 0 };   /* stack-local */
+    int r = sock_block_op(sock_from_fd((int)s), &ctx, "recvfrom");
     if (r > 0) {
         if (copy_to_user((void*)buf, kbuf, (size_t)r) != COPY_SUCCESS)
             return SOCK_EINVAL;
         if (out_addr) {
-            sock_addr_t a = { fip, fp, 0 };
+            sock_addr_t a = { ctx.fip, ctx.fp, 0 };
             if (copy_to_user((void*)out_addr, &a, sizeof(a)) != COPY_SUCCESS)
                 return SOCK_EINVAL;
         }
@@ -1131,7 +1202,10 @@ int64_t sys_sock_listen(uint64_t s, uint64_t backlog, uint64_t a3,
 int64_t sys_sock_accept(uint64_t s, uint64_t a2, uint64_t a3,
                         uint64_t a4, uint64_t a5, uint64_t a6) {
     (void)a2;(void)a3;(void)a4;(void)a5;(void)a6;
-    return sock_accept((int)s);
+    /* NET-BLOCK-0: blocks when the listener has SO_BLOCKING / SO_RCVTIMEO set;
+     * default stays non-blocking EAGAIN. */
+    blk_ctx_t ctx = { BLK_ACCEPT, (int)s, 0, 0, 0, 0 };   /* stack-local */
+    return sock_block_op(sock_from_fd((int)s), &ctx, "accept");
 }
 
 /* A4 (SOCKET-PARITY-0): optval is a user pointer to an int; optlen is the

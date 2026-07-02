@@ -105,6 +105,14 @@ if [ "${TASKMAN_TEST:-0}" = "1" ]; then
     INIT_EXTRA="$INIT_EXTRA -DTASKMAN_TEST"
     echo "*** TASKMAN_TEST build: init spawns sbin/taskman (proclist proof) ***"
 fi
+# BLOCKRECV_TEST=1 adds -DBLOCKRECV_TEST so init spawns two sbin/blockrecv
+# instances (server+client over loopback) -- the NET-BLOCK-0 blocking accept +
+# blocking recv proof. Unset => normal boot never spawns it (blockrecv.elf still
+# ships + is inert).
+if [ "${BLOCKRECV_TEST:-0}" = "1" ]; then
+    INIT_EXTRA="$INIT_EXTRA -DBLOCKRECV_TEST"
+    echo "*** BLOCKRECV_TEST build: init spawns sbin/blockrecv x2 (NET-BLOCK-0 proof) ***"
+fi
 # AUDIO_STREAMTEST=1 adds -DAUDIO_STREAMTEST so init spawns sbin/streamtest, the
 # userspace PCM-streaming proof (SYS_AUDIO_STREAM_WRITE). Pair with AUDIO_SELFTEST=1
 # (kernel, implies HDA_ENABLE). Unset => normal boot byte-for-byte unchanged.
@@ -519,6 +527,10 @@ cc userspace/apps/nicup/nicup.c /tmp/nicup.o; $LD /tmp/crt0.o /tmp/nicup.o -o /t
 # iwlup: IWL-TRIGGER post-desktop trigger for the deferred real iwlwifi bring-up.
 # Clean ENOTSUP no-op unless the build has the real radio (IWLWIFI=1); tiny, shipped always.
 cc userspace/apps/iwlup/iwlup.c /tmp/iwlup.o; $LD /tmp/crt0.o /tmp/iwlup.o -o /tmp/iwlup.elf
+# blockrecv: NET-BLOCK-0 proof (server+client over loopback; blocking accept +
+# blocking recv). Bare main+crt0; shipped always (tiny), inert unless init
+# spawns it under BLOCKRECV_TEST=1.
+cc userspace/apps/blockrecv/blockrecv.c /tmp/blockrecv.o; $LD /tmp/crt0.o /tmp/blockrecv.o -o /tmp/blockrecv.elf
 # cpu1hello: SMP-F3-5 first-ring-3-on-CPU1 workload. Shipped always (tiny);
 # only the SMP_SCHED_DISPATCH kernel ever spawns it (pinned to CPU1).
 cc userspace/tests/cpu1hello.c /tmp/cpu1hello.o; $LD /tmp/crt0.o /tmp/cpu1hello.o -o /tmp/cpu1hello.elf
@@ -960,6 +972,8 @@ cp /tmp/nicup.elf /tmp/ird/bin/nicup
 cp /tmp/iwlup.elf /tmp/ird/bin/iwlup
 # cpu1hello -> /sbin (SMP-F3-5; inert unless the SMP_SCHED_DISPATCH kernel spawns it).
 cp /tmp/cpu1hello.elf /tmp/ird/sbin/cpu1hello
+# blockrecv -> /sbin (NET-BLOCK-0; inert unless init spawns it under BLOCKRECV_TEST).
+cp /tmp/blockrecv.elf /tmp/ird/sbin/blockrecv
 # bklstorm -> /sbin (SMP-H1; inert unless the SMP_BKL kernel spawns it).
 cp /tmp/bklstorm.elf /tmp/ird/sbin/bklstorm
 # batchdemo -> /sbin (SMP-F3-7; inert unless the SMP_BATCH kernel spawns it).

@@ -25,11 +25,13 @@
 #include "../include/kernel.h"
 #include "../include/string.h"
 #include "../include/rtl8139.h"   /* fallback NIC when no e1000 is present */
+#include "../include/virtio_net.h" /* VIRTIO-NET-0: QEMU virtio-net (probed first) */
 
 /* Which NIC backend net_send/net_recv talk to (chosen in net_init). */
 #define NIC_NONE     0
 #define NIC_E1000    1
 #define NIC_RTL8139  2
+#define NIC_VIRTIO   3
 static int g_nic = NIC_NONE;
 
 /* Broadcast MAC. */
@@ -670,12 +672,15 @@ static void net_input(const uint8_t* frame, uint16_t len) {
 /* ------------------------------------------------------------------ */
 int net_send(const void* frame, uint16_t len) {
     if (!net.up) return -1;
-    return (g_nic == NIC_RTL8139) ? rtl8139_tx(frame, len) : e1000_tx(frame, len);
+    if (g_nic == NIC_VIRTIO)   return virtio_net_tx(frame, len);
+    if (g_nic == NIC_RTL8139)  return rtl8139_tx(frame, len);
+    return e1000_tx(frame, len);
 }
 
 int net_recv(void* buf, uint16_t buf_len) {
     if (!net.up) return -1;
-    int n = (g_nic == NIC_RTL8139) ? rtl8139_rx_poll(buf, buf_len)
+    int n = (g_nic == NIC_VIRTIO)  ? virtio_net_rx_poll(buf, buf_len)
+          : (g_nic == NIC_RTL8139) ? rtl8139_rx_poll(buf, buf_len)
                                    : e1000_rx_poll(buf, buf_len);
     if (n > 0) {
         net_input((const uint8_t*)buf, (uint16_t)n);
@@ -709,9 +714,15 @@ int net_init(void) {
     if (net.up) return 0;
     memset(&net, 0, sizeof(net));
 
-    /* Prefer the Intel e1000 (the QEMU-verified path); fall back to RTL8139
-     * (common on QEMU `-device rtl8139` and older real hardware). */
-    if (e1000_init() == 0 && e1000_get_mac(net.mac) == 0) {
+    /* VIRTIO-NET-0: probe virtio-net FIRST (exact-ID, side-effect-free when
+     * absent). It MUST precede e1000_init(): e1000's class-scan fallback would
+     * otherwise claim a virtio device and treat its I/O-port BAR as an MMIO
+     * pointer (corruption). Then prefer the Intel e1000 (the QEMU-verified
+     * path); fall back to RTL8139. */
+    if (virtio_net_init() == 0 && virtio_net_get_mac(net.mac) == 0) {
+        g_nic = NIC_VIRTIO;
+        kprintf("[NET] using virtio-net NIC\n");
+    } else if (e1000_init() == 0 && e1000_get_mac(net.mac) == 0) {
         g_nic = NIC_E1000;
     } else if (rtl8139_init() == 0 && rtl8139_get_mac(net.mac) == 0) {
         g_nic = NIC_RTL8139;
@@ -748,9 +759,12 @@ int net_init(void) {
         eth0.gateway = net.gateway;
         eth0.dns     = NET_QEMU_DNS;        /* 10.0.2.3      */
         eth0.up      = true;
-        eth0.tx      = (g_nic == NIC_RTL8139) ? rtl8139_tx : e1000_tx;
-        eth0.rx_poll = (g_nic == NIC_RTL8139) ? rtl8139_rx_poll : e1000_rx_poll;
-        eth0.get_mac = (g_nic == NIC_RTL8139) ? rtl8139_get_mac : e1000_get_mac;
+        eth0.tx      = (g_nic == NIC_VIRTIO)  ? virtio_net_tx
+                     : (g_nic == NIC_RTL8139) ? rtl8139_tx : e1000_tx;
+        eth0.rx_poll = (g_nic == NIC_VIRTIO)  ? virtio_net_rx_poll
+                     : (g_nic == NIC_RTL8139) ? rtl8139_rx_poll : e1000_rx_poll;
+        eth0.get_mac = (g_nic == NIC_VIRTIO)  ? virtio_net_get_mac
+                     : (g_nic == NIC_RTL8139) ? rtl8139_get_mac : e1000_get_mac;
         netif_register(&eth0);
         /* A4 (SOCKET-PARITY-0): register "lo" AFTER eth0 (eth0 stays default). */
         netif_register_loopback();

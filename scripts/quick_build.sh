@@ -552,6 +552,10 @@ compile kernel/drivers/storage/ahci_block.c  c_ahci_block
 # buffers -- so the added .bss is a few hundred bytes, nowhere near the initrd.
 compile kernel/drivers/net/e1000.c           c_e1000
 compile kernel/drivers/net/rtl8139.c          c_rtl8139
+# VIRTIO-NET-0: legacy virtio-net (QEMU virtio-net-pci). Always compiled;
+# exact-ID probe (no class fallback) -> inert table-miss when absent, so no
+# build flag and the default (e1000) boot is behaviorally unchanged.
+compile kernel/drivers/net/virtio_net.c       c_virtio_net
 compile kernel/net/net.c                      c_net
 # IPv4 routing table (net.c/socket.c call route_init/route_lookup) -- was on disk
 # but missing from the build list.

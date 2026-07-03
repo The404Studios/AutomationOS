@@ -433,6 +433,17 @@ int64_t sys_fork(uint64_t arg1, uint64_t arg2, uint64_t arg3,
         }
     }
 
+    // ---- Inherit the parent's signal dispositions (KERNEL-ROBUST-0) ----
+    // POSIX fork() preserves signal handlers and the signal mask across fork
+    // (only pending signals are cleared). process_create() zero-filled the child
+    // PCB (every disposition SIG_DFL, mask 0), so without this the child silently
+    // reverts every custom/ignored disposition -- e.g. a process that did
+    // sigaction(SIGPIPE, SIG_IGN) then fork() gets its child killed by the first
+    // broken-pipe write. Mirrors thread_create()'s disposition copy.
+    for (int _s = 0; _s < 32; _s++) child->sig_handlers[_s] = parent->sig_handlers[_s];
+    child->sig_mask     = parent->sig_mask;
+    child->sig_restorer = parent->sig_restorer;
+
     // ---- Inherit the parent's FULL register frame (FORK-REGS-INHERIT-0) ----
     // POSIX fork: the child resumes as if fork() returned 0; every other
     // user-visible register must match the parent at the syscall boundary.

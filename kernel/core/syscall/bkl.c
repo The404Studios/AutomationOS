@@ -91,7 +91,7 @@ static const uint8_t bkl_marked[MAX_SYSCALLS] = {
     [SYS_CLIP_SET] = 1, [SYS_CLIP_GET] = 1,
     [SYS_NOTIFY] = 1, [SYS_NOTIFY_POLL] = 1,
     [SYS_CH_CREATE] = 1, [SYS_CH_WRITE] = 1, [SYS_CH_READ] = 1,
-    [SYS_CH_CLOSE] = 1, [SYS_SPAWN_EX] = 1,
+    [SYS_CH_CLOSE] = 1, [SYS_SPAWN_EX] = 1, [SYS_SPAWN_EX_ARGV] = 1,
     [SYS_CH_SENDMSG] = 1, [SYS_CH_RECVMSG] = 1,
     [SYS_CH_GRANT] = 1, [SYS_CH_ACCEPT] = 1,
     /* ---- NET (non-blocking subset) ---- */
@@ -103,6 +103,12 @@ static const uint8_t bkl_marked[MAX_SYSCALLS] = {
     [SYS_NICE] = 1, [SYS_GETPRIORITY] = 1, [SYS_SETPRIORITY] = 1,
     [SYS_PROCLIST] = 1, [SYS_PROC_QUERY] = 1, [SYS_PROC_CTL] = 1,
     [SYS_BLK_READ] = 1, [SYS_BLK_WRITE] = 1,
+    /* ---- durable diskfs store (KERNEL-ROBUST-0): serialize the ONLY syscalls
+     * that mutate the diskfs bitmap/inode table, else they TOCTOU-race under
+     * SMP_BKL and hand two CPUs the same block/inode -> reboot-persistent
+     * cross-file corruption. Same synchronous-disk-I/O class as SYS_BLK_*. */
+    [SYS_PERSIST_READ] = 1, [SYS_PERSIST_WRITE] = 1,
+    [SYS_CFG_GET] = 1, [SYS_CFG_SET] = 1,
 };
 
 int bkl_is_marked(uint64_t syscall_num) {

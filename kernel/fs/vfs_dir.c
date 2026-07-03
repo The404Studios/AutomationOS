@@ -460,6 +460,16 @@ int vfs_rename(const char* oldpath, const char* newpath) {
         return 0;
     }
 
+    // KERNEL-ROBUST-0: refuse to rename a directory into itself (the destination
+    // parent IS the directory being moved). That orphans the subtree and builds a
+    // self-referential cycle that infinite-loops any recursive directory walk.
+    if (dentry->inode && (dentry->inode->type & VFS_TYPE_DIR) &&
+        dentry->inode == new_parent) {
+        vfs_inode_put(old_parent);
+        vfs_inode_put(new_parent);
+        return VFS_ERR_INVAL;
+    }
+
     // Check if destination exists and remove it
     if (new_parent->private_data) {
         vfs_dentry_t** new_entries = (vfs_dentry_t**)new_parent->private_data;
@@ -474,6 +484,18 @@ int vfs_rename(const char* oldpath, const char* newpath) {
                 // Destination exists - remove it. vfs_dentry_free() drops the
                 // inode reference, so don't put it separately (double-free).
                 vfs_dentry_t* old_dentry = new_entries[i];
+                // KERNEL-ROBUST-0: refuse to clobber a NON-EMPTY destination
+                // directory (POSIX ENOTEMPTY). vfs_inode_free() frees only a
+                // directory's flat entry array, not its children, so silently
+                // freeing a populated dir here leaks every child inode/dentry/
+                // buffer AND destroys data the caller never asked to remove.
+                if (old_dentry->inode &&
+                    (old_dentry->inode->type & VFS_TYPE_DIR) &&
+                    old_dentry->inode->size != 0) {
+                    vfs_inode_put(old_parent);
+                    vfs_inode_put(new_parent);
+                    return VFS_ERR_INVAL;
+                }
                 new_entries[i] = NULL;
                 new_parent->size--;
 

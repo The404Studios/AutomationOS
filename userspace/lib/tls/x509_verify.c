@@ -106,6 +106,9 @@ static const unsigned char OID_RSA_ENC[9] = {
 };
 /* id-ce-subjectAltName: 2.5.29.17 */
 static const unsigned char OID_SUBJECT_ALT_NAME[3] = { 0x55, 0x1D, 0x11 };
+
+/* id-ce-basicConstraints: 2.5.29.19 */
+static const unsigned char OID_BASIC_CONSTRAINTS[3] = { 0x55, 0x1D, 0x13 };
 /* commonName: 2.5.4.3 */
 static const unsigned char OID_COMMON_NAME[3] = { 0x55, 0x04, 0x03 };
 
@@ -744,6 +747,56 @@ static int verify_against_roots(const unsigned char *top, unsigned long top_len,
     return last_err;
 }
 
+/*
+ * KERNEL-ROBUST-0: an issuing cert MUST assert basicConstraints cA=TRUE, else a
+ * normal end-entity (non-CA) leaf could sign a forged cert and impersonate any
+ * host (classic basicConstraints bypass -- the gap self-documented in
+ * x509_verify.h). Returns 1 iff this cert carries a basicConstraints extension
+ * with cA == TRUE. An absent extension, or cA absent/FALSE, yields 0.
+ *
+ * BasicConstraints ::= SEQUENCE { cA BOOLEAN DEFAULT FALSE, pathLen INTEGER OPT }
+ * The extnValue is an OCTET STRING wrapping that SEQUENCE's DER. Mirrors the SAN
+ * extension walk in check_hostname().
+ */
+static int cert_is_ca(const tbs_fields *f) {
+    asn1_cur exts;
+    if (!f->have_exts) return 0;
+    exts = f->exts;
+    while (!asn1_at_end(&exts)) {
+        asn1_cur ext;
+        const unsigned char *oid; unsigned long oidlen;
+        int tag; const unsigned char *val; unsigned long vlen;
+
+        if (asn1_enter(&exts, ASN1_SEQUENCE, &ext) != 0) return 0;
+        if (asn1_get_oid(&ext, &oid, &oidlen) != 0) return 0;
+
+        /* optional BOOLEAN critical */
+        if (asn1_peek_tlv(&ext, &tag, &val, &vlen) != 0) return 0;
+        if (tag == (ASN1_CLASS_UNIVERSAL | ASN1_TAG_BOOLEAN)) {
+            if (asn1_skip(&ext) != 0) return 0;
+        }
+
+        /* extnValue OCTET STRING wrapping the extension DER */
+        if (asn1_expect(&ext, ASN1_CLASS_UNIVERSAL | ASN1_TAG_OCTET_STRING,
+                        &val, &vlen) != 0) return 0;
+
+        if (asn1_oid_equals(oid, oidlen, OID_BASIC_CONSTRAINTS,
+                            sizeof OID_BASIC_CONSTRAINTS)) {
+            asn1_cur bc_wrap, bc;
+            int btag; const unsigned char *bv; unsigned long bl;
+            bc_wrap.p = val; bc_wrap.end = val + vlen;
+            if (asn1_enter(&bc_wrap, ASN1_SEQUENCE, &bc) != 0) return 0;
+            if (asn1_at_end(&bc)) return 0;            /* empty => cA defaults FALSE */
+            if (asn1_peek_tlv(&bc, &btag, &bv, &bl) != 0) return 0;
+            if (btag != (ASN1_CLASS_UNIVERSAL | ASN1_TAG_BOOLEAN))
+                return 0;                              /* first element is not cA => FALSE */
+            if (asn1_get_tlv(&bc, &btag, &bv, &bl) != 0) return 0;
+            return (bl >= 1 && bv[0] != 0x00) ? 1 : 0;
+        }
+    }
+    return 0;   /* no basicConstraints extension present */
+}
+
 /* ====================================================================== */
 /* Public: verify the whole chain                                          */
 /* ====================================================================== */
@@ -787,6 +840,10 @@ int x509_verify_chain(const unsigned char *const *certs,
         if (f[i].issuer_dn_len != f[i + 1].subject_dn_len ||
             !v_memeq(f[i].issuer_dn, f[i + 1].subject_dn, f[i].issuer_dn_len))
             return X509V_ERR_DN_MISMATCH;
+        /* KERNEL-ROBUST-0: the signing (issuer) cert MUST be a CA. Without this a
+         * legitimate non-CA leaf could sign a forged cert and impersonate any host
+         * (basicConstraints bypass). */
+        if (!cert_is_ca(&f[i + 1])) return X509V_ERR_NOT_CA;
         rc = verify_cert_signed_by(certs[i], lens[i],
                                    f[i + 1].spki, f[i + 1].spki_len);
         if (rc != X509V_OK) return rc;

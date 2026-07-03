@@ -1286,7 +1286,11 @@ void tcp_input(uint32_t src_ip, uint32_t dst_ip,
         if (s->state == TCP_SYN_SENT) {
             /* RFC 793: a RST during active open is acceptable only if it ACKs
              * the SYN we sent; otherwise it is not for this connection. */
-            if (!(flags & TCP_ACK) || !SEQ32_GEQ(ack, s->snd_nxt))
+            /* KERNEL-ROBUST-0: RFC 793/5961 -- honor a SYN_SENT RST only if it ACKs
+             * our SYN EXACTLY. The old SEQ32_GEQ accepted ~half of all ack values,
+             * letting a blind/forged RST|ACK tear down an active open. Matches the
+             * exact-ack checks at SYN_RCVD/SYN_SENT below. */
+            if (!(flags & TCP_ACK) || ack != s->snd_nxt)
                 return;
         } else {
             /* RFC 5961: in a synchronized state honor the RST only if its seq is

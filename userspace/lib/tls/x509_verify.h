@@ -87,6 +87,7 @@
 #define X509V_ERR_PUBKEY       -10   /* could not extract issuer's public key */
 #define X509V_ERR_TIME_FMT     -11   /* `now` / a cert time was malformed     */
 #define X509V_ERR_INTERNAL     -12   /* buffer too small / unexpected state   */
+#define X509V_ERR_NOT_CA       -13   /* issuer lacks basicConstraints cA=TRUE  */
 
 /* Maximum certificates accepted in one chain (leaf + intermediates). */
 #define X509V_MAX_CHAIN  8

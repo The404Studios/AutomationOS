@@ -1244,6 +1244,7 @@ int64_t sys_sock_accept(uint64_t s, uint64_t a2, uint64_t a3,
 int64_t sys_sock_setsockopt(uint64_t s, uint64_t level, uint64_t optname,
                             uint64_t optval, uint64_t optlen, uint64_t a6) {
     (void)a6;
+    if (!sock_fd_owned((int)s)) return SOCK_EBADF;   /* KERNEL-ROBUST-0: gate cross-process access */
     if (optval == 0 || optlen < sizeof(int)) return SOCK_EINVAL;
     int value = 0;
     if (copy_from_user(&value, (const void*)optval, sizeof(int)) != COPY_SUCCESS)
@@ -1254,6 +1255,7 @@ int64_t sys_sock_setsockopt(uint64_t s, uint64_t level, uint64_t optname,
 int64_t sys_sock_getsockopt(uint64_t s, uint64_t level, uint64_t optname,
                             uint64_t optval, uint64_t optlen, uint64_t a6) {
     (void)a6;
+    if (!sock_fd_owned((int)s)) return SOCK_EBADF;   /* KERNEL-ROBUST-0: gate cross-process access */
     if (optval == 0 || optlen == 0) return SOCK_EINVAL;
     int value = 0;
     int r = sock_getsockopt((int)s, (int)level, (int)optname, &value);
@@ -1266,6 +1268,7 @@ int64_t sys_sock_getsockopt(uint64_t s, uint64_t level, uint64_t optname,
 int64_t sys_sock_shutdown(uint64_t s, uint64_t how, uint64_t a3,
                           uint64_t a4, uint64_t a5, uint64_t a6) {
     (void)a3;(void)a4;(void)a5;(void)a6;
+    if (!sock_fd_owned((int)s)) return SOCK_EBADF;   /* KERNEL-ROBUST-0: gate cross-process access */
     return sock_shutdown((int)s, (int)how);
 }
 

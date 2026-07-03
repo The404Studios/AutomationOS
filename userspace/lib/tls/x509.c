@@ -138,9 +138,12 @@ int x509_spki_extract_rsa(const unsigned char *spki, unsigned long len,
         if (asn1_get_integer(&rsaseq, &iv, &il) != 0) return -9;
         if (copy_integer_be(iv, il, mod, mod_len, 512) != 0) return -10;
 
-        /* publicExponent */
+        /* publicExponent -- KERNEL-ROBUST-0: the exp buffers at every call site are
+         * 16 bytes (x509.h contract), NOT 512. A malicious cert with a >16-byte
+         * publicExponent overflowed them (no stack canary in -fno-stack-protector).
+         * Real RSA exponents are <=4 bytes, so 16 is a safe fail-closed cap. */
         if (asn1_get_integer(&rsaseq, &iv, &il) != 0) return -11;
-        if (copy_integer_be(iv, il, exp, exp_len, 512) != 0) return -12;
+        if (copy_integer_be(iv, il, exp, exp_len, 16) != 0) return -12;
     }
 
     return 0;

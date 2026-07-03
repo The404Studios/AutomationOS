@@ -443,6 +443,13 @@ static vfs_dentry_t* ext2_vfs_lookup(vfs_inode_t* dir, const char* name) {
     // Read directory blocks
     uint32_t blocks_to_read = (dir->size + fs_data->block_size - 1) / fs_data->block_size;
 
+    /* KERNEL-ROBUST-0: dir->size derives from the untrusted on-disk i_size; a
+     * corrupted value (e.g. 0xFFFFFFFF with a 1 KiB block => ~4.19M) would drive
+     * millions of kmalloc+block_read iterations in this non-preemptible syscall
+     * (hang/DoS). A real directory is a handful of blocks; 8192 (8 MiB @ 1 KiB) is
+     * a generous hard ceiling. */
+    if (blocks_to_read > 8192u) blocks_to_read = 8192u;
+
     /* BUG-FIX: the old cap `i < 12` restricted lookup to the 12 direct blocks,
      * making files/dirs stored in indirect blocks invisible. ext2_get_block_num()
      * already handles single/double/triple indirect lookups, so let the full

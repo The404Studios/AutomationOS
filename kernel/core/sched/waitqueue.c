@@ -234,13 +234,23 @@ static int wo_park_and_cleanup(wait_object_t* wo, process_t* current) {
         process_unref(current);
         cooperative_switch_to(current, next);
         // Resumed here after a wakeup. (Stale locals above are NOT touched.)
-    } else if (next == current) {
-        // Degenerate: we got picked despite being blocked (woken between link and
-        // pick). Just resume as RUNNING.
-        next->state = PROCESS_RUNNING;
-        process_set_current(next);
+    } else {
+        // We did NOT hand off to another task. Two cases land here:
+        //   (a) next == current: we got picked despite being blocked (woken
+        //       between link and pick), or
+        //   (b) next == idle/NULL: the timer re-readied us (state READY,
+        //       on_queue=1) while we were mid-`sti;hlt`, and we broke out of the
+        //       idle loop already woken.
+        // In BOTH cases WE are the task to run, so leave this function RUNNING and
+        // OFF-queue. KERNEL-ROBUST-0: the old `else if (next == current)` left
+        // case (b) with state=READY + on_queue=1 -- a queued phantom dup of the
+        // running task -- so a later wait re-picked our own stale entry and
+        // returned without blocking (skipped sleep / premature futex/waitpid wake).
+        // scheduler_remove_process() is idempotent (KILL-FIX-003).
+        if (current->on_queue) scheduler_remove_process(current);
+        current->state = PROCESS_RUNNING;
+        process_set_current(current);
     }
-    // else: next == NULL && we broke out of the idle loop already woken — resume.
 
     // ── Resume cleanup (runs in our own context, no stale locals) ──────────
     // We were woken by EITHER a signal (wait_object_signal already unlinked us

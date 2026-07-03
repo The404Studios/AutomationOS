@@ -951,6 +951,13 @@ ssize_t vfs_write(int fd, const void* buf, size_t count) {
         return VFS_ERR_NOSYS;
     }
 
+    /* KERNEL-ROBUST-0: enforce the fd's open access mode. O_RDONLY == 0x0000, so a
+     * read-only fd has neither O_WRONLY nor O_RDWR set. vfs_ftruncate already
+     * enforces this; vfs_write omitted it, letting an O_RDONLY fd mutate data. */
+    if (!(file->flags & (O_WRONLY | O_RDWR))) {
+        return VFS_ERR_ACCES;
+    }
+
     return file->ops->write(file, buf, count);
 }
 

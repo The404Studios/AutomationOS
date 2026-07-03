@@ -230,8 +230,17 @@ int net_arp_request(uint32_t target_ip) {
 
 /* Send an ARP reply in response to a request that targeted us. */
 static void arp_reply(const arp_pkt_t* req) {
+    /* KERNEL-ROBUST-0: on the net_recv paths `req` aliases g_frame -- the same
+     * buffer we build the reply into (a == req) -- so snapshot the requester's
+     * hardware/protocol address BEFORE we overwrite the shared bytes, else
+     * a->tha/a->tpa read back our own MAC/IP instead of the requester's. */
+    uint8_t req_sha[ETH_ALEN];
+    uint8_t req_spa[4];
+    memcpy(req_sha, req->sha, ETH_ALEN);
+    memcpy(req_spa, req->spa, 4);
+
     uint8_t* f = g_frame;
-    uint16_t off = eth_build(f, req->sha, ETH_P_ARP);
+    uint16_t off = eth_build(f, req_sha, ETH_P_ARP);
 
     arp_pkt_t* a = (arp_pkt_t*)(f + off);
     a->htype = net_htons(ARP_HTYPE_ETHER);
@@ -242,8 +251,8 @@ static void arp_reply(const arp_pkt_t* req) {
     memcpy(a->sha, net.mac, ETH_ALEN);
     uint32_t spa = net_htonl(net.ip);
     memcpy(a->spa, &spa, 4);
-    memcpy(a->tha, req->sha, ETH_ALEN);
-    memcpy(a->tpa, req->spa, 4);
+    memcpy(a->tha, req_sha, ETH_ALEN);
+    memcpy(a->tpa, req_spa, 4);
 
     net_send(f, off + (uint16_t)sizeof(arp_pkt_t));
 }
@@ -547,8 +556,9 @@ static void icmp_echo_reply(const eth_hdr_t* eh, const ipv4_hdr_t* ip,
     oip->ttl       = 64;
     oip->proto     = IPPROTO_ICMP;
     oip->checksum  = 0;
+    uint32_t orig_src = ip->src;   /* KERNEL-ROBUST-0: snapshot before oip->src clobbers the aliased field (oip == ip on the g_frame RX path) */
     oip->src       = net_htonl(net.ip);
-    oip->dst       = ip->src;   /* already big-endian */
+    oip->dst       = orig_src;   /* reply to the pinger, not ourselves */
     oip->checksum  = net_htons(inet_checksum(oip, sizeof(ipv4_hdr_t)));
 
     icmp_hdr_t* oic = (icmp_hdr_t*)((uint8_t*)oip + sizeof(ipv4_hdr_t));

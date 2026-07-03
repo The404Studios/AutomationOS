@@ -936,6 +936,16 @@ int vmm_map_phys_into(uint64_t cr3, uint64_t vaddr, uint64_t paddr,
 
     for (uint64_t i = 0; i < len; i += PAGE_SIZE) {
         paging_map_page((void*)(v + i), (void*)(p + i), flags);
+        /* KERNEL-ROBUST-0: paging_map_page() is void and silently swallows a
+         * page-table alloc failure (OOM), so this used to ALWAYS return 0 --
+         * sys_shmat's OOM rollback was dead code and shmat could hand back a VA
+         * whose tail page is unmapped. Verify the leaf PTE actually landed (reads
+         * the just-set active_pml4); abort and report failure so the caller rolls
+         * back. */
+        if (!(paging_get_pte(v + i) & PAGE_PRESENT)) {
+            active_pml4 = saved;
+            return -1;
+        }
     }
 
     active_pml4 = saved;                       // restore exactly (not just kernel)

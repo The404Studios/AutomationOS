@@ -454,7 +454,11 @@ void* kmalloc(size_t size) {
     // The old check used HEAP_SIZE (16 MiB initial), but heap_extend() can
     // grow the heap up to HEAP_MAX_SIZE (256 MiB). A legitimate allocation
     // between 16 MiB and 256 MiB would kernel_panic on the old assertion.
-    ASSERT_ALWAYS(size <= HEAP_MAX_SIZE);
+    /* KERNEL-ROBUST-0: fail gracefully, don't panic. An oversized request (e.g. a
+     * privileged sys_mac_load_policy with size > 256 MiB) hitting ASSERT_ALWAYS
+     * turned a recoverable per-request condition into a whole-kernel panic. This
+     * matches the graceful OOM return-NULL path below. */
+    if (size > HEAP_MAX_SIZE) return NULL;
 
     /* Round up to 16-byte multiple */
     size = ALIGN_UP(size, 16);
@@ -583,29 +587,25 @@ void* krealloc(void* ptr, size_t new_size) {
         return NULL;
     }
 
-    /* Slab allocations live in the DIRECT MAP, not the heap window, so they are
-     * NOT heap_owns(). Detect the slab magic BEFORE the heap_owns() gate below
-     * (mirroring kfree's order) -- otherwise every slab-backed pointer (all
-     * kmalloc of size <= 4096, the common case) is wrongly rejected and krealloc
-     * returns NULL, leaving the old block un-freed. */
-    if (slab_enabled) {
-        uintptr_t page_base = (uintptr_t)ptr & ~(PAGE_SIZE - 1);
-        uint64_t* magic_ptr = (uint64_t*)page_base;
-        if (*magic_ptr == 0x51AB0BACE51AB0BULL) {
-            /* Slab allocation: we don't know the exact old size, so always
-             * allocate new, copy a conservative amount, and free old */
-            void* new_ptr = kmalloc(new_size);
-            if (!new_ptr) return NULL;
-            /* Copy up to new_size bytes (slab objects are at least as large
-             * as their size class, so this is safe for common realloc patterns) */
-            size_t copy_limit = (new_size < 4096) ? new_size : 4096;
-            memcpy(new_ptr, ptr, copy_limit);
-            slab_free(NULL, ptr);
-            return new_ptr;
-        }
-    }
-
+    /* KERNEL-ROBUST-0: classify by VA range FIRST (heap window vs the disjoint
+     * slab/direct-map region), so an attacker-groomed page-aligned heap block
+     * cannot forge SLAB_MAGIC in its first 8 bytes and be misrouted into the slab
+     * path (type confusion). Slab objects are simply the "not heap_owns" case, so
+     * they still realloc correctly. */
     if (!heap_owns(ptr)) {
+        if (slab_enabled) {
+            uintptr_t page_base = (uintptr_t)ptr & ~(PAGE_SIZE - 1);
+            if (*(uint64_t*)page_base == 0x51AB0BACE51AB0BULL) {  /* SLAB_MAGIC */
+                /* Slab allocation: exact old size unknown, so allocate new, copy a
+                 * conservative amount, and free old. */
+                void* new_ptr = kmalloc(new_size);
+                if (!new_ptr) return NULL;
+                size_t copy_limit = (new_size < 4096) ? new_size : 4096;
+                memcpy(new_ptr, ptr, copy_limit);
+                slab_free(NULL, ptr);
+                return new_ptr;
+            }
+        }
         kprintf("[KREALLOC] REJECTED non-heap pointer: %p\n", ptr);
         return NULL;
     }
@@ -695,25 +695,27 @@ void kfree(void* ptr) {
 
     ASSERT_ALWAYS(heap_initialized);
 
-    /* Check if this is a slab allocation (fast O(1) check via page-aligned header).
-     * Slab pages are 4KB-aligned with a SLAB_MAGIC sentinel. If it matches, route
-     * to slab_free (which extracts the owning cache from the header). */
-    if (slab_enabled) {
-        uintptr_t page_base = (uintptr_t)ptr & ~(PAGE_SIZE - 1);
-        uint64_t* magic_ptr = (uint64_t*)page_base;
-        /* SLAB_MAGIC is 0x51AB0BACE51AB0BULL from slab.c */
-        if (*magic_ptr == 0x51AB0BACE51AB0BULL) {
-#ifdef MEM_DEBUG
-            __atomic_add_fetch(&slab_free_count, 1, __ATOMIC_SEQ_CST);
-            __atomic_add_fetch(&free_count, 1, __ATOMIC_SEQ_CST);
-            /* We don't know the exact size for slab frees, but track the count */
-#endif
-            slab_free(NULL, ptr);  /* NULL cache = auto-detect from header */
-            return;
-        }
-    }
-
+    /* KERNEL-ROBUST-0: classify by VA range FIRST, before consulting the slab
+     * magic. The heap window and the slab region (direct map) are DISJOINT, so
+     * heap_owns() is an authoritative classifier that CANNOT be forged. The old
+     * order read an 8-byte "slab magic" straight out of caller-freeable data at a
+     * page-aligned heap block (page_base == ptr), so a groomed heap allocation
+     * could spoof SLAB_MAGIC and be misrouted into slab_free() -> type confusion
+     * (attacker-chosen cache pointer -> atomic RMW at an arbitrary address). */
     if (!heap_owns(ptr)) {
+        /* Not in the heap window: it may be a slab object (4KB-aligned page with a
+         * SLAB_MAGIC sentinel, living in the direct map). */
+        if (slab_enabled) {
+            uintptr_t page_base = (uintptr_t)ptr & ~(PAGE_SIZE - 1);
+            if (*(uint64_t*)page_base == 0x51AB0BACE51AB0BULL) {  /* SLAB_MAGIC */
+#ifdef MEM_DEBUG
+                __atomic_add_fetch(&slab_free_count, 1, __ATOMIC_SEQ_CST);
+                __atomic_add_fetch(&free_count, 1, __ATOMIC_SEQ_CST);
+#endif
+                slab_free(NULL, ptr);  /* NULL cache = auto-detect from header */
+                return;
+            }
+        }
         kprintf("[KFREE] REJECTED non-heap pointer: %p (not in range %p-%p)\n",
                 ptr, (void*)HEAP_START, (void*)(HEAP_START + HEAP_SIZE));
         return;

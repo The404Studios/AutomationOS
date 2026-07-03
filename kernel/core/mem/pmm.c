@@ -388,8 +388,10 @@ void* pmm_alloc_page(void) {
         cache->alloc_fast++;
         void* page = cache->pages[cache->count];
         spin_unlock(&cache->lock);
-        if (page && *(volatile uint64_t*)page == 0x51AB0BACE51AB0BULL)
-            kprintf("[SLABPROBE] pmm_alloc(fast) handed out LIVE SLAB %p\n", page);
+        /* KERNEL-ROBUST-0: removed a debug SLABPROBE that dereferenced the raw
+         * PHYSICAL frame as a VA -- it faults under a non-kernel CR3 (cow_handle_write
+         * allocates under the faulting process's CR3, whose low identity map may not
+         * cover this frame) and violates the mem.h no-(void*)phys-deref rule. */
         return page;
     }
 
@@ -440,8 +442,8 @@ void* pmm_alloc_page(void) {
                 (unsigned long)used_memory, (unsigned long)total_memory);
         return NULL;
     }
-    if (*(volatile uint64_t*)result == 0x51AB0BACE51AB0BULL)
-        kprintf("[SLABPROBE] pmm_alloc(slow) handed out LIVE SLAB %p\n", result);
+    /* KERNEL-ROBUST-0: removed SLABPROBE debug deref of the raw phys frame (faults
+     * under a non-kernel CR3; violates the mem.h no-(void*)phys-deref rule). */
     return result;
 }
 

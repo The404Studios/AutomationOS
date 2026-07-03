@@ -489,16 +489,19 @@ void* vmm_alloc_at(void* vmm_ctx, void* addr, size_t size, int prot) {
     uint64_t saved_cr3 = read_cr3();
     write_cr3(cr3);
 
-    // Simple overlap check: verify the target range is not already mapped.
-    // A full implementation would check every page or consult a VMA tree.
-    // For now, check first and last page as a basic sanity test.
-    uint64_t first_pte = paging_get_pte(requested_addr);
-    uint64_t last_pte = paging_get_pte(requested_addr + aligned_size - PAGE_SIZE);
+    // KERNEL-ROBUST-0: check EVERY page in the target range, not just the first
+    // and last. The old two-point probe accepted a request whose INTERIOR page
+    // aliased an existing mapping; paging_map_page then overwrote that live leaf
+    // PTE, leaking the shadowed frame and self-aliasing two allocations.
+    int overlap = 0;
+    for (uint64_t off = 0; off < aligned_size; off += PAGE_SIZE) {
+        if (paging_get_pte(requested_addr + off) & PAGE_PRESENT) { overlap = 1; break; }
+    }
 
     // Restore the original CR3
     write_cr3(saved_cr3);
 
-    if ((first_pte & PAGE_PRESENT) || (last_pte & PAGE_PRESENT)) {
+    if (overlap) {
         kprintf("[VMM] vmm_alloc_at: Address range %p-%p already mapped\n",
                 addr, (void*)(requested_addr + aligned_size));
         return NULL;
@@ -855,9 +858,12 @@ int copy_user_string(void* kernel_dst, const void* user_src, size_t max) {
             break;
         }
 
-        // At every page boundary (including the very first byte) verify the
-        // page is actually mapped before dereferencing it.
-        if ((cur_addr & 0xFFFULL) == 0) {
+        // At every page boundary AND on the very first byte (which may be
+        // mid-page) verify the page is actually mapped before dereferencing it.
+        // KERNEL-ROBUST-0: the old guard fired only on 4K-aligned addresses, so a
+        // non-page-aligned unmapped user pointer skipped the check and faulted in
+        // ring 0 -> kernel panic (unprivileged DoS from one bad syscall arg).
+        if (copied == 0 || (cur_addr & 0xFFFULL) == 0) {
             // Close SMAP window before page-table walk (kernel-page reads)
             if (smap_open) { clac(); smap_open = 0; }
             if (!user_page_is_accessible(cur_addr)) {

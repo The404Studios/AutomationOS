@@ -366,7 +366,12 @@ void deliver_pending_signals(sig_gpframe_t* f, uint64_t retval) {
      * SECURITY (P0): defense-in-depth — h and the restorer were validated at
      * sigaction time, but re-check they are canonical user VAs before they can
      * become the sysret RIP; a bad one fails safe to the default action. */
-    if (!f->user_rsp || !sig_va_user(h) || !sig_va_user(p->sig_restorer)) {
+    if (!f->user_rsp || !sig_va_user(f->user_rsp) ||
+        !sig_va_user(h) || !sig_va_user(p->sig_restorer)) {
+        /* KERNEL-ROBUST-0: user_rsp must be a canonical user VA too, not merely
+         * non-zero. An RSP near 2^64 makes the CoW pre-resolve loop below wrap
+         * 64-bit and spin forever with IF=0 -> permanent core hang. Validated
+         * here it fails safe to the default action. */
         signal_default_action(p, sig); return;
     }
     {
@@ -400,7 +405,9 @@ void deliver_pending_signals(sig_gpframe_t* f, uint64_t retval) {
         {
             uint64_t pg, lo = hsp & ~0xFFFULL;
             uint64_t hi = (uc_addr + sizeof(uc) - 1) & ~0xFFFULL;
-            for (pg = lo; pg <= hi; pg += 0x1000) cow_handle_write(pg);
+            /* KERNEL-ROBUST-0: iterate wrap-safe (belt-and-braces; user_rsp is now
+             * canonical-validated above, so hi is bounded to user space). */
+            for (pg = lo; ; pg += 0x1000) { cow_handle_write(pg); if (pg >= hi) break; }
         }
 
         if (copy_to_user((void*)uc_addr, &uc, sizeof(uc)) != 0 ||

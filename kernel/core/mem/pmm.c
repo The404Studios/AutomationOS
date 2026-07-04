@@ -532,7 +532,12 @@ void pmm_free_page(void* page_addr) {
     // header magic=0 -> kmalloc later pops a wild free_list (the SLABDIAG crash).
     // BLOCK the free (leak the page; far cheaper than corrupting the heap) and
     // report the caller chain so the underlying double-allocation is root-caused.
-    if (*(volatile uint64_t*)page_addr == 0x51AB0BACE51AB0BULL) {
+    // KERNEL-SYSCALL-ROBUST-0: read the frame through the direct map, never as a
+    // raw (void*)phys. On the execve/address-space teardown free path the current
+    // CR3 is the NEW process's, whose low identity map need not cover this frame:
+    // a raw deref would read the wrong frame (false guard decision) or #PF-panic
+    // in ring 0 (here holding no lock; the twin at ~:900 holds global_pmm_lock).
+    if (*(volatile uint64_t*)PHYS_TO_DIRECT(page_addr) == 0x51AB0BACE51AB0BULL) {
         kprintf("[PMM] BLOCKED free of a LIVE slab page %p (caller ra=%p<-%p<-%p) — leaking it to protect the heap\n",
                 page_addr, __builtin_return_address(0),
                 __builtin_return_address(1), __builtin_return_address(2));
@@ -897,7 +902,9 @@ void pmm_free_pages(void* base, size_t count) {
         // This fires when a contiguous free runs into live slabs (e.g. a wrong
         // count, or a per-page-allocated shm segment freed as one contiguous run).
         // Skip+leak the page and report the caller so the bad free is root-caused.
-        if (*(volatile uint64_t*)page_addr == 0x51AB0BACE51AB0BULL) {
+        // KERNEL-SYSCALL-ROBUST-0: read via the direct map (see pmm_free_page);
+        // a raw (void*)phys deref here would #PF-panic while holding global_pmm_lock.
+        if (*(volatile uint64_t*)PHYS_TO_DIRECT(page_addr) == 0x51AB0BACE51AB0BULL) {
             kprintf("[PMM] BLOCKED contiguous free of a LIVE slab page %p (range %p+%lu, caller ra=%p<-%p) — leaking it to protect the heap\n",
                     page_addr, base, (unsigned long)count,
                     __builtin_return_address(0), __builtin_return_address(1));

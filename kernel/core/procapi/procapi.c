@@ -158,6 +158,10 @@ int procapi_ctl(uint32_t pid, uint32_t verb, uint64_t arg)
         kprintf("[PROCAPI] Suspending PID %u (%s)\n", proc->pid, proc->name);
         if (proc->state == PROCESS_RUNNING || proc->state == PROCESS_READY) {
             proc->state = PROCESS_BLOCKED;
+            proc->stopped_by_signal = 1;   // KERNEL-SYSCALL-ROBUST-0: mark as
+                                           // API/signal-stopped so RESUME below
+                                           // only re-admits a process WE stopped,
+                                           // never one blocked on sleep/futex.
             // Mirror kill.c SIGSTOP (FIX H4): also take the process OFF the ready
             // queue. scheduler_pick_next only drains TERMINATED, not BLOCKED, so a
             // suspended-but-still-queued process would otherwise be picked and
@@ -174,7 +178,13 @@ int procapi_ctl(uint32_t pid, uint32_t verb, uint64_t arg)
          * Identical logic to kill.c case SIGCONT.
          */
         kprintf("[PROCAPI] Resuming PID %u (%s)\n", proc->pid, proc->name);
-        if (proc->state == PROCESS_BLOCKED) {
+        // KERNEL-SYSCALL-ROBUST-0: only resume a process this API SUSPENDED (or
+        // that SIGSTOP set stopped_by_signal on) -- never one merely blocked in
+        // sys_sleep / on a futex / wait_object. Force-waking those returns them
+        // early with their wait linkage intact (spurious wake, truncated sleep).
+        // Mirrors kill.c SIGCONT's (state==BLOCKED && stopped_by_signal) gate.
+        if (proc->state == PROCESS_BLOCKED && proc->stopped_by_signal) {
+            proc->stopped_by_signal = 0;
             process_set_ready(proc);
             // Mirror kill.c SIGCONT (FIX H4): process_set_ready only flips the state
             // BLOCKED->READY; without scheduler_add_process the process is READY but

@@ -304,6 +304,14 @@ int elf_load_and_exec(void* elf_data, size_t elf_size, const char* name) {
                 ehdr->e_phentsize, (unsigned long)sizeof(elf64_phdr_t));
         return ELF_ERR_INVALID;
     }
+    // KERNEL-SYSCALL-ROBUST-0: bound e_phoff on its own BEFORE the add. e_phoff
+    // is a full uint64_t; a crafted value near UINT64_MAX would make phdr_end
+    // wrap around past the `> elf_size` check, and phdr = elf_data + e_phoff
+    // would then point below the buffer -> OOB kernel read of the phdr loop.
+    if (ehdr->e_phoff > elf_size) {
+        EXEC_LOG("[EXEC] ERROR: e_phoff beyond buffer\n");
+        return ELF_ERR_INVALID;
+    }
     uint64_t phdr_end = (uint64_t)ehdr->e_phoff
                       + (uint64_t)ehdr->e_phnum * (uint64_t)ehdr->e_phentsize;
     if (phdr_end > elf_size) {
@@ -594,12 +602,20 @@ int elf_load_and_exec(void* elf_data, size_t elf_size, const char* name) {
             };
             vma_add(proc, &seg_vma);
 
-            // Record this segment for overlap detection
-            if (exec_n_loaded < EXEC_MAX_LOAD_SEGMENTS) {
-                exec_loaded[exec_n_loaded].start = vaddr_start;
-                exec_loaded[exec_n_loaded].end = vaddr_end;
-                exec_n_loaded++;
+            // Record this segment for overlap detection. KERNEL-SYSCALL-ROBUST-0:
+            // reject (not silently skip) once the tracking table is full -- an
+            // unrecorded PT_LOAD can be overlapped by a later one, leaving the
+            // earlier segment's private frames orphaned at teardown (physical-page
+            // leak, loopable to exhaustion). Real binaries have very few PT_LOADs.
+            if (exec_n_loaded >= EXEC_MAX_LOAD_SEGMENTS) {
+                EXEC_LOG("[EXEC] ERROR: too many PT_LOAD segments (> %d)\n",
+                        EXEC_MAX_LOAD_SEGMENTS);
+                elf_cleanup_failed_load(proc);
+                return ELF_ERR_INVALID;
             }
+            exec_loaded[exec_n_loaded].start = vaddr_start;
+            exec_loaded[exec_n_loaded].end = vaddr_end;
+            exec_n_loaded++;
 
             EXEC_LOG("[EXEC]   Segment %d loaded (filesz=0x%lx, %lu pages)\n",
                     i, filesz, num_pages);
@@ -891,6 +907,9 @@ int elf_stage_into_cr3(void* elf_data, size_t elf_size, const char* argv0_name,
     if (ehdr->e_phnum > 1024) return ELF_ERR_INVALID;
     if (ehdr->e_phentsize != sizeof(elf64_phdr_t)) return ELF_ERR_INVALID;
     {
+        // KERNEL-SYSCALL-ROBUST-0: bound e_phoff independently before the add so
+        // a near-UINT64_MAX e_phoff cannot wrap phdr_end past the buffer check.
+        if (ehdr->e_phoff > elf_size) return ELF_ERR_INVALID;
         uint64_t phdr_end = (uint64_t)ehdr->e_phoff
                           + (uint64_t)ehdr->e_phnum * (uint64_t)ehdr->e_phentsize;
         if (phdr_end > elf_size) return ELF_ERR_INVALID;
@@ -1023,11 +1042,12 @@ int elf_stage_into_cr3(void* elf_data, size_t elf_size, const char* argv0_name,
         };
         if (vma_add_to_list(staged_vma_head, &seg_vma) != 0) STAGE_FAIL(ELF_ERR_NOMEM);
 
-        if (stg_n_loaded < EXEC_MAX_LOAD_SEGMENTS) {
-            stg_loaded[stg_n_loaded].start = vaddr_start;
-            stg_loaded[stg_n_loaded].end = vaddr_end;
-            stg_n_loaded++;
-        }
+        // KERNEL-SYSCALL-ROBUST-0: reject once the overlap table is full (an
+        // unrecorded PT_LOAD could be overlapped by a later one -> orphaned frames).
+        if (stg_n_loaded >= EXEC_MAX_LOAD_SEGMENTS) STAGE_FAIL(ELF_ERR_INVALID);
+        stg_loaded[stg_n_loaded].start = vaddr_start;
+        stg_loaded[stg_n_loaded].end = vaddr_end;
+        stg_n_loaded++;
     }
 
     /* ---- user stack: eager top page, lazy-anon below (mirror of the loader) ---- */

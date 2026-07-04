@@ -2260,6 +2260,9 @@ int64_t sys_gettime(uint64_t uptr, uint64_t arg2, uint64_t arg3,
     (void)arg2; (void)arg3; (void)arg4; (void)arg5; (void)arg6;
     if (!uptr) return EFAULT;
     rtc_time_t t;
+    memset(&t, 0, sizeof(t));   // KERNEL-SYSCALL-ROBUST-0: rtc_time_t has a
+                                // trailing pad byte rtc_read never writes; zero
+                                // it so copy_to_user leaks no kernel-stack byte.
     rtc_read(&t);
     if (copy_to_user((void*)uptr, &t, sizeof(t)) != COPY_SUCCESS) return EFAULT;
     return ESUCCESS;
@@ -2553,8 +2556,14 @@ int64_t sys_perf_report(uint64_t arg1, uint64_t arg2, uint64_t arg3,
 // ============================================================================
 
 // SYS_POWEROFF - Trigger ACPI S5 soft-off. Does not return on success.
-// Only PID 1 (init) or processes spawned by init may shut down the machine.
 // On QEMU this terminates the emulator process cleanly.
+// KERNEL-SYSCALL-ROBUST-0 NOTE: intentionally UNRESTRICTED. This is a
+// single-user desktop where the Shut Down / Restart affordances are ordinary
+// ring-3 GUI apps (controlcenter, startmenu), not PID 1, and there is no
+// capability/uid model to distinguish them from any other process. A prior
+// comment claimed a "PID 1 only" rule that was never enforced; gating on pid==1
+// would break those buttons. Any real restriction must wait on a capability
+// model (see the deferred KERNEL-SMP/CAP hardening notes).
 int64_t sys_poweroff(uint64_t arg1, uint64_t arg2, uint64_t arg3,
                      uint64_t arg4, uint64_t arg5, uint64_t arg6) {
     (void)arg1; (void)arg2; (void)arg3; (void)arg4; (void)arg5; (void)arg6;

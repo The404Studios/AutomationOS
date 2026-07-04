@@ -670,6 +670,21 @@ int64_t sys_shmdt(uint64_t shmaddr, uint64_t arg2, uint64_t arg3,
         return IPC_EINVAL;
     }
 
+    // KERNEL-SYSCALL-ROBUST-0 (HIGH): only a process that actually attached
+    // this segment may detach it. shm_attach_remove returns false when the
+    // caller holds no attach record for seg->id. shmdt resolves seg purely from
+    // user-supplied VA math, so without this gate an unrelated process could
+    // drive attach_count to 0 and free (via the deferred-destroy path below)
+    // physical pages another owner still maps -- a cross-process use-after-free.
+    // Do the ownership check + record removal FIRST, and bail before touching
+    // any shared state if the caller never attached.
+    if (!shm_attach_remove(current, seg->id)) {
+        spin_unlock(&shm_lock);
+        kprintf("[SHMDT] pid=%d never attached segment %d -- denied\n",
+                current->pid, seg->id);
+        return IPC_EINVAL;
+    }
+
     // Unmap from calling process (free_owned=false: physical pages belong to
     // the segment, released only when the last reference is dropped).
     vmm_unmap_range_into(current->context.cr3, virt_addr, seg->size, false);
@@ -677,7 +692,6 @@ int64_t sys_shmdt(uint64_t shmaddr, uint64_t arg2, uint64_t arg3,
     if (seg->attach_count > 0) {
         seg->attach_count--;
     }
-    shm_attach_remove(current, seg->id);   // drop the tracking record
     seg->detach_time = timer_get_ticks();
 
     ipc_id_t seg_id = seg->id;   // save before potential free
@@ -821,6 +835,15 @@ int64_t sys_shmctl(uint64_t shmid, uint64_t cmd, uint64_t buf,
             return IPC_SUCCESS;
 
         case IPC_STAT: {
+            /* KERNEL-SYSCALL-ROBUST-0: gate the metadata read on permission,
+             * exactly like shmat and IPC_RMID do. Segment ids are small
+             * sequential integers, so without this a non-owner could enumerate
+             * ids 1..N and read every segment's owner/mode/size/times. (No-op
+             * while all procs are uid 0, but correct once uids diverge.) */
+            if (!shm_check_permission(seg, current->uid, current->gid, false)) {
+                spin_unlock(&shm_lock);
+                return IPC_EACCES;
+            }
             /* Fill the caller's struct shmid_ds. Snapshot every field UNDER the
              * lock, drop the lock, THEN copy_to_user (which walks the page table
              * and can fault -- must not run under shm_lock, per this file's
@@ -841,6 +864,10 @@ int64_t sys_shmctl(uint64_t shmid, uint64_t cmd, uint64_t buf,
                 unsigned int  shm_lpid;
                 unsigned int  shm_nattch;
             } st;
+            /* KERNEL-SYSCALL-ROBUST-0: zero first so the 4-byte hole after
+             * shm_perm_mode and the trailing padding are not leaked to
+             * userspace (copy_to_user emits all sizeof(st) bytes). */
+            memset(&st, 0, sizeof st);
             st.shm_perm_uid  = seg->creator_uid;
             st.shm_perm_gid  = seg->creator_gid;
             st.shm_perm_mode = seg->mode;

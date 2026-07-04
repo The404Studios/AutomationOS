@@ -722,48 +722,60 @@ typedef struct {
     msg_queue_t*    queue;
     msg_message_t*  first_msg;   /* head of the queued-message chain */
 } msg_deferred_free_t;
-static msg_deferred_free_t msg_cleanup_work[MSG_CLEANUP_MAX];
-
 void msg_cleanup_process(uint32_t pid) {
     MQ_LOG("[MSG] Cleanup for PID %d\n", pid);
 
-    uint32_t nfree = 0;
+    /* KERNEL-SYSCALL-ROBUST-0: `work` is a per-call STACK local (was a
+     * file-static buffer, which two CPUs tearing down processes at once would
+     * overwrite -> double-free/leak). And we loop in BATCHES until no owned
+     * queue remains: a process may own up to MQ_TABLE_SIZE queues, far more
+     * than MSG_CLEANUP_MAX; the old single pass UNLINKED the overflow queues
+     * (id_table cleared) but never freed them, leaking each queue plus its
+     * whole message chain (attacker-amplifiable heap-exhaustion DoS). */
+    msg_deferred_free_t work[MSG_CLEANUP_MAX];
 
-    spin_lock(&msg_lock);
+    for (;;) {
+        uint32_t nfree = 0;
 
-    for (uint32_t i = 0; i < MQ_TABLE_SIZE; i++) {
-        msg_queue_t* q = id_table[i];
-        if (!q || q->owner_pid != pid) {
-            continue;
-        }
+        spin_lock(&msg_lock);
+        for (uint32_t i = 0; i < MQ_TABLE_SIZE && nfree < MSG_CLEANUP_MAX; i++) {
+            msg_queue_t* q = id_table[i];
+            if (!q || q->owner_pid != pid) {
+                continue;
+            }
 
-        /* Remove from both lookup tables first */
-        id_table[i] = NULL;
-        key_table_remove(q);
+            /* Remove from both lookup tables first */
+            id_table[i] = NULL;
+            key_table_remove(q);
 
-        /* Snapshot the queue and its message chain for post-unlock free.
-         * The kfree calls must NOT run under msg_lock (the heap has its own
-         * lock; holding msg_lock across it inverts the lock order). */
-        if (nfree < MSG_CLEANUP_MAX) {
-            msg_cleanup_work[nfree].queue     = q;
-            msg_cleanup_work[nfree].first_msg = q->first;
+            /* Snapshot for post-unlock free (kfree must NOT run under msg_lock:
+             * the heap has its own lock; holding msg_lock across it inverts the
+             * lock order). */
+            work[nfree].queue     = q;
+            work[nfree].first_msg = q->first;
             nfree++;
+
+            MQ_LOG("[MSG] Cleanup PID %d: queuing queue %d for deferred free\n", pid, q->id);
+        }
+        spin_unlock(&msg_lock);
+
+        /* Heap frees outside the lock */
+        for (uint32_t i = 0; i < nfree; i++) {
+            msg_message_t* m = work[i].first_msg;
+            while (m) {
+                msg_message_t* next = m->next;
+                kfree(m);
+                m = next;
+            }
+            MQ_LOG("[MSG] Cleanup PID %d: freed queue\n", pid);
+            kfree(work[i].queue);
         }
 
-        MQ_LOG("[MSG] Cleanup PID %d: queuing queue %d for deferred free\n", pid, q->id);
-    }
-
-    spin_unlock(&msg_lock);
-
-    /* Heap frees outside the lock */
-    for (uint32_t i = 0; i < nfree; i++) {
-        msg_message_t* m = msg_cleanup_work[i].first_msg;
-        while (m) {
-            msg_message_t* next = m->next;
-            kfree(m);
-            m = next;
+        /* A short batch means we scanned the whole table with room left over,
+         * so every owned queue has now been freed. A full batch may have left
+         * more behind -> scan again. */
+        if (nfree < MSG_CLEANUP_MAX) {
+            break;
         }
-        MQ_LOG("[MSG] Cleanup PID %d: freed queue\n", pid);
-        kfree(msg_cleanup_work[i].queue);
     }
 }

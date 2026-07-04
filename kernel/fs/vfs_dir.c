@@ -9,6 +9,7 @@
 #include "../include/mem.h"
 #include "../include/string.h"
 #include "../include/syscall.h"
+#include "../include/sched.h"   /* process_get_current() for dir-handle ownership */
 
 // cleanup helper: auto-kfree a heap path buffer on scope exit -- keeps the
 // 4096-byte path buffers in vfs_unlink/vfs_rename OFF the 8KB kernel stack
@@ -21,6 +22,7 @@ typedef struct {
     vfs_inode_t* inode;
     uint64_t position;  // Current entry index
     uint32_t ref_count;
+    uint32_t owner_pid; // KERNEL-SYSCALL-ROBUST-0: owning process (0 = kernel)
 } vfs_dir_handle_t;
 
 // Global directory handle table (per-process would be better, but keep it simple)
@@ -57,6 +59,12 @@ static int vfs_dir_alloc_handle(vfs_inode_t* inode) {
             dir_handles[i]->inode = inode;
             dir_handles[i]->position = 0;
             dir_handles[i]->ref_count = 1;
+            {
+                // KERNEL-SYSCALL-ROBUST-0: tag the handle with its opener so no
+                // other process can readdir/closedir it (0 = kernel context).
+                process_t* cur = process_get_current();
+                dir_handles[i]->owner_pid = cur ? cur->pid : 0;
+            }
             vfs_inode_get(inode);
 
             return i;
@@ -87,7 +95,20 @@ static void vfs_dir_free_handle(int handle) {
  */
 static vfs_dir_handle_t* vfs_dir_get_handle(int handle) {
     if (handle >= 0 && handle < MAX_DIR_HANDLES) {
-        return dir_handles[handle];
+        vfs_dir_handle_t* dh = dir_handles[handle];
+        // KERNEL-SYSCALL-ROBUST-0: the table is GLOBAL, so enforce per-process
+        // ownership here (the single choke point for readdir/closedir). Without
+        // it a process could brute-force indices to free another process's
+        // handle (cross-process DoS) or read its directory listing + advance its
+        // cursor. owner_pid==0 = kernel-created (any context); a NULL current
+        // (kernel context) may access anything.
+        if (dh && dh->owner_pid != 0) {
+            process_t* cur = process_get_current();
+            if (cur && cur->pid != dh->owner_pid) {
+                return NULL;
+            }
+        }
+        return dh;
     }
     return NULL;
 }

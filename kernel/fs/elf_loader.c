@@ -339,6 +339,12 @@ int elf_load(const char* path, int argc, char** argv,
         return ELF_ERR_INVALID;
     }
     // Check program header table is within file bounds
+    // KERNEL-SYSCALL-ROBUST-0: bound e_phoff on its own so a near-UINT64_MAX
+    // value cannot wrap phdr_end past the file-size check (OOB phdr read).
+    if (ehdr->e_phoff > file_size) {
+        kprintf("[ELF] ERROR: e_phoff beyond buffer\n");
+        return ELF_ERR_INVALID;
+    }
     uint64_t phdr_end = (uint64_t)ehdr->e_phoff
                       + (uint64_t)ehdr->e_phnum * (uint64_t)ehdr->e_phentsize;
     if (phdr_end > file_size) {

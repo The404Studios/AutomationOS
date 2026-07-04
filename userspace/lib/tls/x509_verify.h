@@ -61,10 +61,12 @@
  *     silently accepted. SHA-1 is intentionally not accepted (it is broken for
  *     signing). ECDSA-SHA384/512 requires P-384/P-521 which are not
  *     implemented; those OIDs are also rejected.
- *   * It does NOT enforce basicConstraints CA:TRUE / pathLen, key usage, or
- *     name constraints on intermediates. The chain is authenticated by issuer/
- *     subject DN matching and signature verification only. This is a deliberate
- *     minimalism trade-off; document it to anyone relying on it.
+ *   * It ENFORCES basicConstraints cA=TRUE on every issuer/intermediate cert
+ *     (KERNEL-ROBUST-0): an issuer that does not assert cA=TRUE makes the whole
+ *     chain fail with X509V_ERR_NOT_CA, closing the classic non-CA-leaf
+ *     impersonation hole. It does NOT (yet) enforce pathLenConstraint, keyUsage,
+ *     or name constraints on intermediates; those remain a deliberate
+ *     minimalism trade-off -- document it to anyone relying on it.
  *   * It does NOT verify the leaf cert's public-key-to-handshake binding -- that
  *     (using the authenticated leaf key in the TLS key exchange / CertVerify) is
  *     the TLS layer's job. This module only authenticates the chain itself.
@@ -133,6 +135,28 @@ int x509_verify_chain(const unsigned char *const *certs,
  *   - empty hostname / empty cert_name never match.
  */
 int x509_hostname_match(const char *hostname, const char *cert_name);
+
+/*
+ * NEGCACHAIN-0 test hook: parse ONE standalone DER certificate and report
+ * whether it asserts basicConstraints cA=TRUE. This is the exact predicate
+ * x509_verify_chain() now applies to every issuer cert in a chain (an
+ * issuer that fails this check makes the whole chain X509V_ERR_NOT_CA).
+ * Not part of the verification API proper -- it exists purely so a
+ * userspace regression test can prove that predicate discriminates a CA
+ * cert from a non-CA cert without duplicating the internal ASN.1 walk or
+ * un-static'ing the real helper.
+ *
+ *   der  DER-encoded Certificate (SEQUENCE), tbsCertificate through
+ *        signatureValue -- the whole outer Certificate TLV, same shape as
+ *        one entry of x509_verify_chain()'s `certs` array.
+ *   len  byte length of `der`.
+ *
+ * Returns 1 iff the cert carries a basicConstraints extension with
+ * cA == TRUE. Returns 0 for: no basicConstraints extension, cA absent/
+ * FALSE, or any parse failure (malformed/truncated DER). Never reads past
+ * `der[0..len)`.
+ */
+int x509_test_cert_is_ca(const unsigned char *der, unsigned long len);
 
 /*
  * Built-in self-test. Verifies hostname matching across the required cases

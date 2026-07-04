@@ -109,6 +109,21 @@ int x509_get_validity(const unsigned char *der, unsigned long len,
  */
 int x509_selftest(void);
 
+/*
+ * NEGRSAEXP -- negative regression test for the RSA publicExponent overflow
+ * (KERNEL-ROBUST-0). Feeds x509_spki_extract_rsa() a hand-crafted SPKI whose
+ * RSAPublicKey has a normal 512-bit modulus but a 32-byte publicExponent --
+ * 16 bytes over the exp[16] buffer contract every real call site uses (see
+ * tls.c, x509_verify.c, tls.h srv_exp[16]). Calls the real function with a
+ * genuine 16-byte exponent buffer flanked by 16-byte canary fields and checks
+ * both that the call is rejected (rc == -12, the exponent-cap error) and that
+ * the canaries were not touched. Returns 0 if both hold (i.e. the fix is
+ * present), a distinct negative code otherwise (including if the pre-fix
+ * hardcoded 512 cap let the copy overrun exp[16] into the trailing canary).
+ * No I/O.
+ */
+int x509_negrsaexp_selftest(void);
+
 /* =========================================================================
  * Extended accessors required by the certificate-chain validator.
  * All functions take (der, len) -- the full DER certificate buffer.

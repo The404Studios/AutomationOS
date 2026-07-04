@@ -1269,3 +1269,91 @@ int x509_selftest(void) {
 
     return 0;
 }
+
+/* ---- NEGRSAEXP: negative regression test for the RSA exponent overflow --
+ *
+ * KERNEL-ROBUST-0 fixed a HIGH: copy_integer_be()'s cap for the RSA
+ * publicExponent was hardcoded to 512 (the modulus cap) instead of the real
+ * 16-byte contract every call site's exp[] buffer actually has (tls.c:1670,
+ * x509_verify.c:515, tls.h srv_exp[16]). A certificate carrying a >16-byte
+ * publicExponent sailed through copy_integer_be() and x509_memcpy() smashed
+ * straight past the caller's 16-byte buffer.
+ *
+ * This test drives x509_spki_extract_rsa() -- the real, fixed function --
+ * with a REAL 16-byte exp buffer, not an oversized test buffer (x509_selftest
+ * above uses exp[512], which is why it never caught this bug). The buffer is
+ * embedded in a struct between two 16-byte canary fields; struct members are
+ * laid out in declaration order with no padding between same-alignment
+ * unsigned char arrays (C11 6.7.2.1p15), so this reliably observes any write
+ * past g.exp[16] without depending on undefined stack layout.
+ */
+static const unsigned char NEGRSAEXP_BAD_SPKI[123] = {
+    /* SubjectPublicKeyInfo SEQUENCE, len 0x79 */
+    0x30, 0x79,
+        /* AlgorithmIdentifier SEQUENCE { OID rsaEncryption, NULL } */
+        0x30, 0x0d, 0x06, 0x09, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d,
+        0x01, 0x01, 0x01, 0x05, 0x00,
+        /* BIT STRING, len 0x68, 0 unused bits -- payload is RSAPublicKey DER */
+        0x03, 0x68, 0x00,
+            /* RSAPublicKey SEQUENCE, len 0x65 */
+            0x30, 0x65,
+                /* modulus INTEGER, 65 bytes (0x00 sign byte + 64-byte magnitude;
+                 * same key as X509_SELFTEST_SPKI -- a normal, valid modulus). */
+                0x02, 0x41, 0x00, 0x89, 0x9c, 0xe8, 0xa5, 0xfa, 0x69, 0x53,
+                0x30, 0x65, 0x9a, 0x4f, 0x6a, 0x74, 0x5e, 0xf2, 0xce, 0xa0,
+                0x7e, 0x75, 0x98, 0x05, 0x63, 0xbf, 0xb4, 0x5b, 0x70, 0x07,
+                0xed, 0x0f, 0x1f, 0x58, 0x3a, 0xe1, 0x46, 0xb4, 0xd1, 0x93,
+                0x42, 0x67, 0x8d, 0x80, 0xda, 0xe5, 0xa7, 0x3a, 0xc2, 0x83,
+                0x2d, 0xb9, 0xa0, 0x86, 0xe1, 0x17, 0x46, 0x86, 0x68, 0xdd,
+                0xe4, 0x77, 0x48, 0xaa, 0xf7, 0xf6, 0x46,
+                /* publicExponent INTEGER, 32 nonzero bytes (0x01..0x20) --
+                 * 16 bytes over the real 16-byte exp[] contract. No real RSA
+                 * exponent is anywhere close to this large (typical <= 4 bytes,
+                 * e.g. 0x010001); this value only exists to probe the cap. */
+                0x02, 0x20, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
+                0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10, 0x11, 0x12,
+                0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c,
+                0x1d, 0x1e, 0x1f, 0x20,
+};
+
+int x509_negrsaexp_selftest(void) {
+    struct {
+        unsigned char pre[16];
+        unsigned char exp[16];
+        unsigned char post[16];
+    } g;
+    unsigned char mod[512];
+    unsigned long mod_len, exp_len;
+    int rc, i;
+
+    x509_memset(g.pre,  0xA5, sizeof g.pre);
+    x509_memset(g.exp,  0x00, sizeof g.exp);
+    x509_memset(g.post, 0xA5, sizeof g.post);
+    x509_memset(mod, 0, sizeof mod);
+    mod_len = 0;
+    exp_len = 0;
+
+    rc = x509_spki_extract_rsa(NEGRSAEXP_BAD_SPKI, sizeof NEGRSAEXP_BAD_SPKI,
+                               mod, &mod_len, g.exp, &exp_len);
+
+    /* Canary check FIRST and unconditionally: this is the bug's direct
+     * signature. Pre-fix, copy_integer_be's 512 cap accepts vlen=32 and
+     * x509_memcpy() writes all 32 bytes into g.exp[16], overrunning exactly
+     * into g.post[0..15] (32 - 16 = 16 bytes over, and g.post is exactly 16
+     * bytes -- the overrun lands entirely inside our own struct, so this is
+     * safe to run, but it is unambiguous proof of the out-of-bounds write). */
+    for (i = 0; i < 16; i++)
+        if (g.pre[i] != 0xA5) return -101;       /* impossible underflow */
+    for (i = 0; i < 16; i++)
+        if (g.post[i] != 0xA5) return -102;      /* THE BUG: exp[16] overrun */
+
+    /* Pre-fix, the oversized exponent is also wrongly ACCEPTED (rc == 0). */
+    if (rc == 0) return -103;
+
+    /* Post-fix, x509_spki_extract_rsa must reject specifically via the
+     * exponent-cap path (copy_integer_be cap=16 -> -12), not some unrelated
+     * parse error. */
+    if (rc != -12) return -104;
+
+    return 0;
+}

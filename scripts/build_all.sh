@@ -247,6 +247,24 @@ $LD /tmp/forktest.o -o /tmp/forktest.elf
 # by init. Prints SIGTEST RESULT: PASS iff handlers/masks/default/fail-safe work.
 cc userspace/apps/sigtest/sigtest.c /tmp/sigtest.o
 $LD /tmp/sigtest.o -o /tmp/sigtest.elf
+# neguptr: NEGUPTR-0 regression proof for the copy_user_string unaligned-
+# unmapped-user-pointer HIGH (no libs, own _start), spawned by init. Prints
+# NEGUPTR: PASS iff bad non-page-aligned pointers to SYS_OPEN/SYS_STAT/
+# SYS_UNLINK come back as a negative error instead of panicking the kernel.
+cc userspace/apps/neguptr/neguptr.c /tmp/neguptr.o
+$LD /tmp/neguptr.o -o /tmp/neguptr.elf
+# negrsp/negsock/negdir: KERNEL-ROBUST-0 negative regression probes (bare
+# _start, no crt0, spawned by init). negrsp forks a child that wrecks its own
+# user_rsp before signal delivery (user_rsp-wrap HIGH -> must default-terminate,
+# not spin); negsock forks a child that tries cross-process shutdown/setsockopt/
+# getsockopt on the parent's socket (ownership HIGH -> must EBADF); negdir
+# renames onto a non-empty dir + a dir into itself (vfs_rename HIGH -> EINVAL).
+cc userspace/apps/negrsp/negrsp.c /tmp/negrsp.o
+$LD /tmp/negrsp.o -o /tmp/negrsp.elf
+cc userspace/apps/negsock/negsock.c /tmp/negsock.o
+$LD /tmp/negsock.o -o /tmp/negsock.elf
+cc userspace/apps/negdir/negdir.c /tmp/negdir.o
+$LD /tmp/negdir.o -o /tmp/negdir.elf
 # pollselftest: POLL-SELECT-0 (B10) proof -- poll/select over real fd readiness
 # + epoll level/edge. Self-contained, spawned by init. Smoke greps its RESULT.
 cc userspace/apps/pollselftest/pollselftest.c /tmp/pollselftest.o
@@ -505,6 +523,15 @@ cc userspace/apps/wget/wget.c /tmp/wget.o; $LD /tmp/crt0.o /tmp/wget.o $HTTPS_OB
 # cryptotest app: runs the full crypto/TLS KAT battery at boot (bare _start -- no crt0).
 cc userspace/apps/cryptotest/cryptotest.c /tmp/cryptotest.o
 $LD /tmp/cryptotest.o $CRYPTO_OBJS -o /tmp/cryptotest.elf
+# negcachain: NEGCACHAIN-0 regression proof for the x509_verify.c
+# basicConstraints/cA bypass HIGH (bare _start -- no crt0, spawned by init).
+# Calls x509_test_cert_is_ca() (the fix's public test hook) against hand-
+# crafted cA=TRUE / cA=FALSE / no-extension DER fixtures plus the real CA
+# bundle. Links the full crypto bundle because x509_verify.o pulls in
+# sha256/rsa/p256/p384/ca_bundle even though this test only reaches
+# cert_is_ca(). Prints NEGCACHAIN: PASS.
+cc userspace/apps/negcachain/negcachain.c /tmp/negcachain.o
+$LD /tmp/negcachain.o $CRYPTO_OBJS -o /tmp/negcachain.elf
 # mathtest app: MATH-0 fpm (Q16.16) KAT battery at boot (bare _start -- no crt0).
 # fpm.c carries its own no-sse pragmas; build_test/mathtest_check.sh gates 0-xmm.
 cc userspace/lib/fpm/fpm.c /tmp/fpm.o
@@ -844,7 +871,7 @@ $LD /tmp/crt0.o /tmp/cc.o \
     -o /tmp/cc.elf
 
 echo "[all] canary check (all must be 0):"
-for e in comp init filemanager calculator clock sysinfo settings sysmon uidemo dateapp applauncher taskman terminal editor snake paint synth tetris game2048 sheet notes calendar stopwatch mines piano dashboard welcome bench breakout pong invaders procmon soundtest solitaire aiconsole screenshot stress musicplayer ide bubbletd zombietd pacman clockapp forktest sigtest pollselftest threadtest reaploop forkfdtest forkregtest matmuljobs aibroker sed awk tar pkg make meminfo argvtest msgtest rpctest toolrun echoproof echoargs agenthost tool_read tool_ls tool_stat codeagent toolset_host chainhost modelbridge agentd tool_write tool_cc tool_exec tool_mkdir tool_mv tool_rm tool_spawn tool_kill tool_ps tool_shell tool_mouse tool_key tool_rollback ledgerver cockpit claudehost initrdp initrdalias floattest sleeptest prioritytest matbench tensortest cpuburn blk ps kill free uptime find diff cmp tee wcx xargs gzip cc nettest sockettest cpu1offload smpstress wget netman soundman cryptotest wlanctl wpasupp libtest ping nc netinfo netscan tcping dig httpget pktmon httpd traceroute arp grep head tail sort uniq cut tr nl du touch basename dirname uname hostname whoami date less hexdump lspci tlsprobe certtool dhcpc autodhcp apidemo gsignin js futextest epolltest sendfiletest perftest batchtest domtest htmltest csstest layouttest webtest browser2 webapitest cube3d ray derby deadzone deadzoned dzproto_test dzclient streamtest chess asteroids sudoku photos startmenu controlcenter claudechat anthropic gametest exectest execchild; do
+for e in comp init filemanager calculator clock sysinfo settings sysmon uidemo dateapp applauncher taskman terminal editor snake paint synth tetris game2048 sheet notes calendar stopwatch mines piano dashboard welcome bench breakout pong invaders procmon soundtest solitaire aiconsole screenshot stress musicplayer ide bubbletd zombietd pacman clockapp forktest sigtest neguptr negrsp negsock negdir negcachain pollselftest threadtest reaploop forkfdtest forkregtest matmuljobs aibroker sed awk tar pkg make meminfo argvtest msgtest rpctest toolrun echoproof echoargs agenthost tool_read tool_ls tool_stat codeagent toolset_host chainhost modelbridge agentd tool_write tool_cc tool_exec tool_mkdir tool_mv tool_rm tool_spawn tool_kill tool_ps tool_shell tool_mouse tool_key tool_rollback ledgerver cockpit claudehost initrdp initrdalias floattest sleeptest prioritytest matbench tensortest cpuburn blk ps kill free uptime find diff cmp tee wcx xargs gzip cc nettest sockettest cpu1offload smpstress wget netman soundman cryptotest wlanctl wpasupp libtest ping nc netinfo netscan tcping dig httpget pktmon httpd traceroute arp grep head tail sort uniq cut tr nl du touch basename dirname uname hostname whoami date less hexdump lspci tlsprobe certtool dhcpc autodhcp apidemo gsignin js futextest epolltest sendfiletest perftest batchtest domtest htmltest csstest layouttest webtest browser2 webapitest cube3d ray derby deadzone deadzoned dzproto_test dzclient streamtest chess asteroids sudoku photos startmenu controlcenter claudechat anthropic gametest exectest execchild; do
     n=$(objdump -d /tmp/$e.elf 2>/dev/null | grep -c "fs:0x28" || true)
     echo "  $e=$n"
 done
@@ -866,7 +893,7 @@ if [ "${SELFHEAL:-0}" != "1" ]; then rm -f /tmp/ird/sbin/cwatchdog; fi
 rm -f /tmp/ird/sbin/browser /tmp/ird/bin/browser
 cp /tmp/comp.elf /tmp/ird/sbin/compositor
 cp /tmp/init.elf /tmp/ird/sbin/init
-for e in filemanager calculator clock sysinfo settings sysmon uidemo dateapp applauncher taskman terminal editor snake paint synth tetris game2048 sheet notes calendar stopwatch mines piano dashboard welcome bench breakout pong invaders procmon soundtest solitaire aiconsole screenshot stress musicplayer ide bubbletd startmenu controlcenter claudechat anthropic chess asteroids sudoku photos pacman clockapp zombietd forktest sigtest pollselftest threadtest reaploop forkfdtest forkregtest matmuljobs cube3d ray derby deadzone deadzoned dzproto_test dzclient streamtest exectest; do
+for e in filemanager calculator clock sysinfo settings sysmon uidemo dateapp applauncher taskman terminal editor snake paint synth tetris game2048 sheet notes calendar stopwatch mines piano dashboard welcome bench breakout pong invaders procmon soundtest solitaire aiconsole screenshot stress musicplayer ide bubbletd startmenu controlcenter claudechat anthropic chess asteroids sudoku photos pacman clockapp zombietd forktest sigtest neguptr negrsp negsock negdir negcachain pollselftest threadtest reaploop forkfdtest forkregtest matmuljobs cube3d ray derby deadzone deadzoned dzproto_test dzclient streamtest exectest; do
     cp /tmp/$e.elf /tmp/ird/sbin/$e
 done
 [ "$IV_OK" = "1" ] && cp /tmp/imageviewer.elf /tmp/ird/sbin/imageviewer

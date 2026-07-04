@@ -334,6 +334,40 @@ void _start(void) {
     print("[INIT] Spawning sigtest...\n");
     spawn("sbin/sigtest");
 
+    // NEGUPTR-0 regression probe: hands SYS_OPEN/SYS_STAT/SYS_UNLINK a
+    // deliberately non-page-aligned, unmapped user pointer as the path arg.
+    // On a fixed kernel each call returns a negative EFAULT-class error and
+    // the process survives to print "NEGUPTR: PASS"; on the pre-fix kernel
+    // the first such call panics the kernel in ring 0 (copy_user_string only
+    // checked accessibility on 4K-aligned addresses), so this marker never
+    // appears and boot itself dies. Prints NEGUPTR RESULT to serial, exits.
+    print("[INIT] Spawning neguptr...\n");
+    spawn("sbin/neguptr");
+
+    // NEGCACHAIN-0 regression probe: calls x509_test_cert_is_ca() (the
+    // x509_verify.c fix's public test hook) against hand-crafted cA=TRUE /
+    // cA=FALSE / no-extension DER fixtures plus every real CA-bundle root.
+    // Pre-fix, cert_is_ca()/x509_test_cert_is_ca() do not exist at all, so
+    // this app fails to LINK and never ships -- "NEGCACHAIN: PASS" never
+    // appears in the serial log. Prints NEGCACHAIN: PASS, exits.
+    print("[INIT] Spawning negcachain...\n");
+    spawn("sbin/negcachain");
+
+    // NEGRSP/NEGSOCK/NEGDIR-0 regression probes (KERNEL-ROBUST-0 HIGHs):
+    // negrsp forks a child that wrecks user_rsp before signal delivery (fixed
+    // kernel default-terminates it; a regressed kernel spins with IF=0 and
+    // wedges boot -> the outer smoke timeout catches it); negsock forks a
+    // child that tries cross-process shutdown/setsockopt/getsockopt on the
+    // parent's socket (must come back EBADF); negdir renames onto a non-empty
+    // dir and a dir into itself (must be rejected EINVAL). Each prints
+    // "<TAG>: PASS"; smoke_boot.sh gates on the markers.
+    print("[INIT] Spawning negrsp...\n");
+    spawn("sbin/negrsp");
+    print("[INIT] Spawning negsock...\n");
+    spawn("sbin/negsock");
+    print("[INIT] Spawning negdir...\n");
+    spawn("sbin/negdir");
+
     // POLL-SELECT-0 (B10) probe: poll()/select() over real fd readiness (a
     // ready file vs an idle socket, a timeout, a mixed set) + epoll level/edge.
     // Prints POLLSELFTEST RESULT to serial, exits.

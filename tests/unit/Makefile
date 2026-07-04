@@ -16,8 +16,8 @@ KERNEL_SRC = ../../kernel/core/mem/vmm.c
 HEAP_SRC = ../../kernel/core/mem/heap.c
 
 # Test executables
-TESTS = test_pmm test_heap test_scheduler test_user_copy test_null_checks \
-        test_vmm test_syscall_handlers
+TESTS = test_pmm test_heap test_heap_neghmagic test_scheduler test_user_copy \
+        test_null_checks test_vmm test_syscall_handlers
 
 all: $(TESTS)
 
@@ -26,6 +26,14 @@ test_pmm: test_pmm.c
 
 test_heap: test_heap.c $(HEAP_SRC)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
+
+# NEGHMAGIC regression test (KERNEL-ROBUST-0): kfree()/krealloc() must
+# classify heap-vs-slab via heap_owns() BEFORE trusting an attacker-writable
+# SLAB_MAGIC sentinel in the freed block's own data. #includes heap.c
+# directly (see file header) with HEAP_TEST_HOST, so it needs no extra
+# sources on the command line and none of test_heap's mocks/CFLAGS deps.
+test_heap_neghmagic: test_heap_neghmagic.c $(HEAP_SRC)
+	$(CC) -std=c11 -O2 -g -DHEAP_TEST_HOST -o $@ test_heap_neghmagic.c
 
 test_scheduler: test_scheduler.c
 	$(CC) $(CFLAGS) -o $@ $< $(LDFLAGS)
@@ -58,6 +66,9 @@ run: all
 	@echo ""
 	@echo "=== test_syscall_handlers ==="
 	@./test_syscall_handlers
+	@echo ""
+	@echo "=== test_heap_neghmagic ==="
+	@./test_heap_neghmagic
 	@echo ""
 	@echo "All unit tests completed!"
 

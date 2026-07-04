@@ -797,6 +797,33 @@ static int cert_is_ca(const tbs_fields *f) {
     return 0;   /* no basicConstraints extension present */
 }
 
+/*
+ * NEGCACHAIN test hook: expose cert_is_ca() to userspace regression tests
+ * without duplicating the ASN.1 walk or weakening `static` on the real
+ * internal helper. Parses ONE standalone DER certificate's tbsCertificate
+ * and returns cert_is_ca()'s verdict on it: 1 iff it carries a
+ * basicConstraints extension with cA==TRUE, 0 otherwise (absent extension,
+ * cA FALSE/absent, or any parse failure). Deliberately does NOT verify a
+ * signature or chain linkage -- cert_is_ca() itself never does either; it is
+ * a pure structural probe of a single cert's extensions, so this wrapper
+ * matches the exact code path x509_verify_chain() takes at line ~846 when it
+ * gates issuer certs. Safe on attacker-controlled DER: every read routes
+ * through the bounds-checked asn1.h reader, same as the rest of this file.
+ */
+int x509_test_cert_is_ca(const unsigned char *der, unsigned long len) {
+    const unsigned char *tbs, *sigalg, *sigbits;
+    unsigned long tbs_len, sigalg_len, sigbits_len;
+    asn1_cur tbs_cur;
+    tbs_fields f;
+
+    if (parse_cert_top(der, len, &tbs, &tbs_len, &sigalg, &sigalg_len,
+                       &sigbits, &sigbits_len, &tbs_cur) != 0)
+        return 0;
+    if (parse_tbs_fields(tbs_cur, &f) != 0)
+        return 0;
+    return cert_is_ca(&f);
+}
+
 /* ====================================================================== */
 /* Public: verify the whole chain                                          */
 /* ====================================================================== */

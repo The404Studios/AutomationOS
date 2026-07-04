@@ -533,6 +533,105 @@ check_sockets() {
     fi
 }
 
+check_neguptr() {
+    # NEGUPTR-0 regression gate: init spawns sbin/neguptr, which hands
+    # SYS_OPEN/SYS_STAT/SYS_UNLINK a deliberately non-page-aligned, unmapped
+    # user pointer as the path argument. copy_user_string (kernel/core/mem/
+    # vmm.c) must reject it (EFAULT-class negative return) WITHOUT ever
+    # dereferencing it in ring 0. Pre-fix, the mapped-page check only fired at
+    # 4K-aligned addresses, so a non-aligned unmapped pointer skipped the
+    # check and #PF'd in kernel mode -> kernel_panic() -> boot dies and this
+    # marker never appears (this check then fails on the missing marker, and
+    # check_no_panic/check_no_cpu_exception independently catch the panic).
+    if grep -qF 'NEGUPTR: PASS' "$LOG"; then
+        pass "unaligned unmapped user pointer safely EFAULTs (no ring-0 deref)"
+        return 0
+    elif grep -qF 'NEGUPTR: FAIL' "$LOG"; then
+        fail "neguptr: $(grep -F 'NEGUPTR:' "$LOG" | grep -F FAIL | head -1)"
+        return 1
+    else
+        fail "neguptr did not report PASS (unaligned-unmapped-pointer guard missing or kernel panicked)"
+        return 1
+    fi
+}
+
+check_negcachain() {
+    # NEGCACHAIN-0 regression gate: init spawns sbin/negcachain, which calls
+    # x509_test_cert_is_ca() -- the public wrapper the fix added around the
+    # new static cert_is_ca() -- against hand-crafted DER certs asserting
+    # basicConstraints cA=TRUE, cA=FALSE, and no basicConstraints at all,
+    # plus every root in the compiled-in CA bundle. Pre-fix, cert_is_ca()
+    # and x509_test_cert_is_ca() do not exist in x509_verify.c at all, so
+    # negcachain.elf fails to LINK (undefined symbol) and is never shipped
+    # in the initrd -- init's spawn is a no-op and "NEGCACHAIN: PASS" never
+    # appears in the serial log, so this check fails closed on a pre-fix
+    # tree exactly as strongly as a build failure can.
+    if grep -qF 'NEGCACHAIN: PASS' "$LOG"; then
+        pass "basicConstraints cA check verified (non-CA issuer -> chain fails)"
+        return 0
+    elif grep -qF 'NEGCACHAIN: FAIL' "$LOG"; then
+        fail "negcachain: $(grep -F 'NEGCACHAIN:' "$LOG" | grep -F FAIL | head -1)"
+        return 1
+    else
+        fail "negcachain did not report PASS (basicConstraints/cA check missing, or x509_test_cert_is_ca failed to link)"
+        return 1
+    fi
+}
+
+check_negrsp() {
+    # NEGRSP-0 gate: init spawns sbin/negrsp, which forks a child that installs
+    # a valid handler/restorer, masks+raises SIGUSR1, then clobbers its own
+    # user_rsp to a non-canonical ~0 immediately before the syscall that makes
+    # the signal deliverable. Fixed: deliver_pending_signals rejects the bad
+    # user_rsp -> default action terminates the child -> parent prints PASS.
+    # Pre-fix: the CoW pre-resolve loop wraps and spins with IF=0, wedging the
+    # machine -> this marker never appears and the outer QEMU timeout fires.
+    if grep -qF 'NEGRSP: PASS' "$LOG"; then
+        pass "non-canonical user_rsp in signal delivery rejected (no IF=0 wrap-spin)"
+        return 0
+    elif grep -qF 'NEGRSP: FAIL' "$LOG"; then
+        fail "negrsp: $(grep -F 'NEGRSP:' "$LOG" | grep -F FAIL | head -1)"
+        return 1
+    else
+        fail "negrsp did not report PASS (user_rsp guard missing / kernel wedged IF=0)"
+        return 1
+    fi
+}
+
+check_negsock() {
+    # NEGSOCK gate: init spawns sbin/negsock; parent creates a UDP socket and
+    # forks; the child (which does not own the socket) must be DENIED EBADF on
+    # shutdown/setsockopt/getsockopt. Pre-fix those three lacked the
+    # sock_fd_owned() gate, so the child could tear down the parent's socket.
+    if grep -qF 'NEGSOCK: PASS' "$LOG"; then
+        pass "cross-process shutdown/setsockopt/getsockopt denied (socket ownership gate)"
+        return 0
+    elif grep -qF 'NEGSOCK: FAIL' "$LOG"; then
+        fail "negsock: $(grep -F 'NEGSOCK:' "$LOG" | grep -F FAIL | head -1)"
+        return 1
+    else
+        fail "negsock did not report PASS (socket-ownership gate missing or it crashed)"
+        return 1
+    fi
+}
+
+check_negdir() {
+    # NEGDIR gate: init spawns sbin/negdir, which renames a dir ONTO a
+    # non-empty destination dir and a dir INTO ITSELF; both must be rejected
+    # (VFS_ERR_INVAL) with the victim file intact and the VFS still usable.
+    # Pre-fix vfs_rename() had neither guard (clobber+leak / self-cycle).
+    if grep -qF 'NEGDIR: PASS' "$LOG"; then
+        pass "vfs_rename rejects non-empty-dir clobber and self-cycle (no leak/orphan)"
+        return 0
+    elif grep -qF 'NEGDIR: FAIL' "$LOG"; then
+        fail "negdir: $(grep -F 'NEGDIR:' "$LOG" | grep -F FAIL | head -1)"
+        return 1
+    else
+        fail "negdir did not report PASS (vfs_rename guards missing or it crashed)"
+        return 1
+    fi
+}
+
 check_overhaul_syscalls() {
     # init spawns the futex/epoll/sendfile/perf/batch verification probes; each
     # exercises the syscall's real ABI and prints "<NAME>: PASS". This proves the
@@ -695,6 +794,27 @@ check_heap_extend() {
         # the default quiet ISO. Absence is by design; the proof runs in a verbose build.
         pass "heap growth self-test: N/A (heap_selftest compiled out — BOOT_QUIET build)"
         return 0
+    fi
+}
+
+check_heap_neghmagic() {
+    # NEGHMAGIC-0 regression gate (KERNEL-ROBUST-0 HIGH): kfree()/krealloc() used
+    # to dispatch heap-vs-slab on an 8-byte SLAB_MAGIC sentinel read straight out
+    # of the freed block's data BEFORE the heap_owns() gate -- a heap-owned block
+    # whose data pointer happens to be page-aligned and whose attacker-controlled
+    # first 8 bytes are forged to match the sentinel was misrouted into
+    # slab_free(NULL, ptr) (type confusion). This is a HOST-side regression (not a
+    # boot self-test): tests/unit/test_heap_neghmagic.c pulls the real
+    # kernel/core/mem/heap.c source into a host harness, forges exactly that
+    # condition, and proves kfree()/krealloc() route it through the heap free path
+    # regardless of the forged bytes. Runs independently of the QEMU boot/log this
+    # script otherwise gates, via scripts/run_heap_neghmagic_test.sh.
+    if bash "${KERNEL_ROOT}/scripts/run_heap_neghmagic_test.sh" >/tmp/heap_neghmagic.log 2>&1; then
+        pass "forged heap SLAB_MAGIC cannot reach the unsafe slab-free/realloc path (NEGHMAGIC-0)"
+        return 0
+    else
+        fail "NEGHMAGIC-0 regression: forged heap magic was misrouted -- see /tmp/heap_neghmagic.log"
+        return 1
     fi
 }
 
@@ -929,6 +1049,7 @@ run_checks() {
         check_matmuljobs
         check_smpstress
         check_heap_extend
+        check_heap_neghmagic
         check_aibroker
         check_tools
         check_slab
@@ -942,6 +1063,11 @@ run_checks() {
         check_sysutils
         check_net
         check_sockets
+        check_neguptr
+        check_negcachain
+        check_negrsp
+        check_negsock
+        check_negdir
         check_webstack
         check_crypto
         check_libs

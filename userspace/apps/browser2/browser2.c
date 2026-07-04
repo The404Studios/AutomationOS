@@ -1172,10 +1172,13 @@ static int load_page(const char *url, js_vm *vm,
     /* The built-in home page (also the offline fallback). NO network access ->
      * renders deterministically and never blocks. */
     static const char HOME_HTML[] =
+        /* DESKTOP-REDESIGN-3: about:home on the Signature Dark tokens (hex must
+         * be literal here since this is a CSS string, not C -- values mirror
+         * lib/ui/theme.h: BG1 body, TEXT, teal ACCENT heading, BG2 card). */
         "<html><head><title>AutomationOS</title><style>"
-        "body{background:#ffffff;color:#202020}"
-        "h1{color:#3b82f6;font-size:28px}"
-        ".card{background:#f2f2f2;color:#202020;font-size:16px}"
+        "body{background:#16191f;color:#edf0f4}"
+        "h1{color:#3dd6c4;font-size:28px}"
+        ".card{background:#1e222a;color:#edf0f4;font-size:16px}"
         "</style></head><body>"
         "<h1>AutomationOS Browser</h1>"
         "<p>A from-scratch DOM-rendering browser.</p>"

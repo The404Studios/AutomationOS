@@ -42,6 +42,7 @@
  */
 
 #include "../../lib/ui/ui.h"
+#include "../../lib/ui/theme.h"           /* shared "Signature Dark" design tokens */
 #include "../../include/agentcockpit.h"   /* the cockpit<->agentd SHM contract */
 
 /* -- syscalls (raw ABI; no fs:0x28 canary under -fno-stack-protector) -------- */
@@ -82,15 +83,15 @@ static void out(const char *s) { sc(SYS_WRITE, 1, (long)s, (long)slen(s)); }
 #define LINES_PER_BOX 16                /* == the toolkit's UI_MAX_CHILDREN  */
 #define WRAP_COLS     74                /* chars per log line (~LOG_W/8)      */
 
-/* Aether Dark palette */
-#define COL_TEXT      0xFFFFFFFF
-#define COL_MUTED     0xFFAEAEB2
-#define COL_DIM       0xFF8E8E93
-#define COL_LOG_BG    0xFF141416
-#define COL_GREEN     0xFF7CE38B
-#define COL_AMBER     0xFFFF9E64
-#define COL_BLUE      0xFF9CDCFE
-#define COL_RED       0xFFFF6B6B
+/* Palette mapped by ROLE to the shared "Signature Dark" tokens (see theme.h). */
+#define COL_TEXT      THEME_TEXT       /* primary text                          */
+#define COL_MUTED     THEME_TEXT_DIM   /* secondary / status text               */
+#define COL_DIM       THEME_TEXT_FAINT /* hint / placeholder text               */
+#define COL_LOG_BG    THEME_BG0        /* inset log surface / inert button bg   */
+#define COL_GREEN     THEME_SUCCESS    /* online / allowed / done               */
+#define COL_AMBER     THEME_WARN       /* warning / awaiting confirm            */
+#define COL_BLUE      THEME_ACCENT     /* RUN echo / informational accent       */
+#define COL_RED       THEME_DANGER     /* error / stopped / offline             */
 
 /* -- app + widget state ----------------------------------------------------- */
 static ui_app_t              *g_app;

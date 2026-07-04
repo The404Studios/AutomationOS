@@ -62,6 +62,7 @@
 
 #include "../../lib/wl/wl_client.h"
 #include "../../lib/font/bitfont.h"
+#include "../../lib/ui/theme.h"
 
 /* -----------------------------------------------------------------------
  * Syscall numbers and inline helper.
@@ -249,17 +250,18 @@ typedef long fp_t;
 #define DATA_Y0     (GRID_Y0 + HDR_H)   /* top of first data row         */
 #define DATA_X0     (GRID_X0 + ROWHDR_W)/* left of first data column     */
 
-/* Colors (ARGB). */
-#define COL_BG       0xFFF2F2F2u  /* window background      */
-#define COL_FBAR     0xFFFFFFFFu  /* formula bar bg         */
-#define COL_HDR      0xFFD8D8DCu  /* header cell bg         */
-#define COL_HDR_SEL  0xFFB0C4DEu  /* header of selected col/row */
-#define COL_CELL     0xFFFFFFFFu  /* cell bg                */
-#define COL_SEL      0xFFCFE3FFu  /* selected cell bg       */
-#define COL_GRID     0xFFB0B0B0u  /* grid lines             */
-#define COL_TEXT     0xFF101010u  /* text                   */
-#define COL_HDRTEXT  0xFF303030u  /* header text            */
-#define COL_FORMULA  0xFF005000u  /* computed formula value */
+/* Colors (ARGB) -- repointed to the shared dark theme tokens (theme.h),
+ * mapped by role so the spreadsheet reads as part of the one dark desktop. */
+#define COL_BG       THEME_BG0       /* window background (deepest backdrop) */
+#define COL_FBAR     THEME_BG2       /* formula bar bg (toolbar surface)     */
+#define COL_HDR      THEME_BG2       /* header cell bg (toolbar surface)     */
+#define COL_HDR_SEL  THEME_BG4       /* header of selected col/row (selected)*/
+#define COL_CELL     THEME_BG1       /* cell bg (content surface)            */
+#define COL_SEL      THEME_BG4       /* selected cell bg (selected)          */
+#define COL_GRID     THEME_HAIRLINE  /* grid lines (subtle divider)          */
+#define COL_TEXT     THEME_TEXT      /* text (primary)                       */
+#define COL_HDRTEXT  THEME_TEXT_DIM  /* header text (secondary label)        */
+#define COL_FORMULA  THEME_SUCCESS   /* computed formula value (semantic)    */
 
 /* Cell text store: row-major [row][col]. */
 static char  g_cells[NROWS][NCOLS][CELL_MAX];
@@ -846,7 +848,7 @@ static void render(wl_window *win)
     {
         int x = DATA_X0 + g_sel_col * COL_W;
         int y = DATA_Y0 + g_sel_row * ROW_H;
-        u32 oc = 0xFF1A6FE0u;
+        u32 oc = THEME_ACCENT;   /* cell selection accent (keep) */
         hline(buf, bw, bh, spx, x, y, COL_W, oc);
         hline(buf, bw, bh, spx, x, y + 1, COL_W, oc);
         hline(buf, bw, bh, spx, x, y + ROW_H - 1, COL_W, oc);

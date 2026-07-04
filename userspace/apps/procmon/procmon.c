@@ -60,6 +60,7 @@
 #include "../../lib/wl/wl_client.h"
 #include "../../lib/font/bitfont.h"
 #include "../../lib/aictl/aictl.h"
+#include "../../lib/ui/theme.h"
 
 /* -------------------------------------------------------------------------
  * Extra syscalls used directly in this TU.
@@ -116,47 +117,49 @@ static inline long _sc(long n, long a1, long a2, long a3)
 #define REFRESH_PERIOD  30
 
 /* -------------------------------------------------------------------------
- * Color palette (dark "Aether" theme).
+ * Color palette -- repointed to the shared "Signature Dark" theme tokens
+ * (theme.h) so procmon reads as part of the one cohesive desktop.
+ * Chrome maps by role; process-state indicators use the semantic tokens.
  * ---------------------------------------------------------------------- */
-#define C_BG          0xFF0D1117u
-#define C_HDR_TOP     0xFF1A1F2Eu
-#define C_HDR_BOT     0xFF10141Cu
-#define C_STATS_BG    0xFF131822u
-#define C_PANEL       0xFF161B26u
-#define C_PANEL2      0xFF1E2435u
-#define C_BORDER      0xFF2A3248u
-#define C_ACCENT      0xFF4E9EFFu
-#define C_ACCENT2     0xFF7B5EFFu
-#define C_ACCENT3     0xFF00E5B4u
-#define C_TEXT        0xFFEAEDF5u
-#define C_TEXT2       0xFF9BA8C8u
-#define C_TEXT3       0xFF5A6585u
-#define C_ROW_EVEN    0xFF161B26u
-#define C_ROW_ODD     0xFF1A2030u
-#define C_ROW_SEL     0xFF1E3A5Fu
-#define C_ROW_SEL_BRD 0xFF4E9EFFu
-#define C_SEP         0xFF252D42u
-#define C_BTN_BG      0xFF1E2435u
-#define C_BTN_HOV     0xFF2A3650u
-#define C_BTN_SUSP    0xFF1F3528u   /* green-tinted  */
-#define C_BTN_RESU    0xFF1A3540u   /* blue-tinted   */
-#define C_BTN_KILL    0xFF4A1818u   /* red           */
-#define C_BTN_NICE    0xFF2A2A40u   /* purple-tinted */
-#define C_BTN_LBL     0xFFEEEEEEu
-#define C_STATUS_BG   0xFF0A0E14u
-#define C_STATUS_OK   0xFF4CFF82u
-#define C_STATUS_ERR  0xFFFF5555u
-#define C_STATUS_INFO 0xFF9BA8C8u
+#define C_BG          THEME_BG1       /* window body / table base            */
+#define C_HDR_TOP     THEME_BG2       /* header gradient top (elevated)      */
+#define C_HDR_BOT     THEME_BG1       /* header gradient bottom -> body      */
+#define C_STATS_BG    THEME_BG2       /* stats strip / toolbar               */
+#define C_PANEL       THEME_BG1       /* panel surface                       */
+#define C_PANEL2      THEME_BG2       /* column-header row bg                 */
+#define C_BORDER      THEME_BORDER
+#define C_ACCENT      THEME_ACCENT
+#define C_ACCENT2     THEME_ACCENT    /* table column-header labels          */
+#define C_ACCENT3     THEME_ACCENT
+#define C_TEXT        THEME_TEXT
+#define C_TEXT2       THEME_TEXT_DIM
+#define C_TEXT3       THEME_TEXT_FAINT
+#define C_ROW_EVEN    THEME_BG1       /* zebra: base                         */
+#define C_ROW_ODD     THEME_BG2       /* zebra: lifted                       */
+#define C_ROW_SEL     THEME_BG4       /* selected row bg                     */
+#define C_ROW_SEL_BRD THEME_ACCENT    /* selection stripe                    */
+#define C_SEP         THEME_HAIRLINE
+#define C_BTN_BG      THEME_BG2
+#define C_BTN_HOV     THEME_BG3
+#define C_BTN_SUSP    THEME_BG2       /* neutral action button               */
+#define C_BTN_RESU    THEME_BG2       /* neutral action button               */
+#define C_BTN_KILL    THEME_DANGER    /* destructive action                  */
+#define C_BTN_NICE    THEME_BG2       /* neutral action button               */
+#define C_BTN_LBL     THEME_TEXT
+#define C_STATUS_BG   THEME_BG0       /* deepest strip                       */
+#define C_STATUS_OK   THEME_SUCCESS
+#define C_STATUS_ERR  THEME_DANGER
+#define C_STATUS_INFO THEME_TEXT_DIM
 
 /* State display colors. */
 static u32 state_color(u32 s)
 {
     switch (s) {
-        case 0:  return 0xFF9BA8C8u;   /* created  -- grey  */
-        case 1:  return 0xFF4E9EFFu;   /* ready    -- blue  */
-        case 2:  return 0xFF4CFF82u;   /* running  -- green */
-        case 3:  return 0xFFFFBF42u;   /* blocked  -- amber */
-        case 4:  return 0xFFFF5555u;   /* dead     -- red   */
+        case 0:  return THEME_TEXT_DIM; /* created  -- grey        */
+        case 1:  return THEME_ACCENT;   /* ready    -- accent      */
+        case 2:  return THEME_SUCCESS;  /* running  -- green       */
+        case 3:  return THEME_WARN;     /* blocked  -- amber       */
+        case 4:  return THEME_DANGER;   /* dead     -- red         */
         default: return C_TEXT3;
     }
 }
@@ -630,7 +633,7 @@ static void draw_table(u32 *buf, u32 bw, u32 bh, u32 spx, procmon_t *st)
         if (i == st->selected) {
             row_bg = C_ROW_SEL;
         } else if (pi->state == 2) {
-            row_bg = 0xFF0D1F14u; /* running: very slightly green tinted */
+            row_bg = THEME_BG2; /* running: subtly lifted surface */
         } else {
             row_bg = (i & 1) ? C_ROW_ODD : C_ROW_EVEN;
         }

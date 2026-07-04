@@ -41,6 +41,7 @@
 
 #include "../../lib/wl/wl_client.h"
 #include "../../lib/font/bitfont.h"
+#include "../../lib/ui/theme.h"
 
 /* -----------------------------------------------------------------------
  * Syscall numbers and inline helper (3-arg form, sufficient here).
@@ -173,18 +174,19 @@ static int weekday_of(int year, int month, int day)
 #define ARROW_W      40
 #define ARROW_H      HDR_H
 
-/* Colours (ARGB32). */
-#define COL_BG       0xFF0D1B2Au   /* dark navy background            */
-#define COL_HDR_BG   0xFF112233u   /* slightly lighter header band    */
-#define COL_WDH_BG   0xFF0A1520u   /* weekday header bar              */
-#define COL_TEXT     0xFFD0DCEAu   /* normal light text               */
-#define COL_DIM      0xFF4A6080u   /* dim text for empty cells        */
-#define COL_SEP      0xFF1E3050u   /* grid line colour                */
-#define COL_TODAY    0xFF4C9AFFu   /* today accent fill               */
-#define COL_TODAY_T  0xFF001020u   /* text on today (dark on accent)  */
-#define COL_ARROW    0xFF8ABAEAU   /* arrow symbol colour             */
-#define COL_WDH_T    0xFF6A9FD8u   /* weekday header text colour      */
-#define COL_CELL_HOV 0xFF1A2E44u   /* subtle hover highlight (unused) */
+/* Colours -- repointed to the shared "Signature Dark" theme (theme.h) so the
+ * calendar reads as part of one cohesive desktop. Mapped by ROLE. */
+#define COL_BG       THEME_BG1        /* window body background          */
+#define COL_HDR_BG   THEME_BG2        /* header band (toolbar elevation) */
+#define COL_WDH_BG   THEME_BG0        /* weekday header bar (recessed)   */
+#define COL_TEXT     THEME_TEXT       /* normal light text               */
+#define COL_DIM      THEME_TEXT_FAINT /* dim text for empty cells        */
+#define COL_SEP      THEME_HAIRLINE   /* grid line colour                */
+#define COL_TODAY    THEME_ACCENT     /* today accent fill (semantic)    */
+#define COL_TODAY_T  THEME_ON_ACCENT  /* text on today (dark on accent)  */
+#define COL_ARROW    THEME_ACCENT     /* nav arrow symbol colour         */
+#define COL_WDH_T    THEME_TEXT_DIM   /* weekday header text colour      */
+#define COL_CELL_HOV THEME_BG3        /* subtle hover highlight (unused) */
 
 /* -----------------------------------------------------------------------
  * Runtime clip bounds.

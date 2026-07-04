@@ -53,6 +53,7 @@
 #include "../../lib/wl/wl_client.h"
 #include "../../lib/font/bitfont.h"
 #include "../../lib/audio/audio.h"
+#include "../../lib/ui/theme.h"
 
 /* -------------------------------------------------------------------------
  * Syscall numbers and inline helpers.
@@ -138,28 +139,37 @@ static i32 iclamp(i32 v, i32 lo, i32 hi)
 
 /* -------------------------------------------------------------------------
  * Colour palette.
+ *
+ * Chrome (window/controls/list) is repointed to the shared Signature Dark
+ * design tokens in ../../lib/ui/theme.h so the player reads as part of one
+ * cohesive dark desktop.  The VISUALIZER content colours (C_BG_BASE, the two
+ * pulse colours, and the C_BAR_* bar gradient) are intentionally preserved --
+ * they are the audio-driven spectrum/canvas, not chrome.
  * ---------------------------------------------------------------------- */
+/* ---- Visualizer content colours (PRESERVED -- not chrome) ---- */
 #define C_BG_BASE      0xFF0D0D1Au   /* near-black navy  */
 #define C_BG_PULSE_A   0xFF1A0D2Eu   /* deep purple      */
 #define C_BG_PULSE_B   0xFF0D1A2Eu   /* deep blue        */
-#define C_HDR_BG       0xFF16213Eu
-#define C_INFO_BG      0xFF1A1A2Eu
-#define C_TRANS_BG     0xFF12122Au
-#define C_LIST_BG      0xFF0F0F1Cu
-#define C_LIST_SEL     0xFF2D2D6Au
-#define C_SEP          0xFF33335Au
-#define C_TEXT         0xFFCCCCFFu
-#define C_TEXT_DIM     0xFF6666AAu
-#define C_TEXT_BRIGHT  0xFFFFFFFFu
-#define C_BTN_FACE     0xFF2A2A5Au
-#define C_BTN_HOT      0xFF3C3C7Au
-#define C_BTN_BORDER   0xFF5555AAu
-#define C_PROG_BG      0xFF1E1E3Eu
-#define C_PROG_FG      0xFF6644FFu
-#define C_PROG_HEAD    0xFFCC88FFu
 #define C_BAR_BASE     0xFF4400CCu   /* visualizer bar base colour */
 #define C_BAR_MID      0xFF8822FFu
 #define C_BAR_TOP      0xFFFFAAFFu
+
+/* ---- Chrome (mapped to shared theme tokens) ---- */
+#define C_HDR_BG       THEME_BG2         /* header strip / toolbar        */
+#define C_INFO_BG      THEME_BG1         /* info panel (window body)      */
+#define C_TRANS_BG     THEME_BG2         /* transport toolbar             */
+#define C_LIST_BG      THEME_BG1         /* track list body               */
+#define C_LIST_SEL     THEME_BG4         /* selected track row            */
+#define C_SEP          THEME_HAIRLINE    /* dividers / borders            */
+#define C_TEXT         THEME_TEXT        /* primary text                  */
+#define C_TEXT_DIM     THEME_TEXT_DIM    /* secondary text                */
+#define C_TEXT_BRIGHT  THEME_TEXT        /* bright/primary text           */
+#define C_BTN_FACE     THEME_BG3         /* button face                   */
+#define C_BTN_HOT      THEME_BG4         /* button hover                  */
+#define C_BTN_BORDER   THEME_BORDER      /* button border                 */
+#define C_PROG_BG      THEME_BG3         /* progress track groove         */
+#define C_PROG_FG      THEME_ACCENT      /* progress fill (accent)        */
+#define C_PROG_HEAD    THEME_ACCENT_HI   /* progress head                 */
 
 /* -------------------------------------------------------------------------
  * Track data.
@@ -605,7 +615,7 @@ static void draw_header(u32 *buf, u32 stride_px)
     font_draw_string(buf, (int)stride_px, WIN_W, WIN_H,
                      WIN_W - aw - 8, (HDR_H - FONT_H) / 2,
                      aud_str,
-                     audio_available() ? 0xFF88FF88u : C_TEXT_DIM);
+                     audio_available() ? THEME_SUCCESS : C_TEXT_DIM);
 }
 
 /* Draw info bar (track name + progress). */
@@ -719,7 +729,7 @@ static void draw_tracklist(u32 *buf, u32 stride_px)
         /* Playing indicator. */
         if (i == cur_track && play_state == PS_PLAYING) {
             font_draw_string(buf, (int)stride_px, WIN_W, WIN_H,
-                             WIN_W - 24, ty, ">", 0xFF88FF88u);
+                             WIN_W - 24, ty, ">", THEME_SUCCESS);
         }
     }
 }

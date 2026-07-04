@@ -49,6 +49,7 @@
 #include "../../lib/wl/wl_client.h"
 #include "../../lib/font/bitfont.h"
 #include "../../lib/imgcodec/imgcodec.h"   /* shared freestanding PNG/BMP/GIF decoder */
+#include "../../lib/ui/theme.h"            /* shared "Signature Dark" design tokens   */
 
 /* ------------------------------------------------------------------------- *
  *  Syscall numbers (AOS -- mirror kernel/include/syscall.h) + inline helper. *
@@ -130,17 +131,20 @@ struct dirent {
 #define THUMB_H      64
 #define THUMB_GAP    12
 
-#define COL_BG       0xFF1C1C1Eu      /* window background                      */
-#define COL_CANVAS   0xFF121214u      /* darker matte behind the image          */
-#define COL_TOOLBAR  0xFF2C2C2Eu      /* toolbar / strip panel                  */
-#define COL_PANEL2   0xFF252527u      /* slightly darker panel fill             */
-#define COL_HOVER    0xFF3A3A3Cu      /* hovered control                        */
-#define COL_BTN      0xFF38383Au      /* idle button fill                       */
-#define COL_BORDER   0xFF454547u      /* hairline border                        */
-#define COL_TEXT     0xFFFFFFFFu      /* primary text                           */
-#define COL_DIM      0xFFAEAEB2u      /* secondary text                         */
-#define COL_ACCENT   0xFF0A84FFu      /* selection / accent (system blue)       */
-#define COL_AMBER    0xFFF1C40Fu      /* placeholder highlight                  */
+/* Chrome colors are repointed to the shared theme tokens (theme.h) so Photos
+ * reads as part of one cohesive dark desktop. Image/thumbnail PIXELS are NOT
+ * colored here -- only the neutral mattes/panels they sit on. */
+#define COL_BG       THEME_BG1         /* window background                      */
+#define COL_CANVAS   THEME_BG0         /* darker matte behind the image          */
+#define COL_TOOLBAR  THEME_BG2         /* toolbar / strip panel                  */
+#define COL_PANEL2   THEME_BG1         /* recessed panel / tile-holder fill      */
+#define COL_HOVER    THEME_BG3         /* hovered control                        */
+#define COL_BTN      THEME_BG2         /* idle button fill                       */
+#define COL_BORDER   THEME_HAIRLINE    /* hairline border / divider              */
+#define COL_TEXT     THEME_TEXT        /* primary text                           */
+#define COL_DIM      THEME_TEXT_DIM    /* secondary text                         */
+#define COL_ACCENT   THEME_ACCENT      /* selection / accent (teal, was blue)    */
+#define COL_AMBER    THEME_WARN        /* placeholder warning highlight          */
 
 /* Picture folders scanned in order; first that opens + has images wins, but we
  * accumulate from ALL of them so images scattered across folders show up too. */

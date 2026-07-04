@@ -59,6 +59,7 @@
  */
 
 #include "../../lib/ui/ui.h"
+#include "../../lib/ui/theme.h"   /* shared "Signature Dark" design tokens */
 
 /* -------------------------------------------------------------------------
  * Syscall numbers
@@ -174,26 +175,30 @@ static void tm_cat_uint(char **p, unsigned long v, int w, char pad)
 #define ROW_H        22
 #define ROW_YSTART    8
 
-/* Colors (ARGB32) */
-#define C_WIN_BG     0xFF1C1C1E   /* Aether Dark window background */
-#define C_TITLE_BG   0xFF1A1A2E   /* deep navy title bar */
-#define C_TITLE_FG   0xFF00D4FF   /* cyan accent */
-#define C_HDR_BG     0xFF16213E   /* header row background */
-#define C_HDR_FG     0xFF58A6FF   /* header text blue */
-#define C_LIST_BG    0xFF0D1117   /* list panel background */
-#define C_ROW_EVEN   0xFF161B22   /* even-row shading */
-#define C_ROW_ODD    0xFF0D1117   /* odd-row shading */
-#define C_ROW_SEL    0xFF1E4070   /* selected-row highlight */
-#define C_ROW_DEAD   0xFF3A1A1A   /* recently killed row */
-#define C_TEXT       0xFFCDD5DF   /* normal row text */
-#define C_TEXT_DIM   0xFF707070   /* dimmed / empty */
-#define C_BTN_NORMAL 0xFF2C2C2E   /* button face */
-#define C_BTN_TERM   0xFF2E4A2E   /* "End Task" face (green-tinted) */
-#define C_BTN_KILL   0xFF5C1A1A   /* "Force Quit" face (red) */
-#define C_BTN_LABEL  0xFFEEEEEE   /* button label text */
-#define C_SEP        0xFF30363D   /* separator line */
-#define C_STATUS_FG  0xFFB0B0B0   /* status bar text */
-#define C_DEAD_FG    0xFFE05050   /* bright red for Force Quit highlight */
+/* Colors (ARGB32) -- chrome mapped to shared theme.h tokens by ROLE.
+ * Elevation story: list well = BG0 (deepest) < window body = BG1 < header/
+ * title strips = BG2 < selected row = BG4. The killed-row and button-face
+ * tints below stay literal: they are dark-safe SEMANTIC fills (destructive /
+ * safe-action) with no matching background token in theme.h. */
+#define C_WIN_BG     THEME_BG1     /* window body background                    */
+#define C_TITLE_BG   THEME_BG2     /* title strip (raised chrome)               */
+#define C_TITLE_FG   THEME_ACCENT  /* title accent (was off-brand cyan)         */
+#define C_HDR_BG     THEME_BG2     /* column-header strip                       */
+#define C_HDR_FG     THEME_ACCENT  /* header labels (was off-brand blue)        */
+#define C_LIST_BG    THEME_BG0     /* recessed list well (deepest)              */
+#define C_ROW_EVEN   THEME_BG1     /* even-row zebra (lifted over the well)     */
+#define C_ROW_ODD    THEME_BG0     /* odd-row zebra (matches the well)          */
+#define C_ROW_SEL    THEME_BG4     /* selected-row highlight                    */
+#define C_ROW_DEAD   0xFF3A1A1A    /* recently killed row -- semantic danger tint (dark-safe) */
+#define C_TEXT       THEME_TEXT    /* normal row text                          */
+#define C_TEXT_DIM   THEME_TEXT_DIM/* dimmed / empty                           */
+#define C_BTN_NORMAL THEME_BG2     /* button face                              */
+#define C_BTN_TERM   0xFF2E4A2E    /* "End Task" face -- semantic safe/green (dark-safe) */
+#define C_BTN_KILL   0xFF5C1A1A    /* "Force Quit" face -- semantic destructive/red (dark-safe) */
+#define C_BTN_LABEL  THEME_TEXT    /* button label text                        */
+#define C_SEP        THEME_HAIRLINE/* separator line                           */
+#define C_STATUS_FG  THEME_TEXT_DIM/* status bar text                          */
+#define C_DEAD_FG    THEME_DANGER  /* destructive highlight (semantic token)   */
 
 /* -------------------------------------------------------------------------
  * Per-row click user-data (one struct per pre-created row).

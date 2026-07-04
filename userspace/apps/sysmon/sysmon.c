@@ -69,6 +69,7 @@
  */
 
 #include "../../lib/ui/ui.h"  /* ui_app_t, ui_widget_t, ui_app_create … */
+#include "../../lib/ui/theme.h"  /* shared design tokens (THEME_*) */
 
 /* ------------------------------------------------------------------ */
 /* Syscall numbers                                                      */
@@ -341,14 +342,14 @@ void _start(void) {
     ui_widget_t *root = ui_app_root(app);
 
     /* ---- Title bar panel ---- */
-    ui_widget_t *title_pnl = ui_panel(root, 0, 0, WIN_W, 32, 0xFF1A1A2E);
-    ui_label(title_pnl, 10, 8, "System Monitor", 0xFF00D4FF);
+    ui_widget_t *title_pnl = ui_panel(root, 0, 0, WIN_W, 32, THEME_BG1);
+    ui_label(title_pnl, 10, 8, "System Monitor", THEME_ACCENT);
 
     /* ---- Info panel (uptime, pid, mem) ---- */
-    ui_widget_t *info_pnl = ui_panel(root, 8, 38, WIN_W - 16, 60, 0xFF16213E);
+    ui_widget_t *info_pnl = ui_panel(root, 8, 38, WIN_W - 16, 60, THEME_BG2);
 
     /* uptime – will be updated each tick */
-    g_state.lbl_uptime = ui_label(info_pnl, 10, 6, "Uptime: --:--:--", 0xFFE0E0E0);
+    g_state.lbl_uptime = ui_label(info_pnl, 10, 6, "Uptime: --:--:--", THEME_TEXT);
 
     /* own PID (static) */
     {
@@ -358,26 +359,26 @@ void _start(void) {
         p = sm_append(p, "PID: ");
         p = sm_append(p, sm_utoa((unsigned long)own_pid, nb, 0, ' '));
         *p = '\0';
-        g_state.lbl_pid = ui_label(info_pnl, 10, 24, pidbuf, 0xFFB0B0B0);
+        g_state.lbl_pid = ui_label(info_pnl, 10, 24, pidbuf, THEME_TEXT_DIM);
     }
 
     /* memory line */
     if (g_state.mem_ok) {
-        g_state.lbl_mem = ui_label(info_pnl, 10, 42, "Mem: ...", 0xFFB0B0B0);
+        g_state.lbl_mem = ui_label(info_pnl, 10, 42, "Mem: ...", THEME_TEXT_DIM);
     } else {
-        g_state.lbl_mem = ui_label(info_pnl, 10, 42, "Mem: (unavailable)", 0xFF707070);
+        g_state.lbl_mem = ui_label(info_pnl, 10, 42, "Mem: (unavailable)", THEME_TEXT_FAINT);
     }
 
     /* ---- Process list panel ---- */
-    ui_widget_t *proc_pnl = ui_panel(root, 8, 104, WIN_W - 16, WIN_H - 112, 0xFF0D1117);
+    ui_widget_t *proc_pnl = ui_panel(root, 8, 104, WIN_W - 16, WIN_H - 112, THEME_BG0);
 
     /* Column header */
     g_state.lbl_proc_hdr = ui_label(proc_pnl, 6, 4,
         "  PID Name             State cpu_ms  ",
-        0xFF58A6FF);
+        THEME_ACCENT);
 
     /* Separator line drawn by a thin panel */
-    ui_panel(proc_pnl, 6, 20, WIN_W - 28, 1, 0xFF30363D);
+    ui_panel(proc_pnl, 6, 20, WIN_W - 28, 1, THEME_HAIRLINE);
 
     /* Row labels – one per visible row */
     int row_y_start = 26;
@@ -386,11 +387,11 @@ void _start(void) {
     for (int i = 0; i < MAX_PROCS; i++) {
         int y = row_y_start + i * row_h;
         /* Alternate row shading */
-        unsigned int row_bg = (i & 1) ? 0xFF0D1117 : 0xFF161B22;
+        unsigned int row_bg = (i & 1) ? THEME_BG0 : THEME_BG1;
         ui_panel(proc_pnl, 4, y - 2, WIN_W - 36, row_h, row_bg);
         g_state.lbl_rows[i] = ui_label(proc_pnl, 6, y,
             "(process info unavailable)",
-            0xFFCDD5DF);
+            THEME_TEXT);
     }
     g_state.n_row_labels = MAX_PROCS;
 

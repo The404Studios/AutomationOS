@@ -48,6 +48,7 @@
 
 #include "../../lib/wl/wl_client.h"
 #include "../../lib/font/bitfont.h"
+#include "../../lib/ui/theme.h"   /* shared "Signature Dark" design tokens */
 
 /* ---- syscall numbers ---- */
 #define SYS_READ          2
@@ -295,29 +296,34 @@ static void recompute_layout(void)
     if (g_sidebar_visible < 0) g_sidebar_visible = 0;
 }
 
-/* ---- colors ---- */
-#define COL_BG           0xFF1A1A2Eu  /* deep navy */
-#define COL_SIDEBAR_BG   0xFF16213Eu  /* slightly lighter navy */
-#define COL_SIDEBAR_SEL  0xFF0F3460u  /* selected item */
-#define COL_SIDEBAR_HOV  0xFF1B3A5Cu  /* hovered item */
-#define COL_EDITOR_BG    0xFF1E1E2Eu  /* editor background */
-#define COL_TITLEBAR_BG  0xFF0D1B2Au  /* title bar */
-#define COL_STATUS_BG    0xFF0D1B2Au  /* status bar */
-#define COL_DIVIDER      0xFF3A3A5Cu  /* sidebar/editor divider */
-#define COL_TEXT         0xFFCDD6F4u  /* main text (catppuccin blue) */
-#define COL_TEXT_DIM     0xFF6C7086u  /* dimmed text */
-#define COL_CURSOR       0xFF89B4FAu  /* cursor highlight */
-#define COL_CURSOR_TXT   0xFF1E1E2Eu  /* text under cursor */
-#define COL_HEADER_TXT   0xFFA6E3A1u  /* green header accent */
-#define COL_BUTTON_BG    0xFF313244u  /* button background */
-#define COL_BUTTON_TXT   0xFFCDD6F4u  /* button text */
-#define COL_BUTTON_HOV   0xFF45475Au  /* button hover */
-#define COL_DIRTY        0xFFEBA0ACu  /* red-pink unsaved indicator */
-#define COL_SELECTED_TXT 0xFFF38BA8u  /* selected note name (pink) */
-#define COL_BORDER       0xFF45475Au  /* panel borders */
-#define COL_NEW_BG       0xFF40A02Bu  /* green "New" button */
-#define COL_SAVE_BG      0xFF1E66F5u  /* blue "Save" button */
-#define COL_SAVE_HOV     0xFF2577FFu  /* save hover */
+/* ---- colors ----
+ * Repointed to the shared "Signature Dark" tokens in theme.h so Notes reads
+ * as part of one cohesive dark desktop. Mapped by ROLE, not by old value:
+ * chrome bars -> BG2, body/panels -> BG1, hover -> BG3, selected -> BG4,
+ * primary action + focus (cursor / selection / brand) -> the teal ACCENT.
+ */
+#define COL_BG           THEME_BG1        /* window body backdrop */
+#define COL_SIDEBAR_BG   THEME_BG1        /* sidebar panel */
+#define COL_SIDEBAR_SEL  THEME_BG4        /* selected item row fill */
+#define COL_SIDEBAR_HOV  THEME_BG3        /* hovered item row fill */
+#define COL_EDITOR_BG    THEME_BG1        /* editor content background */
+#define COL_TITLEBAR_BG  THEME_BG2        /* title bar / header strip */
+#define COL_STATUS_BG    THEME_BG2        /* status bar */
+#define COL_DIVIDER      THEME_HAIRLINE   /* dividers / rules / separators */
+#define COL_TEXT         THEME_TEXT       /* primary text */
+#define COL_TEXT_DIM     THEME_TEXT_DIM   /* secondary / dimmed text */
+#define COL_CURSOR       THEME_ACCENT     /* cursor highlight (accent) */
+#define COL_CURSOR_TXT   THEME_ON_ACCENT  /* glyph under the cursor block */
+#define COL_HEADER_TXT   THEME_ACCENT     /* "Notes" brand / header text */
+#define COL_BUTTON_BG    THEME_BG2        /* neutral button face */
+#define COL_BUTTON_TXT   THEME_TEXT       /* button text */
+#define COL_BUTTON_HOV   THEME_BG3        /* neutral button hover */
+#define COL_DIRTY        THEME_WARN       /* unsaved-changes indicator */
+#define COL_SELECTED_TXT THEME_ACCENT     /* selected note name (accent) */
+#define COL_BORDER       THEME_BORDER     /* panel / button borders */
+#define COL_NEW_BG       THEME_BG3        /* secondary "New" button face */
+#define COL_SAVE_BG      THEME_ACCENT     /* primary "Save" button (accent) */
+#define COL_SAVE_HOV     THEME_ACCENT_HI  /* save button hover */
 
 /* ---- notes storage ---- */
 #define NOTES_DIR        "/tmp/notes"
@@ -739,12 +745,12 @@ static void render(wl_window *win, u64 ticks)
     /* [New] button in title bar */
     draw_button(pix, spx, bw, bh,
                 ww - 130, (TITLEBAR_H - 22) / 2, 56, 22,
-                "New", COL_NEW_BG, 0xFF50B03Bu, COL_BUTTON_TXT);
+                "New", COL_NEW_BG, THEME_BG4, COL_BUTTON_TXT);
 
     /* [Save] button in title bar */
     draw_button(pix, spx, bw, bh,
                 ww - 68, (TITLEBAR_H - 22) / 2, 56, 22,
-                "Save", COL_SAVE_BG, COL_SAVE_HOV, COL_BUTTON_TXT);
+                "Save", COL_SAVE_BG, COL_SAVE_HOV, THEME_ON_ACCENT);
 
     /* Dirty indicator in title bar next to "Notes" */
     if (g_dirty) {

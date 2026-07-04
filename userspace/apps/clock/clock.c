@@ -32,6 +32,7 @@
  */
 
 #include "../../lib/ui/ui.h"
+#include "../../lib/ui/theme.h"
 
 /* -----------------------------------------------------------------------
  * Syscall numbers and inline syscall helper.
@@ -134,10 +135,10 @@ void _start(void)
      *         Window is 280px wide; "HH:MM:SS" is 8 chars * 8px = 64px.
      *         Center x = (280 - 64) / 2 = 108.
      */
-    ui_label(root, 108, 20, "Clock", 0xFFAEAEB2);
+    ui_label(root, 108, 20, "Clock", THEME_TEXT_DIM);
 
     /* Time label: place it centered; text will be updated each tick. */
-    g_time_label = ui_label(root, 108, 62, "00:00:00", 0xFFFFFFFF);
+    g_time_label = ui_label(root, 108, 62, "00:00:00", THEME_TEXT);
 
     /* Register the per-frame tick so the label is refreshed each frame. */
     ui_app_set_tick(app, tick_cb, 0);

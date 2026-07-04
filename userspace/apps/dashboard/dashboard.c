@@ -32,6 +32,7 @@
 
 #include "../../lib/wl/wl_client.h"
 #include "../../lib/font/bitfont.h"
+#include "../../lib/ui/theme.h"
 
 /* -----------------------------------------------------------------------
  * Syscall numbers and inline helper (3-arg, no shell-var risk).
@@ -156,39 +157,45 @@ typedef struct {
 #define SPARK_LEN  120
 
 /* -----------------------------------------------------------------------
- * Color palette (dark theme with accent gradients).
+ * Color palette. CHROME colors are repointed to the shared Signature Dark
+ * tokens (theme.h) so the dashboard reads as one cohesive desktop app.
+ * The GAUGE / SPARKLINE data colors below are deliberately PRESERVED as
+ * their own values -- they encode meter/chart data, not chrome.
  * --------------------------------------------------------------------- */
-#define C_BG         0xFF0F1117u   /* main background              */
-#define C_HDR_TOP    0xFF1A1F2Eu   /* header gradient top          */
-#define C_HDR_BOT    0xFF141824u   /* header gradient bottom       */
-#define C_PANEL      0xFF161B26u   /* panel background             */
-#define C_PANEL2     0xFF1E2435u   /* alternate panel shade        */
-#define C_BORDER     0xFF2A3248u   /* panel border                 */
-#define C_ACCENT     0xFF4E9EFFu   /* blue accent                  */
-#define C_ACCENT2    0xFF7B5EFFu   /* purple accent                */
-#define C_ACCENT3    0xFF00E5B4u   /* teal accent                  */
-#define C_TEXT       0xFFEAEDF5u   /* primary text                 */
-#define C_TEXT2      0xFF9BA8C8u   /* secondary text               */
-#define C_TEXT3      0xFF5A6585u   /* dim text                     */
-#define C_BAR_BG     0xFF1E2435u   /* bar track                    */
-#define C_BAR_FG     0xFF4E9EFFu   /* bar fill                     */
-#define C_BAR_HOT    0xFFFF6B6Bu   /* bar fill when high           */
-#define C_SPARK_FG   0xFF00E5B4u   /* sparkline line colour        */
-#define C_SPARK_FILL 0xFF003D2Fu   /* sparkline fill colour        */
-#define C_ROW_A      0xFF161B26u   /* row even background          */
-#define C_ROW_B      0xFF1A2030u   /* row odd background           */
-#define C_ROW_RUN    0xFF1A2E1Au   /* running process highlight    */
-#define C_SEP        0xFF252D42u   /* separator line               */
-#define C_WHITE      0xFFFFFFFFu
+/* ---- Chrome (theme tokens) ---- */
+#define C_BG         THEME_BG1       /* main window background        */
+#define C_HDR_TOP    THEME_BG2       /* header gradient top           */
+#define C_HDR_BOT    THEME_BG1       /* header gradient bottom        */
+#define C_PANEL      THEME_BG2       /* card / panel background       */
+#define C_PANEL2     THEME_BG3       /* alternate panel shade         */
+#define C_BORDER     THEME_BORDER    /* panel border                  */
+#define C_ACCENT     THEME_ACCENT    /* accent (labels / dividers)    */
+#define C_ACCENT2    THEME_ACCENT    /* column-header accent          */
+#define C_ACCENT3    THEME_ACCENT    /* accent (unused)               */
+#define C_TEXT       THEME_TEXT      /* primary text                  */
+#define C_TEXT2      THEME_TEXT_DIM  /* secondary text                */
+#define C_TEXT3      THEME_TEXT_FAINT/* tertiary / dim text           */
+#define C_BAR_BG     THEME_BG3       /* meter track / chart inset     */
+#define C_ROW_A      THEME_BG2       /* row even background           */
+#define C_ROW_B      THEME_BG3       /* row odd background            */
+#define C_ROW_RUN    THEME_BG4       /* highlighted (running) row bg   */
+#define C_SEP        THEME_HAIRLINE  /* separator line                */
+#define C_WHITE      THEME_TEXT      /* (unused)                      */
+
+/* ---- Gauge / chart DATA colors (preserved, not chrome) ---- */
+#define C_BAR_FG     0xFF4E9EFFu   /* processes-meter fill          */
+#define C_BAR_HOT    0xFFFF6B6Bu   /* processes-meter fill when high*/
+#define C_SPARK_FG   0xFF00E5B4u   /* activity sparkline line        */
+#define C_SPARK_FILL 0xFF003D2Fu   /* activity sparkline fill        */
 
 /* State color */
 static u32 state_color(unsigned int s)
 {
     switch (s) {
-        case 0:  return 0xFF4CFF82u;   /* running -- green  */
-        case 1:  return 0xFF4E9EFFu;   /* ready   -- blue   */
-        case 2:  return 0xFFFFBF42u;   /* blocked -- amber  */
-        case 3:  return 0xFFFF5555u;   /* zombie  -- red    */
+        case 0:  return THEME_SUCCESS;  /* running -- green  */
+        case 1:  return THEME_ACCENT;   /* ready   -- accent */
+        case 2:  return THEME_WARN;     /* blocked -- amber  */
+        case 3:  return THEME_DANGER;   /* zombie  -- red    */
         default: return C_TEXT3;
     }
 }

@@ -43,6 +43,7 @@
  */
 
 #include "../../lib/ui/ui.h"
+#include "../../lib/ui/theme.h"
 
 /* -----------------------------------------------------------------------
  * Syscall numbers and inline syscall helper.
@@ -134,13 +135,14 @@ static int append_u32_hex(char *dst, int len, unsigned int v)
  * Application state.
  * --------------------------------------------------------------------- */
 
-/* Colors (ARGB) consistent with the Aether Dark theme. */
-#define COL_TITLE   0xFFFFFFFFu
-#define COL_DIM     0xFFAEAEB2u
-#define COL_ACCENT  0xFF0A84FFu
-#define COL_GREEN   0xFF30D158u
-#define COL_RED     0xFFFF453Au
-#define COL_FIELD   0xFF1C1C1Eu
+/* Colors (ARGB) -- repointed to the shared design tokens (theme.h) so this
+ * panel's custom-drawn chrome matches the rest of the desktop. Roles kept. */
+#define COL_TITLE   THEME_TEXT       /* primary title/section text (was 0xFFFFFFFF)   */
+#define COL_DIM     THEME_TEXT_DIM   /* secondary / dim label text (was 0xFFAEAEB2)   */
+#define COL_ACCENT  THEME_ACCENT     /* "<N>%" readout accent (was iOS blue 0xFF0A84FF)*/
+#define COL_GREEN   THEME_SUCCESS    /* codec online / unmuted status (was 0xFF30D158) */
+#define COL_RED     THEME_DANGER     /* muted / error status (was 0xFFFF453A)         */
+#define COL_FIELD   THEME_BG2        /* status panel surface (was 0xFF1C1C1E)         */
 
 /* Live widgets (updated by callbacks / the tick). */
 static ui_widget_t *g_vol_value  = 0;   /* "<N>%" next to the slider           */

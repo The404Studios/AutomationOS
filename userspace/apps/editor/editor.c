@@ -39,6 +39,7 @@
 
 #include "../../lib/wl/wl_client.h"
 #include "../../lib/font/bitfont.h"
+#include "../../lib/ui/theme.h"
 
 /* ---- syscall numbers ---- */
 #define SYS_WRITE         3
@@ -297,17 +298,17 @@ static int rows_for_height(u32 h)
     return rows;
 }
 
-/* ---- colors ---- */
-#define COL_BG          0xFF1E1E1Eu
-#define COL_GUTTER_BG   0xFF252525u   /* very slightly lighter than main bg */
-#define COL_STATUS_BG   0xFF007ACCu
-#define COL_TEXT        0xFFD4D4D4u
-#define COL_CURSOR      0xFFAEAFADu
-#define COL_CURSOR_TXT  0xFF1E1E1Eu
-#define COL_STATUS_TXT  0xFFFFFFFFu
-#define COL_DIRTY       0xFFFFCC00u
-#define COL_LINE_NUM    0xFF858585u
-#define COL_LINE_NUM_CUR 0xFFCCCCCCu  /* current-line number highlighted */
+/* ---- colors (repointed to the shared Signature Dark theme tokens) ---- */
+#define COL_BG          THEME_BG1        /* editor window body / text surface  */
+#define COL_GUTTER_BG   THEME_BG2        /* line-number gutter (raised panel)  */
+#define COL_STATUS_BG   THEME_BG2        /* status bar surface                 */
+#define COL_TEXT        THEME_TEXT       /* primary editing text               */
+#define COL_CURSOR      THEME_ACCENT     /* caret block (focus accent)         */
+#define COL_CURSOR_TXT  THEME_ON_ACCENT  /* glyph sitting under the caret block*/
+#define COL_STATUS_TXT  THEME_TEXT_DIM   /* status bar text (secondary chrome) */
+#define COL_DIRTY       THEME_WARN       /* modified indicator (amber)         */
+#define COL_LINE_NUM    THEME_TEXT_FAINT /* line numbers (de-emphasized)       */
+#define COL_LINE_NUM_CUR THEME_TEXT_DIM  /* current-line number (brighter)     */
 
 /* ---- scroll ---- */
 static int scroll_row = 0;

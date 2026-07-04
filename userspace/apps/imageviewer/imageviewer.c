@@ -23,6 +23,7 @@
 
 #include "../../lib/wl/wl_client.h"
 #include "../../lib/font/bitfont.h"
+#include "../../lib/ui/theme.h"
 
 /*
  * Pull in the image module's public API. IMAGE_FREESTANDING makes image.h use
@@ -69,14 +70,14 @@ static int map_file(const char *path, void **addr, ulong *size) {
     return (int)sc(SYS_MAP_FILE, (long)path, (long)addr, (long)size, 0, 0, 0);
 }
 
-/* ---- window geometry / palette ---- */
+/* ---- window geometry / palette (chrome from theme.h; image stays untouched) */
 #define WIN_W       640
 #define WIN_H       480
-#define BG_COLOR    0xFF1B1F26u   /* dark slate canvas        */
-#define MAT_COLOR   0xFF11141Au   /* slightly darker matte    */
-#define INK_WHITE   0xFFFFFFFFu
-#define INK_AMBER   0xFFF1C40Fu
-#define INK_GREY    0xFFA0A8B4u
+#define BG_COLOR    THEME_BG2      /* caption/status strip (raised surface)   */
+#define MAT_COLOR   THEME_BG1      /* window body / image matte               */
+#define INK_WHITE   THEME_TEXT     /* primary text                            */
+#define INK_AMBER   THEME_WARN     /* "no image" warning message              */
+#define INK_GREY    THEME_TEXT_DIM /* secondary caption / hint text           */
 
 /*
  * Candidate initrd paths, tried in order. The integrator must place ONE test

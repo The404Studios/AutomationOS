@@ -52,6 +52,7 @@
 
 #include "../../lib/wl/wl_client.h"
 #include "../../lib/font/bitfont.h"
+#include "../../lib/ui/theme.h"
 
 /* =========================================================================
  * Syscall numbers and inline helpers.
@@ -156,29 +157,33 @@ typedef struct {
 #define TAB_CL_W   210
 
 /* =========================================================================
- * Colors (dark theme).
+ * Colors -- repointed to the shared "Signature Dark" tokens (theme.h) so the
+ * app reads as part of one cohesive desktop. Mapped by ROLE (see comments).
+ * Content that is intentionally colored is unaffected here -- this is all
+ * chrome (window body, tab bar, buttons, lap list, and the analog-clock
+ * widget's decorative rim/hands/ticks, which are UI hierarchy, not data).
  * ========================================================================= */
-#define COL_BG         0xFF1A1A2Eu  /* deep navy background              */
-#define COL_PANEL      0xFF16213Eu  /* slightly lighter panel            */
-#define COL_TAB_ACTIVE 0xFF0F3460u  /* active tab                        */
-#define COL_TAB_HOVER  0xFF1A1A3Eu  /* inactive tab                      */
-#define COL_SEP        0xFF4A4A8Au  /* separator lines                   */
-#define COL_TEXT       0xFFE0E0FFu  /* primary text (near-white blue)    */
-#define COL_TEXT_DIM   0xFF7070A0u  /* dimmed text                       */
-#define COL_ACCENT_RUN 0xFF00E5FFu  /* cyan accent while running         */
-#define COL_ACCENT_STP 0xFFFFFFFFu  /* white when stopped                */
-#define COL_BTN        0xFF0F3460u  /* button face                       */
-#define COL_BTN_HL     0xFF1A5090u  /* button hover / active             */
-#define COL_BTN_TXT    0xFFD0D0FFu  /* button label                      */
-#define COL_LAP_ROW    0xFF1E1E3Cu  /* lap row background                */
-#define COL_LAP_TXT    0xFF80C0FFu  /* lap time text                     */
-#define COL_CLOCK_RIM  0xFF4040A0u  /* analog clock ring                 */
-#define COL_CLOCK_FACE 0xFF0D0D25u  /* clock face fill                   */
-#define COL_HAND_HR    0xFFFFFFFFu  /* hour hand                         */
-#define COL_HAND_MIN   0xFF80C0FFu  /* minute hand                       */
-#define COL_HAND_SEC   0xFF00E5FFu  /* second hand                       */
-#define COL_TICK_MAJOR 0xFF8080C0u  /* hour tick marks                   */
-#define COL_TICK_MINOR 0xFF404070u  /* minute tick marks                 */
+#define COL_BG         THEME_BG1        /* window body                       */
+#define COL_PANEL      THEME_BG2        /* panel / surface                   */
+#define COL_TAB_ACTIVE THEME_BG4        /* active (selected) tab             */
+#define COL_TAB_HOVER  THEME_BG2        /* inactive tab (toolbar surface)    */
+#define COL_SEP        THEME_BORDER     /* separators / widget borders       */
+#define COL_TEXT       THEME_TEXT       /* primary text                      */
+#define COL_TEXT_DIM   THEME_TEXT_DIM   /* dimmed / secondary text           */
+#define COL_ACCENT_RUN THEME_ACCENT     /* accent while running              */
+#define COL_ACCENT_STP THEME_TEXT       /* neutral bright when stopped       */
+#define COL_BTN        THEME_BG2        /* button face                       */
+#define COL_BTN_HL     THEME_BG3        /* button hover / active             */
+#define COL_BTN_TXT    THEME_TEXT       /* button label                      */
+#define COL_LAP_ROW    THEME_BG2        /* lap row background                */
+#define COL_LAP_TXT    THEME_ACCENT     /* lap time (highlighted value)      */
+#define COL_CLOCK_RIM  THEME_BORDER     /* analog clock ring                 */
+#define COL_CLOCK_FACE THEME_BG0        /* clock face fill (recessed)        */
+#define COL_HAND_HR    THEME_TEXT       /* hour hand                         */
+#define COL_HAND_MIN   THEME_TEXT_DIM   /* minute hand                       */
+#define COL_HAND_SEC   THEME_ACCENT     /* second hand                       */
+#define COL_TICK_MAJOR THEME_TEXT_DIM   /* hour tick marks                   */
+#define COL_TICK_MINOR THEME_TEXT_FAINT /* minute tick marks                 */
 
 /* =========================================================================
  * Drawing primitives.
@@ -641,7 +646,7 @@ void _start(void)
             /* ---- Buttons ---- */
             /* Start/Stop */
             {
-                u32 btn_col = running ? 0xFF003050u : COL_BTN;
+                u32 btn_col = running ? THEME_BG4 : COL_BTN;
                 fill_rect(win->pixels, stride_px,
                           BTN_SS_X, BTN_Y, BTN_SS_W, BTN_H, btn_col);
                 draw_border(win->pixels, stride_px,
@@ -670,7 +675,7 @@ void _start(void)
             }
             /* Lap */
             {
-                u32 lap_col = (running && lap_count < MAX_LAPS) ? COL_BTN : 0xFF101020u;
+                u32 lap_col = (running && lap_count < MAX_LAPS) ? COL_BTN : THEME_BG1;
                 fill_rect(win->pixels, stride_px,
                           BTN_LP_X, BTN_Y, BTN_LP_W, BTN_H, lap_col);
                 draw_border(win->pixels, stride_px,

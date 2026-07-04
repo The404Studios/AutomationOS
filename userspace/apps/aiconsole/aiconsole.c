@@ -55,6 +55,7 @@
 
 #include "../../lib/wl/wl_client.h"
 #include "../../lib/font/bitfont.h"
+#include "../../lib/ui/theme.h"
 
 /* =========================================================================
  * Syscall numbers (must match kernel/include/syscall.h)
@@ -251,18 +252,20 @@ static void ser_kv_unum(const char *key, unsigned long val) {
 #define INPUT_ROWS  2                       /* rows reserved for input area  */
 #define OUT_ROWS    (MAX_ROWS - INPUT_ROWS) /* 29 output rows                */
 
-/* Colors */
-#define COLOR_BG        0xFF0D1117u   /* near-black background        */
-#define COLOR_OUT_BG    0xFF0D1117u   /* same for output area         */
-#define COLOR_INPUT_BG  0xFF161B22u   /* slightly lighter input bg    */
-#define COLOR_FG        0xFFCDD9E5u   /* cool-white text              */
-#define COLOR_PROMPT    0xFF58A6FFu   /* blue prompt text             */
-#define COLOR_CURSOR    0xFF3FB950u   /* green cursor block           */
-#define COLOR_HLINE     0xFF30363Du   /* separator line               */
-#define COLOR_BANNER    0xFF79C0FFu   /* banner / title color         */
-#define COLOR_LABEL     0xFFF78166u   /* key labels in output         */
-#define COLOR_VALUE     0xFFAFF5B4u   /* values in output             */
-#define COLOR_WARN      0xFFFFA657u   /* warnings / errors            */
+/* Colors -- repointed to the shared Signature Dark tokens (theme.h) so the
+ * console reads as part of the one cohesive dark desktop. Names/roles kept;
+ * only the values now come from tokens. */
+#define COLOR_BG        THEME_BG1       /* window body background       */
+#define COLOR_OUT_BG    THEME_BG1       /* output area (same as body)   */
+#define COLOR_INPUT_BG  THEME_BG2       /* elevated input surface       */
+#define COLOR_FG        THEME_TEXT      /* primary text                 */
+#define COLOR_PROMPT    THEME_ACCENT    /* prompt / accent              */
+#define COLOR_CURSOR    THEME_ACCENT    /* caret block                  */
+#define COLOR_HLINE     THEME_HAIRLINE  /* separator line               */
+#define COLOR_BANNER    THEME_ACCENT    /* banner / section headers     */
+#define COLOR_LABEL     THEME_TEXT_DIM  /* key labels (secondary text)  */
+#define COLOR_VALUE     THEME_SUCCESS   /* values / success messages    */
+#define COLOR_WARN      THEME_WARN      /* warnings / errors            */
 
 /* =========================================================================
  * Grid state: separate output grid and input line.

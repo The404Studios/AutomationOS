@@ -23,6 +23,7 @@
  */
 
 #include "../../lib/ui/ui.h"
+#include "../../lib/ui/theme.h"
 
 /* -- syscalls (6-arg raw ABI, identical to claudehost.c / nc.c) ------------- */
 #define SYS_WRITE      3
@@ -89,7 +90,7 @@ static void emit_line(const char *s, unsigned int color) {
     if (!g_line_box || g_box_lines >= LINES_PER_BOX) {
         g_box_y    = g_msg_y;
         g_line_box = ui_panel(g_transcript, 0, g_box_y, VP_W - 12,
-                              LINES_PER_BOX * LINE_H, 0xFF141416);  /* == scroll bg */
+                              LINES_PER_BOX * LINE_H, THEME_BG1);  /* == scroll bg */
         g_box_lines = 0;
         if (!g_line_box) return;                 /* scroll full -- stop cleanly */
     }
@@ -174,7 +175,7 @@ static void on_send(void *ud) {
     for (; txt[i] && i < (int)sizeof(prompt) - 1; i++) prompt[i] = txt[i];
     prompt[i] = 0;
 
-    add_message("You: ", prompt, 0xFF9CDCFE);     /* light blue                */
+    add_message("You: ", prompt, THEME_ACCENT);    /* user = accent (teal)      */
     ui_textbox_set_text(g_input, "");
     ui_label_set_text(g_status, "Claude is thinking...");
 
@@ -182,11 +183,11 @@ static void on_send(void *ud) {
     if (n == -2)
         add_message("Claude: ", "[broker offline] start `python3 scripts/claude_broker.py` "
                                 "on the host and boot with -netdev user -device e1000.",
-                    0xFFFF9E64);
+                    THEME_WARN);
     else if (n <= 0)
-        add_message("Claude: ", "[no reply from broker]", 0xFFFF9E64);
+        add_message("Claude: ", "[no reply from broker]", THEME_WARN);
     else
-        add_message("Claude: ", g_reply, 0xFFD7FFD7);          /* soft green   */
+        add_message("Claude: ", g_reply, THEME_TEXT);          /* assistant text */
 
     ui_label_set_text(g_status, "Type a message and press Send.");
 }
@@ -198,20 +199,20 @@ void _start(void) {
     ui_widget_t *root = ui_app_root(g_app);
 
     /* Transcript: a dark scroll viewport filling the top. */
-    g_transcript = ui_scroll(root, VP_X, VP_Y, VP_W, VP_H, 0xFF141416, CONTENT_H);
+    g_transcript = ui_scroll(root, VP_X, VP_Y, VP_W, VP_H, THEME_BG1, CONTENT_H);
 
     /* Greeting (rendered into the transcript). */
     add_message("Claude: ", "Hi! I'm Claude, running as a native AutomationOS app. "
                             "Ask me anything and press Send. (Replies route through "
                             "the host broker; the API key never enters the OS.)",
-                0xFFD7FFD7);
+                THEME_TEXT);
 
     /* Input row. */
     g_input  = ui_textbox(root, VP_X, VP_Y + VP_H + 8, VP_W - 96, UI_TEXTBOX_MAXBUF - 1);
     ui_button(root, VP_X + VP_W - 88, VP_Y + VP_H + 6, 88, 28, "Send", on_send, 0);
 
     g_status = ui_label(root, VP_X, VP_Y + VP_H + 34, "Type a message and press Send.",
-                        0xFFAEAEB2);
+                        THEME_TEXT_DIM);
 
     ui_app_run(g_app);   /* never returns */
 }

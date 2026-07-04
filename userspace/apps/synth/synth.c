@@ -27,6 +27,7 @@
 
 #include "../../lib/wl/wl_client.h"
 #include "../../lib/font/bitfont.h"
+#include "../../lib/ui/theme.h"
 
 /* -----------------------------------------------------------------------
  * Syscall numbers (must match kernel/include/syscall.h).
@@ -201,8 +202,12 @@ static void draw_rect_outline(u32 *buf, u32 bw, u32 bh, u32 spx,
 /* -----------------------------------------------------------------------
  * Keyboard color palette.
  * --------------------------------------------------------------------- */
-#define COL_BG          0xFF1A1A2Eu  /* dark navy background           */
-#define COL_TITLE       0xFFE0E0FFu  /* title text                     */
+/* ---- Chrome: repointed to shared theme tokens (Signature Dark) ---------- */
+#define COL_BG          THEME_BG1     /* window body background          */
+#define COL_TITLE       THEME_TEXT    /* title text (primary)            */
+#define COL_HINT        THEME_TEXT_DIM/* keyboard shortcut hint (2nd)    */
+
+/* ---- Content: piano-key instrument colors (PRESERVED intentionally) ----- */
 #define COL_WHITE_KEY   0xFFEEEEEEu  /* white key normal               */
 #define COL_WHITE_HL    0xFF88DDFFu  /* white key highlighted          */
 #define COL_WHITE_EDGE  0xFF444444u  /* white key border               */
@@ -211,7 +216,6 @@ static void draw_rect_outline(u32 *buf, u32 bw, u32 bh, u32 spx,
 #define COL_BLACK_EDGE  0xFF000000u  /* black key border               */
 #define COL_LABEL_W     0xFF222222u  /* label on white key             */
 #define COL_LABEL_B     0xFFCCCCCCu  /* label on black key             */
-#define COL_HINT        0xFF888888u  /* keyboard shortcut hint text    */
 
 /* -----------------------------------------------------------------------
  * Render one complete frame.

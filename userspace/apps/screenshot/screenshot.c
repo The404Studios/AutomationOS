@@ -37,6 +37,7 @@
 
 #include "../../lib/wl/wl_client.h"
 #include "../../lib/font/bitfont.h"
+#include "../../lib/ui/theme.h"
 
 /* -----------------------------------------------------------------------
  * Syscall numbers and inline helper (no libc, no stack canary).
@@ -174,21 +175,21 @@ static void k_memcpy(void *dst, const void *src, unsigned long n)
 #define STS_X    8
 #define STS_Y    40
 
-/* Colors. */
-#define C_BG        0xFF1E1E2Eu   /* dark background                    */
-#define C_CTRL_BG   0xFF2D2D3Fu   /* control bar background             */
-#define C_CTRL_SEP  0xFF44445Au   /* separator line                     */
-#define C_BTN       0xFF4A7FBBu   /* capture button face                */
-#define C_BTN_HOV   0xFF5A8FCBu   /* hover                              */
-#define C_BTN_CLK   0xFF2A5F9Bu   /* pressed                            */
-#define C_DLY_OFF   0xFF3A3A50u   /* delay button inactive              */
-#define C_DLY_ON    0xFF7A4ABBu   /* delay button active (3s selected)  */
-#define C_BORDER    0xFF666688u   /* generic border                     */
-#define C_TEXT      0xFFEEEEFFu   /* primary text                       */
-#define C_TEXT_DIM  0xFF9999BBu   /* dimmed text                        */
-#define C_THUMB_BG  0xFF111120u   /* thumbnail background               */
-#define C_THUMB_BRD 0xFF444466u   /* thumbnail border                   */
-#define C_STATUS_OK 0xFF55DD55u   /* success status text                */
+/* Colors -- repointed to the shared Signature Dark tokens (theme.h). */
+#define C_BG        THEME_BG1      /* window body background             */
+#define C_CTRL_BG   THEME_BG2      /* control bar / toolbar background   */
+#define C_CTRL_SEP  THEME_HAIRLINE /* separator line                     */
+#define C_BTN       THEME_ACCENT   /* capture (primary) button face      */
+#define C_BTN_HOV   THEME_ACCENT_HI/* hover                              */
+#define C_BTN_CLK   THEME_ACCENT_LO/* pressed                            */
+#define C_DLY_OFF   THEME_BG3      /* delay toggle inactive (rest)       */
+#define C_DLY_ON    THEME_ACCENT   /* delay toggle active (3s selected)  */
+#define C_BORDER    THEME_BORDER   /* generic border                     */
+#define C_TEXT      THEME_TEXT     /* primary text                       */
+#define C_TEXT_DIM  THEME_TEXT_DIM /* dimmed / secondary text            */
+#define C_THUMB_BG  THEME_BG0      /* thumbnail well (recessed backdrop) */
+#define C_THUMB_BRD THEME_BORDER   /* thumbnail border                   */
+#define C_STATUS_OK THEME_SUCCESS  /* success status text                */
 
 /* -----------------------------------------------------------------------
  * Drawing primitives (same style as paint.c).
@@ -471,11 +472,11 @@ static void render(wl_window *win, int btn_state, int delay_3s,
     if (counting_down) {
         /* Show "Capturing..." */
         font_draw_string(buf, (int)stride_px, (int)bw, (int)bh,
-                         BTN_X + 14, BTN_Y + 5, "Capturing...", C_TEXT);
+                         BTN_X + 14, BTN_Y + 5, "Capturing...", THEME_ON_ACCENT);
         (void)countdown_end;
     } else {
         font_draw_string(buf, (int)stride_px, (int)bw, (int)bh,
-                         BTN_X + 10, BTN_Y + 5, "Capture Screen", C_TEXT);
+                         BTN_X + 10, BTN_Y + 5, "Capture Screen", THEME_ON_ACCENT);
     }
 
     /* ---- Delay toggle button ---- */
@@ -493,7 +494,7 @@ static void render(wl_window *win, int btn_state, int delay_3s,
                          STS_X, STS_Y, status_buf, C_STATUS_OK);
     } else if (status_ok == -1) {
         font_draw_string(buf, (int)stride_px, (int)bw, (int)bh,
-                         STS_X, STS_Y, status_buf, 0xFFFF4444u);
+                         STS_X, STS_Y, status_buf, THEME_DANGER);
     } else {
         font_draw_string(buf, (int)stride_px, (int)bw, (int)bh,
                          STS_X, STS_Y, "Press 'Capture Screen' to take a screenshot",

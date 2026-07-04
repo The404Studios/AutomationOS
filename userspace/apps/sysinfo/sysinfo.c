@@ -34,6 +34,7 @@
  */
 
 #include "../../lib/ui/ui.h"
+#include "../../lib/ui/theme.h"
 
 /* -----------------------------------------------------------------------
  * Syscall numbers and inline syscall helper.
@@ -132,17 +133,17 @@ void _start(void)
     /*
      * Layout (all x/y relative to root = window origin):
      *
-     *   y=18   "AutomationOS"       -- white title
-     *   y=46   "Desktop: M5"        -- light grey
-     *   y=68   "Compositor: running"-- light grey
-     *   y=96   "Uptime: HH:MM:SS"   -- white, live
+     *   y=18   "AutomationOS"       -- primary text
+     *   y=46   "Desktop: M5"        -- dim text
+     *   y=68   "Compositor: running"-- dim text
+     *   y=96   "Uptime: HH:MM:SS"   -- primary text, live
      *   y=148  [ OK ]               -- button (100x32), x=20
      */
-    ui_label(root, 20, 18, "AutomationOS",         0xFFFFFFFF);
-    ui_label(root, 20, 46, "Desktop: M5",           0xFFAEAEB2);
-    ui_label(root, 20, 68, "Compositor: running",   0xFFAEAEB2);
+    ui_label(root, 20, 18, "AutomationOS",         THEME_TEXT);
+    ui_label(root, 20, 46, "Desktop: M5",           THEME_TEXT_DIM);
+    ui_label(root, 20, 68, "Compositor: running",   THEME_TEXT_DIM);
 
-    g_uptime_label = ui_label(root, 20, 96, "Uptime: 00:00:00", 0xFFFFFFFF);
+    g_uptime_label = ui_label(root, 20, 96, "Uptime: 00:00:00", THEME_TEXT);
 
     ui_button(root, 20, 148, 100, 32, "OK", on_ok, 0);
 

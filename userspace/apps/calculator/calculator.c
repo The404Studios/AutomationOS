@@ -44,6 +44,7 @@
  */
 
 #include "../../lib/ui/ui.h"
+#include "../../lib/ui/theme.h"
 
 /* -----------------------------------------------------------------------
  * Syscall helpers -- no libc.
@@ -403,15 +404,15 @@ void _start(void)
      * Four rows    at y = 62, 118, 174, 230 (gap 8px).
      * ------------------------------------------------------------- */
 
-    /* Display panel (dark background, slightly lighter than the window). */
-    ui_widget_t *disp_panel = ui_panel(root, 8, 10, 224, 44, 0xFF2C2C2E);
+    /* Display panel (card surface, slightly lighter than the window body). */
+    ui_widget_t *disp_panel = ui_panel(root, 8, 10, 224, 44, THEME_BG2);
 
     /*
      * Display label: right-justified look -- place it at x=8 within the
      * panel (the toolkit left-aligns text, so we position it so longer
      * numbers appear near the right edge).  Text "0" on startup.
      */
-    g_calc.display = ui_label(disp_panel, 8, 14, "0", 0xFFFFFFFF);
+    g_calc.display = ui_label(disp_panel, 8, 14, "0", THEME_TEXT);
 
     /* ---- Set up per-digit ud structs. ---- */
     for (int i = 0; i <= 9; i++) {

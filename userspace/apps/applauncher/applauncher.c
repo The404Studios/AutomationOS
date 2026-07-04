@@ -41,6 +41,7 @@
  */
 
 #include "../../lib/ui/ui.h"
+#include "../../lib/ui/theme.h"   /* shared "Signature Dark" design tokens */
 
 /* -----------------------------------------------------------------------
  * Syscall numbers and inline syscall helper.
@@ -303,20 +304,20 @@ void _start(void)
     ui_widget_t *root = ui_app_root(app);
 
     /* Header label: "Applications" centred-ish near the top. */
-    ui_label(root, 196, 14, "Applications", 0xFFAEAEB2);
+    ui_label(root, 196, 14, "Applications", THEME_TEXT_DIM);
 
     /* ---- Build the button grid as nested ROW CONTAINERS ----
      * The toolkit caps EVERY widget at UI_MAX_CHILDREN (16, ui.c). Attaching all
      * APP_COUNT buttons + the header directly to root silently DROPS the apps
      * past the 15th (attach_child returns -1, ui_button returns NULL) -- which is
      * exactly why Date/Claude/Anthropic never appeared. Wrap each row in a
-     * transparent panel (bg == the window bg 0xFF1C1C1E, so invisible): root then
+     * transparent panel (bg == the window bg THEME_BG1, so invisible): root then
      * holds 1 label + ceil(APP_COUNT/COLS) row panels, and each row holds <= COLS
      * buttons -- both well under the cap. (Mirrors startmenu's row_box pattern.) */
     int nrows = (APP_COUNT + COLS - 1) / COLS;
     for (int r = 0; r < nrows; r++) {
         ui_widget_t *row_box = ui_panel(root, GRID_X, ROW_Y(r),
-                                        COLS * (BTN_W + GAP), BTN_H, 0xFF1C1C1E);
+                                        COLS * (BTN_W + GAP), BTN_H, THEME_BG1);
         for (int c = 0; c < COLS; c++) {
             int i = r * COLS + c;
             if (i >= APP_COUNT) break;

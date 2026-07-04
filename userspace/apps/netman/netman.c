@@ -46,6 +46,7 @@
  */
 
 #include "../../lib/ui/ui.h"
+#include "../../lib/ui/theme.h"                   /* shared "Signature Dark" design tokens */
 #include "../../lib/net/dns.h"
 #include "../../../kernel/include/uapi/wlan.h"   /* header-only SYS_WLAN_* ABI */
 
@@ -269,16 +270,19 @@ static int g_frames = 0;
 static ui_app_t    *g_app  = 0;
 static ui_widget_t *g_root = 0;
 
-/* Colors (ARGB) consistent with the Aether Dark theme. */
-#define COL_TITLE     0xFFFFFFFFu
-#define COL_DIM       0xFFAEAEB2u
-#define COL_ACCENT    0xFF0A84FFu
-#define COL_GREEN     0xFF30D158u
-#define COL_LOCK      0xFFFFD60Au
-#define COL_DIMLAYER  0xFF0B0B0Du   /* opaque-dark "dim" backdrop          */
-#define COL_DIALOG    0xFF2C2C2Eu   /* dialog panel fill                   */
-#define COL_SHADOW    0xFF101012u   /* faux drop-shadow under the dialog   */
-#define COL_FIELD     0xFF1C1C1Eu
+/* Colors: mapped by ROLE to the shared "Signature Dark" design tokens
+ * (theme.h) so this app's custom chrome matches the rest of the desktop.
+ * Signal-strength bars are drawn by lib/ui (ui_signal_bars) and keep their
+ * own semantics; only netman's hand-drawn literals are repointed here. */
+#define COL_TITLE     THEME_TEXT       /* primary title/label text            */
+#define COL_DIM       THEME_TEXT_DIM   /* secondary/dim labels                */
+#define COL_ACCENT    THEME_ACCENT     /* accent (was iOS blue -> teal)       */
+#define COL_GREEN     THEME_SUCCESS    /* online / connected / link-UP        */
+#define COL_LOCK      THEME_WARN       /* secured-network lock glyph (yellow) */
+#define COL_DIMLAYER  THEME_BG0        /* opaque-dark modal "dim" backdrop    */
+#define COL_DIALOG    THEME_BG3        /* dialog panel fill (elevated)        */
+#define COL_SHADOW    THEME_SHADOW     /* faux drop-shadow under the dialog   */
+#define COL_FIELD     THEME_BG2        /* list/row surface (card)             */
 
 /* -----------------------------------------------------------------------
  * Forward declarations.

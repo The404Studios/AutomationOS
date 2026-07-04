@@ -32,6 +32,7 @@
 
 #include "../../lib/wl/wl_client.h"
 #include "../../lib/font/bitfont.h"
+#include "../../lib/ui/theme.h"
 
 /* -------------------------------------------------------------------------
  * Syscall numbers and inline helpers.
@@ -105,30 +106,30 @@ static i32 g_h = WIN_H;
 /* -------------------------------------------------------------------------
  * Color palette.
  * ----------------------------------------------------------------------- */
-/* Background: very dark navy */
-#define COL_BG          0xFF0F1117u
-/* Card background: slightly lighter */
-#define COL_CARD        0xFF1A1D27u
+/* Window body: deepest surface in the window */
+#define COL_BG          THEME_BG0
+/* Card background: elevated surface */
+#define COL_CARD        THEME_BG2
 /* Card border */
-#define COL_CARD_BORDER 0xFF2E3348u
-/* Header region bg */
-#define COL_HEADER_BG   0xFF13161Fu
-/* Title text: near white */
-#define COL_TITLE       0xFFF0F4FFu
-/* Subtitle: muted */
-#define COL_SUBTITLE    0xFF8899BBu
+#define COL_CARD_BORDER THEME_BORDER
+/* Header/hero region bg: lifted above the body */
+#define COL_HEADER_BG   THEME_BG1
+/* Title text: primary */
+#define COL_TITLE       THEME_TEXT
+/* Subtitle: secondary */
+#define COL_SUBTITLE    THEME_TEXT_DIM
 /* Section heading: accent */
-#define COL_HEADING     0xFF5C9BFFu
-/* Body text */
-#define COL_BODY        0xFFCDD5E8u
-/* Shortcut key labels: slightly highlighted */
-#define COL_KEY         0xFFFFCC66u
+#define COL_HEADING     THEME_ACCENT
+/* Body text: primary content */
+#define COL_BODY        THEME_TEXT
+/* Shortcut key labels: primary text on a raised keycap pill */
+#define COL_KEY         THEME_TEXT
 /* App name accent */
-#define COL_APP         0xFF79E6A2u
+#define COL_APP         THEME_ACCENT
 /* Shimmer accent base */
-#define COL_ACCENT      0xFF4477FFu
+#define COL_ACCENT      THEME_ACCENT
 /* Separator line */
-#define COL_SEP         0xFF252A3Eu
+#define COL_SEP         THEME_HAIRLINE
 
 /* -------------------------------------------------------------------------
  * Drawing primitives (ARGB32, stride in pixels).
@@ -339,8 +340,8 @@ static void draw_shimmer(u32 *buf, i32 stride_px, u64 ms)
         i32 bright = 255 - (dist_center * 255) / (SHIMMER_W / 2 + 1);
         if (bright < 0) bright = 0;
 
-        /* Color blends from COL_ACCENT to white at the peak. */
-        u32 shimmer_col = lerp_color(COL_ACCENT, 0xFF99BBFF, bright);
+        /* Color blends from COL_ACCENT to a brighter accent at the peak. */
+        u32 shimmer_col = lerp_color(COL_ACCENT, THEME_ACCENT_HI, bright);
 
         for (i32 dy = 0; dy < SHIMMER_H; dy++) {
             i32 py = sy + dy;
@@ -444,11 +445,11 @@ static void draw_frame(u32 *buf, i32 stride_px, u64 ms)
     for (i32 i = 0; i < sc_count; i++) {
         i32 row_y = sc_y + i * (FONT_H + 7);
 
-        /* Key label background pill */
+        /* Key label background pill (raised chip on the card) */
         i32 kw = font_text_width(shortcuts[i].key) + 8;
         fill_rrect(buf, stride_px,
                    col1_x + 14, row_y - 2, kw, FONT_H + 4, 3,
-                   0xFF1E2438u);
+                   THEME_BG3);
         font_draw_string(buf, stride_px, g_w, g_h,
                          col1_x + 18, row_y, shortcuts[i].key, COL_KEY);
 

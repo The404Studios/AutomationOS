@@ -38,6 +38,7 @@
 
 #include "../../lib/wl/wl_client.h"
 #include "../../lib/font/bitfont.h"
+#include "../../lib/ui/theme.h"
 
 /* -------------------------------------------------------------------------
  * Syscall numbers (from kernel/include/syscall.h)
@@ -188,22 +189,24 @@ typedef struct {
 #define REPORT_H    (WIN_H - REPORT_Y)
 
 /* -------------------------------------------------------------------------
- * Colors.
+ * Colors -- repointed to the shared "Signature Dark" theme tokens so the
+ * bench chrome reads as part of one cohesive desktop. Original values kept
+ * in comments for reference. Data/status semantics map to theme semantics.
  * ----------------------------------------------------------------------- */
-#define C_BG        0xFF1A1A2Eu  /* dark navy             */
-#define C_HDR       0xFF16213Eu  /* slightly lighter navy */
-#define C_CTRL      0xFF0F3460u  /* medium blue band      */
-#define C_PANEL     0xFF1E1E2Eu  /* report panel          */
-#define C_SEP       0xFF3A3A5Au
-#define C_TEXT      0xFFCCCCCCu
-#define C_TEXT_DIM  0xFF777799u
-#define C_PASS      0xFF00CC66u  /* green                 */
-#define C_WARN      0xFFFF6600u  /* amber                 */
-#define C_ERR       0xFFFF2244u  /* red                   */
-#define C_BTN_RUN   0xFF226644u  /* Start button          */
-#define C_BTN_STOP  0xFF662222u  /* Stop button           */
-#define C_BTN_HOVER 0xFF334455u
-#define C_ACCENT    0xFF4488FFu
+#define C_BG        THEME_BG1     /* was 0xFF1A1A2E dark navy   -> window body   */
+#define C_HDR       THEME_BG2     /* was 0xFF16213E navy        -> header chrome  */
+#define C_CTRL      THEME_BG2     /* was 0xFF0F3460 blue band   -> control toolbar*/
+#define C_PANEL     THEME_BG1     /* was 0xFF1E1E2E panel       -> report body    */
+#define C_SEP       THEME_BORDER  /* was 0xFF3A3A5A             -> dividers/borders*/
+#define C_TEXT      THEME_TEXT    /* was 0xFFCCCCCC             -> primary text    */
+#define C_TEXT_DIM  THEME_TEXT_DIM/* was 0xFF777799            -> secondary text  */
+#define C_PASS      THEME_SUCCESS /* was 0xFF00CC66 green       -> success/online  */
+#define C_WARN      THEME_WARN    /* was 0xFFFF6600 amber       -> warning         */
+#define C_ERR       THEME_DANGER  /* was 0xFFFF2244 red         -> error           */
+#define C_BTN_RUN   THEME_ACCENT  /* was 0xFF226644 Start btn   -> primary action  */
+#define C_BTN_STOP  THEME_DANGER  /* was 0xFF662222 Stop btn    -> destructive     */
+#define C_BTN_HOVER THEME_BG3     /* was 0xFF334455             -> hover surface    */
+#define C_ACCENT    THEME_ACCENT  /* was 0xFF4488FF blue        -> teal accent      */
 
 /* -------------------------------------------------------------------------
  * Drawing primitives.

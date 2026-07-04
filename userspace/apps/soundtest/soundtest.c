@@ -42,6 +42,7 @@
 #include "../../lib/wl/wl_client.h"
 #include "../../lib/font/bitfont.h"
 #include "../../lib/audio/audio.h"
+#include "../../lib/ui/theme.h"
 
 /* -----------------------------------------------------------------------
  * Syscall inline helper (3-arg form, identical to paint.c / piano.c).
@@ -137,22 +138,23 @@ static void rect_outline(u32 *buf, u32 bw, u32 bh, u32 spx,
 #define BTN_H       36
 #define BTN_RADIUS  0      /* flat style */
 
-/* Colors */
-#define C_BG        0xFF1C1C2E   /* dark navy background */
-#define C_PANEL     0xFF23233A   /* slightly lighter panel */
-#define C_BTN       0xFF2E4070   /* button face */
-#define C_BTN_HOT   0xFF3A5490   /* hover / pressed */
-#define C_BTN_OUT   0xFF4A6AAA   /* button outline */
-#define C_HEADER    0xFF14142A   /* header bar */
-#define C_SEP       0xFF333366   /* separator line */
-#define C_TEXT      0xFFDDDDFF   /* normal text */
-#define C_DIM       0xFF777799   /* dimmed text */
-#define C_AVAIL     0xFF44BB44   /* green "ON" */
-#define C_UNAVAIL   0xFF886644   /* amber "--" */
+/* Colors -- chrome mapped to shared dark theme tokens (theme.h).             */
+#define C_BG        THEME_BG1      /* window body background                  */
+#define C_PANEL     THEME_BG2      /* slightly lighter panel                  */
+#define C_BTN       THEME_BG3      /* button face (raised surface)            */
+#define C_BTN_HOT   THEME_BG4      /* hover / pressed                         */
+#define C_BTN_OUT   THEME_BORDER   /* button outline                         */
+#define C_HEADER    THEME_BG2      /* header bar (top panel)                  */
+#define C_SEP       THEME_HAIRLINE /* separator line                         */
+#define C_TEXT      THEME_TEXT     /* normal text                            */
+#define C_DIM       THEME_TEXT_DIM /* dimmed text                            */
+#define C_AVAIL     THEME_SUCCESS  /* green "ON"                             */
+#define C_UNAVAIL   THEME_WARN     /* amber "--"                            */
+/* Piano keys are the instrument (content) -- preserved, NOT themed. */
 #define C_KEY_WHITE 0xFFEEEEEE   /* piano white key */
 #define C_KEY_BLACK 0xFF222222   /* piano black key */
 #define C_KEY_LIT   0xFF5599FF   /* highlighted piano key */
-#define C_STATUS    0xFF998888   /* status line text */
+#define C_STATUS    THEME_TEXT_DIM /* status line text                       */
 
 /* -----------------------------------------------------------------------
  * Section Y positions.

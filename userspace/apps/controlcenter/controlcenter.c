@@ -37,6 +37,7 @@
  */
 
 #include "../../lib/ui/ui.h"
+#include "../../lib/ui/theme.h"   /* shared "Signature Dark" design tokens */
 
 /* ---- Syscall numbers ---- */
 #define SYS_READ         2
@@ -60,22 +61,22 @@
 #define WIN_W  420
 #define WIN_H  520
 
-/* ---- Colours (Windows 11 dark palette) ---- */
-#define COL_BG         0xFF202020u   /* window background */
-#define COL_SURFACE    0xFF2D2D2Du   /* tile bg off */
-#define COL_SURFACE2   0xFF383838u   /* section bg */
-#define COL_HEADER     0xFF1A1A1Au
-#define COL_TILE_OFF   0xFF3A3A3Cu   /* tile background (inactive) */
-#define COL_TILE_ON    0xFF0078D4u   /* Windows 11 accent blue (active) */
-#define COL_TILE_HOVER 0xFF4A4A4Eu   /* hover (off) */
-#define COL_TILE_HON   0xFF1690E8u   /* hover (on)  */
-#define COL_TEXT       0xFFFFFFFFu
-#define COL_SUBTEXT    0xFFAAAAAEu
-#define COL_SLIDER_TRK 0xFF555555u
-#define COL_SLIDER_FIL 0xFF0078D4u
-#define COL_DIVIDER    0xFF444444u
-#define COL_FOOTER     0xFF191919u
-#define COL_POWER_ICON 0xFF60C060u   /* green = powered */
+/* ---- Colours (mapped to shared theme.h "Signature Dark" tokens) ---- */
+#define COL_BG         THEME_BG1       /* window background            */
+#define COL_SURFACE    THEME_BG2       /* tile bg off                  */
+#define COL_SURFACE2   THEME_BG3       /* section bg                   */
+#define COL_HEADER     THEME_BG2       /* header/toolbar surface       */
+#define COL_TILE_OFF   THEME_BG2       /* tile background (inactive)   */
+#define COL_TILE_ON    THEME_ACCENT    /* active tile fill (teal)      */
+#define COL_TILE_HOVER THEME_BG3       /* hover (off)                  */
+#define COL_TILE_HON   THEME_ACCENT_HI /* hover (on)                   */
+#define COL_TEXT       THEME_TEXT
+#define COL_SUBTEXT    THEME_TEXT_DIM
+#define COL_SLIDER_TRK THEME_BG4       /* slider track (recessed)      */
+#define COL_SLIDER_FIL THEME_ACCENT    /* slider fill                  */
+#define COL_DIVIDER    THEME_HAIRLINE
+#define COL_FOOTER     THEME_BG2       /* footer/status surface        */
+#define COL_POWER_ICON THEME_SUCCESS   /* green = powered/online       */
 
 /* ---- Layout constants ---- */
 #define HEADER_H       44
@@ -256,14 +257,14 @@ static void cc_load_config(void)
 /* Tile colour helpers                                                 */
 /* ================================================================== */
 
-/* Windows 11 accent palette for each tile when ON */
+/* Active-tile fill: unified teal accent (theme.h) for every tile when ON */
 static unsigned int tile_accent_on[NUM_TILES] = {
-    0xFF0078D4u,   /* Wi-Fi       blue   */
-    0xFF0098FFu,   /* Bluetooth   azure  */
-    0xFFFF453Au,   /* Airplane    red    */
-    0xFFFF9F0Au,   /* Night light amber  */
-    0xFF6E3FC9u,   /* Dark mode   violet */
-    0xFF30D158u,   /* DND         green  */
+    THEME_ACCENT,   /* Wi-Fi        */
+    THEME_ACCENT,   /* Bluetooth    */
+    THEME_ACCENT,   /* Airplane     */
+    THEME_ACCENT,   /* Night light  */
+    THEME_ACCENT,   /* Dark mode    */
+    THEME_ACCENT,   /* DND / Focus  */
 };
 
 static unsigned int tile_accent_off[NUM_TILES] = {
@@ -496,16 +497,16 @@ void _start(void)
         ui_image_rect(t->bg_pnl, 10, 10, 28,
                       t->state ? 0xCCFFFFFFu : 0x99808080u,
                       t->icon[0],
-                      t->state ? 0xFF000000u : 0xFFFFFFFFu);
+                      t->state ? THEME_ON_ACCENT : THEME_TEXT);
 
         /* Tile name */
         t->lbl = ui_label(t->bg_pnl, 10, 44, t->name,
-                          t->state ? COL_TEXT : COL_SUBTEXT);
+                          t->state ? THEME_ON_ACCENT : COL_SUBTEXT);
 
         /* On/Off indicator (bottom-right) */
         t->state_lbl = ui_label(t->bg_pnl, TILE_W - 28, 44,
                                 t->state ? "On" : "Off",
-                                t->state ? COL_TEXT : COL_SUBTEXT);
+                                t->state ? THEME_ON_ACCENT : COL_SUBTEXT);
 
         /* Invisible button over the whole tile for click dispatch */
         ui_button(root, tx, ty, TILE_W, TILE_H, "",

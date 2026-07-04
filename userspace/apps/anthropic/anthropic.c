@@ -17,6 +17,7 @@
  */
 
 #include "../../lib/ui/ui.h"
+#include "../../lib/ui/theme.h"
 
 /* -- syscalls (6-arg raw ABI) ----------------------------------------------- */
 #define SYS_WRITE      3
@@ -56,10 +57,10 @@ static int broker_online(void) {
 static void refresh_status(void) {
     if (broker_online()) {
         ui_label_set_text(g_broker_lbl, "Broker: ONLINE  (10.0.2.2:8432)");
-        ui_widget_set_fg(g_broker_lbl, 0xFF7CE38B);            /* green        */
+        ui_widget_set_fg(g_broker_lbl, THEME_SUCCESS);         /* online       */
     } else {
         ui_label_set_text(g_broker_lbl, "Broker: offline -- run claude_broker.py");
-        ui_widget_set_fg(g_broker_lbl, 0xFFFF9E64);            /* amber        */
+        ui_widget_set_fg(g_broker_lbl, THEME_WARN);            /* offline      */
     }
 }
 
@@ -81,13 +82,13 @@ void _start(void) {
     ui_app_t    *app  = ui_app_create("Anthropic", 380, 320);
     ui_widget_t *root = ui_app_root(app);
 
-    ui_label(root, 16, 16, "Anthropic Control Panel", 0xFFFFFFFF);
-    ui_label(root, 16, 40, "Claude, native on AutomationOS.", 0xFFAEAEB2);
+    ui_label(root, 16, 16, "Anthropic Control Panel", THEME_TEXT);
+    ui_label(root, 16, 40, "Claude, native on AutomationOS.", THEME_TEXT_DIM);
 
     /* Broker status (probed now + via Refresh). */
-    g_broker_lbl = ui_label(root, 16, 74, "Broker: checking...", 0xFFAEAEB2);
-    ui_label(root, 16, 96, "Default model: claude-haiku-4-5", 0xFF8E8E93);
-    ui_label(root, 16, 114, "(key stays on the host broker)", 0xFF8E8E93);
+    g_broker_lbl = ui_label(root, 16, 74, "Broker: checking...", THEME_TEXT_DIM);
+    ui_label(root, 16, 96, "Default model: claude-haiku-4-5", THEME_TEXT_FAINT);
+    ui_label(root, 16, 114, "(key stays on the host broker)", THEME_TEXT_FAINT);
 
     /* Actions. */
     ui_button(root, 16, 148, 348, 34, "Open Claude Chat",  cb_spawn, (void *)"sbin/claudechat");

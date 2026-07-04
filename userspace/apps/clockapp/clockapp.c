@@ -54,6 +54,7 @@
 
 #include "../../lib/wl/wl_client.h"
 #include "../../lib/font/bitfont.h"
+#include "../../lib/ui/theme.h"
 
 /* =========================================================================
  * Syscall numbers (must match kernel/include/syscall.h).
@@ -169,33 +170,37 @@ static void ms_to_mmsscc(char *dst, i64 ms)
 #define CT_Y       28
 
 /* =========================================================================
- * Windows-11 inspired palette (light "Mica"-ish chrome, blue accent).
+ * Palette -- repointed to the shared AutomationOS "Signature Dark" tokens
+ * (userspace/lib/ui/theme.h) so Clock+ reads as part of one dark desktop.
+ * Chrome maps by ROLE: elevation-layered surfaces (window backdrop -> rail
+ * panel -> content card), three text tiers, and the teal accent.  The analog
+ * dial is a recessed dark surface with legible text/accent hands + ticks.
  * ========================================================================= */
-#define COL_WIN_BG     0xFFF3F3F3u  /* window background (light)            */
-#define COL_RAIL_BG    0xFFEAEAEAu  /* nav rail surface                     */
-#define COL_CARD       0xFFFFFFFFu  /* content card                         */
-#define COL_CARD_EDGE  0xFFE2E2E2u  /* card hairline border                 */
-#define COL_NAV_SEL    0xFFE3EEFAu  /* selected nav item fill (tint)        */
-#define COL_NAV_HOV    0xFFE9E9E9u  /* hovered nav item fill                */
-#define COL_ACCENT     0xFF0067C0u  /* Windows blue accent                  */
-#define COL_ACCENT_HI  0xFF1A7AD4u  /* accent hover                         */
-#define COL_ACCENT_BAR 0xFF005FB8u  /* selection indicator pill             */
-#define COL_TEXT       0xFF1A1A1Au  /* primary text                        */
-#define COL_TEXT_DIM   0xFF606060u  /* secondary text                      */
-#define COL_TEXT_ON_AC 0xFFFFFFFFu  /* text on accent                       */
-#define COL_BTN        0xFFFBFBFBu  /* neutral button face                  */
-#define COL_BTN_HOV    0xFFF0F0F0u  /* neutral button hover                 */
-#define COL_BTN_EDGE   0xFFD6D6D6u  /* neutral button border                */
-#define COL_FACE       0xFFFFFFFFu  /* analog clock face                    */
-#define COL_RIM        0xFFCFCFCFu  /* analog rim                           */
-#define COL_TICK_MAJ   0xFF707070u  /* hour ticks                           */
-#define COL_TICK_MIN   0xFFC2C2C2u  /* minute ticks                         */
-#define COL_HAND_HR    0xFF202020u  /* hour hand                            */
-#define COL_HAND_MIN   0xFF404040u  /* minute hand                          */
-#define COL_HAND_SEC   COL_ACCENT   /* second hand                          */
-#define COL_FLASH      0xFFD13438u  /* alert flash (Windows red)            */
-#define COL_OK         0xFF107C10u  /* "on/running" green                   */
-#define COL_LAP_ROW     0xFFF6F6F6u  /* lap row band                         */
+#define COL_WIN_BG     THEME_BG0        /* window backdrop (deepest)          */
+#define COL_RAIL_BG    THEME_BG1        /* nav rail surface (panel)           */
+#define COL_CARD       THEME_BG2        /* content card (elevated surface)    */
+#define COL_CARD_EDGE  THEME_HAIRLINE   /* card hairline / dividers           */
+#define COL_NAV_SEL    THEME_BG4        /* selected nav item fill             */
+#define COL_NAV_HOV    THEME_BG3        /* hovered nav item fill              */
+#define COL_ACCENT     THEME_ACCENT     /* teal accent                        */
+#define COL_ACCENT_HI  THEME_ACCENT_HI  /* accent hover                       */
+#define COL_ACCENT_BAR THEME_ACCENT_LO  /* selection pill / accent-btn edge   */
+#define COL_TEXT       THEME_TEXT       /* primary text                       */
+#define COL_TEXT_DIM   THEME_TEXT_DIM   /* secondary text                     */
+#define COL_TEXT_ON_AC THEME_ON_ACCENT  /* text/icon on an accent fill        */
+#define COL_BTN        THEME_BG3        /* neutral button face                */
+#define COL_BTN_HOV    THEME_BG4        /* neutral button hover               */
+#define COL_BTN_EDGE   THEME_BORDER     /* neutral button border              */
+#define COL_FACE       THEME_BG1        /* analog dial (recessed, dark)       */
+#define COL_RIM        THEME_BORDER     /* analog rim                         */
+#define COL_TICK_MAJ   THEME_TEXT_DIM   /* hour ticks                         */
+#define COL_TICK_MIN   THEME_TEXT_FAINT /* minute ticks                       */
+#define COL_HAND_HR    THEME_TEXT       /* hour hand (primary)                */
+#define COL_HAND_MIN   THEME_TEXT_DIM   /* minute hand (secondary)            */
+#define COL_HAND_SEC   COL_ACCENT       /* second hand (teal accent)          */
+#define COL_FLASH      THEME_DANGER     /* alert flash (semantic red)         */
+#define COL_OK         THEME_SUCCESS    /* "on/running" green                 */
+#define COL_LAP_ROW    THEME_BG3        /* lap / list row band                */
 
 /* =========================================================================
  * Drawing primitives (clamped to the window).

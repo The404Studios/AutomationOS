@@ -29,6 +29,7 @@
 
 #include "../../lib/wl/wl_client.h"
 #include "../../lib/font/bitfont.h"
+#include "../../lib/ui/theme.h"
 
 /* -----------------------------------------------------------------------
  * Syscall numbers and inline helper.
@@ -123,17 +124,17 @@ static const char * const palette_label[NUM_COLORS] = {
 #define CLEAR_Y      5
 #define CLEAR_X      (SWATCH_X0 + NUM_COLORS * (SWATCH_W + SWATCH_GAP) + 6)
 
-/* Toolbar background color. */
-#define TOOLBAR_BG   0xFF2D2D2Du
-/* Toolbar separator line color. */
-#define TOOLBAR_SEP  0xFF555555u
-/* Selected swatch highlight border. */
-#define SEL_BORDER   0xFFFFFFFFu
-/* Button face. */
-#define BTN_FACE     0xFF4A4A4Au
-/* Button text. */
-#define BTN_TEXT     0xFFEEEEEEu
-/* Canvas background (white). */
+/* Toolbar background color (chrome -> elevated toolbar surface). */
+#define TOOLBAR_BG   THEME_BG2
+/* Toolbar separator line color (chrome -> widget border divider). */
+#define TOOLBAR_SEP  THEME_BORDER
+/* Selected swatch highlight border (chrome -> accent selection ring). */
+#define SEL_BORDER   THEME_ACCENT
+/* Button face (chrome -> raised surface on the toolbar). */
+#define BTN_FACE     THEME_BG3
+/* Button text (chrome -> primary text). */
+#define BTN_TEXT     THEME_TEXT
+/* Canvas background (white) -- PRESERVED: this is the drawing content surface. */
 #define CANVAS_BG    0xFFFFFFFFu
 
 /* -----------------------------------------------------------------------
@@ -256,7 +257,7 @@ static void draw_toolbar(u32 *buf, u32 bw, u32 bh, u32 stride_px,
     fill_rect(buf, bw, bh, stride_px,
               CLEAR_X, CLEAR_Y, CLEAR_W, CLEAR_H, BTN_FACE);
     draw_border(buf, bw, bh, stride_px,
-                CLEAR_X, CLEAR_Y, CLEAR_W, CLEAR_H, 0xFF888888u);
+                CLEAR_X, CLEAR_Y, CLEAR_W, CLEAR_H, THEME_BORDER);
     /* Center the label "Clear" (5 chars * 8 = 40px wide, 16px tall).
      * Button center_x = CLEAR_X + CLEAR_W/2 = CLEAR_X + 28
      * Text x = center_x - 20 = CLEAR_X + 8

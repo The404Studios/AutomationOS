@@ -44,6 +44,7 @@
  */
 
 #include "../../lib/ui/ui.h"
+#include "../../lib/ui/theme.h"      /* shared "Signature Dark" design tokens   */
 #include "../../include/dockdnd.h"   /* DOCK-DND-1: Start-menu -> dock handoff */
 
 /* -------------------------------------------------------------------------
@@ -125,17 +126,17 @@ static void k_strncpy_pad(char *dst, const char *src, int dstsz)
 #define WIN_W   600
 #define WIN_H   560
 
-/* Windows-11 dark panel colours */
-#define COL_BG          0xFF202020   /* panel background (#202020)            */
-#define COL_HEADER      0xFFFFFFFF   /* section header text                   */
-#define COL_SUBTEXT     0xFFAEAEB2   /* muted labels                          */
-#define COL_TILE_BG     0xFF2C2C2E   /* unpressed tile background             */
-#define COL_TILE_HOVER  0xFF3A3A3C   /* hover/pressed tint (ui toolkit draws) */
-#define COL_ICON_BG     0xFF0078D4   /* accent blue (Win-11 default)          */
-#define COL_ICON_FG     0xFFFFFFFF
-#define COL_SEARCH_BG   0xFF3A3A3C
-#define COL_POWER_BG    0xFF3A3A3C
-#define COL_DIVIDER     0xFF3A3A3C
+/* Signature Dark panel colours -- mapped by ROLE to theme.h tokens */
+#define COL_BG          THEME_BG1    /* floating Start panel body             */
+#define COL_HEADER      THEME_TEXT   /* section header text                   */
+#define COL_SUBTEXT     THEME_TEXT_DIM /* muted labels                        */
+#define COL_TILE_BG     THEME_BG2    /* unpressed tile / card surface         */
+#define COL_TILE_HOVER  THEME_BG3    /* hover/pressed tint (ui toolkit draws) */
+#define COL_ICON_BG     THEME_ACCENT /* accent (was Win-11 blue)              */
+#define COL_ICON_FG     THEME_TEXT   /* glyph on coloured icon tile           */
+#define COL_SEARCH_BG   THEME_BG3    /* search field surface                  */
+#define COL_POWER_BG    THEME_BG3    /* power button surface                  */
+#define COL_DIVIDER     THEME_HAIRLINE /* subtle section divider              */
 
 /* Search box row */
 #define SEARCH_X    16
@@ -414,7 +415,7 @@ void _start(void)
         k_strncpy_pad(g_rec[i].path,  REC_PATHS[i],  128);
         k_strncpy_pad(g_rec[i].label, REC_LABELS[i], 32);
         g_rec[i].icon_char  = 'o';
-        g_rec[i].icon_color = 0xFF3A3A3C;
+        g_rec[i].icon_color = THEME_BG3;   /* neutral chrome icon surface */
     }
 
     /* ---- Create window ---- */
@@ -561,7 +562,7 @@ void _start(void)
 
     /* "User" account icon placeholder on the left */
     ui_image_rect(power_row, 16, (POWER_BTN_H - 32) / 2, 32,
-                  0xFF0078D4, 'U', COL_ICON_FG);
+                  THEME_ACCENT, 'U', COL_ICON_FG);
     ui_label(power_row, 56, 10, "User", COL_SUBTEXT);
 
     /* Shut Down button (right side) */

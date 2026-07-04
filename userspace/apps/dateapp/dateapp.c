@@ -54,6 +54,7 @@
  */
 
 #include "../../lib/ui/ui.h"
+#include "../../lib/ui/theme.h"
 
 /* -----------------------------------------------------------------------
  * Syscall numbers.
@@ -234,13 +235,13 @@ void _start(void)
     /*
      * Layout (360 x 160 window):
      *
-     *   y=16   "Date & Time" header label  (light grey 0xFFAEAEB2)
-     *   y=52   date card panel  (dark card 0xFF2C2C2E), 320x36 at x=20
-     *            label "Date:"  at card-relative x=12,y=10  (grey)
-     *            label value    at card-relative x=72,y=10  (white)
-     *   y=100  time card panel  (dark card 0xFF2C2C2E), 320x36 at x=20
-     *            label "Time:"  at card-relative x=12,y=10  (grey)
-     *            label value    at card-relative x=72,y=10  (white)
+     *   y=16   "Date & Time" header label  (THEME_TEXT_DIM)
+     *   y=52   date card panel  (THEME_BG2 card surface), 320x36 at x=20
+     *            label "Date:"  at card-relative x=12,y=10  (THEME_TEXT_DIM)
+     *            label value    at card-relative x=72,y=10  (THEME_TEXT)
+     *   y=100  time card panel  (THEME_BG2 card surface), 320x36 at x=20
+     *            label "Time:"  at card-relative x=12,y=10  (THEME_TEXT_DIM)
+     *            label value    at card-relative x=72,y=10  (THEME_TEXT)
      *
      * 360px window; "Date & Time" is ~12 chars * 8px = 96px -> center x=132.
      */
@@ -249,17 +250,17 @@ void _start(void)
     ui_widget_t *root = ui_app_root(app);
 
     /* Header */
-    ui_label(root, 132, 16, "Date & Time", 0xFFAEAEB2);
+    ui_label(root, 132, 16, "Date & Time", THEME_TEXT_DIM);
 
     /* Date card */
-    ui_widget_t *date_card = ui_panel(root, 20, 50, 320, 36, 0xFF2C2C2E);
-    ui_label(date_card, 12, 10, "Date:", 0xFF8E8E93);
-    g_state.date_label = ui_label(date_card, 72, 10, "----------", 0xFFFFFFFF);
+    ui_widget_t *date_card = ui_panel(root, 20, 50, 320, 36, THEME_BG2);
+    ui_label(date_card, 12, 10, "Date:", THEME_TEXT_DIM);
+    g_state.date_label = ui_label(date_card, 72, 10, "----------", THEME_TEXT);
 
     /* Time card */
-    ui_widget_t *time_card = ui_panel(root, 20, 98, 320, 36, 0xFF2C2C2E);
-    ui_label(time_card, 12, 10, "Time:", 0xFF8E8E93);
-    g_state.time_label = ui_label(time_card, 72, 10, "--:--:--", 0xFFFFFFFF);
+    ui_widget_t *time_card = ui_panel(root, 20, 98, 320, 36, THEME_BG2);
+    ui_label(time_card, 12, 10, "Time:", THEME_TEXT_DIM);
+    g_state.time_label = ui_label(time_card, 72, 10, "--:--:--", THEME_TEXT);
 
     /* Register tick for live updates. */
     ui_app_set_tick(app, tick_cb, 0);

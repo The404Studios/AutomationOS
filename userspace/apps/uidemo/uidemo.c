@@ -45,6 +45,8 @@
 
 /* Pull in only the ui.h API -- no other external headers. */
 #include "../../lib/ui/ui.h"
+/* Shared design tokens so the app's custom colors match the desktop theme. */
+#include "../../lib/ui/theme.h"
 
 /* -----------------------------------------------------------------------
  * Freestanding helpers -- no libc.
@@ -196,13 +198,13 @@ void _start(void)
      */
 
     /* Header label: large white text near the top, centred-ish at x=20. */
-    ui_label(root, 20, 20, "Welcome to AutomationOS", 0xFFFFFFFF);
+    ui_label(root, 20, 20, "Welcome to AutomationOS", THEME_TEXT);
 
     /* Sub-label: greyed secondary text. */
-    ui_label(root, 20, 48, "M4 UI toolkit demo", 0xFFAEAEB2);
+    ui_label(root, 20, 48, "M4 UI toolkit demo", THEME_TEXT_DIM);
 
     /* Counter label -- allocate BEFORE the button so we can pass it as ud. */
-    g_counter_label = ui_label(root, 20, 160, "clicks: 0", 0xFFFFFFFF);
+    g_counter_label = ui_label(root, 20, 160, "clicks: 0", THEME_TEXT);
 
     /*
      * Accent button: 160 x 40 px, accent blue fill (the toolkit renders

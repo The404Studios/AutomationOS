@@ -744,29 +744,33 @@ static void blit_surface_scaled_alpha(uint32_t *buf, uint32_t bw, uint32_t bh, u
 }
 
 /* ====================================================================== *
- *  Theme -- Aether Dark                                                    *
+ *  Theme -- Signature Dark (DESKTOP-REDESIGN-0)                            *
+ *  Chrome colors come from the shared token header so the compositor,      *
+ *  lib/ui, and every app read as one design. See lib/ui/theme.h.          *
  * ====================================================================== */
-#define COL_DESKTOP   0xFF1C1C1Eu
-#define COL_PANEL     0xFF2C2C2Eu
-#define COL_HOVER     0xFF3A3A3Cu
-#define COL_TEXT      0xFFFFFFFFu
-#define COL_TEXT_DIM  0xFFAEAEB2u
-#define COL_ACCENT    0xFF0A84FFu
-#define COL_BORDER    0xFF38383Au
+#include "../lib/ui/theme.h"
+#define COL_DESKTOP   THEME_BG0
+#define COL_PANEL     THEME_BG1
+#define COL_HOVER     THEME_BG3
+#define COL_TEXT      THEME_TEXT
+#define COL_TEXT_DIM  THEME_TEXT_DIM
+#define COL_ACCENT    THEME_ACCENT
+#define COL_BORDER    THEME_BORDER
 
-/* Wallpaper gradient endpoints (deep blue-navy). */
-#define WALL_TOP        0xFF101826u
-#define WALL_BOT        0xFF1B2A3Au
+/* Wallpaper gradient endpoints -- deep graphite with a faint cool cast
+ * (signature dark; replaces the old blue-navy). */
+#define WALL_TOP        0xFF161C24u
+#define WALL_BOT        0xFF0B0D11u
 
-#define TITLEBAR_FOCUS  0xFF3A3A3Cu   /* focused window titlebar             */
-#define TITLEBAR_UNFOC  0xFF2C2C2Eu   /* unfocused titlebar                  */
-#define BORDER_FOCUS    0xFF0A84FFu   /* focused border (accent)             */
-#define BORDER_UNFOC    0xFF38383Au   /* unfocused border                    */
-#define CURSOR_FILL     0xFFFFFFFFu
+#define TITLEBAR_FOCUS  THEME_TITLEBAR        /* focused window titlebar      */
+#define TITLEBAR_UNFOC  THEME_TITLEBAR_UNFOC  /* unfocused titlebar (dimmer)  */
+#define BORDER_FOCUS    THEME_ACCENT          /* focused border (accent teal) */
+#define BORDER_UNFOC    THEME_BORDER          /* unfocused border             */
+#define CURSOR_FILL     THEME_TEXT
 #define CURSOR_EDGE     0xFF000000u
-#define BTN_CLOSE       0xFFFF5F57u   /* close box (red)                     */
-#define BTN_MIN         0xFFFFBD47u   /* minimize box (amber)                */
-#define WIN_PLACEHOLDER 0xFF1C1C1Eu   /* shown if a client has no shm yet    */
+#define BTN_CLOSE       THEME_DANGER          /* close box                    */
+#define BTN_MIN         THEME_WARN            /* minimize box                 */
+#define WIN_PLACEHOLDER THEME_BG1             /* shown if a client has no shm */
 
 /* GUI SCALE: text-bearing chrome bars DERIVE from the runtime font cell (FONT_H,
  * defined below) so the WHOLE desktop -- not just the IDE -- grows/shrinks when the

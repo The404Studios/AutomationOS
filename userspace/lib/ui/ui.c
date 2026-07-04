@@ -220,33 +220,36 @@ static void ui_log(const char* m) {
     sc(SYS_WRITE, 1, (long)m, (long)ui_strlen(m));
 }
 
-/* ---- Aether Dark palette ---- */
-#define COL_WINDOW  0xFF1C1C1Eu   /* root window background */
-#define COL_SURFACE 0xFF2C2C2Eu   /* default button face    */
-#define COL_HOVER   0xFF3A3A3Cu   /* hover tint             */
-#define COL_TEXT    0xFFFFFFFFu   /* default text           */
-#define COL_ACCENT  0xFF0A84FFu   /* pressed accent         */
-#define COL_BORDER  0xFF38383Au   /* widget border          */
+/* ---- Signature Dark palette (DESKTOP-REDESIGN-0) ----
+ * COL_* names kept so widget code is untouched; values now come from the shared
+ * token header so lib/ui matches the compositor and every app. */
+#include "theme.h"
+#define COL_WINDOW  THEME_BG1        /* root window background  */
+#define COL_SURFACE THEME_BG2        /* default button face     */
+#define COL_HOVER   THEME_BG3        /* hover tint              */
+#define COL_TEXT    THEME_TEXT       /* default text            */
+#define COL_ACCENT  THEME_ACCENT     /* accent                  */
+#define COL_BORDER  THEME_BORDER     /* widget border           */
 
-/* New palette entries for additional widgets */
-#define COL_CHECK_BG    0xFF1C1C1Eu   /* checkbox unchecked bg  */
-#define COL_CHECK_FILL  0xFF0A84FFu   /* checkbox checked fill  */
-#define COL_SLIDER_TRK  0xFF38383Au   /* slider track           */
-#define COL_SLIDER_KNOB 0xFF8E8E93u   /* slider knob            */
-#define COL_TXTBOX_BG   0xFF1C1C1Eu   /* textbox background     */
-#define COL_TXTBOX_FCS  0xFF0A84FFu   /* textbox focus ring     */
-#define COL_PROG_BG     0xFF38383Au   /* progress track         */
-#define COL_PROG_FILL   0xFF30D158u   /* progress fill (green)  */
-#define COL_SCROLL_BAR  0xFF48484Au   /* scrollbar thumb        */
+/* additional widgets */
+#define COL_CHECK_BG    THEME_BG0        /* checkbox unchecked bg  */
+#define COL_CHECK_FILL  THEME_ACCENT     /* checkbox checked fill  */
+#define COL_SLIDER_TRK  THEME_BG3        /* slider track           */
+#define COL_SLIDER_KNOB THEME_TEXT_DIM   /* slider knob            */
+#define COL_TXTBOX_BG   THEME_BG0        /* textbox background     */
+#define COL_TXTBOX_FCS  THEME_ACCENT     /* textbox focus ring     */
+#define COL_PROG_BG     THEME_BG3        /* progress track         */
+#define COL_PROG_FILL   THEME_ACCENT     /* progress fill          */
+#define COL_SCROLL_BAR  THEME_BORDER     /* scrollbar thumb        */
 
-/* v3 animated-widget palette */
-#define COL_TOGGLE_OFF  0xFF3A3A3Cu   /* toggle track when off  */
-#define COL_TOGGLE_ON   0xFF30D158u   /* toggle track when on   */
-#define COL_TOGGLE_KNOB 0xFFFFFFFFu   /* toggle knob            */
-#define COL_SPINNER     0xFF0A84FFu   /* spinner arc accent     */
-#define COL_BARS_ON     0xFF0A84FFu   /* active signal bar      */
-#define COL_BARS_OFF    0xFF38383Au   /* inactive signal bar    */
-#define COL_ROW_SEL     0xFF0A84FFu   /* list-row selected accent */
+/* animated-widget palette */
+#define COL_TOGGLE_OFF  THEME_BG3        /* toggle track when off  */
+#define COL_TOGGLE_ON   THEME_ACCENT     /* toggle track when on   */
+#define COL_TOGGLE_KNOB THEME_TEXT       /* toggle knob            */
+#define COL_SPINNER     THEME_ACCENT     /* spinner arc accent     */
+#define COL_BARS_ON     THEME_ACCENT     /* active signal bar      */
+#define COL_BARS_OFF    THEME_BG3        /* inactive signal bar    */
+#define COL_ROW_SEL     THEME_ACCENT     /* list-row selected accent */
 
 /* ---- widget model ---- */
 

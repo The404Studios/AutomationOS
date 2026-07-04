@@ -498,6 +498,20 @@ static char entry_glyph(const entry_t *e)
 }
 
 /* ----------------------------------------------------------------------- */
+/* Transient status message (surfaces failed mutations in the status bar). */
+/* Set from a non-zero/negative syscall return; auto-expires after a few    */
+/* seconds and is cleared by the next successful directory scan.            */
+/* ----------------------------------------------------------------------- */
+static char g_status[96];            /* current transient message ("" = none) */
+static long g_status_until;          /* tick (ms) after which it expires       */
+
+static void set_status(const char *msg)
+{
+    s_cpy(g_status, msg, sizeof(g_status));
+    g_status_until = sc(SYS_GET_TICKS_MS, 0, 0, 0) + 4000;   /* show ~4s */
+}
+
+/* ----------------------------------------------------------------------- */
 /* Directory scan -> g_ent (dirs first, then files; alphabetical)         */
 /* ----------------------------------------------------------------------- */
 NO_SSP static void do_scan(const char *path)
@@ -510,8 +524,10 @@ NO_SSP static void do_scan(const char *path)
     long fd = sc(SYS_OPENDIR, (long)g_pathbuf, 0, 0);
     if (fd < 0) {
         serial("[FILES] opendir failed: "); serial(g_pathbuf); serial("\n");
+        set_status("Cannot open folder");
         return;
     }
+    g_status[0] = '\0';   /* a successful scan clears any stale error */
 
     /* Collect all entries; sort step below will order them. */
     struct dirent ent;
@@ -668,7 +684,7 @@ NO_SSP static void new_folder(void)
     s_zero(g_pathbuf, PATHLEN);
     path_join(g_pathbuf, PATHLEN, g_cwd, nm);
     long r = sc(SYS_MKDIR, (long)g_pathbuf, 0755, 0);
-    if (r != 0) { serial("[FILES] mkdir failed\n"); return; }
+    if (r != 0) { serial("[FILES] mkdir failed\n"); set_status("Cannot create folder here (read-only)"); g_dirty = 1; return; }
 
     /* CRITICAL FIX: re-scan so the new folder shows immediately. */
     do_scan(g_cwd);
@@ -707,6 +723,8 @@ NO_SSP static void commit_rename(void)
         do_scan(g_cwd);
         g_sel = -1;
         for (int i = 0; i < g_nent; i++) if (s_eq(g_ent[i].name, savedname)) { g_sel = i; break; }
+    } else {
+        set_status("Rename failed");
     }
     g_renaming = 0;
     g_dirty = 1;
@@ -1073,6 +1091,15 @@ NO_SSP static void draw_status(void)
         else { char szb[24]; fmt_size(szb, e->size); s_cat(st, "  ", sizeof(st)); s_cat(st, szb, sizeof(st)); }
     }
     text(12, y + 6, st, COL_TEXTDIM);
+
+    /* Transient status/error surfaced from a failed mutation (right-aligned;
+     * uses the shared THEME_DANGER token -- no new styling introduced). */
+    if (g_status[0]) {
+        int tw = (int)s_len(g_status) * FONT_W;
+        int sx = FBW - tw - 12;
+        if (sx < 12) sx = 12;
+        text(sx, y + 6, g_status, THEME_DANGER);
+    }
 }
 
 NO_SSP static void render(void)
@@ -1241,9 +1268,13 @@ NO_SSP static void on_key(int kc, int pressed, int *shift)
             if (g_sel >= 0 && g_ent[g_sel].type != DT_DIR) {
                 s_zero(g_pathbuf, PATHLEN);
                 path_join(g_pathbuf, PATHLEN, g_cwd, g_ent[g_sel].name);
-                sc(SYS_UNLINK, (long)g_pathbuf, 0, 0);
-                g_sel = -1;
-                do_scan(g_cwd);
+                long r = sc(SYS_UNLINK, (long)g_pathbuf, 0, 0);
+                if (r != 0) {
+                    set_status("Delete failed");
+                } else {
+                    g_sel = -1;
+                    do_scan(g_cwd);
+                }
                 g_dirty = 1;
             }
             break;
@@ -1310,6 +1341,12 @@ NO_SSP int main(int argc, char **argv)
             } else if (kind == WL_EVENT_KEY) {
                 on_key(a, b, &shift);
             }
+        }
+
+        /* expire the transient status message after its window elapses */
+        if (g_status[0] && sc(SYS_GET_TICKS_MS, 0, 0, 0) >= g_status_until) {
+            g_status[0] = '\0';
+            g_dirty = 1;
         }
 
         if (g_dirty) { g_dirty = 0; render(); }

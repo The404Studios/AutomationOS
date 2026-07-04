@@ -132,6 +132,7 @@ typedef long                int64_t;    /* match <stdint.h> __INT64_TYPE__  (LP6
 #define SYS_SYSINFO       62     /* procapi: system memory/uptime     */
 #define SYS_BATTERY       93     /* EC battery: {present,state,%,ac}  */
 #define SYS_NET_INFO      59     /* query IP/MAC/link state           */
+#define SYS_NOTIFY_POLL   66     /* dequeue ONE pending notification into user_buf as "title\0body\0" */
 
 /* net_info_t -- mirrors kernel uapi_net_info_t (kernel/include/uapi/net.h).
  * Used by the panel network indicator (queried once per second). */
@@ -6363,6 +6364,28 @@ void _start(void) {
         /* d3) periodically rescan /Desktop so newly compiled/created items
          * (e.g. IDE output, New Folder) appear without a restart. */
         if ((frame % DESK_RESCAN_FRAMES) == 0) desk_scan();
+
+        /* d3b) NOTIFICATION DRAIN: dequeue any pending kernel notifications via
+         * SYS_NOTIFY_POLL and surface them as toasts. Throttled to ~every 6
+         * frames (~100ms at the 16ms cadence) and capped at 4 per tick so a
+         * burst can never stall the frame loop. Each poll dequeues ONE packed
+         * "title\0body\0" record; toast_show() copies the text out immediately,
+         * so the small stack buffer is safe to reuse across iterations. */
+        if ((frame % 6) == 0) {
+            for (int nd = 0; nd < 4; nd++) {
+                char nbuf[128];
+                long nn = syscall(SYS_NOTIFY_POLL, (long)nbuf, (long)sizeof(nbuf), 0);
+                if (nn <= 0) break;                         /* none pending / error */
+                if (nn > (long)sizeof(nbuf)) nn = (long)sizeof(nbuf);
+                nbuf[nn - 1] = '\0';                        /* keep the string in-bounds */
+                /* packed "title\0body\0": find the title's NUL, then join the
+                 * body onto it with a space so the single-line toast shows both. */
+                int ti = 0;
+                while (ti < (int)nn && nbuf[ti]) ti++;      /* index of title terminator */
+                if (ti < (int)nn - 1) nbuf[ti] = ' ';       /* "title body" if a body follows */
+                toast_show(nbuf, 3500);
+            }
+        }
 
         /* d4) PERF: the panel clock shows HH:MM:SS, so it must repaint once per
          * second even on an otherwise-idle desktop. Pulse dirty when the second

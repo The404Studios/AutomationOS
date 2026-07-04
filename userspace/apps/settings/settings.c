@@ -11,7 +11,7 @@
  *   Sound      : master-volume slider, sound on/off checkbox, test-beep button
  *   About      : OS name, build, arch, credits
  *
- * Config persistence (/tmp/settings.conf):
+ * Config persistence (diskfs via SYS_PERSIST_*, name "settings", survives reboot):
  *   byte 0  : theme  (0=dark, 1=light)
  *   byte 1  : show_clock (0/1)
  *   byte 2  : animations (0/1)
@@ -52,6 +52,11 @@
 #define SYS_GETTIME       42
 #define SYS_BEEP          45
 #define SYS_SYSINFO       62
+#define SYS_PERSIST_READ  94   /* (name_ptr, ubuf, max) -> bytes read (<0 if absent) */
+#define SYS_PERSIST_WRITE 95   /* (name_ptr, ubuf, len) -> bytes written (diskfs, survives reboot) */
+#define SYS_AUDIO_VOLUME  118  /* (vol0to100) -> hda_set_volume */
+#define SYS_AUDIO_MUTE    119  /* (0|1)       -> hda_set_mute   */
+#define SYS_AUDIO_STATUS  123  /* (audio_status_t*) -> fills device state */
 
 /* ---- open flags ---- */
 #define O_RDONLY   0
@@ -112,6 +117,15 @@ typedef struct {
     unsigned int       proc_count;
     unsigned int       _pad;        /* reserved, always 0 */
 } sysinfo_t;
+
+/* ---- audio status struct (must match kernel: 8 bytes) ---- */
+typedef struct {
+    unsigned char present;      /* 1 if an audio codec is present */
+    unsigned char volume;       /* 0..100 */
+    unsigned char muted;        /* 0|1 */
+    unsigned char _pad;         /* reserved */
+    unsigned int  codec_vendor; /* codec vendor id */
+} audio_status_t;
 
 /* ---- gettime struct (must match kernel rtc_time_t: 7 bytes packed) ---- */
 typedef struct {
@@ -261,44 +275,40 @@ static void conf_save(void) {
     conf_buf[4] = (char)(g_state.sound_on    ? 1 : 0);
     conf_buf[5] = (char)(g_state.volume & 0xFF);
 
-    /* Zeroed static path buffer -- no stack VLA. */
-    static char path_buf[32];
-    s_memset(path_buf, 0, sizeof(path_buf));
-    /* "/tmp/settings.conf" */
-    const char *p = "/tmp/settings.conf";
-    for (int i = 0; p[i] && i < 31; i++) path_buf[i] = p[i];
+    /* Persist to diskfs (survives reboot) under the short name "settings".
+     * Same 6-byte on-disk layout as before -- only the storage backend
+     * changed from ramfs (/tmp) to the persistence store. */
+    static char name_buf[16];
+    s_memset(name_buf, 0, sizeof(name_buf));
+    const char *nm = "settings";
+    for (int i = 0; nm[i] && i < 15; i++) name_buf[i] = nm[i];
 
-    iptr_t fd = sc4(SYS_OPEN, (iptr_t)path_buf,
-                    (iptr_t)(O_WRONLY | O_CREAT | O_TRUNC), 0600);
-    if (fd >= 0) {
-        sc4(SYS_WRITE, fd, (iptr_t)conf_buf, CONF_BYTES);
-        sc3(SYS_CLOSE, fd, 0);
+    iptr_t w = sc4(SYS_PERSIST_WRITE, (iptr_t)name_buf,
+                   (iptr_t)conf_buf, CONF_BYTES);
+    if (w >= 0)
         serial("[SETTINGS] saved\n");
-    }
 }
 
 static void conf_load(void) {
     static char buf[CONF_BYTES];
     s_memset(buf, 0xFF, CONF_BYTES);
 
-    static char path_buf[32];
-    s_memset(path_buf, 0, sizeof(path_buf));
-    const char *p = "/tmp/settings.conf";
-    for (int i = 0; p[i] && i < 31; i++) path_buf[i] = p[i];
+    /* Read persisted config from diskfs under the short name "settings".
+     * Same 6-byte on-disk layout -- decode logic below is unchanged. */
+    static char name_buf[16];
+    s_memset(name_buf, 0, sizeof(name_buf));
+    const char *nm = "settings";
+    for (int i = 0; nm[i] && i < 15; i++) name_buf[i] = nm[i];
 
-    iptr_t fd = sc4(SYS_OPEN, (iptr_t)path_buf, O_RDONLY, 0);
-    if (fd >= 0) {
-        iptr_t n = sc4(SYS_READ, fd, (iptr_t)buf, CONF_BYTES);
-        sc3(SYS_CLOSE, fd, 0);
-        if (n == CONF_BYTES) {
-            g_state.theme_dark   = (buf[0] == 0) ? 1 : 0;
-            g_state.show_clock   = (buf[1] == 1) ? 1 : 0;
-            g_state.animations   = (buf[2] == 1) ? 1 : 0;
-            g_state.accent_index = (buf[3] < ACCENT_COUNT) ? (int)(unsigned char)buf[3] : 0;
-            g_state.sound_on     = (buf[4] == 1) ? 1 : 0;
-            g_state.volume       = ((unsigned char)buf[5] <= 100)
-                                   ? (int)(unsigned char)buf[5] : 75;
-        }
+    iptr_t n = sc4(SYS_PERSIST_READ, (iptr_t)name_buf, (iptr_t)buf, CONF_BYTES);
+    if (n == CONF_BYTES) {
+        g_state.theme_dark   = (buf[0] == 0) ? 1 : 0;
+        g_state.show_clock   = (buf[1] == 1) ? 1 : 0;
+        g_state.animations   = (buf[2] == 1) ? 1 : 0;
+        g_state.accent_index = (buf[3] < ACCENT_COUNT) ? (int)(unsigned char)buf[3] : 0;
+        g_state.sound_on     = (buf[4] == 1) ? 1 : 0;
+        g_state.volume       = ((unsigned char)buf[5] <= 100)
+                               ? (int)(unsigned char)buf[5] : 75;
     }
 }
 
@@ -602,6 +612,8 @@ static void build_appearance(ui_widget_t *panel) {
 static void cb_volume_change(int value, void *ud) {
     (void)ud;
     g_state.volume = value;
+    /* Drive the audio hardware (hda_set_volume, 0..100). */
+    sc4(SYS_AUDIO_VOLUME, (iptr_t)value, 0, 0);
     /* Update label */
     if (g_state.vol_label) {
         static char vol_str[8];
@@ -618,6 +630,8 @@ static void cb_volume_change(int value, void *ud) {
 static void cb_toggle_sound(void *ud) {
     (void)ud;
     g_state.sound_on ^= 1;
+    /* Drive the audio hardware mute (hda_set_mute): muted = !sound_on. */
+    sc4(SYS_AUDIO_MUTE, (iptr_t)(g_state.sound_on ? 0 : 1), 0, 0);
     if (g_state.sound_val)
         ui_label_set_text(g_state.sound_val,
                           g_state.sound_on ? "On" : "Off");
@@ -628,6 +642,8 @@ static void cb_toggle_sound(void *ud) {
 static void cb_toggle_sound_chk(int state, void *ud) {
     (void)ud;
     g_state.sound_on = state;
+    /* Drive the audio hardware mute (hda_set_mute): muted = !sound_on. */
+    sc4(SYS_AUDIO_MUTE, (iptr_t)(g_state.sound_on ? 0 : 1), 0, 0);
     if (g_state.sound_val)
         ui_label_set_text(g_state.sound_val,
                           g_state.sound_on ? "On" : "Off");
@@ -797,6 +813,20 @@ void _start(void) {
 
     /* Load persisted config (overrides defaults). */
     conf_load();
+
+    /* Reflect the real audio device: query SYS_AUDIO_STATUS and, if a codec
+     * is present, initialize the volume slider + sound (mute) toggle from the
+     * hardware so the UI matches the actual device state. */
+    {
+        static audio_status_t as;
+        s_memset(&as, 0, sizeof(as));
+        iptr_t ar = sc4(SYS_AUDIO_STATUS, (iptr_t)&as, 0, 0);
+        if (ar >= 0 && as.present) {
+            if (as.volume <= 100)
+                g_state.volume = (int)as.volume;
+            g_state.sound_on = as.muted ? 0 : 1;
+        }
+    }
 
     /* ---- Create window ---- */
     ui_app_t *app = ui_app_create("Control Center", WIN_W, WIN_H);

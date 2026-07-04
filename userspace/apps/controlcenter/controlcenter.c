@@ -50,6 +50,8 @@
 #define SYS_POWEROFF     46
 #define SYS_SYSINFO      62
 #define SYS_NOTIFY       65
+#define SYS_AUDIO_VOLUME 118
+#define SYS_AUDIO_MUTE   119
 
 /* ---- open flags ---- */
 #define O_RDONLY  0
@@ -311,7 +313,12 @@ static void on_toggle_tile(void *ud)
         const char *msg = t->state
             ? "Do Not Disturb\0Notifications muted\0"
             : "Do Not Disturb\0Notifications resumed\0";
-        cc_sc(SYS_NOTIFY, (long)msg, 0, 0);
+        /* Packed "title\0body\0": len MUST be the real total byte count
+           (len=0 is rejected EINVAL at the syscall boundary). */
+        unsigned long tlen  = cc_strlen(msg);            /* title chars   */
+        unsigned long blen  = cc_strlen(msg + tlen + 1); /* body  chars   */
+        unsigned long total = tlen + 1 + blen + 1;       /* + both NULs   */
+        cc_sc(SYS_NOTIFY, (long)msg, (long)total, 0);
     }
 }
 
@@ -322,7 +329,8 @@ static void on_volume_change(int value, void *ud)
 {
     (void)ud;
     g_state.volume = value;
-    /* STUB: would call SYS_VOLUME (not defined) here */
+    /* Drive the real HDA mixer: SYS_AUDIO_VOLUME takes a 0..100 level */
+    cc_sc(SYS_AUDIO_VOLUME, (long)value, 0, 0);
     /* Update label */
     char buf[8];
     cc_utoa((unsigned long)value, buf, 0, ' ');

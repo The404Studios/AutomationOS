@@ -38,8 +38,8 @@
 #define THEME_ON_ACCENT  0xFF06201Du   /* text/icon ON an accent fill          */
 
 /* ---- Lines + semantics ---------------------------------------------------- */
-#define THEME_HAIRLINE   0xFF2A2F38u   /* subtle divider / panel underline     */
-#define THEME_BORDER     0xFF3A414Du   /* stronger widget border               */
+#define THEME_HAIRLINE   0xFF2A2F38u   /* subtle divider / panel underline (decorative) */
+#define THEME_BORDER     0xFF5E6979u   /* functional widget border -- >=3:1 on BG1 (WCAG 1.4.11) */
 #define THEME_SUCCESS    0xFF4ADE80u   /* success / progress / online          */
 #define THEME_WARN       0xFFFBBF24u   /* warning                              */
 #define THEME_DANGER     0xFFF87171u   /* error / destructive / close-hover    */

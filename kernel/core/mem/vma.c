@@ -110,11 +110,17 @@ void* vmm_mmap_anon(uint64_t cr3, uint64_t len, uint32_t prot) {
         return NULL;
     }
 
-    // Page flags (uint64_t to accommodate PAGE_NX in bit 63 for future NX enforcement).
-    // EXEC has no separate hardware bit today; NX is not set here.
+    // Page flags. W^X: anonymous data/heap pages (clib malloc is mmap-backed) are
+    // never executable unless EXEC was explicitly requested. PAGE_NX (bit 63) is
+    // honored now that EFER.NXE is armed on every CPU, so a write primitive into
+    // the heap cannot pivot to code execution. ELF code segments are mapped
+    // executable by the loader, not through here.
     uint64_t flags = PAGE_PRESENT | PAGE_USER;
     if (prot & VMM_PROT_WRITE) {
         flags |= PAGE_WRITE;
+    }
+    if (!(prot & VMM_PROT_EXEC)) {
+        flags |= PAGE_NX;
     }
 
     // Eagerly allocate and map each page. We reuse vmm_map_phys_into for the

@@ -62,6 +62,16 @@ int64_t sys_sendfile(uint64_t out_fd, uint64_t in_fd, uint64_t offset_ptr,
         return EBADF;
     }
 
+    /* out_fd is a socket writer: enforce the SAME cross-process ownership gate
+     * every sys_sock_* handler applies, so a process cannot push file bytes into
+     * a socket owned by another process (sendfile was the lone unguarded writer).
+     * sock_fd_owned() returns 1 for a non-socket fd, so a bad out_fd still falls
+     * through to the normal EBADF from the send path below. */
+    extern int sock_fd_owned(int fd);
+    if (!sock_fd_owned((int)out_fd)) {
+        return EBADF;
+    }
+
     if (count == 0) {
         return 0;
     }

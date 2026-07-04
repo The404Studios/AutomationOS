@@ -1044,7 +1044,9 @@ int64_t sys_sock_socket(uint64_t type, uint64_t a2, uint64_t a3,
  * sock_* users -- DHCP/ARP helpers, the net rig, sock_poll) never come through
  * these sys_ wrappers, so they are unaffected. A bad/free fd returns 1 here so
  * the underlying op still yields its normal SOCK_EBADF. */
-static int sock_fd_owned(int fd) {
+/* Non-static so sys_sendfile (the one socket writer outside this file) can
+ * enforce the same cross-process ownership gate as every sys_sock_* handler. */
+int sock_fd_owned(int fd) {
     sock_t* so = sock_from_fd(fd);
     if (!so) return 1;
     process_t* cur = process_get_current();

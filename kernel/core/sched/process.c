@@ -779,6 +779,13 @@ void process_unref(process_t* proc) {
 
     spin_unlock_irqrestore(&process_table_lock, ptl_flags);
 
+    // Sever any g_sleep_list link BEFORE freeing the PCB. A process killed while
+    // in a timed wait (sleep/futex-timeout) may still be linked on the ref-less
+    // sleep list; without this, the next timer tick walks a freed PCB -> ring-0
+    // use-after-free. sleep_list_remove is idempotent (no-op if not linked) and
+    // IRQ-safe (cli-bracketed), so it is safe on every teardown path.
+    sleep_list_remove(proc);
+
     {
         // Only the CPU that decremented from 1 to 0 reaches here.
         // This prevents double-free race condition.

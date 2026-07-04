@@ -252,6 +252,15 @@ static int cache_evict_lru(void) {
         *slot = victim->hash_next;
     }
 
+    /* Move the CLOCK hand off the victim FIRST. The fast read-ahead pass and the
+     * lru_tail fallback above pick a victim WITHOUT advancing the hand, so the
+     * hand can still point at this entry; freeing it below would leave clock_hand
+     * dangling and the next eviction (a timer/IRQ-reachable path) would deref a
+     * freed entry (ring-0 UAF). Mirrors page_cache_evict_inode(). */
+    if (cache_state.clock_hand == victim) {
+        cache_state.clock_hand = victim->lru_prev ? victim->lru_prev : victim->lru_next;
+    }
+
     /* Remove from LRU */
     lru_remove(victim);
 

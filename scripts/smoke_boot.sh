@@ -555,6 +555,27 @@ check_neguptr() {
     fi
 }
 
+check_negshmdt() {
+    # KERNEL-SYSCALL-ROBUST-0 (HIGH) gate: init spawns sbin/negshmdt, which
+    # SYS_SHMGETs a segment WITHOUT attaching it, then SYS_SHMDTs its canonical
+    # VA. sys_shmdt resolves the segment purely by VA math, so pre-fix it
+    # decremented the shared attach_count / ran the deferred-destroy free without
+    # checking the caller ever attached (cross-process use-after-free) and
+    # returned IPC_SUCCESS. Fixed: it gates on shm_attach_remove() and returns
+    # IPC_EINVAL for a non-attacher. A positive control (attach+detach) proves a
+    # legitimate detach still succeeds.
+    if grep -qF 'NEGSHMDT: PASS' "$LOG"; then
+        pass "shmdt of a never-attached segment denied (cross-process UAF gate)"
+        return 0
+    elif grep -qF 'NEGSHMDT: FAIL' "$LOG"; then
+        fail "negshmdt: $(grep -F 'NEGSHMDT:' "$LOG" | grep -F FAIL | head -1)"
+        return 1
+    else
+        fail "negshmdt did not report PASS (shmdt ownership gate missing or it crashed)"
+        return 1
+    fi
+}
+
 check_negcachain() {
     # NEGCACHAIN-0 regression gate: init spawns sbin/negcachain, which calls
     # x509_test_cert_is_ca() -- the public wrapper the fix added around the
@@ -1068,6 +1089,7 @@ run_checks() {
         check_negrsp
         check_negsock
         check_negdir
+        check_negshmdt
         check_webstack
         check_crypto
         check_libs

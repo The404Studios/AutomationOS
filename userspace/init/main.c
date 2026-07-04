@@ -368,6 +368,13 @@ void _start(void) {
     print("[INIT] Spawning negdir...\n");
     spawn("sbin/negdir");
 
+    // NEGSHMDT (KERNEL-SYSCALL-ROBUST-0 HIGH): shmget-without-attach then shmdt
+    // the segment's canonical VA must be DENIED (IPC_EINVAL); a fixed kernel
+    // prints "NEGSHMDT: PASS", a regressed one accepts the detach -> would drop
+    // another owner's frames (cross-process UAF). smoke_boot.sh gates the marker.
+    print("[INIT] Spawning negshmdt...\n");
+    spawn("sbin/negshmdt");
+
     // POLL-SELECT-0 (B10) probe: poll()/select() over real fd readiness (a
     // ready file vs an idle socket, a timeout, a mixed set) + epoll level/edge.
     // Prints POLLSELFTEST RESULT to serial, exits.

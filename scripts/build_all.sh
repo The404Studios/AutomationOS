@@ -253,6 +253,12 @@ $LD /tmp/sigtest.o -o /tmp/sigtest.elf
 # SYS_UNLINK come back as a negative error instead of panicking the kernel.
 cc userspace/apps/neguptr/neguptr.c /tmp/neguptr.o
 $LD /tmp/neguptr.o -o /tmp/neguptr.elf
+# negshmdt: KERNEL-SYSCALL-ROBUST-0 regression proof for the sys_shmdt cross-
+# process UAF HIGH (bare _start, no crt0, spawned by init). SYS_SHMGET without
+# attach, then SYS_SHMDT the canonical VA -> must be DENIED (IPC_EINVAL) on the
+# fixed kernel (pre-fix returned IPC_SUCCESS). Prints NEGSHMDT: PASS.
+cc userspace/apps/negshmdt/negshmdt.c /tmp/negshmdt.o
+$LD /tmp/negshmdt.o -o /tmp/negshmdt.elf
 # negrsp/negsock/negdir: KERNEL-ROBUST-0 negative regression probes (bare
 # _start, no crt0, spawned by init). negrsp forks a child that wrecks its own
 # user_rsp before signal delivery (user_rsp-wrap HIGH -> must default-terminate,
@@ -871,7 +877,7 @@ $LD /tmp/crt0.o /tmp/cc.o \
     -o /tmp/cc.elf
 
 echo "[all] canary check (all must be 0):"
-for e in comp init filemanager calculator clock sysinfo settings sysmon uidemo dateapp applauncher taskman terminal editor snake paint synth tetris game2048 sheet notes calendar stopwatch mines piano dashboard welcome bench breakout pong invaders procmon soundtest solitaire aiconsole screenshot stress musicplayer ide bubbletd zombietd pacman clockapp forktest sigtest neguptr negrsp negsock negdir negcachain pollselftest threadtest reaploop forkfdtest forkregtest matmuljobs aibroker sed awk tar pkg make meminfo argvtest msgtest rpctest toolrun echoproof echoargs agenthost tool_read tool_ls tool_stat codeagent toolset_host chainhost modelbridge agentd tool_write tool_cc tool_exec tool_mkdir tool_mv tool_rm tool_spawn tool_kill tool_ps tool_shell tool_mouse tool_key tool_rollback ledgerver cockpit claudehost initrdp initrdalias floattest sleeptest prioritytest matbench tensortest cpuburn blk ps kill free uptime find diff cmp tee wcx xargs gzip cc nettest sockettest cpu1offload smpstress wget netman soundman cryptotest wlanctl wpasupp libtest ping nc netinfo netscan tcping dig httpget pktmon httpd traceroute arp grep head tail sort uniq cut tr nl du touch basename dirname uname hostname whoami date less hexdump lspci tlsprobe certtool dhcpc autodhcp apidemo gsignin js futextest epolltest sendfiletest perftest batchtest domtest htmltest csstest layouttest webtest browser2 webapitest cube3d ray derby deadzone deadzoned dzproto_test dzclient streamtest chess asteroids sudoku photos startmenu controlcenter claudechat anthropic gametest exectest execchild; do
+for e in comp init filemanager calculator clock sysinfo settings sysmon uidemo dateapp applauncher taskman terminal editor snake paint synth tetris game2048 sheet notes calendar stopwatch mines piano dashboard welcome bench breakout pong invaders procmon soundtest solitaire aiconsole screenshot stress musicplayer ide bubbletd zombietd pacman clockapp forktest sigtest neguptr negrsp negsock negdir negcachain negshmdt pollselftest threadtest reaploop forkfdtest forkregtest matmuljobs aibroker sed awk tar pkg make meminfo argvtest msgtest rpctest toolrun echoproof echoargs agenthost tool_read tool_ls tool_stat codeagent toolset_host chainhost modelbridge agentd tool_write tool_cc tool_exec tool_mkdir tool_mv tool_rm tool_spawn tool_kill tool_ps tool_shell tool_mouse tool_key tool_rollback ledgerver cockpit claudehost initrdp initrdalias floattest sleeptest prioritytest matbench tensortest cpuburn blk ps kill free uptime find diff cmp tee wcx xargs gzip cc nettest sockettest cpu1offload smpstress wget netman soundman cryptotest wlanctl wpasupp libtest ping nc netinfo netscan tcping dig httpget pktmon httpd traceroute arp grep head tail sort uniq cut tr nl du touch basename dirname uname hostname whoami date less hexdump lspci tlsprobe certtool dhcpc autodhcp apidemo gsignin js futextest epolltest sendfiletest perftest batchtest domtest htmltest csstest layouttest webtest browser2 webapitest cube3d ray derby deadzone deadzoned dzproto_test dzclient streamtest chess asteroids sudoku photos startmenu controlcenter claudechat anthropic gametest exectest execchild; do
     n=$(objdump -d /tmp/$e.elf 2>/dev/null | grep -c "fs:0x28" || true)
     echo "  $e=$n"
 done
@@ -893,7 +899,7 @@ if [ "${SELFHEAL:-0}" != "1" ]; then rm -f /tmp/ird/sbin/cwatchdog; fi
 rm -f /tmp/ird/sbin/browser /tmp/ird/bin/browser
 cp /tmp/comp.elf /tmp/ird/sbin/compositor
 cp /tmp/init.elf /tmp/ird/sbin/init
-for e in filemanager calculator clock sysinfo settings sysmon uidemo dateapp applauncher taskman terminal editor snake paint synth tetris game2048 sheet notes calendar stopwatch mines piano dashboard welcome bench breakout pong invaders procmon soundtest solitaire aiconsole screenshot stress musicplayer ide bubbletd startmenu controlcenter claudechat anthropic chess asteroids sudoku photos pacman clockapp zombietd forktest sigtest neguptr negrsp negsock negdir negcachain pollselftest threadtest reaploop forkfdtest forkregtest matmuljobs cube3d ray derby deadzone deadzoned dzproto_test dzclient streamtest exectest; do
+for e in filemanager calculator clock sysinfo settings sysmon uidemo dateapp applauncher taskman terminal editor snake paint synth tetris game2048 sheet notes calendar stopwatch mines piano dashboard welcome bench breakout pong invaders procmon soundtest solitaire aiconsole screenshot stress musicplayer ide bubbletd startmenu controlcenter claudechat anthropic chess asteroids sudoku photos pacman clockapp zombietd forktest sigtest neguptr negrsp negsock negdir negcachain negshmdt pollselftest threadtest reaploop forkfdtest forkregtest matmuljobs cube3d ray derby deadzone deadzoned dzproto_test dzclient streamtest exectest; do
     cp /tmp/$e.elf /tmp/ird/sbin/$e
 done
 [ "$IV_OK" = "1" ] && cp /tmp/imageviewer.elf /tmp/ird/sbin/imageviewer

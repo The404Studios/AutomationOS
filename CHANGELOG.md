@@ -9,12 +9,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### 2026-07 — Signature Dark redesign + robustness/completeness hardening
+
+**Desktop UI**
+- Unified **"Signature Dark"** design language: one token header
+  (`userspace/lib/ui/theme.h`, graphite surfaces + teal accent) replacing the
+  fragmented per-app palettes across the compositor, `lib/ui`, and all ~44 GUI
+  apps.
+- Release hardening: a WCAG-AA contrast gate (`scripts/theme_contrast_check.py`),
+  a statistical chrome pixel-regression (`scripts/chrome_pixel_check.py`), a
+  desktop golden baseline, and a manual QA checklist
+  (`docs/ui/desktop-redesign-manual-qa.md`).
+
+**Security / robustness (audit → fix → PROVE bricks)**
+- KERNEL-ROBUST-0, CRYPTO-ROBUST-0, KERNEL-SYSCALL-ROBUST-0, NET-RX-ROBUST-0:
+  multi-agent adversarial audits fixing ~40 verified defects (x509 exponent
+  overflow, embedded-NUL hostname bypass, X25519 low-order acceptance,
+  cross-process `shmdt` UAF, ELF `e_phoff` overflow, and more), each with
+  negative-test discriminators and smoke gates.
+- Whole-system completeness sweep: closed default-reachable memory-safety gaps —
+  sleep-list timer-IRQ UAF, `sendfile` socket-ownership bypass, page-cache CLOCK
+  UAF, and W^X (NX) on anonymous/heap pages. Wired previously-inert desktop
+  controls (settings persistence, volume/mute, notifications, filemanager error
+  surfacing).
+- See **SECURITY.md** for the honest posture (deferred SMP-gated items, fail-open
+  TLS trust in progress, non-enforcing capability/seccomp/rlimit scaffolding).
+
+**Boot smoke suite:** now **50 checks** (was 43); build the full suite with
+`FULL=1 bash scripts/build_all.sh`.
+
 ### Phase 1: Core Foundation (95% Complete)
 
 #### Added (Phase 1 Implementation)
 
 **Boot & Initialization**
-- UEFI bootloader (AutoBoot) with GOP framebuffer setup
+- GRUB Multiboot2 boot with framebuffer setup (the shipped path; an experimental ABL loader also exists in-tree)
 - x86_64 long mode initialization
 - Higher-half kernel mapping (0xFFFFFFFF80000000)
 - Bootloader-kernel protocol with memory map, RSDP, framebuffer info

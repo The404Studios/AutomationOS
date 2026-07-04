@@ -2,7 +2,7 @@
 
 > A from-scratch x86_64 operating system that boots to a graphical desktop — on a real 2010 ThinkPad *and* in QEMU — with its own compiler, its own web browser, its own WiFi driver, and a gated AI agent that can drive the machine.
 
-![Platform](https://img.shields.io/badge/platform-x86__64-blue) ![Boot](https://img.shields.io/badge/boot-GRUB%20Multiboot-orange) ![Hardware](https://img.shields.io/badge/runs%20on-ThinkPad%20T410-purple) ![Smoke tests](https://img.shields.io/badge/boot%20smoke-43%2F43-brightgreen) ![License](https://img.shields.io/badge/license-MIT-green)
+![Platform](https://img.shields.io/badge/platform-x86__64-blue) ![Boot](https://img.shields.io/badge/boot-GRUB%20Multiboot-orange) ![Hardware](https://img.shields.io/badge/runs%20on-ThinkPad%20T410-purple) ![Smoke tests](https://img.shields.io/badge/boot%20smoke-50%2F50-brightgreen) ![License](https://img.shields.io/badge/license-MIT-green)
 
 ![desktop](screenshots/desktop.png)
 
@@ -149,13 +149,13 @@ Builds under WSL (Arch Linux) with a stock host toolchain (`gcc`, `nasm`, `ld`, 
 bash scripts/quick_build.sh
 
 # Build the compositor + the full userspace app suite and package the bootable ISO
-bash scripts/build_all.sh
+FULL=1 bash scripts/build_all.sh   # FULL=1 packages the complete self-test suite the smoke gate expects
 
 # Boot it in QEMU
 qemu-system-x86_64 -cdrom build/automationos.iso -m 512 \
     -netdev user,id=n0 -device e1000,netdev=n0
 
-# Run the 43-check boot smoke test
+# Run the boot smoke suite (currently 50 checks)
 bash scripts/smoke_boot.sh
 ```
 
@@ -180,7 +180,7 @@ To run on real hardware, write the ISO to a USB stick and boot it (legacy/BIOS o
 
 What is proven, and how.
 
-- **`scripts/smoke_boot.sh`** boots the ISO under QEMU and runs **43 invariant checks** — kernel start, no panics/faults, fork+CoW isolation, the on-device compiler, crypto/TLS known-answer tests, the networking + socket path, the whole browser pipeline, and more. **43/43.**
+- **`scripts/smoke_boot.sh`** boots the ISO under QEMU and runs **50 invariant checks** — kernel start, no panics/faults, fork+CoW isolation, the on-device compiler, crypto/TLS known-answer tests, the networking + socket path, the whole browser pipeline, and more. **50/50.**
 - **`GAMETEST=1`** spawns every game + app and asserts each survives its init + render loop.
 - **Boot-time KATs** (under `IWLWIFI=1`): `IWL-RXON`, `IWL-SCAN`, `IWL-FWSEL`, `IWL-FW` all PASS — the software-provable half of the WiFi driver (the RF tail is hardware-iterated on the T410).
 - **RFC 8448** known-answer vectors prove the TLS 1.3 key schedule / record / handshake.

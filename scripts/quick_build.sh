@@ -701,20 +701,26 @@ compile kernel/core/syscall/vma_test.c        c_vma_test
 
 echo ""
 echo "[3/3] Linking (strict: undefined symbols are fatal)..."
+# Never let a stale kernel.elf from a prior build masquerade as a fresh success:
+# remove it first, then EXIT NON-ZERO on any link failure or missing output so
+# smoke_boot.sh's `|| exit 1` guard is actually protective.
+rm -f "$KERNEL_OUT"
+LINK_OK=1
 if ld -T kernel/linker.ld -nostdlib $OBJS -o "$KERNEL_OUT" 2>/tmp/ld_err.txt; then
     echo "  Link OK -- no unresolved symbols"
 else
     echo "  LINK FAILED:"
     cat /tmp/ld_err.txt
+    LINK_OK=0
 fi
 
 echo ""
 echo "=== Results: $GOOD compiled, $BAD failed ==="
-if [ -f "$KERNEL_OUT" ]; then
-    echo ""
-    echo "========================================="
-    echo "  SUCCESS: $KERNEL_OUT ($(stat -c%s "$KERNEL_OUT") bytes)"
-    echo "========================================="
-else
-    echo "FAILED: No $KERNEL_OUT produced"
+if [ "$LINK_OK" -ne 1 ] || [ ! -f "$KERNEL_OUT" ]; then
+    echo "FAILED: no clean $KERNEL_OUT produced (compiled=$GOOD failed=$BAD link_ok=$LINK_OK)"
+    exit 1
 fi
+echo ""
+echo "========================================="
+echo "  SUCCESS: $KERNEL_OUT ($(stat -c%s "$KERNEL_OUT") bytes)"
+echo "========================================="

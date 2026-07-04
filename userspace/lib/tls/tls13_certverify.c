@@ -53,6 +53,7 @@ static int der_sig_to_rs(const unsigned char *sig, unsigned long sig_len,
     if (p + seqlen > sig_len) return -1;
     for (int comp = 0; comp < 2; comp++) {
         if (p >= sig_len || sig[p++] != 0x02) return -1;   /* INTEGER */
+        if (p >= sig_len) return -1;   /* CRYPTO-ROBUST-0: length byte must exist */
         unsigned long ilen = sig[p++];
         if (ilen & 0x80) return -1;
         if (p + ilen > sig_len || ilen == 0) return -1;

@@ -48,9 +48,11 @@
  *           Bit 255 is masked to 0 before use, as required by RFC 7748.
  * out    : 32-byte result (little-endian u-coordinate of the output point).
  *
- * Returns 0 on success.  The function never fails in the cryptographic sense
- * (it silently handles the low-order subgroup by design of X25519); the return
- * value is provided for API uniformity.
+ * Returns 0 on success, nonzero on failure.  Failure means the computed
+ * shared secret is all-zero, which happens when `point` is a low-order /
+ * non-contributory point: the peer can force a known secret, so callers MUST
+ * abort the key exchange (RFC 7748 §6.1, RFC 8446 §7.4.2).  CRYPTO-ROBUST-0
+ * fixed an earlier version that unconditionally returned 0.
  */
 int x25519(unsigned char out[32],
            const unsigned char scalar[32],
@@ -62,7 +64,8 @@ int x25519(unsigned char out[32],
  * Equivalent to x25519(out, scalar, {9,0,...,0}).
  * Used to derive a public key from a private scalar.
  *
- * Returns 0 on success.
+ * Returns 0 on success, nonzero if the result is all-zero (never for a
+ * clamped scalar; signalled for contract symmetry with x25519()).
  */
 int x25519_base(unsigned char out[32], const unsigned char scalar[32]);
 

@@ -585,12 +585,30 @@ static void x25519_raw(u8 out[32], const u8 scalar_bytes[32], const u8 u_bytes[3
 
 /* ---- public API ------------------------------------------------------ */
 
+/* Constant-time test for an all-zero 32-byte value. A low-order / non-
+ * contributory peer point drives the X25519 shared secret to all zeros, a
+ * value the peer can force to a known constant; RFC 7748 §6.1 and RFC 8446
+ * §7.4.2 require the recipient to detect this and abort. OR every byte
+ * together so the running time does not reveal where the first nonzero byte
+ * is. Returns 1 iff all 32 bytes are zero. */
+static int ct_is_zero32(const unsigned char v[32])
+{
+    unsigned char acc = 0;
+    int i;
+    for (i = 0; i < 32; i++) acc |= v[i];
+    return acc == 0;
+}
+
 int x25519(unsigned char out[32],
            const unsigned char scalar[32],
            const unsigned char point[32])
 {
     x25519_raw(out, scalar, point);
-    return 0;
+    /* CRYPTO-ROBUST-0: signal failure on an all-zero (low-order point) shared
+     * secret so callers abort the handshake instead of using a secret the peer
+     * chose. tls.c:1621 (TLS 1.3 ECDHE) checks this return; the TLS 1.2 path
+     * has its own explicit zero-check. */
+    return ct_is_zero32(out) ? -1 : 0;
 }
 
 int x25519_base(unsigned char out[32], const unsigned char scalar[32])
@@ -598,7 +616,9 @@ int x25519_base(unsigned char out[32], const unsigned char scalar[32])
     /* Basepoint: u = 9 (little-endian, 32 bytes) */
     static const unsigned char basepoint[32] = { 9 };
     x25519_raw(out, scalar, basepoint);
-    return 0;
+    /* A clamped scalar never yields the identity here, but signal it for
+     * contract symmetry with x25519() rather than emitting an all-zero pubkey. */
+    return ct_is_zero32(out) ? -1 : 0;
 }
 
 /* ---- self-test ------------------------------------------------------- */
@@ -653,7 +673,9 @@ int x25519_selftest(void)
         "c3da55379de9c6908e94ea4df28d084f"
         "32eccf03491c71f754b4075577a28552", 32);
 
-    x25519(result, scalar, u_in);
+    /* CRYPTO-ROBUST-0: a valid (non-low-order) key exchange must return 0 --
+     * proves the new all-zero guard does not false-reject good secrets. */
+    if (x25519(result, scalar, u_in) != 0) return -20;
     if (fe_memcmp(result, expected, 32) != 0) return -1;
 
     /* ------------------------------------------------------------------ */
@@ -684,6 +706,23 @@ int x25519_selftest(void)
 
     x25519(result, scalar, u_in);
     if (fe_memcmp(result, expected, 32) != 0) return -1;
+
+    /* ------------------------------------------------------------------ */
+    /* CRYPTO-ROBUST-0 negative: low-order point => all-zero secret        */
+    /* u = 0 is a low-order Curve25519 point; x25519() must produce an     */
+    /* all-zero shared secret AND signal failure so the TLS 1.3 ECDHE path */
+    /* aborts (RFC 7748 §6.1 / RFC 8446 §7.4.2). Pre-fix x25519()          */
+    /* unconditionally returned 0, so a regressed build fails here.        */
+    /* ------------------------------------------------------------------ */
+    {
+        u8 low[32], sec[32];
+        int i, z = 0;
+        fe_memset(low, 0, 32);                    /* u = 0 (low order) */
+        for (i = 0; i < 32; i++) sec[i] = 0xAA;
+        if (x25519(sec, scalar, low) == 0) return -21;   /* must signal failure */
+        for (i = 0; i < 32; i++) z |= sec[i];
+        if (z != 0) return -22;                   /* secret must be all zero */
+    }
 
     return 0;  /* all vectors passed */
 }

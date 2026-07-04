@@ -839,6 +839,18 @@ static void pt_add(pt *R, const pt *P, const pt *Q)
  *
  * Left-to-right double-and-add over 256 bits of k.
  * k is given as a 32-byte big-endian array.
+ *
+ * CRYPTO-ROBUST-0 NOTE (known, deferred): the `if (bit) pt_add` below is a
+ * secret-scalar-dependent branch, so this routine is NOT constant-time when k
+ * is a private key (p256_keygen d*G, p256_ecdh d*peerPub). This is a LOCAL /
+ * co-resident side channel only -- it is not reachable by the remote-MITM
+ * threat model this TLS client is built against, and the leak is bounded by
+ * single-use ephemeral ECDHE keys (never cached or reused). A constant-time
+ * fix (always-add + constant-time point select) is deferred deliberately:
+ * pt_add here is not a complete/unified addition (it has exceptional cases for
+ * P==Q and the point at infinity that the bit-gated path never hits), so an
+ * unconditional add would risk a correctness regression in the proven ECDHE
+ * path. ECDSA verify is unaffected -- its scalars u1,u2 are public.
  * ========================================================================= */
 static void pt_scalar_mul(pt *R, const pt *P, const unsigned char k[32])
 {

@@ -667,13 +667,22 @@ static int check_hostname(const unsigned char *leaf, unsigned long leaf_len,
                     if (gtag == ASN1_CONTEXT_PRIMITIVE(2)) {
                         /* dNSName -- copy into a bounded NUL-terminated buffer */
                         char name[256];
-                        unsigned long n = gl;
+                        unsigned long n = gl, k;
                         saw_dns = 1;
-                        if (n > sizeof name - 1) n = sizeof name - 1;
-                        v_memcpy(name, gv, n);
-                        name[n] = '\0';
-                        if (x509_hostname_match(hostname, name))
-                            return X509V_OK;
+                        /* CRYPTO-ROBUST-0: reject an embedded NUL. x509_hostname_
+                         * match measures with strlen, so "bank.com\0.evil.com"
+                         * would otherwise be truncated to "bank.com" and wrongly
+                         * match (null-prefix bypass, CVE-2009-2408). A real
+                         * dNSName never contains a NUL; treat it as non-matching
+                         * (saw_dns stays set, so we fail closed, not to CN). */
+                        for (k = 0; k < gl; k++) if (gv[k] == 0) break;
+                        if (k == gl) {
+                            if (n > sizeof name - 1) n = sizeof name - 1;
+                            v_memcpy(name, gv, n);
+                            name[n] = '\0';
+                            if (x509_hostname_match(hostname, name))
+                                return X509V_OK;
+                        }
                     }
                     /* other GeneralName kinds (iPAddress, etc.) ignored */
                 }
@@ -1011,6 +1020,38 @@ int x509_verify_selftest(void) {
                 != X509V_ERR_TIME_FMT) return -26;
         if (x509_verify_chain(&cp, &dl, 1, "x", 0)
                 != X509V_ERR_TIME_FMT) return -27;
+    }
+
+    /* ---- CRYPTO-ROBUST-0: embedded-NUL SAN dNSName must NOT match ----
+     * A CA-mis-issued leaf whose SAN dNSName is "good.com\0.evil.com" must be
+     * rejected by check_hostname() for host "good.com" -- pre-fix, strlen-based
+     * x509_hostname_match truncated at the NUL and wrongly matched (null-prefix
+     * bypass, CVE-2009-2408). We drive check_hostname() directly with a
+     * hand-built extensions blob (one SAN extension) so no full cert/signature
+     * is needed; a matching NUL-free control proves we did not over-reject. */
+    {
+        /* Extension SEQ { OID 2.5.29.17, OCTET { GeneralNames { [2] dNSName } } }
+         * dNSName = "good.com\0.evil.com" (18 bytes, embedded NUL at index 8). */
+        static const unsigned char SAN_NUL[] = {
+            0x30,0x1D, 0x06,0x03,0x55,0x1D,0x11, 0x04,0x16,
+              0x30,0x14, 0x82,0x12,
+                0x67,0x6F,0x6F,0x64,0x2E,0x63,0x6F,0x6D, 0x00,
+                0x2E,0x65,0x76,0x69,0x6C,0x2E,0x63,0x6F,0x6D
+        };
+        /* Same, but dNSName = "good.com" (clean, 8 bytes). */
+        static const unsigned char SAN_OK[] = {
+            0x30,0x13, 0x06,0x03,0x55,0x1D,0x11, 0x04,0x0C,
+              0x30,0x0A, 0x82,0x08,
+                0x67,0x6F,0x6F,0x64,0x2E,0x63,0x6F,0x6D
+        };
+        const unsigned char dummy = 0;
+        tbs_fields f;
+        v_memset(&f, 0, sizeof f);
+        f.have_exts = 1;
+        f.exts.p = SAN_NUL; f.exts.end = SAN_NUL + sizeof SAN_NUL;
+        if (check_hostname(&dummy, 0, &f, "good.com") == X509V_OK) return -28;
+        f.exts.p = SAN_OK;  f.exts.end = SAN_OK + sizeof SAN_OK;
+        if (check_hostname(&dummy, 0, &f, "good.com") != X509V_OK) return -29;
     }
 
     return 0;

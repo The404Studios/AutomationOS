@@ -283,8 +283,13 @@ static int find_cn_in_name(asn1_cur *name_seq, char *out, unsigned long out_cap)
             if (asn1_get_tlv(&atav, &vtag, &val, &val_len) != 0) return -1;
             if (asn1_oid_equals(oid, oid_len,
                                 OID_COMMON_NAME, sizeof OID_COMMON_NAME)) {
-                unsigned long n = val_len;
+                unsigned long n = val_len, k;
                 if (out_cap == 0) return -1;
+                /* CRYPTO-ROBUST-0: reject a CN with an embedded NUL. The caller
+                 * compares out[] with strlen, so "bank.com\0.evil.com" would be
+                 * truncated to "bank.com" and wrongly match (null-prefix bypass,
+                 * CVE-2009-2408). A legitimate CN never contains a NUL. */
+                for (k = 0; k < val_len; k++) if (val[k] == 0) return -1;
                 if (n > out_cap - 1) n = out_cap - 1;
                 x509_memcpy(out, val, n);
                 out[n] = '\0';
@@ -1265,6 +1270,35 @@ int x509_selftest(void) {
         if (issuer1_len != issuer2_len) return -57;
         for (k = 0; k < issuer1_len; k++)
             if (issuer1[k] != issuer2[k]) return -58;
+    }
+
+    /* ---- 19. CRYPTO-ROBUST-0: embedded-NUL CN must be rejected ----
+     * find_cn_in_name() feeds a NUL-terminated buffer to a strlen-based
+     * hostname compare, so a CN of "good.com\0.evil.com" would be truncated to
+     * "good.com" and wrongly match (null-prefix bypass, CVE-2009-2408). The fix
+     * rejects any CN containing an embedded NUL. Drive find_cn_in_name()
+     * directly with a hand-built subject-Name blob (SET{SEQ{OID cn, value}}); a
+     * clean control proves normal CNs still extract correctly. */
+    {
+        /* SET { SEQ { OID 2.5.4.3, PrintableString "good.com\0.evil.com" } } */
+        static const unsigned char CN_NUL[] = {
+            0x31,0x1B, 0x30,0x19, 0x06,0x03,0x55,0x04,0x03, 0x13,0x12,
+                0x67,0x6F,0x6F,0x64,0x2E,0x63,0x6F,0x6D, 0x00,
+                0x2E,0x65,0x76,0x69,0x6C,0x2E,0x63,0x6F,0x6D
+        };
+        /* Same, but CN = "good.com" (clean). */
+        static const unsigned char CN_OK[] = {
+            0x31,0x11, 0x30,0x0F, 0x06,0x03,0x55,0x04,0x03, 0x13,0x08,
+                0x67,0x6F,0x6F,0x64,0x2E,0x63,0x6F,0x6D
+        };
+        char cn[64];
+        asn1_cur ns;
+        ns.p = CN_NUL; ns.end = CN_NUL + sizeof CN_NUL;
+        if (find_cn_in_name(&ns, cn, sizeof cn) != -1) return -59;  /* must reject */
+        ns.p = CN_OK; ns.end = CN_OK + sizeof CN_OK;
+        if (find_cn_in_name(&ns, cn, sizeof cn) != 0) return -60;   /* must accept */
+        if (!(cn[0]=='g'&&cn[1]=='o'&&cn[2]=='o'&&cn[3]=='d'&&cn[4]=='.'&&
+              cn[5]=='c'&&cn[6]=='o'&&cn[7]=='m'&&cn[8]=='\0')) return -61;
     }
 
     return 0;

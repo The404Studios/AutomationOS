@@ -1532,7 +1532,7 @@ static int ecdhe_compute(tls_conn_t *c, transcript_t *tr,
 
     if (c->named_group == GROUP_X25519) {
         /* clamp + base mult handled by x25519_base(); derive public + shared. */
-        x25519_base(c->ecdhe_pub, c->ecdhe_priv);
+        if (x25519_base(c->ecdhe_pub, c->ecdhe_priv) != 0) return TLS_ERR_CRYPTO;
         c->ecdhe_pub_len = 32;
         if (c->peer_pub_len != 32) return TLS_ERR_CURVE;
         x25519(pms, c->ecdhe_priv, c->peer_pub);
@@ -1659,6 +1659,11 @@ static int tls13_do_handshake(tls_conn_t *c, transcript_t *tr, const char *serve
             } else if (mt == 0x0f) {          /* CertificateVerify */
                 if (!got_cert) return TLS_ERR_PROTO;
                 unsigned char th_cert[48]; tr_snapshot(tr, 0, th_cert); /* H(CH..Cert) */
+                /* CRYPTO-ROBUST-0: the 4-byte CertificateVerify header
+                 * (SignatureScheme + length) must be present before reading it;
+                 * tls13_next_handshake_msg only guarantees the whole message
+                 * fits, so blen may be 0..3. Bound-check before get_u16. */
+                if (blen < 4) return TLS_ERR_PROTO;
                 unsigned short sigalg = (unsigned short)get_u16(body);
                 unsigned int siglen = get_u16(body + 2);
                 if (4u + siglen > blen) return TLS_ERR_PROTO;

@@ -49,6 +49,7 @@
 #include "../../lib/net/http.h"          /* http_get, https_get                  */
 #include "../../lib/wl/wl_client.h"      /* wl_connect, wl_create_window, ...    */
 #include "../../lib/font/bitfont.h"      /* font_draw_char, FONT_W, FONT_H       */
+#include "../../lib/ui/theme.h"          /* shared "Signature Dark" design tokens */
 #include "browser2_ui.h"                 /* b2ui_draw_chrome, b2ui_hit_chrome    */
 #include "browser2_anim.h"               /* b2anim_scroll_*, b2anim_crossfade    */
 
@@ -430,11 +431,11 @@ static void fb_commit_to_window(wl_window *win)
             u32 col = 0;
             for (; col < copy_w; col++) drow[col] = srow[col];
             /* Right margin (window wider than canvas): chrome background. */
-            for (; col < win_w && col < dst_pitch; col++) drow[col] = 0xFFF0F0F0u;
+            for (; col < win_w && col < dst_pitch; col++) drow[col] = THEME_BG2;
         } else {
             /* Bottom margin (window taller than canvas): chrome background. */
             for (u32 col = 0; col < win_w && col < dst_pitch; col++)
-                drow[col] = 0xFFF0F0F0u;
+                drow[col] = THEME_BG2;
         }
     }
     wl_commit(win);

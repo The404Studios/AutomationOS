@@ -58,6 +58,7 @@
 #include "../../lib/keymap/keymap.h"   /* shared US-QWERTY: caps-lock + shift + symbols */
 #include "sh_git.h"
 #include "../../lib/channel.h"   /* CHANNEL-0 P4: bound child stdio -> grid */
+#include "../../lib/ui/theme.h"  /* shared "Signature Dark" design tokens    */
 
 /* ---- syscall numbers (must match kernel/include/syscall.h) ---- */
 #define SYS_READ          2
@@ -302,9 +303,9 @@ static void print_char(char ch) { sc(SYS_WRITE, 1, (long)&ch, 1, 0, 0, 0); }
 #define MAX_COLS   (WIN_W / FONT_W)   /* 640/8  = 80 */
 #define MAX_ROWS   (WIN_H / FONT_H)   /* 400/16 = 25 */
 
-#define BG_COLOR     0xFF101418u   /* dark background          */
-#define FG_COLOR     0xFFD8E0E8u   /* light foreground text    */
-#define CURSOR_COLOR 0xFF50C878u   /* green cursor block       */
+#define BG_COLOR     THEME_BG0     /* dark background (desktop backdrop) */
+#define FG_COLOR     THEME_TEXT    /* light foreground text    */
+#define CURSOR_COLOR THEME_ACCENT  /* teal cursor block (on-brand) */
 
 /* =========================================================================
  *  Output redirection capture

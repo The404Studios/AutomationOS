@@ -58,6 +58,7 @@
 
 #include "../../lib/wl/wl_client.h"
 #include "../../lib/font/bitfont.h"
+#include "../../lib/ui/theme.h"
 
 /* All local-buffer functions are annotated so the host GCC's hardening
  * heuristic cannot inject a %fs:0x28 stack canary (no libssp to link). */
@@ -250,23 +251,25 @@ static void path_parent(char *path)
 #define CONTENT_Y   HEADER_TOP
 #define CONTENT_X   SIDEBAR_W
 
-/* Windows 11 light palette (ARGB, opaque). */
-#define COL_CHROME    0xFFF3F3F3u   /* toolbar / address strip            */
-#define COL_SIDEBAR   0xFFEBEBEBu   /* sidebar background                 */
-#define COL_CONTENT   0xFFFFFFFFu   /* main view background               */
-#define COL_BORDER    0xFFE1E1E1u   /* hairline separators                */
-#define COL_TEXT      0xFF1B1B1Bu   /* primary text                       */
-#define COL_TEXTDIM   0xFF6A6A6Au   /* secondary text                     */
-#define COL_ACCENT    0xFF0067C0u   /* Win11 blue                         */
-#define COL_SELBG     0xFFCCE4F7u   /* selected item fill (light blue)    */
-#define COL_SELBORDER 0xFF99CCEEu   /* selected item border               */
-#define COL_HOVER     0xFFF0F0F0u   /* hover fill                         */
-#define COL_BTN       0xFFFBFBFBu   /* toolbar button face                */
-#define COL_BTNHOVER  0xFFEAEAEAu
-#define COL_FOLDER    0xFFFFC75Bu   /* folder icon body (amber)           */
-#define COL_FOLDER2   0xFFE8A83Cu   /* folder icon shade                  */
-#define COL_FILE      0xFFFFFFFFu   /* file icon page                     */
-#define COL_FILEEDGE  0xFFB9B9B9u   /* file icon outline                  */
+/* AutomationOS "Signature Dark" palette -- mapped by ROLE onto the shared
+ * theme.h tokens so Files reads as part of the one cohesive dark desktop
+ * (was a Windows 11 light clone). */
+#define COL_CHROME    THEME_BG2       /* toolbar / address strip            */
+#define COL_SIDEBAR   THEME_BG1       /* sidebar background                 */
+#define COL_CONTENT   THEME_BG1       /* main view background               */
+#define COL_BORDER    THEME_HAIRLINE  /* hairline separators                */
+#define COL_TEXT      THEME_TEXT      /* primary text                       */
+#define COL_TEXTDIM   THEME_TEXT_DIM  /* secondary text                     */
+#define COL_ACCENT    THEME_ACCENT    /* accent (was Win11 blue)            */
+#define COL_SELBG     THEME_BG4       /* selected item fill                 */
+#define COL_SELBORDER THEME_ACCENT    /* selected item border               */
+#define COL_HOVER     THEME_BG3       /* hover fill                         */
+#define COL_BTN       THEME_BG2       /* toolbar button face                */
+#define COL_BTNHOVER  THEME_BG3       /* toolbar button hover               */
+#define COL_FOLDER    THEME_ACCENT    /* folder icon body (accent)          */
+#define COL_FOLDER2   THEME_ACCENT_LO /* folder icon shade                  */
+#define COL_FILE      THEME_BG3       /* file icon page (elevated surface)  */
+#define COL_FILEEDGE  THEME_BORDER    /* file icon outline                  */
 
 /* ----------------------------------------------------------------------- */
 /* Drawing primitives (ARGB32, stride in pixels)                           */
@@ -388,7 +391,7 @@ NO_SSP static void icon_folder(int x, int y)   /* 48x40 tile, centered art */
     /* body */
     fill_round(fx, fy, fw, fh, 3, COL_FOLDER);
     /* subtle front lip highlight */
-    fill(fx + 2, fy + 2, fw - 4, 3, 0xFFFFD98Au);
+    fill(fx + 2, fy + 2, fw - 4, 3, THEME_ACCENT_HI);
 }
 
 NO_SSP static void icon_file(int x, int y, char kind)
@@ -410,8 +413,8 @@ NO_SSP static void icon_file(int x, int y, char kind)
     char g[2] = { kind, 0 };
     if (kind != '-') text(fx + (fw - FONT_W) / 2, fy + 8, g, tint);
     /* a couple of "text lines" */
-    fill(fx + 4, fy + 6, fw - 12, 2, 0xFFD8D8D8u);
-    fill(fx + 4, fy + 12, fw - 8, 2, 0xFFE2E2E2u);
+    fill(fx + 4, fy + 6, fw - 12, 2, THEME_TEXT_FAINT);
+    fill(fx + 4, fy + 12, fw - 8, 2, THEME_TEXT_FAINT);
 }
 
 /* ----------------------------------------------------------------------- */
@@ -819,7 +822,7 @@ NO_SSP static void draw_toolbar(void)
     for (int i = 0; i < 3; i++) {
         unsigned int face = nav[i].hov && nav[i].enabled ? COL_BTNHOVER : COL_CHROME;
         fill_round(nav[i].x, NAVBTN_Y, NAVBTN_W, NAVBTN_H, 6, face);
-        unsigned int fg = nav[i].enabled ? COL_TEXT : 0xFFC0C0C0u;
+        unsigned int fg = nav[i].enabled ? COL_TEXT : THEME_TEXT_FAINT;
         text_center(nav[i].x, NAVBTN_Y + 7, NAVBTN_W, nav[i].g, fg);
     }
 
@@ -1005,12 +1008,12 @@ NO_SSP static void draw_grid(void)
         int trackx = (g_preview ? FBW - 300 : FBW) - 8;
         int tracky = CONTENT_Y + 4;
         int trackh = content_h_px() - 8;
-        fill(trackx, tracky, 4, trackh, 0xFFE8E8E8u);
+        fill(trackx, tracky, 4, trackh, THEME_BG2);
         int thumb_h = trackh * vis / total_rows;
         if (thumb_h < 24) thumb_h = 24;
         int max_scroll = total_rows - vis;
         int thumb_y = tracky + (max_scroll > 0 ? (trackh - thumb_h) * g_scroll / max_scroll : 0);
-        fill_round(trackx, thumb_y, 4, thumb_h, 2, 0xFFBdBdBdu);
+        fill_round(trackx, thumb_y, 4, thumb_h, 2, THEME_BG4);
     }
 }
 

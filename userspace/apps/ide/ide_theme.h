@@ -5,23 +5,25 @@
 #ifndef IDE_THEME_H
 #define IDE_THEME_H
 
-/* ---- base surfaces ---- */
-#define TH_BG          0xFF0C1018u  /* app background (near-black blue)   */
-#define TH_PANEL       0xFF121A28u  /* panel fill                         */
-#define TH_PANEL2      0xFF0F1622u  /* alt panel fill                     */
-#define TH_HEADER      0xFF1A2536u  /* panel header bar                   */
-#define TH_BORDER      0xFF26344Cu  /* hairline border                    */
-#define TH_BORDER_LT   0xFF35496Bu  /* lighter border / divider           */
-#define TH_SELECT      0xFF1D2D45u  /* selected row                       */
-#define TH_HOVER       0xFF182338u  /* hover row                          */
+#include "../../lib/ui/theme.h"
 
-/* ---- text ---- */
-#define TH_TEXT        0xFFD7DEE8u  /* primary text                       */
-#define TH_TEXT_DIM    0xFF8A98AAu  /* secondary text                     */
-#define TH_TEXT_FAINT  0xFF5C6A7Eu  /* tertiary / line numbers            */
+/* ---- base surfaces (CHROME -> shared desktop theme tokens) ---- */
+#define TH_BG          THEME_BG0    /* app background                     */
+#define TH_PANEL       THEME_BG1    /* panel fill                         */
+#define TH_PANEL2      THEME_BG1    /* alt panel fill                     */
+#define TH_HEADER      THEME_BG2    /* panel header bar                   */
+#define TH_BORDER      THEME_HAIRLINE /* hairline border                  */
+#define TH_BORDER_LT   THEME_BORDER /* lighter border / divider           */
+#define TH_SELECT      THEME_BG4    /* selected row                       */
+#define TH_HOVER       THEME_BG3    /* hover row                          */
+
+/* ---- text (CHROME) ---- */
+#define TH_TEXT        THEME_TEXT       /* primary text                   */
+#define TH_TEXT_DIM    THEME_TEXT_DIM   /* secondary text                 */
+#define TH_TEXT_FAINT  THEME_TEXT_FAINT /* tertiary / line numbers        */
 
 /* ---- accents (also used for port/edge colours) ---- */
-#define TH_BLUE        0xFF4D9BE6u  /* input / primary accent             */
+#define TH_BLUE        THEME_ACCENT /* input / primary accent (chrome)    */
 #define TH_CYAN        0xFF49C5D6u  /* state_read                         */
 #define TH_GREEN       0xFF54D17Au  /* connected / safe / write-ok        */
 #define TH_YELLOW      0xFFE6C24Au  /* control / weak                     */

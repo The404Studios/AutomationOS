@@ -37,34 +37,40 @@
 
 #include "../../lib/font/bitfont.h"   /* font_draw_char, FONT_W (8), FONT_H (16) */
 #include "../../libc/string.h"        /* strlen, memset (freestanding userspace libc) */
+#include "../../lib/ui/theme.h"       /* shared "Signature Dark" design tokens        */
 #include "browser2_ui.h"
 
 /* =========================================================================
- * Palette -- 0xAARRGGBB. A light, modern, neutral chrome with a blue accent.
+ * Palette -- chrome colors mapped onto the shared theme.h tokens so the
+ * browser CHROME reads as part of the one cohesive dark desktop. Only the
+ * color VALUES changed; the macro names/roles are unchanged, and the painter
+ * / hit-tester / selftest are untouched. (Rendered web-page content and the
+ * browser-generated bodies below -- about:home, the error page -- are page
+ * content, NOT chrome, and keep their own palette.)
  * ========================================================================= */
-#define C_CHROME_BG    0xFFF0F0F0u   /* toolbar / chrome background (slightly cooler) */
-#define C_TABSTRIP_BG  0xFFE2E2E2u   /* tab-strip trough (distinctly darker)         */
-#define C_ADDR_BG      0xFFFFFFFFu   /* address-bar fill (white)                     */
-#define C_ADDR_SHADOW  0xFFE8E8E8u   /* address-bar inner-shadow bottom row          */
-#define C_ADDR_BORDER  0xFFBBBBBBu   /* address-bar 1px border (sharper contrast)    */
-#define C_ADDR_FOCUS   0xFF3B82F6u   /* address-bar focus ring colour                */
-#define C_ACCENT       0xFF2563EBu   /* progress / focus / link accent (deeper blue) */
-#define C_ACCENT_LITE  0xFF93C5FDu   /* accent highlight / progress leading dot      */
-#define C_TEXT         0xFF1A1A1Au   /* primary text (near-black, higher contrast)   */
-#define C_TEXT_DIM     0xFF6B7280u   /* secondary / placeholder text                 */
-#define C_ICON         0xFF374151u   /* toolbar glyph color                          */
-#define C_ICON_DIM     0xFFB0B7C3u   /* disabled toolbar glyph                       */
-#define C_TAB_ACTIVE   0xFFFFFFFFu   /* active tab fill (pops off trough)            */
-#define C_TAB_INACTIVE 0xFFD8D8D8u   /* inactive tab fill                            */
-#define C_TAB_TOP      0xFFCCCCCCu   /* two-tone rule at top of inactive tab         */
-#define C_TAB_TEXT_ACT 0xFF1A1A1Au   /* active-tab label (full contrast)             */
-#define C_TAB_TEXT_INA 0xFF505766u   /* inactive-tab label (muted)                   */
-#define C_TAB_BORDER   0xFFC0C0C0u   /* tab separator / outline                      */
-#define C_DIVIDER      0xFFCCCCCCu   /* 1px divider under the chrome                 */
-#define C_CLOSE        0xFF808080u   /* tab close glyph (rest)                       */
-#define C_CLOSE_HOT    0xFFCC3333u   /* tab close glyph (hover — drawn if active)    */
-#define C_BTN_HOVER    0xFFE0E0E0u   /* button hover fill circle                     */
-#define C_SECURE       0xFF22C55Eu   /* green lock dot for https                     */
+#define C_CHROME_BG    THEME_BG2        /* toolbar / chrome background            */
+#define C_TABSTRIP_BG  THEME_BG1        /* tab-strip trough (recessed)            */
+#define C_ADDR_BG      THEME_BG1        /* address-bar fill (recessed input well) */
+#define C_ADDR_SHADOW  THEME_HAIRLINE   /* address-bar inner-shadow bottom row    */
+#define C_ADDR_BORDER  THEME_BORDER     /* address-bar 1px border                 */
+#define C_ADDR_FOCUS   THEME_ACCENT     /* address-bar focus ring colour          */
+#define C_ACCENT       THEME_ACCENT     /* progress / focus / link accent         */
+#define C_ACCENT_LITE  THEME_ACCENT_HI  /* accent highlight / progress leading dot*/
+#define C_TEXT         THEME_TEXT       /* primary text                           */
+#define C_TEXT_DIM     THEME_TEXT_DIM   /* secondary / placeholder text           */
+#define C_ICON         THEME_TEXT       /* toolbar glyph color (enabled)          */
+#define C_ICON_DIM     THEME_TEXT_FAINT /* disabled toolbar glyph                 */
+#define C_TAB_ACTIVE   THEME_ACCENT     /* active tab fill (selected affordance)  */
+#define C_TAB_INACTIVE THEME_BG2        /* inactive tab fill                      */
+#define C_TAB_TOP      THEME_HAIRLINE   /* two-tone rule at top of inactive tab   */
+#define C_TAB_TEXT_ACT THEME_ON_ACCENT  /* active-tab label (text on accent fill) */
+#define C_TAB_TEXT_INA THEME_TEXT_DIM   /* inactive-tab label (muted)             */
+#define C_TAB_BORDER   THEME_BORDER     /* tab separator / outline                */
+#define C_DIVIDER      THEME_HAIRLINE   /* 1px divider under the chrome           */
+#define C_CLOSE        THEME_TEXT_DIM   /* tab close glyph (rest)                 */
+#define C_CLOSE_HOT    THEME_DANGER     /* tab close glyph (hover — destructive)  */
+#define C_BTN_HOVER    THEME_BG3        /* button hover fill circle               */
+#define C_SECURE       THEME_SUCCESS    /* green lock dot for https               */
 
 /* Error-page palette (clean, airy design). */
 #define C_ERR_BG       0xFFF8F9FAu

@@ -41,6 +41,7 @@
  */
 
 #include "../../lib/ui/ui.h"
+#include "../../lib/ui/theme.h"
 
 /* ---- syscall numbers ---- */
 #define SYS_READ          2
@@ -69,23 +70,23 @@
 #define CONTENT_W   (WIN_W - CONTENT_X - 4)
 #define CONTENT_H   (WIN_H - 8)
 
-/* ---- colour palette ---- */
-#define COL_WINDOW   0xFF1C1C1Eu
-#define COL_SIDEBAR  0xFF232325u
-#define COL_SURFACE  0xFF2C2C2Eu
-#define COL_SURFACE2 0xFF333335u
-#define COL_HOVER    0xFF3A3A3Cu
-#define COL_TEXT     0xFFFFFFFFu
-#define COL_SUBTEXT  0xFFAAAAAEu
-#define COL_DIVIDER  0xFF38383Au
-#define COL_ON       0xFF30D158u
-#define COL_OFF      0xFF636366u
-#define COL_PROGRESS 0xFF0A84FFu
+/* ---- colour palette (mapped to shared theme.h tokens by role) ---- */
+#define COL_WINDOW   THEME_BG1        /* window body                    */
+#define COL_SIDEBAR  THEME_BG2        /* sidebar surface                */
+#define COL_SURFACE  THEME_BG2        /* content-panel surface          */
+#define COL_SURFACE2 THEME_BG3        /* raised sub-surface             */
+#define COL_HOVER    THEME_BG3        /* hover                          */
+#define COL_TEXT     THEME_TEXT       /* primary text                   */
+#define COL_SUBTEXT  THEME_TEXT_DIM   /* secondary text                 */
+#define COL_DIVIDER  THEME_HAIRLINE   /* subtle divider                 */
+#define COL_ON       THEME_ACCENT     /* on / enabled state             */
+#define COL_OFF      THEME_BG4        /* off / disabled state           */
+#define COL_PROGRESS THEME_ACCENT     /* progress fill                  */
 
 /* ---- accent swatches (6 choices) ---- */
 #define ACCENT_COUNT  6
 static const unsigned int k_accents[ACCENT_COUNT] = {
-    0xFF0A84FFu,   /* 0 Blue   (default) */
+    THEME_ACCENT,  /* 0 Teal   (default) */
     0xFF30D158u,   /* 1 Green  */
     0xFFFF453Au,   /* 2 Red    */
     0xFFFF9F0Au,   /* 3 Orange */

@@ -25,15 +25,22 @@ findings. Include a reproduction and the affected commit.
 - TLS: correct X.509 chain verification math (RSA/ECDSA, `basicConstraints`
   cA), hostname matching with embedded-NUL rejection, and X25519 low-order
   rejection. See the ROBUST hardening history.
+- TLS trust is now **enforced by default at the client layer.** The HTTP layer
+  surfaces the per-fetch verdict (`http_last_trusted()`); `wget` refuses to emit
+  the body of an HTTPS response whose certificate chain did not authenticate
+  against a built-in CA root (override with `-k`/`--insecure`), and `browser2`
+  shows a red address-bar indicator for encrypted-but-unauthenticated pages
+  instead of a false green padlock.
 
 ## Known limitations (deliberate or deferred — do NOT assume otherwise)
 
-- **HTTPS is currently fail-open on trust.** The handshake *computes* certificate
-  trust but does not yet *refuse* an untrusted chain by default; connections are
-  encrypted but not authenticated unless the caller checks `tls_cert_trusted()`.
-  Enforcing-by-default is in progress and gated on live-server validation so it
-  does not break the compiled-in CA set. Treat in-OS HTTPS as confidential but
-  not MITM-resistant until that lands.
+- **HTTPS trust anchors to a fixed 7-root CA bundle.** The client fetchers
+  (`wget`, `browser2`) now fail closed on an unauthenticated chain, but the
+  built-in root set (`ca_roots_data.h`) is small and never refreshed at runtime:
+  a server whose chain anchors to a root outside that bundle is refused even
+  though it is legitimate (`-k` overrides in `wget`). There is no OCSP/CRL
+  revocation check. Any *other* in-OS TLS consumer that does not itself gate on
+  `tls_cert_trusted()` / `http_last_trusted()` remains encrypted-but-unauthenticated.
 - **Poweroff/reboot are intentionally unrestricted.** This is a single-user
   desktop where Shut Down / Restart are ordinary GUI apps; a `pid==1` gate would
   break those buttons, and there is no capability model to distinguish them.

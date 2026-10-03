@@ -5,10 +5,10 @@
 > today — every claim names the file/flag it comes from. It is honest about
 > what is **DONE**, what is **WRITTEN-but-HELD**, and what is **NOT-YET-WRITTEN**.
 >
-> The one-line truth: the entire WPA2/WPA3 software stack is already done and
-> QEMU-proven against a simulated radio. The only thing standing between you
-> and real WiFi is the Intel radio bring-up — and that bring-up has **no
-> emulator**, so it must be iterated on the physical T410 with a serial console.
+> The one-line truth: the Network Manager and WLAN control ABI exist, and QEMU
+> proves a simulated control flow, but real association, live EAPOL, DVM key
+> installation, and the `wlan0` data path are not complete. Passive scan is the
+> current physical-hardware milestone and must be iterated on a T410 over serial.
 
 ---
 
@@ -48,20 +48,17 @@ radio touches *only the driver below the seam* — nothing above it
 (`SYS_WLAN_*`, the supplicant, the GUI) changes at all. The header says this
 explicitly (`wifi.h` lines 5-8).
 
-**The whole software stack above the seam is already done and QEMU-proven:**
+**What the QEMU simulator proves:**
 
 - The scan→connect→status→disconnect flow (`wifisim.c` walks a canned AP list
   of OPEN/WPA2/WPA3 networks and drives the state machine all the way to
   `WLAN_CONNECTED`).
-- The WPA supplicant and crypto: `userspace/apps/wpasupp/`,
-  `userspace/lib/wpa/wpa.c`, `userspace/lib/crypto/wpa_aad.c` — the 4-way
-  handshake lands its pairwise key via `SYS_WLAN_SET_KEY` (`set_key`), exactly
-  as `sim_set_key()` models (`pairwise && klen>0 → CONNECTED`).
-- The control tool `userspace/apps/wlanctl/` and DHCP on the brought-up `wlan0`.
+- WPA2 key-derivation and crypto known-answer paths in `userspace/lib/wpa/`.
+- The control tool `userspace/apps/wlanctl/` and Network Manager GUI wiring.
 
-All of that runs end-to-end **today** in QEMU under `WIFI_SIM=1` with no radio.
-The moment the real driver can *scan*, that same stack runs over the real air —
-because it never knew it was talking to a simulator.
+This is not an RF or IP data-plane proof. `wpasupp` currently uses fixed demo
+MACs/nonces and explicitly reports `no live EAPOL yet`; `wifisim` has no packet
+TX/RX path, so DHCP and Internet traffic still use the emulated wired NIC.
 
 ---
 
@@ -73,16 +70,38 @@ each brick is in:
 | Brick | File | State | What it does |
 |-------|------|-------|--------------|
 | **IWL-IDENT** | `iwl-pci.c`, `iwl-devices.h` | **DONE (QEMU-checkable)** | Detects the T410 card over the candidate PCI IDs, enables MMIO + bus-master, maps BAR0, reads `CSR_HW_REV` — one side-effect-free MMIO read — then **stops**. No APM, no firmware, no reset. |
-| **IWL-FW** | `iwl-fw.c`, `iwl-fw-file.h` | **DONE (QEMU-checkable)** | Parses the modern TLV `.ucode` container (bounds-checked, hostile-input-safe), recording the INST/DATA/INIT/INIT_DATA sub-image sizes the loader will need. Proven by `iwl_fw_selftest()` against an embedded synthetic blob + truncation/short/bad-magic negative tests. |
-| **IWL-TRANS** | `iwl-csr.h` (register map present) | **WRITTEN-but-HELD** | The transport register dictionary (CSR/PRPH/FH offsets, all cited verbatim from Linux v5.10 sources) is in the tree. APM power-up + command/RX DMA ring programming is the next step. **Held** — it has no emulator and is not wired to a trigger yet. |
-| **IWL-LOAD** | — | **NOT-YET-WRITTEN** | uCode image load into SRAM/DRAM → kick the radio → wait for the **ALIVE** notification. |
-| **IWL-OPS** | — | **NOT-YET-WRITTEN** | NVM/EEPROM read → RF config → a real scan → register a `netif` + `wifi_ops` behind the seam (the point at which the sim is finally replaced). |
+| **IWL-FW** | `iwl-fw.c`, `iwl-fw-file.h` | **DONE (QEMU-checkable)** | Bounds-checks both legacy v1/v2 and TLV containers. This includes the legacy `iwlwifi-6000-4.ucode` used by common T410 6200/6300 cards. The KAT verifies metadata, section pointers, and malformed/truncated rejection. |
+| **IWL-TRANS** | `iwl-trans.c`, `iwl-hostcmd.c` | **WRITTEN-but-HARDWARE-UNVERIFIED** | Deferred APM, DMA rings, SCD command queue, bounded notifications, RF-kill, and scan-sized host commands. No emulator covers the device path. |
+| **IWL-LOAD** | `iwl-fw-load.c` | **WRITTEN-but-HARDWARE-UNVERIFIED** | INIT/runtime section DMA, ALIVE waits, calibration capture/replay. The INIT-to-runtime stop/restart transition still needs an upstream-faithful implementation before this is considered complete. |
+| **IWL-NVM/RXON/SCAN** | `iwl-nvm.c`, `iwl-rxon.c`, `iwl-scan.c` | **PARTIAL** | Pure builders/parsers have KATs. EEPROM/OTP family geometry, antenna/regulatory data, and physical scan require T410 validation. |
+| **Association/WPA2/data** | `iwl-ops.c`, `wpasupp.c` | **SCAFFOLDED / NOT CONNECTIVITY** | `connect`, `set_key`, and radio TX/RX are placeholders. There is no live auth/association, EAPOL exchange, PTK/GTK firmware install, CCMP data path, or WLAN DHCP path yet. |
 
-So today, with `IWLWIFI=1`, the kernel does exactly two things on real hardware:
-prints the detected card + `CSR_HW_REV` (IWL-IDENT), and — if you drop a
-firmware file in the initrd — can parse it (IWL-FW). **The radio does not yet
-come up.** Everything past `CSR_HW_REV` (IWL-TRANS/LOAD/OPS) is the hardware
-tail.
+With `IWLWIFI=1`, boot performs safe identification and software KATs only.
+Running `iwlup` after the desktop explicitly attempts the held hardware ladder.
+Even a successful scan does not yet mean the machine can associate or carry IP
+traffic over WiFi.
+
+### Connectivity milestones
+
+The following gates must pass in order before claiming T410 Internet access:
+
+1. Firmware INIT/calibration/runtime ALIVE, valid NVM, and repeated passive scans.
+2. Real 802.11 authentication and association with a controlled open AP.
+3. Intel data TX/RX queues plus Ethernet/802.11 LLC-SNAP conversion; ARP and ping
+   must work with the wired NIC disconnected.
+4. Live WPA2-PSK EAPOL messages 1-4 with random SNonce, replay/MIC validation,
+   GTK unwrap, PTK/GTK firmware installation, and CCMP replay protection.
+5. Per-interface DHCP, ARP, routes, source MAC/IP selection, DNS, TCP 80/443, and
+   trusted TLS through `wlan0`.
+6. Network Manager failure states: wrong password, RF-kill, timeout, reconnect,
+   disconnect, and lease renewal.
+
+Google HTTPS is an acceptance test after gate 5, not a driver primitive. Full
+YouTube playback is a separate browser/media project: the current browser has no
+external-script pipeline, `<video>`, MSE, MP4/WebM demuxer, or video/audio codecs.
+A realistic first media gate is a native player for one controlled local/direct
+format, followed by browser media elements; loading the production YouTube web
+application must not be represented as currently supported.
 
 **Honesty about the radio bring-up:** QEMU does not emulate any iwlwifi card.
 `iwl_init()` on QEMU prints `IWL: no Intel WiFi card found` and returns cleanly
@@ -151,13 +170,10 @@ signature-verification path to load it. (Newer Intel cards, 7000+, require a
 signed image and a far more complex secure-boot flow; the T410 predates all of
 that. This is a large reason the T410 was chosen as the WiFi target.)
 
-Drop the file into the **initrd firmware directory** so `iwl_fw_load_from_initrd()`
-can find it via `initrd_get_file()`. The initrd is staged at `/tmp/ird` during
-`build_all.sh` (then re-tarred into `iso/boot/initrd.img`). Place the blob at a
-path like `/tmp/ird/lib/firmware/iwlwifi-<family>-<api>.ucode` and add a `cp`
-for it alongside the other initrd staging copies in `scripts/build_all.sh`
-(the section that populates `/tmp/ird/...`). The loader is called with the path
-you give it, so keep the two consistent.
+Drop the exact versioned file into the repository's `firmware/` directory.
+`scripts/build_all.sh` stages every `firmware/iwlwifi*.ucode` into the initrd at
+`/lib/firmware/` under its real filename. It does not synthesize a generic alias;
+the driver selects only family-specific candidates and validates the API.
 
 > NOTE: today no firmware ships in the tree, and `iwl_fw_load_from_initrd()`
 > prints a clean hint (`IWL-FW: no firmware ... in initrd`) and returns -1 when
@@ -184,10 +200,8 @@ T410_SAFE=1 IWLWIFI=1 bash scripts/quick_build.sh
 ```
 
 `T410_SAFE=1` disables modern-CPU optimizations (Westmere-safe) — the T410's
-Arrandale CPU needs it. You may add `WIFI_SIM=1` too: the sim and the real
-driver coexist (the sim registers `wlan0`, the real driver only prints
-detect/probe today), which lets you keep exercising the GUI while the radio
-tail is still being written.
+Arrandale CPU needs it. Do not combine `WIFI_SIM=1` and `IWLWIFI=1`; both own
+`wlan0`, and the kernel deliberately rejects that ambiguous profile.
 
 Then flash `build/automationos.iso` to a USB stick (e.g. `dd` the ISO to the
 raw USB device on a Linux box, or use Rufus in DD mode on Windows) and boot the
@@ -214,9 +228,9 @@ IWL-FW: loaded <path>: inst=.. data=.. init=.. init_data=.. ver=.. tlvs=..
 (If the blob is absent or malformed you get the `no firmware`/`malformed` hint
 instead — both are clean, non-fatal.)
 
-**Beyond this point is the hardware tail that is not wired yet.** Once IWL-TRANS
-is enabled and triggered, the next markers will be the `IWLTRANS:` lines around
-APM power-up and ring setup. The discipline is: **every risky MMIO touch is
+**Beyond this point is the hardware-unverified tail.** Running `iwlup` produces
+the `IWLTRANS:`/`IWLLOAD:`/`IWLNVM:`/`IWLSCAN:` marker ladder. The discipline is:
+**every risky MMIO touch is
 preceded by a serial marker**, so whichever marker is the *last line printed*
 tells you exactly where the radio stalled. That last-line-wins ladder is how you
 iterate: flash → boot → read the last marker → fix the step it names → reflash.
@@ -274,7 +288,7 @@ boot.
 | `IWL: BAR0 not mapped -- aborting safe probe` | PCI BAR0 not assigned (BIOS/PCI enumeration) | Confirm `lspci` shows a memory BAR for the device; check that `pci_enable_memory_space`/`bus_master` ran; this is a platform/PCI issue, not the radio |
 | `CSR_HW_REV=0x00000000` or `0xffffffff` | MMIO not actually reaching the device (bad BAR map, card powered down, or a bus stall) | `0xffffffff` usually = no device responding (RF-kill / power); `0x0` = mapped-but-dead. Recheck RF-kill switch and BAR mapping before going further |
 | `IWL-FW: no firmware <path> in initrd` | No `.ucode` staged, or the loader path ≠ the staged path | Drop `iwlwifi-<family>-<api>.ucode` into `/tmp/ird/lib/firmware/`, add the `cp` in `build_all.sh`, and make the `iwl_fw_load_from_initrd` path match exactly |
-| `IWL-FW: <path> is malformed (not a valid TLV .ucode)` | Wrong/corrupt blob, or a legacy v1 (non-TLV) image | Re-download the matching family file from linux-firmware; confirm it is a modern TLV image (the parser rejects v1 by design — `zero` field must be 0, `magic` must be `IWL\n`) |
+| `IWL-FW: <path> is malformed (not valid legacy/TLV .ucode)` | Wrong-family, corrupt, truncated, or structurally inconsistent blob | Re-download the exact family/API filename from linux-firmware; do not rename another card's firmware to a generic alias |
 | Stall at marker **X** (last serial line before a hang) | The MMIO touch *after* marker X wedged (most likely a real hardware bus stall on the T410) | Note marker X — it names the exact step. Compare that register access against the Linux `iwlwifi` source for this family; consider gating that step OFF and deferring, the same way the PCH NIC's risky half was deferred |
 | **ALIVE timeout** (once IWL-LOAD exists) | uCode loaded but the radio never raised the ALIVE notification within `IWL_TRANS_POLL_MAX` | Verify the firmware family/API matches the card; verify INST/DATA were copied to the right SRAM/DRAM addresses; verify APM power-up + clocks completed (earlier markers); this is the core hardware-iteration step with no emulator |
 | Scan returns nothing once OPS exists, but auth/DHCP code looks fine | Software above the seam is *not* the problem — it is QEMU-proven | The bug is in the radio path (RF config / scan command / RX ring), below the seam. Keep `WIFI_SIM=1` as the known-good A/B reference for everything above the seam |
@@ -286,7 +300,42 @@ boot.
 - **Build it:** `T410_SAFE=1 IWLWIFI=1 bash scripts/quick_build.sh && bash scripts/build_all.sh`
 - **The seam:** `kernel/include/wifi.h` (`wifi_ops_t`) + `kernel/include/uapi/wlan.h` (`SYS_WLAN_*`)
 - **The sim (known-good reference):** `kernel/drivers/net/wireless/sim/wifisim.c` (`WIFI_SIM=1`)
-- **The real driver:** `kernel/drivers/net/wireless/intel/iwlwifi/` — `iwl-pci.c` (IDENT, done), `iwl-fw.c`+`iwl-fw-file.h` (FW parse, done), `iwl-csr.h` (TRANS register map, held), LOAD/OPS not yet written
+- **The real driver:** `kernel/drivers/net/wireless/intel/iwlwifi/` — firmware parse and pure KATs are complete; transport/load/NVM/scan are hardware-unverified; association, EAPOL/key install, and data TX/RX remain incomplete
 - **Firmware:** `iwlwifi-<family>-<api>.ucode` from linux-firmware → `/tmp/ird/lib/firmware/` (non-secured / no RSA sig on 1000/5000/6000)
 - **Diagnosis:** attach a serial console; the **last `IWL:`/`IWLTRANS:` marker before a hang** names the failing step
-- **Golden rule:** nothing above the seam needs changing — when the radio can scan, the whole proven WPA2/WPA3 + DHCP stack just works over real air
+- **Golden rule:** treat simulator state transitions as control-plane tests only; require packet captures and WLAN-only DHCP/TLS before claiming real WPA2 or Internet connectivity
+
+---
+
+## Addendum -- deep-research findings on WPA3 and card choice (2026-10-02; [V] primary source read, [S] secondary, [I] inference)
+
+**Verdict for "connect to my WPA3 network on this laptop":** spec-compliant WPA3-Personal (SAE **plus** protected management
+frames) is **not available on the Intel 6000-series cards the T410 shipped with**.
+
+* [V] Linux `iwldvm` sets `MFP_CAPABLE` only if the firmware advertises `IWL_UCODE_TLV_FLAGS_MFP`. Parsed from the current
+  linux-firmware blobs: `iwlwifi-6000g2a-6` / `6000g2b-6` have TLV flags 0xb (MFP bit clear); `iwlwifi-6000-4` (6200/6300) is the old
+  non-TLV format (no flags at all); 1000-5 / 5000-5 / 6050-5 likewise. The DVM key ABI has only NO_ENC/WEP/CCMP/TKIP -- no BIP/IGTK
+  key type. mac80211 therefore drops the BIP cipher suites for these cards.
+* What works: **WPA2-PSK on a WPA2/WPA3 *transition-mode* SSID (PMF optional)**; SAE *without* PMF only against an AP that sets
+  `sae_require_mfp=0` (non-compliant; field reports of it completing on a 6200/6235); it **fails** on WPA3-only SSIDs and on mixed
+  SSIDs with `sae_require_mfp=1` (the current OpenWrt default). Host-software IGTK/BIP is plausible but unproven for SAE on this chip [I].
+* **Recommended path:** (1) `lspci -nn` on the laptop to learn the real card; (2) put the router (or a second SSID) in
+  WPA2/WPA3 transition mode with PMF *optional*; (3) finish the station-mode bring-up to WPA2-PSK + DHCP; (4) add SAE-without-PMF only
+  as an optional extra. Wired Ethernet (`PCH_NIC=1`, see the hardware ladder) remains the dependable internet path meanwhile.
+* **Which cards shipped** [V: Lenovo HMM 63y0535 Table 39]: Intel Wireless-N 1000, Realtek "Adapter II" (RTL8192SE 10ec:8172 or
+  RTL8188CE 10ec:8176 [S]), Intel Advanced-N 6200, Ultimate-N 6300, Advanced-N + WiMAX 6250. **Not** a T410 option: 6205.
+  Our `iwl-devices.h` has 4239, 4238, 422B, 0085; **missing**: 422C (6200), 0083/0084 (1000), 0087/0089 (6250/6050) [V: Linux
+  device table]. Add them (and the matching firmware families `iwlwifi-1000-5`, `iwlwifi-6050-5`) in the next Wi-Fi brick, default-OFF.
+* **BIOS whitelist** [V: HMM error 1802 "Unauthorized network card"; S: ThinkWiki]: swapping in a non-Lenovo card (e.g. Atheros
+  AR9280, whose ath9k driver is fully ISC-licensed and needs no firmware blob) needs a patched BIOS or an EEPROM-ID rewrite -- brick
+  risk, not recommended without a recovery plan. Atheros was never a T410 option.
+* **License handling:** Linux `dvm/commands.h`, `agn.h`, `iwl-csr.h`, `iwl-prph.h`, `fw/file.h` are `GPL-2.0 OR BSD-3-Clause` (take the
+  BSD-3 option and keep the notice); `dvm/rxon.c`, `main.c`, `mac80211.c`, `scan.c`, `tx.c`, `rx.c`, `sta.c` are GPL-only (behaviour
+  only, never copy). OpenBSD/FreeBSD `iwn(4)` (ISC; keep every copyright holder's notice) supports the 6000 series and is the cleaner
+  reference -- but implements **no** 802.11w. Intel firmware (`LICENCE.iwlwifi_firmware`): unmodified binary redistribution allowed
+  with the licence text, no reverse engineering; the project still does not bundle blobs -- the owner stages them in `firmware/`.
+* **Effort ladder** (OpenBSD `iwn` is 7.2k lines for every family; a minimal 6000-series station path is ~3-4.5k lines [I]):
+  BAR0/APM/EEPROM (MAC matches the card label) -> DMA rings + interrupts -> firmware load (hardest, hardware-only) -> BT-coex/
+  calibration/RXON -> scan -> open auth+assoc -> EAPOL + PTK/GTK via ADD_STA -> 802.11<->802.3 + DHCP. Every step needs the physical
+  laptop; QEMU emulates no iwlwifi device. Hardware unknowns: firmware-alive failures, per-card EEPROM calibration, hardware rfkill,
+  BT-coexistence stalls, ASPM/clock quirks on the Ibex Peak root port.

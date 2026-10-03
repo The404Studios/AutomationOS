@@ -715,6 +715,15 @@ static void ps2_handle_mouse_packet(void) {
         mouse_packet_index = 0;
         return;
     }
+    // Drop packets with the X/Y overflow bits set (0x40 / 0x80). On fast
+    // movement the controller cannot represent the delta in 8 bits and sets
+    // these; dx/dy are then truncated garbage. Applying them yields a wrong,
+    // jumpy cursor jump, so discard the packet (matching ps2mouse.c). The sync
+    // check above only validated bit 3, never the overflow bits.
+    if (flags & 0xC0) {
+        mouse_packet_index = 0;
+        return;
+    }
 
     // Handle sign extension for 9-bit values
     if (flags & 0x10) dx |= 0xFF00;  // X sign bit

@@ -417,6 +417,23 @@ int64_t sys_fork(uint64_t arg1, uint64_t arg2, uint64_t arg3,
             return ENOMEM;
         }
     }
+    // ── Inherit the parent's SHM attachments ────────────────────────
+    // fork_copy_user_pages maps the parent's SHM physical frames into the
+    // child's CR3 (non-PTE_OWNED shared pages), but the SHM subsystem is
+    // never told. Without this, the child's shm_attachments stays NULL
+    // and attach_count is never incremented, so when the parent dies or
+    // detaches, shm_cleanup_process frees the physical pages while the
+    // child still has live writable PTEs — cross-allocation heap corruption.
+    {
+        extern int shm_fork_inherit(process_t* parent, process_t* child);
+        int shm_rc = shm_fork_inherit(parent, child);
+        if (shm_rc < 0) {
+            kprintf("[SYSCALL] sys_fork: SHM inherit failed (OOM); failing fork\n");
+            process_destroy(child);
+            return ENOMEM;
+        }
+    }
+
     // ---- Inherit the parent's regular-file fd table (FORK-FD-TABLE-0) ----
     // POSIX fork() shares open file descriptors with the child. Deep-copy each
     // copy-safe ramfs/inode-backed fd into an INDEPENDENT vfs_file_t (shared
@@ -518,6 +535,7 @@ int64_t sys_fork(uint64_t arg1, uint64_t arg2, uint64_t arg3,
     // stable-identity stamp (#10) in sync with the pid override so the child can
     // validate its parent is this exact incarnation, not a recycled PID.
     child->parent_pid = parent->pid;
+    child->cap_denied = parent->cap_denied;                                /* PCAP-0: fork inherits drops */
     child->parent_seq = parent->create_seq;
 
     // ── Make the child schedulable ─────────────────────────────────

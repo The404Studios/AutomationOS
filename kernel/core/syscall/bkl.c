@@ -65,7 +65,14 @@ extern uint32_t cpu_id(void);
 #define BKL_UNOWNED      0xFFFFFFFFu
 #define BKL_WATCHDOG_TSC (2000000ULL * 3000ULL)   /* ~2 s at the 3 GHz estimate */
 
-static volatile uint32_t bkl_word      = 0;            /* the lock bit          */
+/* FIFO TICKET lock (was a plain test-and-set). A TAS lock is UNFAIR: a CPU that issues marked syscalls back to
+ * back (e.g. `ps` printing 127 lines, one marked write each) re-wins the lock every time while the other CPU spins
+ * IF=0 for seconds -- the multi-core proof caught CPU1 starved >2 s that way, and the same starvation would hit the
+ * desktop's compositor if a chatty batch job (a build) ran on CPU1. With tickets each waiter is served in arrival
+ * order, so a wait is bounded by (queue length x hold time) and the watchdog below only fires on a genuinely long hold. */
+static volatile uint32_t bkl_next      = 0;            /* next ticket to hand out        */
+static volatile uint32_t bkl_serving   = 0;            /* ticket currently allowed in    */
+static volatile uint32_t bkl_word      = 0;            /* held flag: ONLY the owner-recursive fast path reads it */
 static volatile uint32_t bkl_owner     = BKL_UNOWNED;  /* owning CPU            */
 static volatile uint32_t bkl_depth     = 0;            /* owner recursion depth */
 
@@ -129,7 +136,8 @@ void bkl_acquire(void) {
 
     int contended = 0;
     uint64_t s = rdtsc();
-    while (__atomic_test_and_set(&bkl_word, __ATOMIC_ACQUIRE)) {
+    uint32_t ticket = __atomic_fetch_add(&bkl_next, 1, __ATOMIC_ACQ_REL);
+    while (__atomic_load_n(&bkl_serving, __ATOMIC_ACQUIRE) != ticket) {
         contended = 1;
         if (!bkl_watchdog_fired && (rdtsc() - s) >= BKL_WATCHDOG_TSC) {
             /* The tripwire for the "marked path blocked while holding the
@@ -146,6 +154,7 @@ void bkl_acquire(void) {
         }
         __asm__ volatile("pause" ::: "memory");
     }
+    __atomic_store_n(&bkl_word, 1, __ATOMIC_RELEASE);
     __atomic_store_n(&bkl_owner, me, __ATOMIC_RELEASE);
     bkl_depth = 1;
 
@@ -178,6 +187,8 @@ void bkl_release(void) {
     }
     if (--bkl_depth == 0) {
         __atomic_store_n(&bkl_owner, BKL_UNOWNED, __ATOMIC_RELEASE);
-        __atomic_clear(&bkl_word, __ATOMIC_RELEASE);
+        __atomic_store_n(&bkl_word, 0, __ATOMIC_RELEASE);
+        /* hand the lock to the next ticket in line (FIFO) */
+        __atomic_store_n(&bkl_serving, bkl_serving + 1, __ATOMIC_RELEASE);
     }
 }

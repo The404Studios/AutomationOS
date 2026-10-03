@@ -117,7 +117,7 @@ int ca_add_root_pem(const char *name, const char *pem, unsigned long pemlen);
  * Maximum entries the bundle can hold (static + runtime combined).
  * Increase if you need more roots; each entry is just a pointer + length.
  */
-#define CA_MAX_ROOTS   32
+#define CA_MAX_ROOTS   64
 
 /*
  * Total byte capacity of the runtime DER slab pool (used by ca_add_root_pem).

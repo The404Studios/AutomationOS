@@ -1,8 +1,8 @@
 /*
- * iwl-fw.c -- Intel iwlwifi MODERN TLV uCode firmware parser (IWL-FW).
- * ===================================================================
- * Brick 2 of the real Intel WiFi driver. Parses the on-disk TLV .ucode
- * container (layout in iwl-fw-file.h) into an iwl_fw result: the version plus
+ * iwl-fw.c -- Intel iwlwifi legacy and TLV uCode firmware parser (IWL-FW).
+ * =======================================================================
+ * Brick 2 of the real Intel WiFi driver. Parses the on-disk .ucode container
+ * (layout in iwl-fw-file.h) into an iwl_fw result: the version plus
  * the INST/DATA/INIT/INIT_DATA sub-image sizes the later loader bricks
  * (IWL-TRANS / IWL-LOAD) will copy into the radio's SRAM/DRAM rings.
  *
@@ -26,6 +26,7 @@
 #include "kernel.h"          /* kprintf */
 #include "initrd.h"          /* initrd_get_file */
 #include "iwl-fw-file.h"
+#include "iwl-fw-load.h"
 
 /*
  * Little-endian uint32 read from an unaligned byte cursor. The header/TLV
@@ -69,7 +70,20 @@ int iwl_fw_parse(const uint8_t* blob, uint32_t len, struct iwl_fw* out) {
     out->init_data_size = 0;
     out->num_tlvs = 0;
 
-    /* Header must fit. */
+    /* A non-zero first word identifies the legacy DVM container used by the
+     * 5000/6000 firmware commonly needed on a T410. */
+    if (len >= 4 && iwl_get_le32(blob) != 0) {
+        struct iwl_legacy_fw_layout legacy;
+        if (iwl_legacy_fw_decode(blob, len, &legacy) != 0) return -1;
+        out->ver            = legacy.ver;
+        out->inst_size      = legacy.inst_size;
+        out->data_size      = legacy.data_size;
+        out->init_size      = legacy.init_size;
+        out->init_data_size = legacy.init_data_size;
+        return 0;
+    }
+
+    /* TLV header must fit. */
     if (len < IWL_FW_HDR_SIZE)
         return -1;
 
@@ -168,12 +182,13 @@ int iwl_fw_load_from_initrd(const char* path, struct iwl_fw* out) {
 
     int rc = iwl_fw_parse((const uint8_t*)data, (uint32_t)size, out);
     if (rc != 0) {
-        kprintf("IWL-FW: %s is malformed (not a valid TLV .ucode)\n", path);
+        kprintf("IWL-FW: %s is malformed (not valid legacy/TLV .ucode)\n", path);
         return -1;
     }
 
-    kprintf("IWL-FW: loaded %s: inst=%u data=%u init=%u init_data=%u ver=%u tlvs=%d\n",
-            path, out->inst_size, out->data_size, out->init_size,
+    kprintf("IWL-FW: loaded %s (%s): inst=%u data=%u init=%u init_data=%u ver=%u tlvs=%d\n",
+            path, iwl_get_le32((const uint8_t*)data) ? "legacy" : "TLV",
+            out->inst_size, out->data_size, out->init_size,
             out->init_data_size, out->ver, out->num_tlvs);
     return 0;
 }
@@ -281,6 +296,18 @@ int iwl_fw_selftest(void) {
         if (fw.num_tlvs       != 4)                    ok = 0;
     }
 
+    iwl_fw_images_t images;
+    if (iwl_fw_capture_sections(iwl_synth_ucode,
+                                (uint32_t)sizeof(iwl_synth_ucode), &images) != 0 ||
+        images.inst.data != iwl_synth_ucode + 96 ||
+        images.inst.len != IWL_ST_INST_LEN ||
+        images.data.len != IWL_ST_DATA_LEN ||
+        images.init_inst.len != IWL_ST_INIT_LEN ||
+        images.init_data.len != IWL_ST_INIT_DATA_LEN) {
+        kprintf("IWL-FW: TLV section capture FAILED\n");
+        ok = 0;
+    }
+
     /* ---- negative test 1: truncated blob (header says a TLV the bytes don't
      * cover). Truncate the synthetic blob mid-INST-payload; the parser must
      * reject it with -1 and must NOT read past the truncated length. ---- */
@@ -345,6 +372,38 @@ int iwl_fw_selftest(void) {
     int rc_mis = iwl_fw_parse(misaligned, (uint32_t)sizeof(misaligned), &fw_bad);
     if (rc_mis != -1) {
         kprintf("IWL-FW: negative(misaligned) FAILED -- expected -1 got %d\n", rc_mis);
+        ok = 0;
+    }
+
+    /* ---- legacy v2 positive + truncation tests. This is the container used by
+     * iwlwifi-6000-4.ucode on common T410 Intel 6200/6300 cards. ---- */
+    static uint8_t legacy[28 + 16 + 8 + 12 + 4];
+    for (uint32_t i = 0; i < sizeof(legacy); i++) legacy[i] = 0;
+    /* ver API=4, build, then INST/DATA/INIT/INIT_DATA/BOOT sizes. */
+    legacy[0] = 0x00; legacy[1] = 0x04; legacy[2] = 0x01; legacy[3] = 0x00;
+    legacy[4] = 0x2a;
+    legacy[8] = 16; legacy[12] = 8; legacy[16] = 12; legacy[20] = 4;
+    for (uint32_t i = 28; i < sizeof(legacy); i++) legacy[i] = (uint8_t)i;
+
+    int rc_legacy = iwl_fw_parse(legacy, (uint32_t)sizeof(legacy), &fw_bad);
+    if (rc_legacy != 0 || fw_bad.inst_size != 16 || fw_bad.data_size != 8 ||
+        fw_bad.init_size != 12 || fw_bad.init_data_size != 4 ||
+        IWL_UCODE_API(fw_bad.ver) != 4 || fw_bad.num_tlvs != 0) {
+        kprintf("IWL-FW: legacy-v2 parse FAILED (rc=%d)\n", rc_legacy);
+        ok = 0;
+    }
+    if (iwl_fw_parse(legacy, (uint32_t)sizeof(legacy) - 1, &fw_bad) != -1) {
+        kprintf("IWL-FW: legacy-v2 truncation FAILED\n");
+        ok = 0;
+    }
+    if (iwl_fw_capture_sections(legacy, (uint32_t)sizeof(legacy), &images) != 0 ||
+        images.inst.data != legacy + IWL_LEGACY_V2_HDR_SIZE ||
+        images.data.data != legacy + IWL_LEGACY_V2_HDR_SIZE + 16 ||
+        images.init_inst.data != legacy + IWL_LEGACY_V2_HDR_SIZE + 16 + 8 ||
+        images.init_data.data != legacy + IWL_LEGACY_V2_HDR_SIZE + 16 + 8 + 12 ||
+        images.inst.len != 16 || images.data.len != 8 ||
+        images.init_inst.len != 12 || images.init_data.len != 4) {
+        kprintf("IWL-FW: legacy-v2 section capture FAILED\n");
         ok = 0;
     }
 

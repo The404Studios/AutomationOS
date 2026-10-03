@@ -94,12 +94,32 @@ static bool shm_attach_add(process_t* proc, ipc_id_t shm_id, void* virt_addr, si
     return true;
 }
 
+// Find an existing attachment for (shm_id, virt_addr). Caller must hold shm_lock.
+static shm_attachment_t* shm_attach_find(process_t* proc, ipc_id_t shm_id, void* virt_addr) {
+    for (shm_attachment_t* a = proc->shm_attachments; a; a = a->next) {
+        if (a->shm_id == shm_id && a->virt_addr == virt_addr) {
+            return a;
+        }
+    }
+    return NULL;
+}
+
 // Remove an attachment from the process's list. Caller must hold shm_lock.
 // Returns true if found and removed, false otherwise.
-static bool shm_attach_remove(process_t* proc, ipc_id_t shm_id) {
+//
+// Matches on BOTH shm_id AND the exact virt_addr the caller attached at. The
+// id alone is not sufficient: sys_shmat accepts an explicit shmaddr that need
+// not equal the id-formula VA, so a caller could hold a record for id N at
+// address A while sys_shmdt (which resolves the segment by VA->id math) is
+// invoked with the *formula* VA B != A. An id-only match would then succeed,
+// drive attach_count to 0, and free physical pages still mapped at A -- a
+// same-process use-after-free. Requiring virt_addr to match ties the detach to
+// a real attachment, so a mismatched address is rejected instead of freeing
+// live pages.
+static bool shm_attach_remove(process_t* proc, ipc_id_t shm_id, void* virt_addr) {
     shm_attachment_t** pp = &proc->shm_attachments;
     while (*pp) {
-        if ((*pp)->shm_id == shm_id) {
+        if ((*pp)->shm_id == shm_id && (*pp)->virt_addr == virt_addr) {
             shm_attachment_t* victim = *pp;
             *pp = victim->next;
             kfree(victim);
@@ -120,6 +140,58 @@ static void shm_attach_free_all(process_t* proc) {
         att = next;
     }
     proc->shm_attachments = NULL;
+}
+
+// ─── Fork SHM inheritance ─────────────────────────────────────────────────
+//
+// fork_copy_user_pages maps the parent's SHM physical frames into the child's
+// CR3 (non-PTE_OWNED branch), but the SHM subsystem is never told about the
+// child. Without this, the child's shm_attachments stays NULL and
+// attach_count is never incremented, so when the parent dies or detaches,
+// cleanup frees the physical pages while the child still has live writable
+// PTEs → classic cross-allocation heap corruption / stale-PTE UAF.
+//
+// This function duplicates the parent's attachment records into the child and
+// bumps each segment's attach_count, making the SHM subsystem track the
+// child's inherited mappings. On OOM (record alloc fails), it rolls back
+// the partially-incremented attach_counts and returns -1 so sys_fork can
+// fail the whole fork rather than leave the child half-tracked.
+
+int shm_fork_inherit(process_t* parent, process_t* child) {
+    if (!parent || !child) return 0;
+    if (!parent->shm_attachments) return 0;   // nothing to inherit
+
+    spin_lock(&shm_lock);
+
+    int inherited = 0;
+    for (shm_attachment_t* att = parent->shm_attachments; att; att = att->next) {
+        shm_segment_t* seg = shm_find_by_id(att->shm_id);
+        if (!seg) continue;   // segment was destroyed between fork start and here
+
+        if (!shm_attach_add(child, att->shm_id, att->virt_addr, att->size, att->flags)) {
+            // OOM: roll back the attach_counts we already bumped this call.
+            // The child's partially-populated shm_attachments list will be
+            // cleaned up by process_destroy (which calls shm_cleanup_process).
+            // We only need to undo the increments WE made, so the segments
+            // don't leak from an over-counted attach_count.
+            for (shm_attachment_t* r = child->shm_attachments; r; r = r->next) {
+                shm_segment_t* rs = shm_find_by_id(r->shm_id);
+                if (rs && rs->attach_count > 0) rs->attach_count--;
+            }
+            spin_unlock(&shm_lock);
+            return -1;
+        }
+        seg->attach_count++;
+        inherited++;
+    }
+
+    spin_unlock(&shm_lock);
+
+    if (inherited > 0) {
+        kprintf("[SHM] fork: inherited %d SHM attachment(s) from PID %d to PID %d\n",
+                inherited, parent->pid, child->pid);
+    }
+    return 0;
 }
 
 // ─── Internal helpers ─────────────────────────────────────────────────────
@@ -570,6 +642,19 @@ int64_t sys_shmat(uint64_t shmid, uint64_t shmaddr, uint64_t shmflg,
         }
     }
 
+    // Idempotent re-attach guard. For addr==NULL the VA is deterministic
+    // (SHM_VA_BASE + id*STRIDE), so a shmat() loop on one segment re-maps the
+    // SAME pages to the SAME VA every time -- but without this check each call
+    // would kmalloc a fresh attach record and bump attach_count, letting an
+    // unprivileged loop exhaust the kernel heap (local DoS) with no address-space
+    // backpressure. If we already hold a record for this segment at this VA, the
+    // mapping above was a harmless no-op rewrite; return the VA without adding a
+    // duplicate record or inflating attach_count.
+    if (shm_attach_find(current, seg->id, (void*)virt_addr)) {
+        spin_unlock(&shm_lock);
+        return (int64_t)virt_addr;
+    }
+
     // Create the per-process attachment record BEFORE bumping attach_count so the two
     // stay consistent. If the record can't be allocated, roll back the whole mapping
     // (shared frames -> free_owned=false, same helper as the partial-map rollback
@@ -678,10 +763,15 @@ int64_t sys_shmdt(uint64_t shmaddr, uint64_t arg2, uint64_t arg3,
     // physical pages another owner still maps -- a cross-process use-after-free.
     // Do the ownership check + record removal FIRST, and bail before touching
     // any shared state if the caller never attached.
-    if (!shm_attach_remove(current, seg->id)) {
+    // Require an attach record for THIS segment at THIS exact address. Matching
+    // on the address (not just seg->id) is what blocks the same-process UAF: a
+    // detach whose address does not correspond to a real attachment is refused
+    // before any page is unmapped or freed. The address we unmap below is thus
+    // guaranteed to be one this process actually mapped.
+    if (!shm_attach_remove(current, seg->id, (void*)virt_addr)) {
         spin_unlock(&shm_lock);
-        kprintf("[SHMDT] pid=%d never attached segment %d -- denied\n",
-                current->pid, seg->id);
+        kprintf("[SHMDT] pid=%d no attachment for segment %d at %p -- denied\n",
+                current->pid, seg->id, (void*)virt_addr);
         return IPC_EINVAL;
     }
 

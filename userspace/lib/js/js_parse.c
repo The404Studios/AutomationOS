@@ -163,7 +163,7 @@ static int is_assign_op(js_tok_kind k)
 /* ------------------------------------------------------------------ */
 
 /* assignment level (right-assoc, also handles ternary below it) */
-static js_node *parse_assign(parser *p)
+static js_node *parse_assign_inner(parser *p)
 {
     js_node *left = parse_binary(p, 1);
     if (!left) return NULL;
@@ -192,6 +192,23 @@ static js_node *parse_assign(parser *p)
         return n;
     }
     return left;
+}
+
+/* Depth-guarded wrapper. parse_assign recurses into itself for the right-assoc
+ * ternary alternative and assignment RHS, which does NOT pass through the
+ * parse_unary guard -- so '1?0:1?0:...' or 'a=a=a=...' would otherwise overflow
+ * the ~64KB user stack. Count these frames against the shared depth budget. */
+static js_node *parse_assign(parser *p)
+{
+    js_node *r;
+    if (++p->depth > JS_PARSE_MAX_DEPTH) {
+        p->depth--;
+        p_err(p, "expression too deeply nested");
+        return NULL;
+    }
+    r = parse_assign_inner(p);
+    p->depth--;
+    return r;
 }
 
 /* binary precedence climbing; min_prec is the lowest precedence allowed */
@@ -537,7 +554,15 @@ static js_node *parse_primary(parser *p)
     case T_FUNCTION: { return parse_function(p, 0); }
     case T_NEW: {
         advance(p);
+        /* 'new new new ...' recurses parse_primary->parse_primary directly,
+         * bypassing the parse_unary guard; count it against the depth budget. */
+        if (++p->depth > JS_PARSE_MAX_DEPTH) {
+            p->depth--;
+            p_err(p, "expression too deeply nested");
+            return NULL;
+        }
         js_node *callee = parse_primary(p);
+        p->depth--;
         if (!callee) return NULL;
         /* allow member chain on callee before args: new a.b() */
         for (;;) {
@@ -852,7 +877,7 @@ static js_node *parse_block(parser *p)
     return n;
 }
 
-static js_node *parse_stmt(parser *p)
+static js_node *parse_stmt_inner(parser *p)
 {
     switch (kind(p)) {
     case T_LBRACE:   return parse_block(p);
@@ -900,6 +925,23 @@ static js_node *parse_stmt(parser *p)
         return n;
     }
     }
+}
+
+/* Depth-guarded wrapper. Statement nesting -- parse_block -> parse_stmt, and
+ * parse_if/while/do/for/try -> parse_stmt -- recurses once per level and does
+ * NOT pass through the parse_unary guard, so deeply nested '{' or 'if(1)...'
+ * would otherwise overflow the user stack. Share the depth budget. */
+static js_node *parse_stmt(parser *p)
+{
+    js_node *r;
+    if (++p->depth > JS_PARSE_MAX_DEPTH) {
+        p->depth--;
+        p_err(p, "statement too deeply nested");
+        return NULL;
+    }
+    r = parse_stmt_inner(p);
+    p->depth--;
+    return r;
 }
 
 /* ------------------------------------------------------------------ */

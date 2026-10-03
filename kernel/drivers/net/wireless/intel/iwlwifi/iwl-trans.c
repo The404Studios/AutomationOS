@@ -180,7 +180,7 @@ void iwl_release_nic_access(struct iwl_trans* trans) {
 
 /* ====================================================================== *
  *  iwl_is_rfkill -- read the live hardware RF-kill switch state.
- *  Linux iwl_is_rfkill_set: CSR_GP_CNTRL bit 27 (HW_RF_KILL_SW) reads SET when
+ *  Linux iwl_is_rfkill_set: CSR_GP_CNTRL bit 27 (HW_RF_KILL_SW) reads CLEAR when
  *  the radio is DISABLED -- the physical wireless slider on the T410 front edge,
  *  or a BIOS "WLAN disabled" setting. An asserted RF-kill makes the firmware
  *  drop everything silently: scan returns zero SSIDs with no other error. So we
@@ -189,7 +189,7 @@ void iwl_release_nic_access(struct iwl_trans* trans) {
 int iwl_is_rfkill(struct iwl_trans* trans) {
     if (!trans || !trans->mmio) return 0;
     uint32_t gp = iwl_read32(trans, CSR_GP_CNTRL);
-    int killed = (gp & CSR_GP_CNTRL_REG_FLAG_HW_RF_KILL_SW) ? 1 : 0;
+    int killed = (gp & CSR_GP_CNTRL_REG_FLAG_HW_RF_KILL_SW) ? 0 : 1;
     trans->rf_kill = killed;
     return killed;
 }

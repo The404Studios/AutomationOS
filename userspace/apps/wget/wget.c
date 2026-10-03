@@ -216,19 +216,21 @@ static int fetch(const char *url, const char *outfile, int insecure) {
         return 1;
     }
 
-    /* For HTTPS: warn about unauthenticated connections unless -k/--insecure. */
-    if (is_https && !insecure) {
-        out("wget: warning: server certificate not validated (no CA roots installed)\n");
-    }
-
     int status = 0;
     long n;
+    http_set_tls_strict(insecure ? 0 : 1);        /* TLS-STRICT-0: -k is the only way to accept an unverified cert */
     if (is_https) {
         n = https_get(g_host, port, g_path, body, sizeof(body), &status);
     } else {
         n = http_get(g_host, port, g_path, body, sizeof(body), &status);
     }
 
+    if (n == HTTP_ERR_CERT) {
+        out("wget: server certificate NOT trusted -- the chain does not anchor to a built-in CA root\n");
+        out("wget: (expired, self-signed, wrong host, or a possible man-in-the-middle). No request was sent.\n");
+        out("wget: Re-run with -k/--insecure only if you accept that risk.\n");
+        return 1;
+    }
     if (n < 0) {
         out("wget: request failed for ");
         out(is_https ? "https://" : "http://");
@@ -236,6 +238,33 @@ static int fetch(const char *url, const char *outfile, int insecure) {
         out(g_path);
         out("\n");
         return 1;
+    }
+
+    /*
+     * TLS trust enforcement (fail-closed by default).
+     *
+     * For an HTTPS request the connection is encrypted, but that alone does NOT
+     * prove we are talking to the real server -- a man-in-the-middle can present
+     * any certificate.  http_last_trusted() reports whether the server's chain
+     * authenticated against a built-in CA root.  If it did not, we refuse to
+     * emit the (unauthenticated) body unless the user explicitly passed
+     * -k/--insecure, exactly like curl.  We check http_last_secure() too so that
+     * an https:// that silently DOWNGRADED to http:// on a redirect is also
+     * caught -- serving that body would be a stripped-TLS attack.
+     */
+    if (is_https && !insecure && !http_last_trusted()) {
+        if (!http_last_secure()) {
+            out("wget: refusing https:// that downgraded to plaintext http://\n");
+        } else {
+            out("wget: server certificate NOT trusted -- chain does not anchor to a\n");
+            out("wget: built-in CA root (possible man-in-the-middle).\n");
+        }
+        out("wget: refusing to write unauthenticated data. Re-run with -k/--insecure\n");
+        out("wget: to accept the connection without certificate validation.\n");
+        return 1;
+    }
+    if (is_https && insecure) {
+        out("wget: warning: proceeding WITHOUT certificate validation (-k)\n");
     }
 
     /* Status line to fd 1, e.g. "HTTP 200, 1234 bytes\n". */

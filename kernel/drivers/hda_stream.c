@@ -108,6 +108,18 @@ int hda_stream_setup(hda_controller_t* ctrl, hda_stream_t* stream,
         hda_stream_stop(ctrl, stream);
     }
 
+    /* HDA-SAFE-0: a stream is re-set-up for every tone (audio_tone.c reuses g_tone_stream), and each
+     * call allocated a fresh 64 KB DMA buffer + BDL page WITHOUT releasing the previous ones. The
+     * stream is stopped here, so the old DMA targets are no longer referenced -- release them. */
+    if (stream->buffer_phys) {
+        pmm_free_pages(stream->buffer_phys, (size_t)((stream->buffer_size + 4095) / 4096));
+        stream->buffer_phys = 0; stream->buffer_virt = 0;
+    }
+    if (stream->bdl_phys) {
+        pmm_free_page(stream->bdl_phys);
+        stream->bdl_phys = 0; stream->bdl_virt = 0;
+    }
+
     // Calculate format register value
     uint16_t format = 0;
 

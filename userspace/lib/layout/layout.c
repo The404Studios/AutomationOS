@@ -26,8 +26,16 @@
 #define LINE_H_OF(fs) ((fs) + 4)
 
 /* Maximum layout recursion depth guard — prevents stack overflow on
- * pathologically deep DOM trees. */
-#define MAX_DEPTH 256
+ * pathologically deep DOM trees. MUST stay below the depth at which
+ * layout_node's recursion exhausts the 64 KB ring-3 stack: each frame
+ * stack-allocates two address-taken css_computed structs (~104 B each) plus an
+ * inline_state, ~360 B/frame, so the safe ceiling is ~(64KB - browser2 call
+ * chain) / 360 ≈ 140. 110 leaves margin. This was 256 -- ABOVE the HTML
+ * parser's 200-node nesting cap, so it could never fire before the stack blew
+ * (a crafted ~200-deep <div> page crashed browser2 while laying it out).
+ * Nodes deeper than this are simply not laid out (return 0 height); the DOM
+ * itself is still valid and freed normally. */
+#define MAX_DEPTH 110
 
 /* ------------------------------------------------------------------ */
 /* Small helpers.                                                       */

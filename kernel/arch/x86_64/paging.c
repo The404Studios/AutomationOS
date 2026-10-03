@@ -46,6 +46,22 @@ bool cpu_smap_active = false;
 #define PTE_ACCESSED   (1ULL << 5)
 #define PTE_DIRTY      (1ULL << 6)
 
+// PT-DIRECTMAP-0: dereference page-table FRAMES through the DIRECT MAP, never the low
+// identity alias. The page-table walkers used to cast a physical frame address straight
+// to a pointer (phys==virt). Under a PROCESS CR3 the low identity range holds that
+// process's own user mappings, so a large image (browser2: 33 MB BSS from 0x882000)
+// shadows page-table frames that live at the same numeric address: the kernel then READ
+// and WROTE the user's pages instead of the tables -- PML4[255] read back as user data,
+// the stack demand fault 'resolved' without installing a PTE, the instruction re-faulted
+// forever and every retry leaked a frame until the PMM was empty (any RAM size).
+// The direct map (PML4[256]) is dedicated, never split and present in every CR3.
+// Table-valued pointers in this file still HOLD the physical address (that is what gets
+// stored in PTEs / compared with CR3); only the dereference goes through PTV().
+// Until paging_init has installed the direct map the raw identity pointer is used (the
+// boot-time identity construction), exactly as before.
+static bool g_pt_dm_online = false;
+#define PTV(p) ((page_table_t*)(g_pt_dm_online ? PHYS_TO_DIRECT((uint64_t)(p)) : (void*)(p)))
+
 static page_table_t* alloc_page_table(void) {
     void* page = pmm_alloc_page();
     if (!page) return NULL;
@@ -162,16 +178,16 @@ void paging_init(void) {
     // sufficient for page tables and kernel heap.
 
     // Get boot PDPT from PML4[0]
-    if (!(boot_pml4->entries[0] & PTE_PRESENT)) {
+    if (!(PTV(boot_pml4)->entries[0] & PTE_PRESENT)) {
         kernel_panic("Boot identity mapping (PML4[0]) not present!");
     }
-    page_table_t* boot_pdpt = (page_table_t*)(boot_pml4->entries[0] & 0x000FFFFFFFFFF000ULL);
+    page_table_t* boot_pdpt = (page_table_t*)(PTV(boot_pml4)->entries[0] & 0x000FFFFFFFFFF000ULL);
 
     // Get boot PD from PDPT[0]
-    if (!(boot_pdpt->entries[0] & PTE_PRESENT)) {
+    if (!(PTV(boot_pdpt)->entries[0] & PTE_PRESENT)) {
         kernel_panic("Boot PDPT[0] not present!");
     }
-    page_table_t* boot_pd = (page_table_t*)(boot_pdpt->entries[0] & 0x000FFFFFFFFFF000ULL);
+    page_table_t* boot_pd = (page_table_t*)(PTV(boot_pdpt)->entries[0] & 0x000FFFFFFFFFF000ULL);
 
     // Boot.asm mapped 256 entries (0-512MB). Extend to 512 entries (0-1GB).
     // This ensures page tables allocated from PMM (which typically allocates
@@ -181,7 +197,7 @@ void paging_init(void) {
     for (uint64_t i = 256; i < 512; i++) {
         // Map each 2MB page (huge page)
         uint64_t phys_addr = i * 0x200000ULL;  // i * 2MB
-        boot_pd->entries[i] = phys_addr | PTE_PRESENT | PTE_WRITE | (1ULL << 7);  // Bit 7 = PS (huge)
+        PTV(boot_pd)->entries[i] = phys_addr | PTE_PRESENT | PTE_WRITE | (1ULL << 7);  // Bit 7 = PS (huge)
     }
 
     // Map 1GB-16GB using additional PDs allocated from PMM.
@@ -192,7 +208,7 @@ void paging_init(void) {
 
     for (uint64_t pdpt_idx = 1; pdpt_idx < total_gb; pdpt_idx++) {
         // Skip if this PDPT entry already exists (shouldn't happen with boot tables)
-        if (boot_pdpt->entries[pdpt_idx] & PTE_PRESENT) continue;
+        if (PTV(boot_pdpt)->entries[pdpt_idx] & PTE_PRESENT) continue;
 
         // Allocate new PD for this 1GB range (PMM allocation will be from 0-1GB)
         page_table_t* pd = (page_table_t*)pmm_alloc_page();
@@ -206,10 +222,10 @@ void paging_init(void) {
         // Fill with 512 2MB huge page entries
         for (uint64_t i = 0; i < 512; i++) {
             uint64_t phys_addr = (pdpt_idx * 512 + i) * 0x200000ULL;
-            pd->entries[i] = phys_addr | PTE_PRESENT | PTE_WRITE | (1ULL << 7);
+            PTV(pd)->entries[i] = phys_addr | PTE_PRESENT | PTE_WRITE | (1ULL << 7);
         }
 
-        boot_pdpt->entries[pdpt_idx] = (uint64_t)pd | PTE_PRESENT | PTE_WRITE;
+        PTV(boot_pdpt)->entries[pdpt_idx] = (uint64_t)pd | PTE_PRESENT | PTE_WRITE;
     }
 
     // Flush TLB to activate new mappings
@@ -233,16 +249,16 @@ void paging_init(void) {
     // kernel runs from the low identity map, so this is transparent to live code,
     // and create_address_space() shares PML4[511] by reference so every process
     // sees the same (un-aliased) higher-half PD.
-    if (kernel_pml4->entries[511] & PTE_PRESENT) {
+    if (PTV(kernel_pml4)->entries[511] & PTE_PRESENT) {
         page_table_t* high_pdpt =
-            (page_table_t*)(kernel_pml4->entries[511] & 0x000FFFFFFFFFF000ULL);
-        if (high_pdpt->entries[510] & PTE_PRESENT) {
-            uint64_t shared = high_pdpt->entries[510];
+            (page_table_t*)(PTV(kernel_pml4)->entries[511] & 0x000FFFFFFFFFF000ULL);
+        if (PTV(high_pdpt)->entries[510] & PTE_PRESENT) {
+            uint64_t shared = PTV(high_pdpt)->entries[510];
             page_table_t* shared_pd = (page_table_t*)(shared & 0x000FFFFFFFFFF000ULL);
             page_table_t* priv_pd = (page_table_t*)pmm_alloc_page();
             if (priv_pd) {
-                for (int i = 0; i < 512; i++) priv_pd->entries[i] = shared_pd->entries[i];
-                high_pdpt->entries[510] = (uint64_t)priv_pd | (shared & 0xFFF);
+                for (int i = 0; i < 512; i++) PTV(priv_pd)->entries[i] = PTV(shared_pd)->entries[i];
+                PTV(high_pdpt)->entries[510] = (uint64_t)priv_pd | (shared & 0xFFF);
                 write_cr3(read_cr3());   // flush TLB so the private PD is live
                 kprintf("[VMM] Un-aliased higher-half kernel PD %p from identity PD %p (heap-safe)\n",
                         priv_pd, shared_pd);
@@ -256,7 +272,7 @@ void paging_init(void) {
     // DIRECT MAP (#20 fix). Give PML4[256] its OWN dedicated PDPT + PD chain of
     // never-split 2MB huge pages, INSTEAD of aliasing the identity PDPT.
     //
-    // OLD (buggy): kernel_pml4->entries[256] = kernel_pml4->entries[0], so the
+    // OLD (buggy): PTV(kernel_pml4)->entries[256] = PTV(kernel_pml4)->entries[0], so the
     // direct map and the low identity map shared ONE PDPT -> PD -> 2MB-huge-PDE
     // chain. Under churn a paging_map_page split a 2MB identity PDE (exec maps a
     // process's low PT_LOAD VAs at 4KB, hitting the huge-page split branch), and
@@ -268,7 +284,7 @@ void paging_init(void) {
     // NEW (fixed): a DEDICATED chain that shares NO structural page with the
     // splittable identity. Nothing ever paging_map_page's into the direct-map VA
     // range, so its huge PDEs stay present forever; a split of an identity PDE
-    // perturbs only PML4[0]'s private chain. Installed at kernel_pml4->entries[256]
+    // perturbs only PML4[0]'s private chain. Installed at PTV(kernel_pml4)->entries[256]
     // BEFORE any process or the AP exists, so it propagates BY REFERENCE to every
     // CR3 (paging_create_address_space copies 256-511) and the AP master CR3 -- no
     // per-CR3 work. Supervisor-only (no USER: ring-3 must not read all RAM) + NX
@@ -298,16 +314,17 @@ void paging_init(void) {
             }
         }
         if (dm_ok) {
-            kernel_pml4->entries[256] = (uint64_t)dm_pdpt
+            PTV(kernel_pml4)->entries[256] = (uint64_t)dm_pdpt
                                         | PTE_PRESENT | PTE_WRITE     // supervisor-only
                                         | (1ULL << 63);               // NX
             write_cr3(read_cr3());                                    // flush -> dedicated map live
+            g_pt_dm_online = true;                                    // PT-DIRECTMAP-0: walkers now use the direct map
             kprintf("[VMM] Direct map ONLINE @ 0x%016lx (DEDICATED PDPT+PD, phys 0..%luGB, never-split, all CR3s)\n",
                     (unsigned long)DIRECT_MAP_BASE, (unsigned long)DM_GB);
         } else {
             // OOM (essentially unreachable this early): fall back to the old alias so
             // boot still completes in the known-buggy-but-boots state (#20 unfixed).
-            kernel_pml4->entries[256] = (kernel_pml4->entries[0] & ~0x4ULL) | (1ULL << 63);
+            PTV(kernel_pml4)->entries[256] = (PTV(kernel_pml4)->entries[0] & ~0x4ULL) | (1ULL << 63);
             write_cr3(read_cr3());
             kprintf("[VMM] WARNING: dedicated direct-map alloc failed; fell back to identity alias (#20 unfixed)\n");
         }
@@ -466,8 +483,8 @@ static void paging_alias_selftest(void) {
     const uint64_t HUGE = (1ULL << 7);
 
     // (1) STRUCTURAL INDEPENDENCE: direct-map PDPT != identity PDPT.
-    uint64_t dm_pdpt_phys = kernel_pml4->entries[256] & MASK;
-    uint64_t id_pdpt_phys = kernel_pml4->entries[0]   & MASK;
+    uint64_t dm_pdpt_phys = PTV(kernel_pml4)->entries[256] & MASK;
+    uint64_t id_pdpt_phys = PTV(kernel_pml4)->entries[0]   & MASK;
     int independent = (dm_pdpt_phys != id_pdpt_phys) && dm_pdpt_phys != 0;
 
     // (2) COHERENCE: a write via the DIRECT MAP is seen via the LOW identity
@@ -533,50 +550,50 @@ void paging_map_page(void* virt, void* phys, uint64_t flags) {
     // Get or create PDPT (uses active_pml4 - may be kernel or process PML4)
     page_table_t* target = active_pml4;
     page_table_t* pdpt;
-    if (!(target->entries[pml4_idx] & PTE_PRESENT)) {
+    if (!(PTV(target)->entries[pml4_idx] & PTE_PRESENT)) {
         kprintf("[PAGING]   Allocating new PDPT for PML4[%lu]\n", pml4_idx);
         pdpt = alloc_page_table();
         if (!pdpt) {
             kprintf("[PAGING] Failed to allocate PDPT for mapping %p\n", virt);
             return;
         }
-        target->entries[pml4_idx] = (uint64_t)pdpt | intermediate_flags;
+        PTV(target)->entries[pml4_idx] = (uint64_t)pdpt | intermediate_flags;
     } else {
-        pdpt = (page_table_t*)(target->entries[pml4_idx] & 0x000FFFFFFFFFF000ULL);
-        if ((flags & PAGE_USER) && !(target->entries[pml4_idx] & PTE_USER)) {
-            target->entries[pml4_idx] |= PTE_USER;
+        pdpt = (page_table_t*)(PTV(target)->entries[pml4_idx] & 0x000FFFFFFFFFF000ULL);
+        if ((flags & PAGE_USER) && !(PTV(target)->entries[pml4_idx] & PTE_USER)) {
+            PTV(target)->entries[pml4_idx] |= PTE_USER;
         }
     }
 
     // Get or create PD
     page_table_t* pd;
-    if (!(pdpt->entries[pdpt_idx] & PTE_PRESENT)) {
+    if (!(PTV(pdpt)->entries[pdpt_idx] & PTE_PRESENT)) {
         pd = alloc_page_table();
         if (!pd) {
             kprintf("[PAGING] Failed to allocate PD for mapping %p\n", virt);
             return;
         }
-        pdpt->entries[pdpt_idx] = (uint64_t)pd | intermediate_flags;
+        PTV(pdpt)->entries[pdpt_idx] = (uint64_t)pd | intermediate_flags;
     } else {
-        pd = (page_table_t*)(pdpt->entries[pdpt_idx] & 0x000FFFFFFFFFF000ULL);
+        pd = (page_table_t*)(PTV(pdpt)->entries[pdpt_idx] & 0x000FFFFFFFFFF000ULL);
         // Upgrade existing entry: add USER bit if mapping user pages
-        if ((flags & PAGE_USER) && !(pdpt->entries[pdpt_idx] & PTE_USER)) {
-            pdpt->entries[pdpt_idx] |= PTE_USER;
+        if ((flags & PAGE_USER) && !(PTV(pdpt)->entries[pdpt_idx] & PTE_USER)) {
+            PTV(pdpt)->entries[pdpt_idx] |= PTE_USER;
         }
     }
 
     // Get or create PT
     page_table_t* pt;
-    if (!(pd->entries[pd_idx] & PTE_PRESENT)) {
+    if (!(PTV(pd)->entries[pd_idx] & PTE_PRESENT)) {
         // Allocating new PT
         pt = alloc_page_table();
         if (!pt) {
             kprintf("[PAGING] Failed to allocate PT for mapping %p\n", virt);
             return;
         }
-        pd->entries[pd_idx] = (uint64_t)pt | intermediate_flags;
+        PTV(pd)->entries[pd_idx] = (uint64_t)pt | intermediate_flags;
         // PD created
-    } else if (pd->entries[pd_idx] & (1ULL << 7)) {
+    } else if (PTV(pd)->entries[pd_idx] & (1ULL << 7)) {
         // HUGE PAGE (2MB) - must split it into 4KB pages.
         // Capture the original PDE flags (minus PS bit 7) to preserve attributes
         // (PRESENT, WRITE, USER if set, etc.) in the 4KB split copies.
@@ -584,7 +601,7 @@ void paging_map_page(void* virt, void* phys, uint64_t flags) {
         // (no PTE_USER), so this is a no-op today but is correct for any future
         // non-identity use where USER or other bits may be present.
         /* Preserve all flag bits including bit 63 (PAGE_NX), minus the PS bit (7). */
-        uint64_t orig_pde_flags = (pd->entries[pd_idx] & ~(1ULL << 7))   /* all bits */
+        uint64_t orig_pde_flags = (PTV(pd)->entries[pd_idx] & ~(1ULL << 7))   /* all bits */
                                 & ~0x000FFFFFFFE00000ULL;                  /* minus phys base */
         pt = alloc_page_table();
         if (!pt) {
@@ -593,19 +610,19 @@ void paging_map_page(void* virt, void* phys, uint64_t flags) {
         }
 
         // Fill PT with 512 entries mapping the original 2MB huge page, inheriting flags.
-        uint64_t base_phys = pd->entries[pd_idx] & 0x000FFFFFFFE00000ULL;  // 2MB-aligned phys base
+        uint64_t base_phys = PTV(pd)->entries[pd_idx] & 0x000FFFFFFFE00000ULL;  // 2MB-aligned phys base
         for (int i = 0; i < 512; i++) {
-            pt->entries[i] = (base_phys + (uint64_t)i * PAGE_SIZE) | orig_pde_flags;
+            PTV(pt)->entries[i] = (base_phys + (uint64_t)i * PAGE_SIZE) | orig_pde_flags;
         }
 
         // Replace huge page entry with PT pointer
-        pd->entries[pd_idx] = (uint64_t)pt | intermediate_flags;
+        PTV(pd)->entries[pd_idx] = (uint64_t)pt | intermediate_flags;
         invlpg(virt);  // Flush TLB for this range
     } else {
-        pt = (page_table_t*)(pd->entries[pd_idx] & 0x000FFFFFFFFFF000ULL);
+        pt = (page_table_t*)(PTV(pd)->entries[pd_idx] & 0x000FFFFFFFFFF000ULL);
         // Upgrade existing entry: add USER bit if mapping user pages
-        if ((flags & PAGE_USER) && !(pd->entries[pd_idx] & PTE_USER)) {
-            pd->entries[pd_idx] |= PTE_USER;
+        if ((flags & PAGE_USER) && !(PTV(pd)->entries[pd_idx] & PTE_USER)) {
+            PTV(pd)->entries[pd_idx] |= PTE_USER;
         }
     }
 
@@ -639,7 +656,7 @@ void paging_map_page(void* virt, void* phys, uint64_t flags) {
         !(virt_addr >= SHARED_FB_VA_START && virt_addr < SHARED_SHM_VA_END)) {
         pte |= PTE_OWNED;
     }
-    pt->entries[pt_idx] = pte;
+    PTV(pt)->entries[pt_idx] = pte;
     invlpg(virt);
 }
 
@@ -655,18 +672,18 @@ void paging_unmap_page(void* virt) {
     // mirror of paging_map_page(), which already uses active_pml4.
     page_table_t* target = active_pml4;
 
-    if (!(target->entries[pml4_idx] & PTE_PRESENT)) return;
-    page_table_t* pdpt = (page_table_t*)(target->entries[pml4_idx] & 0x000FFFFFFFFFF000ULL);
+    if (!(PTV(target)->entries[pml4_idx] & PTE_PRESENT)) return;
+    page_table_t* pdpt = (page_table_t*)(PTV(target)->entries[pml4_idx] & 0x000FFFFFFFFFF000ULL);
 
-    if (!(pdpt->entries[pdpt_idx] & PTE_PRESENT)) return;
-    page_table_t* pd = (page_table_t*)(pdpt->entries[pdpt_idx] & 0x000FFFFFFFFFF000ULL);
+    if (!(PTV(pdpt)->entries[pdpt_idx] & PTE_PRESENT)) return;
+    page_table_t* pd = (page_table_t*)(PTV(pdpt)->entries[pdpt_idx] & 0x000FFFFFFFFFF000ULL);
 
-    if (!(pd->entries[pd_idx] & PTE_PRESENT)) return;
+    if (!(PTV(pd)->entries[pd_idx] & PTE_PRESENT)) return;
     // A 2MB huge page has no PT beneath it; nothing to clear at PTE granularity.
-    if (pd->entries[pd_idx] & (1ULL << 7)) return;
-    page_table_t* pt = (page_table_t*)(pd->entries[pd_idx] & 0x000FFFFFFFFFF000ULL);
+    if (PTV(pd)->entries[pd_idx] & (1ULL << 7)) return;
+    page_table_t* pt = (page_table_t*)(PTV(pd)->entries[pd_idx] & 0x000FFFFFFFFFF000ULL);
 
-    pt->entries[pt_idx] = 0;
+    PTV(pt)->entries[pt_idx] = 0;
 
     // LAZY TLB SHOOTDOWN: Use lazy flush instead of immediate IPI
     // This defers TLB invalidation on remote CPUs until their next context switch,
@@ -691,18 +708,18 @@ uint64_t paging_get_pte(uint64_t virt) {
     page_table_t* target = active_pml4;
     if (!target) return 0;
 
-    if (!(target->entries[pml4_idx] & PTE_PRESENT)) return 0;
-    page_table_t* pdpt = (page_table_t*)(target->entries[pml4_idx] & 0x000FFFFFFFFFF000ULL);
+    if (!(PTV(target)->entries[pml4_idx] & PTE_PRESENT)) return 0;
+    page_table_t* pdpt = (page_table_t*)(PTV(target)->entries[pml4_idx] & 0x000FFFFFFFFFF000ULL);
 
-    if (!(pdpt->entries[pdpt_idx] & PTE_PRESENT)) return 0;
-    page_table_t* pd = (page_table_t*)(pdpt->entries[pdpt_idx] & 0x000FFFFFFFFFF000ULL);
+    if (!(PTV(pdpt)->entries[pdpt_idx] & PTE_PRESENT)) return 0;
+    page_table_t* pd = (page_table_t*)(PTV(pdpt)->entries[pdpt_idx] & 0x000FFFFFFFFFF000ULL);
 
-    if (!(pd->entries[pd_idx] & PTE_PRESENT)) return 0;
+    if (!(PTV(pd)->entries[pd_idx] & PTE_PRESENT)) return 0;
     // 2MB huge page: the PD entry is the leaf mapping.
-    if (pd->entries[pd_idx] & (1ULL << 7)) return pd->entries[pd_idx];
+    if (PTV(pd)->entries[pd_idx] & (1ULL << 7)) return PTV(pd)->entries[pd_idx];
 
-    page_table_t* pt = (page_table_t*)(pd->entries[pd_idx] & 0x000FFFFFFFFFF000ULL);
-    return pt->entries[pt_idx];
+    page_table_t* pt = (page_table_t*)(PTV(pd)->entries[pd_idx] & 0x000FFFFFFFFFF000ULL);
+    return PTV(pt)->entries[pt_idx];
 }
 
 /*
@@ -810,14 +827,14 @@ int vmm_map_range(uint64_t vaddr, uint64_t paddr, uint64_t count,
         /* ------ Level 1: PML4 → PDPT (once per 512 GB) --------------- */
         if (pml4_idx != prev_pml4_idx) {
             page_table_t* target = active_pml4;
-            if (!(target->entries[pml4_idx] & PTE_PRESENT)) {
+            if (!(PTV(target)->entries[pml4_idx] & PTE_PRESENT)) {
                 pdpt = alloc_page_table();
                 if (!pdpt) return -1;
-                target->entries[pml4_idx] = (uint64_t)pdpt | intermediate_flags;
+                PTV(target)->entries[pml4_idx] = (uint64_t)pdpt | intermediate_flags;
             } else {
-                pdpt = (page_table_t*)(target->entries[pml4_idx] & 0x000FFFFFFFFFF000ULL);
-                if ((flags & PAGE_USER) && !(target->entries[pml4_idx] & PTE_USER))
-                    target->entries[pml4_idx] |= PTE_USER;
+                pdpt = (page_table_t*)(PTV(target)->entries[pml4_idx] & 0x000FFFFFFFFFF000ULL);
+                if ((flags & PAGE_USER) && !(PTV(target)->entries[pml4_idx] & PTE_USER))
+                    PTV(target)->entries[pml4_idx] |= PTE_USER;
             }
             prev_pml4_idx = pml4_idx;
             /* Force lower-level re-walk. */
@@ -828,14 +845,14 @@ int vmm_map_range(uint64_t vaddr, uint64_t paddr, uint64_t count,
 
         /* ------ Level 2: PDPT → PD (once per 1 GB) ------------------- */
         if (pdpt_idx != prev_pdpt_idx) {
-            if (!(pdpt->entries[pdpt_idx] & PTE_PRESENT)) {
+            if (!(PTV(pdpt)->entries[pdpt_idx] & PTE_PRESENT)) {
                 pd = alloc_page_table();
                 if (!pd) return -1;
-                pdpt->entries[pdpt_idx] = (uint64_t)pd | intermediate_flags;
+                PTV(pdpt)->entries[pdpt_idx] = (uint64_t)pd | intermediate_flags;
             } else {
-                pd = (page_table_t*)(pdpt->entries[pdpt_idx] & 0x000FFFFFFFFFF000ULL);
-                if ((flags & PAGE_USER) && !(pdpt->entries[pdpt_idx] & PTE_USER))
-                    pdpt->entries[pdpt_idx] |= PTE_USER;
+                pd = (page_table_t*)(PTV(pdpt)->entries[pdpt_idx] & 0x000FFFFFFFFFF000ULL);
+                if ((flags & PAGE_USER) && !(PTV(pdpt)->entries[pdpt_idx] & PTE_USER))
+                    PTV(pdpt)->entries[pdpt_idx] |= PTE_USER;
             }
             prev_pdpt_idx = pdpt_idx;
             /* Force lower-level re-walk. */
@@ -845,11 +862,11 @@ int vmm_map_range(uint64_t vaddr, uint64_t paddr, uint64_t count,
 
         /* ------ Level 3: PD → PT (once per 2 MB) --------------------- */
         if (pd_idx != prev_pd_idx) {
-            if (!(pd->entries[pd_idx] & PTE_PRESENT)) {
+            if (!(PTV(pd)->entries[pd_idx] & PTE_PRESENT)) {
                 pt = alloc_page_table();
                 if (!pt) return -1;
-                pd->entries[pd_idx] = (uint64_t)pt | intermediate_flags;
-            } else if (pd->entries[pd_idx] & (1ULL << 7)) {
+                PTV(pd)->entries[pd_idx] = (uint64_t)pt | intermediate_flags;
+            } else if (PTV(pd)->entries[pd_idx] & (1ULL << 7)) {
                 /*
                  * Huge page (2 MB) in the way — split it into 512 4 KB PTEs
                  * so we can install a fine-grained mapping.  Inherit original
@@ -857,22 +874,22 @@ int vmm_map_range(uint64_t vaddr, uint64_t paddr, uint64_t count,
                  * paging_map_page() so the two functions stay consistent.
                  */
                 /* Preserve all flag bits including bit 63 (PAGE_NX), minus the PS bit (7). */
-                uint64_t orig_pde_flags = (pd->entries[pd_idx] & ~(1ULL << 7))
+                uint64_t orig_pde_flags = (PTV(pd)->entries[pd_idx] & ~(1ULL << 7))
                                         & ~0x000FFFFFFFE00000ULL;
                 pt = alloc_page_table();
                 if (!pt) return -1;
-                uint64_t base_phys = pd->entries[pd_idx] & 0x000FFFFFFFE00000ULL;
+                uint64_t base_phys = PTV(pd)->entries[pd_idx] & 0x000FFFFFFFE00000ULL;
                 for (int s = 0; s < 512; s++) {
-                    pt->entries[s] = (base_phys + (uint64_t)s * PAGE_SIZE) |
+                    PTV(pt)->entries[s] = (base_phys + (uint64_t)s * PAGE_SIZE) |
                                      orig_pde_flags;
                 }
-                pd->entries[pd_idx] = (uint64_t)pt | intermediate_flags;
+                PTV(pd)->entries[pd_idx] = (uint64_t)pt | intermediate_flags;
                 /* Flush the old 2 MB TLB entry if this AS is live. */
                 if (need_invlpg) invlpg((void*)vaddr);
             } else {
-                pt = (page_table_t*)(pd->entries[pd_idx] & 0x000FFFFFFFFFF000ULL);
-                if ((flags & PAGE_USER) && !(pd->entries[pd_idx] & PTE_USER))
-                    pd->entries[pd_idx] |= PTE_USER;
+                pt = (page_table_t*)(PTV(pd)->entries[pd_idx] & 0x000FFFFFFFFFF000ULL);
+                if ((flags & PAGE_USER) && !(PTV(pd)->entries[pd_idx] & PTE_USER))
+                    PTV(pd)->entries[pd_idx] |= PTE_USER;
             }
             prev_pd_idx = pd_idx;
         }
@@ -887,7 +904,7 @@ int vmm_map_range(uint64_t vaddr, uint64_t paddr, uint64_t count,
             pte |= PTE_OWNED;
         }
 
-        pt->entries[pt_idx] = pte;
+        PTV(pt)->entries[pt_idx] = pte;
 
         /* Per-page TLB invalidation only when this AS is currently live. */
         if (need_invlpg) invlpg((void*)vaddr);
@@ -981,14 +998,14 @@ int vmm_unmap_range_into(uint64_t cr3, uint64_t vaddr, uint64_t size,
             uint64_t pdpt_idx = PDPT_INDEX(va);
             uint64_t pd_idx   = PD_INDEX(va);
             uint64_t pt_idx   = PT_INDEX(va);
-            if (target->entries[pml4_idx] & PTE_PRESENT) {
-                page_table_t* pdpt = (page_table_t*)(target->entries[pml4_idx] & 0x000FFFFFFFFFF000ULL);
-                if (pdpt->entries[pdpt_idx] & PTE_PRESENT) {
-                    page_table_t* pd = (page_table_t*)(pdpt->entries[pdpt_idx] & 0x000FFFFFFFFFF000ULL);
-                    if ((pd->entries[pd_idx] & PTE_PRESENT) &&
-                        !(pd->entries[pd_idx] & (1ULL << 7))) {
-                        page_table_t* pt = (page_table_t*)(pd->entries[pd_idx] & 0x000FFFFFFFFFF000ULL);
-                        uint64_t e = pt->entries[pt_idx];
+            if (PTV(target)->entries[pml4_idx] & PTE_PRESENT) {
+                page_table_t* pdpt = (page_table_t*)(PTV(target)->entries[pml4_idx] & 0x000FFFFFFFFFF000ULL);
+                if (PTV(pdpt)->entries[pdpt_idx] & PTE_PRESENT) {
+                    page_table_t* pd = (page_table_t*)(PTV(pdpt)->entries[pdpt_idx] & 0x000FFFFFFFFFF000ULL);
+                    if ((PTV(pd)->entries[pd_idx] & PTE_PRESENT) &&
+                        !(PTV(pd)->entries[pd_idx] & (1ULL << 7))) {
+                        page_table_t* pt = (page_table_t*)(PTV(pd)->entries[pd_idx] & 0x000FFFFFFFFFF000ULL);
+                        uint64_t e = PTV(pt)->entries[pt_idx];
                         if ((e & PTE_PRESENT) && (e & PTE_OWNED)) {
                             // CoW-aware free, mirroring the teardown path below
                             // (~line 865). A fork()-shared OWNED page is mapped in
@@ -1025,7 +1042,7 @@ uint64_t paging_create_address_space(void) {
 
     // Copy kernel upper-half entries (shared, PML4[256-511])
     for (int i = 256; i < 512; i++) {
-        pml4->entries[i] = kernel_pml4->entries[i];
+        PTV(pml4)->entries[i] = PTV(kernel_pml4)->entries[i];
     }
 
     // Deep-copy PML4[0] identity mapping hierarchy so each process has
@@ -1036,8 +1053,8 @@ uint64_t paging_create_address_space(void) {
     // ALL pages already allocated for this address space and return 0. The
     // old code shared the kernel PD on alloc failure, which caused cross-process
     // corruption under memory pressure. Callers (process_create) check for 0.
-    if (kernel_pml4->entries[0] & PTE_PRESENT) {
-        page_table_t* src_pdpt = (page_table_t*)(kernel_pml4->entries[0] & 0x000FFFFFFFFFF000ULL);
+    if (PTV(kernel_pml4)->entries[0] & PTE_PRESENT) {
+        page_table_t* src_pdpt = (page_table_t*)(PTV(kernel_pml4)->entries[0] & 0x000FFFFFFFFFF000ULL);
         page_table_t* new_pdpt = alloc_page_table();
         if (!new_pdpt) {
             // OOM: release the PML4 we already allocated and fail.
@@ -1047,19 +1064,19 @@ uint64_t paging_create_address_space(void) {
         }
 
         for (int j = 0; j < 512; j++) {
-            if (!(src_pdpt->entries[j] & PTE_PRESENT)) {
-                new_pdpt->entries[j] = 0;
+            if (!(PTV(src_pdpt)->entries[j] & PTE_PRESENT)) {
+                PTV(new_pdpt)->entries[j] = 0;
                 continue;
             }
             // Deep-copy each PD that the PDPT points to
-            page_table_t* src_pd = (page_table_t*)(src_pdpt->entries[j] & 0x000FFFFFFFFFF000ULL);
+            page_table_t* src_pd = (page_table_t*)(PTV(src_pdpt)->entries[j] & 0x000FFFFFFFFFF000ULL);
             page_table_t* new_pd = alloc_page_table();
             if (!new_pd) {
                 // OOM: roll back all PDs successfully allocated so far, then
                 // free new_pdpt and the PML4.
                 for (int r = 0; r < j; r++) {
-                    if (new_pdpt->entries[r] & PTE_PRESENT) {
-                        pmm_free_page((void*)(new_pdpt->entries[r] & 0x000FFFFFFFFFF000ULL));
+                    if (PTV(new_pdpt)->entries[r] & PTE_PRESENT) {
+                        pmm_free_page((void*)(PTV(new_pdpt)->entries[r] & 0x000FFFFFFFFFF000ULL));
                     }
                 }
                 pmm_free_page(new_pdpt);
@@ -1068,11 +1085,11 @@ uint64_t paging_create_address_space(void) {
                 return 0;
             }
             for (int k = 0; k < 512; k++) {
-                new_pd->entries[k] = src_pd->entries[k];  // copy PD entries (huge pages or PT pointers)
+                PTV(new_pd)->entries[k] = PTV(src_pd)->entries[k];  // copy PD entries (huge pages or PT pointers)
             }
-            new_pdpt->entries[j] = (uint64_t)new_pd | (src_pdpt->entries[j] & 0xFFF);
+            PTV(new_pdpt)->entries[j] = (uint64_t)new_pd | (PTV(src_pdpt)->entries[j] & 0xFFF);
         }
-        pml4->entries[0] = (uint64_t)new_pdpt | (kernel_pml4->entries[0] & 0xFFF);
+        PTV(pml4)->entries[0] = (uint64_t)new_pdpt | (PTV(kernel_pml4)->entries[0] & 0xFFF);
     }
 
     uint64_t cr3 = (uint64_t)pml4;
@@ -1131,31 +1148,31 @@ void paging_destroy_address_space(uint64_t cr3) {
     // framebuffer, initrd, ELF source data, shm segments) to the PMM.
     #define PTE_HUGE (1ULL << 7)
     for (int i = 0; i < 256; i++) {
-        if (!(pml4->entries[i] & PTE_PRESENT)) continue;
-        page_table_t* pdpt = (page_table_t*)(pml4->entries[i] & 0x000FFFFFFFFFF000ULL);
+        if (!(PTV(pml4)->entries[i] & PTE_PRESENT)) continue;
+        page_table_t* pdpt = (page_table_t*)(PTV(pml4)->entries[i] & 0x000FFFFFFFFFF000ULL);
 
         for (int j = 0; j < 512; j++) {
-            if (!(pdpt->entries[j] & PTE_PRESENT)) continue;
+            if (!(PTV(pdpt)->entries[j] & PTE_PRESENT)) continue;
             // A 1GB huge page at the PDPT level (or any shared entry copied by
             // value) maps memory directly with no PD/PT below it — skip it so we
             // neither dereference it as a table nor free shared RAM.
-            if (pdpt->entries[j] & PTE_HUGE) continue;
-            page_table_t* pd = (page_table_t*)(pdpt->entries[j] & 0x000FFFFFFFFFF000ULL);
+            if (PTV(pdpt)->entries[j] & PTE_HUGE) continue;
+            page_table_t* pd = (page_table_t*)(PTV(pdpt)->entries[j] & 0x000FFFFFFFFFF000ULL);
 
             for (int k = 0; k < 512; k++) {
-                if (!(pd->entries[k] & PTE_PRESENT)) continue;
+                if (!(PTV(pd)->entries[k] & PTE_PRESENT)) continue;
                 // 2MB huge page: no PT beneath it. Identity-mapped huge pages
                 // (inherited from the kernel, no PTE_OWNED) are shared RAM and
                 // must NOT be freed. Process-private huge pages (PTE_OWNED,
                 // created by paging_map_huge_page for user code) must be freed.
-                if (pd->entries[k] & PTE_HUGE) {
-                    if (pd->entries[k] & PTE_OWNED) {
-                        void* huge_phys = (void*)(pd->entries[k] & 0x000FFFFFFFFFF000ULL);
+                if (PTV(pd)->entries[k] & PTE_HUGE) {
+                    if (PTV(pd)->entries[k] & PTE_OWNED) {
+                        void* huge_phys = (void*)(PTV(pd)->entries[k] & 0x000FFFFFFFFFF000ULL);
                         pmm_free_huge_page(huge_phys);
                     }
                     continue;
                 }
-                page_table_t* pt = (page_table_t*)(pd->entries[k] & 0x000FFFFFFFFFF000ULL);
+                page_table_t* pt = (page_table_t*)(PTV(pd)->entries[k] & 0x000FFFFFFFFFF000ULL);
 
                 // SHARED-KERNEL-PT GUARD: create_address_space() copies a split
                 // huge-page PD entry (a PT *pointer*, not a 2MB leaf) BY VALUE, so
@@ -1172,12 +1189,12 @@ void paging_destroy_address_space(uint64_t cr3) {
                 // PT STRUCTURAL page to the PMM (it shadows a still-shared kernel huge
                 // page -- see FIX A below).
                 int leak_pt = 0;
-                if (kernel_pml4 && (kernel_pml4->entries[i] & PTE_PRESENT)) {
-                    page_table_t* kpdpt = (page_table_t*)(kernel_pml4->entries[i] & 0x000FFFFFFFFFF000ULL);
-                    uint64_t kpdpte = kpdpt->entries[j];
+                if (kernel_pml4 && (PTV(kernel_pml4)->entries[i] & PTE_PRESENT)) {
+                    page_table_t* kpdpt = (page_table_t*)(PTV(kernel_pml4)->entries[i] & 0x000FFFFFFFFFF000ULL);
+                    uint64_t kpdpte = PTV(kpdpt)->entries[j];
                     if ((kpdpte & PTE_PRESENT) && !(kpdpte & PTE_HUGE)) {
                         page_table_t* kpd = (page_table_t*)(kpdpte & 0x000FFFFFFFFFF000ULL);
-                        uint64_t kpde = kpd->entries[k];
+                        uint64_t kpde = PTV(kpd)->entries[k];
                         if ((kpde & PTE_PRESENT) && !(kpde & PTE_HUGE) &&
                             (page_table_t*)(kpde & 0x000FFFFFFFFFF000ULL) == pt) {
                             continue;  // process aliases the kernel's OWN PT — never touch it
@@ -1208,9 +1225,9 @@ void paging_destroy_address_space(uint64_t cr3) {
 
                 // Free only leaf pages this process privately owns.
                 for (int m = 0; m < 512; m++) {
-                    if ((pt->entries[m] & PTE_PRESENT) &&
-                        (pt->entries[m] & PTE_OWNED)) {
-                        void* phys_page = (void*)(pt->entries[m] & 0x000FFFFFFFFFF000ULL);
+                    if ((PTV(pt)->entries[m] & PTE_PRESENT) &&
+                        (PTV(pt)->entries[m] & PTE_OWNED)) {
+                        void* phys_page = (void*)(PTV(pt)->entries[m] & 0x000FFFFFFFFFF000ULL);
                         // CoW-aware free: a page shared by a parent+child (fork)
                         // must only be returned to the PMM by its LAST owner.
                         // cow_unref() returns 1 for unshared pages (refcount 0),
@@ -1294,41 +1311,41 @@ int paging_map_huge_page(void* virt, void* phys, uint64_t flags) {
     // Walk/create PDPT
     page_table_t* target = active_pml4;
     page_table_t* pdpt;
-    if (!(target->entries[pml4_idx] & PTE_PRESENT)) {
+    if (!(PTV(target)->entries[pml4_idx] & PTE_PRESENT)) {
         pdpt = alloc_page_table();
         if (!pdpt) {
             kprintf("[PAGING] Failed to allocate PDPT for huge page mapping at %p\n", virt);
             return -1;
         }
-        target->entries[pml4_idx] = (uint64_t)pdpt | intermediate_flags;
+        PTV(target)->entries[pml4_idx] = (uint64_t)pdpt | intermediate_flags;
     } else {
-        pdpt = (page_table_t*)(target->entries[pml4_idx] & 0x000FFFFFFFFFF000ULL);
-        if ((flags & PAGE_USER) && !(target->entries[pml4_idx] & PTE_USER)) {
-            target->entries[pml4_idx] |= PTE_USER;
+        pdpt = (page_table_t*)(PTV(target)->entries[pml4_idx] & 0x000FFFFFFFFFF000ULL);
+        if ((flags & PAGE_USER) && !(PTV(target)->entries[pml4_idx] & PTE_USER)) {
+            PTV(target)->entries[pml4_idx] |= PTE_USER;
         }
     }
 
     // Walk/create PD
     page_table_t* pd;
-    if (!(pdpt->entries[pdpt_idx] & PTE_PRESENT)) {
+    if (!(PTV(pdpt)->entries[pdpt_idx] & PTE_PRESENT)) {
         pd = alloc_page_table();
         if (!pd) {
             kprintf("[PAGING] Failed to allocate PD for huge page mapping at %p\n", virt);
             return -1;
         }
-        pdpt->entries[pdpt_idx] = (uint64_t)pd | intermediate_flags;
+        PTV(pdpt)->entries[pdpt_idx] = (uint64_t)pd | intermediate_flags;
     } else {
-        pd = (page_table_t*)(pdpt->entries[pdpt_idx] & 0x000FFFFFFFFFF000ULL);
-        if ((flags & PAGE_USER) && !(pdpt->entries[pdpt_idx] & PTE_USER)) {
-            pdpt->entries[pdpt_idx] |= PTE_USER;
+        pd = (page_table_t*)(PTV(pdpt)->entries[pdpt_idx] & 0x000FFFFFFFFFF000ULL);
+        if ((flags & PAGE_USER) && !(PTV(pdpt)->entries[pdpt_idx] & PTE_USER)) {
+            PTV(pdpt)->entries[pdpt_idx] |= PTE_USER;
         }
     }
 
     // Check if there's already a 4KB PT here (would conflict)
-    if ((pd->entries[pd_idx] & PTE_PRESENT) && !(pd->entries[pd_idx] & (1ULL << 7))) {
+    if ((PTV(pd)->entries[pd_idx] & PTE_PRESENT) && !(PTV(pd)->entries[pd_idx] & (1ULL << 7))) {
         kprintf("[PAGING] WARNING: Replacing 4KB PT with huge page at %p\n", virt);
         // Free the old PT (defensive: prevents leak)
-        page_table_t* old_pt = (page_table_t*)(pd->entries[pd_idx] & 0x000FFFFFFFFFF000ULL);
+        page_table_t* old_pt = (page_table_t*)(PTV(pd)->entries[pd_idx] & 0x000FFFFFFFFFF000ULL);
         pmm_free_page(old_pt);
     }
 
@@ -1345,7 +1362,7 @@ int paging_map_huge_page(void* virt, void* phys, uint64_t flags) {
         pde |= PTE_OWNED;
     }
 
-    pd->entries[pd_idx] = pde;
+    PTV(pd)->entries[pd_idx] = pde;
 
     // Invalidate TLB for the entire 2MB range
     // Note: invlpg on x86-64 invalidates the entire huge page when used on any
@@ -1378,22 +1395,22 @@ int paging_unmap_huge_page(void* virt) {
 
     page_table_t* target = active_pml4;
 
-    if (!(target->entries[pml4_idx] & PTE_PRESENT)) return -1;
-    page_table_t* pdpt = (page_table_t*)(target->entries[pml4_idx] & 0x000FFFFFFFFFF000ULL);
+    if (!(PTV(target)->entries[pml4_idx] & PTE_PRESENT)) return -1;
+    page_table_t* pdpt = (page_table_t*)(PTV(target)->entries[pml4_idx] & 0x000FFFFFFFFFF000ULL);
 
-    if (!(pdpt->entries[pdpt_idx] & PTE_PRESENT)) return -1;
-    page_table_t* pd = (page_table_t*)(pdpt->entries[pdpt_idx] & 0x000FFFFFFFFFF000ULL);
+    if (!(PTV(pdpt)->entries[pdpt_idx] & PTE_PRESENT)) return -1;
+    page_table_t* pd = (page_table_t*)(PTV(pdpt)->entries[pdpt_idx] & 0x000FFFFFFFFFF000ULL);
 
-    if (!(pd->entries[pd_idx] & PTE_PRESENT)) return -1;
+    if (!(PTV(pd)->entries[pd_idx] & PTE_PRESENT)) return -1;
 
     // Verify it's actually a huge page (PS bit set)
-    if (!(pd->entries[pd_idx] & (1ULL << 7))) {
+    if (!(PTV(pd)->entries[pd_idx] & (1ULL << 7))) {
         kprintf("[PAGING] WARNING: Attempt to unmap non-huge-page PDE at %p\n", virt);
         return -1;
     }
 
     // Clear the PDE
-    pd->entries[pd_idx] = 0;
+    PTV(pd)->entries[pd_idx] = 0;
 
     // Invalidate TLB (one invlpg invalidates the entire 2MB huge page)
     invlpg(virt);
@@ -1444,32 +1461,32 @@ int paging_modify_pte_flags(void* virt, uint64_t new_flags) {
     }
 
     // Walk PML4 -> PDPT
-    if (!(target->entries[pml4_idx] & PTE_PRESENT)) {
+    if (!(PTV(target)->entries[pml4_idx] & PTE_PRESENT)) {
         return -1;  // Page not mapped
     }
-    page_table_t* pdpt = (page_table_t*)(target->entries[pml4_idx] & 0x000FFFFFFFFFF000ULL);
+    page_table_t* pdpt = (page_table_t*)(PTV(target)->entries[pml4_idx] & 0x000FFFFFFFFFF000ULL);
 
     // Walk PDPT -> PD
-    if (!(pdpt->entries[pdpt_idx] & PTE_PRESENT)) {
+    if (!(PTV(pdpt)->entries[pdpt_idx] & PTE_PRESENT)) {
         return -1;  // Page not mapped
     }
-    page_table_t* pd = (page_table_t*)(pdpt->entries[pdpt_idx] & 0x000FFFFFFFFFF000ULL);
+    page_table_t* pd = (page_table_t*)(PTV(pdpt)->entries[pdpt_idx] & 0x000FFFFFFFFFF000ULL);
 
     // Walk PD -> PT
-    if (!(pd->entries[pd_idx] & PTE_PRESENT)) {
+    if (!(PTV(pd)->entries[pd_idx] & PTE_PRESENT)) {
         return -1;  // Page not mapped
     }
 
     // Check for 2MB huge page (PS bit set in PD entry)
-    if (pd->entries[pd_idx] & (1ULL << 7)) {
+    if (PTV(pd)->entries[pd_idx] & (1ULL << 7)) {
         kprintf("[PAGING] WARNING: paging_modify_pte_flags cannot modify 2MB huge pages (virt=%p)\n", virt);
         return -1;
     }
 
-    page_table_t* pt = (page_table_t*)(pd->entries[pd_idx] & 0x000FFFFFFFFFF000ULL);
+    page_table_t* pt = (page_table_t*)(PTV(pd)->entries[pd_idx] & 0x000FFFFFFFFFF000ULL);
 
     // Get current PTE
-    uint64_t old_pte = pt->entries[pt_idx];
+    uint64_t old_pte = PTV(pt)->entries[pt_idx];
     if (!(old_pte & PTE_PRESENT)) {
         return -1;  // Page not mapped
     }
@@ -1487,7 +1504,7 @@ int paging_modify_pte_flags(void* virt, uint64_t new_flags) {
     }
 
     // Update PTE
-    pt->entries[pt_idx] = new_pte;
+    PTV(pt)->entries[pt_idx] = new_pte;
 
     // Invalidate TLB for this page
     invlpg(virt);

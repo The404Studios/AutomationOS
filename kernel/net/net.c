@@ -26,6 +26,7 @@
 #include "../include/string.h"
 #include "../include/rtl8139.h"   /* fallback NIC when no e1000 is present */
 #include "../include/virtio_net.h" /* VIRTIO-NET-0: QEMU virtio-net (probed first) */
+#include "../include/firewall.h"   /* FW-0: fw_ingress / fw_egress chokepoints */
 
 /* Which NIC backend net_send/net_recv talk to (chosen in net_init). */
 #define NIC_NONE     0
@@ -682,6 +683,10 @@ static void net_input(const uint8_t* frame, uint16_t len) {
 /* ------------------------------------------------------------------ */
 int net_send(const void* frame, uint16_t len) {
     if (!net.up) return -1;
+    /* FW-0: every frame the stack OR a raw sender puts on the wire. A dropped frame reports
+     * success (silent drop, like a real filter): an error here made TCP tear the connection
+     * down instead of just timing out. */
+    if (fw_egress((const uint8_t*)frame, len) != FW_VERDICT_ACCEPT) return (int)len;
     if (g_nic == NIC_VIRTIO)   return virtio_net_tx(frame, len);
     if (g_nic == NIC_RTL8139)  return rtl8139_tx(frame, len);
     return e1000_tx(frame, len);
@@ -689,13 +694,19 @@ int net_send(const void* frame, uint16_t len) {
 
 int net_recv(void* buf, uint16_t buf_len) {
     if (!net.up) return -1;
-    int n = (g_nic == NIC_VIRTIO)  ? virtio_net_rx_poll(buf, buf_len)
-          : (g_nic == NIC_RTL8139) ? rtl8139_rx_poll(buf, buf_len)
-                                   : e1000_rx_poll(buf, buf_len);
-    if (n > 0) {
+    /* FW-0: filter BEFORE ARP/ICMP/TCP/UDP see the frame (net_input here, ipv4_demux in the
+     * caller). A burst of dropped frames is bounded: after 64 we report "nothing right now"
+     * and the rest of the ring is drained on the next poll. */
+    for (int tries = 0; tries < 64; tries++) {
+        int n = (g_nic == NIC_VIRTIO)  ? virtio_net_rx_poll(buf, buf_len)
+              : (g_nic == NIC_RTL8139) ? rtl8139_rx_poll(buf, buf_len)
+                                       : e1000_rx_poll(buf, buf_len);
+        if (n <= 0) return n;
+        if (fw_ingress((const uint8_t*)buf, (uint16_t)n) != FW_VERDICT_ACCEPT) continue;
         net_input((const uint8_t*)buf, (uint16_t)n);
+        return n;
     }
-    return n;
+    return 0;
 }
 
 int net_get_mac(uint8_t out[ETH_ALEN]) {

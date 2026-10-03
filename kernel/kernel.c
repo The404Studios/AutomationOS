@@ -1061,6 +1061,13 @@ void kernel_main(void* raw_info) {
     // gated by T410_SAFE_BOOT above.
     boot_mark("network (e1000)");
     BOOT_LOG("[KERNEL] Initializing networking (e1000)...\n");
+    /* FW-0: the filter must be live BEFORE the NIC is, so there is never a window of
+     * unfiltered traffic. fw_selftest() drives the real parse/verdict path with crafted
+     * frames (no NIC) and prints FW-SELFTEST: PASS/FAIL. */
+    extern void fw_init(void);
+    extern int fw_selftest(void);
+    fw_init();
+    fw_selftest();
     extern int net_init(void);
     net_init();
     extern bool e1000_present(void);
@@ -1703,7 +1710,11 @@ void kernel_main(void* raw_info) {
                         }
                     }
 #endif
-#ifdef SMP_BKL
+#if defined(SMP_BKL) && !defined(SMP_PRODUCT)
+                    /* SMP_PRODUCT (MULTICORE=1, the shipping multi-core kernel) keeps the BKL itself but does NOT
+                     * launch the proof storms below at every boot: two 60 s marked-syscall storms saturate the outer
+                     * lock and the serial port and starve the desktop. Proof builds (explicit SMP_* flags, no
+                     * MULTICORE, or MULTICORE=1 SMP_PRODUCT=0) still run them. */
                     /* SMP-H1 BKL-LITE acceptance: TWO 60 s syscall storms,
                      * one pinned to CPU1 (the cpu1hello placement pattern),
                      * one left NORMAL (the funnel homes it to CPU0). Both

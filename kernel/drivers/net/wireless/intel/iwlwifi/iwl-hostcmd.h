@@ -20,9 +20,10 @@
 #include "iwl-trans.h"
 #include "iwl-dvm-commands.h"
 
-/* Max payload we hand the firmware in one command (one cmd-queue page is the
- * DRAM staging area; commands are small). */
-#define IWL_CMD_MAX_PAYLOAD   512
+/* One command occupies a single 4 KiB DMA page. The TFD length field is 12 bits,
+ * so header + payload must be <= 4095 bytes. A DVM scan command is about 924
+ * bytes and must not be rejected by an artificially small generic limit. */
+#define IWL_CMD_MAX_PAYLOAD   4091
 
 /* Max bytes of a received notification payload we copy back to the caller. */
 #define IWL_RESP_MAX          512

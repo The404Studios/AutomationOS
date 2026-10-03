@@ -69,12 +69,19 @@ int64_t sys_vma_test(uint64_t req_ptr, uint64_t arg2, uint64_t arg3,
         return -ESRCH;  // No current process
     }
 
-    // Copy request from userspace
+    // Copy request from userspace. MUST use copy_from_user, not a raw memcpy:
+    // the canonical-half check below does NOT prove the page is mapped, and a
+    // raw kernel deref of an unmapped/unaligned user pointer faults in ring 0
+    // (kernel CS -> the #PF handler's demand-paging recovery is user-mode-only,
+    // so it panics). copy_from_user walks the live CR3 and returns EFAULT
+    // instead -- the fault-safe path every other handler uses.
     vma_test_req_t req;
     if (!req_ptr || req_ptr >= 0x0000800000000000ULL) {
         return -EFAULT;
     }
-    memcpy(&req, (void*)req_ptr, sizeof(req));
+    if (copy_from_user(&req, (const void*)req_ptr, sizeof(req)) != 0) {
+        return -EFAULT;
+    }
 
     // Dispatch based on operation
     switch (req.op) {
@@ -136,8 +143,11 @@ int64_t sys_vma_test(uint64_t req_ptr, uint64_t arg2, uint64_t arg3,
             return -EINVAL;
     }
 
-    // Copy result back to userspace
-    memcpy((void*)req_ptr, &req, sizeof(req));
+    // Copy result back to userspace via the fault-safe path (a raw memcpy here
+    // would panic the kernel if req_ptr landed in a read-only user page).
+    if (copy_to_user((void*)req_ptr, &req, sizeof(req)) != 0) {
+        return -EFAULT;
+    }
 
     return 0;
 }

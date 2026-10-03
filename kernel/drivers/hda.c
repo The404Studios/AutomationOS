@@ -77,6 +77,16 @@ void hda_msleep(uint32_t ms) {
  *
  * For 4-bit verbs use hda_build_verb4() below instead.
  */
+/* HDA-SAFE-0: print v as 0x + `digits` hex digits. The old `serial_putchar('0' + nid)` printed
+ * garbage for any value above 9, which made the serial ladder unreadable on real hardware. */
+static void hda_put_hex(uint32_t v, int digits) {
+    serial_putchar('0'); serial_putchar('x');
+    for (int i = (digits - 1) * 4; i >= 0; i -= 4) {
+        uint8_t n = (uint8_t)((v >> i) & 0xF);
+        serial_putchar(n < 10 ? (char)('0' + n) : (char)('A' + n - 10));
+    }
+}
+
 static uint32_t hda_build_verb(uint8_t codec_addr, uint8_t nid, uint32_t verb, uint32_t param) {
     return ((uint32_t)codec_addr << 28) |
            ((uint32_t)nid << 20) |
@@ -139,7 +149,24 @@ void hda_init(void) {
 
     // Map BAR0 (MMIO)
     uint64_t bar0 = pci_get_bar(pci_dev, 0);
+    /* HDA-SAFE-0: an unassigned BAR (0) or one above the 16 GB identity map would make the very
+     * first register read a wild access on real hardware -- refuse before touching MMIO. */
+    if (bar0 == 0 || bar0 >= (16ULL << 30)) {
+        serial_write("HDA: BAR0 unassigned or out of range -- aborting (no MMIO touched)\n", 67);
+        kfree(g_hda_ctrl);
+        g_hda_ctrl = NULL;
+        return;
+    }
     g_hda_ctrl->mmio_base = (void*)bar0;
+
+    /* HDA-SAFE-0: PCI config 0x44 TCSEL[2:0] must be 0 (traffic class 0) on Intel PCH HDA, or
+     * the controller's DMA can be mapped to a TC the chipset never services -> silent stream.
+     * Linux (azx_init_pci) clears it on every Intel controller; read-modify-write the one byte. */
+    if (pci_dev->vendor_id == 0x8086) {
+        uint8_t tc = pci_config_read_byte(pci_dev->bus, pci_dev->device, pci_dev->function, 0x44);
+        if (tc & 0x07)
+            pci_config_write_byte(pci_dev->bus, pci_dev->device, pci_dev->function, 0x44, (uint8_t)(tc & ~0x07));
+    }
 
     serial_write("HDA: MMIO base at ", 18);
     // Simple hex output
@@ -221,7 +248,22 @@ void hda_init(void) {
      * controller.
      */
     extern void irq_register_handler(uint8_t irq, void (*handler)(void));
-    irq_register_handler(g_hda_ctrl->irq_line, hda_irq_handler);
+    {
+        /* HDA-SAFE-0: interrupt_line is FIRMWARE-supplied. irq_register_handler only rejects
+         * line >= 16, so a value of 0/1/12 would silently REPLACE the PIT / keyboard / mouse
+         * handler and a 2/8/13 would claim the cascade / RTC / FPU line. Register only on
+         * the lines nothing else here owns; otherwise run unregistered (and say so). */
+        uint8_t line = g_hda_ctrl->irq_line;
+        int usable = (line >= 3 && line <= 7) || line == 9 || line == 10 || line == 11 ||
+                     line == 14 || line == 15;
+        if (usable) {
+            irq_register_handler(line, hda_irq_handler);
+        } else {
+            serial_write("HDA: interrupt line is not usable -- handler NOT registered, line=", 66);
+            hda_put_hex(line, 2);
+            serial_putchar('\n');
+        }
+    }
 
     serial_write("HDA: Initialization complete\n", 30);
 }
@@ -572,9 +614,9 @@ int hda_enumerate_codecs(hda_controller_t* ctrl) {
         uint8_t num_nodes = sub_node_count & 0xFF;
 
         serial_write("HDA: Sub-nodes: start=", 22);
-        serial_putchar('0' + start_nid);
+        hda_put_hex(start_nid, 2);
         serial_write(", count=", 8);
-        serial_putchar('0' + num_nodes);
+        hda_put_hex(num_nodes, 2);
         serial_putchar('\n');
 
         // Search for AFG. start_nid/num_nodes are device-reported (uint8); with a
@@ -592,7 +634,7 @@ int hda_enumerate_codecs(hda_controller_t* ctrl) {
             if ((func_type & 0xFF) == 0x01) {  // Audio Function Group
                 codec->afg_nid = (uint8_t)nid;
                 serial_write("HDA: Found AFG at NID ", 23);
-                serial_putchar('0' + (uint8_t)nid);
+                hda_put_hex((uint8_t)nid, 2);
                 serial_putchar('\n');
                 break;
             }
@@ -643,9 +685,9 @@ int hda_codec_read_widgets(hda_codec_t* codec, hda_controller_t* ctrl) {
     codec->afg_num_nodes = sub_node_count & 0xFF;
 
     serial_write("HDA: AFG widgets: start=", 24);
-    serial_putchar('0' + codec->afg_start_nid);
+    hda_put_hex(codec->afg_start_nid, 2);
     serial_write(", count=", 8);
-    serial_putchar('0' + codec->afg_num_nodes);
+    hda_put_hex(codec->afg_num_nodes, 2);
     serial_putchar('\n');
 
     // Read each widget
@@ -702,7 +744,7 @@ int hda_codec_read_widgets(hda_codec_t* codec, hda_controller_t* ctrl) {
     }
 
     serial_write("HDA: Read ", 10);
-    serial_putchar('0' + codec->num_widgets);
+    hda_put_hex(codec->num_widgets, 2);
     serial_write(" widgets\n", 9);
 
     return 0;
@@ -720,7 +762,7 @@ int hda_codec_setup_output(hda_codec_t* codec, hda_controller_t* ctrl) {
         if (codec->widgets[i].type == HDA_WIDGET_AUDIO_OUTPUT) {
             codec->dac_nid = codec->widgets[i].nid;
             serial_write("HDA: Found DAC at NID ", 23);
-            serial_putchar('0' + codec->dac_nid);
+            hda_put_hex(codec->dac_nid, 2);
             serial_putchar('\n');
             break;
         }
@@ -740,7 +782,7 @@ int hda_codec_setup_output(hda_codec_t* codec, hda_controller_t* ctrl) {
             if (widget->pin_caps & (1 << 4)) {
                 codec->pin_nid = widget->nid;
                 serial_write("HDA: Found output pin at NID ", 30);
-                serial_putchar('0' + codec->pin_nid);
+                hda_put_hex(codec->pin_nid, 2);
                 serial_putchar('\n');
                 break;
             }
@@ -811,11 +853,8 @@ int hda_codec_setup_output(hda_codec_t* codec, hda_controller_t* ctrl) {
     {
         uint16_t amp_payload = (1<<15) | (1<<13) | (1<<12) | 0x57; /* unmuted, ~68% gain */
         hda_send_verb4(ctrl, codec->addr, codec->dac_nid, 0x3, amp_payload);
-        serial_write("HDA: DAC amp unmuted (verb4 0x3, payload=0x", 44);
-        serial_putchar('0' + ((amp_payload >> 12) & 0xF));
-        serial_putchar('0' + ((amp_payload >> 8) & 0xF));
-        serial_putchar('0' + ((amp_payload >> 4) & 0xF));
-        serial_putchar('0' + (amp_payload & 0xF));
+        serial_write("HDA: DAC amp unmuted (verb4 0x3, payload=", 41);
+        hda_put_hex(amp_payload, 4);
         serial_write(")\n", 2);
     }
 

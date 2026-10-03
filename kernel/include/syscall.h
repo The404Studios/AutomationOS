@@ -167,6 +167,9 @@
 #define SYS_CFG_GET            133 // RESERVED: CONFIG-STORE (durable config get)
 #define SYS_CFG_SET            134 // RESERVED: CONFIG-STORE (durable config set)
 #define SYS_DEVTREE            135 // RESERVED: DRIVER-FW (device-tree introspection)
+#define SYS_FW_CTL             136 // FW-0: packet filter control (uapi/fw.h); writes need PCAP_NET_ADMIN
+#define SYS_CAP_DROP           137 // PCAP-0: monotonically drop privileges (arg = PCAP_* mask) -> new denied mask
+#define SYS_CAP_QUERY          138 // PCAP-0: current denied mask
 
 #define SYS_VMA_TEST    200 // VMA red-black tree testing and benchmarking
 

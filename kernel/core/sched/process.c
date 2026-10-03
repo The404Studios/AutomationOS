@@ -236,6 +236,7 @@ process_t* process_create(const char* name, void* entry_point) {
     // Initialize process structure
     proc->pid = pid;
     proc->parent_pid = current_process ? current_process->pid : 0;
+    proc->cap_denied = current_process ? current_process->cap_denied : 0;   /* PCAP-0: privilege drops are inherited */
     // #10: snapshot the creator's stable identity so this child can later validate
     // its parent is the SAME incarnation (guards against a recycled parent PID).
     proc->parent_seq = current_process ? current_process->create_seq : 0;
@@ -463,6 +464,7 @@ process_t* thread_create(process_t* parent, uint64_t entry, uint64_t arg,
 
     t->pid = pid;
     t->parent_pid = parent->pid;
+    t->cap_denied = parent->cap_denied;                                    /* PCAP-0 */
     t->parent_seq = parent->create_seq;   // stable parent identity (#10)
     t->state = PROCESS_CREATED;
     t->resume_mode = RESUME_CRETURN;     // first run via the trampoline `ret` path
@@ -844,6 +846,14 @@ void process_unref(process_t* proc) {
         // the 64 system-wide instances forever. Mirrors sock_cleanup_process.
         extern void epoll_cleanup_process(uint32_t pid);
         epoll_cleanup_process(proc->pid);
+
+        // AUDIT FIX: reclaim directory handles owned by the dying process. The
+        // dir_handles[] table is GLOBAL (not in the fd table), so an opendir()
+        // without closedir() (including a crash) leaks a slot + pinned inode
+        // ref; 64 such leaks exhaust the table system-wide. Mirrors the epoll
+        // and socket reclaimers above.
+        extern void vfs_dir_cleanup_process(uint32_t pid);
+        vfs_dir_cleanup_process(proc->pid);
 
         // Free the lazily-allocated waitpid wait queue, if any.
         if (proc->child_wait) {

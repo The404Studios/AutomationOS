@@ -642,6 +642,13 @@ void ide_editor_paste(struct Ide* a) {
     ed_clamp_caret(a);
 }
 
+/* Drop undo/redo history WITHOUT touching the buffer or caret. Called on tab
+ * switch: the undo ring (undo_ops[]/undo_n/...) is a single file-static shared
+ * by all tabs, so ops recorded against tab A's buffer must not survive a switch
+ * to tab B -- replaying them would delete/insert at A's offsets inside B and
+ * silently corrupt (and, if saved, persist) B's contents. */
+void ide_editor_undo_clear(void) { undo_clear(); }
+
 /* ---- public reset ---- */
 void ide_editor_reset(struct Ide* a) {
     Editor* e = &a->editor;

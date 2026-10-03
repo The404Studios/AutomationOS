@@ -370,6 +370,12 @@ static void b2_normalize_input(const char *in, char *out, int cap)
 #define BODY_CAP  (256 * 1024)
 static char g_body[BODY_CAP];
 
+/* Security state of the page currently displayed, for the address-bar dot:
+ *   0 = plain http / local page,  1 = TLS authenticated,  2 = TLS UNauthenticated.
+ * Snapshotted once per navigation (right after the main page fetch) so later
+ * sub-resource fetches can't clobber the verdict shown to the user. */
+static int g_page_security = 0;
+
 /* =========================================================================
  * UA default stylesheet (baked-in CSS string).
  * css_parse handles the UA defaults internally but we give it a small
@@ -1242,11 +1248,35 @@ static int load_page(const char *url, js_vm *vm,
                 body_len = http_get(base_host, (unsigned short)base_port, base_path,
                                     g_body, BODY_CAP, &http_status);
             if (body_len >= 0) break;
+            if (body_len == HTTP_ERR_CERT) break;     /* TLS-STRICT-0: a bad certificate is not transient -- never retry */
             if (fa < 2) { b2_puts("BROWSER2: fetch retry...\n");
                           for (int w = 0; w < 200; w++) sc(SYS_YIELD,0,0,0,0,0,0); }
         }
 
-        if (body_len < 0) {
+        /* Snapshot the authentication verdict for the address-bar dot BEFORE the
+         * about:home fallback below (a failed fetch must show grey, not green).
+         * An https page earns green (1) only if its cert chain authenticated;
+         * an https page that failed to authenticate (or downgraded) shows red (2). */
+        if (body_len >= 0 && base_https)
+            g_page_security = http_last_trusted() ? 1 : 2;
+        else if (body_len == HTTP_ERR_CERT)
+            g_page_security = 2;                  /* red: connection refused, certificate not trusted */
+        else
+            g_page_security = 0;
+
+        if (body_len == HTTP_ERR_CERT) {
+            /* TLS-STRICT-0: show WHY, in the page, instead of silently falling back to about:home. */
+            static const char P1[] = "<html><body><h1>Your connection is not private</h1><p>The security certificate for <b>";
+            static const char P2[] = "</b> could not be verified, so no request was sent. It may be expired, self-signed, issued for a different site, or someone may be intercepting the connection.</p><p>Go back, or try again later.</p></body></html>";
+            int si = 0, k;
+            for (k = 0; P1[k] && si < BODY_CAP - 1; k++) g_body[si++] = P1[k];
+            for (k = 0; base_host[k] && si < BODY_CAP - 1; k++) { char c = base_host[k]; if (c != '<' && c != '>' && c != '&') g_body[si++] = c; }
+            for (k = 0; P2[k] && si < BODY_CAP - 1; k++) g_body[si++] = P2[k];
+            g_body[si] = 0;
+            body_len = si;
+            page_is_network = 0;
+            *p_fetch_ok = 1;
+        } else if (body_len < 0) {
             /* Fetch failed (network likely down -- the lead re-enables the NIC
              * path separately). Fall back to the built-in home page so the
              * browser stays usable instead of showing a dead error screen. */
@@ -1824,7 +1854,8 @@ int main(int argc, char **argv)
                 editview[k]   = 0;
                 addr_str = editview;
             }
-            b2ui_draw_chrome(g_fb, VP_W, VP_H, addr_str, load_pct, 1, 0);
+            b2ui_draw_chrome(g_fb, VP_W, VP_H, addr_str, load_pct, 1, 0,
+                             g_page_security);
 
             /* Present g_fb. */
             if (has_window) {

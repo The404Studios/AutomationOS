@@ -522,6 +522,9 @@ static int s_substr(js_vm *vm, js_value t, js_value *a, int n, js_value *out)
     js_isize len = (js_isize)s->len;
     js_isize b = n>0 ? (js_isize)js_to_number(vm,a[0]) : 0;
     if (b<0){b+=len; if(b<0)b=0;}
+    if (b>len)b=len;   /* clamp high like s_slice/s_substring: a start past the
+                          end otherwise makes cnt negative below, and the
+                          (js_usize) cast turns that into a ~2^64 OOB copy */
     js_isize cnt = (n>1 && a[1].type!=JS_UNDEFINED) ? (js_isize)js_to_number(vm,a[1]) : len-b;
     if (cnt<0)cnt=0;
     if (b+cnt>len)cnt=len-b;
@@ -626,28 +629,45 @@ static int s_replace(js_vm *vm, js_value t, js_value *a, int n, js_value *out)
     }
     *out = js_mk_str(s); return 0;
 }
+/* ToLength-style target: NaN/negative -> 0 (a no-op pad), avoiding the
+ * (js_usize) wrap of a negative that made the pad loop run ~2^64 times. */
+static js_isize pad_target(js_vm *vm, js_value *a, int n)
+{
+    double td = js_to_number(vm, arg(a,n,0));
+    if (js_isnan(td) || td < 0) return 0;
+    return (js_isize)td;
+}
 static int s_padStart(js_vm *vm, js_value t, js_value *a, int n, js_value *out)
 {
     js_string *s = this_str(vm, t);
-    js_usize target = (js_usize)js_to_number(vm, arg(a,n,0));
+    js_isize target = pad_target(vm, a, n);
     js_string *pad = (n>1 && a[1].type!=JS_UNDEFINED) ? js_to_string(vm,a[1]) : js_str_newz(vm," ");
-    if (s->len >= target || pad->len == 0) { *out = js_mk_str(s); return 0; }
+    if ((js_isize)s->len >= target || pad->len == 0) { *out = js_mk_str(s); return 0; }
     js_string *r = js_str_newz(vm,"");
-    while (r->len + s->len < target) r = js_str_concat(vm, r, pad);
+    while ((js_isize)(r->len + s->len) < target) {
+        js_string *nr = js_str_concat(vm, r, pad);
+        if (!nr) { *out = js_mk_str(s); return 0; }   /* arena OOM: bail, no NULL deref */
+        r = nr;
+    }
     /* trim padding to exact */
-    if (r->len + s->len > target) r = js_str_new(vm, r->data, target - s->len);
+    if ((js_isize)(r->len + s->len) > target) r = js_str_new(vm, r->data, (js_usize)(target - (js_isize)s->len));
     r = js_str_concat(vm, r, s);
+    if (!r) { *out = js_mk_str(s); return 0; }
     *out = js_mk_str(r); return 0;
 }
 static int s_padEnd(js_vm *vm, js_value t, js_value *a, int n, js_value *out)
 {
     js_string *s = this_str(vm, t);
-    js_usize target = (js_usize)js_to_number(vm, arg(a,n,0));
+    js_isize target = pad_target(vm, a, n);
     js_string *pad = (n>1 && a[1].type!=JS_UNDEFINED) ? js_to_string(vm,a[1]) : js_str_newz(vm," ");
-    if (s->len >= target || pad->len == 0) { *out = js_mk_str(s); return 0; }
+    if ((js_isize)s->len >= target || pad->len == 0) { *out = js_mk_str(s); return 0; }
     js_string *r = js_str_new(vm, s->data, s->len);
-    while (r->len < target) r = js_str_concat(vm, r, pad);
-    if (r->len > target) r = js_str_new(vm, r->data, target);
+    while ((js_isize)r->len < target) {
+        js_string *nr = js_str_concat(vm, r, pad);
+        if (!nr) { *out = js_mk_str(s); return 0; }   /* arena OOM: bail, no NULL deref */
+        r = nr;
+    }
+    if ((js_isize)r->len > target) r = js_str_new(vm, r->data, (js_usize)target);
     *out = js_mk_str(r); return 0;
 }
 static int s_trimStart(js_vm *vm, js_value t, js_value *a, int n, js_value *out)

@@ -28,6 +28,7 @@
 #include "../include/mem.h"       /* kmalloc + copy_from_user/copy_to_user */
 #include "../include/sched.h"    /* process_get_current (for owner_pid)   */
 #include "../include/netif.h"    /* K1: per-interface tx routing          */
+#include "../include/firewall.h"   /* FW-0: fw_egress on the netif tx branch */
 #include "../include/poll.h"     /* NET-BLOCK-0: poll_pump/poll_sleep_slice */
 #include "../include/time.h"     /* NET-BLOCK-0: ms_to_ticks_atleast1     */
 
@@ -252,6 +253,12 @@ static int ip_send_fragment(uint8_t dmac[ETH_ALEN], uint32_t dst_ip,
         if (netif_get_by_ip(net_get_ip(), &nif) != 0) nif = 0;
         if (!nif) nif = netif_get_default();
         if (nif && nif->tx) {
+            /* FW-0: this branch transmits through the interface directly and never reaches
+             * net_send(), so it needs its own egress verdict -- without it the stack's own
+             * TCP/UDP flows are never tracked and their return traffic is dropped. Dropped =
+             * silent success (a failure here would tear the TCP connection down). The
+             * net_send() fallback below already carries its own hook. */
+            if (fw_egress(f, total) != FW_VERDICT_ACCEPT) return 0;
             nif->tx_packets++; nif->tx_bytes += total;   /* NET-RESILIENCE-OBS */
             return (nif->tx(f, total) > 0) ? 0 : -1;
         }
@@ -878,18 +885,31 @@ int sock_close(int s) {
         }
 
         /* Scan the whole table for SYN_RCVD (or any other) children still
-         * pointing at this listener.  These aren't on the accept_queue yet. */
-        for (int ci = 0; ci < SOCK_MAX; ci++) {
-            if (g_socks[ci].used && g_socks[ci].parent == so) {
-                g_socks[ci].parent = NULL;
-                g_socks[ci].accept_next = NULL;
-                if (g_socks[ci].type == SOCK_STREAM &&
-                    (g_socks[ci].state == TCP_ESTABLISHED ||
-                     g_socks[ci].state == TCP_CLOSE_WAIT)) {
-                    tcp_close(&g_socks[ci]);
+         * pointing at this listener.  These aren't on the accept_queue yet.
+         *
+         * RESCAN: tcp_close() calls sock_poll() which can deliver an inbound
+         * ACK that promotes a SYN_RCVD child via synq_on_ack into a slot the
+         * forward scan already passed (a slot freed by the accept_queue loop
+         * above). Without a re-scan, that child survives with
+         * parent==<about-to-be-freed listener> — a stale pointer that
+         * corrupts the reused slot on later dereference. Repeat the scan
+         * until no more children are found (bounded by SOCK_MAX). */
+        for (int pass = 0; pass < SOCK_MAX; pass++) {
+            int found_any = 0;
+            for (int ci = 0; ci < SOCK_MAX; ci++) {
+                if (g_socks[ci].used && g_socks[ci].parent == so) {
+                    found_any = 1;
+                    g_socks[ci].parent = NULL;
+                    g_socks[ci].accept_next = NULL;
+                    if (g_socks[ci].type == SOCK_STREAM &&
+                        (g_socks[ci].state == TCP_ESTABLISHED ||
+                         g_socks[ci].state == TCP_CLOSE_WAIT)) {
+                        tcp_close(&g_socks[ci]);
+                    }
+                    memset(&g_socks[ci], 0, sizeof(g_socks[ci]));
                 }
-                memset(&g_socks[ci], 0, sizeof(g_socks[ci]));
             }
+            if (!found_any) break;
         }
     }
 

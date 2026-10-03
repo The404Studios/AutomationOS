@@ -128,15 +128,63 @@
 
 /* ---- configurable resolver --------------------------------------------- */
 static unsigned int g_dns_server = DNS_DEFAULT_SERVER;
+/* DNS-LEASE-0: once a caller pins a resolver with dns_set_server() we never override it. Until then the
+ * resolver FOLLOWS the DNS server DHCP delivered (SYS_NET_INFO.dns). It used to query a hard-wired
+ * 10.0.2.3 forever (QEMU slirp's address) and nothing ever called dns_set_server(), so on any real LAN
+ * -- the T410's wired port, WiFi -- every name lookup went to a dead address. */
+static int g_dns_explicit;
 
 void dns_set_server(unsigned int ip_host_order)
 {
     g_dns_server = ip_host_order;
+    g_dns_explicit = 1;
 }
 
+int dns_sync_server(void);
 unsigned int dns_get_server(void)
 {
+    dns_sync_server();   /* the EFFECTIVE resolver: follows the DHCP lease unless a caller pinned one */
     return g_dns_server;
+}
+
+/* mirror of uapi_net_info_t (kernel/include/uapi/net.h, NET_INFO_ABI_SIZE == 80) */
+struct dns_netinfo {
+    char ifname[16]; unsigned char mac[6]; unsigned char _pad[2];
+    unsigned int ip, netmask, gateway, dns;
+    unsigned char up, dhcp, _reserved[6];
+    unsigned long long tx_packets, rx_packets, tx_bytes, rx_bytes;
+};
+#define DNS_SYS_NET_INFO 59
+
+/* Adopt the interface's current DNS server unless the caller pinned one. Returns 1 if the server
+ * changed. Cheap (one syscall) and called at the start of every query, so a lease that arrives or
+ * changes after the first lookup (DHCP completing late, a renew, WiFi roaming) is picked up. */
+static long sc(long n, long a1, long a2, long a3, long a4, long a5);
+int dns_sync_server(void)
+{
+    if (g_dns_explicit) return 0;
+    struct dns_netinfo ni;
+    if (sc(DNS_SYS_NET_INFO, (long)&ni, 0, 0, 0, 0) != 0) return 0;
+    if (ni.dns == 0 || ni.dns == g_dns_server) return 0;
+    g_dns_server = ni.dns;
+    return 1;
+}
+
+/* Block (bounded) until the interface is up with an address. Apps started at boot race DHCP: the first sendto /
+ * connect fails in microseconds because the lease has not landed yet (found by the multi-core proof once boot got
+ * faster: "LIVENET: dns ... FAILED rc=2" = DNS_ERR_SEND). Returns 1 when up, 0 on timeout. Polls SYS_NET_INFO (59)
+ * every 100 ms with SYS_SLEEP (9). */
+#define DNS_SYS_SLEEP 9
+#define DNS_SEND_RETRIES 30
+static int g_send_retry_budget = DNS_SEND_RETRIES;
+int dns_wait_net(unsigned int max_ms)
+{
+    struct dns_netinfo ni;
+    for (unsigned int waited = 0; ; waited += 100) {
+        if (sc(DNS_SYS_NET_INFO, (long)&ni, 0, 0, 0, 0) == 0 && ni.up && ni.ip != 0) return 1;
+        if (waited >= max_ms) return 0;
+        sc(DNS_SYS_SLEEP, 100, 0, 0, 0, 0);
+    }
 }
 
 /* ---- statistics counters ------------------------------------------------ */
@@ -719,6 +767,7 @@ static int do_query_ex(const char *hostname, unsigned int hlen,
                        char *ptr_out, int ptr_cap,
                        unsigned short qtype)
 {
+    dns_sync_server();                    /* DNS-LEASE-0: follow the DHCP-learned resolver */
     long fd = sc(SYS_SOCKET, SOCK_DGRAM, 0, 0, 0, 0);
     if (fd < 0) return DNS_ERR_SOCK;
 
@@ -732,6 +781,7 @@ static int do_query_ex(const char *hostname, unsigned int hlen,
 
     for (int attempt = 0; attempt < DNS_MAX_TRIES; attempt++) {
         if (attempt > 0) g_stats.retries++;
+        dns_sync_server();                /* DNS-LEASE-0: a lease that lands mid-lookup is used by the next attempt */
 
         unsigned int mix = seed ^ (0x9E3779B9u * (unsigned int)(attempt + 1));
         for (unsigned int i = 0; i < hlen; i++)
@@ -778,8 +828,22 @@ static int do_query_ex(const char *hostname, unsigned int hlen,
 
         long sent = sc(SYS_SENDTO, fd, (long)query, qlen,
                        (long)g_dns_server, DNS_PORT);
-        if (sent < 0) { result = DNS_ERR_SEND; continue; }
-
+        if (sent < 0) {
+            result = DNS_ERR_SEND;
+            /* An early send failure usually means the stack is not ready yet (the gateway's ARP reply has not been pumped
+             * through, or the lease has not landed): RX only advances when something polls the socket layer. Retry the SAME
+             * attempt after a short sleep + poll, within a per-process budget of DNS_SEND_RETRIES x 100 ms (3 s). The budget
+             * refills only after a successful send, so an offline machine pays the 3 s once, never per lookup, and a
+             * persistent failure can never loop. */
+            if (g_send_retry_budget > 0) {
+                g_send_retry_budget--;
+                sc(SYS_SOCK_POLL, 0, 0, 0, 0, 0);
+                sc(DNS_SYS_SLEEP, 100, 0, 0, 0, 0);
+                attempt--;
+            }
+            continue;
+        }
+        g_send_retry_budget = DNS_SEND_RETRIES;
         /* ---- bounded poll loop ---- */
         int rlen = -1;
         for (int it = 0; it < DNS_POLL_MAX; it++) {

@@ -97,11 +97,25 @@ int dns_reverse(unsigned int ip, char *out_name, int out_cap);
 void dns_set_server(unsigned int ip_host_order);
 
 /*
+ * dns_wait_net -- block (bounded by max_ms, polled every 100 ms) until the interface is up with an IP address.
+ * Apps that start at boot race DHCP; call this first (or rely on the resolver's one-time wait-and-retry).
+ * Returns 1 when the network is up, 0 on timeout.
+ */
+int dns_wait_net(unsigned int max_ms);
+
+/*
  * dns_get_server -- return the currently configured resolver IP (host order).
  *
  * Returns 0x0A000203 (10.0.2.3) until dns_set_server() has been called.
  */
 unsigned int dns_get_server(void);
+
+/*
+ * dns_sync_server -- DNS-LEASE-0: adopt the DNS server DHCP delivered (SYS_NET_INFO.dns), unless a
+ * caller pinned one with dns_set_server(). Every query does this automatically; call it directly to
+ * refresh dns_get_server() without issuing a query. Returns 1 if the resolver changed.
+ */
+int dns_sync_server(void);
 
 /*
  * dns_clear_cache -- flush every entry from the in-memory resolver cache.

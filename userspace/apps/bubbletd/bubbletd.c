@@ -93,6 +93,13 @@ static inline long sc(long n, long a1, long a2, long a3, long a4, long a5, long 
  * itself) to satisfy the freestanding link. */
 __attribute__((used, optimize("no-tree-loop-distribute-patterns")))
 unsigned long strlen(const char *s) { unsigned long n = 0; while (s[n]) n++; return n; }
+__attribute__((used, optimize("no-tree-loop-distribute-patterns")))
+void *memcpy(void *dst, const void *src, unsigned long n) {
+    unsigned char *d = (unsigned char*)dst;
+    const unsigned char *s = (const unsigned char*)src;
+    for (unsigned long i = 0; i < n; i++) d[i] = s[i];
+    return dst;
+}
 static u64 k_strlen(const char *s) { u64 n = 0; while (s[n]) n++; return n; }
 static void print(const char *m) { sc(SYS_WRITE, 1, (long)m, (long)k_strlen(m), 0, 0, 0); }
 

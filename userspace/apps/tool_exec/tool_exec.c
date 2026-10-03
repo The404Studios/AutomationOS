@@ -113,6 +113,10 @@ static long spawn_wait(const char *path, const char *const *args, int nargs) {
  * calls main(argc,argv), and feeds the return value to SYS_EXIT.
  * ---------------------------------------------------------------------- */
 int main(int argc, char **argv) {
+    /* PCAP-0: everything this tool launches inherits a process with NO kernel privileges
+     * (raw frames, network/firewall admin, ...). The KERNEL enforces it, so it holds no matter
+     * what the launched program tries. SYS_CAP_DROP(137, PCAP_ALL=0xF) is monotonic. */
+    sc(137, 0xF, 0, 0);
     /* Validate argc/argv before any deref -- never touch a missing/empty arg. */
     if (argc < 2 || !argv[1] || !argv[1][0]) {
         out(2, "ERR no_path\n");                  /* diagnostic -> fd2          */

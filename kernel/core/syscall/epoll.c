@@ -239,6 +239,21 @@ int64_t sys_epoll_ctl(uint64_t epfd_arg, uint64_t op_arg, uint64_t fd_arg,
     spinlock_acquire(&ep->lock);
 
     if (op == EPOLL_CTL_ADD) {
+        // Refuse to watch the epoll fd itself, or any OTHER epoll instance.
+        // epoll_has_ready() (the fd_poll_state path used by epoll_wait/poll)
+        // walks the watch list while holding ep->lock and re-enters
+        // fd_poll_state() for each watched fd. If a watched fd is an epoll fd,
+        // that re-enters epoll_has_ready() which re-acquires a non-recursive
+        // spinlock: a self-watch (fd==epfd) deadlocks the CPU outright, and an
+        // A-watches-B / B-watches-A cycle deadlocks identically. Nested epoll
+        // is unsupported here, so reject any epoll-encoded fd up front (EINVAL,
+        // matching Linux's self-loop rejection).
+        if (fd == epfd ||
+            (fd >= 0x10000 && fd < 0x10000 + EPOLL_MAX_INSTANCES)) {
+            spin_unlock(&ep->lock);
+            return EINVAL;
+        }
+
         // Read user event structure
         epoll_event_t event;
         if (copy_from_user(&event, (void*)event_ptr, sizeof(event)) != 0) {

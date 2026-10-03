@@ -190,7 +190,7 @@ struct iwl_calib_hdr {
 #define RXON_FLG_TGG_PROTECT_MSK    0x00000008u  /* 1<<3  */
 #define RXON_FLG_SHORT_SLOT_MSK     0x00000010u  /* 1<<4  */
 #define RXON_FLG_SHORT_PREAMBLE_MSK 0x00000020u  /* 1<<5  */
-#define RXON_FLG_BAND_24G_MSK       0x00000100u  /* 1<<8 (clear == 5GHz)        */
+#define RXON_FLG_BAND_24G_MSK       0x00000001u  /* 1<<0 (clear == 5GHz)        */
 #define RXON_FLG_TSF2HOST_MSK       0x00008000u  /* 1<<15 (report TSF to host)  */
 
 /* filter_flags (dvm/commands.h RXON_FILTER_*). */
@@ -534,6 +534,17 @@ struct iwl_rx_phy_res {
 #define SCD_CONTEXT_QUEUE_OFFSET(x)    (SCD_CONTEXT_MEM_LOWER_BOUND + ((x) * 8))
 #define SCD_TRANS_TBL_MEM_LOWER_BOUND  0x7E0        /* iwl-prph.h */
 #define SCD_TRANS_TBL_OFFSET_QUEUE(x)  ((SCD_TRANS_TBL_MEM_LOWER_BOUND + ((x) * 2)) & 0xfffc)
+
+/* Second per-queue context dword. A command queue uses the standard 64-frame
+ * scheduler window and frame limit; leaving this dword zero prevents the SCD
+ * from dispatching queued host commands on DVM hardware. */
+#define SCD_QUEUE_CTX_REG2_WIN_SIZE_POS      0
+#define SCD_QUEUE_CTX_REG2_FRAME_LIMIT_POS   16
+#define SCD_QUEUE_CTX_REG2_WIN_SIZE          64u
+#define SCD_QUEUE_CTX_REG2_FRAME_LIMIT       64u
+#define SCD_QUEUE_CTX_REG2_VALUE \
+    ((SCD_QUEUE_CTX_REG2_WIN_SIZE << SCD_QUEUE_CTX_REG2_WIN_SIZE_POS) | \
+     (SCD_QUEUE_CTX_REG2_FRAME_LIMIT << SCD_QUEUE_CTX_REG2_FRAME_LIMIT_POS))
 
 /* SCD byte-count table: one struct iwlagn_scd_bc_tbl per queue, each a
  * __le16 tfd_offset[TFD_QUEUE_BC_SIZE]. iwl-fh.h: TFD_QUEUE_BC_SIZE =

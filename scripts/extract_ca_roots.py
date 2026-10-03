@@ -36,6 +36,46 @@ TARGETS = [
     ("DigiCert Global Root G3",                      "digicert_root_g3",      "DigiCert Global Root G3"),
     ("USERTrust ECC Certification Authority",        "usertrust_ecc_ca",      "USERTrust ECC Certification Authority"),
     ("GTS Root R4",                                  "gts_root_r4",           "GTS Root R4"),
+
+    # ---- CERT-REAL-0: the rest of the roots the public web actually anchors to. The first 11 left out
+    # ISRG Root X2 (Let's Encrypt's ECDSA chains: every modern LE site on an E5/E6 intermediate), the other
+    # Google roots, the Amazon/Microsoft/Cloudflare-adjacent roots and the older-but-still-live DigiCert,
+    # Sectigo, GlobalSign, GoDaddy/Starfield, SSL.com and Entrust families. All are taken bit-exact from the
+    # host's system trust store (the Mozilla set); a missing one is skipped with a WARN, never invented.
+    ("ISRG Root X2",                                 "isrg_root_x2",          "ISRG Root X2"),
+    ("GTS Root R2",                                  "gts_root_r2",           "GTS Root R2"),
+    ("GTS Root R3",                                  "gts_root_r3",           "GTS Root R3"),
+    ("Amazon Root CA 2",                             "amazon_root_ca_2",      "Amazon Root CA 2"),
+    ("Amazon Root CA 3",                             "amazon_root_ca_3",      "Amazon Root CA 3"),
+    ("Amazon Root CA 4",                             "amazon_root_ca_4",      "Amazon Root CA 4"),
+    ("DigiCert Assured ID Root CA",                  "digicert_assured_ca",   "DigiCert Assured ID Root CA"),
+    ("DigiCert Assured ID Root G2",                  "digicert_assured_g2",   "DigiCert Assured ID Root G2"),
+    ("DigiCert Assured ID Root G3",                  "digicert_assured_g3",   "DigiCert Assured ID Root G3"),
+    ("DigiCert High Assurance EV Root CA",           "digicert_hv_ev",        "DigiCert High Assurance EV Root CA"),
+    ("DigiCert Trusted Root G4",                     "digicert_trusted_g4",   "DigiCert Trusted Root G4"),
+    ("DigiCert TLS ECC P384 Root G5",                "digicert_tls_ecc_g5",   "DigiCert TLS ECC P384 Root G5"),
+    ("DigiCert TLS RSA4096 Root G5",                 "digicert_tls_rsa_g5",   "DigiCert TLS RSA4096 Root G5"),
+    ("Baltimore CyberTrust Root",                    "baltimore_cybertrust",  "Baltimore CyberTrust Root"),
+    ("Microsoft RSA Root Certificate Authority 2017","microsoft_rsa_2017",    "Microsoft RSA Root Certificate Authority 2017"),
+    ("Microsoft ECC Root Certificate Authority 2017","microsoft_ecc_2017",    "Microsoft ECC Root Certificate Authority 2017"),
+    ("GlobalSign Root R46",                          "globalsign_r46",        "GlobalSign Root R46"),
+    ("GlobalSign Root E46",                          "globalsign_e46",        "GlobalSign Root E46"),
+    ("GlobalSign Root CA - R3",                      "globalsign_r3",         "GlobalSign Root CA - R3"),
+    ("GlobalSign ECC Root CA - R5",                  "globalsign_ecc_r5",     "GlobalSign ECC Root CA - R5"),
+    ("Go Daddy Root Certificate Authority - G2",     "godaddy_root_g2",       "Go Daddy Root Certificate Authority - G2"),
+    ("Starfield Root Certificate Authority - G2",    "starfield_root_g2",     "Starfield Root Certificate Authority - G2"),
+    ("Starfield Services Root Certificate Authority - G2", "starfield_services_g2", "Starfield Services Root Certificate Authority - G2"),
+    ("COMODO RSA Certification Authority",           "comodo_rsa_ca",         "COMODO RSA Certification Authority"),
+    ("COMODO ECC Certification Authority",           "comodo_ecc_ca",         "COMODO ECC Certification Authority"),
+    ("Sectigo Public Server Authentication Root R46","sectigo_server_r46",    "Sectigo Public Server Authentication Root R46"),
+    ("Sectigo Public Server Authentication Root E46","sectigo_server_e46",    "Sectigo Public Server Authentication Root E46"),
+    ("SSL.com Root Certification Authority RSA",     "sslcom_root_rsa",       "SSL.com Root Certification Authority RSA"),
+    ("SSL.com Root Certification Authority ECC",     "sslcom_root_ecc",       "SSL.com Root Certification Authority ECC"),
+    ("SSL.com TLS RSA Root CA 2022",                 "sslcom_tls_rsa_2022",   "SSL.com TLS RSA Root CA 2022"),
+    ("Entrust Root Certification Authority - G2",    "entrust_root_g2",       "Entrust Root Certification Authority - G2"),
+    ("AAA Certificate Services",                     "comodo_aaa",            "AAA Certificate Services"),
+    ("HARICA TLS RSA Root CA 2021",                  "harica_tls_rsa_2021",   "HARICA TLS RSA Root CA 2021"),
+    ("HARICA TLS ECC Root CA 2021",                  "harica_tls_ecc_2021",   "HARICA TLS ECC Root CA 2021"),
 ]
 
 

@@ -26,10 +26,16 @@
 
 /* Draw the chrome strip: address bar showing `url`, a tab strip of `ntabs`
  * tabs (active = `active_tab`), and a load-progress fill `load_pct` (0..100,
- * or -1 to hide). */
+ * or -1 to hide).
+ *
+ * `security` selects the address-bar indicator dot and reflects certificate
+ * AUTHENTICATION, not the URL scheme:
+ *   <0 : derive from URL scheme (legacy)   0 : plain http (grey)
+ *    1 : TLS, cert authenticated (green)    2 : TLS, cert NOT authenticated (red)
+ */
 void b2ui_draw_chrome(unsigned int *fb, int w, int h,
                       const char *url, int load_pct,
-                      int ntabs, int active_tab);
+                      int ntabs, int active_tab, int security);
 
 /* Hit-test a click at (x,y) against the chrome; returns a B2UI_ACT_* code
  * (B2UI_ACT_SELTAB + i for a tab click). */

@@ -33,8 +33,8 @@ uint16_t iwl_build_rxon_baseline(struct iwl_rxon_cmd* r,
 
     /* node_addr = our own MAC (from NVM). */
     if (mac) for (int i = 0; i < 6; i++) r->node_addr[i] = mac[i];
-    /* bssid = broadcast: we are NOT associated to any AP yet (baseline). */
-    for (int i = 0; i < 6; i++) r->bssid_addr[i] = 0xff;
+    /* Keep BSSID zero while unassociated. DVM rejects a multicast/broadcast
+     * BSSID in RXON validation; the promiscuous filter below receives beacons. */
 
     r->dev_type        = RXON_DEV_TYPE_ESS;                 /* managed station */
     r->rx_chain        = (uint16_t)RXON_RX_CHAIN_SCAN_DEFAULT;
@@ -70,9 +70,8 @@ int iwl_rxon_baseline(struct iwl_trans* trans, uint8_t channel) {
     iwl_build_rxon_baseline(&r, trans->mac, channel);
     kprintf("IWLRXON: commit baseline RXON ch=%u (REPLY_RXON 0x10, %u bytes)...\n",
             channel, (unsigned)sizeof(r));
-    /* Async send: the firmware applies the RXON; the proof it worked is that the
-     * subsequent scan starts returning beacons. */
-    if (iwl_send_cmd(trans, REPLY_RXON, &r, sizeof(r), 0, (iwl_rx_notif_t*)0) != 0) {
+    if (iwl_send_cmd(trans, REPLY_RXON, &r, sizeof(r), REPLY_RXON,
+                     (iwl_rx_notif_t*)0) != 0) {
         kprintf("IWLRXON: REPLY_RXON send FAILED -- abort\n");
         return -1;
     }
@@ -81,7 +80,7 @@ int iwl_rxon_baseline(struct iwl_trans* trans, uint8_t channel) {
     struct iwl_rxon_time_cmd tm;
     iwl_build_rxon_timing(&tm);
     kprintf("IWLRXON: send RXON_TIMING (0x14)...\n");
-    if (iwl_send_cmd(trans, REPLY_RXON_TIMING, &tm, sizeof(tm), 0,
+    if (iwl_send_cmd(trans, REPLY_RXON_TIMING, &tm, sizeof(tm), REPLY_RXON_TIMING,
                      (iwl_rx_notif_t*)0) != 0) {
         kprintf("IWLRXON: REPLY_RXON_TIMING send FAILED -- abort\n");
         return -1;
@@ -109,7 +108,7 @@ int iwl_rxon_selftest(void) {
         ok = 0;
     }
     for (int i = 0; i < 6; i++) if (r.node_addr[i]  != mac[i]) ok = 0;   /* our MAC */
-    for (int i = 0; i < 6; i++) if (r.bssid_addr[i] != 0xff)   ok = 0;   /* broadcast */
+    for (int i = 0; i < 6; i++) if (r.bssid_addr[i] != 0x00)   ok = 0;   /* unassociated */
     if (r.dev_type != RXON_DEV_TYPE_ESS)                       ok = 0;
     if (r.channel  != 6)                                       ok = 0;
     if (!(r.flags & RXON_FLG_BAND_24G_MSK))                    ok = 0;   /* 2.4GHz */

@@ -67,6 +67,10 @@ boot() {  # $1=logfile  $2=timeout
     sleep 2
 }
 has(){ grep -qF "$2" "$1"; }   # has <logfile> <literal>
+# kernel_fault <logfile>: PANIC / triple fault / a CPU EXCEPTION with no matching "Terminating faulting
+# process" (a contained ring-3 fault is NOT a kernel fault -- smoke_boot.sh judges it the same way).
+kernel_fault(){ local e c; e=$(grep -acF "CPU EXCEPTION" "$1" || true); c=$(grep -acF "Terminating faulting process" "$1" || true)
+    grep -qiE "PANIC|TRIPLE FAULT" "$1" || [ "${e:-0}" -gt "${c:-0}" ]; }
 
 # ── Preflight: ensure both kernels exist ────────────────────────────────────
 hdr "Preflight: kernels"
@@ -85,16 +89,16 @@ hdr "RUN NORMAL — healthy SELFHEAL desktop (no freeze)"
 SELFHEAL=1 FREEZE_TEST=0 build_iso "$ROOT/build/kernel.elf" || exit 1
 boot /tmp/selfheal_normal.log "$TIMEOUT_LIVE"
 L=/tmp/selfheal_normal.log
-if has "$L" 'SELFHEAL: heartbeat published' && has "$L" 'CWATCHDOG: watching'; then
-    if has "$L" 'CWATCHDOG: heartbeat stalled'; then
+if has "$L" 'SELFHEAL: heartbeat published' && has "$L" 'service=compositor event=healthy'; then
+    if has "$L" 'service=compositor event=heartbeat-stalled'; then
         fail "NORMAL: watchdog FALSE-TRIPPED on a healthy desktop"; FAILS=$((FAILS+1))
-    elif grep -qiE 'PANIC|CPU EXCEPTION|PAGE FAULT|TRIPLE FAULT' "$L"; then
+    elif kernel_fault "$L"; then
         fail "NORMAL: kernel fault during SELFHEAL boot"; FAILS=$((FAILS+1))
     else
-        pass "SELFHEAL-NORMAL: heartbeat published + watchdog watching + no false-trip"
+        pass "SELFHEAL-NORMAL: heartbeat published + PID 1 supervisor healthy + no false-trip"
     fi
 else
-    fail "NORMAL: heartbeat/watchdog markers missing (see $L)"; FAILS=$((FAILS+1))
+    fail "NORMAL: heartbeat/supervisor markers missing (see $L)"; FAILS=$((FAILS+1))
 fi
 
 # ── RUN BLOCK (blocking freeze, default cooperative kernel) ──────────────────
@@ -103,10 +107,10 @@ SELFHEAL=1 FREEZE_TEST=1 FREEZE_MODE=0 build_iso "$ROOT/build/kernel.elf" || exi
 boot /tmp/selfheal_block.log "$TIMEOUT_LIVE"
 L=/tmp/selfheal_block.log
 if has "$L" 'FREEZE_TEST: entering freeze mode 0' \
-   && has "$L" 'CWATCHDOG: heartbeat stalled' \
-   && has "$L" 'CWATCHDOG: recovery overlay fired' \
-   && has "$L" 'CWATCHDOG: PASS respawned'; then
-    if has "$L" 'CWATCHDOG: FAIL recovery storm'; then
+   && has "$L" 'service=compositor event=heartbeat-stalled' \
+   && has "$L" '[SUP] SELFHEAL: recovery overlay fired' \
+   && has "$L" '[SUP] SELFHEAL: PASS respawned'; then
+    if has "$L" 'service=compositor event=circuit-open'; then
         fail "SELFHEAL-BLOCK: recovery STORMED (one-shot re-freeze latch broken)"; FAILS=$((FAILS+1))
     else
         pass "SELFHEAL-BLOCK: PASS — blocking freeze recovered on the default cooperative kernel"
@@ -120,7 +124,7 @@ hdr "RUN TIGHT/default — tight-loop freeze on the DEFAULT kernel (expect SKIP)
 SELFHEAL=1 FREEZE_TEST=1 FREEZE_MODE=1 build_iso "$ROOT/build/kernel.elf" || exit 1
 boot /tmp/selfheal_tight_coop.log "$TIMEOUT_HANG"
 L=/tmp/selfheal_tight_coop.log
-if has "$L" 'CWATCHDOG: PASS respawned'; then
+if has "$L" '[SUP] SELFHEAL: PASS respawned'; then
     pass "SELFHEAL-TIGHT (default): recovered (cooperative kernel preempted the spin? investigate)"
 elif has "$L" 'FREEZE_TEST: entering freeze mode 1'; then
     skip "SELFHEAL-TIGHT: SKIP on default — froze and did NOT recover; tight-loop recovery requires PREEMPT (as designed)"
@@ -133,9 +137,9 @@ hdr "RUN TIGHT/PREEMPT — same tight-loop initrd, PREEMPT kernel (expect recove
 remaster_with_kernel "$ROOT/build/kernel-preempt.elf" || { fail "remaster failed"; exit 1; }
 boot /tmp/selfheal_tight_preempt.log "$TIMEOUT_LIVE"
 L=/tmp/selfheal_tight_preempt.log
-if has "$L" 'CWATCHDOG: PASS respawned'; then
+if has "$L" '[SUP] SELFHEAL: PASS respawned'; then
     pass "SELFHEAL-TIGHT (PREEMPT): PASS — timer preempted the ring-3 spinner, watchdog recovered"
-elif has "$L" 'CWATCHDOG: heartbeat stalled'; then
+elif has "$L" 'service=compositor event=heartbeat-stalled'; then
     # detected but failed to recover -> a real watchdog/overlay defect
     fail "SELFHEAL-TIGHT (PREEMPT): detected the stall but did NOT recover (watchdog/overlay bug) (see $L)"; FAILS=$((FAILS+1))
 else

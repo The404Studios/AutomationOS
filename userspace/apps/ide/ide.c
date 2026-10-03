@@ -208,6 +208,9 @@ static void tab_restore(Ide* a, int idx) {
         a->model.focus = a->focus_func;
     } else { a->model.focus = -1; }
     model_analyze(&a->model);
+    /* The undo ring is global, not per-tab; drop it so ops recorded against the
+     * previous tab's buffer can't replay into this one and corrupt it. */
+    ide_editor_undo_clear();
 }
 
 static int tab_find(Ide* a, const char* path) {

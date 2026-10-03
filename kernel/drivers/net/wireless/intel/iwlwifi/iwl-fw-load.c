@@ -46,9 +46,9 @@ static inline uint32_t fwl_le32(const uint8_t* p) {
 }
 
 /* ====================================================================== *
- *  iwl_fw_capture_sections -- re-walk the TLV stream capturing payload POINTERS
- *  (iwl-fw.c only records sizes). Same strict bounds discipline: no read past
- *  blob+len; reject any overrun. Assigns SRAM destinations per section type.
+ *  iwl_fw_capture_sections -- re-walk the legacy or TLV container capturing
+ *  payload POINTERS (iwl-fw.c only records sizes). Same strict bounds discipline:
+ *  no read past blob+len; reject any overrun. Assigns SRAM destinations.
  * ====================================================================== */
 int iwl_fw_capture_sections(const uint8_t* blob, uint32_t len,
                             iwl_fw_images_t* out) {
@@ -56,8 +56,25 @@ int iwl_fw_capture_sections(const uint8_t* blob, uint32_t len,
 
     for (uint32_t i = 0; i < sizeof(*out); i++) ((uint8_t*)out)[i] = 0;
 
+    if (len >= 4 && fwl_le32(blob) != 0) {
+        struct iwl_legacy_fw_layout legacy;
+        if (iwl_legacy_fw_decode(blob, len, &legacy) != 0) return -1;
+
+        const uint8_t* p = blob + legacy.header_size;
+        out->inst.data = p; out->inst.len = legacy.inst_size;
+        out->inst.dest = IWL_RTC_INST_LOWER_BOUND; p += legacy.inst_size;
+        out->data.data = p; out->data.len = legacy.data_size;
+        out->data.dest = IWL_RTC_DATA_LOWER_BOUND; p += legacy.data_size;
+        out->init_inst.data = p; out->init_inst.len = legacy.init_size;
+        out->init_inst.dest = IWL_RTC_INST_LOWER_BOUND; p += legacy.init_size;
+        out->init_data.data = p; out->init_data.len = legacy.init_data_size;
+        out->init_data.dest = IWL_RTC_DATA_LOWER_BOUND;
+        out->valid = 1;
+        return 0;
+    }
+
     if (len < FWL_HDR_SIZE) return -1;
-    if (fwl_le32(blob + 0) != 0) return -1;                 /* zero field */
+    if (fwl_le32(blob + 0) != 0) return -1;                 /* TLV zero field */
     if (fwl_le32(blob + 4) != IWL_TLV_UCODE_MAGIC) return -1;
 
     uint32_t off = FWL_HDR_SIZE;
@@ -339,6 +356,7 @@ static int iwl_load_image_and_alive(struct iwl_trans* trans,
      * resets the scheduler, so this must run after EVERY ALIVE (INIT + RUNTIME)
      * before the first host command. iwl_scd_cmd_queue_init is one-shot per
      * trans, so clear the guard before each load. (Part of item H-C2.) */
+    trans->cmd_wr_ptr = 0;
     trans->scd_ready = 0;
     if (iwl_scd_cmd_queue_init(trans) != 0) {
         kprintf("IWLLOAD: SCD cmd-queue bring-up FAILED -- abort\n");
@@ -363,7 +381,7 @@ static int iwl_send_calib_results(struct iwl_trans* trans) {
                 g_calib_results[i].op_code, g_calib_results[i].len);
         if (iwl_send_cmd(trans, REPLY_PHY_CALIBRATION_CMD,
                          g_calib_results[i].buf, g_calib_results[i].len,
-                         0, (iwl_rx_notif_t*)0) != 0) {
+                         REPLY_PHY_CALIBRATION_CMD, (iwl_rx_notif_t*)0) != 0) {
             kprintf("IWLLOAD: calib replay (op 0x%02x) FAILED -- abort\n",
                     g_calib_results[i].op_code);
             return -1;
@@ -405,7 +423,7 @@ static int iwl_run_init_and_calib(struct iwl_trans* trans,
     cfg.ucd_calib_cfg.once.send_res  = IWL_CALIB_INIT_CFG_ALL;
     cfg.ucd_calib_cfg.flags          = IWL_CALIB_CFG_FLAG_SEND_COMPLETE_NTFY_MSK;
     if (iwl_send_cmd(trans, CALIBRATION_CFG_CMD, &cfg, sizeof(cfg),
-                     0, (iwl_rx_notif_t*)0) != 0) {
+                     CALIBRATION_CFG_CMD, (iwl_rx_notif_t*)0) != 0) {
         kprintf("IWLLOAD: CALIBRATION_CFG_CMD enqueue failed -- abort\n");
         return -1;
     }

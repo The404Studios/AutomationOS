@@ -321,11 +321,12 @@ int iwl_scan(struct iwl_trans* trans, const iwl_nvm_data_t* chans,
         return -1;
     }
 
-    /* Send REPLY_SCAN_CMD (async: the firmware replies later with notifications
-     * + RX beacons, not an immediate response). */
+    /* Wait for the command acknowledgement before reusing the shared command DMA
+     * page; scan results and completion then arrive as later notifications. */
     kprintf("IWLSCAN: send REPLY_SCAN_CMD (0x80, %u bytes, %d channels)...\n",
             plen, chans ? chans->n_channels : 0);
-    if (iwl_send_cmd(trans, REPLY_SCAN_CMD, scanbuf, plen, 0, (iwl_rx_notif_t*)0) != 0) {
+    if (iwl_send_cmd(trans, REPLY_SCAN_CMD, scanbuf, plen, REPLY_SCAN_CMD,
+                     (iwl_rx_notif_t*)0) != 0) {
         kprintf("IWLSCAN: REPLY_SCAN_CMD send FAILED -- abort\n");
         return -1;
     }
@@ -373,10 +374,10 @@ int iwl_scan(struct iwl_trans* trans, const iwl_nvm_data_t* chans,
         }
     }
 
-    /* Budget exhausted without SCAN_COMPLETE: return what we harvested (still a
-     * clean, bounded outcome -- never hangs). */
+    /* Without SCAN_COMPLETE the firmware did not finish the operation. Returning
+     * a partial count as success hides transport failures as an empty scan. */
     kprintf("IWLSCAN: harvest budget exhausted (no SCAN_COMPLETE) -- %d BSS\n", found);
-    return found;
+    return -1;
 }
 
 /* ====================================================================== *
@@ -403,6 +404,11 @@ int iwl_scan_selftest(void) {
     uint16_t plen = iwl_build_scan_cmd(&nvm, mac, buf, (uint16_t)sizeof(buf));
 
     if (plen == 0) { kprintf("IWL-SCAN: build returned 0\n"); ok = 0; }
+    if (plen > IWL_CMD_MAX_PAYLOAD) {
+        kprintf("IWL-SCAN: payload %u exceeds host-command limit %u\n",
+                plen, IWL_CMD_MAX_PAYLOAD);
+        ok = 0;
+    }
     if (buf[SCAN_CMD_OFF_CHANNEL_COUNT] != 13) ok = 0;
     if (st_rd16(buf + SCAN_CMD_OFF_GOOD_CRC_TH) != IWL_GOOD_CRC_TH_DISABLED) ok = 0;
     if (st_rd16(buf + SCAN_CMD_OFF_RX_CHAIN) != (uint16_t)RXON_RX_CHAIN_SCAN_DEFAULT) ok = 0;

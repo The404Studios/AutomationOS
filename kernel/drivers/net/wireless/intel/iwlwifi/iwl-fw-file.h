@@ -1,6 +1,6 @@
 /*
- * iwl-fw-file.h -- Intel iwlwifi MODERN TLV uCode firmware format (IWL-FW).
- * ==========================================================================
+ * iwl-fw-file.h -- Intel iwlwifi legacy and TLV uCode formats (IWL-FW).
+ * =======================================================================
  * Brick 2 of the real Intel WiFi driver. Mirrors the on-disk layout of the
  * Linux iwlwifi "v2"/TLV firmware container (see Linux
  * drivers/net/wireless/intel/iwlwifi/fw/file.h). A real .ucode is a fixed
@@ -25,6 +25,60 @@
  * uniquely identifies the modern TLV container.
  */
 #define IWL_TLV_UCODE_MAGIC   0x0a4c5749u   /* "IWL\n" little-endian */
+
+/* Legacy DVM firmware starts with a packed version word followed by five image
+ * sizes. API 1/2 use the 24-byte v1 header; API 3+ insert a build word and use
+ * the 28-byte v2 header. Payload order is runtime INST, runtime DATA, INIT INST,
+ * INIT DATA, then optional bootstrap bytes. iwlwifi-6000-4.ucode, used by common
+ * T410 Intel 6200/6300 cards, is this legacy v2 format rather than TLV. */
+#define IWL_UCODE_API(ver)              (((ver) >> 8) & 0xffu)
+#define IWL_LEGACY_V1_HDR_SIZE          24u
+#define IWL_LEGACY_V2_HDR_SIZE          28u
+
+struct iwl_legacy_fw_layout {
+    uint32_t ver;
+    uint32_t header_size;
+    uint32_t inst_size;
+    uint32_t data_size;
+    uint32_t init_size;
+    uint32_t init_data_size;
+    uint32_t boot_size;
+};
+
+static inline uint32_t iwl_fw_get_le32(const uint8_t* p) {
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
+           ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+
+/* Decode and fully bounds-check a legacy firmware container. Requiring the
+ * section sizes to consume the file exactly prevents a wrong header variant or
+ * corrupt size table from producing plausible pointers into unrelated bytes. */
+static inline int iwl_legacy_fw_decode(const uint8_t* blob, uint32_t len,
+                                       struct iwl_legacy_fw_layout* out) {
+    if (!blob || !out || len < 4) return -1;
+
+    uint32_t ver = iwl_fw_get_le32(blob);
+    if (ver == 0) return -1;
+
+    uint32_t header_size = IWL_UCODE_API(ver) <= 2
+                         ? IWL_LEGACY_V1_HDR_SIZE : IWL_LEGACY_V2_HDR_SIZE;
+    if (len < header_size) return -1;
+
+    uint32_t size_off = header_size == IWL_LEGACY_V1_HDR_SIZE ? 4u : 8u;
+    out->ver            = ver;
+    out->header_size    = header_size;
+    out->inst_size      = iwl_fw_get_le32(blob + size_off + 0);
+    out->data_size      = iwl_fw_get_le32(blob + size_off + 4);
+    out->init_size      = iwl_fw_get_le32(blob + size_off + 8);
+    out->init_data_size = iwl_fw_get_le32(blob + size_off + 12);
+    out->boot_size      = iwl_fw_get_le32(blob + size_off + 16);
+
+    if (out->inst_size == 0 || out->data_size == 0) return -1;
+
+    uint64_t total = (uint64_t)header_size + out->inst_size + out->data_size +
+                     out->init_size + out->init_data_size + out->boot_size;
+    return total == (uint64_t)len ? 0 : -1;
+}
 
 /*
  * struct iwl_tlv_ucode_header -- the fixed 88-byte header at the start of a

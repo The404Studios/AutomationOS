@@ -853,17 +853,15 @@ static int32_t g_task_w = 0;   /* 0 = not yet computed (set before first use) */
  * 17 app icons + 2 folders (19 slots, stride 35) fit above the taskbar on the
  * 800px-tall screen -- room for the new Claude + Anthropic dock icons. */
 
-/* Magnification parameters (fixed-point, all in Q8 / integers):
- *   scale = 1 + (MAX_EXTRA/256) * max(0, 1 - dy/INFLUENCE)
- *   MAX_EXTRA/256 ~ 0.9  => max scale ~ 1.9
- *   INFLUENCE ~ 110 px  */
-#define RDOCK_MAG_MAX_EXTRA  230   /* (MAX-1)*256 => (1.9-1)*256 = 230        */
-#define RDOCK_MAG_INFLUENCE  110   /* pixel radius of magnification field     */
+/* Restrained event-driven magnification: 1.30x at the cursor, with neighbors
+ * easing gently. This remains readable without the old 1.9x overlap/ghosting. */
+#define RDOCK_MAG_MAX_EXTRA   77   /* (1.30 - 1.0) * 256                      */
+#define RDOCK_MAG_INFLUENCE   72   /* pixel radius of magnification field     */
 #define RDOCK_SMOOTH_SHIFT     3   /* smooth toward target: >>3 per frame     */
 
 /* Bounce animation on launch click: horizontal (leftward) swing */
-#define RDOCK_BOUNCE_MS   420
-#define RDOCK_BOUNCE_AMP   18   /* max pixel displacement (left)             */
+#define RDOCK_BOUNCE_MS   240
+#define RDOCK_BOUNCE_AMP    6   /* short confirmation, not a distracting swing */
 
 /* Folder popover (legacy rect popover replaced by the rainbow fan-out below;
  * the ANIM_MS timing is reused to drive the fan open/close animation). */
@@ -876,7 +874,7 @@ static int32_t g_task_w = 0;   /* 0 = not yet computed (set before first use) */
 #define RDOCK_FAN_ARC_DEG   160   /* total angular spread of the rainbow      */
 #define RDOCK_FAN_RADIUS    140   /* arc radius at full open (px)             */
 #define RDOCK_FAN_TILE       44   /* fanned-out member icon tile size (px)    */
-#define RDOCK_FAN_BOB_AMP     4   /* vertical floating bob amplitude (px)     */
+#define RDOCK_FAN_BOB_AMP     0   /* settled folders remain still/idle-cheap  */
 #define RDOCK_FAN_SPARKLES    8   /* sparkle dots drawn around a hovered icon */
 
 /* Number of app entries and folders */
@@ -1666,7 +1664,7 @@ static void anim_tick(long now) {
     if (g_toast_dur_ms > 0) mark_dirty();
     for (int fi = 0; fi < g_nfolders; fi++) {
         rdock_folder_state_t *fs = &g_rdock_folders[fi];
-        if (fs->open || fs->anim_closing || fs->anim_t > 0) {
+        if (fs->anim_closing || (fs->open && fs->anim_t < 256)) {
             mark_dirty();
             /* GHOST FIX: the rainbow fan-out sweeps member icons up to
              * RDOCK_FAN_RADIUS (140px) LEFT of the dock strip -- well outside any
@@ -1683,7 +1681,7 @@ static void anim_tick(long now) {
         if (g_rdock_icons[i].bounce_active ||
             g_rdock_icons[i].scale_q8 != g_rdock_icons[i].scale_target) {
             mark_dirty();
-            /* GHOST FIX: hover-magnify grows an icon up to ~1.9x (68px) plus a
+            /* GHOST FIX: hover-magnify grows an icon up to ~1.3x plus a
              * tooltip plate, both LEFT of the 44px strip and OUTSIDE any window's
              * commit rect. A committing window (e.g. the IDE caret blink) would
              * otherwise narrow the damage scissor and clip the dock repaint,
@@ -1956,21 +1954,30 @@ static void render_desktop_icons(uint32_t *buf, uint32_t w, uint32_t h, uint32_t
 
         desk_icon_t *di = &g_desk_icons[i];
 
-        /* hover highlight rectangle behind the whole cell */
+        /* Persistent selection plus hover lift. Motion is input-driven, so a
+         * settled desktop remains idle instead of animating forever. */
         int hovered = (cur_x >= tx - 6 && cur_x < tx + DESK_TILE + 6 &&
                        cur_y >= ty - 2 && cur_y < ty + DESK_TILE + DESK_LABEL_GAP + FONT_H + 2);
-        if (hovered)
+        int selected = (g_desk_last_idx == i);
+        if (selected || hovered)
             fill_round_rect(buf, w, h, stride, tx - 6, ty - 2,
                             DESK_TILE + 12, DESK_TILE + DESK_LABEL_GAP + FONT_H + 4,
-                            8, 0x550A84FFu);   /* accent-blue hover glow (was flat white) */
+                            8, selected ? 0x663A4655u : 0x552E3845u);
+        if (selected)
+            stroke_rect(buf, w, h, stride, tx - 6, ty - 2,
+                        DESK_TILE + 12, DESK_TILE + DESK_LABEL_GAP + FONT_H + 4,
+                        COL_ACCENT);
+
+        int32_t draw_y = ty - (hovered ? 2 : 0);
+        if (hovered) icon_draw_shadow(buf, (int)stride, tx, draw_y, DESK_TILE, 3, 70);
 
         /* the icon art (drawn FULLY inside the clamped tile) */
         if (di->is_dir) {
-            icon_folder(buf, (int)stride, tx, ty, DESK_TILE, 0xFFE0B040u);
+            icon_folder(buf, (int)stride, tx, draw_y, DESK_TILE, 0xFFF2B84Bu);
         } else {
             /* recognizable icon when the name matches a known app, else a
              * generic text-file tile. icon_for_app falls back to initials. */
-            icon_for_app(buf, (int)stride, tx, ty, DESK_TILE, di->name);
+            icon_for_app(buf, (int)stride, tx, draw_y, DESK_TILE, di->name);
         }
 
         /* centered name label below the tile (truncated to fit the cell) */
@@ -1981,11 +1988,15 @@ static void render_desktop_icons(uint32_t *buf, uint32_t w, uint32_t h, uint32_t
         int show = nlen > maxch ? maxch : nlen;
         int li;
         for (li = 0; li < show; li++) lbl[li] = di->name[li];
+        if (nlen > maxch && show >= 3) {
+            lbl[show - 3] = '.'; lbl[show - 2] = '.'; lbl[show - 1] = '.';
+        }
         lbl[show] = '\0';
         int32_t lbl_w = show * FONT_W;
         int32_t lbl_x = tx + DESK_TILE / 2 - lbl_w / 2;
-        int32_t lbl_y = ty + DESK_TILE + DESK_LABEL_GAP;
+        int32_t lbl_y = draw_y + DESK_TILE + DESK_LABEL_GAP;
         if (lbl_x < 2) lbl_x = 2;
+        cz_text(buf, (int)stride, (int)w, (int)h, lbl_x + 1, lbl_y + 1, lbl, 0xCC000000u);
         cz_text(buf, (int)stride, (int)w, (int)h, lbl_x, lbl_y, lbl, COL_TEXT);
     }
 }
@@ -2628,19 +2639,28 @@ static void render_dock(uint32_t *buf, uint32_t w, uint32_t h, uint32_t stride,
     fill_round_top_rect(buf, w, h, stride, 0, dy, (int32_t)w, DOCK_H, 10, COL_PANEL);
     fill_rect(buf, w, h, stride, 0, dy, (int32_t)w, 1, COL_BORDER);
 
-    /* launcher button: rounded accent square labeled "T"; subtle hover lift */
+    /* Start launcher: four-pane system mark on a dark tile. */
     int32_t lx = launcher_x(), ly = launcher_y(h);
     int launch_hover = (cur_x >= lx && cur_x < lx + LAUNCH_SZ &&
                         cur_y >= ly && cur_y < ly + LAUNCH_SZ);
     if (launch_hover)
         fill_round_rect(buf, w, h, stride, lx - 1, ly - 1, LAUNCH_SZ + 2, LAUNCH_SZ + 2, 9, COL_HOVER);
-    fill_round_rect(buf, w, h, stride, lx, ly, LAUNCH_SZ, LAUNCH_SZ, 8, COL_ACCENT);
-    cz_text(buf, (int)stride, (int)w, (int)h,
-                     lx + (LAUNCH_SZ - FONT_W) / 2, ly + (LAUNCH_SZ - FONT_H) / 2,
-                     "T", COL_TEXT);
+    fill_round_rect(buf, w, h, stride, lx, ly, LAUNCH_SZ, LAUNCH_SZ, 8,
+                    launch_hover ? THEME_BG4 : THEME_BG2);
+    stroke_rect(buf, w, h, stride, lx, ly, LAUNCH_SZ, LAUNCH_SZ,
+                launch_hover ? COL_ACCENT : COL_BORDER);
+    {
+        int pane = 7, gap = 3;
+        int px = lx + (LAUNCH_SZ - (pane * 2 + gap)) / 2;
+        int py = ly + (LAUNCH_SZ - (pane * 2 + gap)) / 2;
+        fill_round_rect(buf, w, h, stride, px, py, pane, pane, 2, COL_ACCENT);
+        fill_round_rect(buf, w, h, stride, px + pane + gap, py, pane, pane, 2, COL_ACCENT);
+        fill_round_rect(buf, w, h, stride, px, py + pane + gap, pane, pane, 2, COL_ACCENT);
+        fill_round_rect(buf, w, h, stride, px + pane + gap, py + pane + gap, pane, pane, 2, COL_ACCENT);
+    }
     /* Tooltip for the launcher button */
     if (launch_hover) {
-        int32_t lt_w = 8 * FONT_W + 16;  /* "Terminal" */
+        int32_t lt_w = 5 * FONT_W + 16;  /* "Start" */
         int32_t lt_h = FONT_H + 8;
         int32_t lt_x = lx + LAUNCH_SZ / 2 - lt_w / 2;
         int32_t lt_y = dy - lt_h - 6;
@@ -2648,7 +2668,7 @@ static void render_dock(uint32_t *buf, uint32_t w, uint32_t h, uint32_t stride,
         fill_round_rect(buf, w, h, stride, lt_x, lt_y, lt_w, lt_h, 5, 0xF0111111u);
         stroke_rect(buf, w, h, stride, lt_x, lt_y, lt_w, lt_h, COL_BORDER);
         cz_text(buf, (int)stride, (int)w, (int)h,
-                         lt_x + 8, lt_y + 4, "Terminal", COL_TEXT);
+                         lt_x + 8, lt_y + 4, "Start", COL_TEXT);
     }
 
     /* taskbar: one button per window (minimized windows keep their button). */
@@ -2666,12 +2686,12 @@ static void render_dock(uint32_t *buf, uint32_t w, uint32_t h, uint32_t stride,
          * subtle lift (a slightly larger rounded backing) for a fluid feel. */
         if (hover && s != focused)
             fill_round_rect(buf, w, h, stride, bx - 1, by - 1, TASK_W + 2, TASK_H + 2, 5, COL_HOVER);
-        uint32_t bg = (s == focused) ? COL_ACCENT : (hover ? COL_HOVER : COL_PANEL);
+        uint32_t bg = (s == focused) ? THEME_BG3 : (hover ? COL_HOVER : COL_PANEL);
         fill_round_rect(buf, w, h, stride, bx, by, TASK_W, TASK_H, 4, bg);
         stroke_rect(buf, w, h, stride, bx, by, TASK_W, TASK_H,
                     (s == focused) ? COL_ACCENT : COL_BORDER);
         if (s == focused)                              /* active-window accent bar */
-            fill_round_rect(buf, w, h, stride, bx + 3, by + TASK_H - 3, TASK_W - 6, 2, 1, COL_TEXT);
+            fill_round_rect(buf, w, h, stride, bx + 3, by + TASK_H - 4, TASK_W - 6, 3, 1, COL_ACCENT);
         /* minimized windows get a dim accent dot to show they're parked */
         if (g_windows[s].minimized)
             fill_round_rect(buf, w, h, stride, bx + 4, by + TASK_H / 2 - 2, 4, 4, 2,
@@ -2727,9 +2747,9 @@ static void render_snap_preview(uint32_t *buf, uint32_t w, uint32_t h, uint32_t 
     int32_t fw = (int32_t)cw + 2 * BORDER_W;
     int32_t fh = (int32_t)ch + TITLEBAR_H + 2 * BORDER_W;
     /* translucent accent fill + a brighter 2px border */
-    fill_round_rect(buf, w, h, stride, ox, oy, fw, fh, WIN_RADIUS, 0x500A84FFu);
-    stroke_rect(buf, w, h, stride, ox, oy, fw, fh, 0xCC0A84FFu);
-    stroke_rect(buf, w, h, stride, ox + 1, oy + 1, fw - 2, fh - 2, 0x880A84FFu);
+    fill_round_rect(buf, w, h, stride, ox, oy, fw, fh, WIN_RADIUS, 0x5018B7A0u);
+    stroke_rect(buf, w, h, stride, ox, oy, fw, fh, 0xCC18B7A0u);
+    stroke_rect(buf, w, h, stride, ox + 1, oy + 1, fw - 2, fh - 2, 0x8818B7A0u);
 }
 
 /* ---------------------------------------------------------------------- *
@@ -2945,7 +2965,9 @@ static void rdock_update_scales(int32_t cursor_x, int32_t cursor_y, uint32_t W) 
         /* smooth toward target */
         int32_t cur = g_rdock_icons[i].scale_q8;
         int32_t diff = target - cur;
-        cur += diff - (diff >> RDOCK_SMOOTH_SHIFT);
+        cur += diff >> RDOCK_SMOOTH_SHIFT;
+        if (diff > 0 && cur == g_rdock_icons[i].scale_q8) cur++;
+        if (diff < 0 && cur == g_rdock_icons[i].scale_q8) cur--;
         /* clamp */
         if (cur < 256) cur = 256;
         if (cur > 256 + RDOCK_MAG_MAX_EXTRA) cur = 256 + RDOCK_MAG_MAX_EXTRA;
@@ -3131,7 +3153,7 @@ static void render_right_dock(uint32_t *buf, uint32_t w, uint32_t h, uint32_t st
 
     /* dock strip background */
     fill_rect(buf, w, h, stride, strip_x, PANEL_H, RDOCK_W,
-              (int32_t)h - PANEL_H - DOCK_H, 0xE02C2C2Eu);
+              (int32_t)h - PANEL_H - DOCK_H, THEME_BG1);
     /* left border */
     fill_rect(buf, w, h, stride, strip_x, PANEL_H, 1,
               (int32_t)h - PANEL_H - DOCK_H, COL_BORDER);
@@ -3199,7 +3221,8 @@ static void render_right_dock(uint32_t *buf, uint32_t w, uint32_t h, uint32_t st
             draw_folder_grid(buf, w, h, stride, tx, ty, sz, i - RDOCK_NICONS);
         } else {
             /* recognizable procedural icon (draws its own tile background) */
-            icon_for_app(buf, (int)stride, tx, ty, sz, rdock_apps[i].path + 5);
+            icon_for_app_accent(buf, (int)stride, tx, ty, sz,
+                                rdock_apps[i].path + 5, tile_col);
         }
 
         /* DOCK-DND-0: selection ring (toggled with Alt+click) */
@@ -4362,6 +4385,18 @@ static int32_t shm_segment_cpid(int shm_id) {
     return (int32_t)ds.shm_cpid;
 }
 
+static uint64_t shm_segment_ctime(int shm_id) {
+    struct {
+        unsigned int  shm_perm_uid, shm_perm_gid, shm_perm_mode;
+        unsigned long shm_segsz, shm_atime, shm_dtime, shm_ctime;
+        unsigned int  shm_cpid, shm_lpid, shm_nattch;
+    } ds;
+    ds.shm_ctime = 0;
+    long r = sc6(SYS_SHMCTL, (long)shm_id, IPC_STAT, (long)&ds, 0, 0, 0);
+    if (r != 0) return 0;
+    return (uint64_t)ds.shm_ctime;
+}
+
 static void handle_create(const wl_req_create_t *req) {
     int slot = find_free_slot();
     if (slot < 0) {
@@ -4748,9 +4783,13 @@ static void selfheal_reg_sync(void) {
         window_t *win = &g_windows[s];
         volatile sh_winreg_ent_t *e = &g_wreg[s];
         if (!win->used || win->phase == PH_CLOSING) { e->used = 0; continue; }
+        /* Invalidate first so a compositor death midway through this copy leaves
+         * an entry rejected rather than a torn mixture of old and new fields. */
+        e->used       = 0;
         e->win_id     = win->win_id;
         e->client_pid = win->client_pid;
         e->shm_id     = win->shm_id;
+        e->shm_ctime  = shm_segment_ctime(win->shm_id);
         e->buf_w      = win->buf_w;
         e->buf_h      = win->buf_h;
         e->x          = win->x;
@@ -4775,8 +4814,23 @@ static void selfheal_restore_windows(uint32_t fb_w, uint32_t fb_h) {
     for (int s = 0; s < (int)SH_WINREG_MAX; s++) {
         volatile sh_winreg_ent_t *e = &g_wreg[s];
         if (!e->used) continue;
-        if (e->win_id <= 0 || e->shm_id < 0 ||
-            e->buf_w == 0 || e->buf_h == 0) { e->used = 0; continue; }
+        if (e->win_id <= 0 || e->shm_id < 0 || e->client_pid <= 1 ||
+            e->buf_w == 0 || e->buf_h == 0 ||
+            e->buf_w > 16384u || e->buf_h > 16384u || e->shm_ctime == 0) {
+            e->used = 0; continue;
+        }
+
+        /* Numeric SHM IDs are reusable table slots. Verify both the kernel-
+         * recorded creator and creation timestamp before attaching, otherwise a
+         * stale registry entry could display unrelated memory and later kill a
+         * recycled client PID when its restored window is closed. */
+        if (shm_segment_cpid(e->shm_id) != e->client_pid ||
+            shm_segment_ctime(e->shm_id) != e->shm_ctime) {
+            print("[COMP] SELFHEAL: reject stale shm for win="); print_num(e->win_id);
+            print("\n");
+            e->used = 0;
+            continue;
+        }
 
         long addr = sc6(SYS_SHMAT, (long)e->shm_id, 0, 0, 0, 0, 0);
         if (addr <= 0) {                            /* client died with its buffer */
@@ -6570,12 +6624,13 @@ void _start(void) {
          * back to it, massively OVERSHOOTING the budget (frames ~100ms+ => ~9 FPS
          * with several apps open). Instead BLOCK-SLEEP the remainder: the kernel
          * drops us from the runqueue, runs the clients, and wakes us right at the
-         * deadline -- so we present on a steady ~60Hz cadence and clients still get
+             * deadline -- so we present on a steady ~60Hz cadence and clients still get
          * their full share of CPU. If we overran the budget, just yield once. */
         now = syscall(SYS_GET_TICKS_MS, 0, 0, 0);
-        next += 16;
+        long frame_step = (frame % 3 == 0) ? 16 : 17;   /* 16/17/17 = 60 Hz average */
+        next += frame_step;
         long sleep_ms = next - now;
-        if (sleep_ms > 16) sleep_ms = 16;              /* clamp after a stall */
+        if (sleep_ms > frame_step) sleep_ms = frame_step; /* clamp after a stall */
         if (sleep_ms >= 1) syscall(SYS_SLEEP, sleep_ms, 0, 0);
         else               syscall(SYS_YIELD, 0, 0, 0);
         now = syscall(SYS_GET_TICKS_MS, 0, 0, 0);

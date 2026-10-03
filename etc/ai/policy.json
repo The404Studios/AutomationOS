@@ -22,7 +22,9 @@
     "kill": "confirm",
     "shell": "confirm",
     "mouse": "confirm",
-    "key": "confirm"
+    "key": "confirm",
+    "fw_status": "auto",
+    "firewall": "confirm"
   },
   "_mouse_key_doc": "mouse and key are synthetic-input GUI-takeover tools: always confirm because they seize the human pointer/keyboard.",
 
@@ -38,6 +40,7 @@
     "list_dir",
     "stat",
     "ps",
+    "fw_status",
     "write_file",
     "compile",
     "execute",
@@ -58,6 +61,7 @@
     "shell",
     "mouse",
     "key",
+    "firewall",
     "move",
     "file.write_project",
     "pkg.install_request",

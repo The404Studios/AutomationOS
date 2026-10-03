@@ -154,4 +154,8 @@ uint32_t icon_accent_for_name(const char *name);
 void icon_for_app(uint32_t *px, int stride, int x, int y, int size,
                   const char *app_name);
 
+/* High-level dispatch with an explicit accent supplied by the shell/theme. */
+void icon_for_app_accent(uint32_t *px, int stride, int x, int y, int size,
+                         const char *app_name, uint32_t accent);
+
 #endif /* ICON_H */

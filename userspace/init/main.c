@@ -15,7 +15,20 @@ typedef unsigned long size_t;
 #define SYS_YIELD   15
 #define SYS_SHMGET  18
 #define SYS_SHMAT   19
+#define SYS_KILL    26
+#define SYS_GET_TICKS_MS 40
 #define SYS_TIME    41
+#define SYS_RECOVERY_OVERLAY 88
+
+#define WNOHANG 1
+#define SIGKILL 9
+
+#define COMP_POLL_MS             50
+#define COMP_START_TIMEOUT_MS 10000
+#define COMP_STALL_MS          2500
+#define COMP_STABLE_RESET_MS  30000
+#define COMP_CIRCUIT_FAILS         5
+#define COMP_CIRCUIT_COOLDOWN_MS 30000
 
 #ifdef SELFHEAL
 /* SELFHEAL: init creates+owns the compositor heartbeat SHM page. selfheal.h is
@@ -50,16 +63,30 @@ static size_t strlen(const char* s) {
     return len;
 }
 
+/* Line-buffered console output. Init builds its log lines from several fragments ("[INIT] Process " + pid + " exited"),
+ * and on a multi-core kernel another CPU's print can land BETWEEN two fragments and tear the line (found by the multi-core
+ * proof: "[INIT] Process 5[SYSCALL] sys_stat..." -- init had reaped the process, the log said otherwise). Collect a whole
+ * line and emit it in ONE write; the serial driver already makes a single write atomic. */
+static char g_lb[256];
+static int  g_ln;
+static void print_flush(void) {
+    if (g_ln > 0) { syscall(SYS_WRITE, 1, (long)g_lb, g_ln); g_ln = 0; }
+}
+
 static void print(const char* msg) {
-    syscall(SYS_WRITE, 1, (long)msg, strlen(msg));
+    for (; *msg; msg++) {
+        if (g_ln >= (int)sizeof(g_lb)) print_flush();
+        g_lb[g_ln++] = *msg;
+        if (*msg == '\n') print_flush();
+    }
 }
 
 static void print_num(long n) {
-    char buf[20];
+    char buf[24];
     int i = 0;
     if (n < 0) { print("-"); n = -n; }
     do { buf[i++] = '0' + (n % 10); n /= 10; } while (n > 0);
-    while (i > 0) { char c = buf[--i]; syscall(SYS_WRITE, 1, (long)&c, 1); }
+    while (i > 0) { char c[2]; c[0] = buf[--i]; c[1] = 0; print(c); }
 }
 
 static int spawn(const char* path) {
@@ -92,11 +119,33 @@ static int spawn_ex_argv1(const char* path, const char* arg) {
 }
 
 static void yield(void) {
+    print_flush();
     syscall(SYS_YIELD, 0, 0, 0);
 }
 
 static void sleep(int ms) {
+    print_flush();
     syscall(SYS_SLEEP, ms, 0, 0);
+}
+
+static long now_ms(void) {
+    return syscall(SYS_GET_TICKS_MS, 0, 0, 0);
+}
+
+static long compositor_backoff_ms(int failures) {
+    long delay = 250;
+    int shifts = failures > 1 ? failures - 1 : 0;
+    if (shifts > 5) shifts = 5;
+    while (shifts-- > 0) delay <<= 1;
+    return delay > 8000 ? 8000 : delay;
+}
+
+static void print_supervisor(const char* event, long pid, long value) {
+    print("[SUP] t="); print_num(now_ms());
+    print(" service=compositor event="); print(event);
+    if (pid >= 0) { print(" pid="); print_num(pid); }
+    if (value >= 0) { print(" value_ms="); print_num(value); }
+    print("\n");
 }
 
 void _start(void) {
@@ -132,6 +181,7 @@ void _start(void) {
 #endif
 
 #ifdef SELFHEAL
+    volatile sh_heartbeat_t* heal = (volatile sh_heartbeat_t*)0;
     /* SELFHEAL: init (PID 1, immortal) CREATES + OWNS the compositor heartbeat
      * segment, then zeroes the page (sys_shmget does NOT zero page contents), so
      * the first compositor instance reads magic==0 and detects a fresh segment.
@@ -150,6 +200,7 @@ void _start(void) {
             if (hb_addr > 0) {
                 volatile unsigned char* p = (volatile unsigned char*)hb_addr;
                 for (unsigned i = 0; i < SELFHEAL_SHM_SIZE; i++) p[i] = 0;
+                heal = (volatile sh_heartbeat_t*)hb_addr;
                 print("[INIT] SELFHEAL: heartbeat segment ready\n");
             } else {
                 print("[INIT] SELFHEAL: heartbeat shmat FAILED\n");
@@ -212,18 +263,6 @@ void _start(void) {
     // init does not wait for it. If no NIC or DHCP fails, exits silently.
     print("[INIT] Spawning autodhcp...\n");
     spawn("sbin/autodhcp");
-
-#ifdef SELFHEAL
-    /* SELFHEAL: the recovery supervisor. It polls the heartbeat and, on a freeze,
-     * fires the recovery overlay + kills the compositor (init respawns it below). */
-    print("[INIT] SELFHEAL: spawning cwatchdog...\n");
-    int cwatchdog_pid = spawn("sbin/cwatchdog");
-    if (cwatchdog_pid > 0) {
-        print("[INIT] cwatchdog started (PID "); print_num(cwatchdog_pid); print(")\n");
-    } else {
-        print("[INIT] ERROR: Failed to spawn cwatchdog!\n");
-    }
-#endif
 
     // M3: spawn a test client that creates a window over the SHM protocol.
     // (No settle delay: both processes are queued and the SysV inbox queue is
@@ -367,6 +406,11 @@ void _start(void) {
     spawn("sbin/negsock");
     print("[INIT] Spawning negdir...\n");
     spawn("sbin/negdir");
+    // FWTEST (FW-0/PCAP-0): kernel packet-filter control plane + ENFORCED privilege drops
+    // (a child that drops CAP_NET_ADMIN/RAW is refused by the kernel; its child inherits the
+    // refusal; the privileged parent is unaffected). Prints "FWTEST: PASS" for smoke_boot.sh.
+    print("[INIT] Spawning fwtest...\n");
+    spawn("sbin/fwtest");
 
     // NEGSHMDT (KERNEL-SYSCALL-ROBUST-0 HIGH): shmget-without-attach then shmdt
     // the segment's canonical VA must be DENIED (IPC_EINVAL); a fixed kernel
@@ -741,6 +785,38 @@ void _start(void) {
 #endif
 #endif  // !DESKTOP_MINIMAL (self-test storm, part B)
 
+#ifdef DNS_TEST
+    /* DNS-LEASE-0 proof (test builds only): does the resolver follow the DHCP-learned DNS? */
+    print("[INIT] Spawning dnstest...\n");
+    spawn("sbin/dnstest");
+#endif
+#ifdef NET_LIVE
+    /* LIVE-Internet proof (test builds only): real DNS + HTTP + verified HTTPS. */
+    print("[INIT] Spawning livenet...\n");
+    spawn("sbin/livenet");
+#endif
+#ifdef WIN_TEST
+    /* WIN-MIN proof (test builds only): run each Windows fixture to completion, one at a time. */
+    {
+        static const char* const wf[] = { "/usr/share/winfix/nocrt_hello.exe", "/usr/share/winfix/crt_hello.exe",
+                                          "/usr/share/winfix/bad_trunc.exe", "/usr/share/winfix/bad_magic.exe",
+                                          "/usr/share/winfix/bad_machine.exe", 0 };
+        for (int wi = 0; wf[wi]; wi++) {
+            int wp = spawn_args("bin/winrun", wf[wi]);
+            if (wp > 0) { int wst = 0; syscall(SYS_WAITPID, wp, (long)&wst, 0); }
+        }
+        print("[INIT] WINTEST: done\n");
+    }
+#endif
+
+#if defined(AGENTD_SERVE) && defined(DESKTOP_MINIMAL)
+    /* AGENTD-SERVE-0: the LEAN desktop profile has no storm, so spawn the OS-side tool host here.
+     * /etc/agentd.conf (serve=1) makes it a long-lived MCP-bridge tool host. (In FULL builds it
+     * is already spawned by the storm above.) */
+    print("[INIT] Spawning agentd (tool-host / serve mode)...\n");
+    agentd_pid = spawn("sbin/agentd");
+#endif
+
     print("[INIT] All services started!\n");
 
     // C4: verify the agent audit ledger's tamper-evident hash-chain (aibroker writes it
@@ -817,22 +893,30 @@ void _start(void) {
     // system (clean PID reuse) without perturbing any measurement.
     int reaploop_spawned = 0;
 
-    // Compositor restart rate limiter: if the compositor dies 5 times within 30
-    // seconds, stop respawning it (crash loop — something is fundamentally broken;
-    // infinite respawn would just burn PIDs and CPU). Uses SYS_TIME (seconds since
-    // epoch) to track the last 5 death timestamps in a ring.
-    #define COMP_DEATH_LIMIT  5
-    #define COMP_DEATH_WINDOW 30   /* seconds */
-    long comp_death_times[COMP_DEATH_LIMIT];
-    int  comp_death_idx = 0;
-    int  comp_death_count = 0;
-    int  comp_rate_limited = 0;
-    for (int i = 0; i < COMP_DEATH_LIMIT; i++) comp_death_times[i] = 0;
+    /* One authoritative compositor supervisor. It uses monotonic time, bounded
+     * backoff and a temporary circuit cooldown; no failure permanently disables
+     * the desktop. PID 1 only ever kills its currently tracked child, avoiding
+     * the stale-PID race in the former external watchdog. */
+    int  comp_failures = 0;
+    int  comp_restart_pending = compositor_pid <= 0;
+    int  comp_healthy = 0;
+    int  comp_hb_seeded = 0;
+    int  comp_hb_advances = 0;
+    int  comp_kill_sent = 0;
+    int  comp_generation = compositor_pid > 0 ? 1 : 0;
+    long comp_started_ms = now_ms();
+    long comp_healthy_since_ms = 0;
+    long comp_hb_changed_ms = comp_started_ms;
+    long comp_next_start_ms = comp_restart_pending ? comp_started_ms + 250 : 0;
+    long comp_circuit_until_ms = 0;
+    unsigned long long comp_hb_last = 0;
 
     while (1) {
         int status;
-        int pid = (int)syscall(SYS_WAITPID, -1, (long)&status, 0);
-        if (pid > 0) {
+        int pid;
+        /* Drain every available zombie without blocking so health and restart
+         * deadlines continue to run even when no child exits. */
+        while ((pid = (int)syscall(SYS_WAITPID, -1, (long)&status, WNOHANG)) > 0) {
             print("[INIT] Process ");
             print_num(pid);
             print(" exited with status ");
@@ -860,44 +944,25 @@ void _start(void) {
             }
 
             if (pid == compositor_pid) {
-                if (comp_rate_limited) {
-                    print("[INIT] Compositor died again but rate-limited -- NOT restarting\n");
+                long t = now_ms();
+                compositor_pid = -1;
+                comp_healthy = 0;
+                comp_hb_seeded = 0;
+                comp_hb_advances = 0;
+                comp_kill_sent = 0;
+                comp_failures++;
+                comp_restart_pending = 1;
+
+                if (comp_failures >= COMP_CIRCUIT_FAILS) {
+                    comp_circuit_until_ms = t + COMP_CIRCUIT_COOLDOWN_MS;
+                    comp_next_start_ms = comp_circuit_until_ms;
+                    print_supervisor("circuit-open", -1, COMP_CIRCUIT_COOLDOWN_MS);
                 } else {
-                    long now = syscall(SYS_TIME, 0, 0, 0);
-                    // Record this death in the ring buffer
-                    comp_death_times[comp_death_idx] = now;
-                    comp_death_idx = (comp_death_idx + 1) % COMP_DEATH_LIMIT;
-                    if (comp_death_count < COMP_DEATH_LIMIT)
-                        comp_death_count++;
-
-                    // Check rate: if we have COMP_DEATH_LIMIT deaths and the
-                    // oldest one in the ring is within COMP_DEATH_WINDOW seconds
-                    // of now, we are crash-looping.
-                    if (comp_death_count >= COMP_DEATH_LIMIT) {
-                        long oldest = comp_death_times[comp_death_idx % COMP_DEATH_LIMIT];
-                        if (now - oldest < COMP_DEATH_WINDOW) {
-                            print("[INIT] Compositor crashed ");
-                            print_num(COMP_DEATH_LIMIT);
-                            print(" times in ");
-                            print_num(COMP_DEATH_WINDOW);
-                            print("s -- HALTING respawn\n");
-                            comp_rate_limited = 1;
-                        }
-                    }
-
-                    if (!comp_rate_limited) {
-                        print("[INIT] Restarting compositor...\n");
-                        compositor_pid = spawn("sbin/compositor");
-                    }
+                    long delay = compositor_backoff_ms(comp_failures);
+                    comp_next_start_ms = t + delay;
+                    print_supervisor("backoff", -1, delay);
                 }
             }
-
-#ifdef SELFHEAL
-            if (pid == cwatchdog_pid) {
-                print("[INIT] Restarting cwatchdog...\n");
-                cwatchdog_pid = spawn("sbin/cwatchdog");
-            }
-#endif
 
             // Yield after each reap so a process woken DURING init's reap burst
             // (e.g. a sleeper hitting its deadline) is dispatched promptly. The #9
@@ -908,8 +973,96 @@ void _start(void) {
             // latency (observed: a 50 ms sleep measured ~480 ms). Spreading the
             // teardown keeps the desktop + timing-sensitive probes responsive.
             yield();
-        } else {
-            yield();
         }
+
+        long t = now_ms();
+
+#ifdef SELFHEAL
+        if (compositor_pid > 0 && heal && heal->magic == SELFHEAL_MAGIC &&
+            heal->version == SELFHEAL_VERSION &&
+            (int)heal->compositor_pid == compositor_pid) {
+            unsigned long long fc = heal->frame_counter;
+            if (!comp_hb_seeded) {
+                comp_hb_seeded = 1;
+                comp_hb_last = fc;
+                comp_hb_changed_ms = t;
+            } else if (fc != comp_hb_last) {
+                comp_hb_last = fc;
+                comp_hb_changed_ms = t;
+                if (comp_hb_advances < 2) comp_hb_advances++;
+                if (!comp_healthy && comp_hb_advances >= 2) {
+                    comp_healthy = 1;
+                    comp_healthy_since_ms = t;
+                    print_supervisor("healthy", compositor_pid, -1);
+                    if (comp_generation > 1)
+                        print("[SUP] SELFHEAL: PASS respawned (two heartbeats)\n");
+                }
+            }
+        }
+
+        if (compositor_pid > 0 && !comp_kill_sent &&
+            ((!comp_healthy && t - comp_started_ms >= COMP_START_TIMEOUT_MS) ||
+             (comp_healthy && t - comp_hb_changed_ms >= COMP_STALL_MS))) {
+            print_supervisor(comp_healthy ? "heartbeat-stalled" : "startup-timeout",
+                             compositor_pid,
+                             comp_healthy ? t - comp_hb_changed_ms : t - comp_started_ms);
+            /* One immediate kill of PID 1's tracked child. There is no delayed
+             * second kill that could hit a replacement after PID reuse. */
+            syscall(SYS_KILL, compositor_pid, SIGKILL, 0);
+            comp_kill_sent = 1;
+            syscall(SYS_RECOVERY_OVERLAY, 0, 2000, 0);
+            print("[SUP] SELFHEAL: recovery overlay fired\n");
+            comp_healthy = 0;
+            comp_hb_seeded = 0;
+        }
+#endif
+
+#ifndef SELFHEAL
+        if (compositor_pid > 0 && !comp_healthy &&
+            t - comp_started_ms >= COMP_START_TIMEOUT_MS) {
+            comp_healthy = 1;
+            comp_healthy_since_ms = t;
+            print_supervisor("healthy-no-heartbeat", compositor_pid, -1);
+        }
+#endif
+
+        if (comp_healthy && comp_failures > 0 &&
+            t - comp_healthy_since_ms >= COMP_STABLE_RESET_MS) {
+            comp_failures = 0;
+            comp_circuit_until_ms = 0;
+            print_supervisor("stable-reset", compositor_pid, -1);
+        }
+
+        if (comp_restart_pending && compositor_pid <= 0 && t >= comp_next_start_ms) {
+            if (comp_circuit_until_ms > t) {
+                comp_next_start_ms = comp_circuit_until_ms;
+            } else {
+                print_supervisor("start", -1, -1);
+                compositor_pid = spawn("sbin/compositor");
+                if (compositor_pid > 0) {
+                    comp_generation++;
+                    comp_restart_pending = 0;
+                    comp_started_ms = t;
+                    comp_hb_changed_ms = t;
+                    comp_hb_seeded = 0;
+                    comp_hb_advances = 0;
+                    comp_kill_sent = 0;
+                    comp_healthy = 0;
+                } else {
+                    comp_failures++;
+                    if (comp_failures >= COMP_CIRCUIT_FAILS) {
+                        comp_circuit_until_ms = t + COMP_CIRCUIT_COOLDOWN_MS;
+                        comp_next_start_ms = comp_circuit_until_ms;
+                        print_supervisor("circuit-open", -1, COMP_CIRCUIT_COOLDOWN_MS);
+                    } else {
+                        long delay = compositor_backoff_ms(comp_failures);
+                        comp_next_start_ms = t + delay;
+                        print_supervisor("spawn-backoff", -1, delay);
+                    }
+                }
+            }
+        }
+
+        sleep(COMP_POLL_MS);
     }
 }

@@ -141,8 +141,22 @@ void* vmm_mmap_anon(uint64_t cr3, uint64_t len, uint32_t prot) {
         }
         // Map this single private page into cr3. vmm_map_phys_into saves/restores
         // the active target, so each call is self-contained and syscall-safe.
-        vmm_map_phys_into(cr3, base + i * PAGE_SIZE, (uint64_t)phys,
-                          PAGE_SIZE, flags);
+        if (vmm_map_phys_into(cr3, base + i * PAGE_SIZE, (uint64_t)phys,
+                              PAGE_SIZE, flags) != 0) {
+            // An intermediate page-table allocation OOM'd, so this page was NOT
+            // mapped. It therefore lacks PTE_OWNED and teardown can't reclaim it
+            // -- free it here. Then roll back the pages already mapped this call,
+            // exactly like the pmm_alloc_page() OOM branch above. Returning base
+            // with an unmapped interior hole would fault a later user access that
+            // vma_find() can't resolve -> SIGSEGV on a region we reported OK.
+            kprintf("[VMA] mmap_anon: map failed at %lu/%lu pages, rolling back\n",
+                    (unsigned long)i, (unsigned long)npages);
+            pmm_free_page(phys);
+            if (i > 0) {
+                vmm_unmap_range_into(cr3, base, i * PAGE_SIZE, true);
+            }
+            return NULL;
+        }
     }
 
     // Commit the cursor.

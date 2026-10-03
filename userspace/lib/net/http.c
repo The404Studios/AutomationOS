@@ -205,6 +205,70 @@ static int     g_ka_tls;                 /* TLS flag of cached connection     */
 static unsigned long  g_ka_idle;         /* timestamp when it was cached      */
 static int     g_ka_valid;               /* 1 if g_ka_nc is live              */
 
+/* ---- last-fetch security verdict --------------------------------------------
+ * Snapshotted from the connection that served the FINAL (terminal) hop of the
+ * most recently completed http_do_get() call.  g_last_tls == 1 iff that hop
+ * was TLS; g_last_trusted == 1 iff its certificate chain anchored to a built-in
+ * CA root (nc.trusted).  Callers (wget fail-closed, browser2 indicator) read
+ * these via http_last_secure() / http_last_trusted() to decide whether the
+ * bytes they just received are authenticated.  Reset at the top of every
+ * top-level fetch so a stale verdict never leaks into a later plain-HTTP call. */
+static int     g_last_tls;               /* final served hop used TLS          */
+static int     g_last_trusted;           /* final served hop cert-authenticated */
+static int     g_tls_strict = 1;         /* TLS-STRICT-0: untrusted cert => HTTP_ERR_CERT, no request sent */
+
+void http_set_tls_strict(int on) { g_tls_strict = on ? 1 : 0; }
+int  http_get_tls_strict(void)   { return g_tls_strict; }
+
+/* HTTP-CHUNK-0 -- end-of-body detection for `Transfer-Encoding: chunked`.
+ *
+ * Found by a LIVE test (build_test proofkit dns_lease): a Cloudflare-served https page arrives chunked on a
+ * keep-alive connection. The whole page and the terminal `0\r\n\r\n` chunk were already received, but the
+ * receive loop only stopped early on Content-Length, so it waited for the peer to close -- which a keep-alive
+ * server never does -- and the fetch hung.
+ *
+ * chunk_scan walks the chunk grammar (RFC 9112 7.1): size(hex)[;ext] CRLF data CRLF ... 0 CRLF [trailers] CRLF.
+ * It only ever ADVANCES *pos over chunks that are fully present, so it resumes where it left off (linear
+ * total work) and can never report completion early. Returns 1 iff the final CRLF has arrived; 0 = need more
+ * bytes; -1 = malformed (caller falls back to the old close/timeout behaviour). */
+static int chunk_scan(const char *b, long len, long *pos)
+{
+    long i = *pos;
+    for (int guard = 0; guard < 1000000; guard++) {
+        long j = i;
+        unsigned long sz = 0;
+        int digits = 0;
+        while (j < len) {
+            char c = b[j];
+            int v = (c >= '0' && c <= '9') ? c - '0' : (c >= 'a' && c <= 'f') ? c - 'a' + 10 : (c >= 'A' && c <= 'F') ? c - 'A' + 10 : -1;
+            if (v < 0) break;
+            sz = sz * 16u + (unsigned long)v;
+            if (++digits > 8) return -1;              /* absurd chunk size */
+            j++;
+        }
+        if (j >= len) return 0;                        /* size line not complete yet */
+        if (!digits) return -1;
+        while (j < len && b[j] != '\r') j++;           /* skip chunk extensions */
+        if (j + 1 >= len) return 0;
+        if (b[j + 1] != '\n') return -1;
+        j += 2;                                        /* j = start of chunk data (or trailers) */
+        if (sz == 0) {
+            for (;;) {                                 /* trailer lines until an empty line */
+                if (j + 1 >= len) return 0;
+                if (b[j] == '\r' && b[j + 1] == '\n') { *pos = j + 2; return 1; }
+                while (j < len && b[j] != '\n') j++;
+                if (j >= len) return 0;
+                j++;
+            }
+        }
+        if (j + (long)sz + 2 > len) return 0;          /* chunk data + CRLF not fully here yet */
+        if (b[j + (long)sz] != '\r' || b[j + (long)sz + 1] != '\n') return -1;
+        i = j + (long)sz + 2;
+        *pos = i;                                      /* this chunk is complete: never rescan it */
+    }
+    return -1;
+}
+
 /* ---- tiny freestanding helpers ----------------------------------------- */
 
 static void h_memcpy(void *dst, const void *src, unsigned long n)
@@ -353,10 +417,18 @@ static int ci_contains(const char *hay, const char *needle)
  * 20 digits, which is safe for any 64-bit value). */
 static long parse_long(const char *s)
 {
+    const long LMAX = 0x7FFFFFFFFFFFFFFFL;   /* LONG_MAX (freestanding, no limits.h) */
     long v = 0;
     int  guard = 0;
     while (*s >= '0' && *s <= '9' && guard < 20) {
-        v = v * 10 + (long)(*s - '0');
+        int d = *s - '0';
+        /* Saturate instead of overflowing. A Content-Length past LONG_MAX would
+         * wrap NEGATIVE; the receive-loop fast-stop (got_body >= clen) then fires
+         * immediately (any got_body >= a negative clen), truncating the body to
+         * the first packet. Clamping to LONG_MAX yields an unsatisfiable length,
+         * so the loop instead reads until peer-close / buffer-full -- never early. */
+        if (v > (LMAX - d) / 10) { v = LMAX; s++; guard++; continue; }
+        v = v * 10 + (long)d;
         s++; guard++;
     }
     return v;
@@ -630,6 +702,14 @@ static long http_fetch_raw(const char *host, unsigned short port,
         }
     }
 
+    /* TLS-STRICT-0: an HTTPS connection that did not authenticate must not carry a request (cookies, bearer
+     * tokens, API keys). Applies to a reused keep-alive connection too (its verdict travels with it). */
+    if (use_tls && g_tls_strict && !g_nc.trusted) {
+        netconn_close(&g_nc);
+        netconn_set_deadline(0);
+        return HTTP_ERR_CERT;
+    }
+
     /* Connect/handshake may have consumed the whole budget. */
     if (deadline_passed(deadline)) {
         netconn_close(&g_nc);
@@ -740,6 +820,8 @@ static long http_fetch_raw(const char *host, unsigned short port,
     int  have_meta = 0;
 
     int timed_out = 0;
+    int truncated = 0;   /* broke on a full raw[] with body possibly undrained */
+    long chunk_pos = 0;  /* HTTP-CHUNK-0: resume point of the chunked-body scan (relative to body_off) */
     for (int it = 0; it < HTTP_POLL_MAX; it++) {
         /* Wall-clock deadline check (covers the TLS path too, whose internal
          * netconn_read bound is independent of our budget). */
@@ -779,7 +861,12 @@ static long http_fetch_raw(const char *host, unsigned short port,
             if (got_body >= meta->clen) break;
         }
 
-        if (raw_len >= raw_cap) break;     /* raw buffer full */
+        /* HTTP-CHUNK-0: a chunked body is complete the moment its terminal chunk + trailers are in. */
+        if (have_meta && meta->chunked && body_off >= 0) {
+            if (chunk_scan((const char *)raw + body_off, raw_len - body_off, &chunk_pos) == 1) break;
+        }
+
+        if (raw_len >= raw_cap) { truncated = 1; break; }  /* raw buffer full */
     }
 
     /* The netconn-layer deadline only applies to this round-trip; clear it so a
@@ -811,6 +898,14 @@ static long http_fetch_raw(const char *host, unsigned short port,
             return HTTP_ERR_TIMEO;
         }
     }
+
+    /* If we stopped because raw[] filled (body larger than HTTP_RAW_MAX, or a
+     * chunked/Content-Length-less response that didn't fit), the socket may
+     * still hold un-drained body bytes. Caching such a connection would make the
+     * next same-host request read that leftover tail as its status line and
+     * corrupt the fetch, so force a fresh connection: clear keep_alive here and
+     * http_do_get will netconn_close() instead of ka_put(). */
+    if (truncated) meta->keep_alive = 0;
 
     *p_body_off = body_off;
     return raw_len;
@@ -1051,6 +1146,12 @@ static long http_do_get(const char *host, unsigned short port, const char *path,
     if (out_status) *out_status = 0;
     if (!host || !path || !out_body) return HTTP_ERR_INVAL;
 
+    /* Clear the security verdict for this fetch.  If we return an error before
+     * any hop completes, the verdict stays "not secure / not trusted", which is
+     * the fail-safe reading for a caller that queries http_last_trusted(). */
+    g_last_tls     = 0;
+    g_last_trusted = 0;
+
     /* Compute the absolute deadline ONCE: all redirect hops share this budget,
      * so a redirect chain to slow hosts cannot multiply the wait.  A timeout of
      * 0 means "use the default"; the resulting `deadline` is always non-zero so
@@ -1099,6 +1200,14 @@ static long http_do_get(const char *host, unsigned short port, const char *path,
                                       raw, (long)sizeof(raw),
                                       &body_off, &meta, deadline);
         if (raw_len < 0) return raw_len;        /* propagate HTTP_ERR_* */
+
+        /* Snapshot this hop's security posture BEFORE the keep-alive cache may
+         * move g_nc.  Each hop overwrites the previous, so after the loop these
+         * reflect the FINAL served connection -- exactly what a redirect chain's
+         * terminal body was delivered over (e.g. an https:// that downgraded to
+         * http:// leaves g_last_tls == 0, which is the honest verdict). */
+        g_last_tls     = g_nc.is_tls;
+        g_last_trusted = g_nc.trusted;
 
         int status = meta.status;
 
@@ -1179,6 +1288,22 @@ long https_get(const char *host, unsigned short port, const char *path,
 {
     return http_get_ex(host, port, path, out_body, out_cap, out_status,
                        HTTP_MAX_REDIRECTS, HTTP_F_TLS);
+}
+
+/* http_last_secure -- 1 iff the terminal hop of the most recent fetch was TLS
+ * (encrypted).  Says nothing about authentication -- see http_last_trusted. */
+int http_last_secure(void)
+{
+    return g_last_tls ? 1 : 0;
+}
+
+/* http_last_trusted -- 1 iff the terminal hop was TLS AND its certificate chain
+ * authenticated against a built-in CA root.  This is the flag security-sensitive
+ * callers must gate on (curl's exit-6 / browser padlock).  Returns 0 for plain
+ * HTTP, for encrypted-but-unauthenticated TLS, and for any failed fetch. */
+int http_last_trusted(void)
+{
+    return (g_last_tls && g_last_trusted) ? 1 : 0;
 }
 
 long http_get_range(const char *host, unsigned short port, const char *path,

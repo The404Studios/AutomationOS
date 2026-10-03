@@ -17,6 +17,26 @@ if [ "${SCHED_DEBUG:-0}" = "1" ]; then
 fi
 
 # ─────────────────────────────────────────────────────────────────────────────
+# MULTICORE=1 -- the whole multi-core stack in ONE switch (what build_test/vm_verify.sh proves under
+# `qemu -smp 2 -cpu Westmere`): AP bring-up + per-CPU scheduler + CPU1 ring-3 dispatch + IPI + BKL-lite +
+# BATCH routing + run-mask audit + desktop split (compositor on CPU0, batch work on CPU1).
+# Any individual flag still wins if you set it yourself (e.g. `MULTICORE=1 SMP_DSPLIT=0`). The kernel lands in
+# build/kernel-smp.elf (same as the long hand-written form). Default build is unchanged when unset.
+# ─────────────────────────────────────────────────────────────────────────────
+if [ "${MULTICORE:-0}" = "1" ]; then
+    for _v in SMP SMP_SCHED SMP_SCHED_DISPATCH SMP_IPI SMP_BKL SMP_BATCH SMP_RUNMASK SMP_DSPLIT; do
+        eval "export $_v=\${$_v:-1}"
+    done
+    echo "*** MULTICORE build: full SMP stack (SMP SCHED DISPATCH IPI BKL BATCH RUNMASK DSPLIT) ***"
+    # SMP_PRODUCT: the shipping profile. Same kernel, but the boot-time PROOF storms (2 x 60 s bklstorm) are not
+    # launched. `MULTICORE=1 SMP_PRODUCT=0` gives the proof kernel back.
+    if [ "${SMP_PRODUCT:-1}" = "1" ]; then
+        CFLAGS="$CFLAGS -DSMP_PRODUCT"
+        echo "*** SMP_PRODUCT: boot-time proof storms are NOT launched (BKL stays armed) ***"
+    fi
+fi
+
+# ─────────────────────────────────────────────────────────────────────────────
 # T410-SAFE PROFILE (GATED behind the T410_SAFE env var).
 #   T410_SAFE=1 SCHED_DEBUG=0 bash scripts/quick_build.sh
 # A boring-correctness profile for the 2010 Westmere i5-520M (ThinkPad T410):
@@ -60,6 +80,14 @@ fi
 if [ "${IWLWIFI:-0}" = "1" ]; then
     CFLAGS="$CFLAGS -DIWLWIFI"
     echo "*** IWLWIFI build: real Intel WiFi detect + safe probe (T410; bring-up deferred) ***"
+fi
+
+# FW_OPEN=1: build the firewall with its INBOUND default policy = ACCEPT (stateful tracking,
+# sanity drops and rules all still work). The shipping default is IN=DROP; this is only for
+# harnesses that must reach a guest service from the host (hostfwd/server tests).
+if [ "${FW_OPEN:-0}" = "1" ]; then
+    CFLAGS="$CFLAGS -DFW_OPEN"
+    echo "*** FW_OPEN build: firewall inbound default policy = ACCEPT (harness profile) ***"
 fi
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -600,6 +628,7 @@ fi
 # BSD-ish sockets (UDP + active-open TCP) on top of net.c. The ~338KB socket
 # table now lives in kmalloc (see socket.c), NOT .bss, so these are safe to link.
 compile kernel/net/socket.c                  c_socket
+compile kernel/net/firewall.c                c_firewall
 compile kernel/net/udp.c                      c_udp
 compile kernel/net/tcp.c                      c_tcp
 # NET-P1-A0 test rig: compiles EMPTY unless -DNET_SELFTEST (NET_SELFTEST=1).
@@ -629,6 +658,7 @@ compile kernel/ipc/notify.c                  c_notify
 compile kernel/ipc/ipc.c                      c_ipc
 compile kernel/core/sched/scheduler.c        c_scheduler
 compile kernel/core/sched/process.c          c_process
+compile kernel/core/sched/proc_caps.c        c_proc_caps
 compile kernel/core/sched/context.c          c_context
 compile kernel/core/sched/waitqueue.c        c_waitqueue
 compile kernel/core/syscall/handlers.c       c_syscall_handlers

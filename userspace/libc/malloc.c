@@ -328,8 +328,19 @@ static void _heap_init(void) {
 // Returns the head block_hdr of the new arena, or NULL on failure.
 // --------------------------------------------------------------------------
 
-static blk_hdr_t* _grow_heap(void) {
-    long addr = __sc(SYS_MMAP_NR, 0, (long)MMAP_CHUNK_SIZE, 0, 0, 0);
+static blk_hdr_t* _grow_heap(unsigned long need) {
+    // Size the chunk to the request, not a fixed 2 MB. `need` is the aligned
+    // payload size; add the arena + block headers and round up to a page. Use at
+    // least MMAP_CHUNK_SIZE so small allocations still batch into 2 MB arenas.
+    // Without this, ANY single allocation larger than ~2 MB failed (returned
+    // NULL) even with gigabytes free -- e.g. decoding a >8 MB image once the
+    // static heap was used. (Overflow-guarded: malloc/realloc reject
+    // size > SIZE_MAX-15 before reaching here, so need + headers cannot wrap.)
+    unsigned long want  = need + sizeof(arena_hdr_t) + sizeof(blk_hdr_t);
+    unsigned long chunk = MMAP_CHUNK_SIZE;
+    if (want > chunk) chunk = (want + 4095UL) & ~4095UL;   // page-round the larger request
+
+    long addr = __sc(SYS_MMAP_NR, 0, (long)chunk, 0, 0, 0);
     if (addr <= 0) {
         return (blk_hdr_t*)0;  // mmap failed (ENOMEM or not implemented)
     }
@@ -338,7 +349,7 @@ static blk_hdr_t* _grow_heap(void) {
 
     // Place an arena_hdr at the start of the chunk.
     arena_hdr_t *ah = (arena_hdr_t*)mem;
-    ah->size   = MMAP_CHUNK_SIZE;
+    ah->size   = chunk;
     ah->magic  = ARENA_MAGIC;
     ah->_pad0  = 0;
     ah->next   = _arenas;
@@ -346,7 +357,7 @@ static blk_hdr_t* _grow_heap(void) {
 
     // The block region starts right after the arena_hdr.
     unsigned char  *blk_start = mem + sizeof(arena_hdr_t);
-    unsigned long   blk_cap   = MMAP_CHUNK_SIZE - sizeof(arena_hdr_t);
+    unsigned long   blk_cap   = chunk - sizeof(arena_hdr_t);
     return _arena_init_blocks(blk_start, blk_cap);
 }
 
@@ -380,6 +391,12 @@ static blk_hdr_t* _find_list_for(blk_hdr_t *h) {
 
 void* malloc(unsigned long size) {
     if (size == 0) return (void*)0;
+    // Reject sizes that would overflow the 16-byte round-up below. _align16 is
+    // (size+15)&~15, which WRAPS to 0 for size > SIZE_MAX-15 -- malloc would
+    // then return a non-NULL 0-byte block for a gigantic request and the caller
+    // (or calloc's zeroing loop) writes far past it. (This also makes calloc
+    // safe: calloc -> malloc(total) now returns NULL for an overflowing total.)
+    if (size > ((unsigned long)-1 - 15UL)) return (void*)0;
     if (!_heap_ready) _heap_init();
 
     size = _align16(size);
@@ -414,8 +431,8 @@ void* malloc(unsigned long size) {
         if (p) return p;
     }
 
-    // Grow: request a new 2 MB chunk from the kernel.
-    blk_hdr_t *new_list = _grow_heap();
+    // Grow: request a new chunk sized to this allocation (>= 2 MB).
+    blk_hdr_t *new_list = _grow_heap(size);
     if (!new_list) return (void*)0;   // truly out of memory
 
     return _alloc_from_list(new_list, size);
@@ -476,6 +493,7 @@ void* realloc(void* ptr, unsigned long size) {
     blk_hdr_t *h = _payload_blk(ptr);
     if (h->magic != BLOCK_MAGIC) return (void*)0;
 
+    if (size > ((unsigned long)-1 - 15UL)) return (void*)0;  /* _align16 wrap (see malloc) */
     unsigned long aligned_new = _align16(size);
 
     // If current block already fits, return it in-place (no copy needed).

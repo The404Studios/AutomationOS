@@ -24,6 +24,7 @@
 #include "../include/mem.h"      /* copy_from_user / copy_to_user, COPY_*  */
 #include "../include/errno.h"    /* canonical negative errno (EINVAL/EFAULT/ENOTSUP) */
 #include "../include/string.h"   /* memset, memcpy, strcmp */
+#include "../include/proc_caps.h" /* PCAP-0: proc_cap_check */
 
 /* Bound user transfers to one Ethernet frame. */
 #define NET_SYS_MAX_FRAME  ETH_MAX_FRAME
@@ -32,6 +33,7 @@ int64_t sys_net_send(uint64_t buf, uint64_t len, uint64_t a3,
                      uint64_t a4, uint64_t a5, uint64_t a6) {
     (void)a3; (void)a4; (void)a5; (void)a6;
 
+    if (!proc_cap_check(PCAP_NET_RAW)) return EPERM;   /* PCAP-0: raw frame send */
     if (!net_up()) return ENOTSUP;
     if (buf == 0 || len == 0 || len > NET_SYS_MAX_FRAME) return EINVAL;
 
@@ -48,6 +50,7 @@ int64_t sys_net_recv(uint64_t buf, uint64_t len, uint64_t a3,
                      uint64_t a4, uint64_t a5, uint64_t a6) {
     (void)a3; (void)a4; (void)a5; (void)a6;
 
+    if (!proc_cap_check(PCAP_NET_RAW)) return EPERM;   /* PCAP-0: raw frame sniff */
     if (!net_up()) return ENOTSUP;
     if (buf == 0 || len == 0) return EINVAL;
 
@@ -125,6 +128,7 @@ int64_t sys_net_config(uint64_t req_ptr, uint64_t a2, uint64_t a3,
     (void)a2; (void)a3; (void)a4; (void)a5; (void)a6;
 
     if (req_ptr == 0) return EINVAL;
+    if (!proc_cap_check(PCAP_NET_ADMIN)) return EPERM;  /* PCAP-0: IP/gateway/DNS/bring-up are admin-only */
 
     uapi_net_config_t req;
     if (copy_from_user(&req, (const void*)req_ptr, sizeof(req)) != COPY_SUCCESS)

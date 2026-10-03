@@ -519,6 +519,12 @@ typedef struct process {
     uint64_t sig_mask;
     uint64_t sig_pending;
     uint64_t sig_restorer;
+
+    // PCAP-0: privileges this process has dropped (PCAP_* bits, include/proc_caps.h).
+    // 0 = nothing dropped (the default). Appended at the very END so no asm-hardcoded
+    // offset moves; zeroed by the memset in process_create()/thread_create(). Monotonic
+    // and inherited by every child (spawn/fork/thread).
+    uint64_t cap_denied;
 } process_t;
 
 // Global pointer to current process (for PE loader and other subsystems)

@@ -1,11 +1,11 @@
 /* selfheal.h — SELFHEAL desktop self-heal contract (heartbeat shared page).
  *
  * One 4 KiB SysV SHM page the compositor stamps once per frame-loop iteration so
- * a tiny userspace supervisor (sbin/cwatchdog) can distinguish a LIVE desktop
+ * PID 1 can distinguish a LIVE desktop
  * from a FROZEN one with zero kernel cooperation.  Shared, verbatim, by:
  *   - init        (userspace/init/main.c)            — CREATES + OWNS the segment
  *   - compositor  (userspace/compositor/compositor_m8.c) — WRITER (per frame)
- *   - cwatchdog   (userspace/apps/cwatchdog/cwatchdog.c)  — READER (poller)
+ *   - init        (userspace/init/main.c)                 — READER/supervisor
  *
  * ============================ OWNERSHIP (load-bearing) =======================
  * Verified against kernel/ipc/shm.c:shm_cleanup_process (lines 955-988): when a
@@ -45,8 +45,8 @@
  * compositor with its own uint32_t/uint64_t typedefs — includes it without any
  * collision, and the struct layout is identical everywhere (no field drift).
  *
- * GATING: every includer guards its use behind -DSELFHEAL, so the DEFAULT build
- * compiles none of this and is byte-for-byte unchanged.
+ * GATING: every includer guards its use behind -DSELFHEAL. Shipping builds enable
+ * it by default; SELFHEAL=0 is retained for narrow diagnostic builds.
  */
 #ifndef SELFHEAL_H
 #define SELFHEAL_H
@@ -56,7 +56,7 @@
 #define SELFHEAL_SHM_KEY   0x53480001   /* 'SH' + 0001                            */
 #define SELFHEAL_SHM_SIZE  4096u        /* exactly one page                       */
 #define SELFHEAL_MAGIC     0x53484254u  /* 'SHBT' — set once the page is live     */
-#define SELFHEAL_VERSION   2u           /* v2: + window registry at offset 256    */
+#define SELFHEAL_VERSION   3u           /* v3: registry records SHM incarnation   */
 
 /* Informational compositor state (the liveness decision is purely "did
  * frame_counter advance", not this field). */
@@ -65,7 +65,7 @@
 #define SH_STATE_STOPPING  2u
 
 /* The shared page.  All fields volatile: single-writer (compositor) /
- * single-reader (watchdog), no lock — a torn read just delays detection by one
+ * single-reader (PID 1), no lock — a torn read just delays detection by one
  * poll, which is benign.  Primitive types keep the layout identical across all
  * three includers regardless of their local typedefs. */
 typedef struct sh_heartbeat {
@@ -106,9 +106,10 @@ typedef struct sh_winreg_ent {
     volatile int          win_id;       /* compositor-assigned id (client holds)  */
     volatile int          client_pid;   /* owner pid (reply-queue key)            */
     volatile int          shm_id;       /* the client's pixel-buffer segment      */
+    volatile unsigned long long shm_ctime; /* rejects a recycled numeric shm_id    */
     volatile unsigned int buf_w, buf_h; /* IMMUTABLE buffer extent (pixels)       */
     volatile int          x, y;         /* frame position at last mirror          */
     char                  title[SH_WINREG_TITLE];
-} sh_winreg_ent_t;                       /* 80 B x 16 = 1280 B; 256+1280 < 4096   */
+} sh_winreg_ent_t;                       /* 88 B x 16; 256+1408 < 4096             */
 
 #endif /* SELFHEAL_H */

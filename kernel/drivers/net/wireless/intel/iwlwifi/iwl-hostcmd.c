@@ -269,9 +269,12 @@ int iwl_scd_cmd_queue_init(struct iwl_trans* trans) {
     iwl_write_prph(trans, SCD_QUEUE_RDPTR(IWL_CMD_QUEUE_ID), 0);
     iwl_write32(trans, HBUS_TARG_WRPTR, (0u & 0xff) | (IWL_CMD_QUEUE_ID << 8));
 
-    kprintf("IWLCMD: clear cmd-queue SCD context word...\n");
+    kprintf("IWLCMD: initialize cmd-queue SCD context...\n");
     iwl_write_mem32(trans,
         trans->scd_base_addr + SCD_CONTEXT_QUEUE_OFFSET(IWL_CMD_QUEUE_ID), 0);
+    iwl_write_mem32(trans,
+        trans->scd_base_addr + SCD_CONTEXT_QUEUE_OFFSET(IWL_CMD_QUEUE_ID) + 4,
+        SCD_QUEUE_CTX_REG2_VALUE);
 
     kprintf("IWLCMD: activate cmd queue (SCD_QUEUE_STATUS_BITS)...\n");
     iwl_write_prph(trans, SCD_QUEUE_STATUS_BITS(IWL_CMD_QUEUE_ID),
@@ -308,7 +311,8 @@ int iwl_scd_cmd_queue_init(struct iwl_trans* trans) {
      * is (len + CRC + delimiter) & 0xFFF | (sta_id << 12); for the empty queue we
      * seed slot 0 with the minimal delimiter+crc length (sta_id 0). The enqueue
      * path updates the live slot's entry per command below. */
-    struct iwlagn_scd_bc_tbl* bc = (struct iwlagn_scd_bc_tbl*)trans->scd_bc_tbl;
+    struct iwlagn_scd_bc_tbl* bc =
+        &((struct iwlagn_scd_bc_tbl*)trans->scd_bc_tbl)[IWL_CMD_QUEUE_ID];
     bc->tfd_offset[0] =
         (uint16_t)((IWL_TX_CRC_SIZE + IWL_TX_DELIMITER_SIZE) & 0xFFF);
     iwl_desc_wmb();
@@ -365,7 +369,7 @@ static int iwl_cmd_enqueue(struct iwl_trans* trans, uint8_t cmd_id,
      * TFD to a running uCode. (Part of item H-C2.) */
     if (trans->scd_bc_tbl) {
         struct iwlagn_scd_bc_tbl* bc =
-            (struct iwlagn_scd_bc_tbl*)trans->scd_bc_tbl;
+            &((struct iwlagn_scd_bc_tbl*)trans->scd_bc_tbl)[IWL_CMD_QUEUE_ID];
         uint16_t bc_len =
             (uint16_t)((total + IWL_TX_CRC_SIZE + IWL_TX_DELIMITER_SIZE) & 0xFFF);
         bc->tfd_offset[wr] = bc_len;

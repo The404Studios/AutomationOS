@@ -331,10 +331,21 @@ typedef struct {
     int cap;
 } estk;
 
+/* Hard cap on open-element nesting = maximum DOM tree depth. Kept safely below
+ * dom.c's DOM_WALK_MAX_DEPTH (256) so every bounded tree walk covers the whole
+ * tree, and low enough that the recursive dom_node_free teardown (~64 B/frame)
+ * cannot overflow the 64 KB ring-3 stack. Past this depth estk_push refuses to
+ * open a deeper context (treated like the realloc-OOM failure the callers
+ * already tolerate), so crafted deeply-nested HTML (e.g. "<div>" x100000) is
+ * flattened instead of building a pathological tree that crashes teardown or
+ * hides nodes below the node-count guard's walk cap. Real pages nest < ~50. */
+#define HTML_MAX_NEST_DEPTH 200
+
 static void estk_init(estk *s) { s->a = 0; s->len = 0; s->cap = 0; }
 
 static int estk_push(estk *s, struct dom_node *n)
 {
+    if (s->len >= HTML_MAX_NEST_DEPTH) return 0;   /* cap DOM depth (see above) */
     if (s->len + 1 > s->cap) {
         int nc = s->cap ? s->cap * 2 : 16;
         struct dom_node **na = (struct dom_node **)realloc(

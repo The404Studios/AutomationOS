@@ -10,6 +10,8 @@
 #include "../../include/poll.h"   // POLL-SELECT-0: sys_poll / sys_select prototypes
 #include "../../include/audio.h" // audio_beep (SYS_BEEP target)
 #include "../../include/mem.h"   // copy_to_user / COPY_SUCCESS (SYS_AUDIO_STATUS)
+#include "../../include/firewall.h"   // FW-0: sys_fw_ctl
+#include "../../include/proc_caps.h"  // PCAP-0: sys_cap_drop / sys_cap_query
 #include "../../include/acpi.h"  // power_off / power_reboot (SYS_POWEROFF/REBOOT)
 #include "../../include/pci.h"   // sys_pci_list (SYS_PCI_LIST=92)
 // NOTE: do NOT include compat/errno.h here. It defines EINVAL/ENOTSUP as
@@ -317,6 +319,9 @@ void syscall_init(void) {
     syscall_table[SYS_WLAN_DISCONNECT] = (syscall_handler_t)sys_wlan_disconnect;
     syscall_table[SYS_WLAN_SET_KEY]    = (syscall_handler_t)sys_wlan_set_key;
     syscall_table[SYS_WLAN_DIAG]       = (syscall_handler_t)sys_wlan_diag;
+    syscall_table[SYS_FW_CTL]          = sys_fw_ctl;      /* FW-0 */
+    syscall_table[SYS_CAP_DROP]        = sys_cap_drop;    /* PCAP-0 */
+    syscall_table[SYS_CAP_QUERY]       = sys_cap_query;   /* PCAP-0 */
 
     // PCI device list (lspci userspace tool)
     syscall_table[SYS_PCI_LIST]    = (syscall_handler_t)sys_pci_list;

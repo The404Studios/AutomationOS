@@ -142,9 +142,13 @@ void dom_node_free(dom_node *node)
 {
     if (!node) return;
 
-    /* Free child subtree iteratively-bounded to avoid pathological stack
-       use. We snapshot first_child and walk siblings; each child does its
-       own recursion (depth bounded by DOM_WALK_MAX_DEPTH in practice). */
+    /* Recurses once per tree LEVEL (line below). This is only safe because the
+       tree DEPTH is capped at the source: html_parse's estk_push refuses to
+       open a context past HTML_MAX_NEST_DEPTH (200), well under the 64 KB ring-3
+       stack budget at ~64 B/frame. (The old comment here claimed a
+       DOM_WALK_MAX_DEPTH bound that this function does NOT enforce -- there is
+       no depth guard in dom_node_free itself; the bound lives in the parser.)
+       Siblings are walked iteratively and capped by DOM_MAX_CHILDREN_SCAN. */
     dom_node *c = node->first_child;
     unsigned long guard = 0;
     while (c && guard++ < DOM_MAX_CHILDREN_SCAN) {

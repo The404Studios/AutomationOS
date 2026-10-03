@@ -1587,6 +1587,14 @@ static ssize_t ramfs_write(vfs_file_t* file, const void* buf, size_t count) {
         inode->size = file->offset;
     }
 
+    // Invalidate any sendfile page-cache snapshot of this inode. The sendfile
+    // fast-path caches an independent COPY of inode->data keyed by (inode,
+    // offset); this direct write mutates inode->data in place, so without an
+    // evict a later sendfile() would serve the STALE pre-write bytes over a
+    // socket (transmitting overwritten file contents). Mirrors the truncate/
+    // ftruncate paths, which already evict.
+    page_cache_evict_inode(inode);
+
     return (ssize_t)count;
 }
 

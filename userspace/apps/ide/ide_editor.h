@@ -85,6 +85,9 @@ typedef struct {
 
 /* Reset caret/scroll/dirty after a new file is loaded into a->src. */
 void ide_editor_reset(struct Ide* a);
+/* Clear undo/redo history only (buffer/caret untouched). Call on tab switch so
+ * one tab's undo ops can never replay into another tab's buffer. */
+void ide_editor_undo_clear(void);
 
 /* Render the editor panel (gutter + code + caret) into Rect r. */
 void ide_editor_render(struct Ide* a, Canvas* cv, struct Rect r);

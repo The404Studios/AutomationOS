@@ -91,6 +91,27 @@ static void vfs_dir_free_handle(int handle) {
 }
 
 /**
+ * Reclaim every directory handle owned by a dying process.
+ *
+ * dir_handles[] is a GLOBAL 64-entry table, not part of the per-process fd
+ * table, so process teardown must free these explicitly. Without it a process
+ * that opendir()s and then exits/crashes without closedir() permanently leaks
+ * the slot + kmalloc'd handle + a pinned inode reference; after 64 such leaks
+ * system-wide, vfs_dir_alloc_handle() returns -1 for every process forever
+ * (permanent opendir/ls/filemanager DoS). Mirrors epoll_cleanup_process() /
+ * sock_cleanup_process(). Called from process_unref() teardown.
+ */
+void vfs_dir_cleanup_process(uint32_t pid) {
+    if (pid == 0) return;                 // never touch kernel-owned handles
+    if (!dir_handles_initialized) return;
+    for (int i = 0; i < MAX_DIR_HANDLES; i++) {
+        if (dir_handles[i] && dir_handles[i]->owner_pid == pid) {
+            vfs_dir_free_handle(i);       // drops the pinned inode ref + frees slot
+        }
+    }
+}
+
+/**
  * Get directory handle
  */
 static vfs_dir_handle_t* vfs_dir_get_handle(int handle) {
@@ -348,6 +369,40 @@ int vfs_unlink(const char* path) {
     return 0;
 }
 
+// Returns 1 if `target` IS `root` or appears anywhere in the directory subtree
+// rooted at `root` (a downward walk of the child-dentry arrays); else 0.
+//
+// Used by vfs_rename to reject moving a directory into itself or into one of its
+// own descendants -- e.g. rename("/a","/a/b/c"). The old guard only compared
+// dentry->inode against new_parent directly, catching the one-level case
+// (rename "/a" -> "/a/x") but missing any deeper target, which would orphan the
+// subtree and build a self-referential cycle that infinite-loops every recursive
+// directory walk. This walk is depth-bounded: exceeding the cap returns 1
+// (fail safe -- refuse the rename) so a pathologically deep tree or a
+// pre-existing cycle can neither overflow the kernel stack nor loop forever.
+// "." / ".." entries (if the fs materialises them) are skipped so the walk
+// never ascends.
+static int vfs_dir_is_self_or_descendant(vfs_inode_t* root, vfs_inode_t* target,
+                                         int depth) {
+    if (!root || !target) return 0;
+    if (root == target) return 1;
+    if (depth <= 0) return 1;                 // too deep: fail safe, refuse
+    if (!(root->type & VFS_TYPE_DIR) || !root->private_data) return 0;
+
+    vfs_dentry_t** entries = (vfs_dentry_t**)root->private_data;
+    for (uint64_t i = 0; i < root->data_capacity; i++) {
+        vfs_dentry_t* d = entries[i];
+        if (!d || !d->inode) continue;
+        if (!(d->inode->type & VFS_TYPE_DIR)) continue;   // only dirs can nest
+        // Skip self / parent links so the walk never ascends into a loop.
+        if (d->name[0] == '.' && (d->name[1] == '\0' ||
+            (d->name[1] == '.' && d->name[2] == '\0'))) continue;
+        if (vfs_dir_is_self_or_descendant(d->inode, target, depth - 1))
+            return 1;
+    }
+    return 0;
+}
+
 /**
  * Rename/move file or directory
  */
@@ -481,11 +536,14 @@ int vfs_rename(const char* oldpath, const char* newpath) {
         return 0;
     }
 
-    // KERNEL-ROBUST-0: refuse to rename a directory into itself (the destination
-    // parent IS the directory being moved). That orphans the subtree and builds a
-    // self-referential cycle that infinite-loops any recursive directory walk.
+    // KERNEL-ROBUST: refuse to move a directory into itself OR into any of its
+    // own descendants -- e.g. rename("/a","/a/b/c"). Either orphans the subtree
+    // and builds a self-referential cycle that infinite-loops every recursive
+    // directory walk (ls -R, file-manager/IDE tree scan, tar). The direct
+    // dentry->inode == new_parent test only caught the one-level case; the
+    // subtree walk below (depth-bounded, fail-safe) catches every depth.
     if (dentry->inode && (dentry->inode->type & VFS_TYPE_DIR) &&
-        dentry->inode == new_parent) {
+        vfs_dir_is_self_or_descendant(dentry->inode, new_parent, 64)) {
         vfs_inode_put(old_parent);
         vfs_inode_put(new_parent);
         return VFS_ERR_INVAL;

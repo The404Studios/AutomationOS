@@ -36,6 +36,7 @@ typedef unsigned long long  u64;
 #define SYS_SENDTO      56   /* sc(56, fd, buf, len, ip_host, port)           */
 #define SYS_RECVFROM    57   /* sc(57, fd, buf, len, &sock_addr|0, 0)         */
 #define SYS_SOCK_POLL   58   /* sc(58, 0,0,0,0,0) -- pump NIC/timers          */
+#define SYS_SLEEP        9   /* sc(9, ms,0,0,0,0) -- blocking sleep (kernel/include/syscall.h) */
 #define SYS_NET_INFO    59   /* sc(59, &net_info, 0,0,0,0)                     */
 #define SYS_BIND        76   /* sc(76, fd, port, 0,0,0) -> 0/-err             */
 /* Raw-frame fallback path (only used when DHCP_USE_RAW_FALLBACK is defined). */
@@ -119,7 +120,7 @@ typedef unsigned long long  u64;
 
 /* Per-receive poll bound, and number of DISCOVER/REQUEST retransmits. */
 #define DHCP_POLL_MAX    200000
-#define DHCP_RETRIES     4
+#define DHCP_RETRIES     6
 
 /* ---- raw 5-arg inline syscall (rdi/rsi/rdx/r10/r8) ---------------------- */
 static long sc(long n, long a1, long a2, long a3, long a4, long a5)
@@ -503,7 +504,13 @@ int dhcp_acquire(dhcp_lease_t* out)
         int dlen = build_packet(pkt, xid, mac, DHCPDISCOVER, 0, 0);
         long sent = sc(SYS_SENDTO, fd, (long)pkt, (long)dlen,
                        (long)IP_BROADCAST, DHCP_SERVER_PORT);
-        if (sent < 0) { result = DHCP_E_SEND; continue; }
+        if (sent < 0) {
+            /* DHCP-ROBUST-0: sendto fails while the link is still coming up (the next-hop ARP cannot
+             * resolve yet). Retrying instantly burned every attempt in microseconds; give the PHY
+             * a second per attempt instead (QEMU's e1000 links ~0.5 s after init, the T410's 82577LM
+             * takes several seconds after `nicup`). */
+            result = DHCP_E_SEND; sc(SYS_SLEEP, 1000, 0, 0, 0, 0); continue;
+        }
 
         /* ---- wait OFFER ---- */
         int olen = wait_reply(fd, xid, DHCPOFFER, rbuf, (int)sizeof(rbuf));
@@ -520,7 +527,7 @@ int dhcp_acquire(dhcp_lease_t* out)
                                 offered.ip, offered.server);
         sent = sc(SYS_SENDTO, fd, (long)pkt, (long)rlen,
                   (long)IP_BROADCAST, DHCP_SERVER_PORT);
-        if (sent < 0) { result = DHCP_E_SEND; continue; }
+        if (sent < 0) { result = DHCP_E_SEND; sc(SYS_SLEEP, 1000, 0, 0, 0, 0); continue; }
 
         /* ---- wait ACK ---- */
         int alen = wait_reply(fd, xid, DHCPACK, rbuf, (int)sizeof(rbuf));

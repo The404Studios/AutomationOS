@@ -636,6 +636,38 @@ check_negsock() {
     fi
 }
 
+check_fwselftest() {
+    # FW-SELFTEST gate: the kernel boots with the FW-0 packet filter live and drives its REAL
+    # parse/verdict path with crafted frames (default-deny inbound, stateful return traffic,
+    # rule ordering, sanity drops, conntrack expiry, non-IP pass-through, disable switch).
+    if grep -qF 'FW-SELFTEST: PASS' "$LOG"; then
+        pass "firewall self-test (stateful filter: $(grep -F 'FW-SELFTEST: PASS' "$LOG" | head -1 | sed 's/.*PASS //'))"
+        return 0
+    elif grep -qF 'FW-SELFTEST: FAIL' "$LOG"; then
+        fail "firewall self-test: $(grep -F 'FW-SELFTEST' "$LOG" | grep -F FAIL | head -1)"
+        return 1
+    else
+        fail "firewall self-test did not report (fw_init/fw_selftest not wired)"
+        return 1
+    fi
+}
+
+check_fwtest() {
+    # FWTEST gate: SYS_FW_CTL round-trip + PCAP-0: a child that drops CAP_NET_ADMIN/RAW is
+    # refused EPERM by the KERNEL on firewall writes, raw frame send/recv and NET_CONFIG; the
+    # drop is inherited by a grandchild and is per-process (the privileged parent keeps its rights).
+    if grep -qF 'FWTEST: PASS' "$LOG"; then
+        pass "privilege drop enforced by the kernel (firewall ctl + raw net refused, inherited, per-process)"
+        return 0
+    elif grep -qF 'FWTEST: FAIL' "$LOG"; then
+        fail "fwtest: $(grep -F 'FWTEST:' "$LOG" | grep -F -e FAIL -e BAD | head -2 | tr '\n' ' ')"
+        return 1
+    else
+        fail "fwtest did not report PASS (FW_CTL/CAP syscalls unwired or it crashed)"
+        return 1
+    fi
+}
+
 check_negdir() {
     # NEGDIR gate: init spawns sbin/negdir, which renames a dir ONTO a
     # non-empty destination dir and a dir INTO ITSELF; both must be rejected
@@ -1090,6 +1122,8 @@ run_checks() {
         check_negsock
         check_negdir
         check_negshmdt
+        check_fwselftest
+        check_fwtest
         check_webstack
         check_crypto
         check_libs

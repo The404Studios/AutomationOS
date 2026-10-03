@@ -304,4 +304,40 @@ long https_post(const char *host, unsigned short port, const char *path,
  */
 int http_selftest(void);
 
+/*
+ * http_last_secure / http_last_trusted -- security verdict of the LAST fetch.
+ *
+ * Both refer to the terminal (final, body-serving) hop of the most recently
+ * completed http_get / https_get / http_get_ex / http_get_range call, and are
+ * reset to 0 at the start of each such call.
+ *
+ *   http_last_secure()  -> 1 iff that hop used TLS (traffic was encrypted).
+ *   http_last_trusted() -> 1 iff that hop used TLS AND the server certificate
+ *                          chain authenticated against a built-in CA root.
+ *
+ * A caller that requested HTTPS and receives a body should treat
+ * http_last_trusted() == 0 as "encrypted but UNAUTHENTICATED" -- i.e. subject
+ * to man-in-the-middle -- and fail closed (or clearly flag it) unless the user
+ * explicitly opted into an insecure fetch. Plain HTTP and failed fetches both
+ * report 0/0.
+ */
+int http_last_secure(void);
+int http_last_trusted(void);
+
+/*
+ * TLS-STRICT-0 -- certificate policy.
+ *
+ * DEFAULT (strict = 1): an HTTPS request whose server certificate chain does NOT authenticate against a
+ * built-in CA root fails with HTTP_ERR_CERT *before a single request byte is sent*. That is the point: an
+ * encrypted-but-unauthenticated connection can be a man-in-the-middle, and a request carries cookies,
+ * Authorization: Bearer tokens and API keys. Previously the handshake completed and the request (token
+ * included) went out anyway; only wget and the browser's padlock looked at the verdict afterwards.
+ *
+ * http_set_tls_strict(0) is the explicit opt-out (wget -k / --insecure, diagnostic tools). It is global to
+ * the process and is NOT inherited by other programs.
+ */
+#define HTTP_ERR_CERT  (-5)   /* server certificate not trusted (TLS-STRICT-0) */
+void http_set_tls_strict(int on);
+int  http_get_tls_strict(void);
+
 #endif /* AUTOMATIONOS_HTTP_H */

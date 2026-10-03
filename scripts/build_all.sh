@@ -10,7 +10,12 @@ cd "$(dirname "$0")/.."
 # SSE store (movaps) to a stack slot #GP. -mstackrealign makes each function
 # realign its own stack, eliminating the whole class of crash.
 CF="-std=gnu11 -ffreestanding -nostdlib -fno-builtin -fno-stack-protector -fno-pic -fno-pie -mno-red-zone -mstackrealign -O2"
-LD="ld -nostdlib -static -n -no-pie -e _start -T userspace/userspace.ld"
+# fsmem.o = weak memcpy/memset/memmove/memcmp, linked into EVERY userspace ELF.
+# GCC's freestanding contract requires the environment to provide them; GCC 16
+# lowers aggregate copies/inits to calls even under -fno-builtin, and many apps
+# link with crt0 only. Weak, so any app/lib with its own strong copy still wins.
+gcc $CF -c userspace/lib/c/fsmem.c -o /tmp/fsmem.o
+LD="ld -nostdlib -static -n -no-pie -e _start /tmp/fsmem.o -T userspace/userspace.ld"
 cc() { gcc $CF -c "$1" -o "$2"; }
 
 # TLS13=1 builds the TLS 1.3-capable client: tls.c (the only consumer of the
@@ -188,27 +193,37 @@ if [ "${WIFI_DEMO_FAIL:-0}" = "1" ]; then
     INIT_EXTRA="$INIT_EXTRA -DWIFI_DEMO_FAIL"
     echo "*** WIFI_DEMO_FAIL build: init tries a wrong-passphrase connect (proves WLAN_FAILED) ***"
 fi
-# SELFHEAL=1 wires the userspace desktop self-heal: the compositor publishes a
-# per-frame heartbeat into a SysV SHM page, init creates+owns that page and spawns
-# sbin/cwatchdog (the recovery supervisor). Threads -DSELFHEAL into the compositor
-# AND init compiles and builds+ships sbin/cwatchdog. Unset => none of it is
-# compiled or shipped, and the default initrd is byte-for-byte unchanged.
+# Desktop self-heal is shipping-default: the compositor publishes a heartbeat
+# into init-owned SHM and PID 1 supervises it with bounded backoff/cooldown.
+# SELFHEAL=0 remains available for narrow diagnostics.
 SELFHEAL_EXTRA=""
-if [ "${SELFHEAL:-0}" = "1" ]; then
+SELFHEAL_ENABLED="${SELFHEAL:-1}"
+if [ "$SELFHEAL_ENABLED" = "1" ]; then
     SELFHEAL_EXTRA="-DSELFHEAL"
     INIT_EXTRA="$INIT_EXTRA -DSELFHEAL"
-    echo "*** SELFHEAL build: compositor heartbeat + init + sbin/cwatchdog (-DSELFHEAL) ***"
+    echo "*** SELFHEAL build: compositor heartbeat + PID 1 bounded supervisor (-DSELFHEAL) ***"
 fi
 # FREEZE_TEST=1 (+ FREEZE_MODE=0 blocking | 1 tight-loop) adds a ONE-SHOT forced
 # freeze to the compositor for the recovery PROOF (scripts/selfheal_smoke.sh).
 # The freeze hook lives inside the SELFHEAL machinery, so FREEZE_TEST implies
 # SELFHEAL. Never set in a shipping build.
+# AGENTD_SERVE=1 also makes init spawn sbin/agentd in the LEAN (desktop) profile; in FULL it already
+# does. The conf file above switches it into long-lived tool-host mode.
+if [ "${AGENTD_SERVE:-0}" = "1" ]; then INIT_EXTRA="$INIT_EXTRA -DAGENTD_SERVE"; fi
+# DNS_TEST=1: init spawns sbin/dnstest (DNS-LEASE-0 proof: does the resolver follow the DHCP lease?).
+# Test builds only -- a normal build ships no dnstest and spawns nothing extra.
+if [ "${DNS_TEST:-0}" = "1" ]; then INIT_EXTRA="$INIT_EXTRA -DDNS_TEST"; echo "*** DNS_TEST build: init spawns sbin/dnstest ***"; fi
+# NET_LIVE=1: init spawns sbin/livenet (real DNS + HTTP + verified-HTTPS to the live Internet). Test builds only.
+if [ "${NET_LIVE:-0}" = "1" ]; then INIT_EXTRA="$INIT_EXTRA -DNET_LIVE"; echo "*** NET_LIVE build: init spawns sbin/livenet ***"; fi
+# WIN_TEST=1: init runs the Windows-compat fixtures (sbin/winrun on /usr/share/winfix/*.exe) one after another.
+# Needs mingw-w64 on the build host. Test builds only.
+if [ "${WIN_TEST:-0}" = "1" ]; then INIT_EXTRA="$INIT_EXTRA -DWIN_TEST"; echo "*** WIN_TEST build: init runs the Windows .exe fixtures ***"; fi
 FREEZE_EXTRA=""
 if [ "${FREEZE_TEST:-0}" = "1" ]; then
     FREEZE_EXTRA="-DSELFHEAL_FREEZE -DFREEZE_MODE=${FREEZE_MODE:-0}"
     case "$SELFHEAL_EXTRA" in
         *-DSELFHEAL*) ;;
-        *) SELFHEAL_EXTRA="-DSELFHEAL"; INIT_EXTRA="$INIT_EXTRA -DSELFHEAL";;
+        *) SELFHEAL_ENABLED=1; SELFHEAL_EXTRA="-DSELFHEAL"; INIT_EXTRA="$INIT_EXTRA -DSELFHEAL";;
     esac
     echo "*** FREEZE_TEST build: compositor self-freeze mode=${FREEZE_MODE:-0} (implies SELFHEAL) ***"
 fi
@@ -299,14 +314,6 @@ $LD /tmp/threadtest.o -o /tmp/threadtest.elf
 # == 256). Prints REAPLOOP: PASS iff the PID pool never exhausts (the #9 reap fix).
 cc userspace/apps/reaploop/reaploop.c /tmp/reaploop.o
 $LD /tmp/reaploop.o -o /tmp/reaploop.elf
-# cwatchdog: SELFHEAL desktop recovery supervisor (sbin/cwatchdog). Bare _start,
-# no libs/crt0. Built + shipped ONLY under SELFHEAL=1 (init spawns it only under
-# -DSELFHEAL), so the default initrd is byte-for-byte unchanged.
-if [ "${SELFHEAL:-0}" = "1" ]; then
-    cc userspace/apps/cwatchdog/cwatchdog.c /tmp/cwatchdog.o
-    $LD /tmp/cwatchdog.o -o /tmp/cwatchdog.elf
-fi
-
 # AI-native layer + standard tools (self-contained freestanding apps, no libs).
 # aibroker = the capability-gated AI command broker (/sbin); the rest are /bin
 # tools the shell can spawn (sed/awk/tar/pkg/make/meminfo). Each has a self-test.
@@ -319,6 +326,15 @@ cc userspace/apps/meminfo/meminfo.c   /tmp/meminfo.o;  $LD /tmp/meminfo.o  -o /t
 # argv-aware tools: link crt0 first (it provides _start -> main(argc,argv)).
 cc userspace/apps/sed/sed.c     /tmp/sed.o;     $LD /tmp/crt0.o /tmp/sed.o     -o /tmp/sed.elf
 cc userspace/apps/awk/awk.c     /tmp/awk.o;     $LD /tmp/crt0.o /tmp/awk.o     -o /tmp/awk.elf
+# fwtest: FW-0/PCAP-0 proof (bare _start, fork-based; init spawns it). fwctl: packet-filter
+# management tool (crt0/argv, /bin).
+cc userspace/apps/fwtest/fwtest.c /tmp/fwtest.o; $LD /tmp/fwtest.o -o /tmp/fwtest.elf
+# dnstest links dns.o, which is built later in this script -- see the DNS_TEST block after it.
+cc userspace/apps/fwctl/fwctl.c   /tmp/fwctl.o;  $LD /tmp/crt0.o /tmp/fwctl.o -o /tmp/fwctl.elf
+# winrun (WIN-MIN): runs a Windows x64 console .exe in user space = PE loader (lib/pe) + Win32 shim.
+cc userspace/lib/pe/pe.c /tmp/pe.o
+cc userspace/apps/winrun/win_shim.c /tmp/winshim.o
+cc userspace/apps/winrun/winrun.c /tmp/winrun.o; $LD /tmp/crt0.o /tmp/winrun.o /tmp/winshim.o /tmp/pe.o -o /tmp/winrun.elf
 cc userspace/apps/tar/tar.c     /tmp/tar.o;     $LD /tmp/crt0.o /tmp/tar.o     -o /tmp/tar.elf
 cc userspace/apps/pkg/pkg.c     /tmp/pkg.o;     $LD /tmp/crt0.o /tmp/pkg.o     -o /tmp/pkg.elf
 cc userspace/apps/make/make.c   /tmp/make.o;    $LD /tmp/crt0.o /tmp/make.o    -o /tmp/make.elf
@@ -381,6 +397,9 @@ cc userspace/apps/tool_mv/tool_mv.c       /tmp/tool_mv.o;    $LD /tmp/crt0.o /tm
 cc userspace/apps/tool_rm/tool_rm.c       /tmp/tool_rm.o;    $LD /tmp/crt0.o /tmp/tool_rm.o    -o /tmp/tool_rm.elf
 cc userspace/apps/tool_spawn/tool_spawn.c /tmp/tool_spawn.o; $LD /tmp/crt0.o /tmp/tool_spawn.o -o /tmp/tool_spawn.elf
 cc userspace/apps/tool_kill/tool_kill.c   /tmp/tool_kill.o;  $LD /tmp/crt0.o /tmp/tool_kill.o  -o /tmp/tool_kill.elf
+# TOOLSET-FW-0: ONE source, TWO programs -- the read/write privilege boundary is fixed at build time.
+cc userspace/apps/tool_fw/tool_fw.c /tmp/tool_fw.o; $LD /tmp/crt0.o /tmp/tool_fw.o -o /tmp/tool_fw.elf
+gcc $CF -DTOOL_FW_RO -c userspace/apps/tool_fw/tool_fw.c -o /tmp/tool_fwstat.o; $LD /tmp/crt0.o /tmp/tool_fwstat.o -o /tmp/tool_fwstat.elf
 cc userspace/apps/tool_ps/tool_ps.c       /tmp/tool_ps.o;    $LD /tmp/crt0.o /tmp/tool_ps.o    -o /tmp/tool_ps.elf
 cc userspace/apps/tool_shell/tool_shell.c /tmp/tool_shell.o; $LD /tmp/crt0.o /tmp/tool_shell.o -o /tmp/tool_shell.elf
 # SYNTHINPUT-0: synthetic input tools (mouse/keyboard) -- the agent drives the GUI via these.
@@ -570,6 +589,8 @@ $LD /tmp/libtest.o /tmp/json.o /tmp/dhcp.o /tmp/lmath.o \
     /tmp/img_bmp.o /tmp/img_png.o /tmp/img_gif.o /tmp/img_codec.o /tmp/deflate.o /tmp/lstring.o -o /tmp/libtest.elf
 # dhcpc: obtain + print a DHCP lease (crt0+main; links dhcp).
 cc userspace/apps/dhcpc/dhcpc.c /tmp/dhcpc.o; $LD /tmp/crt0.o /tmp/dhcpc.o /tmp/dhcp.o -o /tmp/dhcpc.elf
+# dnstest (DNS-LEASE-0 proof): real DHCP exchange + resolver check. Shipped only under DNS_TEST=1.
+cc userspace/apps/dnstest/dnstest.c /tmp/dnstest.o; $LD /tmp/crt0.o /tmp/dnstest.o /tmp/dns.o /tmp/dhcp.o -o /tmp/dnstest.elf
 # autodhcp: auto-DHCP on boot -- sleeps 2s, checks link, runs DHCP if up.
 cc userspace/apps/autodhcp/autodhcp.c /tmp/autodhcp.o; $LD /tmp/crt0.o /tmp/autodhcp.o /tmp/dhcp.o -o /tmp/autodhcp.elf
 # nicup: E1000-PCH-0B post-desktop trigger for the deferred T410 NIC bring-up.
@@ -601,6 +622,8 @@ cc userspace/tests/threadprobe.c /tmp/threadprobe.o; $LD /tmp/crt0.o /tmp/thread
 cc userspace/apps/renderworker/renderworker.c /tmp/renderworker.o; $LD /tmp/crt0.o /tmp/renderworker.o -o /tmp/renderworker.elf
 # apidemo: fetch http(s) URL + pretty-print JSON (crt0+main; HTTPS + json).
 cc userspace/apps/apidemo/apidemo.c /tmp/apidemo.o; $LD /tmp/crt0.o /tmp/apidemo.o /tmp/json.o $HTTPS_OBJS -o /tmp/apidemo.elf
+# livenet: LIVE-Internet proof (DNS + HTTP + verified HTTPS). Shipped only under NET_LIVE=1.
+cc userspace/apps/livenet/livenet.c /tmp/livenet.o; $LD /tmp/crt0.o /tmp/livenet.o $HTTPS_OBJS -o /tmp/livenet.elf
 # gsignin: "Sign in with Google" via OAuth 2.0 Device Flow (RFC 8628); HTTPS POST + json.
 cc userspace/apps/gsignin/gsignin.c /tmp/gsignin.o; $LD /tmp/crt0.o /tmp/gsignin.o /tmp/json.o $HTTPS_OBJS -o /tmp/gsignin.elf
 
@@ -877,7 +900,7 @@ $LD /tmp/crt0.o /tmp/cc.o \
     -o /tmp/cc.elf
 
 echo "[all] canary check (all must be 0):"
-for e in comp init filemanager calculator clock sysinfo settings sysmon uidemo dateapp applauncher taskman terminal editor snake paint synth tetris game2048 sheet notes calendar stopwatch mines piano dashboard welcome bench breakout pong invaders procmon soundtest solitaire aiconsole screenshot stress musicplayer ide bubbletd zombietd pacman clockapp forktest sigtest neguptr negrsp negsock negdir negcachain negshmdt pollselftest threadtest reaploop forkfdtest forkregtest matmuljobs aibroker sed awk tar pkg make meminfo argvtest msgtest rpctest toolrun echoproof echoargs agenthost tool_read tool_ls tool_stat codeagent toolset_host chainhost modelbridge agentd tool_write tool_cc tool_exec tool_mkdir tool_mv tool_rm tool_spawn tool_kill tool_ps tool_shell tool_mouse tool_key tool_rollback ledgerver cockpit claudehost initrdp initrdalias floattest sleeptest prioritytest matbench tensortest cpuburn blk ps kill free uptime find diff cmp tee wcx xargs gzip cc nettest sockettest cpu1offload smpstress wget netman soundman cryptotest wlanctl wpasupp libtest ping nc netinfo netscan tcping dig httpget pktmon httpd traceroute arp grep head tail sort uniq cut tr nl du touch basename dirname uname hostname whoami date less hexdump lspci tlsprobe certtool dhcpc autodhcp apidemo gsignin js futextest epolltest sendfiletest perftest batchtest domtest htmltest csstest layouttest webtest browser2 webapitest cube3d ray derby deadzone deadzoned dzproto_test dzclient streamtest chess asteroids sudoku photos startmenu controlcenter claudechat anthropic gametest exectest execchild; do
+for e in comp init filemanager calculator clock sysinfo settings sysmon uidemo dateapp applauncher taskman terminal editor snake paint synth tetris game2048 sheet notes calendar stopwatch mines piano dashboard welcome bench breakout pong invaders procmon soundtest solitaire aiconsole screenshot stress musicplayer ide bubbletd zombietd pacman clockapp forktest sigtest neguptr negrsp negsock negdir negcachain negshmdt pollselftest threadtest reaploop forkfdtest forkregtest matmuljobs aibroker sed awk tar pkg make meminfo argvtest msgtest rpctest toolrun echoproof echoargs agenthost tool_read tool_ls tool_stat codeagent toolset_host chainhost modelbridge agentd tool_write tool_cc tool_exec tool_mkdir tool_mv tool_rm tool_spawn tool_kill tool_ps tool_shell tool_mouse tool_key tool_rollback ledgerver cockpit claudehost initrdp initrdalias floattest sleeptest prioritytest matbench tensortest cpuburn blk ps kill free uptime find diff cmp tee wcx xargs gzip cc nettest sockettest cpu1offload smpstress wget netman soundman cryptotest wlanctl wpasupp libtest ping nc netinfo netscan tcping dig httpget pktmon httpd traceroute arp grep head tail sort uniq cut tr nl du touch basename dirname uname hostname whoami date less hexdump lspci tlsprobe certtool dhcpc autodhcp apidemo gsignin js futextest epolltest sendfiletest perftest batchtest domtest htmltest csstest layouttest webtest browser2 webapitest cube3d ray derby deadzone deadzoned dzproto_test dzclient streamtest chess asteroids sudoku photos startmenu controlcenter claudechat anthropic gametest exectest execchild fwtest fwctl tool_fw tool_fwstat dnstest livenet winrun; do
     n=$(objdump -d /tmp/$e.elf 2>/dev/null | grep -c "fs:0x28" || true)
     echo "  $e=$n"
 done
@@ -890,16 +913,23 @@ rm -rf /tmp/ird && mkdir -p /tmp/ird/sbin /tmp/ird/bin
 # (fresh checkout / cleaned tree) — otherwise the first `cp ... /tmp/ird/sbin/`
 # below fails with "No such file or directory" and the whole initrd is empty.
 ( cd /tmp/ird && tar xf /mnt/c/Users/wilde/Desktop/Kernel/iso/boot/initrd.img 2>/dev/null || true )
-# SELFHEAL gating: the seed above can carry an sbin/cwatchdog left by a PRIOR
-# SELFHEAL build. On a non-SELFHEAL build, drop it so the default initrd never
-# ships the watchdog (preserves the byte-for-byte-unchanged default image).
-if [ "${SELFHEAL:-0}" != "1" ]; then rm -f /tmp/ird/sbin/cwatchdog; fi
+# PID 1 now owns compositor supervision. Purge the former external watchdog from
+# seeded initrds so two independent recovery loops can never race each other.
+rm -f /tmp/ird/sbin/cwatchdog
+# Build-MODE artifacts must never leak from a previous build's initrd into this one (the seed above
+# carries them): /etc/agentd.conf would silently turn every later build's agentd into a
+# reconnect-forever tool host, and sbin/httpd would widen what the agent's spawn tool can start.
+# They are recreated below ONLY when AGENTD_SERVE=1 / E2E_HTTPD=1 asks for them.
+rm -f /tmp/ird/etc/agentd.conf
+[ "${DNS_TEST:-0}" = "1" ] || rm -f /tmp/ird/sbin/dnstest
+[ "${NET_LIVE:-0}" = "1" ] || rm -f /tmp/ird/sbin/livenet
+[ "${E2E_HTTPD:-0}" = "1" ] || rm -f /tmp/ird/sbin/httpd
 # BROWSER-CONSOLIDATE-0: the seed above can carry the REMOVED legacy text-only
 # 'browser'; purge it so only browser2 (the real DOM/CSS/JS/HTTPS browser) ships.
 rm -f /tmp/ird/sbin/browser /tmp/ird/bin/browser
 cp /tmp/comp.elf /tmp/ird/sbin/compositor
 cp /tmp/init.elf /tmp/ird/sbin/init
-for e in filemanager calculator clock sysinfo settings sysmon uidemo dateapp applauncher taskman terminal editor snake paint synth tetris game2048 sheet notes calendar stopwatch mines piano dashboard welcome bench breakout pong invaders procmon soundtest solitaire aiconsole screenshot stress musicplayer ide bubbletd startmenu controlcenter claudechat anthropic chess asteroids sudoku photos pacman clockapp zombietd forktest sigtest neguptr negrsp negsock negdir negcachain negshmdt pollselftest threadtest reaploop forkfdtest forkregtest matmuljobs cube3d ray derby deadzone deadzoned dzproto_test dzclient streamtest exectest; do
+for e in filemanager calculator clock sysinfo settings sysmon uidemo dateapp applauncher taskman terminal editor snake paint synth tetris game2048 sheet notes calendar stopwatch mines piano dashboard welcome bench breakout pong invaders procmon soundtest solitaire aiconsole screenshot stress musicplayer ide bubbletd startmenu controlcenter claudechat anthropic chess asteroids sudoku photos pacman clockapp zombietd forktest sigtest neguptr negrsp negsock negdir negcachain negshmdt pollselftest threadtest reaploop forkfdtest forkregtest matmuljobs cube3d ray derby deadzone deadzoned dzproto_test dzclient streamtest exectest fwtest; do
     cp /tmp/$e.elf /tmp/ird/sbin/$e
 done
 [ "$IV_OK" = "1" ] && cp /tmp/imageviewer.elf /tmp/ird/sbin/imageviewer
@@ -909,6 +939,16 @@ mkdir -p /tmp/ird/bin
 cp /tmp/aibroker.elf /tmp/ird/sbin/aibroker
 cp /tmp/sed.elf      /tmp/ird/bin/sed
 cp /tmp/awk.elf      /tmp/ird/bin/awk
+cp /tmp/fwctl.elf    /tmp/ird/bin/fwctl
+cp /tmp/winrun.elf   /tmp/ird/bin/winrun
+# WIN_TEST=1: ship the Windows fixtures (built with mingw-w64) -- never in a normal build.
+rm -rf /tmp/ird/usr/share/winfix
+if [ "${WIN_TEST:-0}" = "1" ]; then
+    mkdir -p /tmp/ird/usr/share/winfix
+    bash tests/win/build_fixtures.sh /tmp/ird/usr/share/winfix > /tmp/winfix_build.log 2>&1 \
+        && echo "WIN_TEST: fixtures staged -> /usr/share/winfix ($(ls /tmp/ird/usr/share/winfix | tr '\n' ' '))" \
+        || { echo "WIN_TEST: fixture build FAILED (see /tmp/winfix_build.log)"; }
+fi
 cp /tmp/tar.elf      /tmp/ird/bin/tar
 cp /tmp/pkg.elf      /tmp/ird/bin/pkg
 cp /tmp/make.elf     /tmp/ird/bin/make
@@ -965,6 +1005,14 @@ cp /tmp/tool_mv.elf    /tmp/ird/sbin/tool_mv
 cp /tmp/tool_rm.elf    /tmp/ird/sbin/tool_rm
 cp /tmp/tool_spawn.elf /tmp/ird/sbin/tool_spawn
 cp /tmp/tool_kill.elf  /tmp/ird/sbin/tool_kill
+cp /tmp/tool_fw.elf    /tmp/ird/sbin/tool_fw
+cp /tmp/tool_fwstat.elf /tmp/ird/sbin/tool_fwstat
+# E2E_HTTPD=1 (test builds only): make sbin/httpd spawnable through the agent's `spawn` tool, so
+# build_test/mcp_bridge_e2e.sh can prove a kernel firewall rule really gates a live guest service.
+# A normal build does NOT widen what the agent can start (tool_spawn only runs sbin/ apps).
+if [ "${DNS_TEST:-0}" = "1" ]; then cp /tmp/dnstest.elf /tmp/ird/sbin/dnstest; fi
+if [ "${NET_LIVE:-0}" = "1" ]; then cp /tmp/livenet.elf /tmp/ird/sbin/livenet; fi
+if [ "${E2E_HTTPD:-0}" = "1" ]; then cp /tmp/httpd.elf /tmp/ird/sbin/httpd; echo "*** E2E_HTTPD: sbin/httpd shipped for the MCP e2e test ***"; fi
 cp /tmp/tool_ps.elf    /tmp/ird/sbin/tool_ps
 cp /tmp/tool_shell.elf /tmp/ird/sbin/tool_shell
 cp /tmp/tool_mouse.elf /tmp/ird/sbin/tool_mouse
@@ -983,6 +1031,13 @@ mkdir -p /tmp/ird/etc && printf 'TOOLSET-0-FILE\n' > /tmp/ird/etc/toolset0.txt
 # AGENT-POLICY (C1): seed the canonical agent safety policy so aibroker loads it
 # instead of falling back to built-in defaults (the auditable source of truth).
 mkdir -p /tmp/ird/etc/ai && cp etc/ai/policy.json /tmp/ird/etc/ai/policy.json
+# AGENTD_SERVE=1: ship /etc/agentd.conf so sbin/agentd runs as a long-lived TOOL HOST that dials the
+# MCP bridge (scripts/chainlayer_mcp_bridge.py) and reconnects forever. AGENTD_BROKER overrides the
+# address (default 10.0.2.2:8433 = QEMU slirp host). /etc is path-protected: no agent can rewrite it.
+if [ "${AGENTD_SERVE:-0}" = "1" ]; then
+    printf 'serve=1\nbroker=%s\n' "${AGENTD_BROKER:-10.0.2.2:8433}" > /tmp/ird/etc/agentd.conf
+    echo "*** AGENTD_SERVE build: /etc/agentd.conf -> serve=1 broker=${AGENTD_BROKER:-10.0.2.2:8433} ***"
+fi
 # IWL-FW firmware: the real iwlwifi driver AUTO-SELECTS iwlwifi-<fam>-<api>.ucode
 # from the initrd /lib/firmware/ by the detected card family (iwl-ops.c
 # iwl_fw_candidates). The blobs are redistributable Intel vendor files the USER
@@ -990,16 +1045,11 @@ mkdir -p /tmp/ird/etc/ai && cp etc/ai/policy.json /tmp/ird/etc/ai/policy.json
 # drop the whole set of DVM blobs (iwlwifi-1000-5 / -5000-5 / -6000-4 /
 # -6000g2a-6 .ucode) and WiFi auto-picks the right one for whatever T410 card is
 # present -- no manual card identification. We stage ALL of them with their real
-# names; the alias is just a final fallback for a single-blob drop.
+# names. Never synthesize a generic alias: selecting the wrong family's blob is
+# unsafe, and the driver intentionally accepts only family-specific filenames.
 mkdir -p /tmp/ird/lib/firmware
 if ls firmware/iwlwifi*.ucode >/dev/null 2>&1; then
   cp firmware/iwlwifi*.ucode /tmp/ird/lib/firmware/ 2>/dev/null
-  # Back-compat: if the user dropped exactly one versioned blob and no alias,
-  # alias the first to the generic name (the driver tries it last anyway).
-  if [ ! -f /tmp/ird/lib/firmware/iwlwifi.ucode ]; then
-    FIRST_FW=$(ls firmware/iwlwifi*.ucode 2>/dev/null | head -1)
-    [ -n "$FIRST_FW" ] && cp "$FIRST_FW" /tmp/ird/lib/firmware/iwlwifi.ucode
-  fi
   echo "IWL-FW: staged firmware into initrd /lib/firmware/ -- driver auto-selects by family ($(ls -1 /tmp/ird/lib/firmware/ 2>/dev/null | tr '\n' ' '))"
 else
   echo "IWL-FW: no firmware/iwlwifi*.ucode provided (bundle the DVM blobs in firmware/ for real-radio auto-select; QEMU/sim unaffected)"
@@ -1050,8 +1100,6 @@ cp /tmp/renderworker.elf /tmp/ird/sbin/renderworker
 cp /tmp/cpu1offload.elf /tmp/ird/sbin/cpu1offload
 # smpstress -> /sbin (init spawns it; PASS on SMP after thousands of CPU1 jobs, SKIP on default).
 cp /tmp/smpstress.elf /tmp/ird/sbin/smpstress
-# cwatchdog only exists under SELFHEAL=1; if-guard keeps `set -e` happy on default.
-if [ "${SELFHEAL:-0}" = "1" ]; then cp /tmp/cwatchdog.elf /tmp/ird/sbin/cwatchdog; fi
 # overhaul-syscall verification probes -> /sbin (init spawns them at boot)
 for t in futextest epolltest sendfiletest perftest batchtest; do
     cp /tmp/$t.elf /tmp/ird/sbin/$t

@@ -70,7 +70,8 @@
 #define C_CLOSE        THEME_TEXT_DIM   /* tab close glyph (rest)                 */
 #define C_CLOSE_HOT    THEME_DANGER     /* tab close glyph (hover — destructive)  */
 #define C_BTN_HOVER    THEME_BG3        /* button hover fill circle               */
-#define C_SECURE       THEME_SUCCESS    /* green lock dot for https               */
+#define C_SECURE       THEME_SUCCESS    /* green dot: TLS + cert authenticated    */
+#define C_INSECURE     THEME_DANGER     /* red dot: TLS but cert NOT authenticated */
 
 /* Error-page palette (clean, airy design). */
 #define C_ERR_BG       0xFFF8F9FAu
@@ -342,7 +343,7 @@ static void ui_icon_dot(unsigned int *fb, int w, int h, int cx, int cy, int r,
  * ========================================================================= */
 void b2ui_draw_chrome(unsigned int *fb, int w, int h,
                       const char *url, int load_pct,
-                      int ntabs, int active_tab)
+                      int ntabs, int active_tab, int security)
 {
     if (!fb || w <= 0 || h <= 0) return;
 
@@ -373,12 +374,26 @@ void b2ui_draw_chrome(unsigned int *fb, int w, int h,
         /* Restore corner pixels knocked out by ui_round_fill over the border. */
         ui_fill_rect(fb, w, h, ADDR_X + 1, TOOL_Y, addr_w - 2, 1, C_ADDR_BORDER);
 
-        /* Security indicator: a small green dot for https, grey for http. */
-        int has_https = (url && url[0] == 'h' && url[1] == 't' && url[2] == 't'
-                         && url[3] == 'p' && url[4] == 's');
+        /* Security indicator dot.  `security` reports the AUTHENTICATION state
+         * of the loaded page, NOT merely its URL scheme -- an https:// page
+         * whose certificate did not validate is NOT green:
+         *   <0  : derive from URL scheme (legacy; used by self-tests)
+         *    0  : plain http -> grey (neutral)
+         *    1  : TLS + certificate authenticated -> green
+         *    2  : TLS but certificate NOT authenticated -> red (MITM-possible)
+         * Showing green for a bare "https" prefix would be a false padlock, so
+         * the string-derived path is only taken when the caller opts out (<0). */
+        int sec = security;
+        if (sec < 0) {
+            int has_https = (url && url[0] == 'h' && url[1] == 't' && url[2] == 't'
+                             && url[3] == 'p' && url[4] == 's');
+            sec = has_https ? 1 : 0;
+        }
+        unsigned int dot_col = (sec == 1) ? C_SECURE
+                             : (sec == 2) ? C_INSECURE
+                                          : C_ADDR_BORDER;
         int dot_x = ADDR_X + ADDR_TEXT_PAD + 4;
         int dot_y = TOOL_Y + TOOL_H / 2;
-        unsigned int dot_col = has_https ? C_SECURE : C_ADDR_BORDER;
         ui_icon_dot(fb, w, h, dot_x, dot_y, 3, dot_col);
 
         /* Text baseline centers a 16px glyph in the 24px bar. */
@@ -707,7 +722,7 @@ int b2ui_selftest(void)
 
     /* 2. Draw a representative chrome: a URL, 50% load, 3 tabs, tab #1 active. */
     b2ui_draw_chrome(g_st_fb, ST_W, ST_H,
-                     "http://example.com/some/long/path", 50, 3, 1);
+                     "http://example.com/some/long/path", 50, 3, 1, -1);
 
     /* 3a. Address-bar interior pixel must be the white fill (non-sentinel). */
     int ax = ADDR_X + 4;
@@ -787,14 +802,14 @@ int b2ui_selftest(void)
     }
 
     /* 11. Defensive: NULL fb / zero dims must not crash and must no-op. */
-    b2ui_draw_chrome(NULL, ST_W, ST_H, "x", 50, 1, 0);
-    b2ui_draw_chrome(g_st_fb, 0, 0, NULL, -1, 0, 0);
+    b2ui_draw_chrome(NULL, ST_W, ST_H, "x", 50, 1, 0, -1);
+    b2ui_draw_chrome(g_st_fb, 0, 0, NULL, -1, 0, 0, -1);
     b2ui_draw_error_page(NULL, 10, 10, NULL);
     b2ui_draw_link_hover(g_st_fb, ST_W, ST_H, -100, -100, 5, 5);
 
     /* 12. Progress line: at load_pct=0 no accent pixel at x=0. */
     memset(g_st_fb, 0, sizeof(g_st_fb));
-    b2ui_draw_chrome(g_st_fb, ST_W, ST_H, NULL, 0, 1, 0);
+    b2ui_draw_chrome(g_st_fb, ST_W, ST_H, NULL, 0, 1, 0, -1);
     /* load_pct=0 → pw=0 → no fill (progress bar shows nothing) */
     {
         unsigned int v0 = g_st_fb[(long)PROG_Y * ST_W + 0] & 0x00FFFFFFu;
@@ -804,7 +819,7 @@ int b2ui_selftest(void)
 
     /* 13. Progress at 100%: pixel at x=w-1 must be accent (or leading dot). */
     memset(g_st_fb, 0, sizeof(g_st_fb));
-    b2ui_draw_chrome(g_st_fb, ST_W, ST_H, NULL, 100, 1, 0);
+    b2ui_draw_chrome(g_st_fb, ST_W, ST_H, NULL, 100, 1, 0, -1);
     {
         unsigned int v1 = g_st_fb[(long)PROG_Y * ST_W + (ST_W / 2)] & 0x00FFFFFFu;
         if (v1 != (C_ACCENT & 0x00FFFFFFu) && v1 != (C_ACCENT_LITE & 0x00FFFFFFu))

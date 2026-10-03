@@ -46,6 +46,7 @@
 #define AGENT_PORT  8433          /* the Nemotron agent broker (free of 8431/8432/8434) */
 #define LINE_CAP    8192          /* a TOOL/RESULT line                              */
 #define MAX_STEPS   16            /* bounded ReAct loop                              */
+#define SERVE_MAX_STEPS 1000000   /* serve mode: a long-lived tool-host session (PING keeps it alive) */
 #define NET_WAIT_MAX 3000000
 
 /* ---- AGENTCOCKPIT-0: optional cockpit GUI seam (status + control over a SHM page) ----
@@ -179,7 +180,7 @@ static int is_confirm_tool(const char* t){
      * require_approval set in /etc/ai/policy.json). rollback + move WRITE files, so
      * they belong here too. Policy can ADD confirm tools (union), never remove. */
     return streq(t,"remove")||streq(t,"spawn")||streq(t,"kill")||streq(t,"mouse")
-         ||streq(t,"key")||streq(t,"rollback")||streq(t,"move")
+         ||streq(t,"key")||streq(t,"rollback")||streq(t,"move")||streq(t,"firewall")
          ||policy_confirm_has(t); }
 /* pre-mutation snapshot -> /var/snapshots/<enc(path)>.<seq> (ramfs => in-session rollback).
  * Keyed on the FULL path (not basename) so /tmp/a/x and /home/x never collide. Encoding
@@ -319,6 +320,11 @@ static const char* resolve_tool(const char* name){
      * that looks like a path -- until then it stays off. */
     /* Phase 4 synthetic input -- GUI takeover (CONFIRM-class in /etc/ai/policy.json).
      * Effects are inert unless the compositor has authorised injection (active=1). */
+    /* TOOLSET-FW-0: the kernel packet filter. fw_status = read-only tool (AUTO); firewall =
+     * mutating tool (CONFIRM -- see is_confirm_tool). Two programs, so the privilege boundary
+     * is fixed at build time and a model can never talk the read-only one into a write. */
+    if(streq(name,"fw_status")) return "sbin/tool_fwstat";
+    if(streq(name,"firewall"))  return "sbin/tool_fw";
     if(streq(name,"mouse"))     return "sbin/tool_mouse";
     if(streq(name,"key"))       return "sbin/tool_key";
     return 0;                                  /* unknown/unsupported -> rejected */
@@ -410,6 +416,47 @@ static int dispatch(int ctrl, unsigned long rid, const char* prog,
     return 1;
 }
 
+/* ---- AGENTD-SERVE-0: optional /etc/agentd.conf -------------------------------------------
+ * /etc is path-protected (protected_prefixes), so no agent tool can ever rewrite this file or
+ * redirect its own broker. Absent or garbled -> the historical one-shot behaviour, unchanged.
+ *   broker=A.B.C.D:PORT   where the host broker / MCP bridge listens (default 10.0.2.2:8433,
+ *                         the QEMU slirp host)
+ *   serve=1               long-lived tool-host mode: keep reconnecting; a session survives the
+ *                         bridge's PING keepalives and is not capped at MAX_STEPS tool calls */
+static unsigned g_broker_ip = MODEL_IP; static long g_broker_port = AGENT_PORT;
+static int g_serve = 0, g_told_no_broker = 0;
+/* "A.B.C.D:PORT" -> 1 on success. Strict: four octets 0-255, port 1-65535, nothing else. */
+static int parse_broker(const char* s, unsigned* ip, long* port){
+    unsigned v=0, o[4]={0,0,0,0}; int digits=0, k=0;
+    for(;; s++){
+        char c=*s;
+        if(c>='0'&&c<='9'){ v=v*10+(unsigned)(c-'0'); digits++; if(v>65535u) return 0; }
+        else if(c=='.' && digits && k<3){ if(v>255u) return 0; o[k++]=v; v=0; digits=0; }
+        else if(c==':' && digits && k==3){
+            if(v>255u) return 0; o[3]=v; s++;
+            long p=0; int pd=0;
+            while(*s>='0'&&*s<='9'){ p=p*10+(*s-'0'); pd++; s++; if(p>65535) return 0; }
+            if(!pd || p<1) return 0;
+            *ip=(o[0]<<24)|(o[1]<<16)|(o[2]<<8)|o[3]; *port=p; return 1;
+        } else return 0;
+    }
+}
+static void conf_load(void){
+    static char cb[512];
+    long fd=_ch_sc(SYS_OPEN_N,(long)"/etc/agentd.conf",0,0,0,0,0);
+    if(fd<0) return;
+    long n=_ch_sc(SYS_READ_N,fd,(long)cb,sizeof(cb)-1,0,0,0);
+    _ch_sc(SYS_CLOSE_N,fd,0,0,0,0,0);
+    if(n<=0) return;
+    cb[n]=0;
+    for(long i=0;i<n;){
+        if(eqn(cb+i,"serve=1",7)) g_serve=1;
+        else if(eqn(cb+i,"broker=",7)){ unsigned ip; long port; if(parse_broker(cb+i+7,&ip,&port)){ g_broker_ip=ip; g_broker_port=port; } }
+        while(i<n && cb[i]!='\n') i++;
+        i++;
+    }
+}
+
 static int host_mode(const char* goal){
     cp_attach();                 /* AGENTCOCKPIT-0: attach lookup-only; g_cp NULL if no cockpit */
     policy_load();               /* POLICY-LOAD: tighten-only confirm/deny overlay; empty == floor */
@@ -417,12 +464,14 @@ static int host_mode(const char* goal){
      * passed via argv[1] arrives TRUNCATED to its first word. The cockpit writes the full
      * goal into g_cp->goal, so read it from there when present. */
     const char* egoal = (g_cp && g_cp->goal[0]) ? (const char*)g_cp->goal : goal;
-    if(!net_ready()){ outfd(1,"AGENTD: SKIP no_net\n"); return 0; }
+    if(!net_ready()){ if(!g_serve||!g_told_no_broker){ outfd(1,"AGENTD: SKIP no_net\n"); g_told_no_broker=1; } return 0; }
     long fd=_ch_sc(SYS_SOCKET,SOCK_STREAM,0,0,0,0,0);
     if(fd<0){ outfd(1,"AGENTD: SKIP no_socket\n"); return 0; }
-    long cr=_ch_sc(SYS_CONNECT,fd,(long)MODEL_IP,AGENT_PORT,0,0,0);
+    long cr=_ch_sc(SYS_CONNECT,fd,(long)g_broker_ip,g_broker_port,0,0,0);
     if(cr<0){ _ch_sc(SYS_CLOSE_SK,fd,0,0,0,0,0);
-        outfd(1,"AGENTD: SKIP no_broker (run scripts/nemotron_mock.py or nemotron_broker.js)\n"); return 0; }
+        if(!g_serve||!g_told_no_broker){ outfd(1,"AGENTD: SKIP no_broker (run scripts/nemotron_mock.py or nemotron_broker.js)\n"); g_told_no_broker=1; }
+        return 0; }
+    g_told_no_broker=0;      /* a session is up: report the next outage again */
 
     /* spawn the gated tool runner (self) over a control channel */
     unsigned my_pid=(unsigned)getpid();
@@ -443,11 +492,13 @@ static int host_mode(const char* goal){
     static char line[LINE_CAP];
     static char args[LINE_CAP];
     unsigned long rid=1; int steps=0, done=0;
-    for(int step=0; step<MAX_STEPS; step++){
+    int max_steps = g_serve ? SERVE_MAX_STEPS : MAX_STEPS;
+    for(int step=0; step<max_steps; step++){
         if(g_cp && g_cp->stop){ g_cp->state=AC_STATE_STOPPED; agent_ledger("-","-","STOP"); outfd(1,"AGENTD: STOP (operator)\n"); break; }
         int ll=recv_line(fd,line,sizeof(line));
         if(ll<0){ outfd(1,"AGENTD: broker closed\n"); break; }
         if(eqn(line,"DONE",4)){ outfd(1,"AGENTD: DONE "); outfd(1,line+ (line[4]==' '?5:4)); outfd(1,"\n"); done=1; break; }
+        if(eqn(line,"PING",4)){ step--; continue; }      /* keepalive from the bridge: never consumes a step */
         if(!eqn(line,"TOOL ",5)){ outfd(1,"AGENTD: (ignoring non-TOOL line)\n"); continue; }
 
         char tool[TOOL_NAME_MAX];
@@ -519,7 +570,15 @@ static int host_mode(const char* goal){
 
 int main(int argc, char** argv){
     if(argc>=2 && argv[1] && argv[1][0]=='r' && argv[1][1]==':') return runner_mode(parse_pid(argv[1]));
+    conf_load();
     const char* goal = (argc>=2 && argv[1] && argv[1][0]) ? argv[1]
                        : "List /etc, then read and report the contents of /etc/toolset0.txt.";
-    return host_mode(goal);
+    if(!g_serve) return host_mode(goal);
+    /* AGENTD-SERVE-0: long-lived tool host. Reconnect forever (bounded 3 s wait between tries,
+     * ticks-based and yielding so the desktop is never starved). */
+    for(;;){
+        host_mode(goal);
+        long t0=_ch_sc(SYS_GET_TICKS_MS,0,0,0,0,0,0);
+        for(long it=0; it<4000000; it++){ if(_ch_sc(SYS_GET_TICKS_MS,0,0,0,0,0,0)-t0>=3000) break; yield(); }
+    }
 }

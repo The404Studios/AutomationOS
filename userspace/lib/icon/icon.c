@@ -244,69 +244,28 @@ static void ic_draw_tile_bg(uint32_t *px, int stride,
     uint32_t top    = ic_lighten(bg, 30);  /* +12 % towards white */
     uint32_t bottom = ic_darken (bg, 30);  /* +12 % towards black */
 
+    int r = corner_r;
     for (int row = 0; row < size; row++) {
         int t = row * 256 / (size > 1 ? size - 1 : 1);
         uint32_t row_col = ic_lerp_col(top, bottom, t);
-        /* Paint the full-width row, then mask corners below */
-        ic_fill_rect(px, stride, x, y, size, size,
-                     x, y + row, size, 1, row_col);
-    }
-
-    /* Punch out corners by painting with transparent black (erase approach:
-     * use the caller's existing background).  Since we don't know the
-     * caller's bg, we overdraw the corners with a "round corner mask":
-     * For each corner quadrant, pixels OUTSIDE the circle radius get alpha=0
-     * (transparent) via ic_fill_qcircle.  Instead, we fill only the inside
-     * of each corner circle with the gradient colour, which achieves the
-     * rounded look without needing an erase operation.
-     *
-     * The simplest correct approach: re-draw the full rectangle then composite
-     * the four corner quarter-discs in the GRADIENT colour (already done above
-     * because ic_fill_rrect paints the gradient as solid colours).
-     *
-     * Here we use a per-pixel approach for the corner regions only. */
-
-    /* Corner mask: for pixels in each corner box, check distance from the
-     * corner circle centre; if outside, set pixel to 0x00000000 (transparent). */
-    int r = corner_r;
-    /* Top-left corner box */
-    for (int dy = 0; dy < r; dy++) {
-        for (int dx = 0; dx < r; dx++) {
-            int dist2 = (r-1-dx)*(r-1-dx) + (r-1-dy)*(r-1-dy);
-            if (dist2 > r*r) {
-                uint32_t *p = px + (y + dy) * stride + (x + dx);
-                *p = 0x00000000;
+        for (int col = 0; col < size; col++) {
+            int inside = 1;
+            if (col < r && row < r) {
+                int dx = r - 1 - col, dy = r - 1 - row;
+                inside = dx*dx + dy*dy <= r*r;
+            } else if (col >= size - r && row < r) {
+                int dx = col - (size - r), dy = r - 1 - row;
+                inside = dx*dx + dy*dy <= r*r;
+            } else if (col >= size - r && row >= size - r) {
+                int dx = col - (size - r), dy = row - (size - r);
+                inside = dx*dx + dy*dy <= r*r;
+            } else if (col < r && row >= size - r) {
+                int dx = r - 1 - col, dy = row - (size - r);
+                inside = dx*dx + dy*dy <= r*r;
             }
-        }
-    }
-    /* Top-right corner box */
-    for (int dy = 0; dy < r; dy++) {
-        for (int dx = 0; dx < r; dx++) {
-            int dist2 = dx*dx + (r-1-dy)*(r-1-dy);
-            if (dist2 > r*r) {
-                uint32_t *p = px + (y + dy) * stride + (x + size - r + dx);
-                *p = 0x00000000;
-            }
-        }
-    }
-    /* Bottom-right corner box */
-    for (int dy = 0; dy < r; dy++) {
-        for (int dx = 0; dx < r; dx++) {
-            int dist2 = dx*dx + dy*dy;
-            if (dist2 > r*r) {
-                uint32_t *p = px + (y + size - r + dy) * stride + (x + size - r + dx);
-                *p = 0x00000000;
-            }
-        }
-    }
-    /* Bottom-left corner box */
-    for (int dy = 0; dy < r; dy++) {
-        for (int dx = 0; dx < r; dx++) {
-            int dist2 = (r-1-dx)*(r-1-dx) + dy*dy;
-            if (dist2 > r*r) {
-                uint32_t *p = px + (y + size - r + dy) * stride + (x + dx);
-                *p = 0x00000000;
-            }
+            /* Direct-to-scene callers already contain wallpaper/window pixels.
+             * Leave exterior corner pixels untouched instead of erasing them. */
+            if (inside) px[(y + row) * stride + x + col] = row_col;
         }
     }
 }
@@ -1373,12 +1332,10 @@ static const uint32_t *icon_asset_for(const char *name)
     return 0;
 }
 
-void icon_for_app(uint32_t *px, int stride, int x, int y, int size,
-                  const char *app_name)
+void icon_for_app_accent(uint32_t *px, int stride, int x, int y, int size,
+                         const char *app_name, uint32_t accent)
 {
     if (!px || !app_name || size <= 0) return;
-
-    uint32_t accent = icon_accent_for_name(app_name);
 
     /* Prefer a real Google Material icon when we have one for this app. */
     {
@@ -1534,4 +1491,11 @@ void icon_for_app(uint32_t *px, int stride, int x, int y, int size,
     ic_initials(app_name, init);
     uint32_t fg = IC_ARGB(0xFF, 0xFF, 0xFF, 0xFF); /* white text */
     icon_rounded_tile(px, stride, x, y, size, accent, fg, init);
+}
+
+void icon_for_app(uint32_t *px, int stride, int x, int y, int size,
+                  const char *app_name)
+{
+    icon_for_app_accent(px, stride, x, y, size, app_name,
+                        icon_accent_for_name(app_name));
 }

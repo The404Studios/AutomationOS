@@ -649,7 +649,7 @@ static Arena *arena_new(size_t need)
     if (total < HEAP_MIN_ARENA)
         total = HEAP_MIN_ARENA;
     /* round up to page (4 KB) */
-    total = (total + 4095u) & ~4095u;
+    total = (total + 4095u) & ~(size_t)4095u;   /* full-width mask: ~4095u zero-extends and clears the high 32 bits */
 
     /* prot = PROT_READ|PROT_WRITE = 3; flags = MAP_PRIVATE|MAP_ANON = 0x22 */
     void *ptr = (void *)sc(SYS_MMAP, 0, (long)total, 3, 0x22, 0, 0);
@@ -677,6 +677,11 @@ static Arena *arena_new(size_t need)
 void *malloc(size_t size)
 {
     if (size == 0) return NULL;
+    /* align_up is (size+15)&~15, which WRAPS to 0 for size > SIZE_MAX-15 --
+     * that would hand back a non-NULL 0-byte block for a gigantic request and
+     * the caller (or calloc's memset) overruns it. Reject before rounding up.
+     * (This also makes calloc safe: calloc -> malloc(total) returns NULL.) */
+    if (size > ((size_t)-1 - 15UL)) return NULL;
     size = align_up(size);
 
     /* Walk existing arenas first-fit */
@@ -772,6 +777,7 @@ void *realloc(void *ptr, size_t size)
     Block *b = payload_blk(ptr);
     if (b->magic != HEAP_MAGIC) return NULL;
 
+    if (size > ((size_t)-1 - 15UL)) return NULL;   /* align_up wrap (see malloc) */
     size_t asize = align_up(size);
     if (b->size >= asize)
         return ptr; /* already fits — no move needed */

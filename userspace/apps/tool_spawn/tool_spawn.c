@@ -92,6 +92,10 @@ static int spawn_allowed(const char*app){
  *  return value is fed to SYS_EXIT. We validate argv before any deref.
  * ======================================================================= */
 int main(int argc,char** argv){
+  /* PCAP-0: everything this tool launches inherits a process with NO kernel privileges
+   * (raw frames, network/firewall admin, ...). The KERNEL enforces it, so it holds no matter
+   * what the launched program tries. SYS_CAP_DROP(137, PCAP_ALL=0xF) is monotonic. */
+  sc(137, 0xF, 0, 0);
   /* Validate argv before touching it (never deref a missing/empty arg). */
   if(argc<2 || !argv[1] || !argv[1][0]){
     out(FD_OUT,"DENY spawn \n");

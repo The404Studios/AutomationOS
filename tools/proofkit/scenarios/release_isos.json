@@ -1,0 +1,37 @@
+{
+  "name": "release_isos",
+  "description": "Boot each shipped T410 release ISO (single/multicore x PCH_NIC off/on) in QEMU: live desktop, no fault, right CPU count, no test-only services",
+  "build": [],
+  "vms": [
+    {"label": "single", "iso": "build/release/automationos-v0.2.0-t410-single.iso", "mem": 1024, "smp": 1, "cpu": "Westmere", "netdev": "user,id=n0", "pcap": false, "timeout": 120, "settle": 20, "screenshots": ["final"]},
+    {"label": "multicore", "iso": "build/release/automationos-v0.2.0-t410-multicore.iso", "mem": 1024, "smp": 2, "cpu": "Westmere", "netdev": "user,id=n0", "pcap": false, "timeout": 120, "settle": 20, "screenshots": ["final"]},
+    {"label": "single_eth", "iso": "build/release/automationos-v0.2.0-t410-single-eth.iso", "mem": 1024, "smp": 1, "cpu": "Westmere", "netdev": "user,id=n0", "pcap": false, "timeout": 120, "settle": 20, "screenshots": ["final"]},
+    {"label": "multicore_eth", "iso": "build/release/automationos-v0.2.0-t410-multicore-eth.iso", "mem": 1024, "smp": 2, "cpu": "Westmere", "netdev": "user,id=n0", "pcap": false, "timeout": 120, "settle": 20, "screenshots": ["final"]}
+  ],
+  "assertions": [
+    {"id": "single.boot", "stage": "single (1 CPU)", "vm": "single", "type": "serial_contains", "pattern": "event=healthy|\\[COMP\\] fps window: frames=\\d+", "regex": true, "why": "the shipped image boots to a live desktop (compositor healthy or producing frames)"},
+    {"id": "single.no_fault", "stage": "single (1 CPU)", "vm": "single", "type": "no_kernel_fault", "depends_on": ["single.boot"], "why": "no kernel fault"},
+    {"id": "single.ui", "stage": "single (1 CPU)", "vm": "single", "type": "screenshot", "name": "final", "not_blank": true, "min_colors": 64, "depends_on": ["single.boot"], "why": "the desktop actually painted"},
+    {"id": "single.no_testsvc", "stage": "single (1 CPU)", "vm": "single", "type": "serial_absent", "depends_on": ["single.boot"], "pattern": "LIVENET:", "why": "the shipped image does NOT carry the test-only livenet (it contacts a dozen real websites at every boot)"},
+    {"id": "single.single_cpu", "stage": "single (1 CPU)", "vm": "single", "type": "serial_absent", "depends_on": ["single.boot"], "pattern": "Brick F2 VERIFY", "why": "the single-core image does not start the second CPU"},
+    {"id": "multicore.boot", "stage": "multicore (2 CPUs)", "vm": "multicore", "type": "serial_contains", "pattern": "event=healthy|\\[COMP\\] fps window: frames=\\d+", "regex": true, "why": "the shipped image boots to a live desktop (compositor healthy or producing frames)"},
+    {"id": "multicore.no_fault", "stage": "multicore (2 CPUs)", "vm": "multicore", "type": "no_kernel_fault", "depends_on": ["multicore.boot"], "why": "no kernel fault"},
+    {"id": "multicore.ui", "stage": "multicore (2 CPUs)", "vm": "multicore", "type": "screenshot", "name": "final", "not_blank": true, "min_colors": 64, "depends_on": ["multicore.boot"], "why": "the desktop actually painted"},
+    {"id": "multicore.no_testsvc", "stage": "multicore (2 CPUs)", "vm": "multicore", "type": "serial_absent", "depends_on": ["multicore.boot"], "pattern": "LIVENET:", "why": "the shipped image does NOT carry the test-only livenet (it contacts a dozen real websites at every boot)"},
+    {"id": "multicore.cpu1", "stage": "multicore (2 CPUs)", "vm": "multicore", "type": "serial_contains", "pattern": "\\[SMP\\] Brick F2 VERIFY: AP kthread counter 0 -> [1-9]", "regex": true, "why": "the second CPU came up and executed a scheduled thread"},
+    {"id": "multicore.no_storm", "stage": "multicore (2 CPUs)", "vm": "multicore", "type": "serial_absent", "depends_on": ["multicore.boot"], "pattern": "H1: bklstorm", "why": "the shipping multi-core kernel (SMP_PRODUCT) does not launch the proof storms"},
+    {"id": "multicore.no_invariant", "stage": "multicore (2 CPUs)", "vm": "multicore", "type": "serial_absent", "depends_on": ["multicore.boot"], "pattern": "SCHED_INVARIANT|TLB_INVARIANT\\] VIOLATION", "regex": true, "why": "no scheduler / TLB invariant violation"},
+    {"id": "single_eth.boot", "stage": "single-eth (1 CPU, PCH_NIC opt-in compiled)", "vm": "single_eth", "type": "serial_contains", "pattern": "event=healthy|\\[COMP\\] fps window: frames=\\d+", "regex": true, "why": "the shipped image boots to a live desktop (compositor healthy or producing frames)"},
+    {"id": "single_eth.no_fault", "stage": "single-eth (1 CPU, PCH_NIC opt-in compiled)", "vm": "single_eth", "type": "no_kernel_fault", "depends_on": ["single_eth.boot"], "why": "no kernel fault"},
+    {"id": "single_eth.ui", "stage": "single-eth (1 CPU, PCH_NIC opt-in compiled)", "vm": "single_eth", "type": "screenshot", "name": "final", "not_blank": true, "min_colors": 64, "depends_on": ["single_eth.boot"], "why": "the desktop actually painted"},
+    {"id": "single_eth.no_testsvc", "stage": "single-eth (1 CPU, PCH_NIC opt-in compiled)", "vm": "single_eth", "type": "serial_absent", "depends_on": ["single_eth.boot"], "pattern": "LIVENET:", "why": "the shipped image does NOT carry the test-only livenet (it contacts a dozen real websites at every boot)"},
+    {"id": "single_eth.single_cpu", "stage": "single-eth (1 CPU, PCH_NIC opt-in compiled)", "vm": "single_eth", "type": "serial_absent", "depends_on": ["single_eth.boot"], "pattern": "Brick F2 VERIFY", "why": "the single-core image does not start the second CPU"},
+    {"id": "multicore_eth.boot", "stage": "multicore-eth (2 CPUs, PCH_NIC opt-in compiled)", "vm": "multicore_eth", "type": "serial_contains", "pattern": "event=healthy|\\[COMP\\] fps window: frames=\\d+", "regex": true, "why": "the shipped image boots to a live desktop (compositor healthy or producing frames)"},
+    {"id": "multicore_eth.no_fault", "stage": "multicore-eth (2 CPUs, PCH_NIC opt-in compiled)", "vm": "multicore_eth", "type": "no_kernel_fault", "depends_on": ["multicore_eth.boot"], "why": "no kernel fault"},
+    {"id": "multicore_eth.ui", "stage": "multicore-eth (2 CPUs, PCH_NIC opt-in compiled)", "vm": "multicore_eth", "type": "screenshot", "name": "final", "not_blank": true, "min_colors": 64, "depends_on": ["multicore_eth.boot"], "why": "the desktop actually painted"},
+    {"id": "multicore_eth.no_testsvc", "stage": "multicore-eth (2 CPUs, PCH_NIC opt-in compiled)", "vm": "multicore_eth", "type": "serial_absent", "depends_on": ["multicore_eth.boot"], "pattern": "LIVENET:", "why": "the shipped image does NOT carry the test-only livenet (it contacts a dozen real websites at every boot)"},
+    {"id": "multicore_eth.cpu1", "stage": "multicore-eth (2 CPUs, PCH_NIC opt-in compiled)", "vm": "multicore_eth", "type": "serial_contains", "pattern": "\\[SMP\\] Brick F2 VERIFY: AP kthread counter 0 -> [1-9]", "regex": true, "why": "the second CPU came up and executed a scheduled thread"},
+    {"id": "multicore_eth.no_storm", "stage": "multicore-eth (2 CPUs, PCH_NIC opt-in compiled)", "vm": "multicore_eth", "type": "serial_absent", "depends_on": ["multicore_eth.boot"], "pattern": "H1: bklstorm", "why": "the shipping multi-core kernel (SMP_PRODUCT) does not launch the proof storms"},
+    {"id": "multicore_eth.no_invariant", "stage": "multicore-eth (2 CPUs, PCH_NIC opt-in compiled)", "vm": "multicore_eth", "type": "serial_absent", "depends_on": ["multicore_eth.boot"], "pattern": "SCHED_INVARIANT|TLB_INVARIANT\\] VIOLATION", "regex": true, "why": "no scheduler / TLB invariant violation"}
+  ]
+}

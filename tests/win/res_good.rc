@@ -1,0 +1,68 @@
+/* res_good.rc -- resources for the pe_resources / pe_manifest host tests (tests/win/run_res_tests.sh).
+ *
+ * Compiled with x86_64-w64-mingw32-windres into res_hello.exe.  Numeric type/ids are used instead of the
+ * winuser.h names so no Windows headers are required.
+ *
+ *   RT_MANIFEST (24) id 1            tests/win/res_good.manifest
+ *   RT_VERSION  (16) id 1            FileVersion 1.2.3.4, ProductVersion 5.6.7.8, en-US + de-DE string tables
+ *   RT_RCDATA   (10) id 200          4 languages: neutral, en-US, de-DE, fr-FR   (multi-language resource)
+ *   RT_RCDATA   (10) name GREETING   string-named resource
+ *   type "MYTYPE" id 1 / name FOO    string-named TYPE (custom resource type)
+ *   RT_STRING   (6)  ids 1 and 2     a STRINGTABLE
+ *   RT_RCDATA   (10) id 300          a resource whose only language is de-DE (language fallback test)
+ */
+
+LANGUAGE 0x00, 0x00
+1 24 "res_good.manifest"
+200 RCDATA { "lang-neutral\0" }
+
+LANGUAGE 0x09, 0x01
+1 VERSIONINFO
+ FILEVERSION 1,2,3,4
+ PRODUCTVERSION 5,6,7,8
+ FILEFLAGSMASK 0x3fL
+ FILEFLAGS 0x0L
+ FILEOS 0x40004L
+ FILETYPE 0x1L
+ FILESUBTYPE 0x0L
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904B0"
+        BEGIN
+            VALUE "CompanyName", "Example Corp"
+            VALUE "FileDescription", "Resource Test App"
+            VALUE "FileVersion", "1.2.3.4"
+            VALUE "InternalName", "res_hello"
+            VALUE "OriginalFilename", "res_hello.exe"
+            VALUE "ProductName", "Res Test Product"
+            VALUE "ProductVersion", "5.6.7.8"
+        END
+        BLOCK "040704B0"
+        BEGIN
+            VALUE "FileDescription", "Ressourcen-Testprogramm"
+            VALUE "ProductName", "Res Testprodukt"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x409, 1200, 0x407, 1200
+    END
+END
+200 RCDATA { "lang-en-US\0" }
+GREETING RCDATA { "hello-named\0" }
+1 MYTYPE { "custom-type-1\0" }
+FOO MYTYPE { "custom-type-foo\0" }
+STRINGTABLE
+BEGIN
+    1, "string one"
+    2, "string two"
+    17, "string seventeen"
+END
+
+LANGUAGE 0x07, 0x01
+200 RCDATA { "lang-de-DE\0" }
+300 RCDATA { "only-de-DE\0" }
+
+LANGUAGE 0x0C, 0x01
+200 RCDATA { "lang-fr-FR\0" }

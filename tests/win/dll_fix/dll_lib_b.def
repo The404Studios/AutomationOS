@@ -1,0 +1,4 @@
+LIBRARY dll_lib_b.dll
+EXPORTS
+  sub
+  b_id

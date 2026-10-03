@@ -1,0 +1,9 @@
+LIBRARY dll_lib_a.dll
+EXPORTS
+  add
+  mul
+  ordfn @7 NONAME
+  a_sub_twice
+  get_via_ptr
+  fwd_add = dll_lib_b.sub
+  fwd_k32 = KERNEL32.SetLastError

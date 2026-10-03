@@ -1,0 +1,3 @@
+LIBRARY dll_bad.dll
+EXPORTS
+  bad_fn

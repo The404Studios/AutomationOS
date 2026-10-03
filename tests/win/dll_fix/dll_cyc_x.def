@@ -1,0 +1,4 @@
+LIBRARY dll_cyc_x.dll
+EXPORTS
+  x_val
+  x_calls_y

@@ -1,0 +1,66 @@
+{
+  "name": "wincompat",
+  "description": "WIN-MIN: a real Windows x64 console program (built with MinGW) runs on the OS through winrun -- parse, map+relocate, resolve imports, run, exit code -- and corrupt executables are refused",
+  "build": [
+    {"name": "kernel", "cmd": "bash scripts/quick_build.sh", "skip_if_env": "NOBUILD", "why": "the default kernel must link"},
+    {"name": "userspace", "cmd": "WIN_TEST=1 bash scripts/build_all.sh", "skip_if_env": "NOBUILD",
+     "why": "ships bin/winrun plus the Windows fixtures (needs mingw-w64 on the build host)"}
+  ],
+  "vms": [
+    {"label": "main", "iso": "build/automationos.iso", "mem": 512, "smp": 1, "netdev": "user,id=n0", "pcap": false,
+     "timeout": 150, "until": "WINTEST: done", "settle": 4, "screenshots": ["final"]}
+  ],
+  "assertions": [
+    {"id": "lib.pe_tests", "stage": "0 library", "type": "cmd", "timeout": 600,
+     "cmd": "bash tests/win/run_pe_tests.sh 2>&1 | tail -6", "stdout_matches": "PE-FUZZ: PASS",
+     "why": "the parser is fed attacker-controlled files: ASAN/UBSAN unit tests + a 300k-iteration mutation fuzzer must pass on the host"},
+
+    {"id": "boot.alive", "stage": "1 boot", "type": "serial_contains", "pattern": "All services started", "why": "the OS came up"},
+    {"id": "boot.fixtures_staged", "stage": "1 boot", "type": "serial_contains", "depends_on": ["boot.alive"],
+     "pattern": "usr/share/winfix/nocrt_hello.exe", "why": "the fixtures made it into the initrd (mingw-w64 present on the build host)"},
+    {"id": "boot.test_finished", "stage": "1 boot", "type": "serial_contains", "depends_on": ["boot.alive"],
+     "pattern": "WINTEST: done", "why": "init ran every fixture to completion"},
+    {"id": "boot.no_fault", "stage": "1 boot", "type": "no_kernel_fault", "depends_on": ["boot.alive"], "why": "no kernel fault while running foreign code"},
+
+    {"id": "L0.parse", "stage": "2 tier-1: no-CRT program", "type": "serial_contains", "depends_on": ["boot.test_finished"],
+     "pattern": "WINRUN: L0 parse OK file=/usr/share/winfix/nocrt_hello.exe .*machine=x86_64 subsystem=console image_base=0x140000000", "regex": true,
+     "why": "the PE32+ header is validated and understood"},
+    {"id": "L1.map_relocate", "stage": "2 tier-1: no-CRT program", "type": "serial_contains", "depends_on": ["L0.parse"],
+     "pattern": "WINRUN: L1 mapped at 0x[0-9a-f]+ preferred=0x140000000 delta=nonzero relocs=applied", "regex": true,
+     "why": "the image was placed away from its preferred base and its relocations applied"},
+    {"id": "L2.imports", "stage": "2 tier-1: no-CRT program", "type": "serial_contains", "depends_on": ["L1.map_relocate"],
+     "pattern": "WINRUN: L2 imports total=3 unresolved=0", "why": "all three kernel32 imports (GetStdHandle, WriteFile, ExitProcess) resolved to working functions"},
+    {"id": "L3.entry", "stage": "2 tier-1: no-CRT program", "type": "serial_contains", "depends_on": ["L2.imports"],
+     "pattern": "WINRUN: L3 entry 0x[0-9a-f]+ -> calling", "regex": true, "why": "control was transferred through the Windows x64 ABI"},
+    {"id": "L3.output", "stage": "2 tier-1: no-CRT program", "type": "serial_contains", "depends_on": ["L3.entry"],
+     "pattern": "WINFIX: nocrt hello", "why": "the program's own text reached the console: proves WriteFile works AND that the pointer in .data (which needed a relocation) was fixed up correctly"},
+    {"id": "L3.exit_code", "stage": "2 tier-1: no-CRT program", "type": "serial_contains", "depends_on": ["L3.output"],
+     "pattern": "WINRUN: exit code=42", "why": "ExitProcess(42) ended the process with exactly that code"},
+    {"id": "L3.order", "stage": "2 tier-1: no-CRT program", "type": "serial_order", "depends_on": ["L3.exit_code"],
+     "patterns": ["WINRUN: L0 parse OK file=/usr/share/winfix/nocrt_hello.exe", "WINRUN: L1 mapped", "WINRUN: L2 imports total=3",
+                  "WINRUN: L3 entry", "WINFIX: nocrt hello", "WINRUN: exit code=42"],
+     "why": "the stages happened in the right order -- not just that each marker exists somewhere"},
+
+    {"id": "neg.truncated", "stage": "3 hostile input", "type": "serial_contains", "depends_on": ["boot.test_finished"],
+     "pattern": "WINRUN: REJECT .*file=/usr/share/winfix/bad_trunc.exe", "regex": true, "why": "a valid header cut short is refused (and the line names THAT file, so a read failure on a good file cannot satisfy this)"},
+    {"id": "neg.not_pe", "stage": "3 hostile input", "type": "serial_contains", "depends_on": ["boot.test_finished"],
+     "pattern": "WINRUN: REJECT .*file=/usr/share/winfix/bad_magic.exe", "regex": true, "why": "512 bytes that are not a PE are refused"},
+    {"id": "neg.wrong_arch", "stage": "3 hostile input", "type": "serial_contains", "depends_on": ["boot.test_finished"],
+     "pattern": "WINRUN: REJECT .*file=/usr/share/winfix/bad_machine.exe", "regex": true, "why": "a real PE whose Machine says ARM64 is refused"},
+    {"id": "neg.good_not_rejected", "stage": "3 hostile input", "type": "serial_absent", "depends_on": ["boot.test_finished"],
+     "pattern": "WINRUN: REJECT .*file=/usr/share/winfix/nocrt_hello.exe", "regex": true, "why": "the VALID tier-1 program must not be refused by the parser/reader"},
+    {"id": "neg.never_ran", "stage": "3 hostile input", "type": "serial_absent", "depends_on": ["neg.truncated", "neg.not_pe", "neg.wrong_arch"],
+     "pattern": "WINRUN: L3 entry .*bad_", "regex": true, "why": "a rejected file must never reach the entry point"},
+    {"id": "neg.no_fault", "stage": "3 hostile input", "type": "no_kernel_fault", "depends_on": ["neg.truncated"], "why": "refusing garbage must not hurt the kernel"},
+
+    {"id": "tier2.crt_parse", "stage": "4 tier-2: C-runtime program (known gap)", "type": "serial_contains", "depends_on": ["boot.test_finished"],
+     "pattern": "WINRUN: L0 parse OK file=/usr/share/winfix/crt_hello.exe", "severity": "warn",
+     "why": "an ordinary MinGW program parses and maps"},
+    {"id": "tier2.crt_imports_resolved", "stage": "4 tier-2: C-runtime program (known gap)", "type": "serial_value",
+     "depends_on": ["tier2.crt_parse"], "pattern": "WINRUN: L2 imports total=\\d+ unresolved=(?P<v>\\d+)", "which": "last", "op": "==", "value": 0, "severity": "warn",
+     "why": "MEASURES the remaining gap: the UCRT/msvcrt imports an ordinary program needs (printf, malloc, __getmainargs, ...). Turns green when tier 2 lands."},
+
+    {"id": "ui.not_blank", "stage": "5 screen", "type": "screenshot", "name": "final", "not_blank": true, "min_colors": 64,
+     "depends_on": ["boot.alive"], "severity": "warn", "why": "the desktop still painted while foreign code ran"}
+  ]
+}

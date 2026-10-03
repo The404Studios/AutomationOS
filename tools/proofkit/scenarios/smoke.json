@@ -1,0 +1,19 @@
+{
+  "name": "smoke",
+  "description": "Regression gate: FULL userspace build + the whole boot smoke suite (scripts/smoke_boot.sh) + the static ABI guard",
+  "build": [
+    {"name": "kernel", "cmd": "bash scripts/quick_build.sh", "skip_if_env": "NOBUILD", "why": "the default kernel must link"},
+    {"name": "userspace", "cmd": "FULL=1 bash scripts/build_all.sh", "skip_if_env": "NOBUILD", "timeout": 3000,
+     "why": "FULL=1 is required: the default (lean) profile does not spawn the self-test storm the smoke suite grades"}
+  ],
+  "assertions": [
+    {"id": "smoke.all_checks", "stage": "1 boot smoke", "type": "cmd", "timeout": 600,
+     "cmd": "bash scripts/smoke_boot.sh 2>&1 | tail -4", "stdout_matches": "all \\d+ checks passed",
+     "why": "every boot invariant the project has accumulated must still hold"},
+    {"id": "smoke.count", "stage": "1 boot smoke", "type": "cmd", "timeout": 60, "depends_on": ["smoke.all_checks"],
+     "cmd": "grep -c . /dev/null; grep -a -c 'PASS\\]' /tmp/smoke_boot.log 2>/dev/null; true", "expect_exit": 0,
+     "severity": "warn", "why": "informational"},
+    {"id": "abi.syscall_numbers", "stage": "2 static", "type": "cmd", "cmd": "python3 tools/proofkit/static/check_syscall_abi.py",
+     "stdout_matches": "syscall ABI: OK", "why": "uapi numbers must match the kernel"}
+  ]
+}

@@ -1,0 +1,57 @@
+{
+  "name": "tls_certs",
+  "description": "CERT-REAL-0 + TLS-STRICT-0: real certificates verify against the embedded roots across many CAs/key types, and broken certificates are refused before any request is sent",
+  "build": [
+    {"name": "kernel", "cmd": "bash scripts/quick_build.sh", "skip_if_env": "NOBUILD", "why": "the default kernel must still link"},
+    {"name": "userspace", "cmd": "NET_LIVE=1 bash scripts/build_all.sh", "skip_if_env": "NOBUILD",
+     "why": "livenet (the site matrix + badssl negatives) ships only in NET_LIVE builds"}
+  ],
+  "vms": [
+    {"label": "main", "iso": "build/automationos.iso", "mem": 512, "smp": 1, "netdev": "user,id=n0",
+     "timeout": 420, "until": "LIVENET: negatives rejected=", "settle": 5, "screenshots": ["final"]}
+  ],
+  "assertions": [
+    {"id": "boot.alive", "stage": "1 boot", "type": "serial_contains", "pattern": "All services started", "why": "the OS came up"},
+    {"id": "boot.no_fault", "stage": "1 boot", "type": "no_kernel_fault", "depends_on": ["boot.alive"], "why": "no kernel fault"},
+
+    {"id": "net.baseline", "stage": "2 baseline", "type": "serial_contains", "depends_on": ["boot.alive"],
+     "pattern": "LIVENET: https status=200", "why": "plain DNS+HTTP+HTTPS must work before certificate breadth means anything"},
+
+    {"id": "cert.example", "stage": "3 real certs", "type": "serial_contains", "depends_on": ["net.baseline"],
+     "pattern": "LIVENET: https status=200 bytes=577 trusted=1", "why": "example.com (Cloudflare-served, ECDSA chain) authenticates"},
+    {"id": "cert.google", "stage": "3 real certs", "type": "serial_contains", "depends_on": ["net.baseline"],
+     "pattern": "LIVENET: site www.google.com status=", "regex": false,
+     "why": "Google Trust Services chain"},
+    {"id": "cert.google.trusted", "stage": "3 real certs", "type": "serial_contains", "depends_on": ["cert.google"],
+     "pattern": "LIVENET: site www.google.com status=\\d+ trusted=1", "regex": true, "why": "...and it must be trusted, not merely reachable"},
+    {"id": "cert.github.trusted", "stage": "3 real certs", "type": "serial_contains", "depends_on": ["net.baseline"],
+     "pattern": "LIVENET: site github.com status=\\d+ trusted=1", "regex": true, "why": "GitHub (ECDSA chain)"},
+    {"id": "cert.cloudflare.trusted", "stage": "3 real certs", "type": "serial_contains", "depends_on": ["net.baseline"],
+     "pattern": "LIVENET: site www.cloudflare.com status=\\d+ trusted=1", "regex": true, "severity": "warn", "why": "Cloudflare"},
+    {"id": "cert.letsencrypt.trusted", "stage": "3 real certs", "type": "serial_contains", "depends_on": ["net.baseline"],
+     "pattern": "LIVENET: site letsencrypt.org status=\\d+ trusted=1", "regex": true, "severity": "warn", "why": "ISRG / Let's Encrypt family"},
+    {"id": "cert.amazon.trusted", "stage": "3 real certs", "type": "serial_contains", "depends_on": ["net.baseline"],
+     "pattern": "LIVENET: site www.amazon.com status=\\d+ trusted=1", "regex": true, "severity": "warn", "why": "Amazon / DigiCert RSA"},
+    {"id": "cert.microsoft.trusted", "stage": "3 real certs", "type": "serial_contains", "depends_on": ["net.baseline"],
+     "pattern": "LIVENET: site www.microsoft.com status=\\d+ trusted=1", "regex": true, "severity": "warn", "why": "Microsoft roots"},
+    {"id": "cert.wikipedia.trusted", "stage": "3 real certs", "type": "serial_contains", "depends_on": ["net.baseline"],
+     "pattern": "LIVENET: site en.wikipedia.org status=\\d+ trusted=1", "regex": true, "severity": "warn", "why": "Wikimedia (Let's Encrypt ECDSA)"},
+    {"id": "cert.breadth", "stage": "3 real certs", "type": "serial_value", "depends_on": ["net.baseline"],
+     "pattern": "LIVENET: sites ok=(?P<v>\\d+) of", "op": ">=", "value": 7, "which": "last",
+     "why": "at least 7 of the 8 real sites must authenticate (one may be down or change CA)"},
+
+    {"id": "neg.expired", "stage": "4 broken certs", "type": "serial_contains", "depends_on": ["net.baseline"],
+     "pattern": "LIVENET: neg expired.badssl.com REJECTED (cert)", "why": "an expired certificate must never be trusted"},
+    {"id": "neg.self_signed", "stage": "4 broken certs", "type": "serial_contains", "depends_on": ["net.baseline"],
+     "pattern": "LIVENET: neg self-signed.badssl.com REJECTED (cert)", "why": "a self-signed certificate must never be trusted"},
+    {"id": "neg.wrong_host", "stage": "4 broken certs", "type": "serial_contains", "depends_on": ["net.baseline"],
+     "pattern": "LIVENET: neg wrong.host.badssl.com REJECTED (cert)", "why": "a valid certificate for a DIFFERENT host must be refused (hostname check)"},
+    {"id": "neg.untrusted_root", "stage": "4 broken certs", "type": "serial_contains", "depends_on": ["net.baseline"],
+     "pattern": "LIVENET: neg untrusted-root.badssl.com REJECTED (cert)", "why": "a chain to a root we do not embed must be refused"},
+    {"id": "neg.none_accepted", "stage": "4 broken certs", "type": "serial_absent", "depends_on": ["net.baseline"],
+     "pattern": "ACCEPTED", "why": "NOTHING invalid may be accepted -- this is the one that matters"},
+
+    {"id": "ui.not_blank", "stage": "5 screen", "type": "screenshot", "name": "final", "not_blank": true, "min_colors": 64,
+     "depends_on": ["boot.alive"], "severity": "warn", "why": "the desktop painted"}
+  ]
+}

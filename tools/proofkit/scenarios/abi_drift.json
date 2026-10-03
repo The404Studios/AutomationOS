@@ -1,0 +1,9 @@
+{
+  "name": "abi_drift",
+  "description": "Static guard: the uapi syscall-number header must match the kernel's real numbers (no VM needed)",
+  "assertions": [
+    {"id": "abi.syscall_numbers", "stage": "1 static", "type": "cmd", "cmd": "python3 tools/proofkit/static/check_syscall_abi.py",
+     "stdout_matches": "syscall ABI: OK",
+     "why": "16 of 48 uapi numbers were wrong and nothing noticed; a test then 'slept' through the wrong syscall and ran before the NIC link was up"}
+  ]
+}

@@ -43,7 +43,7 @@ QPID=$!
 # restored desktop actually render before the screendump.
 ok=0
 for i in $(seq 1 90); do
-    grep -qF "CWATCHDOG: PASS respawned" "$LOG" 2>/dev/null && { ok=1; break; }
+    grep -qF "[SUP] SELFHEAL: PASS respawned" "$LOG" 2>/dev/null && { ok=1; break; }
     sleep 1
 done
 sleep 4
@@ -78,18 +78,20 @@ while IFS= read -r m; do
 done <<'MARKERS'
 [INIT] SELFHEAL: heartbeat segment ready
 [SHELL] SELFHEAL: heartbeat published
-CWATCHDOG: watching
 FREEZE_TEST: entering freeze mode 0
-CWATCHDOG: heartbeat stalled
-CWATCHDOG: PASS respawned
+service=compositor event=heartbeat-stalled
+[SUP] SELFHEAL: recovery overlay fired
+[SUP] SELFHEAL: PASS respawned
 MARKERS
 
 RESTORED=$(grep -cF "SELFHEAL: restored win=" "$LOG" 2>/dev/null || true)
 RESTORED=${RESTORED:-0}
 echo "  restored_windows=$RESTORED (expect >= 2: terminal + filemanager)"
 [ "$RESTORED" -ge 2 ] || P=0
-if grep -qF "CWATCHDOG: FAIL recovery storm" "$LOG"; then echo "  STORM (one-shot latch broken)"; P=0; fi
-if grep -qiE "PANIC|CPU EXCEPTION|TRIPLE FAULT" "$LOG"; then echo "  KERNEL FAULT during recovery"; P=0; fi
+if grep -qF "service=compositor event=circuit-open" "$LOG"; then echo "  STORM (one-shot latch broken)"; P=0; fi
+EXC=$(grep -acF "CPU EXCEPTION" "$LOG" || true); CON=$(grep -acF "Terminating faulting process" "$LOG" || true)
+if grep -qiE "PANIC|TRIPLE FAULT" "$LOG" || [ "${EXC:-0}" -gt "${CON:-0}" ]; then echo "  KERNEL FAULT during recovery (exceptions=$EXC contained=$CON)"; P=0; fi
+if [ "${CON:-0}" -gt 0 ]; then echo "  note: $CON ring-3 process(es) were terminated by the kernel (contained, not a kernel fault): $(grep -aF 'Terminating faulting process' "$LOG" | head -3 | tr '\n' ' ')"; fi
 
 if [ "$P" = "1" ]; then
     echo "SELFHEAL-FIX: PASS recovery=1 restored_windows=$RESTORED no_storm=1 no_fault=1"

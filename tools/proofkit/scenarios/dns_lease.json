@@ -1,0 +1,62 @@
+{
+  "name": "dns_lease",
+  "description": "DNS-LEASE-0 + live Internet: the resolver follows the DHCP-learned DNS server, and real DNS/HTTP/verified-HTTPS work from inside the guest",
+  "build": [
+    {"name": "kernel", "cmd": "bash scripts/quick_build.sh", "skip_if_env": "NOBUILD",
+     "why": "the default kernel must still link"},
+    {"name": "userspace", "cmd": "DNS_TEST=1 NET_LIVE=1 bash scripts/build_all.sh", "skip_if_env": "NOBUILD",
+     "why": "dnstest (DHCP + resolver check) and livenet (real Internet) are shipped only in these test builds"}
+  ],
+  "vms": [
+    {"label": "lease", "iso": "build/automationos.iso", "mem": 512, "smp": 1,
+     "netdev": "user,id=n0,dns=10.0.2.4", "timeout": 100, "until": "DNSTEST: resolve", "settle": 4,
+     "screenshots": ["final"]},
+    {"label": "internet", "iso": "build/automationos.iso", "mem": 512, "smp": 1,
+     "netdev": "user,id=n0", "timeout": 170, "until": "LIVENET: (PASS|FAIL)", "settle": 6,
+     "screenshots": ["final"]}
+  ],
+  "assertions": [
+    {"id": "boot.alive", "stage": "1 boot", "vm": "lease", "type": "serial_contains", "pattern": "All services started",
+     "why": "nothing else is meaningful if the OS did not come up"},
+    {"id": "boot.no_fault", "stage": "1 boot", "vm": "lease", "type": "no_kernel_fault", "depends_on": ["boot.alive"],
+     "why": "a kernel fault invalidates every later result"},
+    {"id": "boot.no_oom", "stage": "1 boot", "vm": "lease", "type": "serial_absent", "pattern": "out of physical memory",
+     "depends_on": ["boot.alive"], "why": "PT-DIRECTMAP-0 regression guard (browser2 BSS used to eat all RAM)"},
+
+    {"id": "dhcp.wire_sequence", "stage": "2 dhcp", "vm": "lease", "type": "pcap_order", "depends_on": ["boot.alive"],
+     "steps": [{"kind": "dhcp", "dhcp": "DISCOVER"}, {"kind": "dhcp", "dhcp": "OFFER"},
+               {"kind": "dhcp", "dhcp": "REQUEST"}, {"kind": "dhcp", "dhcp": "ACK"}],
+     "why": "a real DHCP exchange must cross the NIC -- not just a log line claiming one happened"},
+    {"id": "dhcp.lease_dns", "stage": "2 dhcp", "vm": "lease", "type": "serial_contains", "depends_on": ["dhcp.wire_sequence"],
+     "pattern": "dhcp lease ip=10.0.2.15 dns=10.0.2.4",
+     "why": "the lease must carry the non-default DNS this boot planted (slirp dns=10.0.2.4)"},
+
+    {"id": "dns.follows_lease", "stage": "3 resolver", "vm": "lease", "type": "serial_contains", "depends_on": ["dhcp.lease_dns"],
+     "pattern": "DNSTEST: PASS",
+     "why": "the resolver ignored the lease and kept querying the hard-wired 10.0.2.3 -- every lookup on a real LAN went to a dead address"},
+    {"id": "dns.queries_lease_server", "stage": "3 resolver", "vm": "lease", "type": "pcap_has", "depends_on": ["dhcp.lease_dns"],
+     "kind": "dns", "dst": "10.0.2.4", "dport": 53, "min": 1,
+     "why": "the proof must be on the wire: a DNS query actually addressed to the lease's server"},
+    {"id": "dns.default_abandoned", "stage": "3 resolver", "vm": "lease", "type": "pcap_absent_after", "depends_on": ["dns.queries_lease_server"],
+     "after": {"kind": "dns", "dst": "10.0.2.4"}, "kind": "dns", "dst": "10.0.2.3",
+     "why": "once the lease is in use, nothing may still send to the hard-wired default (retries included)"},
+
+    {"id": "net.boot", "stage": "4 internet", "vm": "internet", "type": "serial_contains", "pattern": "All services started",
+     "why": "second boot, ordinary NAT networking (the default DNS)"},
+    {"id": "net.dns_resolves", "stage": "4 internet", "vm": "internet", "type": "serial_contains", "depends_on": ["net.boot"],
+     "pattern": "LIVENET: dns example.com -> ", "why": "a real A record came back through the host's resolver"},
+    {"id": "net.http", "stage": "4 internet", "vm": "internet", "type": "serial_contains", "depends_on": ["net.dns_resolves"],
+     "pattern": "LIVENET: http  status=200", "why": "plain HTTP to the real Internet"},
+    {"id": "net.https", "stage": "4 internet", "vm": "internet", "type": "serial_contains", "depends_on": ["net.dns_resolves"],
+     "pattern": "LIVENET: https status=200", "why": "TLS handshake + page over the real Internet"},
+    {"id": "net.https_verified", "stage": "4 internet", "vm": "internet", "type": "serial_contains", "depends_on": ["net.https"],
+     "pattern": "trusted=1", "why": "encrypted is not authenticated: the certificate chain must verify against a built-in root"},
+    {"id": "net.tcp_443_on_wire", "stage": "4 internet", "vm": "internet", "type": "pcap_has", "depends_on": ["net.dns_resolves"],
+     "kind": "tcp", "dport": 443, "syn": true, "min": 1, "why": "a real TCP SYN to port 443 left the NIC"},
+    {"id": "net.live_pass", "stage": "4 internet", "vm": "internet", "type": "serial_contains", "depends_on": ["net.https_verified", "net.http"],
+     "pattern": "LIVENET: PASS", "why": "the guest's own end-to-end verdict"},
+
+    {"id": "ui.not_blank", "stage": "5 screen", "vm": "internet", "type": "screenshot", "name": "final", "not_blank": true,
+     "min_colors": 64, "depends_on": ["net.boot"], "severity": "warn", "why": "the desktop actually painted something"}
+  ]
+}
